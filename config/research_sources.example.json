@@ -1,0 +1,50 @@
+{
+  "known_tickers": {
+    "005930": "Samsung Electronics",
+    "000660": "SK hynix",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "SPY": "SPDR S&P 500 ETF"
+  },
+  "rss_feeds": [],
+  "retry_failed_sources": true,
+  "retry_attempts": 3,
+  "retry_backoff_ms": 800,
+  "html_pages": [],
+  "dynamic_pages": [],
+  "stooq_symbols": [],
+  "yahoo_chart_symbols": [
+    {
+      "symbol": "005930.KS",
+      "ticker": "005930",
+      "market": "KOSPI",
+      "company_name": "Samsung Electronics",
+      "sector": "Semiconductor"
+    },
+    {
+      "symbol": "AAPL",
+      "ticker": "AAPL",
+      "market": "NASDAQ",
+      "company_name": "Apple",
+      "sector": "Technology"
+    },
+    {
+      "symbol": "MSFT",
+      "ticker": "MSFT",
+      "market": "NASDAQ",
+      "company_name": "Microsoft",
+      "sector": "Technology"
+    },
+    {
+      "symbol": "SPY",
+      "ticker": "SPY",
+      "market": "US-ETF",
+      "company_name": "SPDR S&P 500 ETF",
+      "sector": "IndexETF"
+    }
+  ],
+  "fred_series": [],
+  "ecos_series": [],
+  "opendart_disclosures": []
+}

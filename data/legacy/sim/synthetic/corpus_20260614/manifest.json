@@ -1,0 +1,19 @@
+{
+  "synthetic": true,
+  "environment": "sim",
+  "scenarios": 5,
+  "ticker_count": 30,
+  "trading_days": 20,
+  "interval_minutes": 5,
+  "seed": 20260614,
+  "total_bars": 234000,
+  "total_news": 1200,
+  "bundle_roots": [
+    "data\\sim\\synthetic\\corpus_20260614\\scenario_000",
+    "data\\sim\\synthetic\\corpus_20260614\\scenario_001",
+    "data\\sim\\synthetic\\corpus_20260614\\scenario_002",
+    "data\\sim\\synthetic\\corpus_20260614\\scenario_003",
+    "data\\sim\\synthetic\\corpus_20260614\\scenario_004"
+  ],
+  "created_at": "2026-06-13T14:51:07.961705+00:00"
+}

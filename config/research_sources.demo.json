@@ -1,0 +1,20 @@
+{
+  "known_tickers": {
+    "005930": "Samsung Electronics",
+    "000660": "SK hynix"
+  },
+  "rss_feeds": [
+    "../data/fixtures/sample_news.xml"
+  ],
+  "html_pages": [
+    {
+      "url": "../data/fixtures/semiconductor_research.html",
+      "title": "Semiconductor cycle research note"
+    }
+  ],
+  "stooq_symbols": [],
+  "yahoo_chart_symbols": [],
+  "fred_series": [],
+  "ecos_series": [],
+  "opendart_disclosures": []
+}

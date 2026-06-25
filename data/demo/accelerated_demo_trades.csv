@@ -1,0 +1,7 @@
+timestamp,ticker,side,quantity,price,value,reason
+2026-06-12T00:15:00+00:00,QQQ,BUY,2,119.3938,238.7876,Goal-directed BUY based on ontology and chart score 2.38.; Target feasibility is 68% for 1 days.
+2026-06-12T00:16:00+00:00,SNOW,BUY,4,71.8222,287.2888,Goal-directed BUY based on ontology and chart score 2.63.; Target feasibility is 68% for 1 days.
+2026-06-12T00:16:00+00:00,UBER,BUY,1,182.5619,182.5619,Goal-directed BUY based on ontology and chart score 2.53.; Target feasibility is 68% for 1 days.
+2026-06-12T00:18:00+00:00,JPM,BUY,1,267.1748,267.1748,Goal-directed BUY based on ontology and chart score 2.73.; Target feasibility is 68% for 1 days.
+2026-06-12T00:18:00+00:00,SPY,BUY,2,154.8883,309.7766,Goal-directed BUY based on ontology and chart score 2.73.; Target feasibility is 68% for 1 days.
+2026-06-12T00:19:00+00:00,CVX,BUY,8,40.6142,324.9136,Goal-directed BUY based on ontology and chart score 2.63.; Target feasibility is 68% for 1 days.

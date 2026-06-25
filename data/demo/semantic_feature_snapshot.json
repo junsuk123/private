@@ -1,0 +1,1311 @@
+[
+  {
+    "ticker": "AAPL",
+    "raw_indicators": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.019,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0354020851,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0992962017,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.00881,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.69,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:59dfdb6d707c0872",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "ShortTermMomentumPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.35402085099999997,
+        "supporting_indicators": [
+          "return_5d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:df50bdeafddfde1f",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MediumTermTrendPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.4964810085,
+        "supporting_indicators": [
+          "return_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:026f0f6b065be306",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5189999999999999,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:2fcd006e3c4591a7",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.653615276,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:b0778fdc367ee66e",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.603615276,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:6bf42921c60557b5",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:7b5541f96696425c",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 0.806309578507,
+        "supporting_indicators": [
+          "stochastic_k_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:7b5541f96696425c",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:589223c22917a45a",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.654023122,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:168cf86f179d1b0d",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "UpperBandTouch",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "bollinger_percent_b_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:9c9338e313a23010",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeSpike",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:168a35a24a81236d",
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeBackedRise",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio",
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:117dc18cf4b19b22",
+        "metadata": {}
+      }
+    ]
+  },
+  {
+    "ticker": "MSFT",
+    "raw_indicators": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.018,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.030271082,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0776196584,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.00782,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.6799999999999999,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:3a58498cfd3cf896",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "ShortTermMomentumPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.30271082,
+        "supporting_indicators": [
+          "return_5d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:4253736a7b5352b0",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.518,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:b00a45dc02af0584",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6308441563000002,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:7b1a1306c7b37d83",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5808441564,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:08a7b2411980b8a0",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:93a6475f6f7f9f4a",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:cb252600ded3417b",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.654023122,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:98aad001feec7a0c",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "BollingerSqueeze",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.06030782125000002,
+        "supporting_indicators": [
+          "bollinger_band_width_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:f5e38f6aed509f64",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "UpperBandTouch",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "bollinger_percent_b_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:80f94b0d2f5874ac",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeSpike",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:cbf34a3c2805a800",
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeBackedRise",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio",
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:d12bbcdf3c0c285c",
+        "metadata": {}
+      }
+    ]
+  },
+  {
+    "ticker": "NVDA",
+    "raw_indicators": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.021,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0457254195,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.1438981978,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.01079,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.71,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:5ef8e9f24394511a",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "ShortTermMomentumPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.45725419500000003,
+        "supporting_indicators": [
+          "return_5d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:dea25cc1e6a00413",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MediumTermTrendPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.7194909889999999,
+        "supporting_indicators": [
+          "return_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:b0d3af7609f0547c",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5209999999999999,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:46bbfd2f776e941b",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.7183806934000003,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:022682587f90137c",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6683806934000001,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:9c9aa717c5cb1c9b",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:6d427073c7f96600",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 0.842076986875,
+        "supporting_indicators": [
+          "stochastic_k_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:6d427073c7f96600",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:3fe73c979c00768d",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.654023122,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:abf1727c6efb560c",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "UpperBandTouch",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "bollinger_percent_b_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:032e67aad1e41e07",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeSpike",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:4dfa9d0c320045c6",
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeBackedRise",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio",
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:fb03f6f49bb9bb80",
+        "metadata": {}
+      }
+    ]
+  },
+  {
+    "ticker": "AMZN",
+    "raw_indicators": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": -0.002,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": -0.0099600799,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": -0.039249043,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.01198,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5084060636999999,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:85aebc20d9484fee",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.45840606370000003,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:bb26809970d64fab",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RSIOversold",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "Watchlist",
+        "ontology_node_id": "semantic:d52744e4c112214a",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MoneyFlowSellingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic:318cc0effb744fca",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:81087005b97b6ed8",
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "BollingerSqueeze",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.42280229874999997,
+        "supporting_indicators": [
+          "bollinger_band_width_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:afc22ccccbebd45c",
+        "metadata": {}
+      }
+    ]
+  },
+  {
+    "ticker": "TSLA",
+    "raw_indicators": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.016,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0200701001,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0354787245,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.00584,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv",
+        "calculation_version": "semantic-indicators-v1",
+        "metadata": {}
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.66,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:23da7a347e1db64d",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.516,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:c35904ba1a287d0e",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.602307832,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:737ca12eefca5853",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5523078319,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:8f6a937cec97e027",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:aa285838dd5696a7",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:828ba8a42dd8c7f8",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.654023122,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:b1405290da79652f",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "BollingerSqueeze",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.61788200875,
+        "supporting_indicators": [
+          "bollinger_band_width_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:9127845bfc351b30",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "UpperBandTouch",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "bollinger_percent_b_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:27178c27d77e2349",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeSpike",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:443d13f85cd31c2d",
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-02-14T00:00:00+00:00",
+        "feature_name": "VolumeBackedRise",
+        "feature_category": "volume_flow",
+        "state": "active",
+        "confidence": 0.80898876405,
+        "supporting_indicators": [
+          "volume_spike_ratio",
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:07926d7a2b54119d",
+        "metadata": {}
+      }
+    ]
+  }
+]

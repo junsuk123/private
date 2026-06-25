@@ -1,0 +1,85 @@
+{
+  "known_tickers": {
+    "005930": "Samsung Electronics",
+    "005930.KS": "Samsung Electronics",
+    "000660": "SK hynix",
+    "000660.KS": "SK hynix",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "AMZN": "Amazon",
+    "GOOGL": "Alphabet",
+    "TSLA": "Tesla",
+    "SPY": "SPDR S&P 500 ETF",
+    "QQQ": "Invesco QQQ",
+    "EWY": "iShares MSCI South Korea ETF"
+  },
+  "listed_universe": {
+    "enabled": true,
+    "markets": [
+      "US",
+      "KR"
+    ],
+    "include_in_known_tickers": true,
+    "batch_size": 1500,
+    "cursor_path": "data/research_universe_cursor.json"
+  },
+  "rss_feeds": [
+    "https://finance.yahoo.com/rss/headline?s=005930.KS",
+    "https://finance.yahoo.com/rss/headline?s=000660.KS",
+    "https://finance.yahoo.com/rss/headline?s=AAPL",
+    "https://finance.yahoo.com/rss/headline?s=MSFT",
+    "https://finance.yahoo.com/rss/headline?s=NVDA",
+    "https://finance.yahoo.com/rss/headline?s=SPY",
+    "https://finance.yahoo.com/rss/headline?s=QQQ"
+  ],
+  "rss_fetch_articles": true,
+  "rss_article_fetch_limit_per_feed": 3,
+  "retry_failed_sources": true,
+  "retry_attempts": 1,
+  "retry_backoff_ms": 300,
+  "html_pages": [
+    {
+      "url": "https://www.federalreserve.gov/monetarypolicy.htm",
+      "title": "Federal Reserve monetary policy overview",
+      "event_type": "MACRO"
+    },
+    {
+      "url": "https://www.bls.gov/cpi/",
+      "title": "BLS Consumer Price Index",
+      "event_type": "MACRO"
+    },
+    {
+      "url": "https://www.sec.gov/about",
+      "title": "SEC investor protection and market oversight",
+      "event_type": "FINANCIAL"
+    },
+    {
+      "url": "https://www.nasdaq.com/market-activity/stocks/nvda",
+      "title": "Nasdaq NVDA market activity",
+      "event_type": "MARKET"
+    }
+  ],
+  "dynamic_pages": [],
+  "stooq_symbols": [],
+  "alpha_vantage_symbols": [
+    {
+      "symbol": "IBM",
+      "ticker": "IBM",
+      "market": "NYSE",
+      "company_name": "IBM",
+      "sector": "Technology"
+    },
+    {
+      "symbol": "MSFT",
+      "ticker": "MSFT",
+      "market": "NASDAQ",
+      "company_name": "Microsoft",
+      "sector": "Technology"
+    }
+  ],
+  "yahoo_chart_symbols": [],
+  "fred_series": [],
+  "ecos_series": [],
+  "opendart_disclosures": []
+}

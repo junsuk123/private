@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: personal-investment-agents
+Version: 0.1.0
+Summary: Safe, auditable personal stock-investment analysis system scaffold.
+Requires-Python: >=3.11
+Requires-Dist: fastapi
+Requires-Dist: tzdata
+Requires-Dist: uvicorn
+Provides-Extra: npu
+Requires-Dist: openvino; extra == "npu"
+Provides-Extra: local-llm
+Requires-Dist: accelerate; extra == "local-llm"
+Requires-Dist: sentencepiece; extra == "local-llm"
+Requires-Dist: torch; extra == "local-llm"
+Requires-Dist: transformers; extra == "local-llm"
+Provides-Extra: openvino-llm
+Requires-Dist: accelerate; extra == "openvino-llm"
+Requires-Dist: optimum-intel[openvino]; extra == "openvino-llm"
+Requires-Dist: sentencepiece; extra == "openvino-llm"
+Requires-Dist: transformers; extra == "openvino-llm"

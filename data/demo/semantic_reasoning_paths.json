@@ -1,0 +1,122 @@
+[
+  {
+    "ticker": "AAPL",
+    "as_of": "2026-02-14T00:00:00+00:00",
+    "strategy_signal": "BuyCandidate",
+    "positive_features": [
+      "DailyReturnPositive",
+      "ShortTermMomentumPositive",
+      "MediumTermTrendPositive",
+      "PriceAboveMA20",
+      "MACDBullishCross",
+      "MomentumIncreasing",
+      "MoneyFlowBuyingPressure",
+      "VolatilityLow",
+      "VolumeSpike",
+      "VolumeBackedRise"
+    ],
+    "negative_features": [],
+    "risk_features": [
+      "RangeOverbought",
+      "RangeOverbought",
+      "UpperBandTouch"
+    ],
+    "contradiction_score": 0.298701,
+    "final_confidence": 0.80872,
+    "explanation": "AAPL as of 2026-02-14T00:00:00+00:00 -> BuyCandidate with confidence 0.81. Positive=10, negative=0, risk=3."
+  },
+  {
+    "ticker": "MSFT",
+    "as_of": "2026-02-14T00:00:00+00:00",
+    "strategy_signal": "BuyCandidate",
+    "positive_features": [
+      "DailyReturnPositive",
+      "ShortTermMomentumPositive",
+      "PriceAboveMA20",
+      "MACDBullishCross",
+      "MomentumIncreasing",
+      "MoneyFlowBuyingPressure",
+      "VolatilityLow",
+      "BollingerSqueeze",
+      "VolumeSpike",
+      "VolumeBackedRise"
+    ],
+    "negative_features": [],
+    "risk_features": [
+      "RangeOverbought",
+      "UpperBandTouch"
+    ],
+    "contradiction_score": 0.248611,
+    "final_confidence": 0.813577,
+    "explanation": "MSFT as of 2026-02-14T00:00:00+00:00 -> BuyCandidate with confidence 0.81. Positive=10, negative=0, risk=2."
+  },
+  {
+    "ticker": "NVDA",
+    "as_of": "2026-02-14T00:00:00+00:00",
+    "strategy_signal": "BuyCandidate",
+    "positive_features": [
+      "DailyReturnPositive",
+      "ShortTermMomentumPositive",
+      "MediumTermTrendPositive",
+      "PriceAboveMA20",
+      "MACDBullishCross",
+      "MomentumIncreasing",
+      "MoneyFlowBuyingPressure",
+      "VolatilityLow",
+      "VolumeSpike",
+      "VolumeBackedRise"
+    ],
+    "negative_features": [],
+    "risk_features": [
+      "RangeOverbought",
+      "RangeOverbought",
+      "UpperBandTouch"
+    ],
+    "contradiction_score": 0.28683,
+    "final_confidence": 0.844796,
+    "explanation": "NVDA as of 2026-02-14T00:00:00+00:00 -> BuyCandidate with confidence 0.84. Positive=10, negative=0, risk=3."
+  },
+  {
+    "ticker": "AMZN",
+    "as_of": "2026-02-14T00:00:00+00:00",
+    "strategy_signal": "BuyCandidate",
+    "positive_features": [
+      "MACDBullishCross",
+      "MomentumIncreasing",
+      "RSIOversold",
+      "VolatilityLow",
+      "BollingerSqueeze"
+    ],
+    "negative_features": [],
+    "risk_features": [
+      "MoneyFlowSellingPressure"
+    ],
+    "contradiction_score": 0.22781,
+    "final_confidence": 0.661169,
+    "explanation": "AMZN as of 2026-02-14T00:00:00+00:00 -> BuyCandidate with confidence 0.66. Positive=5, negative=0, risk=1."
+  },
+  {
+    "ticker": "TSLA",
+    "as_of": "2026-02-14T00:00:00+00:00",
+    "strategy_signal": "BuyCandidate",
+    "positive_features": [
+      "DailyReturnPositive",
+      "PriceAboveMA20",
+      "MACDBullishCross",
+      "MomentumIncreasing",
+      "MoneyFlowBuyingPressure",
+      "VolatilityLow",
+      "BollingerSqueeze",
+      "VolumeSpike",
+      "VolumeBackedRise"
+    ],
+    "negative_features": [],
+    "risk_features": [
+      "RangeOverbought",
+      "UpperBandTouch"
+    ],
+    "contradiction_score": 0.243294,
+    "final_confidence": 0.82764,
+    "explanation": "TSLA as of 2026-02-14T00:00:00+00:00 -> BuyCandidate with confidence 0.83. Positive=9, negative=0, risk=2."
+  }
+]

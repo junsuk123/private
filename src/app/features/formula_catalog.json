@@ -1,0 +1,110 @@
+{
+  "calculation_version": "semantic-indicators-v1",
+  "parameter_tuning": {
+    "model": "RegimeFormulaParameterTuner",
+    "model_version": "formula-parameter-tuner-v1",
+    "principle": "AI may recommend formula parameters, but the formula definitions remain deterministic and auditable.",
+    "tunable_parameters": ["rsi_period", "bollinger_period", "bollinger_stddev", "atr_period", "volume_window"]
+  },
+  "formulas": [
+    {
+      "name": "return_n",
+      "category": "price_return",
+      "definition": "close_t / close_t_minus_n - 1",
+      "inputs": ["close"],
+      "default_parameters": {"windows": [1, 5, 20, 60, 120]},
+      "output_range": "(-1, infinity)",
+      "interpretation": "Positive values indicate appreciation over the lookback.",
+      "limitations": "Requires consistent adjusted or raw close convention.",
+      "source_references": ["Standard return definition"]
+    },
+    {
+      "name": "ema",
+      "category": "trend",
+      "definition": "EMA_t = alpha * value_t + (1 - alpha) * EMA_t_minus_1; alpha = 2 / (n + 1)",
+      "inputs": ["close"],
+      "default_parameters": {"windows": [12, 20, 26]},
+      "output_range": "price scale",
+      "interpretation": "Smoothed trend estimate.",
+      "limitations": "Lagging and sensitive to initialization.",
+      "source_references": ["OANDA MACD overview", "Investopedia MACD"]
+    },
+    {
+      "name": "macd",
+      "category": "trend",
+      "definition": "EMA(12) - EMA(26), signal = EMA(9) of MACD, histogram = MACD - signal",
+      "inputs": ["close"],
+      "default_parameters": {"fast": 12, "slow": 26, "signal": 9},
+      "output_range": "price scale",
+      "interpretation": "MACD above signal supports bullish momentum.",
+      "limitations": "False signals in sideways markets.",
+      "source_references": ["OANDA MACD overview", "Investopedia MACD"]
+    },
+    {
+      "name": "rsi",
+      "category": "momentum",
+      "definition": "100 - 100 / (1 + average_gain / average_loss)",
+      "inputs": ["close"],
+      "default_parameters": {"period": 14},
+      "output_range": "0 to 100",
+      "interpretation": "Above 70 often overbought; below 30 often oversold.",
+      "limitations": "Needs trend context.",
+      "source_references": ["OANDA RSI guide", "Investopedia RSI"]
+    },
+    {
+      "name": "bollinger_bands",
+      "category": "volatility",
+      "definition": "middle = SMA(20), upper = middle + 2 * stdev, lower = middle - 2 * stdev",
+      "inputs": ["close"],
+      "default_parameters": {"period": 20, "stddevs": 2.0},
+      "output_range": "price scale plus ratio derivatives",
+      "interpretation": "Band width measures compression/expansion; percent B locates price inside or outside bands.",
+      "limitations": "Lagging and not predictive alone.",
+      "source_references": ["Investopedia Bollinger Bands", "Schwab Bollinger Bands"]
+    },
+    {
+      "name": "atr",
+      "category": "volatility",
+      "definition": "Wilder-smoothed average of true range, where true range is max(high-low, abs(high-prev_close), abs(low-prev_close))",
+      "inputs": ["high", "low", "close"],
+      "default_parameters": {"period": 14},
+      "output_range": "price scale",
+      "interpretation": "Higher ATR indicates larger recent price ranges.",
+      "limitations": "No direction information.",
+      "source_references": ["Investopedia ATR", "StockCharts ATR"]
+    },
+    {
+      "name": "stochastic_k",
+      "category": "momentum",
+      "definition": "(close - lowest_low_n) / (highest_high_n - lowest_low_n) * 100",
+      "inputs": ["high", "low", "close"],
+      "default_parameters": {"period": 14, "signal": 3},
+      "output_range": "0 to 100",
+      "interpretation": "Above 80 often overbought; below 20 often oversold.",
+      "limitations": "Noisy in choppy markets.",
+      "source_references": ["StockCharts Stochastic Oscillator", "OANDA Stochastic Oscillator"]
+    },
+    {
+      "name": "obv",
+      "category": "volume_flow",
+      "definition": "Cumulative volume added on up closes and subtracted on down closes.",
+      "inputs": ["close", "volume"],
+      "default_parameters": {},
+      "output_range": "cumulative volume scale",
+      "interpretation": "Trend and divergence are more useful than absolute value.",
+      "limitations": "Start-date dependent.",
+      "source_references": ["StockCharts OBV", "Investopedia OBV"]
+    },
+    {
+      "name": "mfi",
+      "category": "volume_flow",
+      "definition": "100 - 100 / (1 + positive_money_flow / negative_money_flow)",
+      "inputs": ["high", "low", "close", "volume"],
+      "default_parameters": {"period": 14},
+      "output_range": "0 to 100",
+      "interpretation": "Above 80 indicates strong buying pressure/overbought; below 20 selling pressure/oversold.",
+      "limitations": "Depends on volume quality.",
+      "source_references": ["TradingView MFI", "Investopedia MFI"]
+    }
+  ]
+}

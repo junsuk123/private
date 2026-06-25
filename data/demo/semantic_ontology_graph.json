@@ -1,0 +1,722 @@
+[
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:return_1d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:return_5d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:return_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:return_60d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:return_120d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:close_location_value:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:gap_up_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:gap_down_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:distance_from_52w_high:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:distance_from_52w_low:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:rolling_drawdown_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:intraday_range_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:candle_body_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:upper_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:lower_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:sma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:sma_60:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:ema_12:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:ema_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:ema_26:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:macd_line:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:macd_signal:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:macd_histogram:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:rsi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:bollinger_middle_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:bollinger_upper_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:bollinger_lower_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:bollinger_band_width_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:bollinger_percent_b_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:atr_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:historical_volatility_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:obv:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:volume_ma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:volume_spike_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:stochastic_k_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:stochastic_d_3:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AAPL",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AAPL:mfi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:return_1d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:return_5d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:return_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:return_60d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:return_120d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:close_location_value:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:gap_up_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:gap_down_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:distance_from_52w_high:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:distance_from_52w_low:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:rolling_drawdown_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:intraday_range_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:candle_body_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:upper_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:lower_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:sma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:sma_60:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:ema_12:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:ema_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:ema_26:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:macd_line:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:macd_signal:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:macd_histogram:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:rsi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:bollinger_middle_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:bollinger_upper_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:bollinger_lower_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:bollinger_band_width_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:bollinger_percent_b_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:atr_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:historical_volatility_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:obv:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:volume_ma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:volume_spike_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:stochastic_k_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:stochastic_d_3:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "MSFT",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:MSFT:mfi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:return_1d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:return_5d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:return_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:return_60d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:return_120d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:close_location_value:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:gap_up_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:gap_down_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:distance_from_52w_high:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:distance_from_52w_low:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:rolling_drawdown_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:intraday_range_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:candle_body_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:upper_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:lower_shadow_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:sma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:sma_60:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:ema_12:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:ema_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:ema_26:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:macd_line:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:macd_signal:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:macd_histogram:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:rsi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:bollinger_middle_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:bollinger_upper_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:bollinger_lower_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:bollinger_band_width_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:bollinger_percent_b_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:atr_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:historical_volatility_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:obv:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:volume_ma_20:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:volume_spike_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:stochastic_k_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:stochastic_d_3:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "NVDA",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:NVDA:mfi_14:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:return_1d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:return_5d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:return_20d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:return_60d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:return_120d:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:close_location_value:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:gap_up_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:gap_down_ratio:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  },
+  {
+    "subject": "AMZN",
+    "predicate": "hasTechnicalIndicator",
+    "object": "indicator:AMZN:distance_from_52w_high:2026-02-14T00:00:00+00:00",
+    "evidence_id": "semantic-indicators-v1"
+  }
+]

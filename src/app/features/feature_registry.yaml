@@ -1,0 +1,116 @@
+version: semantic-feature-registry-v1
+parameter_tuning:
+  calculation_method: ai_parameter_model
+  model: RegimeFormulaParameterTuner
+  tunable_parameters:
+    - rsi_period
+    - bollinger_period
+    - bollinger_stddev
+    - atr_period
+    - volume_window
+  rule: "AI recommends parameters as of the decision timestamp; formulas remain deterministic."
+features:
+  - name: RSIOverbought
+    calculation_method: formula_rule
+    category: momentum
+    formula: rsi
+    inputs: [rsi_14]
+    parameters: {threshold: 70}
+    semantic_mapping: "rsi_14 >= 70"
+    ontology_mapping: {relation: supportsSignal, target_signal: WaitOrTakeProfit}
+  - name: RSIOversold
+    calculation_method: formula_rule
+    category: momentum
+    formula: rsi
+    inputs: [rsi_14]
+    parameters: {threshold: 30}
+    semantic_mapping: "rsi_14 <= 30"
+    ontology_mapping: {relation: supportsSignal, target_signal: Watchlist}
+  - name: MACDBullishCross
+    calculation_method: formula_rule
+    category: trend
+    formula: macd
+    inputs: [macd_line, macd_signal]
+    parameters: {}
+    semantic_mapping: "macd_line > macd_signal"
+    ontology_mapping: {relation: supportsSignal, target_signal: BuyCandidate}
+  - name: MACDBearishCross
+    calculation_method: formula_rule
+    category: trend
+    formula: macd
+    inputs: [macd_line, macd_signal]
+    parameters: {}
+    semantic_mapping: "macd_line < macd_signal"
+    ontology_mapping: {relation: contradictsSignal, target_signal: AggressiveBuy}
+  - name: BollingerSqueeze
+    calculation_method: formula_rule
+    category: volatility
+    formula: bollinger_bands
+    inputs: [bollinger_band_width_20]
+    parameters: {max_width: 0.08}
+    semantic_mapping: "bollinger_band_width_20 <= 0.08"
+    ontology_mapping: {relation: supportsSignal, target_signal: BreakoutWatch}
+  - name: UpperBandTouch
+    calculation_method: formula_rule
+    category: volatility
+    formula: bollinger_bands
+    inputs: [bollinger_percent_b_20]
+    parameters: {min_percent_b: 1.0}
+    semantic_mapping: "bollinger_percent_b_20 >= 1"
+    ontology_mapping: {relation: supportsSignal, target_signal: WaitOrTakeProfit}
+  - name: VolatilityHigh
+    calculation_method: formula_rule
+    category: volatility_risk
+    formula: historical_volatility
+    inputs: [historical_volatility_20d]
+    parameters: {annualized_threshold: 0.45}
+    semantic_mapping: "historical_volatility_20d >= 0.45"
+    ontology_mapping: {relation: increasesRiskOf, target_signal: RiskAdjustedSizing}
+  - name: VolumeSpike
+    calculation_method: formula_rule
+    category: volume_flow
+    formula: volume_spike_ratio
+    inputs: [volume_spike_ratio]
+    parameters: {threshold: 2.0}
+    semantic_mapping: "volume_spike_ratio >= 2.0"
+    ontology_mapping: {relation: supportsSignal, target_signal: BreakoutWatch}
+  - name: VolumeBackedRise
+    calculation_method: formula_rule
+    category: volume_flow
+    formula: volume_spike_ratio
+    inputs: [volume_spike_ratio, return_1d]
+    parameters: {volume_threshold: 2.0, return_threshold: 0.0}
+    semantic_mapping: "volume_spike_ratio >= 2.0 and return_1d > 0"
+    ontology_mapping: {relation: supportsSignal, target_signal: BuyCandidate}
+  - name: DrawdownSevere
+    calculation_method: formula_rule
+    category: volatility_risk
+    formula: rolling_drawdown
+    inputs: [rolling_drawdown_20d]
+    parameters: {threshold: -0.20}
+    semantic_mapping: "rolling_drawdown_20d <= -0.20"
+    ontology_mapping: {relation: increasesRiskOf, target_signal: ReduceRiskCandidate}
+  - name: AdaptiveBreakoutCandidate
+    calculation_method: ai_model
+    category: learned_pattern
+    formula: learned_centroid_or_replaceable_model
+    inputs: [return_5d, volume_spike_ratio, bollinger_band_width_20, macd_histogram]
+    parameters: {training_label_rule: future_return_5d_above_2pct, threshold: 0.58}
+    semantic_mapping: "learned from walk-forward training data"
+    ontology_mapping: {relation: supportsSignal, target_signal: BuyCandidate}
+  - name: AdaptiveRiskOffCandidate
+    calculation_method: ai_model
+    category: learned_risk
+    formula: learned_centroid_or_replaceable_model
+    inputs: [historical_volatility_20d, rolling_drawdown_20d, return_5d, macd_histogram]
+    parameters: {training_label_rule: triple_barrier_negative, threshold: 0.58}
+    semantic_mapping: "learned from walk-forward training data"
+    ontology_mapping: {relation: increasesRiskOf, target_signal: ReduceRiskCandidate}
+  - name: MajorSupplyContract
+    calculation_method: ai_text_or_structured_event_model
+    category: unstructured_event
+    formula: event extraction / text model
+    inputs: [news_text, disclosure_text]
+    parameters: {requires_source_confidence: true}
+    semantic_mapping: "inferred from disclosure/news text or structured event parser"
+    ontology_mapping: {relation: supportsSignal, target_signal: BuyCandidate}

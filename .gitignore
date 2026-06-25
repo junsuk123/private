@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+data/raw/
+data/processed/
+data/store/
+data/legacy/**/store/
+*.sqlite3
+logs/
+.env
+.env.*
+!.env.example

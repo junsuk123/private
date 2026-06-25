@@ -1,0 +1,41 @@
+[project]
+name = "personal-investment-agents"
+version = "0.1.0"
+description = "Safe, auditable personal stock-investment analysis system scaffold."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "tzdata",
+  "uvicorn"
+]
+
+[project.optional-dependencies]
+npu = [
+  "openvino"
+]
+local-llm = [
+  "accelerate",
+  "sentencepiece",
+  "torch",
+  "transformers"
+]
+openvino-llm = [
+  "accelerate",
+  "optimum-intel[openvino]",
+  "sentencepiece",
+  "transformers"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

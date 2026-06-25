@@ -1,0 +1,4624 @@
+[
+  {
+    "ticker": "AAPL",
+    "as_of": "2026-03-21T00:00:00+00:00",
+    "raw_indicators": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.004,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0384503739,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 5
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.1222991194,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": 0.388700793,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 120
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": -0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "up"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.00604,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "down"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_high",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "high"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_low",
+        "value": 0.5249879423,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "low"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rolling_drawdown_20d",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "intraday_range_ratio",
+        "value": 0.04,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "candle_body_ratio",
+        "value": 0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "upper_shadow_ratio",
+        "value": 0.625,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "upper"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "lower_shadow_ratio",
+        "value": 0.125,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "lower"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_20",
+        "value": 147.0940604036,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_60",
+        "value": 132.701238743,
+        "unit": "price",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_12",
+        "value": 150.3770090073,
+        "unit": "price",
+        "lookback_window": "12 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 12
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_20",
+        "value": 147.2910882749,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_26",
+        "value": 145.0755073801,
+        "unit": "price",
+        "lookback_window": "26 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 26
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_line",
+        "value": 5.3015016273,
+        "unit": "price",
+        "lookback_window": "12/26 EMA",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_signal",
+        "value": 5.1087658602,
+        "unit": "price",
+        "lookback_window": "9 EMA of MACD",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_histogram",
+        "value": 0.1927357671,
+        "unit": "price",
+        "lookback_window": "MACD-signal",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rsi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "rsi_14"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_middle_20",
+        "value": 147.0940604036,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_middle_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_upper_20",
+        "value": 156.513725271,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_upper_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_lower_20",
+        "value": 137.6743955363,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_lower_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_band_width_20",
+        "value": 0.1280767536,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_band_width_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_percent_b_20",
+        "value": 0.964969159,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_percent_b_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "atr_14",
+        "value": 5.8937877861,
+        "unit": "price",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "atr_14"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "historical_volatility_20d",
+        "value": 0.0857223425,
+        "unit": "annualized_ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "annualization": 252
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "obv",
+        "value": 128060000.0,
+        "unit": "volume",
+        "lookback_window": null,
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "method": "cumulative"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_ma_20",
+        "value": 2038000,
+        "unit": "volume",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "canonical_name": "volume_ma_20"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_spike_ratio",
+        "value": 0.882642998,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_k_14",
+        "value": 76.4783488299,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "stochastic_k_14"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_d_3",
+        "value": 76.4783488299,
+        "unit": "index",
+        "lookback_window": "3 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "signal": 3,
+            "canonical_name": "stochastic_d_3"
+          }
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "mfi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "mfi_14"
+          }
+        }
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.54,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:dc530471e482898d",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "ShortTermMomentumPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.384503739,
+        "supporting_indicators": [
+          "return_5d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:a783d1d239eca751",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MediumTermTrendPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.611495597,
+        "supporting_indicators": [
+          "return_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:739c23f9a5c823fa",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.504,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:f0e82c842796e62e",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MA20AboveMA60",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.658460341417568,
+        "supporting_indicators": [
+          "sma_20",
+          "sma_60"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:3a3707fe435c10b0",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6927357671000003,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:d16343623c4afcd4",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6427357671,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:1c2a39948d0ff2d8",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:5e83d536bc8c9ac1",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:6eaba99ce8cbcaf2",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.4285177166666666,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:cf384b01abb2fe4d",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveRiskOffCandidate",
+        "feature_category": "learned_risk",
+        "state": "active",
+        "confidence": 0.963891,
+        "supporting_indicators": [
+          "historical_volatility_20d",
+          "rolling_drawdown_20d",
+          "return_5d",
+          "macd_histogram"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-ai:09af64c1b9647487",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "historical_volatility_20d",
+            "rolling_drawdown_20d",
+            "return_5d",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MajorSupplyContract",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.8500000000000001,
+        "supporting_indicators": [
+          "contract",
+          "supply",
+          "order backlog"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-text:65a2e1dd70fb1d78",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 2
+        }
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AnalystUpgrade",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.65,
+        "supporting_indicators": [
+          "upgrade",
+          "raised target",
+          "outperform"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-text:621c8442c2db6737",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 1
+        }
+      }
+    ],
+    "reasoning_paths": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "strategy_signal": "BuyCandidate",
+        "positive_features": [
+          "DailyReturnPositive",
+          "ShortTermMomentumPositive",
+          "MediumTermTrendPositive",
+          "PriceAboveMA20",
+          "MA20AboveMA60",
+          "MACDBullishCross",
+          "MomentumIncreasing",
+          "MoneyFlowBuyingPressure",
+          "VolatilityLow",
+          "MajorSupplyContract",
+          "AnalystUpgrade"
+        ],
+        "negative_features": [],
+        "risk_features": [
+          "RangeOverbought",
+          "AdaptiveRiskOffCandidate"
+        ],
+        "contradiction_score": 0.220011,
+        "final_confidence": 0.889162,
+        "explanation": "AAPL as of 2026-03-21T00:00:00+00:00 -> BuyCandidate with confidence 0.89. Positive=11, negative=0, risk=2."
+      }
+    ],
+    "parameter_recommendations": [
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "rsi_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_period",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_stddev",
+        "value": 2.0,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "atr_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AAPL",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "volume_window",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      }
+    ]
+  },
+  {
+    "ticker": "MSFT",
+    "as_of": "2026-03-21T00:00:00+00:00",
+    "raw_indicators": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.003,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0333072444,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 5
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.1001914829,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": 0.3082177174,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 120
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": -0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "up"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.00703,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "down"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_high",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "high"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_low",
+        "value": 0.4096865724,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "low"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rolling_drawdown_20d",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "intraday_range_ratio",
+        "value": 0.04,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "candle_body_ratio",
+        "value": 0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "upper_shadow_ratio",
+        "value": 0.625,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "upper"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "lower_shadow_ratio",
+        "value": 0.125,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "lower"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_20",
+        "value": 137.1062726091,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_60",
+        "value": 126.0150114142,
+        "unit": "price",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_12",
+        "value": 139.6084958404,
+        "unit": "price",
+        "lookback_window": "12 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 12
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_20",
+        "value": 137.2493351371,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_26",
+        "value": 135.5482106583,
+        "unit": "price",
+        "lookback_window": "26 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 26
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_line",
+        "value": 4.0602851821,
+        "unit": "price",
+        "lookback_window": "12/26 EMA",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_signal",
+        "value": 3.9148043719,
+        "unit": "price",
+        "lookback_window": "9 EMA of MACD",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_histogram",
+        "value": 0.1454808102,
+        "unit": "price",
+        "lookback_window": "MACD-signal",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rsi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "rsi_14"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_middle_20",
+        "value": 137.1062726091,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_middle_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_upper_20",
+        "value": 144.3436869132,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_upper_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_lower_20",
+        "value": 129.8688583049,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_lower_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_band_width_20",
+        "value": 0.1055737884,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_band_width_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_percent_b_20",
+        "value": 0.9713511034,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_percent_b_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "atr_14",
+        "value": 5.4943676449,
+        "unit": "price",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "atr_14"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "historical_volatility_20d",
+        "value": 0.0857223425,
+        "unit": "annualized_ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "annualization": 252
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "obv",
+        "value": 128060000.0,
+        "unit": "volume",
+        "lookback_window": null,
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "method": "cumulative"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_ma_20",
+        "value": 2038000,
+        "unit": "volume",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "canonical_name": "volume_ma_20"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_spike_ratio",
+        "value": 0.882642998,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_k_14",
+        "value": 73.4951426468,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "stochastic_k_14"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_d_3",
+        "value": 73.4951426468,
+        "unit": "index",
+        "lookback_window": "3 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "signal": 3,
+            "canonical_name": "stochastic_d_3"
+          }
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "mfi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "mfi_14"
+          }
+        }
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.53,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:7f36cc6621927652",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "ShortTermMomentumPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.33307244399999997,
+        "supporting_indicators": [
+          "return_5d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:2894947ee2ac8de2",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MediumTermTrendPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.5009574145,
+        "supporting_indicators": [
+          "return_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:c88d72a581e16ff5",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5029999999999999,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:e72d8f07dcd9e4ea",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MA20AboveMA60",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6380153965025961,
+        "supporting_indicators": [
+          "sma_20",
+          "sma_60"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:7d6a1cb0a5eac381",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6454808102000005,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:71635cc652afa710",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5954808102,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:3a76ad8b59a7e58c",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:3b93f316f8acc973",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:88837018b7f6f153",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.4285177166666666,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:240e763ac218c5dd",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveRiskOffCandidate",
+        "feature_category": "learned_risk",
+        "state": "active",
+        "confidence": 0.9193,
+        "supporting_indicators": [
+          "historical_volatility_20d",
+          "rolling_drawdown_20d",
+          "return_5d",
+          "macd_histogram"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-ai:ff3833444e30da64",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "historical_volatility_20d",
+            "rolling_drawdown_20d",
+            "return_5d",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MajorSupplyContract",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.65,
+        "supporting_indicators": [
+          "contract",
+          "supply",
+          "order backlog"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-text:8a5c7abfa85bf8ef",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 1
+        }
+      }
+    ],
+    "reasoning_paths": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "strategy_signal": "BuyCandidate",
+        "positive_features": [
+          "DailyReturnPositive",
+          "ShortTermMomentumPositive",
+          "MediumTermTrendPositive",
+          "PriceAboveMA20",
+          "MA20AboveMA60",
+          "MACDBullishCross",
+          "MomentumIncreasing",
+          "MoneyFlowBuyingPressure",
+          "VolatilityLow",
+          "MajorSupplyContract"
+        ],
+        "negative_features": [],
+        "risk_features": [
+          "RangeOverbought",
+          "AdaptiveRiskOffCandidate"
+        ],
+        "contradiction_score": 0.247849,
+        "final_confidence": 0.800804,
+        "explanation": "MSFT as of 2026-03-21T00:00:00+00:00 -> BuyCandidate with confidence 0.80. Positive=10, negative=0, risk=2."
+      }
+    ],
+    "parameter_recommendations": [
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "rsi_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_period",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_stddev",
+        "value": 2.0,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "atr_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "MSFT",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "volume_window",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      }
+    ]
+  },
+  {
+    "ticker": "NVDA",
+    "as_of": "2026-03-21T00:00:00+00:00",
+    "raw_indicators": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": -0.0039974123,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 5
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0679102248,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": 0.2178792586,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 120
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": -0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "up"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.02683,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "down"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_high",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "high"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_low",
+        "value": 0.2920683979,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "low"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rolling_drawdown_20d",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "intraday_range_ratio",
+        "value": 0.04,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "candle_body_ratio",
+        "value": 0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "upper_shadow_ratio",
+        "value": 0.625,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "upper"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "lower_shadow_ratio",
+        "value": 0.125,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "lower"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_20",
+        "value": 127.3839990061,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_60",
+        "value": 119.4551437351,
+        "unit": "price",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_12",
+        "value": 128.9605244609,
+        "unit": "price",
+        "lookback_window": "12 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 12
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_20",
+        "value": 127.3632139894,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_26",
+        "value": 126.1739135949,
+        "unit": "price",
+        "lookback_window": "26 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 26
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_line",
+        "value": 2.786610866,
+        "unit": "price",
+        "lookback_window": "12/26 EMA",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_signal",
+        "value": 2.8035052075,
+        "unit": "price",
+        "lookback_window": "9 EMA of MACD",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_histogram",
+        "value": -0.0168943414,
+        "unit": "price",
+        "lookback_window": "MACD-signal",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rsi_14",
+        "value": 56.1325233759,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "rsi_14"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_middle_20",
+        "value": 127.3839990061,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_middle_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_upper_20",
+        "value": 132.6647895975,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_upper_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_lower_20",
+        "value": 122.1032084147,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_lower_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_band_width_20",
+        "value": 0.0829113646,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_band_width_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_percent_b_20",
+        "value": 0.7532359715,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_percent_b_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "atr_14",
+        "value": 5.5560520298,
+        "unit": "price",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "atr_14"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "historical_volatility_20d",
+        "value": 0.3254274113,
+        "unit": "annualized_ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "annualization": 252
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "obv",
+        "value": -620000.0,
+        "unit": "volume",
+        "lookback_window": null,
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "method": "cumulative"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_ma_20",
+        "value": 2038000,
+        "unit": "volume",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "canonical_name": "volume_ma_20"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_spike_ratio",
+        "value": 0.882642998,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_k_14",
+        "value": 55.4013013605,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "stochastic_k_14"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_d_3",
+        "value": 61.956555637,
+        "unit": "index",
+        "lookback_window": "3 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "signal": 3,
+            "canonical_name": "stochastic_d_3"
+          }
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "mfi_14",
+        "value": 56.8278033794,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "mfi_14"
+          }
+        }
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MA20AboveMA60",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6163751683107326,
+        "supporting_indicators": [
+          "sma_20",
+          "sma_60"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:cb84eec71cd49a93",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MACDBearishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5168943415,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "contradictsSignal",
+        "target_signal": "AggressiveBuy",
+        "ontology_node_id": "semantic:829b7f00a8133902",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveBreakoutCandidate",
+        "feature_category": "learned_pattern",
+        "state": "active",
+        "confidence": 0.924772,
+        "supporting_indicators": [
+          "return_5d",
+          "volume_spike_ratio",
+          "bollinger_band_width_20",
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-ai:4aee4c0e45ae254c",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "return_5d",
+            "volume_spike_ratio",
+            "bollinger_band_width_20",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveRiskOffCandidate",
+        "feature_category": "learned_risk",
+        "state": "active",
+        "confidence": 0.827641,
+        "supporting_indicators": [
+          "historical_volatility_20d",
+          "rolling_drawdown_20d",
+          "return_5d",
+          "macd_histogram"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-ai:98b40cf949c27d70",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "historical_volatility_20d",
+            "rolling_drawdown_20d",
+            "return_5d",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MajorSupplyContract",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.8500000000000001,
+        "supporting_indicators": [
+          "contract",
+          "supply",
+          "order backlog"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-text:5b69bd4a44be83bc",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 2
+        }
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AnalystUpgrade",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.8500000000000001,
+        "supporting_indicators": [
+          "upgrade",
+          "raised target",
+          "outperform"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-text:9a9a63c0723cf05a",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 2
+        }
+      }
+    ],
+    "reasoning_paths": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "strategy_signal": "BuyCandidate",
+        "positive_features": [
+          "MA20AboveMA60",
+          "AdaptiveBreakoutCandidate",
+          "MajorSupplyContract",
+          "AnalystUpgrade"
+        ],
+        "negative_features": [
+          "MACDBearishCross"
+        ],
+        "risk_features": [
+          "AdaptiveRiskOffCandidate"
+        ],
+        "contradiction_score": 0.293203,
+        "final_confidence": 0.618282,
+        "explanation": "NVDA as of 2026-03-21T00:00:00+00:00 -> BuyCandidate with confidence 0.62. Positive=4, negative=1, risk=1."
+      }
+    ],
+    "parameter_recommendations": [
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "rsi_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_period",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_stddev",
+        "value": 2.0,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "atr_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "NVDA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "volume_window",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      }
+    ]
+  },
+  {
+    "ticker": "AMZN",
+    "as_of": "2026-03-21T00:00:00+00:00",
+    "raw_indicators": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": -0.0039974123,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 5
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0679102248,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": 0.2178792586,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 120
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": -0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "up"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.02683,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "down"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_high",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "high"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_low",
+        "value": 0.2920683979,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "low"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rolling_drawdown_20d",
+        "value": -0.017,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "intraday_range_ratio",
+        "value": 0.04,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "candle_body_ratio",
+        "value": 0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "upper_shadow_ratio",
+        "value": 0.625,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "upper"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "lower_shadow_ratio",
+        "value": 0.125,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "lower"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_20",
+        "value": 127.3839990061,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_60",
+        "value": 119.4551437351,
+        "unit": "price",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_12",
+        "value": 128.9605244609,
+        "unit": "price",
+        "lookback_window": "12 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 12
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_20",
+        "value": 127.3632139894,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_26",
+        "value": 126.1739135949,
+        "unit": "price",
+        "lookback_window": "26 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 26
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_line",
+        "value": 2.786610866,
+        "unit": "price",
+        "lookback_window": "12/26 EMA",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_signal",
+        "value": 2.8035052075,
+        "unit": "price",
+        "lookback_window": "9 EMA of MACD",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_histogram",
+        "value": -0.0168943414,
+        "unit": "price",
+        "lookback_window": "MACD-signal",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rsi_14",
+        "value": 56.1325233759,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "rsi_14"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_middle_20",
+        "value": 127.3839990061,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_middle_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_upper_20",
+        "value": 132.6647895975,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_upper_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_lower_20",
+        "value": 122.1032084147,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_lower_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_band_width_20",
+        "value": 0.0829113646,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_band_width_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_percent_b_20",
+        "value": 0.7532359715,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_percent_b_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "atr_14",
+        "value": 5.5560520298,
+        "unit": "price",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "atr_14"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "historical_volatility_20d",
+        "value": 0.3254274113,
+        "unit": "annualized_ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "annualization": 252
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "obv",
+        "value": -1400000.0,
+        "unit": "volume",
+        "lookback_window": null,
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "method": "cumulative"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_ma_20",
+        "value": 1695000,
+        "unit": "volume",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "canonical_name": "volume_ma_20"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_spike_ratio",
+        "value": 1.0623145401,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_k_14",
+        "value": 55.4013013605,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "stochastic_k_14"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_d_3",
+        "value": 61.956555637,
+        "unit": "index",
+        "lookback_window": "3 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "signal": 3,
+            "canonical_name": "stochastic_d_3"
+          }
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "mfi_14",
+        "value": 50.2837671286,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "mfi_14"
+          }
+        }
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MA20AboveMA60",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.6163751683107326,
+        "supporting_indicators": [
+          "sma_20",
+          "sma_60"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:1db59851175d2154",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MACDBearishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5168943415,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "contradictsSignal",
+        "target_signal": "AggressiveBuy",
+        "ontology_node_id": "semantic:8e4e22adaa54063b",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveBreakoutCandidate",
+        "feature_category": "learned_pattern",
+        "state": "active",
+        "confidence": 0.729837,
+        "supporting_indicators": [
+          "return_5d",
+          "volume_spike_ratio",
+          "bollinger_band_width_20",
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-ai:89610527357ac7e5",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "return_5d",
+            "volume_spike_ratio",
+            "bollinger_band_width_20",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveRiskOffCandidate",
+        "feature_category": "learned_risk",
+        "state": "active",
+        "confidence": 0.827641,
+        "supporting_indicators": [
+          "historical_volatility_20d",
+          "rolling_drawdown_20d",
+          "return_5d",
+          "macd_histogram"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-ai:4c3a7902e662e9fa",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "historical_volatility_20d",
+            "rolling_drawdown_20d",
+            "return_5d",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "RegulatoryPenaltyNegative",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.65,
+        "supporting_indicators": [
+          "penalty",
+          "fine",
+          "sanction"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-text:5937c083e19c8534",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 1
+        }
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "LitigationRiskHigh",
+        "feature_category": "unstructured_event",
+        "state": "active",
+        "confidence": 0.65,
+        "supporting_indicators": [
+          "lawsuit",
+          "litigation",
+          "class action"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-text:a219980436a097b7",
+        "generation_method": "ai_text_proxy",
+        "model_version": "text-heuristic-semantic-v1",
+        "metadata": {
+          "document_count": 1,
+          "matched_keywords": 1
+        }
+      }
+    ],
+    "reasoning_paths": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "strategy_signal": "ReduceRiskCandidate",
+        "positive_features": [
+          "MA20AboveMA60",
+          "AdaptiveBreakoutCandidate"
+        ],
+        "negative_features": [
+          "MACDBearishCross"
+        ],
+        "risk_features": [
+          "AdaptiveRiskOffCandidate",
+          "RegulatoryPenaltyNegative",
+          "LitigationRiskHigh"
+        ],
+        "contradiction_score": 0.662667,
+        "final_confidence": 0.388687,
+        "explanation": "AMZN as of 2026-03-21T00:00:00+00:00 -> ReduceRiskCandidate with confidence 0.39. Positive=2, negative=1, risk=3."
+      }
+    ],
+    "parameter_recommendations": [
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "rsi_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_period",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_stddev",
+        "value": 2.0,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "atr_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "AMZN",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "volume_window",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      }
+    ]
+  },
+  {
+    "ticker": "TSLA",
+    "as_of": "2026-03-21T00:00:00+00:00",
+    "raw_indicators": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_1d",
+        "value": 0.001,
+        "unit": "ratio",
+        "lookback_window": "1 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_5d",
+        "value": 0.0230821181,
+        "unit": "ratio",
+        "lookback_window": "5 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 5
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_20d",
+        "value": 0.0572112177,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_60d",
+        "value": 0.1607673436,
+        "unit": "ratio",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "return_120d",
+        "value": null,
+        "unit": "ratio",
+        "lookback_window": "120 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 120
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "close_location_value",
+        "value": -0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_up_ratio",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "up"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "gap_down_ratio",
+        "value": 0.00901,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "direction": "down"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_high",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "high"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "distance_from_52w_low",
+        "value": 0.2042946583,
+        "unit": "ratio",
+        "lookback_window": "252 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 252,
+            "extreme": "low"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rolling_drawdown_20d",
+        "value": 0.0,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "intraday_range_ratio",
+        "value": 0.04,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "candle_body_ratio",
+        "value": 0.25,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 1
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "upper_shadow_ratio",
+        "value": 0.625,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "upper"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "lower_shadow_ratio",
+        "value": 0.125,
+        "unit": "ratio",
+        "lookback_window": "1 bar",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "side": "lower"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_20",
+        "value": 119.1059176901,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "sma_60",
+        "value": 113.7198814624,
+        "unit": "price",
+        "lookback_window": "60 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 60
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_12",
+        "value": 120.3151437817,
+        "unit": "price",
+        "lookback_window": "12 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 12
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_20",
+        "value": 119.1805366304,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "ema_26",
+        "value": 118.3590153153,
+        "unit": "price",
+        "lookback_window": "26 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 26
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_line",
+        "value": 1.9561284664,
+        "unit": "price",
+        "lookback_window": "12/26 EMA",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_signal",
+        "value": 1.8723184624,
+        "unit": "price",
+        "lookback_window": "9 EMA of MACD",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "macd_histogram",
+        "value": 0.083810004,
+        "unit": "price",
+        "lookback_window": "MACD-signal",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "fast": 12,
+            "slow": 26,
+            "signal": 9
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "rsi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "rsi_14"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_middle_20",
+        "value": 119.1059176901,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_middle_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_upper_20",
+        "value": 122.7647109434,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_upper_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_lower_20",
+        "value": 115.4471244368,
+        "unit": "price",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_lower_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_band_width_20",
+        "value": 0.0614376401,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_band_width_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "bollinger_percent_b_20",
+        "value": 0.9935654656,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 20,
+            "stddevs": 2.0,
+            "canonical_name": "bollinger_percent_b_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "atr_14",
+        "value": 4.7763185062,
+        "unit": "price",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "atr_14"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "historical_volatility_20d",
+        "value": 0.0857223425,
+        "unit": "annualized_ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "annualization": 252
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "obv",
+        "value": 128060000.0,
+        "unit": "volume",
+        "lookback_window": null,
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "method": "cumulative"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_ma_20",
+        "value": 2038000,
+        "unit": "volume",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20,
+            "canonical_name": "volume_ma_20"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "volume_spike_ratio",
+        "value": 0.882642998,
+        "unit": "ratio",
+        "lookback_window": "20 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "window": 20
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_k_14",
+        "value": 64.2298135027,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "stochastic_k_14"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "stochastic_d_3",
+        "value": 64.2298135027,
+        "unit": "index",
+        "lookback_window": "3 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "signal": 3,
+            "canonical_name": "stochastic_d_3"
+          }
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "indicator_name": "mfi_14",
+        "value": 100.0,
+        "unit": "index",
+        "lookback_window": "14 bars",
+        "source": "ohlcv+ai-parameters",
+        "calculation_version": "semantic-indicators-v1",
+        "calculation_method": "formula",
+        "metadata": {
+          "parameters": {
+            "period": 14,
+            "canonical_name": "mfi_14"
+          }
+        }
+      }
+    ],
+    "semantic_features": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "DailyReturnPositive",
+        "feature_category": "price_return",
+        "state": "active",
+        "confidence": 0.51,
+        "supporting_indicators": [
+          "return_1d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:e5d6110a7ef3da42",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "PriceAboveMA20",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5009999999999999,
+        "supporting_indicators": [
+          "sma_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:59e8950ea2cf9357",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MA20AboveMA60",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.5973623095490197,
+        "supporting_indicators": [
+          "sma_20",
+          "sma_60"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:5e46445ce63c7134",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MACDBullishCross",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.583810004,
+        "supporting_indicators": [
+          "macd_line",
+          "macd_signal"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:9d2258002f05b843",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MomentumIncreasing",
+        "feature_category": "trend",
+        "state": "active",
+        "confidence": 0.533810004,
+        "supporting_indicators": [
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "HoldWithTrailingStop",
+        "ontology_node_id": "semantic:783dd9c734e2feed",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "RangeOverbought",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "rsi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "WaitOrTakeProfit",
+        "ontology_node_id": "semantic:48aa1444ff0a7978",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "MoneyFlowBuyingPressure",
+        "feature_category": "momentum",
+        "state": "active",
+        "confidence": 1.0,
+        "supporting_indicators": [
+          "mfi_14"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic:70f7ce64f9179898",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "VolatilityLow",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.4285177166666666,
+        "supporting_indicators": [
+          "historical_volatility_20d"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:b18c7f0553ea7f96",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "BollingerSqueeze",
+        "feature_category": "volatility",
+        "state": "active",
+        "confidence": 0.23202949874999998,
+        "supporting_indicators": [
+          "bollinger_band_width_20"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BreakoutWatch",
+        "ontology_node_id": "semantic:572211657051787e",
+        "generation_method": "formula_rule",
+        "model_version": null,
+        "metadata": {}
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveBreakoutCandidate",
+        "feature_category": "learned_pattern",
+        "state": "active",
+        "confidence": 0.821976,
+        "supporting_indicators": [
+          "return_5d",
+          "volume_spike_ratio",
+          "bollinger_band_width_20",
+          "macd_histogram"
+        ],
+        "semantic_relation": "supportsSignal",
+        "target_signal": "BuyCandidate",
+        "ontology_node_id": "semantic-ai:c59121bcfcb157f8",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "return_5d",
+            "volume_spike_ratio",
+            "bollinger_band_width_20",
+            "macd_histogram"
+          ]
+        }
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "feature_name": "AdaptiveRiskOffCandidate",
+        "feature_category": "learned_risk",
+        "state": "active",
+        "confidence": 0.80002,
+        "supporting_indicators": [
+          "historical_volatility_20d",
+          "rolling_drawdown_20d",
+          "return_5d",
+          "macd_histogram"
+        ],
+        "semantic_relation": "increasesRiskOf",
+        "target_signal": "ReduceRiskCandidate",
+        "ontology_node_id": "semantic-ai:ddc36ccd827aec5c",
+        "generation_method": "ai_model",
+        "model_version": "ai-semantic-layer-v1",
+        "metadata": {
+          "model_type": "centroid_classifier",
+          "threshold": 0.58,
+          "input_indicators": [
+            "historical_volatility_20d",
+            "rolling_drawdown_20d",
+            "return_5d",
+            "macd_histogram"
+          ]
+        }
+      }
+    ],
+    "reasoning_paths": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "strategy_signal": "BuyCandidate",
+        "positive_features": [
+          "DailyReturnPositive",
+          "PriceAboveMA20",
+          "MA20AboveMA60",
+          "MACDBullishCross",
+          "MomentumIncreasing",
+          "MoneyFlowBuyingPressure",
+          "VolatilityLow",
+          "BollingerSqueeze",
+          "AdaptiveBreakoutCandidate"
+        ],
+        "negative_features": [],
+        "risk_features": [
+          "RangeOverbought",
+          "AdaptiveRiskOffCandidate"
+        ],
+        "contradiction_score": 0.256833,
+        "final_confidence": 0.758679,
+        "explanation": "TSLA as of 2026-03-21T00:00:00+00:00 -> BuyCandidate with confidence 0.76. Positive=9, negative=0, risk=2."
+      }
+    ],
+    "parameter_recommendations": [
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "rsi_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_period",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "bollinger_stddev",
+        "value": 2.0,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "atr_period",
+        "value": 14,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      },
+      {
+        "ticker": "TSLA",
+        "as_of": "2026-03-21T00:00:00+00:00",
+        "parameter_name": "volume_window",
+        "value": 20,
+        "recommended_by": "RegimeFormulaParameterTuner",
+        "model_version": "formula-parameter-tuner-v1",
+        "confidence": 0.68,
+        "reason": "normal trend regime",
+        "source_features": [
+          "realized_volatility_20",
+          "return_20",
+          "sample_size",
+          "volume_ratio_20"
+        ]
+      }
+    ]
+  }
+]

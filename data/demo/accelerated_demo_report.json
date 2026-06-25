@@ -1,0 +1,82 @@
+{
+  "accelerated_steps": 20,
+  "bars_per_ticker": 20,
+  "charts_path": "data\\demo\\accelerated_demo_charts.csv",
+  "final_cash": 8389.5,
+  "final_equity": 10006.14,
+  "final_positions": {
+    "CVX": 324.91,
+    "JPM": 266.72,
+    "QQQ": 236.86,
+    "SNOW": 289.77,
+    "SPY": 308.19,
+    "UBER": 190.19
+  },
+  "initial_equity": 10000,
+  "profit_amount": 6.14,
+  "report_path": "data\\demo\\accelerated_demo_report.json",
+  "return_rate": 0.000614,
+  "sample_trades": [
+    {
+      "price": 119.3938,
+      "quantity": 2,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.38.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "QQQ",
+      "timestamp": "2026-06-12T00:15:00+00:00",
+      "value": 238.7876
+    },
+    {
+      "price": 71.8222,
+      "quantity": 4,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.63.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "SNOW",
+      "timestamp": "2026-06-12T00:16:00+00:00",
+      "value": 287.2888
+    },
+    {
+      "price": 182.5619,
+      "quantity": 1,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.53.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "UBER",
+      "timestamp": "2026-06-12T00:16:00+00:00",
+      "value": 182.5619
+    },
+    {
+      "price": 267.1748,
+      "quantity": 1,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.73.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "JPM",
+      "timestamp": "2026-06-12T00:18:00+00:00",
+      "value": 267.1748
+    },
+    {
+      "price": 154.8883,
+      "quantity": 2,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.73.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "SPY",
+      "timestamp": "2026-06-12T00:18:00+00:00",
+      "value": 309.7766
+    },
+    {
+      "price": 40.6142,
+      "quantity": 8,
+      "reason": "Goal-directed BUY based on ontology and chart score 2.63.; Target feasibility is 68% for 1 days.",
+      "side": "BUY",
+      "ticker": "CVX",
+      "timestamp": "2026-06-12T00:19:00+00:00",
+      "value": 324.9136
+    }
+  ],
+  "simulated_minutes": 20,
+  "target_achieved": false,
+  "target_profit_amount": 200.0,
+  "target_return_rate": 0.02,
+  "ticker_count": 47,
+  "trade_count": 6,
+  "trades_path": "data\\demo\\accelerated_demo_trades.csv"
+}
