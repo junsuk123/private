@@ -7,15 +7,64 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.sample_collectors import collect_sample_market
-from app.execution import MockKisDevelopersApi
+from app.execution import KisDevelopersApiClient, MockKisDevelopersApi
 from app.goals import NegotiatedGoal
 from app.graph import OntologyReasoner
 from app.graph.builders import build_market_graph
 from app.indicators import build_sample_indicators
 from app.risk import RiskManager
-from app.schemas.domain import AccountSnapshot, OrderSide
+from app.schemas.domain import AccountSnapshot, FinalOrder, OrderSide, OrderType
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
+
+
+class RecordingKisTransport:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+        self.calls.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers),
+                "body": dict(body or {}),
+                "params": dict(params or {}),
+            }
+        )
+        if url.endswith("/oauth2/tokenP"):
+            return {"access_token": "paper-token", "expires_in": 86400}
+        if url.endswith("/uapi/hashkey"):
+            return {"HASH": "paper-hash"}
+        if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
+            return {"rt_cd": "0", "msg1": "accepted", "output": {"ODNO": "0000000001"}}
+        if url.endswith("/uapi/domestic-stock/v1/trading/inquire-daily-ccld"):
+            return {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "pdno": "005930",
+                        "tot_ccld_qty": "2",
+                        "avg_prvs": "70000",
+                        "sll_buy_dvsn_cd": "02",
+                    }
+                ],
+            }
+        if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+            return {
+                "rt_cd": "0",
+                "output1": [
+                    {
+                        "pdno": "005930",
+                        "prdt_name": "Samsung Electronics",
+                        "hldg_qty": "2",
+                        "pchs_avg_pric": "70000",
+                        "prpr": "71000",
+                    }
+                ],
+                "output2": [{"dnca_tot_amt": "1000000"}],
+            }
+        raise AssertionError(f"unexpected KIS request: {method} {url}")
 
 
 class MockKisApiTest(unittest.TestCase):
@@ -24,7 +73,7 @@ class MockKisApiTest(unittest.TestCase):
         market = markets[0]
         account = AccountSnapshot(cash=10_000_000, holdings=())
         indicators = build_sample_indicators(markets)
-        graph = build_market_graph(markets, indicators)
+        graph = build_market_graph(markets, indicators, npu_scores=_supportive_npu_scores(markets))
         plan = build_goal_execution_plan(
             NegotiatedGoal(0.03, 300_000, 60, 70, "unit"),
             account,
@@ -55,7 +104,7 @@ class MockKisApiTest(unittest.TestCase):
         markets = collect_sample_market()
         account = AccountSnapshot(cash=10_000_000, holdings=())
         indicators = build_sample_indicators(markets)
-        graph = build_market_graph(markets, indicators)
+        graph = build_market_graph(markets, indicators, npu_scores=_supportive_npu_scores(markets))
         OntologyReasoner(graph).infer()
 
         run = run_mock_trading_cycle(
@@ -72,6 +121,44 @@ class MockKisApiTest(unittest.TestCase):
         self.assertGreater(len(run.kis_order_receipts), 0)
         self.assertGreater(len(run.kis_executions), 0)
         self.assertGreater(len(run.portfolio.account.holdings), 0)
+
+    def test_paper_kis_client_uses_real_rest_contract_in_mock_cycle(self) -> None:
+        transport = RecordingKisTransport()
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=True,
+            enabled=True,
+            transport=transport,
+        )
+        order = FinalOrder(
+            ticker="005930",
+            market="KR",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=2,
+            limit_price=70000,
+        )
+
+        receipt = broker.place_limit_order(order)
+        execution = broker.get_order_status(receipt.order_id)
+        portfolio = broker.get_portfolio()
+
+        order_call = next(call for call in transport.calls if call["url"].endswith("/order-cash"))
+        self.assertIn("openapivts.koreainvestment.com:29443", order_call["url"])
+        self.assertEqual(order_call["headers"]["tr_id"], "VTTC0012U")
+        self.assertEqual(order_call["headers"]["hashkey"], "paper-hash")
+        self.assertEqual(order_call["body"]["CANO"], "12345678")
+        self.assertEqual(order_call["body"]["ACNT_PRDT_CD"], "01")
+        self.assertEqual(order_call["body"]["EXCG_ID_DVSN_CD"], "KRX")
+        self.assertEqual(receipt.order_id, "0000000001")
+        self.assertEqual(execution.status, "FILLED")
+        self.assertEqual(portfolio.account.holdings[0].ticker, "005930")
+
+
+def _supportive_npu_scores(markets):
+    return {market.ticker: (0.2, 0.2, 0.0, 0.0, 0.0, 0.4) for market in markets}
 
 
 if __name__ == "__main__":

@@ -61,6 +61,19 @@ One-command Windows launch:
 
 If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded local model. Otherwise it checks for an Ollama-compatible local server at `127.0.0.1:11434`; if unavailable, event classification falls back to deterministic keyword rules.
 
+## KIS Developers Broker Adapter
+
+`src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so simulation code can be run with an injected fake KIS transport and later switched to the real transport.
+
+Safe defaults:
+
+- `KIS_PAPER_TRADING=true` uses `https://openapivts.koreainvestment.com:29443`.
+- `KIS_PAPER_TRADING=false` uses `https://openapi.koreainvestment.com:9443`.
+- `KIS_LIVE_ENABLED=false` blocks all KIS order and account calls.
+- `KIS_ACCOUNT_NO` may be `12345678-01` or paired with `KIS_ACCOUNT_PRODUCT_CODE=01`.
+
+The adapter follows the current KIS guide pattern: `/oauth2/tokenP` for access tokens, `/uapi/hashkey` before cash-order POSTs, and the new domestic cash-order TR IDs `TTTC0011U`/`TTTC0012U` for live and `VTTC0011U`/`VTTC0012U` for paper. Keep token issuance and order calls on the same base URL; mixing paper and live domains will fail at the KIS gateway.
+
 Optional in-process local LLM setup:
 
 ```powershell
@@ -228,7 +241,7 @@ src/app/
   audit/           Append-only audit logger
   backtesting/     Streaming and accelerated simulation tools
   data/            Public collectors, classifiers, HTTP helpers
-  execution/       Mock/paper broker boundary; real KIS client disabled
+  execution/       Mock broker plus KIS Developers REST adapter
   features/        Formula indicators, semantic features, model-row scaffolding
   goals/           Target feasibility and compromise goal negotiation
   graph/           Ontology graph, event mapper, NPU classifier, reasoner
