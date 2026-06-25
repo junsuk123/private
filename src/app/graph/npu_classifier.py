@@ -20,6 +20,8 @@ class OntologyNpuStatus:
     score_dim: int
     last_latency_ms: float | None = None
     last_items: int = 0
+    last_batches: int = 0
+    last_items_per_second: float | None = None
     fallback_reason: str | None = None
 
 
@@ -35,6 +37,9 @@ class OntologyNpuClassifier:
         self._fallback_reason: str | None = None
         self._last_latency_ms: float | None = None
         self._last_items = 0
+        self._last_batches = 0
+        self._last_items_per_second: float | None = None
+        self._batch_buffer: np.ndarray | None = None
         self._lock = Lock()
 
     def classify(
@@ -42,29 +47,37 @@ class OntologyNpuClassifier:
         markets: tuple[MarketSnapshot, ...],
         indicators: dict[str, IndicatorSnapshot],
     ) -> dict[str, tuple[float, ...]]:
-        rows: list[tuple[str, tuple[float, ...]]] = []
+        tickers: list[str] = []
+        feature_rows: list[tuple[float, ...]] = []
         for market in markets:
             indicator = indicators.get(market.ticker)
             if indicator is None:
                 continue
-            rows.append((market.ticker, _features(market, indicator)))
-        if not rows:
+            tickers.append(market.ticker)
+            feature_rows.append(_features(market, indicator))
+        if not tickers:
             return {}
 
         compiled = self._compiled_model()
         started = time.perf_counter()
         scores: dict[str, tuple[float, ...]] = {}
         with self._lock:
-            for offset in range(0, len(rows), self.batch_size):
-                chunk = rows[offset : offset + self.batch_size]
-                batch = np.zeros((self.batch_size, self.feature_dim), dtype=np.float32)
-                for index, (_, feature_row) in enumerate(chunk):
-                    batch[index, :] = feature_row
+            batch = self._input_buffer()
+            batches = 0
+            for offset in range(0, len(tickers), self.batch_size):
+                chunk_size = min(self.batch_size, len(tickers) - offset)
+                batch[:chunk_size, :] = feature_rows[offset : offset + chunk_size]
+                if chunk_size < self.batch_size:
+                    batch[chunk_size:, :] = 0.0
                 output = compiled([batch])[0]
-                for index, (ticker, _) in enumerate(chunk):
+                batches += 1
+                for index, ticker in enumerate(tickers[offset : offset + chunk_size]):
                     scores[ticker] = tuple(float(value) for value in output[index, : self.score_dim])
-        self._last_latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
-        self._last_items = len(rows)
+        elapsed_seconds = time.perf_counter() - started
+        self._last_latency_ms = round(elapsed_seconds * 1000.0, 3)
+        self._last_items = len(tickers)
+        self._last_batches = batches
+        self._last_items_per_second = round(len(tickers) / elapsed_seconds, 2) if elapsed_seconds > 0 else None
         return scores
 
     def status(self) -> OntologyNpuStatus:
@@ -77,8 +90,15 @@ class OntologyNpuClassifier:
             score_dim=self.score_dim,
             last_latency_ms=self._last_latency_ms,
             last_items=self._last_items,
+            last_batches=self._last_batches,
+            last_items_per_second=self._last_items_per_second,
             fallback_reason=self._fallback_reason,
         )
+
+    def _input_buffer(self) -> np.ndarray:
+        if self._batch_buffer is None:
+            self._batch_buffer = np.zeros((self.batch_size, self.feature_dim), dtype=np.float32)
+        return self._batch_buffer
 
     def _compiled_model(self) -> Any:
         if self._compiled is not None:
@@ -142,6 +162,6 @@ def get_ontology_npu_classifier() -> OntologyNpuClassifier:
     if _CLASSIFIER is None:
         with _LOCK:
             if _CLASSIFIER is None:
-                batch_size = max(128, int(os.getenv("ONTOLOGY_NPU_BATCH_SIZE", "2048")))
+                batch_size = max(128, int(os.getenv("ONTOLOGY_NPU_BATCH_SIZE", "4096")))
                 _CLASSIFIER = OntologyNpuClassifier(batch_size=batch_size)
     return _CLASSIFIER

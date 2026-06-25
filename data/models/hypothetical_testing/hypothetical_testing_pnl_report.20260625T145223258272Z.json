@@ -1,0 +1,2020 @@
+{
+  "artifact": {
+    "generated_at": "2026-06-25T14:52:23.223267+00:00",
+    "hypothetical_trades": [
+      {
+        "entry_price": 50.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 49.8,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2,
+        "side": "BUY",
+        "ticker": "RP0000"
+      },
+      {
+        "entry_price": 50.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 50.547900000000006,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1521,
+        "side": "SELL",
+        "ticker": "RP0001"
+      },
+      {
+        "entry_price": 52.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 52.0479,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0521,
+        "side": "BUY",
+        "ticker": "RP0003"
+      },
+      {
+        "entry_price": 52.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 52.8,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0004"
+      },
+      {
+        "entry_price": 54.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 54.308400000000006,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1084,
+        "side": "BUY",
+        "ticker": "RP0006"
+      },
+      {
+        "entry_price": 54.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 55.064699999999995,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1647,
+        "side": "SELL",
+        "ticker": "RP0007"
+      },
+      {
+        "entry_price": 56.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 56.074799999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2252,
+        "side": "BUY",
+        "ticker": "RP0009"
+      },
+      {
+        "entry_price": 57.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 56.829,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.171,
+        "side": "SELL",
+        "ticker": "RP0010"
+      },
+      {
+        "entry_price": 58.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 58.3416,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0584,
+        "side": "BUY",
+        "ticker": "RP0012"
+      },
+      {
+        "entry_price": 59.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 59.1,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0013"
+      },
+      {
+        "entry_price": 60.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 60.621,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.121,
+        "side": "BUY",
+        "ticker": "RP0015"
+      },
+      {
+        "entry_price": 61.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 61.383599999999994,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1836,
+        "side": "SELL",
+        "ticker": "RP0016"
+      },
+      {
+        "entry_price": 62.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 62.3496,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2504,
+        "side": "BUY",
+        "ticker": "RP0018"
+      },
+      {
+        "entry_price": 63.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 63.110099999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1899,
+        "side": "SELL",
+        "ticker": "RP0019"
+      },
+      {
+        "entry_price": 64.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 64.6353,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0647,
+        "side": "BUY",
+        "ticker": "RP0021"
+      },
+      {
+        "entry_price": 65.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 65.4,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0022"
+      },
+      {
+        "entry_price": 66.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 66.9336,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1336,
+        "side": "BUY",
+        "ticker": "RP0024"
+      },
+      {
+        "entry_price": 67.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 67.70249999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2025,
+        "side": "SELL",
+        "ticker": "RP0025"
+      },
+      {
+        "entry_price": 68.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 68.62440000000001,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2756,
+        "side": "BUY",
+        "ticker": "RP0027"
+      },
+      {
+        "entry_price": 69.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 69.3912,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2088,
+        "side": "SELL",
+        "ticker": "RP0028"
+      },
+      {
+        "entry_price": 71.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 70.929,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.071,
+        "side": "BUY",
+        "ticker": "RP0030"
+      },
+      {
+        "entry_price": 71.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 71.7,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0031"
+      },
+      {
+        "entry_price": 73.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 73.24619999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1462,
+        "side": "BUY",
+        "ticker": "RP0033"
+      },
+      {
+        "entry_price": 73.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 74.02139999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2214,
+        "side": "SELL",
+        "ticker": "RP0034"
+      },
+      {
+        "entry_price": 75.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 74.89920000000001,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3008,
+        "side": "BUY",
+        "ticker": "RP0036"
+      },
+      {
+        "entry_price": 75.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 75.6723,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2277,
+        "side": "SELL",
+        "ticker": "RP0037"
+      },
+      {
+        "entry_price": 77.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 77.2227,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0773,
+        "side": "BUY",
+        "ticker": "RP0039"
+      },
+      {
+        "entry_price": 78.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 78.0,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0040"
+      },
+      {
+        "entry_price": 79.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 79.5588,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1588,
+        "side": "BUY",
+        "ticker": "RP0042"
+      },
+      {
+        "entry_price": 80.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 80.34029999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2403,
+        "side": "SELL",
+        "ticker": "RP0043"
+      },
+      {
+        "entry_price": 81.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 81.174,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.326,
+        "side": "BUY",
+        "ticker": "RP0045"
+      },
+      {
+        "entry_price": 82.19999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 81.95339999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2466,
+        "side": "SELL",
+        "ticker": "RP0046"
+      },
+      {
+        "entry_price": 83.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 83.51639999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0836,
+        "side": "BUY",
+        "ticker": "RP0048"
+      },
+      {
+        "entry_price": 84.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 84.3,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0049"
+      },
+      {
+        "entry_price": 85.69999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 85.8714,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1714,
+        "side": "BUY",
+        "ticker": "RP0051"
+      },
+      {
+        "entry_price": 86.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 86.6592,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2592,
+        "side": "SELL",
+        "ticker": "RP0052"
+      },
+      {
+        "entry_price": 87.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 87.44879999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3512,
+        "side": "BUY",
+        "ticker": "RP0054"
+      },
+      {
+        "entry_price": 88.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 88.2345,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2655,
+        "side": "SELL",
+        "ticker": "RP0055"
+      },
+      {
+        "entry_price": 89.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 89.8101,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0899,
+        "side": "BUY",
+        "ticker": "RP0057"
+      },
+      {
+        "entry_price": 90.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 90.6,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0058"
+      },
+      {
+        "entry_price": 92.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 92.184,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.184,
+        "side": "BUY",
+        "ticker": "RP0060"
+      },
+      {
+        "entry_price": 92.69999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 92.97809999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2781,
+        "side": "SELL",
+        "ticker": "RP0061"
+      },
+      {
+        "entry_price": 94.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 93.72359999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3764,
+        "side": "BUY",
+        "ticker": "RP0063"
+      },
+      {
+        "entry_price": 94.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 94.51559999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2844,
+        "side": "SELL",
+        "ticker": "RP0064"
+      },
+      {
+        "entry_price": 96.19999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 96.10379999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0962,
+        "side": "BUY",
+        "ticker": "RP0066"
+      },
+      {
+        "entry_price": 96.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 96.9,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0067"
+      },
+      {
+        "entry_price": 98.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 98.4966,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.1966,
+        "side": "BUY",
+        "ticker": "RP0069"
+      },
+      {
+        "entry_price": 99.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 99.29699999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.297,
+        "side": "SELL",
+        "ticker": "RP0070"
+      },
+      {
+        "entry_price": 100.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 99.9984,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4016,
+        "side": "BUY",
+        "ticker": "RP0072"
+      },
+      {
+        "entry_price": 101.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 100.79669999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3033,
+        "side": "SELL",
+        "ticker": "RP0073"
+      },
+      {
+        "entry_price": 102.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 102.3975,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1025,
+        "side": "BUY",
+        "ticker": "RP0075"
+      },
+      {
+        "entry_price": 103.19999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 103.19999999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0076"
+      },
+      {
+        "entry_price": 104.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 104.80919999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2092,
+        "side": "BUY",
+        "ticker": "RP0078"
+      },
+      {
+        "entry_price": 105.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 105.61589999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3159,
+        "side": "SELL",
+        "ticker": "RP0079"
+      },
+      {
+        "entry_price": 106.69999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 106.27319999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4268,
+        "side": "BUY",
+        "ticker": "RP0081"
+      },
+      {
+        "entry_price": 107.4,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 107.07780000000001,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3222,
+        "side": "SELL",
+        "ticker": "RP0082"
+      },
+      {
+        "entry_price": 108.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 108.6912,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1088,
+        "side": "BUY",
+        "ticker": "RP0084"
+      },
+      {
+        "entry_price": 109.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 109.5,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0085"
+      },
+      {
+        "entry_price": 110.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 111.12180000000001,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2218,
+        "side": "BUY",
+        "ticker": "RP0087"
+      },
+      {
+        "entry_price": 111.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 111.93479999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3348,
+        "side": "SELL",
+        "ticker": "RP0088"
+      },
+      {
+        "entry_price": 113.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 112.548,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.452,
+        "side": "BUY",
+        "ticker": "RP0090"
+      },
+      {
+        "entry_price": 113.69999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 113.35889999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3411,
+        "side": "SELL",
+        "ticker": "RP0091"
+      },
+      {
+        "entry_price": 115.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 114.9849,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1151,
+        "side": "BUY",
+        "ticker": "RP0093"
+      },
+      {
+        "entry_price": 115.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 115.8,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0094"
+      },
+      {
+        "entry_price": 117.19999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 117.43439999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2344,
+        "side": "BUY",
+        "ticker": "RP0096"
+      },
+      {
+        "entry_price": 117.89999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 118.25369999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3537,
+        "side": "SELL",
+        "ticker": "RP0097"
+      },
+      {
+        "entry_price": 119.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 118.8228,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4772,
+        "side": "BUY",
+        "ticker": "RP0099"
+      },
+      {
+        "entry_price": 120.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 119.64,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.36,
+        "side": "SELL",
+        "ticker": "RP0100"
+      },
+      {
+        "entry_price": 121.39999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 121.2786,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1214,
+        "side": "BUY",
+        "ticker": "RP0102"
+      },
+      {
+        "entry_price": 122.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 122.1,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0103"
+      },
+      {
+        "entry_price": 123.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 123.747,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.247,
+        "side": "BUY",
+        "ticker": "RP0105"
+      },
+      {
+        "entry_price": 124.19999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 124.57259999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3726,
+        "side": "SELL",
+        "ticker": "RP0106"
+      },
+      {
+        "entry_price": 125.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 125.0976,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5024,
+        "side": "BUY",
+        "ticker": "RP0108"
+      },
+      {
+        "entry_price": 126.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 125.9211,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3789,
+        "side": "SELL",
+        "ticker": "RP0109"
+      },
+      {
+        "entry_price": 127.69999999999999,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 127.57229999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1277,
+        "side": "BUY",
+        "ticker": "RP0111"
+      },
+      {
+        "entry_price": 128.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 128.39999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0112"
+      },
+      {
+        "entry_price": 129.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 130.05960000000002,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2596,
+        "side": "BUY",
+        "ticker": "RP0114"
+      },
+      {
+        "entry_price": 130.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 130.89149999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.3915,
+        "side": "SELL",
+        "ticker": "RP0115"
+      },
+      {
+        "entry_price": 131.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 131.37239999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5276,
+        "side": "BUY",
+        "ticker": "RP0117"
+      },
+      {
+        "entry_price": 132.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 132.2022,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3978,
+        "side": "SELL",
+        "ticker": "RP0118"
+      },
+      {
+        "entry_price": 134.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 133.866,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.134,
+        "side": "BUY",
+        "ticker": "RP0120"
+      },
+      {
+        "entry_price": 134.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 134.7,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0121"
+      },
+      {
+        "entry_price": 136.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 136.3722,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2722,
+        "side": "BUY",
+        "ticker": "RP0123"
+      },
+      {
+        "entry_price": 136.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 137.2104,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4104,
+        "side": "SELL",
+        "ticker": "RP0124"
+      },
+      {
+        "entry_price": 138.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 137.6472,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5528,
+        "side": "BUY",
+        "ticker": "RP0126"
+      },
+      {
+        "entry_price": 138.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 138.48329999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4167,
+        "side": "SELL",
+        "ticker": "RP0127"
+      },
+      {
+        "entry_price": 140.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 140.15970000000002,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1403,
+        "side": "BUY",
+        "ticker": "RP0129"
+      },
+      {
+        "entry_price": 141.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 141.0,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0130"
+      },
+      {
+        "entry_price": 142.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 142.68479999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2848,
+        "side": "BUY",
+        "ticker": "RP0132"
+      },
+      {
+        "entry_price": 143.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 143.52929999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4293,
+        "side": "SELL",
+        "ticker": "RP0133"
+      },
+      {
+        "entry_price": 144.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 143.922,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.578,
+        "side": "BUY",
+        "ticker": "RP0135"
+      },
+      {
+        "entry_price": 145.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 144.7644,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4356,
+        "side": "SELL",
+        "ticker": "RP0136"
+      },
+      {
+        "entry_price": 146.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 146.4534,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1466,
+        "side": "BUY",
+        "ticker": "RP0138"
+      },
+      {
+        "entry_price": 147.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 147.3,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0139"
+      },
+      {
+        "entry_price": 148.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 148.9974,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.2974,
+        "side": "BUY",
+        "ticker": "RP0141"
+      },
+      {
+        "entry_price": 149.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 149.84819999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4482,
+        "side": "SELL",
+        "ticker": "RP0142"
+      },
+      {
+        "entry_price": 150.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 150.19680000000002,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6032,
+        "side": "BUY",
+        "ticker": "RP0144"
+      },
+      {
+        "entry_price": 151.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 151.0455,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4545,
+        "side": "SELL",
+        "ticker": "RP0145"
+      },
+      {
+        "entry_price": 152.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 152.7471,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1529,
+        "side": "BUY",
+        "ticker": "RP0147"
+      },
+      {
+        "entry_price": 153.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 153.6,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0148"
+      },
+      {
+        "entry_price": 155.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 155.31,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.31,
+        "side": "BUY",
+        "ticker": "RP0150"
+      },
+      {
+        "entry_price": 155.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 156.16709999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.4671,
+        "side": "SELL",
+        "ticker": "RP0151"
+      },
+      {
+        "entry_price": 157.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 156.4716,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6284,
+        "side": "BUY",
+        "ticker": "RP0153"
+      },
+      {
+        "entry_price": 157.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 157.3266,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4734,
+        "side": "SELL",
+        "ticker": "RP0154"
+      },
+      {
+        "entry_price": 159.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 159.0408,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1592,
+        "side": "BUY",
+        "ticker": "RP0156"
+      },
+      {
+        "entry_price": 159.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 159.89999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0157"
+      },
+      {
+        "entry_price": 161.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 161.6226,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3226,
+        "side": "BUY",
+        "ticker": "RP0159"
+      },
+      {
+        "entry_price": 162.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 162.486,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.486,
+        "side": "SELL",
+        "ticker": "RP0160"
+      },
+      {
+        "entry_price": 163.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 162.74639999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6536,
+        "side": "BUY",
+        "ticker": "RP0162"
+      },
+      {
+        "entry_price": 164.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 163.6077,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4923,
+        "side": "SELL",
+        "ticker": "RP0163"
+      },
+      {
+        "entry_price": 165.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 165.3345,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1655,
+        "side": "BUY",
+        "ticker": "RP0165"
+      },
+      {
+        "entry_price": 166.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 166.2,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0166"
+      },
+      {
+        "entry_price": 167.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 167.93519999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3352,
+        "side": "BUY",
+        "ticker": "RP0168"
+      },
+      {
+        "entry_price": 168.3,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 168.8049,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5049,
+        "side": "SELL",
+        "ticker": "RP0169"
+      },
+      {
+        "entry_price": 169.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 169.0212,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6788,
+        "side": "BUY",
+        "ticker": "RP0171"
+      },
+      {
+        "entry_price": 170.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 169.88879999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.5112,
+        "side": "SELL",
+        "ticker": "RP0172"
+      },
+      {
+        "entry_price": 171.8,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 171.62820000000002,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1718,
+        "side": "BUY",
+        "ticker": "RP0174"
+      },
+      {
+        "entry_price": 172.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 172.5,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0175"
+      },
+      {
+        "entry_price": 173.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 174.24779999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3478,
+        "side": "BUY",
+        "ticker": "RP0177"
+      },
+      {
+        "entry_price": 174.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 175.1238,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5238,
+        "side": "SELL",
+        "ticker": "RP0178"
+      },
+      {
+        "entry_price": 176.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 175.296,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.704,
+        "side": "BUY",
+        "ticker": "RP0180"
+      },
+      {
+        "entry_price": 176.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 176.16989999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.5301,
+        "side": "SELL",
+        "ticker": "RP0181"
+      },
+      {
+        "entry_price": 178.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 177.9219,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1781,
+        "side": "BUY",
+        "ticker": "RP0183"
+      },
+      {
+        "entry_price": 178.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 178.79999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0184"
+      },
+      {
+        "entry_price": 180.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 180.5604,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3604,
+        "side": "BUY",
+        "ticker": "RP0186"
+      },
+      {
+        "entry_price": 180.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 181.44269999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5427,
+        "side": "SELL",
+        "ticker": "RP0187"
+      },
+      {
+        "entry_price": 182.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 181.5708,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7292,
+        "side": "BUY",
+        "ticker": "RP0189"
+      },
+      {
+        "entry_price": 183.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 182.451,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.549,
+        "side": "SELL",
+        "ticker": "RP0190"
+      },
+      {
+        "entry_price": 184.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 184.21559999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1844,
+        "side": "BUY",
+        "ticker": "RP0192"
+      },
+      {
+        "entry_price": 185.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 185.1,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0193"
+      },
+      {
+        "entry_price": 186.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 186.873,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.373,
+        "side": "BUY",
+        "ticker": "RP0195"
+      },
+      {
+        "entry_price": 187.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 187.76159999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5616,
+        "side": "SELL",
+        "ticker": "RP0196"
+      },
+      {
+        "entry_price": 188.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 187.8456,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7544,
+        "side": "BUY",
+        "ticker": "RP0198"
+      },
+      {
+        "entry_price": 189.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 188.73209999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.5679,
+        "side": "SELL",
+        "ticker": "RP0199"
+      },
+      {
+        "entry_price": 190.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 190.5093,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.1907,
+        "side": "BUY",
+        "ticker": "RP0201"
+      },
+      {
+        "entry_price": 191.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 191.39999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0202"
+      },
+      {
+        "entry_price": 192.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 193.1856,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3856,
+        "side": "BUY",
+        "ticker": "RP0204"
+      },
+      {
+        "entry_price": 193.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 194.08049999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5805,
+        "side": "SELL",
+        "ticker": "RP0205"
+      },
+      {
+        "entry_price": 194.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 194.1204,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7796,
+        "side": "BUY",
+        "ticker": "RP0207"
+      },
+      {
+        "entry_price": 195.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 195.01319999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.5868,
+        "side": "SELL",
+        "ticker": "RP0208"
+      },
+      {
+        "entry_price": 197.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 196.803,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.197,
+        "side": "BUY",
+        "ticker": "RP0210"
+      },
+      {
+        "entry_price": 197.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 197.7,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0211"
+      },
+      {
+        "entry_price": 199.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 199.4982,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.3982,
+        "side": "BUY",
+        "ticker": "RP0213"
+      },
+      {
+        "entry_price": 199.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 200.39939999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.5994,
+        "side": "SELL",
+        "ticker": "RP0214"
+      },
+      {
+        "entry_price": 201.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 200.3952,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.8048,
+        "side": "BUY",
+        "ticker": "RP0216"
+      },
+      {
+        "entry_price": 201.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 201.29429999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.6057,
+        "side": "SELL",
+        "ticker": "RP0217"
+      },
+      {
+        "entry_price": 203.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 203.09669999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2033,
+        "side": "BUY",
+        "ticker": "RP0219"
+      },
+      {
+        "entry_price": 204.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 204.0,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0220"
+      },
+      {
+        "entry_price": 205.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 205.81079999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4108,
+        "side": "BUY",
+        "ticker": "RP0222"
+      },
+      {
+        "entry_price": 206.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 206.71829999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6183,
+        "side": "SELL",
+        "ticker": "RP0223"
+      },
+      {
+        "entry_price": 207.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 206.67,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.83,
+        "side": "BUY",
+        "ticker": "RP0225"
+      },
+      {
+        "entry_price": 208.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 207.5754,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.6246,
+        "side": "SELL",
+        "ticker": "RP0226"
+      },
+      {
+        "entry_price": 209.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 209.3904,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2096,
+        "side": "BUY",
+        "ticker": "RP0228"
+      },
+      {
+        "entry_price": 210.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 210.29999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0229"
+      },
+      {
+        "entry_price": 211.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 212.12339999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4234,
+        "side": "BUY",
+        "ticker": "RP0231"
+      },
+      {
+        "entry_price": 212.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 213.03719999999996,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6372,
+        "side": "SELL",
+        "ticker": "RP0232"
+      },
+      {
+        "entry_price": 213.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 212.9448,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.8552,
+        "side": "BUY",
+        "ticker": "RP0234"
+      },
+      {
+        "entry_price": 214.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 213.8565,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.6435,
+        "side": "SELL",
+        "ticker": "RP0235"
+      },
+      {
+        "entry_price": 215.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 215.68409999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2159,
+        "side": "BUY",
+        "ticker": "RP0237"
+      },
+      {
+        "entry_price": 216.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 216.6,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0238"
+      },
+      {
+        "entry_price": 218.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 218.436,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.436,
+        "side": "BUY",
+        "ticker": "RP0240"
+      },
+      {
+        "entry_price": 218.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 219.35609999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6561,
+        "side": "SELL",
+        "ticker": "RP0241"
+      },
+      {
+        "entry_price": 220.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 219.21959999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.8804,
+        "side": "BUY",
+        "ticker": "RP0243"
+      },
+      {
+        "entry_price": 220.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 220.1376,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.6624,
+        "side": "SELL",
+        "ticker": "RP0244"
+      },
+      {
+        "entry_price": 222.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 221.9778,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2222,
+        "side": "BUY",
+        "ticker": "RP0246"
+      },
+      {
+        "entry_price": 222.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 222.89999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0247"
+      },
+      {
+        "entry_price": 224.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 224.74859999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4486,
+        "side": "BUY",
+        "ticker": "RP0249"
+      },
+      {
+        "entry_price": 225.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 225.67499999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.675,
+        "side": "SELL",
+        "ticker": "RP0250"
+      },
+      {
+        "entry_price": 226.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 225.49439999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.9056,
+        "side": "BUY",
+        "ticker": "RP0252"
+      },
+      {
+        "entry_price": 227.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 226.4187,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.6813,
+        "side": "SELL",
+        "ticker": "RP0253"
+      },
+      {
+        "entry_price": 228.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 228.2715,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2285,
+        "side": "BUY",
+        "ticker": "RP0255"
+      },
+      {
+        "entry_price": 229.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 229.2,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0256"
+      },
+      {
+        "entry_price": 230.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 231.06119999999999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4612,
+        "side": "BUY",
+        "ticker": "RP0258"
+      },
+      {
+        "entry_price": 231.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 231.99389999999997,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.6939,
+        "side": "SELL",
+        "ticker": "RP0259"
+      },
+      {
+        "entry_price": 232.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 231.76919999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.9308,
+        "side": "BUY",
+        "ticker": "RP0261"
+      },
+      {
+        "entry_price": 233.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 232.69979999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.7002,
+        "side": "SELL",
+        "ticker": "RP0262"
+      },
+      {
+        "entry_price": 234.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 234.56519999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2348,
+        "side": "BUY",
+        "ticker": "RP0264"
+      },
+      {
+        "entry_price": 235.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 235.5,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0265"
+      },
+      {
+        "entry_price": 236.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 237.3738,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4738,
+        "side": "BUY",
+        "ticker": "RP0267"
+      },
+      {
+        "entry_price": 237.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 238.31279999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7128,
+        "side": "SELL",
+        "ticker": "RP0268"
+      },
+      {
+        "entry_price": 239.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 238.044,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.956,
+        "side": "BUY",
+        "ticker": "RP0270"
+      },
+      {
+        "entry_price": 239.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 238.9809,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.7191,
+        "side": "SELL",
+        "ticker": "RP0271"
+      },
+      {
+        "entry_price": 241.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 240.8589,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2411,
+        "side": "BUY",
+        "ticker": "RP0273"
+      },
+      {
+        "entry_price": 241.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 241.79999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0274"
+      },
+      {
+        "entry_price": 243.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 243.6864,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.4864,
+        "side": "BUY",
+        "ticker": "RP0276"
+      },
+      {
+        "entry_price": 243.89999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 244.63169999999994,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7317,
+        "side": "SELL",
+        "ticker": "RP0277"
+      },
+      {
+        "entry_price": 245.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 244.31879999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.9812,
+        "side": "BUY",
+        "ticker": "RP0279"
+      },
+      {
+        "entry_price": 246.0,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 245.262,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.738,
+        "side": "SELL",
+        "ticker": "RP0280"
+      },
+      {
+        "entry_price": 247.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 247.15259999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2474,
+        "side": "BUY",
+        "ticker": "RP0282"
+      },
+      {
+        "entry_price": 248.1,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 248.1,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0283"
+      },
+      {
+        "entry_price": 249.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 249.999,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.499,
+        "side": "BUY",
+        "ticker": "RP0285"
+      },
+      {
+        "entry_price": 250.2,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 250.95059999999995,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7506,
+        "side": "SELL",
+        "ticker": "RP0286"
+      },
+      {
+        "entry_price": 251.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 250.59359999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -1.0064,
+        "side": "BUY",
+        "ticker": "RP0288"
+      },
+      {
+        "entry_price": 252.29999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 251.54309999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.7569,
+        "side": "SELL",
+        "ticker": "RP0289"
+      },
+      {
+        "entry_price": 253.7,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 253.44629999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.2537,
+        "side": "BUY",
+        "ticker": "RP0291"
+      },
+      {
+        "entry_price": 254.39999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 254.39999999999998,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.0,
+        "side": "SELL",
+        "ticker": "RP0292"
+      },
+      {
+        "entry_price": 255.79999999999998,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 256.3116,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.5116,
+        "side": "BUY",
+        "ticker": "RP0294"
+      },
+      {
+        "entry_price": 256.5,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 257.2695,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -0.7695,
+        "side": "SELL",
+        "ticker": "RP0295"
+      },
+      {
+        "entry_price": 257.9,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 256.86839999999995,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": -1.0316,
+        "side": "BUY",
+        "ticker": "RP0297"
+      },
+      {
+        "entry_price": 258.6,
+        "entry_time": "2026-06-25T14:45:00+00:00",
+        "exit_price": 257.8242,
+        "exit_time": "2026-06-25T15:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.7758,
+        "side": "SELL",
+        "ticker": "RP0298"
+      }
+    ],
+    "mode": "testing",
+    "orders_submitted": 0,
+    "realized_pnl": -15.3929,
+    "trade_count": 200,
+    "win_rate": 0.335,
+    "winning_trades": 67
+  },
+  "metadata": {
+    "orders_submitted": 0
+  },
+  "model_family": "hypothetical_testing",
+  "model_name": "hypothetical_testing:pnl_report",
+  "saved_at": "2026-06-25T14:52:23.258272+00:00",
+  "simulated": false
+}

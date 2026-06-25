@@ -1,91 +1,89 @@
 # System Algorithm Analysis
 
-This document summarizes the current algorithmic design of the personal investment analysis system as implemented in `src/app`.
+This document summarizes the current algorithmic design implemented under `src/app`.
 
-The system is a safe, read-only-first investment research and paper-trading simulator. It combines public research collection, local storage, indicator snapshots, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, and mock/streaming simulation. Live automated trading is intentionally disabled.
+The system is a safe realtime-only investment research, learning, hypothetical-testing, and paper/simulation framework. It combines public research collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, mock KIS paper trading, realtime hypothetical testing, and in-memory streaming simulation. Live automated trading is intentionally disabled.
 
 ## 1. Top-Level Flow
-
-The main runtime path is:
 
 ```text
 Research sources
   -> event/market/macro normalization
-  -> local SQLite store
+  -> data/store SQLite persistence
   -> analysis context
-  -> indicators
+  -> ontology_filter_1 candidate screening
+  -> indicators + time-synchronized frames
   -> ontology graph
-  -> ontology reasoning paths
+  -> reasoning paths
   -> strategy signals
   -> order intents
-  -> risk validation
-  -> mock KIS / streaming simulation / UI output
+  -> deterministic risk validation
+  -> mock KIS / realtime hypothetical test / streaming simulation / UI output
 ```
 
 Primary entry points:
 
-- `run.py` inserts `src` into `sys.path` and calls `app.run.main`.
-- `src/app/run.py` runs startup checks, selects an available web port, then starts `uvicorn app.web:app`.
-- `src/app/web.py` exposes the FastAPI web UI and API endpoints.
-- `src/app/cli.py` exposes demo, research, accelerated-demo, and synthetic-data commands.
-- Current web runtime uses FastAPI/Uvicorn and SQLite-backed local stores.
+- `run.py`: inserts `src` into `sys.path` and calls `app.run.main`.
+- `src/app/run.py`: performs startup checks, resolves port behavior, and starts `uvicorn app.web:app`.
+- `run.ps1`: starts a strict local app server on port `8010`, applies safe realtime/NPU defaults, and opens a managed browser.
+- `src/app/web.py`: FastAPI web UI and API orchestration.
+- `src/app/cli.py`: demo, research, accelerated-demo, and synthetic-data commands.
 
 ## 2. Data Collection Algorithm
 
 Implemented mainly in `src/app/research/service.py`.
 
-`ResearchService.run_from_config(path)` loads a JSON config and calls `run(config, base_dir)`.
-
 Supported sources:
 
-- full listed-stock universe catalogs for US/overseas and domestic KRX markets
-- RSS feeds via `RssNewsCollector`
-- static HTML pages via `HtmlResearchCollector`
-- dynamic pages via `DynamicPageCollector`
-- Stooq market data
-- Yahoo chart market data, subject to robots.txt restrictions
+- US/overseas and KRX listed-stock universe catalogs
+- RSS feeds
+- static HTML pages
+- dynamic pages through Playwright when installed
+- Stooq daily/latest market data
+- Yahoo chart market data, subject to robots/runtime restrictions
+- Alpha Vantage daily market data
 - FRED macro data
 - ECOS macro data
 - OpenDART disclosures
 
-For each configured source:
+For each configured run:
 
-1. Load the configured listed universe when `listed_universe.enabled=true`.
-2. Add every listed symbol to the internal ticker-recognition map.
-3. Store a `listed_universe_catalog` raw record containing the full universe count and the current rotating batch.
-4. Build a source key such as `rss:<url>` or `yahoo_chart:<symbol>`.
-5. Run the collector action.
-6. Normalize output into one of:
-   - `ClassifiedEvent`
-   - `RawSourceRecord`
-   - `MarketSnapshot`
-   - `MacroMetricRecord`
-7. If a source fails and retry is enabled, enqueue a `_RetryJob`.
-8. Drain the retry queue with configurable attempts and backoff.
-9. Return `ResearchRunResult` with diagnostics.
+1. Load the configured listed universe when `listed_universe.enabled = true`.
+2. Add listed symbols to deterministic ticker recognition.
+3. Store a `listed_universe_catalog` raw record.
+4. Create deterministic `listed_universe_reference` market snapshots for the current rotating batch.
+5. Build source keys such as `rss:<url>`, `html:<url>`, `yahoo_chart:<symbol>`.
+6. Run each collector action.
+7. Normalize output into `ClassifiedEvent`, `RawSourceRecord`, `MarketSnapshot`, or `MacroMetricRecord`.
+8. Optionally classify event text through a JSON-returning event LLM.
+9. Fall back to keyword classification when no LLM is available or the LLM call fails.
+10. Queue eligible failed sources for retry.
+11. Drain retries with configured attempts and backoff.
+12. Deduplicate events/raw records and return `ResearchRunResult` with diagnostics.
 
-The full listed universe is intentionally separated from expensive per-symbol network crawling. The system tracks all symbols and creates a rotating `listed_universe_reference` market snapshot batch for graph/analysis visibility. Detailed external fetching remains bounded so the UI and API do not hang while trying to fetch thousands of symbols in a single request.
+The full universe is tracked separately from expensive per-symbol collection. `RESEARCH_UNIVERSE_BATCH_SIZE` controls how many reference symbols are surfaced per refresh, and `data/research_universe_cursor.json` stores the rotating cursor.
 
-Event classification uses:
+LLM event classification supports:
 
-- `JsonEventLLMClassifier` when configured through environment variables.
-- Local/OpenAI-compatible/embedded model clients when available.
-- Keyword fallback in `app.data.classifier`.
-- A capped ticker hint list for LLM prompts, while the complete universe remains available to deterministic ticker matching.
-- The default local LLM path uses Ollama with `qwen2.5:1.5b-instruct` when available. LLM calls are capped per refresh to keep collection responsive.
+- remote OpenAI-compatible chat completions
+- local OpenAI-compatible servers such as Ollama
+- embedded Hugging Face causal/chat models
+- embedded multimodal Transformers models
+- embedded OpenVINO/Optimum Intel models for NPU-oriented local inference
 
-Diagnostics include event counts, skipped sources, live/local source counts, latest observed timestamp, per-ticker sentiment counts, listed-universe total count, known ticker count, rotating batch size, and rotating cursor position.
+Prompt ticker hints are capped by `LLM_EVENT_KNOWN_TICKER_PROMPT_LIMIT`, while deterministic matching can still use the complete known ticker map.
 
 ## 3. Storage Algorithm
 
 Implemented in `src/app/storage/local_store.py`.
 
-The storage layer uses SQLite at:
+The active web runtime writes to:
 
-- live mode: `data/live/store/research.sqlite3`
-- simulation mode: `data/sim/store/research.sqlite3`
+```text
+data/store/research.sqlite3
+```
 
-The table schema is generic:
+Generic table:
 
 ```text
 records(kind, record_key, observed_at, inserted_at, payload)
@@ -94,54 +92,110 @@ primary key: (kind, record_key)
 
 Save algorithm:
 
-1. Prune records older than `RESEARCH_RETENTION_DAYS`.
-2. Convert dataclass records to JSON-compatible dictionaries.
-3. Compute a stable `record_key` per kind:
+1. Prune rows older than `RESEARCH_RETENTION_DAYS`.
+2. Convert dataclasses to JSON-compatible dictionaries.
+3. Reject simulated/synthetic rows.
+4. Compute stable keys:
    - events: `event_id`
-   - raw records: source id/url plus retrieval time
-   - market snapshots: ticker/source/retrieval time
+   - raw records: source id/url/payload prefix plus retrieved time
+   - market snapshots: ticker/source/retrieved time
+   - macro metrics: name/observed time
+   - realtime quotes: ticker/market/source/observed time
+   - realtime executions: ticker/market/source/trade id or execution tuple
    - graph triples: subject/predicate/object/evidence
    - reasoning paths: `path_id`
-4. Insert with `insert or ignore`.
-5. In live mode, reject simulated rows using `_is_simulated_row`.
+5. Insert with `insert or ignore`.
 
-This gives deduplication, retention pruning, and live/simulation separation.
+`ModelArtifactStore` writes JSON artifacts under:
+
+```text
+data/models/<model_family>/<model>.<timestamp>.json
+data/models/<model_family>/<model>.latest.json
+```
+
+It refuses artifacts marked `simulated=True`.
 
 ## 4. Analysis Context Construction
 
 Implemented in `src/app/pipeline.py`.
 
-`build_analysis_context(research_result, stored_research)` creates a complete decision snapshot:
+`build_analysis_context(research_result, stored_research)` builds a complete decision snapshot:
 
-1. Load sample account.
-2. Load sample markets.
-3. Merge stored and live market snapshots by ticker.
-4. Build indicators with `build_sample_indicators`.
-5. Merge stored, live, and sample research events by event id.
-6. Build ontology graph.
-7. Run ontology inference.
-8. Build reasoning paths for tickers.
-9. Build portfolio report.
-10. Generate rule-based strategy signals.
-11. Generate order intents.
-12. Run deterministic risk validation.
+1. Load sample account and sample fallback market data.
+2. Merge stored markets and fresh research markets by ticker.
+3. Run `ontology_filter_1` over lightweight market snapshots.
+4. Keep selected candidates plus priority tickers such as `005930`, `000660`, `AAPL`, `MSFT`, `NVDA`, `SPY`, and `QQQ`.
+5. Build lightweight `IndicatorSnapshot` values.
+6. Merge stored, live, and sample research events.
+7. Limit events by relevance, directionality, classification confidence, labels, facts, and recency.
+8. Merge raw records, macro metrics, realtime quotes, and realtime executions into time-synchronized frames.
+9. Build ontology graph from markets, indicators, events, temporal frames, candidate-selection metadata, and tuning metadata.
+10. Add ontology tuning relationships for risk-adaptive sizing, momentum breakout thresholding, and event-risk weighting.
+11. Run ontology inference and build reasoning paths.
+12. Build portfolio report.
+13. Generate baseline rule-based strategy signals.
+14. Generate order intents.
+15. Validate intents through `RiskManager`.
 
-The result is an `AnalysisContext` containing account, markets, indicators, events, graph, reasoning paths, report, signals, intents, risk results, and ontology runtime status.
+`AnalysisContext` includes account, markets, indicators, events, graph, reasoning paths, report, signals, intents, risk results, ontology runtime status, candidate selection, parameter tuning, and temporal frames.
 
-## 5. Indicator Algorithm
+## 5. Candidate Screening Algorithm
 
-The current production context uses `build_sample_indicators` in `src/app/indicators/engine.py`. It creates `IndicatorSnapshot` values from market snapshots and sample assumptions.
+Implemented in `src/app/trading_pipeline.py`.
 
-The broader feature system under `src/app/features` includes:
+`ontology_filter_1` screens a large universe before heavier chart/strategy analysis.
 
+Inputs are `LightweightMarketSnapshot` records:
+
+- current price
+- price change rate
+- trading value
+- trading volume
+- volume change rate
+- market cap
+- foreign/institution/retail net buy values
+- upper-limit proximity
+- new 52-week-high flag
+- halt status
+- management-stock status
+- liquidity score
+
+Reject immediately when:
+
+- trading is halted
+- management-stock status is active
+- trading value is below `min_trading_value`
+- liquidity score is below `min_liquidity_score`
+
+Candidate score:
+
+```text
+score =
+  liquidity_score * 0.35
+  + max(0, volume_change_rate) * 0.18
+  + max(0, price_change_rate) * 3.0
+  + 0.18 if high trading value and volume surge
+  + 0.20 if foreign and institution net buying align with momentum
+  + 0.12 if upper-limit-near or new 52-week high
+```
+
+The result records selected candidates, rejected stocks, per-stock reasoning traces, latency, API call count, full universe count, and chart-fetch scope. Results can be cached for a short TTL.
+
+## 6. Indicator and Feature Algorithm
+
+The primary web decision path uses `build_sample_indicators` from `src/app/indicators/engine.py`. It creates interpretable `IndicatorSnapshot` values for markets in the active analysis set.
+
+The broader feature subsystem under `src/app/features` provides:
+
+- formula-only OHLCV indicators
 - semantic feature generation
-- parameter tuning context features
-- AI semantic layer prototypes
-- OHLCV label/dataset builders
+- hybrid formula plus AI semantic states
+- parameter tuning context
+- no-lookahead dataset rows and labels
 
-Those modules support future model training and semantic indicator expansion, but the main web decision path currently uses the simpler `IndicatorSnapshot` pipeline.
+Those modules are ready to enrich the main pipeline, but the current dashboard decisions still rely primarily on lightweight `IndicatorSnapshot` plus ontology reasoning.
 
-## 6. Ontology Graph Algorithm
+## 7. Ontology Graph Algorithm
 
 Implemented in:
 
@@ -149,38 +203,45 @@ Implemented in:
 - `src/app/graph/event_mapper.py`
 - `src/app/graph/knowledge_graph.py`
 - `src/app/graph/reasoner.py`
+- `src/app/time_series.py`
 
-The graph is a set of unique triples:
+Graph triples are unique:
 
 ```text
 (subject, predicate, object, evidence_id)
 ```
 
-Market graph construction:
-
-For each market:
+Market and indicator relations include:
 
 - company `hasTicker` ticker
 - company `belongsToSector` sector
 - ticker `isListedOn` market
+- growth and margin support positive signals
+- high PER can contradict valuation discipline
+- macro risk and volatility increase risk nodes
+- NPU scores can add support/risk/contradiction-style evidence where available
 
-Indicator-derived relations:
+Event relations link classified news/disclosures to tickers, sectors, positive impact, negative risk, and event labels/key facts.
 
-- operating income growth > 15% -> `supportsSignal EarningsGrowth`
-- operating margin > 15% -> `supportsSignal ProfitabilityQuality`
-- PER > 20 -> `contradictsSignal ValuationDiscipline`
-- macro risk score > 0.40 -> `increasesRiskOf MacroRateRisk`
-- 20-day volatility > 0.06 -> `increasesRiskOf VolatilityRisk`
+Temporal-frame relations link time buckets to tickers, events, quotes, executions, market snapshots, raw sources, macro context, and impact score.
 
-Event-derived relations are added by `add_events_to_graph`, linking classified news/disclosures to tickers, sectors, positive impact, or risk concepts.
+Pipeline metadata adds relations for:
 
-Ontology inference:
+- `OntologyFilter1:LightweightScreening`
+- `SelectiveChartFetching`
+- `SemanticFeatureExtraction`
+- `OntologyFilter2:EntryDecision`
+- `AIPredictionSmallSet`
+- `OntologyFilter3:FinalRiskApproval`
+- ontology tuning modes and tuned parameter values
 
-- If a subject has both `EarningsGrowth` and `ProfitabilityQuality`, add `supportsSignal BuyCandidate`.
-- If a subject has `BuyCandidate` and `MacroRateRisk`, add `contradictsSignal AggressiveBuy`.
-- If a subject has macro, volatility, or negative event risk, add `supportsSignal RiskAdjustedSizing`.
+Reasoner inference:
 
-Reasoning path score:
+- earnings growth plus profitability quality can support `BuyCandidate`
+- buy candidate plus macro rate risk can contradict `AggressiveBuy`
+- macro, volatility, or negative-event risk can support `RiskAdjustedSizing`
+
+Reasoning confidence:
 
 ```text
 confidence = clamp(0.05, 0.95,
@@ -196,11 +257,9 @@ Conclusion:
 - confidence >= 0.58 -> `BuyCandidate`
 - otherwise -> `HoldOrWatch`
 
-## 7. Strategy Signal Algorithm
+## 8. Strategy Algorithms
 
-There are two strategy layers.
-
-### 7.1 Rule-Based Strategy
+### 8.1 Rule-Based Strategy
 
 Implemented in `src/app/strategy/rule_based.py`.
 
@@ -227,26 +286,23 @@ Confidence:
 confidence = clamp(0.0, 0.85, 0.45 + score * 0.1)
 ```
 
-BUY signals are converted to `OrderIntent` with:
+BUY signals become `OrderIntent` records with:
 
 ```text
 suggested_weight = clamp(0.01, 0.05, confidence * 0.05)
 ```
 
-### 7.2 Goal-Directed Strategy
+### 8.2 Goal-Directed Strategy
 
 Implemented in `src/app/strategy/goal_directed.py`.
-
-This layer is used after the user selects a target return and period.
 
 Annualized required return:
 
 ```text
-annualized_required_return =
-  (1 + target_return_rate) ** (365 / period_days) - 1
+(1 + target_return_rate) ** (365 / period_days) - 1
 ```
 
-Per-market score includes:
+Score inputs include:
 
 - ontology support/risk/contradiction
 - RSI
@@ -257,7 +313,7 @@ Per-market score includes:
 - volatility
 - macro risk
 - annualized target difficulty
-- feasibility penalty/bonus
+- target feasibility
 
 Important scoring examples:
 
@@ -290,33 +346,21 @@ Action thresholds:
 - score <= -0.35 -> `REDUCE`
 - otherwise -> `HOLD`
 
-If feasibility is below 35 and score is low, action is forced toward `REDUCE`.
+If feasibility is below 35 and score is weak, action is forced toward `REDUCE`.
 
-Goal-directed intent sizing:
+BUY sizing:
 
 ```text
 max_goal_weight = min(0.06, max(0.015, 0.025 + target_return_rate))
-BUY suggested weight =
+suggested_weight =
   min(max_goal_weight, max(0.01, confidence * 0.04 + rank_bonus * 0.004))
-REDUCE suggested weight =
-  current_weight * 0.50
-SELL suggested weight =
-  0
 ```
 
-## 8. Goal Feasibility Algorithm
+REDUCE sizing is half of current weight. SELL target weight is zero.
+
+## 9. Goal Feasibility Algorithm
 
 Implemented in `src/app/goals/negotiation.py`.
-
-Input:
-
-- target return rate or target profit amount
-- period days
-- account snapshot
-- market snapshots
-- indicators
-- strategy signals
-- ontology graph
 
 Requested return:
 
@@ -335,18 +379,12 @@ Market support:
 
 ```text
 base 24
-+ average BUY signal confidence contribution
++ BUY-signal confidence contribution
 + growth / operating income / margin contribution
 cap at 78
 ```
 
-Risk pressure:
-
-```text
-volatility pressure, capped at 28
-macro pressure, capped at 22
-cash pressure: +10 if cash_weight < 30%
-```
+Risk pressure includes volatility, macro risk, and low cash pressure.
 
 Annualized drag:
 
@@ -357,45 +395,34 @@ Annualized drag:
 Feasibility:
 
 ```text
-feasibility = clamp(3, 96,
-  market_support - risk_pressure - annualized_drag
-)
+clamp(3, 96, market_support - risk_pressure - annualized_drag)
 ```
 
-Compromise goals:
+Compromise goals include the requested target, a lower return target, a longer period target, and a balanced lower-return/longer-period target.
 
-- requested target
-- lower return target at 60%
-- longer period target
-- balanced target at 75% return and longer period
-
-The UI sorts compromise goals by feasibility descending.
-
-## 9. Risk Manager Algorithm
+## 10. Risk Manager Algorithm
 
 Implemented in `src/app/risk/manager.py`.
 
-The risk manager is deterministic and is the final gate before a `FinalOrder`.
-
 Checks:
 
-- LLM direct execution is blocked.
-- live trading is disabled.
-- action is BUY/SELL/REDUCE.
-- only limit orders are allowed.
-- daily loss limit is not breached.
-- trade count limit is not breached.
-- liquidity is above minimum average daily trading value.
-- volatility is below maximum.
-- duplicate pending order is blocked.
-- source data is present and market price is valid.
-- restricted products are blocked.
-- single-stock weight cap.
-- intraday position weight cap.
-- sector weight cap.
-- deposit/cash reserve checks.
+- LLM direct order execution blocked
+- live trading disabled
+- action is BUY, SELL, or REDUCE
+- only limit order mode
+- daily loss limit
+- trade count limit
+- minimum average daily trading value
+- maximum volatility
+- duplicate pending ticker
+- source data and valid last price
+- restricted products blocked
+- max single-stock weight
+- max intraday BUY weight
+- max sector weight
+- deposit and cash reserve
 
-Weight adjustment:
+Adjusted weight:
 
 ```text
 adjusted_weight = min(
@@ -405,7 +432,7 @@ adjusted_weight = min(
 )
 ```
 
-For BUY:
+BUY:
 
 ```text
 target_value = equity * adjusted_weight
@@ -413,7 +440,7 @@ buy_amount = max(0, target_value - current_value)
 quantity = floor(buy_amount / last_price)
 ```
 
-For SELL/REDUCE:
+SELL/REDUCE:
 
 ```text
 sell_value = current_value for SELL
@@ -421,11 +448,9 @@ sell_value = max(0, current_value - target_value) for REDUCE
 quantity = floor(sell_value / last_price)
 ```
 
-Orders with quantity <= 0 are rejected.
+Quantity `<= 0` is rejected. Approved orders are `LIMIT` orders with `manual_approval_required=True`.
 
-Approved orders are always `LIMIT` and `manual_approval_required=True`.
-
-## 10. Mock KIS Trading Algorithm
+## 11. Mock KIS Trading Algorithm
 
 Implemented in:
 
@@ -436,16 +461,16 @@ Mock trading cycle:
 
 ```text
 goal
-  -> mock LLM judgment
+  -> deterministic mock LLM-style judgment
   -> ontology evidence
   -> goal execution plan
-  -> risk manager validation
+  -> RiskManager validation
   -> MockKisDevelopersApi place_limit_order
-  -> mock fill check
-  -> portfolio update
+  -> fill check
+  -> mock portfolio update
 ```
 
-Mock LLM judgment is deterministic:
+Mock LLM-style score:
 
 ```text
 score =
@@ -454,74 +479,94 @@ score =
   - ontology_risk_count * 0.30
 ```
 
-Top 5 tickers are selected.
-
-Mock KIS fill rule:
-
-- BUY fills if limit price >= mock market price.
-- SELL fills if limit price <= mock market price.
-- BUY also requires sufficient mock cash.
-- Filled BUY updates cash, quantity, average price, and holdings.
-- Filled SELL updates cash and removes/reduces holdings.
-
 No real brokerage API is called.
 
-## 11. Streaming Simulation Algorithm
+## 12. Realtime Learning and Testing Algorithms
+
+Implemented in `src/app/realtime/learning.py`.
+
+Learning examples are built from adjacent `TimeSynchronizedTickerFrame` records and current strategy signals:
+
+```text
+realized_return = (current_price - previous_price) / previous_price * action_direction
+realized_pnl = (current_price - previous_price) * action_direction
+label = realized_pnl > 0
+```
+
+Feature snapshots include:
+
+- impact score
+- event count
+- quote count
+- execution count
+- macro count
+- signal confidence
+- signal score
+
+Hypothetical testing creates one-share hypothetical trades from adjacent frames when a signal action is BUY, SELL, or REDUCE. It reports trade count, winning trades, win rate, realized PnL, and `orders_submitted = 0`.
+
+Artifacts are saved under:
+
+```text
+data/models/realtime_supervised/
+data/models/hypothetical_testing/
+```
+
+## 13. Streaming Simulation Algorithm
 
 Implemented in `src/app/backtesting/streaming_demo.py` and exposed through `src/app/web.py`.
 
-The simulation test path is:
+Start:
 
 ```text
-POST /api/operation-mode/start
-  mode = simulation_testing
-  target_return_rate
-  period_minutes
-  -> create StreamingAcceleratedDemo in memory
-  -> return demo_id
-
-UI loop:
-  POST /api/streaming-demo/step
-  -> run one visible simulation step
-  -> update portfolio, holdings, trades, progress, return rate
+POST /api/streaming-demo/start
+target_return_rate
+period_minutes
+initial_cash
 ```
 
-Current UI behavior:
+Step:
 
-- The user-facing acceleration option has been removed.
-- The simulation advances by UI step calls, but the server returns `status="waiting"` until the next real-time one-minute bar is due.
-- Missing/stale `demo_id` is treated as `status="expired"` with HTTP 200, not a 404 error.
-- The UI stops the loop when it receives `expired`.
-- The top mock-return card is updated from the streaming account state on every successful step.
-- URL parameters `target_return_rate` and `period_minutes` are copied into the goal form on page load.
+```text
+POST /api/streaming-demo/step
+demo_id
+```
 
 Initialization:
 
-1. Load the configured US/overseas and domestic KRX listed-stock universe.
-2. Generate synthetic one-minute charts for the simulation universe.
-3. Add warmup bars.
-4. Set initial cash.
-5. Clear holdings and trade history.
-6. Use realtime mode by default: one visible simulation bar requires one wall-clock minute.
+1. Load the global listed universe.
+2. Optionally cap it with `SIM_STREAMING_UNIVERSE_LIMIT`.
+3. Build lightweight snapshots.
+4. Run `ontology_filter_1`.
+5. Generate synthetic one-minute charts for selected candidate tickers.
+6. Add warmup bars.
+7. Initialize cash, holdings, trade history, and realtime step timing.
 
-Each step:
+Each due step:
 
-1. Select a bounded active ticker batch from the full universe, plus current holdings.
-2. Get prices at the current synthetic bar for the active batch.
-2. Build account snapshot from cash and holdings.
-3. Build market snapshots and indicators at the step.
-4. Build ontology graph and infer.
-5. Build a goal-directed execution plan using the target return and period.
-6. Rank intents:
-   - SELL/REDUCE first
-   - then higher confidence
-7. Validate each intent through `RiskManager` with simulation-specific rules.
-8. Apply approved orders directly to simulated cash/holdings.
-9. Record `SimulatedTrade`.
-10. Recompute account value and return rate.
-11. Return visible step, raw chart bar, active/universe ticker counts, prices, progress, account, holdings, trades, and final results if complete.
+1. Get synthetic prices at the current bar.
+2. Build account from cash and holdings.
+3. Build market snapshots and indicators.
+4. Run NPU/CPU ontology classifier scores over the universe.
+5. Select candidate tickers by ontology/NPU score, keeping current holdings.
+6. Build ontology graph and infer.
+7. Build goal-directed execution plan.
+8. Rank SELL/REDUCE before BUY, then by confidence.
+9. Validate up to 10 intents through `RiskManager`.
+10. Apply approved orders to simulated cash/holdings.
+11. Record `SimulatedTrade`.
+12. Liquidate remaining holdings on the final step.
+13. Return account value, return rate, progress, prices, holdings, trades, and NPU status.
 
-Return calculation:
+Step timing:
+
+```text
+seconds_until_next_step = 60 / scale_factor - elapsed_since_next_due
+```
+
+With the current web start path, scale factor is `1.0`, so one visible synthetic minute is due per wall-clock minute.
+
+Return:
 
 ```text
 account_value = cash + sum(quantity * current_price)
@@ -529,110 +574,106 @@ return_rate = (account_value - initial_cash) / initial_cash
 progress = visible_steps_completed / period_minutes
 ```
 
-The web UI updates:
+If a step is too early, the API returns `status = waiting`. If the session is missing or stale, it returns `status = expired` with HTTP 200.
 
-- left simulation status panel
-- cash / invested / profit / return rate
-- top mock-return card
-- recent executions table
-- positions table
-- return sparkline and system-flow progress cards
-
-## 12. Web API and UI Algorithm
+## 14. Web API and UI Algorithm
 
 Implemented in `src/app/web.py`.
 
 Startup:
 
-- starts a background live worker
-- live worker refreshes research, stores records, rebuilds analysis context, and updates progress state
+- applies realtime acceleration hints
+- starts the live worker only when `AUTO_START_LIVE_WORKER=true`
+- otherwise refreshes on demand through API/UI calls
+
+Concurrency:
+
+- `/api/live-snapshot` uses `run_in_threadpool`.
+- operation-mode starts use a lock and busy status to avoid overlapping starts.
+- streaming demo steps use per-demo locks.
 
 Important endpoints:
 
-- `GET /api/status`: portfolio/account status
-- `GET /api/research`: events, graph triples, reasoning paths
-- `GET /api/research/diagnostics`: source/store/runtime diagnostics
-- `GET /api/ontology/graph`: graph payload for 3D visualization
-- `GET /api/realtime/runtime`: NPU/CPU runtime status and operation mode
-- `POST /api/live-snapshot`: threadpool snapshot response with optional goal assessment
-- `POST /api/assess-goal`: goal feasibility and compromise goals
-- `POST /api/start`: start mock KIS paper-trading run after accepted goal
-- `POST /api/operation-mode/start`: live/simulation training/testing mode
-- `POST /api/streaming-demo/step`: one streaming simulation step
+- `GET /api/status`
+- `GET /api/research`
+- `POST /api/research/refresh`
+- `GET /api/research/diagnostics`
+- `GET /api/research/volume`
+- `GET /api/ontology/graph`
+- `GET /api/ontology/runtime`
+- `GET /api/realtime/runtime`
+- `POST /api/live-snapshot`
+- `POST /api/assess-goal`
+- `POST /api/start`
+- `POST /api/operation-mode/start`
+- `GET /api/operation-mode/status`
+- `POST /api/operation-mode/stop-learning`
+- `POST /api/streaming-demo/start`
+- `POST /api/streaming-demo/step`
+- `GET /api/streaming-demo/status/{demo_id}`
+- `POST /api/mock-kis/orders`
+- `GET /api/mock-kis/portfolio`
 
-Concurrency note:
-
-`/api/live-snapshot` uses `run_in_threadpool` so periodic UI refreshes do not block the event loop and delay user actions such as learning/test mode starts.
-
-Port behavior:
-
-`app.run` selects the next free port if the requested port is occupied. If port `8000` is already in use, it may print and use `8001`.
-
-Use the printed Web UI URL. Opening a neighboring port that was not printed will produce a connection error because no server is listening there.
-
-## 13. Runtime Modes
+## 15. Runtime Modes
 
 Implemented in `src/app/realtime/mode_manager.py` and `src/app/runtime/environment.py`.
 
-Modes:
+Current operation modes:
 
-- `simulation_training`
-- `simulation_testing`
-- `live_training`
+- `learning`
+- `testing`
 - `live_trading`
 
-Simulation modes:
+All modes use:
 
-- use `data/sim`
-- allow synthetic data
-- block live orders
-- store models under `data/sim/models`
+```text
+data/store
+data/models
+```
 
-Live modes:
+`DataEnvironment.live()` and `DataEnvironment.simulation()` currently resolve to the same realtime environment. Synthetic data is not accepted by the active realtime store or model store.
 
-- use `data/live`
-- reject synthetic rows in live store
-- keep live orders blocked
-- live trading remains a guarded/manual-approval boundary
-
-## 14. Safety Model
+## 16. Safety Model
 
 The system is designed so that:
 
 - LLM-like judgment is advisory only.
-- LLM or mock LLM never directly submits real orders.
+- Event LLM output is strict JSON and falls back to keyword rules.
 - `OrderIntent` must pass `RiskManager`.
-- `FinalOrder` requires limit order mode.
+- `FinalOrder` is always a limit order.
 - `manual_approval_required=True` is retained.
 - live trading is disabled by default.
 - restricted products are blocked.
-- simulation and live storage are separated.
+- hypothetical testing reports zero broker orders.
+- streaming simulation changes only in-memory simulated state.
 
-## 15. Known Algorithmic Limitations
+## 17. Known Algorithmic Limitations
 
-Current limitations visible in the implementation:
+- Main production indicators are still lightweight snapshots, not a full historical production indicator engine.
+- Some live market/chart sources can be skipped due to robots.txt, missing API keys, source outages, or missing Playwright.
+- Full listed-stock universe catalogs are tracked, but expensive external fetching is intentionally bounded.
+- Streaming simulation sessions are in memory and expire on server restart.
+- Mock LLM judgment is deterministic scoring, not an independent model decision.
+- Risk rules are conservative hard gates, not a full brokerage compliance engine.
+- `live_trading` is a guarded boundary, not automatic execution.
+- This is personal research infrastructure, not financial advice.
 
-- Main production indicators are still sample/snapshot-based, not full historical production indicators.
-- Some live market chart sources can be skipped due to robots.txt or missing Playwright.
-- Full listed-stock universe catalogs are tracked, but expensive per-symbol external crawling is intentionally rotated in bounded batches.
-- Streaming simulation sessions are in memory; they expire on server restart.
-- The mock LLM judgment is deterministic scoring, not a real independent model decision.
-- Risk rules are deterministic and conservative, but not a full brokerage compliance engine.
-- The system is research infrastructure and not financial advice.
-
-## 16. Key Files
+## 18. Key Files
 
 - `src/app/run.py`: startup and web server launch
 - `src/app/web.py`: FastAPI UI/API orchestration
 - `src/app/research/service.py`: source collection and diagnostics
-- `src/app/storage/local_store.py`: SQLite storage and live/sim separation
+- `src/app/storage/local_store.py`: SQLite storage
+- `src/app/storage/model_store.py`: JSON model artifact store
 - `src/app/pipeline.py`: analysis context pipeline
+- `src/app/trading_pipeline.py`: lightweight ontology candidate filter
 - `src/app/graph/builders.py`: market graph construction
 - `src/app/graph/reasoner.py`: ontology inference and reasoning paths
 - `src/app/goals/negotiation.py`: feasibility and compromise scoring
 - `src/app/strategy/rule_based.py`: baseline strategy signals
 - `src/app/strategy/goal_directed.py`: target-aware strategy
 - `src/app/risk/manager.py`: deterministic risk validation
+- `src/app/realtime/learning.py`: realtime supervised examples and hypothetical tests
 - `src/app/trading/mock_program.py`: mock trading cycle
-- `src/app/execution/kis_mock.py`: mock KIS order/fill/portfolio behavior
-- `src/app/backtesting/streaming_demo.py`: stepwise simulation
+- `src/app/execution/kis_mock.py`: mock KIS behavior
+- `src/app/backtesting/streaming_demo.py`: stepwise in-memory simulation

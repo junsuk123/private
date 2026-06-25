@@ -1,0 +1,583 @@
+{
+  "iterations": [
+    {
+      "iteration": 1,
+      "elapsed_ms": 544.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {
+        "realtime_supervised": "data\\models\\realtime_supervised\\realtime_supervised_trade_timing.20260625T145035317407Z.json",
+        "hypothetical_testing": "data\\models\\hypothetical_testing\\hypothetical_testing_pnl_report.20260625T145035349444Z.json"
+      },
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.816,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 2,
+      "elapsed_ms": 478.0,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.265,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 3,
+      "elapsed_ms": 520.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.858,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 4,
+      "elapsed_ms": 549.9,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 14.186,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 5,
+      "elapsed_ms": 522.1,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.169,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 6,
+      "elapsed_ms": 538.7,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 13.262,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 7,
+      "elapsed_ms": 504.2,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.342,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 8,
+      "elapsed_ms": 455.9,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 10.304,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 9,
+      "elapsed_ms": 431.8,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 10.926,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 10,
+      "elapsed_ms": 430.4,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.475,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 11,
+      "elapsed_ms": 459.5,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.589,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 12,
+      "elapsed_ms": 468.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.787,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 13,
+      "elapsed_ms": 472.7,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.354,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 14,
+      "elapsed_ms": 454.2,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 10.89,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 15,
+      "elapsed_ms": 422.1,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 10.509,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 16,
+      "elapsed_ms": 451.6,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 17.994,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 17,
+      "elapsed_ms": 482.2,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.541,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 18,
+      "elapsed_ms": 471.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.357,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 19,
+      "elapsed_ms": 486.9,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 14.929,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 20,
+      "elapsed_ms": 464.8,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.29,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 21,
+      "elapsed_ms": 458.7,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.546,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 22,
+      "elapsed_ms": 458.9,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 10.381,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 23,
+      "elapsed_ms": 522.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 12.201,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 24,
+      "elapsed_ms": 489.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 13.148,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 25,
+      "elapsed_ms": 470.7,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.485,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 26,
+      "elapsed_ms": 476.3,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.99,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 27,
+      "elapsed_ms": 468.8,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.974,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 28,
+      "elapsed_ms": 461.6,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.384,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 29,
+      "elapsed_ms": 448.4,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {},
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.826,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    },
+    {
+      "iteration": 30,
+      "elapsed_ms": 528.7,
+      "npu_scores_produced": 122880,
+      "frames": 600,
+      "examples": 300,
+      "hypothetical_trades": 200,
+      "model_artifacts_written": {
+        "realtime_supervised": "data\\models\\realtime_supervised\\realtime_supervised_trade_timing.20260625T145049170759Z.json",
+        "hypothetical_testing": "data\\models\\hypothetical_testing\\hypothetical_testing_pnl_report.20260625T145049201749Z.json"
+      },
+      "npu": {
+        "backend": "NPU",
+        "uses_npu": true,
+        "batch_size": 2048,
+        "feature_dim": 8,
+        "score_dim": 6,
+        "last_latency_ms": 11.44,
+        "last_items": 4096,
+        "fallback_reason": null
+      }
+    }
+  ],
+  "market_count": 4096,
+  "learning_signal_count": 300,
+  "total_elapsed_s": 14.986
+}

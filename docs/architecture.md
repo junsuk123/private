@@ -2,60 +2,110 @@
 
 ## Principle
 
-The system separates probabilistic reasoning from deterministic control. Classifiers, semantic layers, ontology reasoning, and mock LLM-style scoring can explain, classify, and propose. They cannot directly execute live trades. Every proposed order must pass the deterministic risk manager before it can become a `FinalOrder`, and live automated execution remains disabled.
+The system separates probabilistic reasoning from deterministic control. Classifiers, semantic layers, ontology screening, and strategy scoring can explain, classify, rank, tune, and propose. They cannot directly execute live trades.
+
+Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved orders are limit orders with manual approval required. The current app supports mock/paper and hypothetical execution paths only; live automated brokerage execution remains blocked.
 
 ## Runtime Flow
 
-1. Read-only collectors load the listed-stock universe and fetch market, financial, macro, disclosure, and news data.
-2. Normalizers convert raw data into typed records with source metadata.
-3. `LocalResearchStore` persists normalized records in mode-specific SQLite stores.
-4. `build_analysis_context` merges stored data, live snapshots, sample markets, indicators, events, graph triples, reasoning paths, strategy signals, order intents, and risk results.
-5. Indicator engines calculate interpretable metrics.
-6. The ontology layer links companies, sectors, indicators, events, risks, and signals.
-7. The ontology reasoner infers buy candidates, risk adjustments, and reasoning paths.
-8. Deterministic strategy modules produce `StrategySignal` and `OrderIntent` records.
-9. `RiskManager` validates each `OrderIntent` against hard rules.
-10. Approved intents become mock/paper orders or streaming-simulation trades only. Live trading remains blocked.
-11. Audit logging records inputs, mode changes, decisions, rejections, and outputs.
+```text
+Research sources
+  -> event/market/macro normalization
+  -> realtime SQLite store
+  -> analysis context
+  -> lightweight ontology candidate filter
+  -> indicators and time-synchronized frames
+  -> ontology graph
+  -> ontology reasoning paths
+  -> strategy signals
+  -> order intents
+  -> risk validation
+  -> mock KIS / hypothetical testing / streaming simulation / UI output
+```
 
-## Implemented Public Data Layer
+Detailed flow:
 
-- `HtmlResearchCollector` fetches allowed HTML pages, extracts text, and stores source metadata.
-- `RssNewsCollector` reads RSS feeds and classifies items into structured events.
-- `ResearchService` loads the configured US/overseas and domestic KRX listed universe, stores a `listed_universe_catalog` record, and exposes universe diagnostics.
-- `StooqMarketDataCollector` can fetch public daily CSV market data.
-- `YahooChartCollector` is supported where robots.txt and runtime conditions allow it.
-- `OpenDartDisclosureCollector`, `EcosMacroCollector`, and `FredMacroCollector` are implemented with optional API keys from environment variables.
-- `RawArchive` stores raw source records as JSON for auditability.
-- `ResearchService` retries eligible failed sources with configurable attempts and backoff.
-- Expensive per-symbol collection is bounded by a rotating universe batch cursor so the app does not block while trying to process every listed symbol in one request.
+1. Public collectors load listed-stock universes and fetch configured market, macro, disclosure, news, RSS, HTML, and dynamic-page data.
+2. Normalizers convert source output into typed records with source metadata.
+3. `LocalResearchStore` persists normalized records in `data/store/research.sqlite3`.
+4. `build_analysis_context` merges stored research, fresh research, sample fallback data, realtime quotes/executions, indicators, temporal frames, ontology graph, reasoning paths, signals, intents, and risk results.
+5. `ontology_filter_1` screens a large universe with low-cost liquidity/momentum/flow features before heavier analysis.
+6. Indicator engines calculate interpretable metrics.
+7. The ontology layer links companies, sectors, tickers, indicators, events, time buckets, risks, tuning modes, and signals.
+8. The ontology reasoner infers buy candidates, risk-adjusted sizing, contradictions, and reasoning paths.
+9. Strategy modules produce `StrategySignal` and `OrderIntent` records.
+10. `RiskManager` validates each intent against hard rules.
+11. Approved intents can become mock KIS orders, hypothetical test records, or streaming-simulation trades only.
+12. Audit logging records inputs, mode changes, refreshes, decisions, rejections, and outputs.
 
-Brokerage account collection and live order placement remain intentionally excluded.
+## Public Data Layer
+
+Implemented in `src/app/research/service.py` and `src/app/data`.
+
+- `RssNewsCollector` collects RSS events and can optionally fetch linked articles.
+- `HtmlResearchCollector` fetches allowed static pages.
+- `DynamicPageCollector` uses browser rendering when Playwright is installed.
+- `StooqMarketDataCollector`, `YahooChartMarketDataCollector`, and `AlphaVantageDailyMarketDataCollector` collect daily/latest market snapshots where available.
+- `OpenDartDisclosureCollector`, `EcosMacroCollector`, and `FredMacroCollector` use optional environment API keys.
+- `ResearchService` loads the configured US/overseas and KRX listed universe, stores a `listed_universe_catalog` record, and creates deterministic `listed_universe_reference` snapshots for the current rotating batch.
+- `RawArchive` stores raw source records as JSON when configured.
+- Failed sources can be retried with configurable attempts and backoff.
+
+The full listed universe is tracked, but expensive per-symbol collection is bounded by a rotating cursor so the app does not block on thousands of symbols during one refresh.
+
+## Storage Runtime
+
+The active runtime uses one realtime-only data layout:
+
+```text
+data/store/research.sqlite3
+data/raw/
+data/models/<model_family>/
+data/reports/
+data/synthetic_disabled/
+```
+
+`LocalResearchStore` stores records in a generic SQLite table keyed by `(kind, record_key)`. It prunes old records according to `RESEARCH_RETENTION_DAYS`, deduplicates with stable keys, and rejects synthetic/simulated records.
+
+`ModelArtifactStore` writes versioned JSON artifacts and `<model>.latest.json` files under `data/models`. It rejects simulated model artifacts.
 
 ## Web Runtime
 
-`src/app/run.py` performs startup checks and then starts `uvicorn app.web:app`.
+`run.py` inserts `src` into `sys.path` and calls `app.run.main`. `src/app/run.py` performs startup checks, selects a port unless strict mode is requested, then starts `uvicorn app.web:app`.
 
-Port behavior:
-
-- The default requested port is `8000`.
-- If that port is occupied, the runner selects the next available port and prints the actual Web UI URL.
-- Browser URLs must use the printed port. For example, if the runner prints `http://127.0.0.1:8000`, opening `http://127.0.0.1:8001` will fail unless a server is also running there.
-
-The FastAPI app starts a background live worker that refreshes research, stores records, rebuilds the analysis context, and updates UI progress state.
+`run.ps1` starts the app on strict port `8010` by default, opens a managed browser window when possible, and stops the server when that window closes.
 
 Important UI/API paths:
 
 - `GET /`: single-page web UI
-- `GET /api/status`: account, report, signals, orders, and mock run status
-- `GET /api/research`: events, graph triples, reasoning paths, and diagnostics
+- `GET /api/status`: account, report, risk, and refresh status
+- `GET /api/research`: configured research result, events, graph triples, and reasoning paths
+- `POST /api/research/refresh`: background refresh trigger
+- `GET /api/research/diagnostics`: source, store, runtime, and data-policy diagnostics
+- `GET /api/research/volume`: local store volume summaries
 - `GET /api/ontology/graph`: graph payload for visualization
-- `GET /api/realtime/runtime`: runtime backend, operation mode, and acceleration-policy diagnostics
-- `POST /api/live-snapshot`: goal-aware live snapshot, executed in a threadpool to avoid blocking UI actions
+- `GET /api/ontology/runtime`: ontology runtime status
+- `GET /api/realtime/runtime`: acceleration, event LLM, NPU, risk-policy, and operation-mode diagnostics
+- `POST /api/live-snapshot`: goal-aware live snapshot, executed in a threadpool
 - `POST /api/assess-goal`: target feasibility and compromise goals
-- `POST /api/start`: accepted-goal mock KIS paper trading
-- `POST /api/operation-mode/start`: live/simulation training or testing mode selection
-- `POST /api/streaming-demo/step`: one visible streaming-simulation step
+- `POST /api/start`: accepted-goal mock KIS paper-trading run
+- `POST /api/operation-mode/start`: learning, testing, or live-trading mode start
+- `GET /api/operation-mode/status`: operation and learning state
+- `POST /api/operation-mode/stop-learning`: stop realtime learning collection
+- `POST /api/streaming-demo/start`: start in-memory streaming simulation
+- `POST /api/streaming-demo/step`: run one visible simulation step when due
+- `POST /api/mock-kis/orders`: mock KIS limit order endpoint
+- `GET /api/mock-kis/portfolio`: mock portfolio state
+
+## Operation Modes
+
+Implemented in `src/app/realtime/mode_manager.py`.
+
+- `learning`: realtime collection with supervised PnL-label artifact updates.
+- `testing`: realtime hypothetical test with `orders_submitted = 0`.
+- `live_trading`: realtime trading gate; live brokerage execution remains guarded/blocked.
+
+All modes use the unified realtime data store and model root. Synthetic data is not allowed as input to these modes.
 
 ## Agent Boundaries
 
@@ -65,36 +115,40 @@ Reads portfolio state and produces allocation suggestions, exposure summaries, a
 
 ### Data Crawling and Classification Agent
 
-Classifies official API, RSS, disclosure, and news data into structured event records. It must not fabricate missing values and must preserve source metadata.
+Classifies official API, RSS, disclosure, HTML, dynamic-page, and news data into structured event records. It must not fabricate missing values and must preserve source metadata.
 
 ### Ontology-Based Strategy and Execution Planning Agent
 
 Uses typed indicators and graph relationships to generate explainable signals and order intents. It must separate facts, assumptions, inferred relationships, and conclusions.
 
-### Goal-Directed Simulation Planner
+### Goal-Directed Planner
 
-Uses the selected target return and target time to create a goal execution plan for mock/streaming simulation. It may rank BUY, SELL, REDUCE, and HOLD intents, but it still has to pass `RiskManager`.
+Uses the selected target return and target period to create a goal execution plan. It may rank BUY, SELL, REDUCE, and HOLD signals, but every generated intent still has to pass `RiskManager`.
 
 ## Deterministic Modules
 
+### Candidate Filter
+
+`ontology_filter_1` evaluates lightweight snapshots before chart-heavy analysis. It rejects halted, management-status, illiquid, or very low-liquidity names. It ranks candidates using liquidity score, volume change, price momentum, foreign/institution buying, and breakout flags.
+
 ### Risk Manager
 
-Rejects orders that violate cash reserve, position size, sector exposure, daily loss, liquidity, volatility, duplicate-order, data-integrity, or trading-mode rules.
+Rejects orders that violate live-trading disablement, action/type rules, daily loss, trade count, liquidity, volatility, duplicate-order, data-integrity, restricted-product, single-stock, intraday, sector, cash, or deposit checks.
 
 ### Order Executor
 
-Accepts only `FinalOrder` objects. The current implementation supports mock/paper interfaces only. Live trading raises an explicit error or is blocked at the risk/mode boundary.
+Accepts only `FinalOrder` objects. The current implementation supports mock/paper interfaces. The real KIS client skeleton is isolated behind broker boundaries and is disabled by default.
 
 ### Streaming Simulation
 
-`StreamingAcceleratedDemo` maintains an in-memory simulation session. It builds synthetic charts from the configured US/overseas and domestic KRX listed universe, then evaluates a bounded active ticker batch on each visible step while preserving full-universe coverage over time. The current web UI does not expose a user-facing acceleration multiplier. Simulation testing uses the target return and target minutes from the form and advances one visible step per `/api/streaming-demo/step` call.
+`StreamingAcceleratedDemo` maintains an in-memory session. It generates synthetic one-minute charts for selected universe candidates, screens/ranks candidates, builds ontology evidence, generates goal-directed intents, validates them through `RiskManager`, and updates simulated cash/holdings/trades.
 
-If a stale or missing `demo_id` is sent to `/api/streaming-demo/step`, the API returns HTTP 200 with `status="expired"` so the UI can stop cleanly instead of surfacing a 404 error.
+If a stale or missing `demo_id` is sent to `/api/streaming-demo/step`, the API returns HTTP 200 with `status = expired` so the UI can stop cleanly.
 
 ### Audit and Monitoring
 
-Writes append-only JSONL records with timestamps and structured payloads.
+Audit logs are append-only JSONL records with timestamps and structured payloads.
 
 ## Current Implementation Choice
 
-The current workspace uses FastAPI/Uvicorn for the web runtime and SQLite for local persistence. The graph is in-memory and record-oriented. PostgreSQL, TimescaleDB, Neo4j/RDF4J, pgvector, APScheduler, and Prometheus can still be added phase-by-phase once the core contracts are stable.
+The current workspace uses FastAPI/Uvicorn for the web runtime, SQLite for local persistence, JSON model artifacts for lightweight learning outputs, and an in-memory graph. PostgreSQL, TimescaleDB, Neo4j/RDF4J, pgvector, APScheduler, and Prometheus can still be added phase-by-phase once the core contracts are stable.

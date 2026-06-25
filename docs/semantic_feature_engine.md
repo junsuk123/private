@@ -1,6 +1,8 @@
 # Semantic Feature Engine Developer Guide
 
-This guide covers the semantic feature subsystem under `src/app/features`. It is an extensible layer for richer indicators, semantic states, graph triples, and model rows. The current web dashboard still uses the simpler `IndicatorSnapshot` decision path as its primary production path, while these modules support incremental expansion.
+This guide covers the semantic feature subsystem under `src/app/features`. It is an extensible layer for richer indicators, semantic states, graph triples, and model rows.
+
+The current web dashboard still uses the lighter `IndicatorSnapshot` decision path as its primary production path. Before that path runs, the current pipeline also applies `ontology_filter_1` from `src/app/trading_pipeline.py` to screen the broad universe with low-cost liquidity, momentum, flow, halt-status, and management-status features. The semantic feature modules are the planned richer replacement/enrichment layer for later stages, not the only source of live dashboard decisions today.
 
 ## Add a New Raw Indicator
 
@@ -144,6 +146,20 @@ Use `build_semantic_feature_graph(raw_indicators, semantic_features)` to convert
 - `semantic_node supportsSignal target_signal`
 - ticker-level support/risk/contradiction triples for existing reasoners
 
+The active analysis context also adds pipeline and tuning metadata triples, including:
+
+- `OntologyFilter1:LightweightScreening`
+- `SelectiveChartFetching`
+- `SemanticFeatureExtraction`
+- `OntologyFilter2:EntryDecision`
+- `AIPredictionSmallSet`
+- `OntologyFilter3:FinalRiskApproval`
+- `OntologyTuningMode:RiskAdaptive`
+- `OntologyTuningMode:MomentumBreakout`
+- `OntologyTuningMode:EventRisk`
+
+These graph nodes make candidate selection and parameter adaptation visible to the ontology graph UI and reasoning diagnostics.
+
 ## Trading Safety
 
 These modules produce analysis, graph, and dataset records only. They do not generate executable orders and do not enable live trading.
@@ -159,4 +175,4 @@ semantic feature
   -> mock/paper FinalOrder only
 ```
 
-Live automated execution remains disabled.
+Live automated execution remains disabled. Realtime learning and hypothetical testing write artifacts to `data/models`, but simulated artifacts are refused by the active realtime model store.

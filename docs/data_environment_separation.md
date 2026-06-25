@@ -1,110 +1,100 @@
-# Live vs Simulation Data Separation
+# Realtime Data Environment Policy
 
-The system keeps live and simulation assets in separate directory trees.
+The current system uses a realtime-only local data environment. Older live/simulation split directories may still exist in the repository history or under `data/legacy`, but they are not the active web runtime layout.
 
-## Live
+## Active Layout
 
-- `data/live/store`: live research SQLite store
-- `data/live/raw`: archived raw live documents
-- `data/live/models`: live-approved model artifacts
-- `data/live/reports`: optional live reports
+- `data/store`: realtime research SQLite store
+- `data/raw`: archived raw realtime documents when archiving is enabled
+- `data/models`: realtime learning and hypothetical-test model artifacts
+- `data/reports`: optional reports and demo outputs
+- `data/synthetic_disabled`: placeholder directory; synthetic data is not accepted by the realtime store
 
-Live stores reject records marked as synthetic or simulated. Live trading is still blocked; live mode is used for current-market research, learning, diagnostics, and manually gated analysis only.
+`default_environment()` reads:
 
-## Simulation
+- `DATA_ROOT`, default `data`
+- `DATA_ENV`, default `realtime`
 
-- `data/sim/store`: simulated/offline research store
-- `data/sim/raw`: simulated raw documents
-- `data/sim/models`: models trained on synthetic or offline test data
-- `data/sim/synthetic`: generated OHLCV/news bundles
-- `data/sim/reports`: batch and streaming simulation reports
+`DataEnvironment.live()` and `DataEnvironment.simulation()` both resolve to the same realtime environment. This is intentional in the current implementation.
 
-Simulation mode is the only place where synthetic data and model artifacts trained on synthetic/offline data should be written.
+## Store Rules
 
-## Synthetic Data Policy
+`LocalResearchStore` writes to `data/store/research.sqlite3` unless an explicit root is passed.
 
-Synthetic data is allowed only under `data/sim`. It is explicitly tagged with:
-
-- `synthetic: true`
-- `market: SIM` where applicable
-- `source_name` such as `synthetic_news`
-- `source_id` beginning with `synthetic:`
-- `raw_url` beginning with `local://synthetic`
-
-`LocalResearchStore(mode="live")` rejects simulated market/research records.
-`ModelArtifactStore(mode="live")` rejects simulated model artifacts.
-
-## Runtime Mode Mapping
-
-The web UI exposes four operation modes:
-
-- `simulation_training`: synthetic/offline learning, writes under `data/sim`.
-- `simulation_testing`: in-memory streaming simulation using target return and target minutes.
-- `live_training`: current market data learning, writes under `data/live`, orders prohibited.
-- `live_trading`: guarded/manual approval boundary, automatic execution remains blocked.
-
-The visible simulation test flow starts through:
+The generic SQLite table is:
 
 ```text
-POST /api/operation-mode/start
-mode = simulation_testing
-target_return_rate = form value
-period_minutes = form value
+records(kind, record_key, observed_at, inserted_at, payload)
+primary key: (kind, record_key)
 ```
 
-The server creates an in-memory `StreamingAcceleratedDemo` and returns a `demo_id`. The UI then calls `/api/streaming-demo/step` repeatedly. The demo session is intentionally not persisted; restarting the server expires it.
+Supported record kinds include:
 
-If the UI sends an old `demo_id`, `/api/streaming-demo/step` returns:
+- `events`
+- `raw_records`
+- `market_snapshots`
+- `macro_metrics`
+- `realtime_quotes`
+- `realtime_executions`
+- `graph_triples`
+- `reasoning_paths`
+
+Before saving, the store prunes rows older than `RESEARCH_RETENTION_DAYS` and inserts records with `insert or ignore` stable keys.
+
+## Synthetic Data Rejection
+
+Realtime storage rejects simulated or synthetic records. A row is treated as simulated when it contains signals such as:
+
+- market `SIM`
+- source names starting with `sim`, `synthetic`, or `accelerated_demo`
+- raw URLs starting with `local://sim`, `local://synthetic`, or `local://accelerated-demo`
+- source IDs starting with `sim:`, `synthetic:`, or `demo-chart:`
+- graph evidence IDs starting with simulation/synthetic prefixes
+
+`ModelArtifactStore` also refuses `simulated=True` artifacts in the realtime-only model store.
+
+## Operation Mode Mapping
+
+The web UI exposes three operation modes through `OperationModeManager`:
+
+- `learning`: realtime collection and supervised PnL-label artifact updates under `data/models`.
+- `testing`: realtime hypothetical trade testing; no broker orders are submitted.
+- `live_trading`: realtime trading gate; live brokerage execution remains guarded and blocked by default app flow.
+
+All modes use the unified realtime store:
+
+```text
+data/store
+```
+
+The runtime policy exposed in `/api/research/diagnostics` states:
+
+```text
+Learning, testing, and live trading all use the unified realtime data store only.
+```
+
+## Streaming Simulation
+
+Streaming simulation is a separate in-memory workflow. It starts through:
+
+```text
+POST /api/streaming-demo/start
+POST /api/streaming-demo/step
+```
+
+The simulation generates synthetic one-minute charts in memory from the listed universe, screens candidates with ontology/NPU logic, and applies approved mock orders only to simulated cash and holdings. The session is not persisted; restarting the server expires the `demo_id`.
+
+If the UI sends a stale `demo_id`, `/api/streaming-demo/step` returns:
 
 ```text
 HTTP 200
 status = expired
 ```
 
-This avoids a user-facing 404 during normal session expiration and lets the UI display a clean restart message.
-
-## Market Session Simulation
-
-`MarketCalendar` defines regular sessions for simulation:
-
-- US: 09:30-16:00 America/New_York
-- KRX: 09:00-15:30 Asia/Seoul
-
-The utility currently excludes weekends. Exchange holidays should be integrated
-later through an official exchange calendar or a maintained local holiday file.
-
-Generate test data:
-
-```powershell
-$env:PYTHONPATH="src"
-python -m app.cli generate-sim-data --exchange US --trading-days 15 --interval-minutes 5
-```
-
-Generate a larger randomized corpus for repeated model training and validation:
-
-```powershell
-$env:PYTHONPATH="src"
-python -m app.cli generate-sim-data `
-  --exchange US `
-  --scenarios 5 `
-  --ticker-count 30 `
-  --trading-days 20 `
-  --interval-minutes 5 `
-  --randomness-scale 1.7
-```
-
-Randomized scenario controls include:
-
-- `--scenarios`: number of independent market scenarios
-- `--ticker-count`: number of synthetic tickers per scenario
-- `--randomness-scale`: volatility and wick scale multiplier
-- `--shock-probability`: intraday jump/crash probability for a single bundle
-- `--volume-spike-probability`: volume spike probability for a single bundle
-- `--news-events-per-ticker`: synthetic news frequency for a single bundle
-
 ## Separation Rules
 
-- Do not copy synthetic records from `data/sim` into `data/live`.
-- Do not train live-approved models from simulation-only rows unless they are explicitly reviewed and promoted.
-- Do not reuse an in-memory streaming `demo_id` across server restarts.
-- Treat `data/live` as read-only-first research state, not as an automatic execution source.
+- Treat `data/store` as the only active research store.
+- Do not copy synthetic rows into `data/store`.
+- Do not save simulated model artifacts into `data/models`.
+- Treat streaming demo state as temporary in-memory state.
+- Treat `live_trading` as a guarded/manual approval boundary, not automatic execution.

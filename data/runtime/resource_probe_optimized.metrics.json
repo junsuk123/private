@@ -1,0 +1,231 @@
+﻿{
+    "measured_at":  "2026-06-25T23:55:03.7531955+09:00",
+    "workload":  "Optimized CPU/memory sample: 30-iteration NPU inference and learning workload with 4096 NPU batch and reusable input buffer",
+    "exit_code":  null,
+    "sample_count":  22,
+    "process_cpu_percent":  {
+                                "min":  3.59,
+                                "avg":  3.98,
+                                "max":  4.4
+                            },
+    "process_working_set_mb":  {
+                                   "min":  32.2,
+                                   "avg":  130.5,
+                                   "max":  135.3
+                               },
+    "process_private_mb":  {
+                               "min":  694.6,
+                               "avg":  757.49,
+                               "max":  760.7
+                           },
+    "system_memory_used_mb":  {
+                                  "min":  13047.7,
+                                  "avg":  13154.32,
+                                  "max":  13200.3
+                              },
+    "system_memory_used_percent":  {
+                                       "min":  81.73,
+                                       "avg":  82.4,
+                                       "max":  82.69
+                                   },
+    "samples":  [
+                    {
+                        "timestamp":  "2026-06-25T23:54:51.6523814+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  null,
+                        "process_working_set_mb":  32.2,
+                        "process_private_mb":  694.6,
+                        "system_memory_used_mb":  13047.7,
+                        "system_memory_used_percent":  81.73
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:52.3765949+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.63,
+                        "process_working_set_mb":  134.4,
+                        "process_private_mb":  759,
+                        "system_memory_used_mb":  13122.7,
+                        "system_memory_used_percent":  82.2
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:52.9649064+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.74,
+                        "process_working_set_mb":  135.1,
+                        "process_private_mb":  759.7,
+                        "system_memory_used_mb":  13134.1,
+                        "system_memory_used_percent":  82.27
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:53.5688204+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.76,
+                        "process_working_set_mb":  135.1,
+                        "process_private_mb":  759.7,
+                        "system_memory_used_mb":  13128.5,
+                        "system_memory_used_percent":  82.24
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:54.1404775+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.98,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13146.3,
+                        "system_memory_used_percent":  82.35
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:54.6571845+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.99,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13143.8,
+                        "system_memory_used_percent":  82.33
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:55.1718486+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13161,
+                        "system_memory_used_percent":  82.44
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:55.7138442+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.06,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13158.4,
+                        "system_memory_used_percent":  82.42
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:56.2480214+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.39,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13123.6,
+                        "system_memory_used_percent":  82.21
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:56.7613019+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.29,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13118.2,
+                        "system_memory_used_percent":  82.17
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:57.2623550+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.83,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13130.7,
+                        "system_memory_used_percent":  82.25
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:57.8714053+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.96,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13153.1,
+                        "system_memory_used_percent":  82.39
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:58.5033590+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.16,
+                        "process_working_set_mb":  135.3,
+                        "process_private_mb":  760.7,
+                        "system_memory_used_mb":  13153.9,
+                        "system_memory_used_percent":  82.4
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:59.1185121+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.27,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13151.9,
+                        "system_memory_used_percent":  82.38
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:54:59.6206331+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.96,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13158.7,
+                        "system_memory_used_percent":  82.43
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:00.1354631+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13190.4,
+                        "system_memory_used_percent":  82.63
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:00.6354272+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.4,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13195.9,
+                        "system_memory_used_percent":  82.66
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:01.1517183+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.99,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13200.3,
+                        "system_memory_used_percent":  82.69
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:01.7240733+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.6,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13191.9,
+                        "system_memory_used_percent":  82.63
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:02.2224710+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.85,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13197,
+                        "system_memory_used_percent":  82.67
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:02.7059654+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  4.11,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13195.2,
+                        "system_memory_used_percent":  82.66
+                    },
+                    {
+                        "timestamp":  "2026-06-25T23:55:03.2208372+09:00",
+                        "pid":  7696,
+                        "process_cpu_percent":  3.59,
+                        "process_working_set_mb":  135.2,
+                        "process_private_mb":  760.6,
+                        "system_memory_used_mb":  13191.8,
+                        "system_memory_used_percent":  82.63
+                    }
+                ]
+}

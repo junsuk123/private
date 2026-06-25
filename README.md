@@ -1,59 +1,65 @@
 # Personal Multi-Agent Ontology-Based Automated Stock Investment System
 
-Personal-use research system for safe, auditable, explainable stock-investment analysis.
+Personal-use research system for safe, auditable, explainable stock-investment analysis and realtime-only paper/hypothetical trading experiments.
 
-This repository starts at the safe phase: read-only data collection, indicator calculation, ontology-style reasoning, structured strategy signals, and deterministic risk validation. Live trading is disabled by design.
+The current implementation is intentionally conservative: it collects public/current-market research, builds indicators and ontology evidence, negotiates target feasibility, creates strategy intents, and validates every possible order through deterministic risk rules. Live automated brokerage execution remains blocked.
 
 ## Safety Model
 
-- LLM agents never execute trades.
-- LLM agents may only produce structured analysis, signals, and `OrderIntent` objects.
-- The deterministic `RiskManager` validates every intent before it can become a `FinalOrder`.
-- Live order execution is not implemented in this scaffold.
+- LLM or LLM-like components never execute trades.
+- AI/semantic/ontology layers may classify events, rank candidates, tune analysis parameters, and produce `OrderIntent` objects.
+- `RiskManager` is the deterministic final gate before an intent can become a `FinalOrder`.
+- Approved orders are limit orders with `manual_approval_required=True`.
+- Live automated execution is disabled by default and remains blocked in the current app flow.
 - Margin, leverage, derivatives, short selling, credit loans, and leveraged ETFs are rejected.
-- Manual approval is required by default.
+- Testing and streaming simulation submit no real broker orders.
 
 ## Current Scope
 
-This initial workspace includes:
+Implemented capabilities include:
 
-- Architecture documentation
-- Typed domain schemas
-- Sample read-only data collectors
-- Public research collectors for RSS, HTML, Stooq, OpenDART, ECOS, and FRED
-- Indicator calculation engine
-- Lightweight ontology/knowledge graph layer
-- Ontology event mapping and rule-based reasoning paths
-- Deterministic strategy signal generation
-- Deterministic risk manager
-- Audit logging
-- CLI demo pipeline
-- Unit tests for core risk and pipeline behavior
-- Web UI for target-return negotiation before program start
+- FastAPI web UI and API runtime
+- Public research collectors for RSS, HTML, dynamic pages, Stooq, Yahoo chart, Alpha Vantage, OpenDART, ECOS, and FRED
+- Listed-universe ingestion for US/overseas and KRX symbols
+- Rotating universe batches so large universes do not block UI refreshes
+- Local/OpenAI-compatible/embedded/OpenVINO event LLM classification with keyword fallback
+- SQLite-backed local research store with stable record keys and retention pruning
+- Lightweight indicator snapshots for the main decision path
+- Ontology graph, event mapping, NPU/CPU ontology candidate screening, and rule-based reasoning paths
+- Goal feasibility negotiation and compromise target generation
+- Rule-based and goal-directed strategy signal generation
+- Deterministic risk validation
+- Mock KIS paper-trading boundary and streaming simulation
+- Realtime learning and hypothetical testing artifacts under `data/models`
+- Audit logging and diagnostics endpoints
 
 ## Quick Start
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -e .
 python .\run.py
 ```
 
-Run these as separate commands in PowerShell, or use `.\run.ps1` to start the app with the same launch flow.
-
-One-command start on Windows PowerShell:
+One-command Windows launch:
 
 ```powershell
 .\run.ps1
 ```
 
-`run.ps1` sets safe defaults automatically, including `DATA_ENV=realtime`,
-learning mode, NPU/low-latency preferences, and live refresh interval.
-If `models/local-llm/event-classifier` exists, event classification loads that
-model directly inside this Python process. Otherwise, if a local
-Ollama-compatible server is running on `127.0.0.1:11434`, event classification
-uses that local small LLM. If neither local model path is available, it falls
-back to keyword classification.
+`run.ps1` starts a managed local app server on `http://127.0.0.1:8010` by default, opens Chrome or Edge when available, and stops the server when the managed browser window closes. It sets safe defaults including:
+
+- `DATA_ENV=realtime`
+- `DATA_ROOT=data`
+- `REALTIME_STORE_ROOT=data/store`
+- `TRADING_MODE=learning`
+- `LIVE_TRADING_ENABLED=false`
+- `ONTOLOGY_ACCELERATOR=NPU`
+- OpenVINO/NPU low-latency hints with CPU fallback
+- small LLM event-classification limits for responsive refreshes
+
+If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded local model. Otherwise it checks for an Ollama-compatible local server at `127.0.0.1:11434`; if unavailable, event classification falls back to deterministic keyword rules.
 
 Optional in-process local LLM setup:
 
@@ -65,18 +71,7 @@ mkdir models\local-llm
 .\run.ps1
 ```
 
-For multimodal Hugging Face checkpoints that use `AutoProcessor` plus `AutoModelForMultimodalLM`, set:
-
-```powershell
-pip install ".[local-llm]"
-$env:LLM_EVENT_CLASSIFIER_ENABLED="true"
-$env:LLM_EVENT_PROVIDER="multimodal"
-$env:LLM_EVENT_MODEL="google/diffusiongemma-26B-A4B-it"
-$env:LLM_EVENT_DEVICE="auto"
-.\run.ps1
-```
-
-For Intel OpenVINO/NPU local inference, install:
+Optional Intel OpenVINO/NPU event classification:
 
 ```powershell
 pip install ".[openvino-llm]"
@@ -86,16 +81,14 @@ $env:LLM_EVENT_DEVICE="NPU"
 .\run.ps1
 ```
 
-This sequence runs startup checks with live Yahoo Finance RSS/chart data, writes audit logs, and starts the web UI.
-
-For dynamic web pages that require scrolling/rendering, enable `dynamic_pages` in config and install Playwright:
+For dynamic web pages that require browser rendering:
 
 ```powershell
 pip install playwright
 playwright install
 ```
 
-Optional individual commands:
+Useful individual commands:
 
 ```powershell
 $env:PYTHONPATH="src"
@@ -106,119 +99,169 @@ python -m unittest discover -s tests
 uvicorn app.web:app --app-dir src --reload
 ```
 
-Ontology NPU mode:
+## Data Layout
 
-```powershell
-pip install ".[npu]"
-$env:ONTOLOGY_ACCELERATOR="NPU"
-python .\run.py
-```
-
-The ontology runtime prefers OpenVINO NPU when an `NPU` device is available. If no NPU
-runtime is detected, the API reports a CPU fallback in `/api/ontology/graph` and
-`/api/research/diagnostics`.
-
-Live data diagnostics:
+The current runtime uses one realtime-only layout:
 
 ```text
-http://127.0.0.1:8000/api/research/diagnostics
+data/store/research.sqlite3
+data/raw/
+data/models/<model_family>/
+data/reports/
+data/synthetic_disabled/
 ```
 
-The live worker continuously refreshes data in the background, rebuilds indicators,
-updates the ontology graph, and stores both raw research and reasoning outputs in
-SQLite at `data/store/research.sqlite3`. Duplicate rows are ignored by stable record
-keys, and stale rows are pruned automatically.
+Simulation and synthetic rows are rejected from the realtime research/model stores. Historical `data/live`, `data/sim`, and `data/legacy` files may exist from older phases, but the active web runtime uses `data/store` and `data/models`.
 
-```powershell
-$env:LIVE_REFRESH_SECONDS="15"
-$env:RESEARCH_RETENTION_DAYS="30"
-.\run.ps1
-```
+Model artifacts are versioned and also written to `<model>.latest.json` inside each model-family folder.
 
-When a user selects a target return and period, the start flow builds a
-goal-directed paper-trading plan. The plan combines ontology relations with common
-chart/market rules such as RSI, volume confirmation, valuation, liquidity, volatility,
-and macro risk. It can produce BUY, HOLD, REDUCE, and SELL intents, then passes them
-through the deterministic risk manager before recording paper orders. Live brokerage
-execution remains disabled.
+## Runtime Modes
 
-Realtime operating modes:
-
-```powershell
-학습: 실시간 수집 데이터로 추론하고, 예측 매수/매도와 이후 실시간 손익을 지도학습 라벨로 저장합니다.
-테스트: 실제 주문 없이 체결했다고 가정한 거래의 실현 손익을 계산합니다.
-실전: 실시간 데이터와 리스크 게이트를 통과한 주문만 브로커 실행 경계로 이동할 수 있습니다.
-```
-
-Data is stored in one realtime layout:
-
-- `data/store`
-- `data/raw`
-- `data/models/<model_family>`
-- `data/reports`
-
-Synthetic/simulation records are rejected from the realtime store and model store.
-Model artifacts are versioned and also written to `<model>.latest.json` inside
-each model-family folder.
-
-Mock KIS Developers flow:
+The web operation-mode manager exposes:
 
 ```text
-LLM judgment -> ontology evidence -> OrderIntent -> RiskManager
--> Mock KIS limit order -> fill check -> mock portfolio update
+learning      realtime collection and supervised PnL-label artifact updates
+testing       realtime hypothetical trade test; orders_submitted = 0
+live_trading  realtime trading gate; brokerage execution remains guarded/blocked
 ```
 
-Simulation endpoints:
+Streaming simulation is separate from operation-mode testing and starts through:
 
 ```text
-POST /api/mock-trading/run
+POST /api/streaming-demo/start
+POST /api/streaming-demo/step
+```
+
+It creates synthetic one-minute charts in memory, uses the listed universe plus ontology/NPU candidate screening, runs goal-directed strategy and `RiskManager`, then applies approved orders only to simulated cash and holdings.
+
+## Core Algorithm
+
+```text
+Public/current research sources
+  -> normalization and optional LLM event classification
+  -> data/store SQLite persistence
+  -> analysis context
+  -> lightweight ontology candidate filter
+  -> indicator snapshots and time-synchronized frames
+  -> ontology graph + reasoning paths
+  -> goal feasibility and strategy scoring
+  -> OrderIntent records
+  -> deterministic RiskManager validation
+  -> mock KIS / hypothetical test / streaming simulation output
+```
+
+The first ontology filter screens the full available universe with low-cost quote-like features such as liquidity, volume change, price momentum, foreign/institution flow, halt status, and management-stock status. Only selected candidates continue to heavier graph/strategy stages, with priority tickers retained for visibility.
+
+## Resource Profile
+
+Local resource probe measured on 2026-06-25 23:53 KST with `C:\Python311\python.exe`.
+
+Workload:
+
+```text
+30 iterations
+4096 synthetic market snapshots
+30 OpenVINO ontology classifier calls per iteration
+3,686,400 total NPU score rows
+600 time-synchronized frames per iteration
+300 realtime supervised learning examples per iteration
+200 hypothetical trades per iteration
+model artifacts written on the first and last iteration
+```
+
+Observed result:
+
+```text
+total elapsed time:              11.871 s
+average iteration time:          377.81 ms
+iteration time range:            339.20-470.60 ms
+OpenVINO backend:                NPU
+NPU active according to runtime: true
+NPU batch size:                  4096
+NPU batches per 4096-row call:   1
+NPU latency per 4096-row call:   avg 9.996 ms, min 7.911 ms, max 13.202 ms
+last measured NPU throughput:    425,258 rows/s
+process CPU usage:               avg 3.98%, max 4.40% of total logical CPU
+process working set memory:      avg 130.5 MB, max 135.3 MB
+process private memory:          avg 757.49 MB, max 760.7 MB
+system memory used:              avg 82.40%, max 82.69%
+GPU/NPU compute counter:         avg 0.00%, max 0.00%
+GPU 3D counter for process:      avg 6.61%, max 13.22%
+adapter shared memory:           avg 1606.25 MB, max 1617.2 MB
+```
+
+Measurement notes:
+
+- The application runtime reported `backend=NPU`, `uses_npu=True`, and no fallback reason.
+- The ontology NPU classifier uses a reusable input buffer and defaults to `ONTOLOGY_NPU_BATCH_SIZE=4096` to reduce per-call allocation churn and increase work per NPU dispatch.
+- Windows `GPU Engine(*)\Utilization Percentage` did not expose a separate measurable NPU compute engine for this OpenVINO workload on this machine, so the OS counter stayed at `0.00%` even while OpenVINO reported NPU execution.
+- CPU and process memory are sampled from the Python process; adapter memory is the aggregate Windows GPU adapter memory counter, not a per-model allocation.
+
+## Important API Paths
+
+```text
+GET  /api/status
+GET  /api/research
+POST /api/research/refresh
+GET  /api/research/diagnostics
+GET  /api/research/volume
+GET  /api/ontology/graph
+GET  /api/ontology/runtime
+GET  /api/realtime/runtime
+POST /api/live-snapshot
+POST /api/assess-goal
+POST /api/start
+POST /api/operation-mode/start
+GET  /api/operation-mode/status
+POST /api/operation-mode/stop-learning
+POST /api/streaming-demo/start
+POST /api/streaming-demo/step
 POST /api/mock-kis/orders
-GET  /api/mock-kis/orders/{order_id}
 GET  /api/mock-kis/portfolio
 ```
-
-The broker boundary is isolated behind `BrokerClient` in
-`src/app/execution/broker.py`. The current implementation uses
-`MockKisDevelopersApi`; a disabled `KisDevelopersApiClient` skeleton is available
-for later real KIS Developers integration without changing the strategy, ontology,
-risk, or trading-cycle code.
-
-No external service credentials are required for the demo.
 
 ## Repository Layout
 
 ```text
 src/app/
-  agents/          LLM-facing interfaces and placeholder agents
+  agents/          LLM-facing interfaces and contracts
   audit/           Append-only audit logger
-  backtesting/     Placeholder package for later phases
-  data/            Read-only sample collectors and source metadata
-  execution/       Order executor interface; live trading disabled
-  graph/           Ontology schema and in-memory knowledge graph
-  indicators/      Financial, market, technical, and macro indicators
+  backtesting/     Streaming and accelerated simulation tools
+  data/            Public collectors, classifiers, HTTP helpers
+  execution/       Mock/paper broker boundary; real KIS client disabled
+  features/        Formula indicators, semantic features, model-row scaffolding
+  goals/           Target feasibility and compromise goal negotiation
+  graph/           Ontology graph, event mapper, NPU classifier, reasoner
+  indicators/      Main lightweight IndicatorSnapshot engine
+  models/          Dataset and no-lookahead labeling helpers
+  realtime/        Operation modes, acceleration policy, learning/test helpers
+  research/        Source orchestration, retries, diagnostics
   risk/            Deterministic hard-rule risk manager
-  strategy/        Signal and order-intent generation
-  schemas/         Shared domain models
+  storage/         SQLite research store and model artifact store
+  strategy/        Rule-based and goal-directed strategy generation
 docs/
-  architecture.md  System architecture and phase plan
-config/
-  risk_rules.example.json
-tests/
-  Unit tests
+  architecture.md
+  system_algorithm_analysis.md
+  realtime_short_horizon_policy.md
+  data_environment_separation.md
+  semantic_feature_engine.md
+  semantic_feature_codebase_analysis.md
+research_notes/
+  technical_indicator_formulas.md
 ```
 
 ## Development Phases
 
-1. Read-only data and normalized storage
-2. Indicator engine
-3. Ontology and knowledge graph
-4. LLM agent layer with strict JSON outputs
-5. Strategy and deterministic risk manager
-6. Backtesting
-7. Paper trading
+1. Realtime-only public data collection and normalized local storage
+2. Indicator and semantic feature expansion
+3. Ontology graph, candidate filtering, and reasoning
+4. Local/remote LLM classification with strict JSON output
+5. Goal-directed strategy and deterministic risk manager
+6. Hypothetical testing and streaming simulation
+7. Paper/mock brokerage workflows
 8. Brokerage read-only integration
-9. Manual-approval trading
-10. Limited automation only after proven stability
+9. Manual-approval trading gate
+10. Limited automation only after proven stability and explicit controls
 
 ## Disclaimer
 
