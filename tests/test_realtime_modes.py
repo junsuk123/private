@@ -83,6 +83,24 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
         start_worker.assert_called_once_with("learning")
 
+    def test_testing_mode_starts_background_collection_without_blocking(self) -> None:
+        client = TestClient(app)
+        with (
+            patch("app.web._start_live_worker") as start_worker,
+            patch("app.web._start_streaming_demo", return_value="demo-test") as start_demo,
+            patch("app.web._get_or_refresh_live") as refresh_live,
+        ):
+            data = client.post("/api/operation-mode/start", json={"mode": "testing"}).json()
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["test_status"], "background_collection_started")
+        self.assertEqual(data["demo_id"], "demo-test")
+        self.assertEqual(data["demo_status"], "initialized")
+        self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
+        start_demo.assert_called_once()
+        start_worker.assert_called_once_with("testing")
+        refresh_live.assert_not_called()
+
     def test_stop_learning_endpoint_stops_collection_worker(self) -> None:
         client = TestClient(app)
         with patch("app.web._stop_live_worker") as stop_worker:

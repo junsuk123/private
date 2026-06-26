@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import inspect
 import json
 import os
 import re
 import threading
 import time
 import traceback
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -17,6 +19,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette import routing as starlette_routing
 
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
@@ -46,6 +49,81 @@ from app.schemas.domain import (
 from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
+
+
+def _ensure_starlette_router_event_compatibility() -> None:
+  """Support FastAPI 0.x when Starlette 1.x removed router event hooks."""
+  signature = inspect.signature(starlette_routing.Router.__init__)
+  if "on_startup" in signature.parameters:
+    return
+  if getattr(starlette_routing.Router, "_fastapi_event_compat", False):
+    return
+
+  original_init = starlette_routing.Router.__init__
+
+  @asynccontextmanager
+  async def event_lifespan(router: Any) -> Any:
+    await router.startup()
+    try:
+      yield
+    finally:
+      await router.shutdown()
+
+  def event_lifespan_context(_app: Any) -> Any:
+    return event_lifespan(_app.router if hasattr(_app, "router") else _app)
+
+  def compatible_init(
+      self: Any,
+      routes: Any = None,
+      redirect_slashes: bool = True,
+      default: Any = None,
+      on_startup: Any = None,
+      on_shutdown: Any = None,
+      lifespan: Any = None,
+      **kwargs: Any,
+  ) -> None:
+    original_init(
+        self,
+        routes=routes,
+        redirect_slashes=redirect_slashes,
+        default=default,
+        lifespan=lifespan,
+        **kwargs,
+    )
+    self.on_startup = list(on_startup or [])
+    self.on_shutdown = list(on_shutdown or [])
+    if lifespan is None:
+      self.lifespan_context = event_lifespan_context
+
+  def add_event_handler(self: Any, event_type: str, func: Any) -> None:
+    if event_type == "startup":
+      self.on_startup.append(func)
+      return
+    if event_type == "shutdown":
+      self.on_shutdown.append(func)
+      return
+    raise ValueError(f"Unsupported event type: {event_type}")
+
+  async def startup(self: Any) -> None:
+    for handler in list(getattr(self, "on_startup", ())):
+      result = handler()
+      if inspect.isawaitable(result):
+        await result
+
+  async def shutdown(self: Any) -> None:
+    for handler in list(getattr(self, "on_shutdown", ())):
+      result = handler()
+      if inspect.isawaitable(result):
+        await result
+
+  starlette_routing.Router.__init__ = compatible_init
+  starlette_routing.Router.add_event_handler = add_event_handler
+  starlette_routing.Router.startup = startup
+  starlette_routing.Router.shutdown = shutdown
+  starlette_routing.Router._fastapi_event_compat = True
+
+
+_ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
 audit = AuditLogger(Path("logs/web-audit.jsonl"))
@@ -181,6 +259,7 @@ def _start_streaming_demo(
   period_minutes: int = 390,
   initial_cash: float = 10_000_000,
   seed: int = 42,
+  acceleration_factor: float = 1.0,
 ) -> str:
   """Start a streaming accelerated demo and return demo_id."""
   demo_id = str(uuid4())
@@ -188,9 +267,13 @@ def _start_streaming_demo(
   if target_return_rate > 1:
     target_return_rate /= 100.0
   initial_cash = max(100_000.0, float(initial_cash))
+  acceleration_factor = max(1.0, float(acceleration_factor))
   
   demo = StreamingAcceleratedDemo(
-      config=TimeScalerConfig(mode=TimeMode.REALTIME, acceleration_factor=1.0),
+      config=TimeScalerConfig(
+          mode=TimeMode.ACCELERATED if acceleration_factor > 1 else TimeMode.REALTIME,
+          acceleration_factor=acceleration_factor,
+      ),
       target_return_rate=target_return_rate,
       period_minutes=period_minutes,
       initial_cash=initial_cash,
@@ -207,6 +290,7 @@ def _start_streaming_demo(
       "target_return_rate": target_return_rate,
       "period_minutes": period_minutes,
       "initial_cash": initial_cash,
+      "acceleration_factor": acceleration_factor,
   })
   
   return demo_id
@@ -469,18 +553,33 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["training_message"] = "Realtime learning will update model artifacts until you press the stop button."
 
       if mode == "testing":
-        snapshot = _get_or_refresh_live(force_refresh=True)
-        context = snapshot["context"]
-        test_result = run_hypothetical_realtime_test(context.temporal_frames, context.signals)
-        model_paths = update_realtime_model_artifacts(
-            ModelArtifactStore(),
-            build_realtime_supervised_examples(context.temporal_frames, context.signals),
-            test_result,
+        target_return_rate = float(payload.get("target_return_rate", 0.02))
+        if target_return_rate > 1:
+          target_return_rate /= 100.0
+        period_minutes = int(payload.get("period_minutes", 390))
+        initial_cash = float(payload.get("initial_cash", 10_000_000))
+        acceleration_factor = float(payload.get("acceleration_factor", 60.0))
+        demo_id = _start_streaming_demo(
+            target_return_rate=target_return_rate,
+            period_minutes=period_minutes,
+            initial_cash=initial_cash,
+            seed=int(payload.get("seed", 42)),
+            acceleration_factor=acceleration_factor,
         )
-        result["test_status"] = "completed"
-        result["test_result"] = test_result
-        result["model_artifacts"] = model_paths
-        result["test_message"] = "Realtime test completed with hypothetical trades only; no broker orders were submitted."
+        demo = _streaming_demos.get(demo_id)
+        _start_live_worker(mode)
+        result["test_status"] = "background_collection_started"
+        result["demo_id"] = demo_id
+        result["demo_status"] = "initialized"
+        result["target_return_rate"] = target_return_rate
+        result["period_minutes"] = period_minutes
+        result["initial_cash"] = max(100_000.0, initial_cash)
+        result["acceleration_factor"] = acceleration_factor
+        result["universe_count"] = len(demo._bars_by_ticker) if demo is not None else 0
+        result["test_message"] = (
+            "Realtime testing started in the background; hypothetical trades only, "
+            "no broker orders will be submitted. Streaming simulated buy/sell is running in-app."
+        )
 
       _set_operation_request(False, "started", f"{mode} started", None)
       result["request"] = _operation_mode_request_snapshot()
@@ -809,17 +908,20 @@ async def streaming_demo_start(request: Request) -> JSONResponse:
       period_minutes = 390
     initial_cash = max(100_000.0, float(payload.get("initial_cash", 10_000_000)))
     seed = int(payload.get("seed", 42))
+    acceleration_factor = float(payload.get("acceleration_factor", 1.0))
     demo_id = _start_streaming_demo(
         target_return_rate=target_return_rate,
         period_minutes=period_minutes,
         initial_cash=initial_cash,
         seed=seed,
+        acceleration_factor=acceleration_factor,
     )
     
     return _json({
         "demo_id": demo_id,
         "status": "initialized",
         "progress": 0.0,
+        "acceleration_factor": acceleration_factor,
         "message": "시뮬레이션 데모가 시작되었습니다. 단계별 진행하기 위해 /api/streaming-demo/step을 호출하세요.",
     })
 
@@ -2698,19 +2800,20 @@ HTML = """
         }
         renderOperationMode(data);
         updateLearningStopButton(data.learning);
+        const testingStarted = mode === 'testing' && data.test_status === 'background_collection_started';
         renderSystemFlow({
           environment: 'done',
           mode: 'done',
-          data: mode === 'learning' ? 'active' : 'done',
+          data: mode === 'learning' || testingStarted ? 'active' : 'done',
           analysis: 'idle',
-          simulation: mode === 'testing' ? 'done' : 'idle',
+          simulation: testingStarted ? 'active' : mode === 'testing' ? 'done' : 'idle',
         }, {
           mode: `${modeLabel(mode)} 시작됨`,
           data: mode.includes('training') ? '학습 데이터 갱신 중' : '데이터 준비 완료',
           simulation: mode === 'testing' ? '가상 실현손익 계산 완료' : '테스트 대기',
         });
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-        if (false && mode === 'testing' && data.demo_id) {
+        if (mode === 'testing' && data.demo_id) {
           document.getElementById('streamingDemoContainer').style.display = 'block';
           streamingDemoId = data.demo_id;
           streamingDemoRunning = true;

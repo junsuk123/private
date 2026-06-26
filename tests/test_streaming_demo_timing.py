@@ -4,6 +4,7 @@ import sys
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -95,6 +96,47 @@ class StreamingDemoTimingTest(unittest.TestCase):
             self.assertIn("ontology_filter_1", due_step)
             self.assertLessEqual(due_step["ontology_filter_1"]["chart_fetch_count"], len(TEST_TICKERS))
             self.assertEqual(due_step["ontology_filter_1"]["chart_fetch_count"], due_step["universe_count"])
+        finally:
+            if previous_limit is None:
+                os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)
+            else:
+                os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = previous_limit
+            if previous_target is None:
+                os.environ.pop("ONTOLOGY_FILTER1_TARGET_COUNT", None)
+            else:
+                os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
+
+    def test_testing_mode_starts_streaming_buy_sell_loop(self) -> None:
+        previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
+        previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
+        os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
+        os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
+        client = TestClient(app)
+        try:
+            with patch("app.web._start_live_worker"):
+                start_response = client.post(
+                    "/api/operation-mode/start",
+                    json={
+                        "mode": "testing",
+                        "target_return_rate": 0.02,
+                        "period_minutes": 20,
+                        "initial_cash": 10_000_000,
+                        "acceleration_factor": 120,
+                    },
+                )
+            self.assertEqual(start_response.status_code, 200)
+            start_payload = start_response.json()
+            demo_id = start_payload["demo_id"]
+            self.assertEqual(start_payload["test_status"], "background_collection_started")
+            self.assertIn(demo_id, _streaming_demos)
+
+            _streaming_demos[demo_id]._started_at_monotonic -= 60
+            step = client.post("/api/streaming-demo/step", json={"demo_id": demo_id}).json()
+
+            self.assertEqual(step["status"], "running")
+            self.assertEqual(step["step"], 1)
+            self.assertGreaterEqual(step["cumulative_trades"], 1)
+            self.assertGreaterEqual(step["trades_in_step"], 1)
         finally:
             if previous_limit is None:
                 os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)

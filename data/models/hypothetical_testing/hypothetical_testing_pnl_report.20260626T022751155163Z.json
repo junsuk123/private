@@ -1,6 +1,6 @@
 {
   "artifact": {
-    "generated_at": "2026-06-26T04:29:14.029790+00:00",
+    "generated_at": "2026-06-26T02:27:51.140164+00:00",
     "hypothetical_trades": [
       {
         "entry_price": 450780.0,
@@ -46,7 +46,7 @@
         "entry_price": 450780.0,
         "entry_time": "2026-06-25T19:00:00+00:00",
         "exit_price": 450780.0,
-        "exit_time": "2026-06-26T04:30:00+00:00",
+        "exit_time": "2026-06-26T02:30:00+00:00",
         "quantity": 1,
         "realized_pnl": 0.0,
         "side": "BUY",
@@ -65,6 +65,6 @@
   },
   "model_family": "hypothetical_testing",
   "model_name": "hypothetical_testing:pnl_report",
-  "saved_at": "2026-06-26T04:29:14.044044+00:00",
+  "saved_at": "2026-06-26T02:27:51.155163+00:00",
   "simulated": false
 }

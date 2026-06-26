@@ -1,0 +1,19 @@
+{
+  "artifact": {
+    "generated_at": "2026-06-26T01:31:23.823399+00:00",
+    "hypothetical_trades": [],
+    "mode": "testing",
+    "orders_submitted": 0,
+    "realized_pnl": 0,
+    "trade_count": 0,
+    "win_rate": 0.0,
+    "winning_trades": 0
+  },
+  "metadata": {
+    "orders_submitted": 0
+  },
+  "model_family": "hypothetical_testing",
+  "model_name": "hypothetical_testing:pnl_report",
+  "saved_at": "2026-06-26T01:31:23.835911+00:00",
+  "simulated": false
+}
