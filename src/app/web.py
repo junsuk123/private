@@ -1809,13 +1809,14 @@ def _graph_payload(context: Any) -> dict[str, Any]:
             )
 
     importance = _node_importance_map(links)
+    kind_overrides = _semantic_node_kind_overrides(links)
     nodes: dict[str, dict[str, Any]] = {}
     for link in links:
         for node_id in (link["source"], link["target"]):
             if node_id in nodes:
                 continue
             score = round(importance.get(node_id, 0.0), 4)
-            nodes[node_id] = _node_payload(node_id, score, event_meta.get(node_id))
+            nodes[node_id] = _node_payload(node_id, score, event_meta.get(node_id), kind_overrides.get(str(node_id)))
 
     return {
         "nodes": list(nodes.values()),
@@ -1833,8 +1834,9 @@ def _node_payload(
     node_id: str,
     importance_score: float,
     event_meta: dict[str, Any] | None = None,
+    kind_override: str | None = None,
 ) -> dict[str, Any]:
-    kind = _node_kind(node_id)
+    kind = kind_override or _node_kind(node_id)
     payload = {
         "id": node_id,
         "label": event_meta.get("title", node_id) if event_meta else node_id,
@@ -1845,6 +1847,29 @@ def _node_payload(
     if event_meta:
         payload.update(event_meta)
     return payload
+
+
+def _semantic_node_kind_overrides(links: list[dict[str, Any]]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    relation_kind = {
+        "supportsSignal": "support",
+        "decreasesRiskOf": "support",
+        "increasesRiskOf": "risk",
+        "contradictsSignal": "contradiction",
+    }
+    for link in links:
+        kind = relation_kind.get(str(link.get("predicate", "")))
+        if not kind:
+            continue
+        for field in ("source", "target"):
+            node_id = str(link.get(field, ""))
+            if not node_id or _node_kind(node_id) in {"ticker", "event", "temporal", "pipeline", "tuning", "parameter", "metric", "sector"}:
+                continue
+            if overrides.get(node_id) == "risk":
+                continue
+            if kind == "risk" or node_id not in overrides:
+                overrides[node_id] = kind
+    return overrides
 
 
 def _node_kind(node_id: str) -> str:
@@ -1881,13 +1906,43 @@ def _node_kind(node_id: str) -> str:
         "EarningsGrowth",
         "ProfitabilityQuality",
         "PositiveEventImpact",
+        "PositiveInvestorFlow",
+        "InformedOrderFlowImbalance",
+        "ForeignInstitutionJointBuying",
+        "RetailSupplyAbsorbedByInformedFlow",
+        "OrderFlowPriceConfirmation",
+        "SuspectedSmartMoneyAccumulation",
+        "OrderFlowConfirmedBuyCandidate",
+        "SectorMomentum",
         "BuyCandidate",
+        "HoldWithTrailingStop",
+        "BreakoutWatch",
+        "Watchlist",
         "RiskAdjustedSizing",
     }:
         return "support"
-    if node_id in {"MacroRateRisk", "NegativeEventRisk", "VolatilityRisk", "LiquidityRisk"}:
+    if node_id in {
+        "MacroRateRisk",
+        "NegativeEventRisk",
+        "VolatilityRisk",
+        "LiquidityRisk",
+        "OrderFlowDistributionRisk",
+        "ThinLiquidityPriceImpactRisk",
+        "SellCandidate",
+        "ReduceRiskCandidate",
+        "WaitOrTakeProfit",
+    }:
         return "risk"
-    if node_id in {"ValuationDiscipline", "AggressiveBuy", "ValuationSlightlyHigh"}:
+    if node_id in {
+        "ValuationDiscipline",
+        "AggressiveBuy",
+        "ValuationSlightlyHigh",
+        "InformedOrderFlowDistribution",
+        "ForeignInstitutionJointSelling",
+        "RetailDemandMeetsInformedSelling",
+        "OrderFlowPriceDivergence",
+        "SuspectedSmartMoneyDistribution",
+    }:
         return "contradiction"
     if _looks_like_ticker(node_id):
         return "ticker"
@@ -2274,7 +2329,7 @@ HTML = """
     .reasoning-progress span { display: block; height: 100%; width: 0%; background: #facc15; }
     .ontology-legend { position: absolute; z-index: 2; left: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 24px); }
     .legend-item { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 0 8px; border-radius: 6px; background: rgba(15,23,42,.72); border: 1px solid rgba(255,255,255,.18); color: #e5e7eb; font-size: 12px; }
-    .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; border: 1px solid rgba(255,255,255,.5); box-shadow: 0 0 0 1px rgba(15,23,42,.35); }
     .ontology-panel { position: absolute; z-index: 2; top: 58px; right: 12px; width: 260px; max-width: calc(100% - 24px); padding: 12px; border-radius: 8px; background: rgba(15,23,42,.86); border: 1px solid rgba(255,255,255,.18); color: #e5e7eb; font-size: 12px; }
     .ontology-panel strong { display: block; font-size: 15px; margin-bottom: 6px; color: #fff; }
     .ontology-panel .muted { color: #cbd5e1; }
@@ -2426,14 +2481,17 @@ HTML = """
           </div>
           <div class="ontology-legend">
             <span class="legend-item"><span class="legend-dot" style="background:#38bdf8"></span>종목</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span>뉴스/이벤트</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f97316"></span>뉴스/이벤트</span>
             <span class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span>시간축</span>
             <span class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>긍정 신호</span>
             <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>리스크</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#fb7185"></span>상충 요인</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#a78bfa"></span>섹터</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#14b8a6"></span>Pipeline</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#d946ef"></span>상충 요인</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#84cc16"></span>섹터</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>Pipeline</span>
             <span class="legend-item"><span class="legend-dot" style="background:#eab308"></span>Tuning</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#ec4899"></span>Parameter</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#94a3b8"></span>Metric</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f8fafc"></span>개체</span>
           </div>
           <div id="ontologyTooltip"></div>
         </section>
@@ -3599,6 +3657,7 @@ HTML = """
       let rotationY = 0.34;
       let targetZoom = 760;
       let pausedUntil = 0;
+      let visibleCenter = new THREE.Vector3(0, 0, 0);
 
       function resize() {
         const rect = canvas.getBoundingClientRect();
@@ -3634,6 +3693,7 @@ HTML = """
         rotationX = -0.18;
         rotationY = 0.34;
         targetZoom = 760;
+        fitVisibleGraph();
       };
       document.getElementById('toggleLabels').onclick = () => {
         labelState.visible = !labelState.visible;
@@ -3660,8 +3720,10 @@ HTML = """
       });
 
       function updateVisibility() {
+        let visibleCount = 0;
         for (const mesh of nodeMeshes) {
           mesh.visible = activeKinds.has(mesh.userData.kind);
+          if (mesh.visible) visibleCount += 1;
         }
         for (const glow of nodeGlowById.values()) {
           glow.visible = (glow.userData.highlight || reasoningState.activeNodeIds.has(glow.userData.id)) && activeKinds.has(glow.userData.kind);
@@ -3685,6 +3747,24 @@ HTML = """
             && reasoningState.activeLinkKeys.has(linkKey(line.userData.source, line.userData.target, line.userData.predicate))
           );
         }
+        fitVisibleGraph();
+        document.getElementById('ontologyCounts').textContent =
+          `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${visibleCount}/${renderGraph.links.length}`;
+      }
+
+      function fitVisibleGraph() {
+        const visibleMeshes = nodeMeshes.filter((mesh) => activeKinds.has(mesh.userData.kind));
+        if (!visibleMeshes.length) {
+          visibleCenter.set(0, 0, 0);
+          return;
+        }
+        const center = new THREE.Vector3(0, 0, 0);
+        let maxDistance = 1;
+        for (const mesh of visibleMeshes) center.add(mesh.position);
+        center.multiplyScalar(1 / visibleMeshes.length);
+        for (const mesh of visibleMeshes) maxDistance = Math.max(maxDistance, mesh.position.distanceTo(center));
+        visibleCenter.copy(center);
+        targetZoom = Math.max(260, Math.min(1300, maxDistance * 2.35 + 280));
       }
 
       function updateReasoning(now) {
@@ -3760,6 +3840,9 @@ HTML = """
         if (!dragging && now > pausedUntil) rotationY += 0.0022;
         root.rotation.x = rotationX;
         root.rotation.y = rotationY;
+        root.position.x += (-visibleCenter.x - root.position.x) * 0.08;
+        root.position.y += (-visibleCenter.y - root.position.y) * 0.08;
+        root.position.z += (-visibleCenter.z - root.position.z) * 0.08;
         camera.position.z += (targetZoom - camera.position.z) * 0.08;
         updateReasoning(now);
         applyReasoningGlow(now);
@@ -3826,6 +3909,28 @@ HTML = """
 
       function visibleNode(node) {
         return activeKinds.has(node.kind);
+      }
+
+      function fitVisibleGraph2d() {
+        const visibleNodes = nodes.filter(visibleNode);
+        if (!visibleNodes.length) {
+          view.scale = 1;
+          view.offsetX = 0;
+          view.offsetY = 0;
+          return;
+        }
+        const xs = visibleNodes.map((node) => (node.position || [0, 0, 0])[0]);
+        const ys = visibleNodes.map((node) => (node.position || [0, 0, 0])[1]);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+        const rect = canvas.getBoundingClientRect();
+        view.offsetX = -((minX + maxX) / 2);
+        view.offsetY = -((minY + maxY) / 2);
+        view.scale = Math.max(0.45, Math.min(2.7, Math.min(rect.width / (width + 120), rect.height / (height + 120))));
       }
 
       function setActiveReasoningStep(index) {
@@ -3957,9 +4062,7 @@ HTML = """
         if (hoveredNode) renderNodePanel(hoveredNode, data.links);
       };
       document.getElementById('resetGraph').onclick = () => {
-        view.scale = 1;
-        view.offsetX = 0;
-        view.offsetY = 0;
+        fitVisibleGraph2d();
       };
       document.getElementById('toggleLabels').onclick = () => {
         view.labels = !view.labels;
@@ -3974,12 +4077,14 @@ HTML = """
         input.onchange = () => {
           if (input.checked) activeKinds.add(input.value);
           else activeKinds.delete(input.value);
+          fitVisibleGraph2d();
         };
       });
 
       graphState = { stop: false, renderer: null };
       resize();
       window.addEventListener('resize', resize, { passive: true });
+      fitVisibleGraph2d();
       if (reasoningState.steps.length) setActiveReasoningStep(0);
       requestAnimationFrame(draw);
     }
@@ -4002,44 +4107,64 @@ HTML = """
     }
 
     function prepareRenderableGraph(rawNodes, rawLinks) {
-      const maxNodes = 1200;
-      const maxLinks = 5200;
-      const degreeMap = new Map(rawNodes.map((node) => [node.id, 0]));
+      const kindOverrides = inferRenderableKinds(rawNodes, rawLinks);
+      const normalizedNodes = rawNodes.map((node) => kindOverrides.has(node.id) ? { ...node, kind: kindOverrides.get(node.id) } : node);
+      const degreeMap = new Map(normalizedNodes.map((node) => [node.id, 0]));
       for (const link of rawLinks) {
         const boost = importantPredicate(link.predicate) ? 7 : 1;
         degreeMap.set(link.source, (degreeMap.get(link.source) || 0) + boost);
         degreeMap.set(link.target, (degreeMap.get(link.target) || 0) + boost);
       }
-      const priorityKind = { event: 7, ticker: 6.5, temporal: 6.2, pipeline: 6, tuning: 5.8, parameter: 5.2, support: 5, risk: 5, contradiction: 5, sector: 4, metric: 3, entity: 1 };
-      const nodes = rawNodes
+      const scoreNode = (node) => Number(node.importance_score || 0) + (degreeMap.get(node.id) || 0) * 0.02 + (node.highlight ? 3 : 0);
+      const byScore = (a, b) => scoreNode(b) - scoreNode(a);
+      const priorityKind = { support: 9, risk: 9, contradiction: 9, pipeline: 7.2, tuning: 7, parameter: 6.6, metric: 6, sector: 5.7, ticker: 5.2, event: 4.8, temporal: 4.4, entity: 1 };
+      const nodes = normalizedNodes
         .slice()
         .sort((a, b) => {
           const kindScore = (priorityKind[b.kind] || 0) - (priorityKind[a.kind] || 0);
           if (kindScore) return kindScore;
-          const scoreA = Number(a.importance_score || 0) + (degreeMap.get(a.id) || 0) * 0.02 + (a.highlight ? 3 : 0);
-          const scoreB = Number(b.importance_score || 0) + (degreeMap.get(b.id) || 0) * 0.02 + (b.highlight ? 3 : 0);
-          return scoreB - scoreA;
-        })
-        .slice(0, maxNodes);
+          return byScore(a, b);
+        });
       const selected = new Set(nodes.map((node) => node.id));
-      for (const link of rawLinks) {
-        if (!importantPredicate(link.predicate)) continue;
-        if (selected.size >= maxNodes) break;
-        if (!selected.has(link.source)) selected.add(link.source);
-        if (selected.size >= maxNodes) break;
-        if (!selected.has(link.target)) selected.add(link.target);
-      }
-      const nodeById = new Map(rawNodes.map((node) => [node.id, node]));
-      const selectedNodes = [...selected].map((id) => nodeById.get(id)).filter(Boolean);
       const links = rawLinks
         .filter((link) => selected.has(link.source) && selected.has(link.target))
-        .sort((a, b) => Number(importantPredicate(b.predicate)) - Number(importantPredicate(a.predicate)))
-        .slice(0, maxLinks);
-      return { nodes: selectedNodes, links };
+        .sort((a, b) => Number(importantPredicate(b.predicate)) - Number(importantPredicate(a.predicate)));
+      return { nodes, links };
+    }
+
+    function inferRenderableKinds(rawNodes, rawLinks) {
+      const fixedKinds = new Set(['ticker', 'event', 'temporal', 'pipeline', 'tuning', 'parameter', 'metric', 'sector']);
+      const nodeById = new Map(rawNodes.map((node) => [node.id, node]));
+      const overrides = new Map();
+      const assign = (id, kind) => {
+        const node = nodeById.get(id);
+        if (!node || fixedKinds.has(node.kind)) return;
+        if (overrides.get(id) === 'risk') return;
+        if (kind === 'risk' || !overrides.has(id)) overrides.set(id, kind);
+      };
+      for (const link of rawLinks) {
+        if (link.predicate === 'supportsSignal' || link.predicate === 'decreasesRiskOf') {
+          assign(link.source, 'support');
+          assign(link.target, 'support');
+        } else if (link.predicate === 'increasesRiskOf') {
+          assign(link.source, 'risk');
+          assign(link.target, 'risk');
+        } else if (link.predicate === 'contradictsSignal') {
+          assign(link.source, 'contradiction');
+          assign(link.target, 'contradiction');
+        }
+      }
+      return overrides;
     }
 
     function importantPredicate(predicate) {
       return [
+        'supportsSignal',
+        'increasesRiskOf',
+        'contradictsSignal',
+        'decreasesRiskOf',
+        'generatesSemanticFeature',
+        'hasTechnicalIndicator',
         'hasRecentNews',
         'hasRecentDisclosure',
         'selectsCandidate',
@@ -4436,27 +4561,27 @@ HTML = """
     function nodeColor(kind) {
       return {
         ticker: 0x38bdf8,
-        event: 0xf59e0b,
+        event: 0xf97316,
         temporal: 0x06b6d4,
-        pipeline: 0x14b8a6,
+        pipeline: 0x2563eb,
         tuning: 0xeab308,
-        parameter: 0xf97316,
-        metric: 0x64748b,
-        sector: 0xa78bfa,
+        parameter: 0xec4899,
+        metric: 0x94a3b8,
+        sector: 0x84cc16,
         support: 0x22c55e,
         risk: 0xef4444,
-        contradiction: 0xfb7185,
-        entity: 0xe5e7eb
-      }[kind] || 0xe5e7eb;
+        contradiction: 0xd946ef,
+        entity: 0xf8fafc
+      }[kind] || 0xf8fafc;
     }
 
     function edgeColor(predicate) {
       if (predicate === 'supportsSignal') return 0x22c55e;
       if (predicate === 'increasesRiskOf') return 0xef4444;
-      if (predicate === 'contradictsSignal') return 0xfb7185;
-      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xf59e0b;
+      if (predicate === 'contradictsSignal') return 0xd946ef;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xf97316;
       if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker' || predicate === 'containsEvent' || predicate === 'occursInTimeBucket' || predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 0x06b6d4;
-      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom') return 0x14b8a6;
+      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom') return 0x2563eb;
       if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue' || predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage' || predicate === 'usesOntologySignal' || predicate === 'calibratesSignal' || predicate === 'raisesTuningPressure') return 0xeab308;
       return 0x94a3b8;
     }
@@ -4464,16 +4589,16 @@ HTML = """
     function neonColor(kind) {
       return {
         ticker: 0x67e8f9,
-        event: 0xfde68a,
+        event: 0xfdba74,
         temporal: 0x67e8f9,
-        pipeline: 0x5eead4,
+        pipeline: 0x93c5fd,
         tuning: 0xfef08a,
-        parameter: 0xfdba74,
+        parameter: 0xf9a8d4,
         metric: 0xcbd5e1,
-        sector: 0xc4b5fd,
+        sector: 0xd9f99d,
         support: 0x86efac,
         risk: 0xfca5a5,
-        contradiction: 0xf9a8d4,
+        contradiction: 0xf0abfc,
         entity: 0xffffff
       }[kind] || 0xffffff;
     }
@@ -4481,10 +4606,10 @@ HTML = """
     function neonEdgeColor(predicate) {
       if (predicate === 'supportsSignal') return 0x86efac;
       if (predicate === 'increasesRiskOf') return 0xfca5a5;
-      if (predicate === 'contradictsSignal') return 0xf9a8d4;
-      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xfde68a;
+      if (predicate === 'contradictsSignal') return 0xf0abfc;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xfdba74;
       if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker' || predicate === 'containsEvent' || predicate === 'occursInTimeBucket' || predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 0x67e8f9;
-      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom') return 0x5eead4;
+      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom') return 0x93c5fd;
       if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue' || predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage' || predicate === 'usesOntologySignal' || predicate === 'calibratesSignal' || predicate === 'raisesTuningPressure') return 0xfef08a;
       return 0x67e8f9;
     }
