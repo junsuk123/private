@@ -52,6 +52,9 @@ class SimulatedTrade:
     price: float
     value: float
     reason: str
+    currency: str = "KRW"
+    fx_rate: float = 1.0
+    value_krw: float | None = None
 
 
 @dataclass(frozen=True)
@@ -602,10 +605,15 @@ def generate_synthetic_charts(
         if ticker in {"005930", "000660"}:
             price = rng.uniform(70_000, 210_000)
         trend_bucket = index % 10
-        drift = 0.0018 if trend_bucket in {0, 1, 2, 3} else 0.00045
-        if trend_bucket in {8, 9}:
-            drift = -0.00065
-        volatility = 0.004 + (index % 7) * 0.0008
+        upward_bias = os.getenv("SIM_DEMO_UPWARD_BIAS", "1").strip().lower() not in {"0", "false", "no"}
+        if upward_bias:
+            drift = 0.0036 if trend_bucket in {0, 1, 2, 3, 4, 5} else 0.00155
+            volatility = 0.0034 + (index % 7) * 0.00055
+        else:
+            drift = 0.0018 if trend_bucket in {0, 1, 2, 3} else 0.00045
+            if trend_bucket in {8, 9}:
+                drift = -0.00065
+            volatility = 0.004 + (index % 7) * 0.0008
         bars: list[ChartBar] = []
         for step, timestamp in enumerate(timestamps):
             session_name = _session_name_for_timestamp(calendar, timestamp)
@@ -615,7 +623,7 @@ def generate_synthetic_charts(
             shock = rng.gauss(drift + cycle, volatility * session_volatility)
             if step in {18, 37, 69} and trend_bucket in {0, 1, 2, 3}:
                 shock += 0.018
-            if step in {44, 92} and trend_bucket in {8, 9}:
+            if not upward_bias and step in {44, 92} and trend_bucket in {8, 9}:
                 shock -= 0.022
             price = max(1.0, price * (1 + shock))
             volume_base = 1_000_000 + (index + 1) * 80_000
@@ -760,7 +768,18 @@ def _write_trades(path: Path, trades: list[SimulatedTrade]) -> None:
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=("timestamp", "ticker", "side", "quantity", "price", "value", "reason"),
+            fieldnames=(
+                "timestamp",
+                "ticker",
+                "side",
+                "quantity",
+                "price",
+                "value",
+                "reason",
+                "currency",
+                "fx_rate",
+                "value_krw",
+            ),
         )
         writer.writeheader()
         for trade in trades:

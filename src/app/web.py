@@ -260,6 +260,7 @@ def _start_streaming_demo(
   initial_cash: float = 10_000_000,
   seed: int = 42,
   acceleration_factor: float = 1.0,
+  profit_gain: float = 1.0,
 ) -> str:
   """Start a streaming accelerated demo and return demo_id."""
   demo_id = str(uuid4())
@@ -268,6 +269,7 @@ def _start_streaming_demo(
     target_return_rate /= 100.0
   initial_cash = max(100_000.0, float(initial_cash))
   acceleration_factor = max(1.0, float(acceleration_factor))
+  profit_gain = max(0.25, min(4.0, float(profit_gain)))
   
   demo = StreamingAcceleratedDemo(
       config=TimeScalerConfig(
@@ -277,6 +279,7 @@ def _start_streaming_demo(
       target_return_rate=target_return_rate,
       period_minutes=period_minutes,
       initial_cash=initial_cash,
+      profit_gain_multiplier=profit_gain,
       seed=seed,
   )
   demo.initialize()
@@ -291,6 +294,7 @@ def _start_streaming_demo(
       "period_minutes": period_minutes,
       "initial_cash": initial_cash,
       "acceleration_factor": acceleration_factor,
+      "profit_gain": profit_gain,
   })
   
   return demo_id
@@ -559,12 +563,14 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         period_minutes = int(payload.get("period_minutes", 390))
         initial_cash = float(payload.get("initial_cash", 10_000_000))
         acceleration_factor = float(payload.get("acceleration_factor", 60.0))
+        profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
         demo_id = _start_streaming_demo(
             target_return_rate=target_return_rate,
             period_minutes=period_minutes,
             initial_cash=initial_cash,
             seed=int(payload.get("seed", 42)),
             acceleration_factor=acceleration_factor,
+            profit_gain=profit_gain,
         )
         demo = _streaming_demos.get(demo_id)
         _start_live_worker(mode)
@@ -575,6 +581,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["period_minutes"] = period_minutes
         result["initial_cash"] = max(100_000.0, initial_cash)
         result["acceleration_factor"] = acceleration_factor
+        result["profit_gain"] = max(0.25, min(4.0, profit_gain))
         result["universe_count"] = len(demo._bars_by_ticker) if demo is not None else 0
         result["test_message"] = (
             "Realtime testing started in the background; hypothetical trades only, "
@@ -909,12 +916,14 @@ async def streaming_demo_start(request: Request) -> JSONResponse:
     initial_cash = max(100_000.0, float(payload.get("initial_cash", 10_000_000)))
     seed = int(payload.get("seed", 42))
     acceleration_factor = float(payload.get("acceleration_factor", 1.0))
+    profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
     demo_id = _start_streaming_demo(
         target_return_rate=target_return_rate,
         period_minutes=period_minutes,
         initial_cash=initial_cash,
         seed=seed,
         acceleration_factor=acceleration_factor,
+        profit_gain=profit_gain,
     )
     
     return _json({
@@ -922,6 +931,7 @@ async def streaming_demo_start(request: Request) -> JSONResponse:
         "status": "initialized",
         "progress": 0.0,
         "acceleration_factor": acceleration_factor,
+        "profit_gain": max(0.25, min(4.0, profit_gain)),
         "message": "시뮬레이션 데모가 시작되었습니다. 단계별 진행하기 위해 /api/streaming-demo/step을 호출하세요.",
     })
 
@@ -976,7 +986,14 @@ async def streaming_demo_step(request: Request) -> JSONResponse:
             "cash": result.cash,
             "account_value": result.account_value,
             "return_rate": result.return_rate,
+            "base_currency": result.base_currency,
+            "cash_by_currency": result.cash_by_currency,
+            "account_value_krw": result.account_value_krw,
+            "usd_krw_rate": result.usd_krw_rate,
         },
+        "principal_protection": _to_jsonable(result.principal_protection),
+        "profit_gain": _to_jsonable(result.profit_gain),
+        "currency_by_ticker": result.currency_by_ticker,
         "holdings": result.holdings,
         "trades_in_step": len(result.trades_in_step),
         "cumulative_trades": result.cumulative_trades,
@@ -1055,7 +1072,14 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "cash": result.cash,
                 "account_value": result.account_value,
                 "return_rate": result.return_rate,
+                "base_currency": result.base_currency,
+                "cash_by_currency": result.cash_by_currency,
+                "account_value_krw": result.account_value_krw,
+                "usd_krw_rate": result.usd_krw_rate,
             },
+            "principal_protection": _to_jsonable(result.principal_protection),
+            "profit_gain": _to_jsonable(result.profit_gain),
+            "currency_by_ticker": result.currency_by_ticker,
             "holdings": result.holdings,
             "trades_in_step": len(result.trades_in_step),
             "cumulative_trades": result.cumulative_trades,
@@ -2495,6 +2519,7 @@ HTML = """
           <div class="muted" id="workMessage">버튼을 누르면 진행 현황이 표시됩니다.</div>
           <div class="bar"><span id="workProgress"></span></div>
         </div>
+        <div class="field"><label for="profitGain">수익률 게인</label><input id="profitGain" name="profit_gain" type="number" min="0.25" max="4" step="0.25" value="1" placeholder="예: 1.5"></div>
       </form>
       <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
       <h2>시뮬레이션 테스트</h2>
@@ -2621,6 +2646,19 @@ HTML = """
     let streamingDemoTimer = null;
     let streamingReturnSeries = [];
     const fmtWon = new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 });
+    const fmtUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    function formatMoney(value, currency = 'KRW') {
+      const amount = Number(value || 0);
+      return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(amount) : fmtWon.format(amount);
+    }
+
+    function formatCashByCurrency(account = {}) {
+      const cashByCurrency = account.cash_by_currency || {};
+      const krw = Number(cashByCurrency.KRW ?? account.cash ?? 0);
+      const usd = Number(cashByCurrency.USD ?? 0);
+      return `원화 ${fmtWon.format(krw)} / 달러 ${fmtUsd.format(usd)}`;
+    }
 
     async function loadStatus() {
       const data = await (await fetch('/api/status')).json();
@@ -3373,7 +3411,9 @@ HTML = """
       const accountValue = Number(account.account_value || streamingInitialCash || 0);
       const cash = Number(account.cash || 0);
       const returnRate = Number(account.return_rate || 0);
-      const targetRate = Number(streamingTargetReturnRate || 0);
+      const targetRate = data.principal_protection
+        ? Number(data.principal_protection.target_profit_amount || 0) / Math.max(1, accountValue)
+        : Number(streamingTargetReturnRate || 0);
       const targetPercent = targetRate * 100;
       const profit = accountValue - Number(streamingInitialCash || 0);
       const progress = targetRate > 0 ? Math.max(0, Math.min(100, (returnRate / targetRate) * 100)) : 0;
@@ -3456,9 +3496,9 @@ HTML = """
         return `<tr>
           <td>${item.ticker}</td>
           <td>${item.quantity}</td>
-          <td>${fmtWon.format(item.average_price || 0)}</td>
-          <td>${fmtWon.format(item.last_price || 0)}</td>
-          <td>${fmtWon.format(item.market_value || 0)}</td>
+          <td>${formatMoney(item.average_price || 0, item.currency)}</td>
+          <td>${formatMoney(item.last_price || 0, item.currency)}</td>
+          <td>${formatMoney(item.market_value || 0, item.currency)}</td>
           <td class="${tone}">${fmtWon.format(pnl)}</td>
           <td class="${tone}">${rate.toFixed(2)}%</td>
         </tr>`;
@@ -3469,7 +3509,7 @@ HTML = """
           <td class="${sideClass}">${item.side}</td>
           <td>${item.ticker}</td>
           <td>${item.quantity}</td>
-          <td>${fmtWon.format(item.price || 0)}</td>
+          <td>${formatMoney(item.price || 0, item.currency)}</td>
         </tr>`;
       }).join('') : '<tr><td colspan="4">체결 내역 없음</td></tr>';
     }
@@ -4881,6 +4921,7 @@ HTML = """
       if (targetReturn > 1) targetReturn = targetReturn / 100.0;
       const periodMinutes = parseInt(document.getElementById('targetMinutes')?.value || 390);
       const initialCash = Math.max(100000, Number(document.getElementById('initialCash')?.value || 10000000));
+      const profitGain = Math.max(0.25, Math.min(4, Number(document.getElementById('profitGain')?.value || 1)));
       
       streamingDemoHistory = [];  // 초기화
       streamingDemoPrices = {};
@@ -4897,6 +4938,7 @@ HTML = """
             target_return_rate: targetReturn,
             period_minutes: periodMinutes,
             initial_cash: initialCash,
+            profit_gain: profitGain,
           })
         });
         const data = await response.json();
@@ -4983,7 +5025,7 @@ HTML = """
           const profit = data.account.account_value - streamingInitialCash;  // 수익금 = 총자산 - 초기자본
           
           document.getElementById('streamingDeposit').textContent = 
-            fmtWon.format(cash);
+            formatCashByCurrency(data.account);
           document.getElementById('streamingInvested').textContent = 
             fmtWon.format(invested);
           document.getElementById('streamingProfit').textContent = 
@@ -4991,6 +5033,12 @@ HTML = """
           document.getElementById('streamingReturnRate').textContent = 
             (data.account.return_rate * 100).toFixed(2) + '%';
           renderStreamingPerformance(data);
+          if (data.principal_protection) {
+            const protection = data.principal_protection;
+            const lockText = protection.principal_locked ? `보호원금 ${fmtWon.format(protection.protected_principal || 0)}` : '원금보존 대기';
+            document.getElementById('mockTarget').textContent =
+              `${lockText} · ${protection.cycle_index || 1}단계 목표 ${fmtWon.format(protection.target_profit_amount || 0)}`;
+          }
         }
         
         // 거래 내역 누적
@@ -5008,7 +5056,7 @@ HTML = """
                 <td class="side-${t.side.toLowerCase()}">${t.side}</td>
                 <td>${t.ticker}</td>
                 <td>${t.quantity}</td>
-                <td>${fmtWon.format(t.price)}</td>
+                <td>${formatMoney(t.price, t.currency)}</td>
               </tr>`
             ).join('');
             executionList.innerHTML = executionHtml;
@@ -5019,7 +5067,7 @@ HTML = """
           if (tradeList) {
             const tradeHtml = data.trades.map(t => 
               `<tr><td>${t.ticker}</td><td class="side-${t.side.toLowerCase()}">${t.side}</td>
-               <td>${t.quantity}</td><td>${fmtWon.format(t.value)}</td></tr>`
+               <td>${t.quantity}</td><td>${formatMoney(t.value, t.currency)}${t.currency === 'USD' ? ` (${fmtWon.format(t.value_krw || 0)})` : ''}</td></tr>`
             ).join('');
             tradeList.innerHTML = tradeHtml;
           }
@@ -5035,13 +5083,14 @@ HTML = """
             } else {
               const positionHtml = holdings.map(([ticker, quantity]) => {
                 const price = streamingDemoPrices[ticker] || 0;
+                const currency = (data.currency_by_ticker || {})[ticker] || 'KRW';
                 const marketValue = quantity * price;
                 return `<tr>
                   <td>${ticker}</td>
                   <td>${quantity}</td>
-                  <td>${fmtWon.format(price)}</td>
-                  <td>${fmtWon.format(price)}</td>
-                  <td>${fmtWon.format(marketValue)}</td>
+                  <td>${formatMoney(price, currency)}</td>
+                  <td>${formatMoney(price, currency)}</td>
+                  <td>${formatMoney(marketValue, currency)}</td>
                   <td>-</td>
                   <td>-</td>
                 </tr>`;

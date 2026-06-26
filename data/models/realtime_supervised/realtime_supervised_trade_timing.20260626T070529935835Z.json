@@ -1,13 +1,13 @@
 {
   "artifact": {
-    "example_count": 43,
+    "example_count": 40,
     "examples": [
       {
-        "as_of": "2026-06-25T19:00:00+00:00",
+        "as_of": "2026-06-25T15:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 23,
+          "event_count": 10,
           "execution_count": 0,
-          "impact_score": 18.4,
+          "impact_score": 8.0,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.51,
@@ -23,9 +23,45 @@
       {
         "as_of": "2026-06-25T19:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 23,
+          "event_count": 33,
           "execution_count": 0,
-          "impact_score": 18.4,
+          "impact_score": 26.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.51,
+          "signal_score": 0.6000000000000001
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 0.6000000000000001,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-25T15:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 10,
+          "execution_count": 0,
+          "impact_score": 8.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.65,
+          "signal_score": 2.0
+        },
+        "label": 0,
+        "predicted_action": "BUY",
+        "predicted_score": 2.0,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "005930"
+      },
+      {
+        "as_of": "2026-06-25T19:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 33,
+          "execution_count": 0,
+          "impact_score": 26.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.65,
@@ -57,43 +93,61 @@
         "ticker": "005930"
       },
       {
+        "as_of": "2026-06-25T14:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 24,
+          "execution_count": 0,
+          "impact_score": 19.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T15:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 31,
+          "execution_count": 0,
+          "impact_score": 24.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T15:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 41,
+          "execution_count": 0,
+          "impact_score": 32.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
         "as_of": "2026-06-25T15:45:00+00:00",
-        "feature_snapshot": {
-          "event_count": 3,
-          "execution_count": 0,
-          "impact_score": 2.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.6,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
-        "as_of": "2026-06-25T17:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 38,
-          "execution_count": 0,
-          "impact_score": 30.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.6,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
-        "as_of": "2026-06-25T17:30:00+00:00",
         "feature_snapshot": {
           "event_count": 51,
           "execution_count": 0,
@@ -111,11 +165,47 @@
         "ticker": "AAPL"
       },
       {
+        "as_of": "2026-06-25T17:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 79,
+          "execution_count": 0,
+          "impact_score": 63.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T17:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 92,
+          "execution_count": 0,
+          "impact_score": 73.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
         "as_of": "2026-06-25T19:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 74,
+          "event_count": 91,
           "execution_count": 0,
-          "impact_score": 59.2,
+          "impact_score": 72.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.6100000000000001,
@@ -255,63 +345,9 @@
         "ticker": "AAPL"
       },
       {
-        "as_of": "2026-06-26T05:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 11,
-          "execution_count": 0,
-          "impact_score": 7.2,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.6,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
         "as_of": "2026-06-26T06:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 12,
-          "execution_count": 0,
-          "impact_score": 8.0,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.6,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
-        "as_of": "2026-06-26T06:45:00+00:00",
-        "feature_snapshot": {
           "event_count": 11,
-          "execution_count": 0,
-          "impact_score": 7.2,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.6,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
-        "as_of": "2026-06-26T07:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 13,
           "execution_count": 0,
           "impact_score": 8.8,
           "macro_count": 0,
@@ -327,79 +363,61 @@
         "ticker": "AAPL"
       },
       {
-        "as_of": "2026-06-26T07:45:00+00:00",
+        "as_of": "2026-06-25T14:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 15,
+          "event_count": 24,
           "execution_count": 0,
-          "impact_score": 10.4,
+          "impact_score": 19.2,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
+          "signal_confidence": 0.37,
+          "signal_score": -0.8
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 1.6,
+        "predicted_score": -0.8,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
-        "ticker": "AAPL"
+        "ticker": "NVDA"
       },
       {
-        "as_of": "2026-06-26T10:15:00+00:00",
+        "as_of": "2026-06-25T15:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 22,
+          "event_count": 31,
           "execution_count": 0,
-          "impact_score": 12.8,
+          "impact_score": 24.8,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.6100000000000001,
-          "signal_score": 1.6
+          "signal_confidence": 0.37,
+          "signal_score": -0.8
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 1.6,
+        "predicted_score": -0.8,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
-        "ticker": "AAPL"
+        "ticker": "NVDA"
+      },
+      {
+        "as_of": "2026-06-25T15:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 41,
+          "execution_count": 0,
+          "impact_score": 32.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.37,
+          "signal_score": -0.8
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.8,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "NVDA"
       },
       {
         "as_of": "2026-06-25T15:45:00+00:00",
-        "feature_snapshot": {
-          "event_count": 3,
-          "execution_count": 0,
-          "impact_score": 2.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-25T17:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 38,
-          "execution_count": 0,
-          "impact_score": 30.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-25T17:30:00+00:00",
         "feature_snapshot": {
           "event_count": 51,
           "execution_count": 0,
@@ -417,11 +435,47 @@
         "ticker": "NVDA"
       },
       {
+        "as_of": "2026-06-25T17:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 79,
+          "execution_count": 0,
+          "impact_score": 63.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.37,
+          "signal_score": -0.8
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.8,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "NVDA"
+      },
+      {
+        "as_of": "2026-06-25T17:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 92,
+          "execution_count": 0,
+          "impact_score": 73.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.37,
+          "signal_score": -0.8
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.8,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "NVDA"
+      },
+      {
         "as_of": "2026-06-25T19:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 74,
+          "event_count": 91,
           "execution_count": 0,
-          "impact_score": 59.2,
+          "impact_score": 72.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.37,
@@ -543,119 +597,29 @@
         "ticker": "NVDA"
       },
       {
-        "as_of": "2026-06-26T06:45:00+00:00",
-        "feature_snapshot": {
-          "event_count": 8,
-          "execution_count": 0,
-          "impact_score": 6.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-26T07:15:00+00:00",
+        "as_of": "2026-06-25T14:45:00+00:00",
         "feature_snapshot": {
           "event_count": 10,
           "execution_count": 0,
           "impact_score": 8.0,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
+          "signal_confidence": 0.51,
+          "signal_score": 0.6
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": -0.8,
+        "predicted_score": 0.6,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-26T07:45:00+00:00",
-        "feature_snapshot": {
-          "event_count": 13,
-          "execution_count": 0,
-          "impact_score": 10.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-26T09:00:00+00:00",
-        "feature_snapshot": {
-          "event_count": 8,
-          "execution_count": 0,
-          "impact_score": 6.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-26T10:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 19,
-          "execution_count": 0,
-          "impact_score": 15.2,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
-      },
-      {
-        "as_of": "2026-06-26T10:30:00+00:00",
-        "feature_snapshot": {
-          "event_count": 20,
-          "execution_count": 0,
-          "impact_score": 16.0,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.37,
-          "signal_score": -0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": -0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "NVDA"
+        "ticker": "QQQ"
       },
       {
         "as_of": "2026-06-25T17:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 35,
+          "event_count": 38,
           "execution_count": 0,
-          "impact_score": 28.0,
+          "impact_score": 30.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.51,
@@ -687,22 +651,22 @@
         "ticker": "QQQ"
       },
       {
-        "as_of": "2026-06-26T04:15:00+00:00",
+        "as_of": "2026-06-25T14:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 13,
+          "event_count": 10,
           "execution_count": 0,
-          "impact_score": -10.4,
+          "impact_score": 8.0,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.51,
-          "signal_score": 0.6
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.6,
+        "predicted_score": 1.2000000000000002,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
-        "ticker": "QQQ"
+        "ticker": "SPY"
       },
       {
         "as_of": "2026-06-25T19:15:00+00:00",
@@ -725,9 +689,9 @@
       {
         "as_of": "2026-06-25T19:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 10,
+          "event_count": 8,
           "execution_count": 0,
-          "impact_score": 8.0,
+          "impact_score": 6.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.5700000000000001,
@@ -757,24 +721,6 @@
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "SPY"
-      },
-      {
-        "as_of": "2026-06-26T04:15:00+00:00",
-        "feature_snapshot": {
-          "event_count": 13,
-          "execution_count": 0,
-          "impact_score": -10.4,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.5700000000000001,
-          "signal_score": 1.2000000000000002
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 1.2000000000000002,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "SPY"
       }
     ],
     "positive_labels": 0
@@ -784,6 +730,6 @@
   },
   "model_family": "realtime_supervised",
   "model_name": "realtime_supervised:trade_timing",
-  "saved_at": "2026-06-26T10:54:19.401712+00:00",
+  "saved_at": "2026-06-26T07:05:29.935835+00:00",
   "simulated": false
 }

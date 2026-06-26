@@ -138,13 +138,18 @@ def _score_market(
     support.extend(flow_support)
     contradiction.extend(flow_contra)
 
-    score -= min(1.3, max(0.0, annualized_required_return - 0.20) * 1.2)
+    compounding_mode = "Principal-preserving" in goal.label
+    if compounding_mode:
+        score += 0.85
+        score -= min(0.35, max(0.0, annualized_required_return - 0.20) * 0.25)
+    else:
+        score -= min(1.3, max(0.0, annualized_required_return - 0.20) * 1.2)
     if goal.feasibility_percent < 35:
         score -= 0.9
         contradiction.append("LowGoalFeasibility")
     score += min(0.5, max(0, goal.feasibility_percent - 50) / 100)
 
-    action = OrderAction.REDUCE if goal.feasibility_percent < 35 and score < 0.5 else _action_from_score(score)
+    action = OrderAction.REDUCE if goal.feasibility_percent < 35 and score < 0.5 else _action_from_score(score, compounding_mode)
     confidence = max(0.05, min(0.92, 0.48 + score * 0.10))
     return StrategySignal(
         ticker=market.ticker,
@@ -157,12 +162,14 @@ def _score_market(
     )
 
 
-def _action_from_score(score: float) -> OrderAction:
-    if score >= 2.2:
+def _action_from_score(score: float, compounding_mode: bool = False) -> OrderAction:
+    buy_threshold = 1.25 if compounding_mode else 2.2
+    reduce_threshold = -0.8 if compounding_mode else -0.35
+    if score >= buy_threshold:
         return OrderAction.BUY
     if score <= -1.1:
         return OrderAction.SELL
-    if score <= -0.35:
+    if score <= reduce_threshold:
         return OrderAction.REDUCE
     return OrderAction.HOLD
 
@@ -178,7 +185,11 @@ def _build_goal_intents(
     holding_values = account.holdings_by_ticker()
     intents: list[OrderIntent] = []
     buy_signals = [signal for signal in signals if signal.action == OrderAction.BUY]
-    max_goal_weight = min(0.06, max(0.015, 0.025 + goal.target_return_rate))
+    compounding_mode = "Principal-preserving" in goal.label
+    if compounding_mode:
+        max_goal_weight = min(0.50, max(0.18, 0.24 + min(goal.target_return_rate, 0.25) * 0.80))
+    else:
+        max_goal_weight = min(0.06, max(0.015, 0.025 + goal.target_return_rate))
 
     for signal in signals:
         if signal.action == OrderAction.HOLD:
@@ -189,7 +200,10 @@ def _build_goal_intents(
 
         if signal.action == OrderAction.BUY:
             rank_bonus = (buy_signals.index(signal) + 1) / max(1, len(buy_signals))
-            suggested_weight = min(max_goal_weight, max(0.01, signal.confidence * 0.04 + rank_bonus * 0.004))
+            if compounding_mode:
+                suggested_weight = min(max_goal_weight, max(0.12, signal.confidence * 0.34 + rank_bonus * 0.04))
+            else:
+                suggested_weight = min(max_goal_weight, max(0.01, signal.confidence * 0.04 + rank_bonus * 0.004))
             if "InformedOrderFlowImbalance" in signal.supporting_factors:
                 suggested_weight = min(max_goal_weight, suggested_weight * 1.08)
         elif signal.action == OrderAction.REDUCE:

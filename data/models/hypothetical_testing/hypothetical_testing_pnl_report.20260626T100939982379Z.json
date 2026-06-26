@@ -1,7 +1,17 @@
 {
   "artifact": {
-    "generated_at": "2026-06-26T10:54:19.398708+00:00",
+    "generated_at": "2026-06-26T10:09:39.972377+00:00",
     "hypothetical_trades": [
+      {
+        "entry_price": 450780.0,
+        "entry_time": "2026-06-25T15:30:00+00:00",
+        "exit_price": 450780.0,
+        "exit_time": "2026-06-25T19:00:00+00:00",
+        "quantity": 1,
+        "realized_pnl": 0.0,
+        "side": "BUY",
+        "ticker": "005930"
+      },
       {
         "entry_price": 450780.0,
         "entry_time": "2026-06-25T19:00:00+00:00",
@@ -16,7 +26,7 @@
         "entry_price": 450780.0,
         "entry_time": "2026-06-25T23:00:00+00:00",
         "exit_price": 450780.0,
-        "exit_time": "2026-06-26T11:00:00+00:00",
+        "exit_time": "2026-06-26T10:15:00+00:00",
         "quantity": 1,
         "realized_pnl": 0.0,
         "side": "BUY",
@@ -26,7 +36,7 @@
     "mode": "testing",
     "orders_submitted": 0,
     "realized_pnl": 0.0,
-    "trade_count": 2,
+    "trade_count": 3,
     "win_rate": 0.0,
     "winning_trades": 0
   },
@@ -35,6 +45,6 @@
   },
   "model_family": "hypothetical_testing",
   "model_name": "hypothetical_testing:pnl_report",
-  "saved_at": "2026-06-26T10:54:19.410710+00:00",
+  "saved_at": "2026-06-26T10:09:39.982379+00:00",
   "simulated": false
 }
