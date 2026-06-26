@@ -13,6 +13,7 @@ from app.schemas.domain import (
     OrderIntent,
     StrategySignal,
 )
+from app.strategy.rule_based import _ontology_flow_adjustment
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,11 @@ def _score_market(
         score -= 0.9
         contradiction.append("MacroRiskHigh")
 
+    flow_score, flow_support, flow_contra = _ontology_flow_adjustment(graph, market.ticker)
+    score += flow_score
+    support.extend(flow_support)
+    contradiction.extend(flow_contra)
+
     score -= min(1.3, max(0.0, annualized_required_return - 0.20) * 1.2)
     if goal.feasibility_percent < 35:
         score -= 0.9
@@ -184,10 +190,13 @@ def _build_goal_intents(
         if signal.action == OrderAction.BUY:
             rank_bonus = (buy_signals.index(signal) + 1) / max(1, len(buy_signals))
             suggested_weight = min(max_goal_weight, max(0.01, signal.confidence * 0.04 + rank_bonus * 0.004))
+            if "InformedOrderFlowImbalance" in signal.supporting_factors:
+                suggested_weight = min(max_goal_weight, suggested_weight * 1.08)
         elif signal.action == OrderAction.REDUCE:
             if current_weight <= 0:
                 continue
-            suggested_weight = max(0.0, current_weight * 0.50)
+            reduction_ratio = 0.70 if any("OrderFlow" in item or "Selling" in item for item in signal.contradicting_factors) else 0.50
+            suggested_weight = max(0.0, current_weight * reduction_ratio)
         else:
             if current_weight <= 0:
                 continue
@@ -204,6 +213,7 @@ def _build_goal_intents(
                 reasoning_summary=(
                     f"Goal-directed {signal.action.value} based on ontology and chart score {signal.score:.2f}.",
                     f"Target feasibility is {goal.feasibility_percent}% for {goal.period_days} days.",
+                    "Domestic investor-flow formulas are represented as ontology evidence when available.",
                 ),
                 supporting_factors=signal.supporting_factors,
                 contradicting_factors=signal.contradicting_factors,

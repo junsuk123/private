@@ -38,6 +38,15 @@ class SentimentDirection(StrEnum):
     NEUTRAL = "NEUTRAL"
 
 
+class InvestorGroup(StrEnum):
+    RETAIL = "RETAIL"
+    INSTITUTION = "INSTITUTION"
+    FOREIGN = "FOREIGN"
+    SUSPECTED_SMART_MONEY = "SUSPECTED_SMART_MONEY"
+    MIXED = "MIXED"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass(frozen=True)
 class SourceMetadata:
     source_name: str
@@ -95,6 +104,27 @@ class MarketSnapshot:
     average_daily_trading_value: float
     volatility_20d: float
     source: SourceMetadata
+    investor_flow: InvestorFlowSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class InvestorFlowSnapshot:
+    ticker: str
+    market: str
+    foreign_net_buy: float = 0.0
+    institution_net_buy: float = 0.0
+    retail_net_buy: float = 0.0
+    program_net_buy: float = 0.0
+    short_net_change: float = 0.0
+    volume_change_rate: float = 0.0
+    price_change_rate: float = 0.0
+    trading_value: float = 0.0
+    observed_at: datetime | None = None
+    source: SourceMetadata | None = None
+
+    @property
+    def net_buy_total(self) -> float:
+        return self.foreign_net_buy + self.institution_net_buy + self.retail_net_buy
 
 
 @dataclass(frozen=True)

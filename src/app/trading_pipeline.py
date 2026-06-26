@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
-from app.schemas.domain import MarketSnapshot
+from app.schemas.domain import InvestorFlowSnapshot, MarketSnapshot
+from app.strategy.investor_flow import assess_domestic_investor_flow
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ class LightweightMarketSnapshot:
     foreign_net_buy: float
     institution_net_buy: float
     retail_net_buy: float
+    program_net_buy: float
+    short_net_change: float
     upper_limit_near: bool
     new_52week_high: bool
     halt_status: bool
@@ -133,6 +136,8 @@ def build_lightweight_market_snapshots(
                 foreign_net_buy=round((-0.5 + _stable_unit(f"{stock.ticker}:foreign")) * trading_value * 0.08, 2),
                 institution_net_buy=round((-0.5 + _stable_unit(f"{stock.ticker}:institution")) * trading_value * 0.08, 2),
                 retail_net_buy=round((-0.5 + _stable_unit(f"{stock.ticker}:retail")) * trading_value * 0.08, 2),
+                program_net_buy=round((-0.5 + _stable_unit(f"{stock.ticker}:program")) * trading_value * 0.05, 2),
+                short_net_change=round((-0.5 + _stable_unit(f"{stock.ticker}:short")) * trading_value * 0.02, 2),
                 upper_limit_near=price_change > 0.12,
                 new_52week_high=_stable_unit(f"{stock.ticker}:high52") > 0.93,
                 halt_status=_stable_unit(f"{stock.ticker}:halt") > 0.997,
@@ -154,6 +159,7 @@ def build_lightweight_market_snapshots_from_markets(
         liquidity_score = min(1.0, trading_value / 3_000_000_000)
         momentum = _stable_unit(f"{market.ticker}:analysis-momentum") * 0.18 - 0.06
         volume_change = _stable_unit(f"{market.ticker}:analysis-volume") * 1.8 - 0.35
+        flow = market.investor_flow
         snapshots.append(
             LightweightMarketSnapshot(
                 ticker=market.ticker,
@@ -165,9 +171,11 @@ def build_lightweight_market_snapshots_from_markets(
                 trading_volume=volume,
                 volume_change_rate=round(volume_change, 5),
                 market_cap=trading_value * (20 + _stable_unit(f"{market.ticker}:analysis-cap") * 900),
-                foreign_net_buy=round((_stable_unit(f"{market.ticker}:analysis-foreign") - 0.5) * trading_value * 0.08, 2),
-                institution_net_buy=round((_stable_unit(f"{market.ticker}:analysis-institution") - 0.5) * trading_value * 0.08, 2),
-                retail_net_buy=round((_stable_unit(f"{market.ticker}:analysis-retail") - 0.5) * trading_value * 0.08, 2),
+                foreign_net_buy=_flow_value(flow, "foreign_net_buy", market.ticker, "analysis-foreign", trading_value, 0.08),
+                institution_net_buy=_flow_value(flow, "institution_net_buy", market.ticker, "analysis-institution", trading_value, 0.08),
+                retail_net_buy=_flow_value(flow, "retail_net_buy", market.ticker, "analysis-retail", trading_value, 0.08),
+                program_net_buy=_flow_value(flow, "program_net_buy", market.ticker, "analysis-program", trading_value, 0.05),
+                short_net_change=_flow_value(flow, "short_net_change", market.ticker, "analysis-short", trading_value, 0.02),
                 upper_limit_near=momentum > 0.10,
                 new_52week_high=_stable_unit(f"{market.ticker}:analysis-high52") > 0.94,
                 halt_status=False,
@@ -215,6 +223,8 @@ def ontology_filter_1(
                 "foreign_net_buy": snapshot.foreign_net_buy,
                 "institution_net_buy": snapshot.institution_net_buy,
                 "retail_net_buy": snapshot.retail_net_buy,
+                "program_net_buy": snapshot.program_net_buy,
+                "short_net_change": snapshot.short_net_change,
                 "upper_limit_near": snapshot.upper_limit_near,
                 "new_52week_high": snapshot.new_52week_high,
                 "halt_status": snapshot.halt_status,
@@ -273,6 +283,33 @@ def _score_lightweight_snapshot(
     score += min(1.0, snapshot.liquidity_score) * 0.35
     score += max(0.0, snapshot.volume_change_rate) * 0.18
     score += max(0.0, snapshot.price_change_rate) * 3.0
+    flow_assessment = assess_domestic_investor_flow(
+        MarketSnapshot(
+            ticker=snapshot.ticker,
+            market=snapshot.market,
+            company_name=snapshot.ticker,
+            sector=snapshot.sector,
+            last_price=snapshot.current_price,
+            average_daily_trading_value=snapshot.trading_value,
+            volatility_20d=0.0,
+            source=_pipeline_source(),
+            investor_flow=InvestorFlowSnapshot(
+                ticker=snapshot.ticker,
+                market=snapshot.market,
+                foreign_net_buy=snapshot.foreign_net_buy,
+                institution_net_buy=snapshot.institution_net_buy,
+                retail_net_buy=snapshot.retail_net_buy,
+                program_net_buy=snapshot.program_net_buy,
+                short_net_change=snapshot.short_net_change,
+                volume_change_rate=snapshot.volume_change_rate,
+                price_change_rate=snapshot.price_change_rate,
+                trading_value=snapshot.trading_value,
+            ),
+        )
+    )
+    score += flow_assessment.score_adjustment * 0.25
+    fired.extend(factor.lower() for factor in flow_assessment.supporting_factors[:3])
+    fired.extend(factor.lower() for factor in flow_assessment.contradicting_factors[:3])
     if snapshot.trading_value >= min_trading_value and snapshot.volume_change_rate > 0.25:
         fired.append("high_trading_value_and_volume_surge")
         score += 0.18
@@ -290,6 +327,25 @@ def _score_lightweight_snapshot(
 def _sector_for(ticker: str) -> str:
     sectors = ("Technology", "Financials", "Healthcare", "Industrials", "Consumer", "Energy", "Materials")
     return sectors[int(_stable_unit(f"{ticker}:sector") * len(sectors)) % len(sectors)]
+
+
+def _flow_value(
+    flow: InvestorFlowSnapshot | None,
+    field_name: str,
+    ticker: str,
+    salt: str,
+    trading_value: float,
+    scale: float,
+) -> float:
+    if flow is not None:
+        return round(float(getattr(flow, field_name)), 2)
+    return round((_stable_unit(f"{ticker}:{salt}") - 0.5) * trading_value * scale, 2)
+
+
+def _pipeline_source():
+    from app.schemas.domain import SourceMetadata
+
+    return SourceMetadata("pipeline_lightweight_flow", datetime.now(timezone.utc), source_id="pipeline-flow")
 
 
 def _stable_unit(value: str) -> float:

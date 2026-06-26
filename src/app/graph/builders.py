@@ -4,6 +4,7 @@ from app.graph import KnowledgeGraph
 from app.schemas.domain import ClassifiedEvent, IndicatorSnapshot, MarketSnapshot
 from app.graph.event_mapper import add_events_to_graph
 from app.graph.npu_classifier import get_ontology_npu_classifier
+from app.strategy.investor_flow import assess_domestic_investor_flow
 
 
 def build_market_graph(
@@ -20,6 +21,7 @@ def build_market_graph(
         graph.add(company, "hasTicker", market.ticker, market.source.source_id)
         graph.add(company, "belongsToSector", market.sector, market.source.source_id)
         graph.add(market.ticker, "isListedOn", market.market, market.source.source_id)
+        _add_investor_flow_to_graph(graph, market)
 
         indicator = indicators.get(market.ticker)
         if indicator is None:
@@ -50,3 +52,23 @@ def build_market_graph(
             graph.add(market.ticker, "supportsSignal", "NpuCompositeMomentum", "npu-indicator-composite")
 
     return add_events_to_graph(graph, events)
+
+
+def _add_investor_flow_to_graph(graph: KnowledgeGraph, market: MarketSnapshot) -> None:
+    assessment = assess_domestic_investor_flow(market)
+    if market.investor_flow is None or assessment.metrics is None:
+        return
+    source_id = market.investor_flow.source.source_id if market.investor_flow.source else market.source.source_id
+    graph.add(market.ticker, "hasDominantInvestorFlow", assessment.dominant_group.value, source_id)
+    graph.add(market.ticker, "usesFlowModel", "OrderFlowImbalancePriceImpactModel", source_id)
+    graph.add("OrderFlowImbalancePriceImpactModel", "basedOnFormula", "normalized_investor_imbalance", "research:ofi")
+    graph.add("OrderFlowImbalancePriceImpactModel", "basedOnFormula", "kyle_lambda_proxy", "research:kyle")
+    graph.add("OrderFlowImbalancePriceImpactModel", "basedOnFormula", "retail_absorption", "research:investor-type-flow")
+    for name, value in assessment.metrics.__dict__.items():
+        graph.add(market.ticker, "hasFlowMetric", f"{name}:{value:.6f}", source_id)
+    for factor in assessment.supporting_factors:
+        graph.add(market.ticker, "supportsSignal", factor, source_id)
+    for factor in assessment.contradicting_factors:
+        graph.add(market.ticker, "contradictsSignal", factor, source_id)
+    for factor in assessment.risk_factors:
+        graph.add(market.ticker, "increasesRiskOf", factor, source_id)

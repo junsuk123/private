@@ -106,23 +106,17 @@ class OntologyNpuClassifier:
         with self._lock:
             if self._compiled is not None:
                 return self._compiled
-            import openvino as ov
+            weights = _linear_weights()
+            try:
+                import openvino as ov
+            except ModuleNotFoundError as exc:
+                self._compiled = _NumpyLinearModel(weights)
+                self._backend = "CPU_NUMPY"
+                self._fallback_reason = f"OpenVINO unavailable: {exc}"
+                return self._compiled
 
             ops = ov.opset8
             x = ops.parameter([self.batch_size, self.feature_dim], ov.Type.f32, name="ontology_features")
-            weights = np.array(
-                [
-                    [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                    [0.5, 0.5, -0.25, -0.25, -0.25, 0.0],
-                    [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-                    [0.2, 0.2, 0.0, 0.0, 0.0, 0.6],
-                ],
-                dtype=np.float32,
-            )
             model = ov.Model([ops.matmul(x, ops.constant(weights), False, False)], [x], "ontology_npu_classifier")
             core = ov.Core()
             requested = os.getenv("ONTOLOGY_CLASSIFIER_DEVICE", os.getenv("OPENVINO_DEVICE", "NPU"))
@@ -135,6 +129,30 @@ class OntologyNpuClassifier:
                 self._backend = "CPU"
                 self._fallback_reason = f"{requested} compile failed: {exc}"
             return self._compiled
+
+
+class _NumpyLinearModel:
+    def __init__(self, weights: np.ndarray) -> None:
+        self.weights = weights
+
+    def __call__(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
+        return [inputs[0] @ self.weights]
+
+
+def _linear_weights() -> np.ndarray:
+    return np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.5, -0.25, -0.25, -0.25, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            [0.2, 0.2, 0.0, 0.0, 0.0, 0.6],
+        ],
+        dtype=np.float32,
+    )
 
 
 def _features(market: MarketSnapshot, indicator: IndicatorSnapshot) -> tuple[float, ...]:

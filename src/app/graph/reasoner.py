@@ -11,17 +11,30 @@ SUPPORT_WEIGHTS = {
     "ProfitabilityQuality": 0.14,
     "PositiveEventImpact": 0.10,
     "PositiveInvestorFlow": 0.10,
+    "InformedOrderFlowImbalance": 0.13,
+    "ForeignInstitutionJointBuying": 0.12,
+    "RetailSupplyAbsorbedByInformedFlow": 0.10,
+    "OrderFlowPriceConfirmation": 0.09,
+    "SuspectedSmartMoneyAccumulation": 0.08,
+    "OrderFlowConfirmedBuyCandidate": 0.10,
     "SectorMomentum": 0.08,
 }
 CONTRADICTION_WEIGHTS = {
     "ValuationDiscipline": 0.12,
     "ValuationSlightlyHigh": 0.10,
+    "InformedOrderFlowDistribution": 0.15,
+    "ForeignInstitutionJointSelling": 0.13,
+    "RetailDemandMeetsInformedSelling": 0.11,
+    "OrderFlowPriceDivergence": 0.10,
+    "SuspectedSmartMoneyDistribution": 0.12,
 }
 RISK_WEIGHTS = {
     "MacroRateRisk": 0.14,
     "VolatilityRisk": 0.18,
     "NegativeEventRisk": 0.18,
     "LiquidityRisk": 0.20,
+    "OrderFlowDistributionRisk": 0.16,
+    "ThinLiquidityPriceImpactRisk": 0.14,
 }
 
 
@@ -67,16 +80,23 @@ class OntologyReasoner:
         subjects = {triple.subject for triple in self.graph.triples()}
         for subject in subjects:
             support_objects = set(self.graph.objects(subject, "supportsSignal"))
+            contra_objects = set(self.graph.objects(subject, "contradictsSignal"))
             risk_objects = set(self.graph.objects(subject, "increasesRiskOf"))
             if {"EarningsGrowth", "ProfitabilityQuality"}.issubset(support_objects):
                 self.graph.add(subject, "supportsSignal", "BuyCandidate", "reasoner:growth-quality")
             if "BuyCandidate" in support_objects and "MacroRateRisk" in risk_objects:
                 self.graph.add(subject, "contradictsSignal", "AggressiveBuy", "reasoner:macro-risk")
+            if {"InformedOrderFlowImbalance", "OrderFlowPriceConfirmation"}.issubset(support_objects):
+                self.graph.add(subject, "supportsSignal", "OrderFlowConfirmedBuyCandidate", "reasoner:ofi-price-impact")
+            if "InformedOrderFlowDistribution" in contra_objects:
+                self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:ofi-distribution")
 
     def _infer_risk_adjustments(self) -> None:
         for triple in self.graph.matching(predicate="increasesRiskOf"):
             if triple.object in {"MacroRateRisk", "VolatilityRisk", "NegativeEventRisk"}:
                 self.graph.add(triple.subject, "supportsSignal", "RiskAdjustedSizing", "reasoner:risk-sizing")
+            if triple.object in {"OrderFlowDistributionRisk", "ThinLiquidityPriceImpactRisk"}:
+                self.graph.add(triple.subject, "supportsSignal", "RiskAdjustedSizing", "reasoner:flow-risk-sizing")
 
 
 def _format_triples(triples: tuple[Triple, ...]) -> tuple[str, ...]:

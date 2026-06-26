@@ -33,7 +33,7 @@ Detailed flow:
 6. Indicator engines calculate interpretable metrics.
 7. The ontology layer links companies, sectors, tickers, indicators, events, time buckets, risks, tuning modes, and signals.
 8. The ontology reasoner infers buy candidates, risk-adjusted sizing, contradictions, and reasoning paths.
-9. Strategy modules produce `StrategySignal` and `OrderIntent` records.
+9. Strategy modules combine indicator, ontology, and domestic investor-flow evidence to produce `StrategySignal` and `OrderIntent` records.
 10. `RiskManager` validates each intent against hard rules.
 11. Approved intents can become mock KIS orders, hypothetical test records, or streaming-simulation trades only.
 12. Audit logging records inputs, mode changes, refreshes, decisions, rejections, and outputs.
@@ -121,6 +121,16 @@ Classifies official API, RSS, disclosure, HTML, dynamic-page, and news data into
 
 Uses typed indicators and graph relationships to generate explainable signals and order intents. It must separate facts, assumptions, inferred relationships, and conclusions.
 
+For domestic stocks, the ontology layer also evaluates investor-flow records when they are available. KRX-style foreign, institutional, and individual net buying/selling are normalized by trading value and converted into ontology evidence. The formulas are intentionally transparent:
+
+- `imbalance_g = net_buy_g / trading_value`
+- `informed_imbalance = 0.55 * foreign + 0.45 * institution - 0.20 * retail + 0.15 * program`
+- `retail_absorption = -retail * (0.55 * foreign + 0.45 * institution)`
+- `kyle_lambda_proxy = price_change_rate / total_imbalance`, only when imbalance is large enough to avoid division noise
+- `signed_impact_efficiency = price_change_rate * informed_imbalance`
+
+The graph stores these as `hasFlowMetric` triples and then emits semantic evidence such as `InformedOrderFlowImbalance`, `RetailSupplyAbsorbedByInformedFlow`, `OrderFlowPriceConfirmation`, or distribution/risk counterparts. Unusual volume/program-pressure patterns are labeled only as `SUSPECTED_SMART_MONEY`; this is a cautious inference, not a confirmed investor identity. These adjustments remain advisory and still flow through `OrderIntent -> RiskManager -> FinalOrder`.
+
 ### Goal-Directed Planner
 
 Uses the selected target return and target period to create a goal execution plan. It may rank BUY, SELL, REDUCE, and HOLD signals, but every generated intent still has to pass `RiskManager`.
@@ -129,7 +139,7 @@ Uses the selected target return and target period to create a goal execution pla
 
 ### Candidate Filter
 
-`ontology_filter_1` evaluates lightweight snapshots before chart-heavy analysis. It rejects halted, management-status, illiquid, or very low-liquidity names. It ranks candidates using liquidity score, volume change, price momentum, foreign/institution buying, and breakout flags.
+`ontology_filter_1` evaluates lightweight snapshots before chart-heavy analysis. It rejects halted, management-status, illiquid, or very low-liquidity names. It ranks candidates using liquidity score, volume change, price momentum, foreign/institution/retail flow, suspected smart-money accumulation/distribution, and breakout flags.
 
 ### Risk Manager
 

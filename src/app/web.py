@@ -2390,7 +2390,7 @@ HTML = """
         </section>
         <section class="ontology-scene ontology-wide-layout">
           <div class="ontology-toolbar">
-            <span class="ontology-badge">2D 온톨로지 네트워크</span>
+            <span class="ontology-badge">3D 온톨로지 네트워크</span>
             <span class="ontology-badge" id="ontologyCounts">노드 - · 관계 -</span>
             <button id="resetGraph" type="button">시점 초기화</button>
             <button id="toggleLabels" type="button">라벨 켜기</button>
@@ -3464,20 +3464,19 @@ HTML = """
     async function renderOntologyGraph(data) {
       const canvas = document.getElementById('ontologyCanvas');
       const tooltip = document.getElementById('ontologyTooltip');
-      renderOntologyGraph2d(data, canvas, tooltip);
-      return;
       const THREE = await loadThree();
       if (!THREE) {
+        renderOntologyGraph2d(data, canvas, tooltip);
         tooltip.style.display = 'block';
         tooltip.style.left = '12px';
         tooltip.style.top = '52px';
-        tooltip.textContent = '3D 라이브러리를 불러오지 못했습니다.';
+        tooltip.textContent = '3D 라이브러리를 불러오지 못해 2D로 표시합니다.';
         return;
       }
 
       if (graphState) {
         graphState.stop = true;
-        graphState.renderer.dispose();
+        if (graphState.renderer) graphState.renderer.dispose();
       }
 
       const scene = new THREE.Scene();
@@ -4075,7 +4074,6 @@ HTML = """
     function computeGraphLayout(rawNodes, rawLinks) {
       const nodes = rawNodes.map((node, index) => ({ ...node, index }));
       if (!nodes.length) return nodes;
-      return computeSemanticLayout(nodes, rawLinks);
       if (nodes.length > 700) return computeFastClusterLayout(nodes, rawLinks);
 
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
@@ -4091,12 +4089,17 @@ HTML = """
 
       const anchors = {
         ticker: [0, 0, 0],
-        support: [-130, 80, 70],
-        risk: [145, 70, -60],
-        contradiction: [170, -65, 80],
-        sector: [-150, -95, -80],
-        entity: [10, -145, 95],
-        event: [20, 125, -95],
+        support: [-130, 95, 95],
+        risk: [155, 90, -95],
+        contradiction: [160, -85, 115],
+        sector: [-165, -105, -100],
+        entity: [0, -165, 120],
+        event: [-15, 150, -125],
+        temporal: [-95, -155, 20],
+        pipeline: [145, -130, -35],
+        tuning: [135, 20, 150],
+        parameter: [205, -35, 125],
+        metric: [215, 115, 25],
       };
       const positions = new Map();
       const velocities = new Map();
@@ -4337,14 +4340,19 @@ HTML = """
         degreeMap.set(link.source, (degreeMap.get(link.source) || 0) + 1);
         degreeMap.set(link.target, (degreeMap.get(link.target) || 0) + 1);
       }
-      const rings = {
-        support: { radius: 85, z: 50, offset: 0.0 },
-        risk: { radius: 135, z: -45, offset: 0.8 },
-        contradiction: { radius: 175, z: 80, offset: 1.6 },
-        sector: { radius: 215, z: -85, offset: 2.4 },
-        ticker: { radius: 285, z: 0, offset: 3.0 },
-        event: { radius: 340, z: -125, offset: 3.8 },
-        entity: { radius: 390, z: 120, offset: 4.6 },
+      const shells = {
+        ticker: { center: [0, 0, 0], radius: 245, xScale: 1.18, yScale: 0.88, zScale: 0.92, offset: 0.2 },
+        support: { center: [-135, 90, 120], radius: 95, xScale: 0.95, yScale: 0.85, zScale: 1.25, offset: 0.9 },
+        risk: { center: [145, 90, -115], radius: 115, xScale: 1.0, yScale: 0.9, zScale: 1.18, offset: 1.7 },
+        contradiction: { center: [155, -90, 125], radius: 125, xScale: 0.95, yScale: 0.95, zScale: 1.22, offset: 2.5 },
+        sector: { center: [-180, -115, -105], radius: 130, xScale: 1.05, yScale: 0.86, zScale: 1.08, offset: 3.1 },
+        event: { center: [-10, 165, -145], radius: 165, xScale: 1.22, yScale: 0.72, zScale: 1.28, offset: 3.8 },
+        temporal: { center: [-110, -170, 35], radius: 110, xScale: 0.8, yScale: 0.95, zScale: 1.3, offset: 4.3 },
+        pipeline: { center: [140, -150, -45], radius: 105, xScale: 0.9, yScale: 0.9, zScale: 1.25, offset: 4.8 },
+        tuning: { center: [135, 20, 165], radius: 105, xScale: 0.85, yScale: 0.85, zScale: 1.3, offset: 5.2 },
+        parameter: { center: [215, -45, 135], radius: 95, xScale: 0.75, yScale: 0.9, zScale: 1.2, offset: 5.6 },
+        metric: { center: [225, 115, 30], radius: 100, xScale: 0.82, yScale: 0.9, zScale: 1.12, offset: 6.0 },
+        entity: { center: [0, -165, 130], radius: 165, xScale: 1.15, yScale: 0.78, zScale: 1.22, offset: 6.4 },
       };
       const grouped = new Map();
       for (const node of nodes) {
@@ -4352,18 +4360,26 @@ HTML = """
         grouped.get(node.kind).push(node);
       }
       const positioned = [];
+      const goldenAngle = Math.PI * (3 - Math.sqrt(5));
       for (const [kind, group] of grouped.entries()) {
-        const ring = rings[kind] || rings.entity;
+        const shell = shells[kind] || shells.entity;
         group.sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0));
         group.forEach((node, index) => {
-          const angle = ring.offset + index * Math.PI * 2 / Math.max(1, group.length);
-          const radius = ring.radius + (seededUnit(`${node.id}:radius`) - 0.5) * 36;
+          const t = group.length === 1 ? 0.5 : (index + 0.5) / group.length;
+          const zUnit = 1 - 2 * t;
+          const radial = Math.sqrt(Math.max(0, 1 - zUnit * zUnit));
+          const angle = shell.offset + index * goldenAngle + seededUnit(`${node.id}:angle`) * 0.38;
+          const degree = degreeMap.get(node.id) || 0;
+          const importance = Math.min(1, Math.log1p(Math.max(0, Number(node.importance_score || 0))) / 5.2);
+          const corePull = Math.min(0.42, degree * 0.018 + importance * 0.22);
+          const radius = shell.radius * (1 - corePull) + seededUnit(`${node.id}:radius`) * 52;
+          const [cx, cy, cz] = shell.center;
           positioned.push({
             ...node,
             position: [
-              Math.cos(angle) * radius,
-              Math.sin(angle) * radius,
-              ring.z + (seededUnit(`${node.id}:zfast`) - 0.5) * 120,
+              cx + Math.cos(angle) * radial * radius * shell.xScale,
+              cy + Math.sin(angle) * radial * radius * shell.yScale,
+              cz + zUnit * radius * shell.zScale + (seededUnit(`${node.id}:zfast`) - 0.5) * 42,
             ],
           });
         });
