@@ -19,7 +19,12 @@ DEFAULT_TRADING_COST_CONFIG: dict[str, Any] = {
     "spread": {"default_spread_rate": 0.0},
     "market_impact": {"default_market_impact_rate": 0.0},
     "safety_margin": {"default_safety_margin_rate": 0.001},
-    "gate": {"max_cost_to_alpha_ratio": 0.5, "default_target_net_return": 0.0},
+    "gate": {
+        "max_cost_to_alpha_ratio": 0.5,
+        "default_target_net_return": 0.0,
+        "max_spread_rate": 0.003,
+        "max_slippage_rate": 0.003,
+    },
 }
 
 

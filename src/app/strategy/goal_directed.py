@@ -206,15 +206,21 @@ def _build_goal_intents(
                 suggested_weight = min(max_goal_weight, max(0.01, signal.confidence * 0.04 + rank_bonus * 0.004))
             if "InformedOrderFlowImbalance" in signal.supporting_factors:
                 suggested_weight = min(max_goal_weight, suggested_weight * 1.08)
+            gross_expected_return = max(0.01, min(0.12, goal.target_return_rate + max(0.0, signal.score) * 0.004))
+            expected_exit_price = market.last_price * (1 + gross_expected_return)
         elif signal.action == OrderAction.REDUCE:
             if current_weight <= 0:
                 continue
             reduction_ratio = 0.70 if any("OrderFlow" in item or "Selling" in item for item in signal.contradicting_factors) else 0.50
             suggested_weight = max(0.0, current_weight * reduction_ratio)
+            gross_expected_return = None
+            expected_exit_price = None
         else:
             if current_weight <= 0:
                 continue
             suggested_weight = 0.0
+            gross_expected_return = None
+            expected_exit_price = None
 
         intents.append(
             OrderIntent(
@@ -232,6 +238,18 @@ def _build_goal_intents(
                 supporting_factors=signal.supporting_factors,
                 contradicting_factors=signal.contradicting_factors,
                 source_data_ids=indicator.source_ids if indicator is not None else (market.source.source_id or market.ticker,),
+                strategy_family="goal_directed",
+                signal_name=f"goal_{signal.action.value.lower()}",
+                expected_exit_price=expected_exit_price,
+                expected_holding_minutes=max(1, goal.period_days * 390),
+                gross_expected_return=gross_expected_return,
+                target_net_return=0.0 if signal.action == OrderAction.BUY else None,
+                ontology_tags=tuple(signal.supporting_factors),
+                strategy_metadata={
+                    "score": signal.score,
+                    "goal_target_return_rate": goal.target_return_rate,
+                    "goal_period_days": goal.period_days,
+                },
             )
         )
 

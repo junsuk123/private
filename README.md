@@ -96,6 +96,16 @@ Trading-cost defaults live in `config/trading_costs.json`. The default domestic-
 
 The ontology graph exposes this path as `TradingCost -> BreakEvenReturn/NetExpectedReturn -> NetProfitability -> FinalTradeGate`, so the visualization can show how fees, tax, slippage, spread, and market impact affect final approval.
 
+## Short-Horizon Strategy Research Mode
+
+Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.
+
+These modules produce `StrategyCandidate` records, not executable orders. Candidates must pass `TradingCostEngine`, ontology risk semantics, `RealityCheckValidator` where required, and the deterministic `RiskManager`/FinalTradeGate path before any order intent can be considered. The default execution mode is `paper_trading`; `live_trading_enabled` is `false`.
+
+The short-horizon strategies are research infrastructure for paper trading and dry runs. They do not guarantee profits, and passing a backtest or reality check does not imply future performance.
+
+See `docs/short_term_trading_strategy_design.md` for the full design.
+
 Optional in-process local LLM setup:
 
 ```powershell

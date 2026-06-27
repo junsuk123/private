@@ -20,10 +20,14 @@ def build_semantic_feature_graph(
         graph.add(feature_node, feature.semantic_relation, feature.target_signal or feature.feature_name, feature.feature_name)
         if feature.semantic_relation == "increasesRiskOf":
             graph.add(feature.ticker, "increasesRiskOf", feature.feature_name, feature.feature_name)
+            if feature.target_signal == "TradeForbidden":
+                graph.add(feature.ticker, "increasesRiskOf", "TradeForbidden", feature.feature_name)
         elif feature.semantic_relation == "contradictsSignal":
             graph.add(feature.ticker, "contradictsSignal", feature.target_signal or feature.feature_name, feature.feature_name)
         elif feature.semantic_relation == "decreasesRiskOf":
             graph.add(feature.ticker, "decreasesRiskOf", feature.feature_name, feature.feature_name)
         else:
             graph.add(feature.ticker, "supportsSignal", feature.target_signal or feature.feature_name, feature.feature_name)
+            if feature.target_signal == "TradeAllowed":
+                graph.add(feature.ticker, "supportsSignal", "TradeAllowed", feature.feature_name)
     return graph

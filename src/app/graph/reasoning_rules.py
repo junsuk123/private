@@ -5,9 +5,27 @@ from datetime import datetime
 
 from app.features.schemas import ReasoningPathRecord, SemanticFeatureRecord
 
-POSITIVE_SIGNALS = {"BuyCandidate", "HoldWithTrailingStop", "BreakoutWatch", "Watchlist"}
+POSITIVE_SIGNALS = {
+    "BuyCandidate",
+    "HoldWithTrailingStop",
+    "BreakoutWatch",
+    "Watchlist",
+    "TradeAllowed",
+}
 NEGATIVE_SIGNALS = {"AggressiveBuy"}
-RISK_SIGNALS = {"SellCandidate", "ReduceRiskCandidate", "RiskAdjustedSizing", "WaitOrTakeProfit"}
+RISK_SIGNALS = {
+    "SellCandidate",
+    "ReduceRiskCandidate",
+    "RiskAdjustedSizing",
+    "WaitOrTakeProfit",
+    "TradeForbidden",
+}
+HARD_RISK_FEATURES = {
+    "CostBurdenHigh",
+    "SpreadTooWide",
+    "SlippageRiskHigh",
+    "NoOutOfSampleValidation",
+}
 
 
 def build_semantic_reasoning_paths(
@@ -58,8 +76,12 @@ def build_semantic_reasoning_paths(
 
 
 def _select_signal(confidence: float, positive: tuple[str, ...], risk: tuple[str, ...]) -> str:
+    if any(feature in HARD_RISK_FEATURES for feature in risk):
+        return "TradeForbidden"
     if risk and confidence < 0.45:
         return "ReduceRiskCandidate"
+    if "CostEfficientTrade" in positive and len(positive) >= 2 and not risk:
+        return "TradeAllowed"
     if len(positive) >= 3 and confidence >= 0.55:
         return "BuyCandidate"
     if "BollingerSqueeze" in positive:

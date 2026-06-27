@@ -36,6 +36,8 @@ class RiskManager:
         report = build_portfolio_report(account)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
+        metadata: dict[str, object] = {}
+        rejection_log: list[dict[str, object]] = []
 
         checks["llm_direct_order_execution_blocked"] = (
             not self.rules.llm_direct_order_execution_allowed
@@ -58,6 +60,17 @@ class RiskManager:
             and not self.rules.leverage_etf_allowed
             and not self.rules.credit_loan_allowed
         )
+        checks["expected_exit_price_present"] = (
+            intent.action != OrderAction.BUY
+            or (intent.expected_exit_price is not None and intent.expected_exit_price > 0)
+        )
+        checks["strategy_family_present"] = intent.action != OrderAction.BUY or bool(intent.strategy_family)
+        checks["live_validation_id_present"] = (
+            not self.rules.live_trading_enabled
+            or intent.action != OrderAction.BUY
+            or bool(intent.validation_id)
+        )
+        checks["ontology_trade_not_forbidden"] = "TradeForbidden" not in set(intent.ontology_tags)
         source = market.source
         source_type = source.source_type or infer_source_type(source.source_name, source.raw_url)
         source_trust = source.trust_level if source.trust_level > 0 else default_trust_level(source_type)
@@ -117,37 +130,117 @@ class RiskManager:
 
         for check, ok in checks.items():
             if not ok:
-                reasons.append(check)
+                reason = _reason_for_failed_check(check)
+                _add_rejection(reasons, rejection_log, reason, check)
+                if check == "live_validation_id_present":
+                    _add_rejection(reasons, rejection_log, "REALITY_CHECK_NOT_PASSED", check)
 
         final_order = None
-        metadata: dict[str, object] = {}
         approved = not reasons
         if approved and intent.action == OrderAction.BUY:
             spend = max(0.0, target_value - current_value)
             quantity = floor(spend / market.last_price)
             if quantity > 0:
+                orderbook_snapshot = intent.strategy_metadata.get("orderbook_snapshot")
                 cost = self.cost_engine.estimate(
                     symbol=intent.ticker,
                     market=intent.market,
                     venue="KRX",
                     instrument_type=_instrument_type_for_market(market),
                     entry_price=market.last_price,
-                    expected_exit_price=market.last_price * (1 + max(0.0, intent.confidence * 0.012)),
+                    expected_exit_price=float(intent.expected_exit_price),
                     quantity=quantity,
-                    target_net_return=0.0,
+                    target_net_return=intent.target_net_return or 0.0,
+                    orderbook_snapshot=orderbook_snapshot if isinstance(orderbook_snapshot, dict) else None,
                     average_daily_trading_value=market.average_daily_trading_value,
                 )
                 metadata["cost_breakdown"] = cost.as_dict()
+                metadata["validation_required"] = not bool(intent.validation_id)
+                target_net_return = intent.target_net_return or 0.0
+                policy = self.cost_engine.policy_for(venue="KRX", instrument_type=_instrument_type_for_market(market))
+                notional = max(1e-9, cost.entry_price * cost.quantity)
+                spread_rate = cost.spread_cost / notional
+                slippage_rate = cost.slippage_cost / notional
+                max_spread_rate = _cost_gate_float(self.cost_engine, "max_spread_rate", 0.003)
+                max_slippage_rate = _cost_gate_float(self.cost_engine, "max_slippage_rate", 0.003)
                 checks["cost_adjusted_cash_available"] = (
                     spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost
                     <= account.cash
                 )
-                checks["net_profitability_check"] = cost.tradable
+                checks["net_profitability_check"] = cost.net_expected_return > 0
+                checks["target_net_return_check"] = cost.net_expected_return >= target_net_return
+                checks["break_even_with_margin_check"] = (
+                    cost.gross_expected_return >= cost.break_even_return + policy.safety_margin_rate
+                )
+                checks["cost_to_alpha_check"] = cost.cost_to_alpha_ratio <= policy.max_cost_to_alpha_ratio
+                checks["spread_risk_check"] = spread_rate <= max_spread_rate
+                checks["slippage_risk_check"] = slippage_rate <= max_slippage_rate
                 if not checks["cost_adjusted_cash_available"]:
-                    reasons.append("cost_adjusted_cash_available")
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "cost_adjusted_cash_available",
+                        "cost_adjusted_cash_available",
+                        {"required_cash": spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost},
+                    )
                     approved = False
                 if not checks["net_profitability_check"]:
-                    reasons.append(cost.reject_reason or "net_profitability_check")
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        cost.reject_reason or "NET_RETURN_NOT_POSITIVE",
+                        "net_profitability_check",
+                        {"net_expected_return": cost.net_expected_return},
+                    )
+                    approved = False
+                if not checks["target_net_return_check"]:
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "BELOW_TARGET_NET_RETURN_AFTER_COST",
+                        "target_net_return_check",
+                        {"net_expected_return": cost.net_expected_return, "target_net_return": target_net_return},
+                    )
+                    approved = False
+                if not checks["break_even_with_margin_check"]:
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "BELOW_BREAK_EVEN_WITH_MARGIN",
+                        "break_even_with_margin_check",
+                        {
+                            "gross_expected_return": cost.gross_expected_return,
+                            "break_even_return": cost.break_even_return,
+                            "safety_margin_rate": policy.safety_margin_rate,
+                        },
+                    )
+                    approved = False
+                if not checks["cost_to_alpha_check"]:
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "COST_BURDEN_HIGH",
+                        "cost_to_alpha_check",
+                        {"cost_to_alpha_ratio": cost.cost_to_alpha_ratio, "max_cost_to_alpha_ratio": policy.max_cost_to_alpha_ratio},
+                    )
+                    approved = False
+                if not checks["spread_risk_check"]:
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "SPREAD_TOO_WIDE",
+                        "spread_risk_check",
+                        {"spread_rate": spread_rate, "max_spread_rate": max_spread_rate},
+                    )
+                    approved = False
+                if not checks["slippage_risk_check"]:
+                    _add_rejection(
+                        reasons,
+                        rejection_log,
+                        "SLIPPAGE_RISK_HIGH",
+                        "slippage_risk_check",
+                        {"slippage_rate": slippage_rate, "max_slippage_rate": max_slippage_rate},
+                    )
                     approved = False
             if approved:
                 final_order = _final_order_or_reject(intent, market, OrderSide.BUY, quantity, reasons)
@@ -155,7 +248,7 @@ class RiskManager:
         elif approved and intent.action in {OrderAction.SELL, OrderAction.REDUCE}:
             if current_value <= 0:
                 approved = False
-                reasons.append("holding_exists")
+                _add_rejection(reasons, rejection_log, "holding_exists", "holding_exists")
             else:
                 sell_value = current_value if intent.action == OrderAction.SELL else max(0.0, current_value - target_value)
                 quantity = floor(sell_value / market.last_price)
@@ -163,8 +256,13 @@ class RiskManager:
                 approved = final_order is not None
         elif approved:
             approved = False
-            reasons.append("action_requires_no_order")
+            _add_rejection(reasons, rejection_log, "action_requires_no_order", "action_requires_no_order")
 
+        for reason in reasons:
+            if not any(item.get("reason") == reason for item in rejection_log):
+                rejection_log.append({"reason": reason, "check": "final_order"})
+        if reasons:
+            metadata["rejection_log"] = tuple(rejection_log)
         return RiskManagerResult(
             ticker=intent.ticker,
             action=intent.action,
@@ -203,3 +301,34 @@ def _instrument_type_for_market(market: MarketSnapshot) -> str:
     if any(token in text for token in ("etf", "etn", "elw")):
         return "domestic_etf"
     return "domestic_stock"
+
+
+def _reason_for_failed_check(check: str) -> str:
+    return {
+        "expected_exit_price_present": "MISSING_EXPECTED_EXIT_PRICE",
+        "strategy_family_present": "MISSING_STRATEGY_FAMILY",
+        "live_validation_id_present": "MISSING_VALIDATION_ID",
+        "ontology_trade_not_forbidden": "ONTOLOGY_TRADE_FORBIDDEN",
+    }.get(check, check)
+
+
+def _add_rejection(
+    reasons: list[str],
+    rejection_log: list[dict[str, object]],
+    reason: str,
+    check: str,
+    details: dict[str, object] | None = None,
+) -> None:
+    if reason not in reasons:
+        reasons.append(reason)
+    entry: dict[str, object] = {"reason": reason, "check": check}
+    if details:
+        entry["details"] = details
+    rejection_log.append(entry)
+
+
+def _cost_gate_float(engine: TradingCostEngine, key: str, default: float) -> float:
+    try:
+        return float(engine.config.get("gate", {}).get(key, default))
+    except (TypeError, ValueError):
+        return default

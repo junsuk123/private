@@ -98,6 +98,11 @@ def test_risk_manager_records_cost_breakdown_and_blocks_unprofitable_buy() -> No
         supporting_factors=("test",),
         contradicting_factors=(),
         source_data_ids=("quote",),
+        strategy_family="unit_test",
+        signal_name="low_edge",
+        expected_exit_price=10_010,
+        expected_holding_minutes=60,
+        gross_expected_return=0.001,
     )
 
     result = RiskManager().validate(intent, AccountSnapshot(cash=10_000_000, holdings=()), market)

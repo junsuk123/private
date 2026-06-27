@@ -299,6 +299,17 @@ class OrderIntent:
     source_data_ids: tuple[str, ...]
     model_uncertainty: float | None = None
 
+    strategy_family: str | None = None
+    signal_name: str | None = None
+    expected_exit_price: float | None = None
+    expected_holding_minutes: int | None = None
+    gross_expected_return: float | None = None
+    target_net_return: float | None = None
+    validation_id: str | None = None
+    cost_breakdown: dict[str, Any] | None = None
+    ontology_tags: tuple[str, ...] = ()
+    strategy_metadata: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(frozen=True)
 class FinalOrder:

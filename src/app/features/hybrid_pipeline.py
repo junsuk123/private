@@ -8,7 +8,6 @@ from app.features.indicator_engine import IndicatorEngine
 from app.features.parameter_tuning import FormulaParameterTuner
 from app.features.schemas import FeatureSnapshot, OHLCVBar, SemanticFeatureRecord
 from app.features.semantic_feature_engine import SemanticFeatureEngine
-from app.graph.reasoning_rules import build_semantic_reasoning_paths
 
 
 @dataclass(frozen=True)
@@ -63,6 +62,8 @@ class HybridSemanticFeaturePipeline:
         if self.config.enable_text_layer and documents:
             text_features = self.text_model.predict_text(raw_indicators[-1].ticker, raw_indicators[-1].as_of, documents)
         semantic_features = _deduplicate_features(formula_features + ai_features + text_features)
+        from app.graph.reasoning_rules import build_semantic_reasoning_paths
+
         reasoning_paths = build_semantic_reasoning_paths(semantic_features)
         return FeatureSnapshot(
             ticker=raw_indicators[-1].ticker,

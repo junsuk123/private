@@ -13,6 +13,11 @@ from app.features.parameter_tuning import (
     build_parameter_context_features,
 )
 from app.features.semantic_feature_engine import SemanticFeatureEngine, SemanticMappingConfig
+from app.features.short_horizon_features import (
+    ShortHorizonFeatureBuilder,
+    ShortHorizonFeatureConfig,
+    ShortHorizonFeatures,
+)
 from app.features.schemas import (
     FeatureSnapshot,
     FormulaParameterRecommendation,
@@ -38,6 +43,9 @@ __all__ = [
     "SemanticFeatureEngine",
     "SemanticFeatureRecord",
     "SemanticMappingConfig",
+    "ShortHorizonFeatureBuilder",
+    "ShortHorizonFeatureConfig",
+    "ShortHorizonFeatures",
     "TextHeuristicSemanticModel",
     "RegimeFormulaParameterTuner",
     "build_parameter_context_features",

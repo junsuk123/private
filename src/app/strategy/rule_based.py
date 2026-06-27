@@ -110,6 +110,7 @@ def generate_order_intents(
         suggested_weight = min(0.05, max(0.01, signal.confidence * 0.05))
         if "InformedOrderFlowImbalance" in signal.supporting_factors:
             suggested_weight = min(0.05, suggested_weight * 1.08)
+        gross_expected_return = max(0.012, min(0.08, signal.score * 0.012))
 
         intents.append(
             OrderIntent(
@@ -127,6 +128,14 @@ def generate_order_intents(
                 supporting_factors=signal.supporting_factors,
                 contradicting_factors=signal.contradicting_factors,
                 source_data_ids=indicator.source_ids,
+                strategy_family="rule_based",
+                signal_name="fundamental_ontology_buy",
+                expected_exit_price=market.last_price * (1 + gross_expected_return),
+                expected_holding_minutes=360,
+                gross_expected_return=gross_expected_return,
+                target_net_return=0.0,
+                ontology_tags=tuple(signal.supporting_factors),
+                strategy_metadata={"score": signal.score},
             )
         )
 

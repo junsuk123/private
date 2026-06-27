@@ -3,14 +3,32 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from app.data.source_policy import compute_quality_score
+from app.features.schemas import OHLCVBar
+from app.features.short_horizon_features import ShortHorizonFeatures
 from app.graph.npu_classifier import OntologyNpuLinearScorer
 from app.schemas.domain import InvestorFlowSnapshot, MarketSnapshot
+from app.strategy.candidate_factory import (
+    StrategyCandidateFactory,
+    StrategyCandidateFactoryInput,
+    StrategyCandidateFactoryResult,
+    StrategyFactoryConfig,
+)
+from app.strategy.pairs_relative_value import PairRelativeValueConfig, PairRelativeValueEngine, PairUniverseBuilder
+from app.strategy.short_horizon import (
+    IntradayMomentumConfig,
+    IntradayMomentumEngine,
+    ShortTermReversalConfig,
+    ShortTermReversalEngine,
+    TechnicalRuleConfig,
+    TechnicalRuleEngine,
+)
 from app.strategy.investor_flow import assess_domestic_investor_flow
 
 logger = logging.getLogger(__name__)
@@ -95,6 +113,7 @@ class CandidateCache:
 
 
 _candidate_cache = CandidateCache()
+SHORT_HORIZON_STRATEGY_CONFIG_PATH = Path("config/short_horizon_strategies.yaml")
 
 
 def universe_from_tickers(tickers: Iterable[str]) -> tuple[UniverseStock, ...]:
@@ -361,6 +380,137 @@ def ontology_filter_1(
     return result
 
 
+def load_short_horizon_strategy_config(
+    path: Path | str = SHORT_HORIZON_STRATEGY_CONFIG_PATH,
+) -> dict[str, dict[str, Any]]:
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    return _parse_simple_yaml(config_path.read_text(encoding="utf-8"))
+
+
+def build_strategy_candidate_factory_from_config(
+    config: dict[str, dict[str, Any]] | None = None,
+) -> StrategyCandidateFactory:
+    loaded = config or load_short_horizon_strategy_config()
+    factory_cfg = loaded.get("strategy_candidate_factory", {})
+    reversal_cfg = loaded.get("short_term_reversal", {})
+    intraday_cfg = loaded.get("intraday_momentum", {})
+    technical_cfg = loaded.get("technical_rule", loaded.get("technical_breakout", {}))
+    pair_cfg = loaded.get("pair_relative_value", {})
+    return StrategyCandidateFactory(
+        StrategyFactoryConfig(
+            enabled=bool(factory_cfg.get("enabled", True)),
+            paper_only=bool(factory_cfg.get("paper_only", True)),
+            enable_short_term_reversal=bool(reversal_cfg.get("enabled", True)),
+            enable_intraday_momentum=bool(intraday_cfg.get("enabled", True)),
+            enable_technical_rule=bool(technical_cfg.get("enabled", True)),
+            enable_pair_relative_value=bool(pair_cfg.get("enabled", True)),
+            target_net_return=float(factory_cfg.get("target_net_return", 0.003)),
+            max_cost_to_alpha_ratio=float(factory_cfg.get("max_cost_to_alpha_ratio", 0.5)),
+            max_spread_rate=float(factory_cfg.get("max_spread_rate", 0.0015)),
+            min_liquidity_score=float(factory_cfg.get("min_liquidity_score", 0.5)),
+            venue=str(factory_cfg.get("venue", "KRX")),
+            market=str(factory_cfg.get("market", "KR")),
+            instrument_type=str(factory_cfg.get("instrument_type", "domestic_stock")),
+        ),
+        short_term_reversal=ShortTermReversalEngine(
+            ShortTermReversalConfig(
+                enabled=bool(reversal_cfg.get("enabled", True)),
+                paper_only=bool(reversal_cfg.get("paper_only", True)),
+                rebound_ratio=float(reversal_cfg.get("rebound_ratio", 0.35)),
+                max_rebound_cap=float(reversal_cfg.get("max_rebound_cap", 0.006)),
+                min_shock_vol_multiple=float(reversal_cfg.get("min_shock_vol_multiple", 1.2)),
+                target_net_return=float(reversal_cfg.get("target_net_return", 0.003)),
+                max_spread_rate=float(reversal_cfg.get("max_spread_rate", 0.0015)),
+                min_liquidity_score=float(reversal_cfg.get("min_liquidity_score", 0.5)),
+                expected_holding_minutes=int(reversal_cfg.get("expected_holding_minutes", 30)),
+            )
+        ),
+        intraday_momentum=IntradayMomentumEngine(
+            IntradayMomentumConfig(
+                enabled=bool(intraday_cfg.get("enabled", True)),
+                paper_only=bool(intraday_cfg.get("paper_only", True)),
+                opening_window_minutes=int(intraday_cfg.get("opening_window_minutes", 30)),
+                beta_r_open_to_late=float(intraday_cfg.get("beta_r_open_to_late", 0.25)),
+                target_net_return=float(intraday_cfg.get("target_net_return", 0.003)),
+                min_open_return=float(intraday_cfg.get("min_open_return", 0.002)),
+                min_volume_zscore=float(intraday_cfg.get("min_volume_zscore", 0.5)),
+                min_market_alignment_score=float(intraday_cfg.get("min_market_alignment_score", 0.5)),
+                requires_market_alignment=bool(intraday_cfg.get("requires_market_alignment", True)),
+                expected_holding_minutes=int(intraday_cfg.get("expected_holding_minutes", 180)),
+            )
+        ),
+        technical_rule=TechnicalRuleEngine(
+            TechnicalRuleConfig(
+                enabled=bool(technical_cfg.get("enabled", True)),
+                paper_only=bool(technical_cfg.get("paper_only", True)),
+                ma_fast=int(technical_cfg.get("ma_fast", 5)),
+                ma_slow=int(technical_cfg.get("ma_slow", 20)),
+                range_window=int(technical_cfg.get("range_window", 20)),
+                breakout_buffer=float(technical_cfg.get("breakout_buffer", 0.001)),
+                volume_multiplier=float(technical_cfg.get("volume_multiplier", 1.5)),
+                breakout_capture_ratio=float(technical_cfg.get("breakout_capture_ratio", 0.4)),
+                volatility_target=float(technical_cfg.get("volatility_target", 0.006)),
+                target_net_return=float(technical_cfg.get("target_net_return", 0.003)),
+                max_spread_rate=float(technical_cfg.get("max_spread_rate", 0.0015)),
+                min_liquidity_score=float(technical_cfg.get("min_liquidity_score", 0.5)),
+                expected_holding_minutes=int(technical_cfg.get("expected_holding_minutes", 60)),
+            )
+        ),
+        pair_relative_value=PairRelativeValueEngine(
+            PairRelativeValueConfig(
+                enabled=bool(pair_cfg.get("enabled", True)),
+                paper_only=bool(pair_cfg.get("paper_only", True)),
+                formation_window_days=int(pair_cfg.get("formation_window_days", 60)),
+                trading_window_days=int(pair_cfg.get("trading_window_days", 20)),
+                max_pair_distance=float(pair_cfg.get("max_pair_distance", 0.15)),
+                spread_z_entry=float(pair_cfg.get("spread_z_entry", -2.0)),
+                convergence_ratio=float(pair_cfg.get("convergence_ratio", 0.4)),
+                target_net_return=float(pair_cfg.get("target_net_return", 0.004)),
+                min_liquidity_score=float(pair_cfg.get("min_liquidity_score", 0.5)),
+                max_spread_rate=float(pair_cfg.get("max_spread_rate", 0.0015)),
+                expected_holding_minutes=int(pair_cfg.get("expected_holding_minutes", 7200)),
+            )
+        ),
+        pair_universe_builder=PairUniverseBuilder(
+            PairRelativeValueConfig(
+                enabled=bool(pair_cfg.get("enabled", True)),
+                formation_window_days=int(pair_cfg.get("formation_window_days", 60)),
+                trading_window_days=int(pair_cfg.get("trading_window_days", 20)),
+                max_pair_distance=float(pair_cfg.get("max_pair_distance", 0.15)),
+            )
+        ),
+    )
+
+
+def generate_short_horizon_strategy_candidates(
+    *,
+    features_by_ticker: dict[str, ShortHorizonFeatures],
+    price_history_by_ticker: dict[str, tuple[OHLCVBar, ...]] | None = None,
+    entry_prices: dict[str, float] | None = None,
+    mode: str | None = None,
+    config: dict[str, dict[str, Any]] | None = None,
+) -> StrategyCandidateFactoryResult:
+    loaded = config or load_short_horizon_strategy_config()
+    execution = loaded.get("execution", {})
+    requested_mode = mode or str(execution.get("default_mode", "paper_trading"))
+    live_enabled = bool(execution.get("live_trading_enabled", False))
+    if requested_mode == "live_trading" and not live_enabled:
+        logger.warning("short_horizon_factory_live_blocked defaulting to no candidates")
+        return StrategyCandidateFactoryResult(candidates=(), filtered_candidates=())
+    trading_mode = "paper" if requested_mode in {"paper", "paper_trading", "dry_run"} else requested_mode
+    factory = build_strategy_candidate_factory_from_config(loaded)
+    return factory.build(
+        StrategyCandidateFactoryInput(
+            features_by_ticker=features_by_ticker,
+            price_history_by_ticker=price_history_by_ticker or {},
+            entry_prices=entry_prices or {},
+        ),
+        trading_mode=trading_mode,
+    )
+
+
 def _rank_accepted_with_npu(
     snapshots: tuple[LightweightMarketSnapshot, ...],
     accepted_tickers: tuple[str, ...],
@@ -490,3 +640,38 @@ def _pipeline_source():
 def _stable_unit(value: str) -> float:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") / float(2**64 - 1)
+
+
+def _parse_simple_yaml(text: str) -> dict[str, dict[str, Any]]:
+    parsed: dict[str, dict[str, Any]] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not line.startswith(" ") and line.endswith(":"):
+            current = line[:-1].strip()
+            parsed[current] = {}
+            continue
+        if current is None or ":" not in line:
+            continue
+        key, value = line.strip().split(":", 1)
+        parsed[current][key.strip()] = _parse_yaml_scalar(value.strip())
+    return parsed
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    if value in {"true", "True"}:
+        return True
+    if value in {"false", "False"}:
+        return False
+    if value in {"null", "None", "~"}:
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    try:
+        if any(part in value.lower() for part in (".", "e")):
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
