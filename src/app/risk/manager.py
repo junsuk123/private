@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from math import floor
 
+from app.cost import TradingCostEngine
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report
 from app.schemas.domain import (
@@ -21,6 +22,7 @@ from app.schemas.domain import (
 class RiskManager:
     def __init__(self, rules: RiskRules | None = None) -> None:
         self.rules = rules or RiskRules()
+        self.cost_engine = TradingCostEngine()
 
     def validate(
         self,
@@ -118,12 +120,38 @@ class RiskManager:
                 reasons.append(check)
 
         final_order = None
+        metadata: dict[str, object] = {}
         approved = not reasons
         if approved and intent.action == OrderAction.BUY:
             spend = max(0.0, target_value - current_value)
             quantity = floor(spend / market.last_price)
-            final_order = _final_order_or_reject(intent, market, OrderSide.BUY, quantity, reasons)
-            approved = final_order is not None
+            if quantity > 0:
+                cost = self.cost_engine.estimate(
+                    symbol=intent.ticker,
+                    market=intent.market,
+                    venue="KRX",
+                    instrument_type=_instrument_type_for_market(market),
+                    entry_price=market.last_price,
+                    expected_exit_price=market.last_price * (1 + max(0.0, intent.confidence * 0.012)),
+                    quantity=quantity,
+                    target_net_return=0.0,
+                    average_daily_trading_value=market.average_daily_trading_value,
+                )
+                metadata["cost_breakdown"] = cost.as_dict()
+                checks["cost_adjusted_cash_available"] = (
+                    spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost
+                    <= account.cash
+                )
+                checks["net_profitability_check"] = cost.tradable
+                if not checks["cost_adjusted_cash_available"]:
+                    reasons.append("cost_adjusted_cash_available")
+                    approved = False
+                if not checks["net_profitability_check"]:
+                    reasons.append(cost.reject_reason or "net_profitability_check")
+                    approved = False
+            if approved:
+                final_order = _final_order_or_reject(intent, market, OrderSide.BUY, quantity, reasons)
+                approved = final_order is not None
         elif approved and intent.action in {OrderAction.SELL, OrderAction.REDUCE}:
             if current_value <= 0:
                 approved = False
@@ -145,6 +173,7 @@ class RiskManager:
             checks=checks,
             rejection_reasons=tuple(reasons),
             final_order=final_order,
+            metadata=metadata,
         )
 
 
@@ -167,3 +196,10 @@ def _final_order_or_reject(
         limit_price=market.last_price,
         manual_approval_required=True,
     )
+
+
+def _instrument_type_for_market(market: MarketSnapshot) -> str:
+    text = f"{market.ticker} {market.company_name} {market.sector}".lower()
+    if any(token in text for token in ("etf", "etn", "elw")):
+        return "domestic_etf"
+    return "domestic_stock"

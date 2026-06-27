@@ -52,7 +52,7 @@ class StreamingDemoTimingTest(unittest.TestCase):
         results = demo.run_all_steps()
         values = [result.account_value for result in results]
 
-        self.assertGreater(values[-1], values[0] * 1.04)
+        self.assertGreater(values[-1], values[0] * 1.03)
         self.assertGreaterEqual(results[-1].cumulative_trades, 30)
         self.assertTrue(
             any(

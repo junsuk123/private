@@ -33,6 +33,7 @@ Implemented capabilities include:
 - Rule-based and goal-directed strategy signal generation
 - Deterministic risk validation
 - KIS paper-trading boundary and local paper-trading loop
+- KIS/BanKIS trading-cost model for fees, sell tax, slippage, spread, break-even return, and net profitability checks
 - Realtime learning and paper-trading evaluation artifacts under `data/models`
 - Audit logging and diagnostics endpoints
 - Recursive audit redaction for credentials, tokens, account numbers, and broker secrets
@@ -86,6 +87,14 @@ Safe defaults:
 The adapter follows the current KIS guide pattern: `/oauth2/tokenP` for access tokens, `/uapi/hashkey` before cash-order POSTs, and the new domestic cash-order TR IDs `TTTC0011U`/`TTTC0012U` for live and `VTTC0011U`/`VTTC0012U` for paper. Keep token issuance and order calls on the same base URL; mixing paper and live domains will fail at the KIS gateway.
 
 Secrets are loaded automatically from the ignored local file `config/secrets/kis_api_keys.env` when the KIS client starts. Copy `config/secrets/kis_api_keys.env.example` and keep real values out of Git. Use `python scripts/check_kis_connection.py` for a token-only check, or add `--account` for the read-only balance endpoint.
+
+## Trading Costs And Net Profitability
+
+Trading-cost defaults live in `config/trading_costs.json`. The default domestic-stock profile models KRX/NXT brokerage fees, Korean sell-side transaction tax, slippage, bid-ask spread, market-impact reserve, and a safety margin. ETF/ETN/ELW defaults use the separate fee/tax profile in the same file.
+
+`TradingCostEngine` estimates gross return, total cost, break-even return, required exit price, net expected profit, net expected return, and cost-to-alpha ratio. `RiskManager` records the cost breakdown on BUY validations and blocks trades whose expected net return is not positive after costs. Backtesting and streaming paper-trading cash flows also deduct domestic trade costs and record `trading_cost` plus `net_value` on each simulated trade.
+
+The ontology graph exposes this path as `TradingCost -> BreakEvenReturn/NetExpectedReturn -> NetProfitability -> FinalTradeGate`, so the visualization can show how fees, tax, slippage, spread, and market impact affect final approval.
 
 Optional in-process local LLM setup:
 

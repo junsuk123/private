@@ -25,8 +25,10 @@ from app.backtesting.accelerated_demo import (
     _indicators_at,
     _markets_at,
     _prices_at,
+    _simulated_trade_cost,
     _to_jsonable,
 )
+from app.cost import TradingCostEngine
 from app.backtesting.time_scaler import TimeMode, TimeScaler, TimeScalerConfig
 from app.goals import NegotiatedGoal
 from app.graph import OntologyReasoner
@@ -164,6 +166,7 @@ class StreamingAcceleratedDemo:
     _capital_cycle_index: int = field(default=1, init=False, repr=False)
     _capital_cycle_seed: float = field(default=0.0, init=False, repr=False)
     _capital_cycle_start_equity: float = field(default=0.0, init=False, repr=False)
+    _cost_engine: TradingCostEngine = field(default_factory=TradingCostEngine, init=False, repr=False)
 
     def _warmup_steps(self) -> int:
         return min(15, max(0, len(self._timestamps) - 1))
@@ -194,7 +197,7 @@ class StreamingAcceleratedDemo:
             target_count=target_count,
             cache_key=f"streaming:{self.seed}:{len(universe_tickers)}:{target_count}",
         )
-        tickers = self._candidate_selection.candidate_stocks or tuple(universe_tickers[: min(20, len(universe_tickers))])
+        tickers = tuple(universe_tickers) if self.tickers else self._candidate_selection.candidate_stocks or tuple(universe_tickers[: min(20, len(universe_tickers))])
         if not self.tickers and len(tickers) < 5:
             seen = set(tickers)
             tickers = tuple(tickers) + tuple(ticker for ticker in DEMO_TICKERS if ticker not in seen)[: 5 - len(tickers)]
@@ -211,6 +214,7 @@ class StreamingAcceleratedDemo:
         self._capital_cycle_index = 1
         self._capital_cycle_seed = float(self.initial_cash)
         self._capital_cycle_start_equity = float(self.initial_cash)
+        self._cost_engine = TradingCostEngine()
         self._initialized = True
         self._started_at_monotonic = time.monotonic()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -323,10 +327,18 @@ class StreamingAcceleratedDemo:
             fx_rate = usd_krw_rate if currency == USD_CURRENCY else 1.0
             native_price = order.limit_price / fx_rate
             value = order.quantity * native_price
+            trading_cost = _simulated_trade_cost(
+                self._cost_engine,
+                order.side,
+                order.ticker,
+                native_price,
+                order.quantity,
+                currency,
+            )
             
-            if order.side == OrderSide.BUY and self._ensure_cash_for_buy(currency, value, usd_krw_rate):
+            if order.side == OrderSide.BUY and self._ensure_cash_for_buy(currency, value + trading_cost, usd_krw_rate):
                 executed_quantity = order.quantity
-                self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) - value
+                self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) - value - trading_cost
                 previous_quantity = self._holdings.get(order.ticker, 0)
                 previous_cost = self._average_cost_by_ticker.get(order.ticker, native_price)
                 new_quantity = previous_quantity + order.quantity
@@ -345,7 +357,15 @@ class StreamingAcceleratedDemo:
                 fx_rate = usd_krw_rate if currency == USD_CURRENCY else 1.0
                 native_price = order.limit_price / fx_rate
                 value = quantity * native_price
-                self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value
+                trading_cost = _simulated_trade_cost(
+                    self._cost_engine,
+                    order.side,
+                    order.ticker,
+                    native_price,
+                    quantity,
+                    currency,
+                )
+                self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value - trading_cost
                 self._holdings[order.ticker] = owned - quantity
                 if self._holdings[order.ticker] <= 0:
                     del self._holdings[order.ticker]
@@ -367,6 +387,8 @@ class StreamingAcceleratedDemo:
                 currency=currency,
                 fx_rate=fx_rate,
                 value_krw=round(_to_krw(value, currency, usd_krw_rate), 2),
+                trading_cost=round(trading_cost, 4),
+                net_value=round(value + trading_cost if order.side == OrderSide.BUY else value - trading_cost, 4),
             )
             step_trades.append(trade)
             self._trades.append(trade)
@@ -493,7 +515,8 @@ class StreamingAcceleratedDemo:
             currency = self._holding_currency_by_ticker.get(ticker, _currency_for_ticker(ticker))
             usd_krw_rate = _usd_krw_rate()
             fx_rate = usd_krw_rate if currency == USD_CURRENCY else 1.0
-            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value
+            trading_cost = _simulated_trade_cost(self._cost_engine, OrderSide.SELL, ticker, price, quantity, currency)
+            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value - trading_cost
             self._cash = self._cash_equivalent_krw(usd_krw_rate)
             del self._holdings[ticker]
             self._average_cost_by_ticker.pop(ticker, None)
@@ -509,6 +532,8 @@ class StreamingAcceleratedDemo:
                 currency=currency,
                 fx_rate=fx_rate,
                 value_krw=round(_to_krw(value, currency, usd_krw_rate), 2),
+                trading_cost=round(trading_cost, 4),
+                net_value=round(value - trading_cost, 4),
             )
             trades.append(trade)
             self._trades.append(trade)
@@ -559,7 +584,8 @@ class StreamingAcceleratedDemo:
 
             currency = self._holding_currency_by_ticker.get(ticker, _currency_for_ticker(ticker))
             value = quantity * price
-            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value
+            trading_cost = _simulated_trade_cost(self._cost_engine, OrderSide.SELL, ticker, price, quantity, currency)
+            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value - trading_cost
             remaining = owned - quantity
             if remaining > 0:
                 self._holdings[ticker] = remaining
@@ -579,6 +605,8 @@ class StreamingAcceleratedDemo:
                 currency=currency,
                 fx_rate=usd_krw_rate if currency == USD_CURRENCY else 1.0,
                 value_krw=round(_to_krw(value, currency, usd_krw_rate), 2),
+                trading_cost=round(trading_cost, 4),
+                net_value=round(value - trading_cost, 4),
             )
             trades.append(trade)
             self._trades.append(trade)
@@ -807,7 +835,14 @@ class StreamingAcceleratedDemo:
             needed_krw = protected_floor - cash_equivalent
             quantity = min(owned, max(1, math.ceil(needed_krw / max(1.0, price_krw))))
             value = quantity * price
-            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value
+            trading_cost = _simulated_trade_cost(self._cost_engine, OrderSide.SELL, ticker, price, quantity, currency)
+            net_value_krw = _to_krw(value - trading_cost, currency, usd_krw_rate)
+            while quantity < owned and net_value_krw < needed_krw:
+                quantity += 1
+                value = quantity * price
+                trading_cost = _simulated_trade_cost(self._cost_engine, OrderSide.SELL, ticker, price, quantity, currency)
+                net_value_krw = _to_krw(value - trading_cost, currency, usd_krw_rate)
+            self._cash_by_currency[currency] = self._cash_by_currency.get(currency, 0.0) + value - trading_cost
             remaining = owned - quantity
             if remaining > 0:
                 self._holdings[ticker] = remaining
@@ -826,6 +861,8 @@ class StreamingAcceleratedDemo:
                 currency=currency,
                 fx_rate=usd_krw_rate if currency == USD_CURRENCY else 1.0,
                 value_krw=round(_to_krw(value, currency, usd_krw_rate), 2),
+                trading_cost=round(trading_cost, 4),
+                net_value=round(value - trading_cost, 4),
             )
             trades.append(trade)
             self._trades.append(trade)

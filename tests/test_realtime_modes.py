@@ -122,7 +122,10 @@ class RealtimeModesTest(unittest.TestCase):
         with (
             patch("app.web._start_live_worker") as start_worker,
             patch("app.web._start_streaming_demo") as start_demo,
-            patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "live"}) as kis_probe,
+            patch(
+                "app.web._kis_connection_probe",
+                return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
+            ) as kis_probe,
             patch("app.web._get_or_refresh_live") as refresh_live,
         ):
             data = client.post("/api/operation-mode/start", json={"mode": "live_readiness"}).json()
@@ -133,7 +136,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["kis_connection"]["mode"], "live")
         start_worker.assert_called_once_with("learning")
         start_demo.assert_not_called()
-        kis_probe.assert_called_once_with(paper=False, include_account=False)
+        kis_probe.assert_called_once_with(paper=False, include_account=True)
         refresh_live.assert_not_called()
 
     def test_stop_learning_endpoint_keeps_continuous_collection_alive(self) -> None:

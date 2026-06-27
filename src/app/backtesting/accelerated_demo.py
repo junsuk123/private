@@ -12,6 +12,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from app.cost import TradingCostEngine
 from app.goals import NegotiatedGoal
 from app.graph import OntologyReasoner
 from app.graph.builders import build_market_graph
@@ -55,6 +56,8 @@ class SimulatedTrade:
     currency: str = "KRW"
     fx_rate: float = 1.0
     value_krw: float | None = None
+    trading_cost: float = 0.0
+    net_value: float | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,27 @@ DEMO_TICKERS = (
     "TXN",
     "PEP",
 )
+
+
+def _simulated_trade_cost(
+    engine: TradingCostEngine,
+    side: OrderSide,
+    ticker: str,
+    price: float,
+    quantity: int,
+    currency: str = "KRW",
+) -> float:
+    if currency != "KRW" or price <= 0 or quantity <= 0:
+        return 0.0
+    instrument_type = "domestic_stock" if ticker.replace(".", "").isdigit() else "domestic_stock"
+    policy = engine.policy_for(instrument_type=instrument_type, venue="KRX")
+    value = price * quantity
+    variable_cost = value * (policy.slippage_rate + policy.spread_rate + policy.market_impact_rate)
+    if side == OrderSide.BUY:
+        return value * policy.buy_fee_rate + variable_cost
+    if side == OrderSide.SELL:
+        return value * (policy.sell_fee_rate + policy.sell_tax_rate) + variable_cost
+    return 0.0
 
 NASDAQ_TRADER_LISTING_URLS = (
     "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
@@ -442,6 +466,7 @@ def run_accelerated_demo(
     cash = initial_cash
     holdings: dict[str, int] = {}
     trades: list[SimulatedTrade] = []
+    cost_engine = TradingCostEngine()
     period_days = max(1, math.ceil(period_minutes / 390))
     warmup_steps = min(15, max(0, len(timestamps) - 1))
     goal = NegotiatedGoal(
@@ -496,19 +521,24 @@ def run_accelerated_demo(
                 continue
             order = result.final_order
             value = order.quantity * order.limit_price
-            if order.side == OrderSide.BUY and cash >= value:
-                cash -= value
+            quantity = order.quantity
+            trading_cost = _simulated_trade_cost(cost_engine, order.side, order.ticker, order.limit_price, quantity)
+            if order.side == OrderSide.BUY and cash >= value + trading_cost:
+                cash -= value + trading_cost
                 holdings[order.ticker] = holdings.get(order.ticker, 0) + order.quantity
+                net_value = value + trading_cost
             elif order.side == OrderSide.SELL:
                 owned = holdings.get(order.ticker, 0)
                 quantity = min(owned, order.quantity)
                 if quantity <= 0:
                     continue
-                cash += quantity * order.limit_price
+                value = quantity * order.limit_price
+                trading_cost = _simulated_trade_cost(cost_engine, order.side, order.ticker, order.limit_price, quantity)
+                cash += value - trading_cost
                 holdings[order.ticker] = owned - quantity
                 if holdings[order.ticker] <= 0:
                     del holdings[order.ticker]
-                value = quantity * order.limit_price
+                net_value = value - trading_cost
             else:
                 continue
             pending.add(order.ticker)
@@ -517,10 +547,12 @@ def run_accelerated_demo(
                     timestamp=timestamp,
                     ticker=order.ticker,
                     side=order.side.value,
-                    quantity=order.quantity,
+                    quantity=quantity,
                     price=order.limit_price,
                     value=value,
                     reason="; ".join(intent.reasoning_summary),
+                    trading_cost=round(trading_cost, 4),
+                    net_value=round(net_value, 4),
                 )
             )
 
@@ -534,7 +566,8 @@ def run_accelerated_demo(
         if price <= 0:
             continue
         value = quantity * price
-        cash += value
+        trading_cost = _simulated_trade_cost(cost_engine, OrderSide.SELL, ticker, price, quantity)
+        cash += value - trading_cost
         del holdings[ticker]
         trades.append(
             SimulatedTrade(
@@ -545,6 +578,8 @@ def run_accelerated_demo(
                 price=price,
                 value=value,
                 reason="mandatory final liquidation",
+                trading_cost=round(trading_cost, 4),
+                net_value=round(value - trading_cost, 4),
             )
         )
     final_positions = {
@@ -779,6 +814,8 @@ def _write_trades(path: Path, trades: list[SimulatedTrade]) -> None:
                 "currency",
                 "fx_rate",
                 "value_krw",
+                "trading_cost",
+                "net_value",
             ),
         )
         writer.writeheader()

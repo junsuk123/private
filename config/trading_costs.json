@@ -1,0 +1,38 @@
+{
+  "broker": "KoreaInvestment",
+  "account_type": "BanKIS",
+  "default_market": "KR",
+  "domestic_stock": {
+    "KRX": {
+      "buy_fee_rate": 0.000140527,
+      "sell_fee_rate": 0.000140527,
+      "sell_tax_rate": 0.002
+    },
+    "NXT": {
+      "buy_fee_rate": 0.000130527,
+      "sell_fee_rate": 0.000130527,
+      "sell_tax_rate": 0.002
+    }
+  },
+  "domestic_etf_etn_elw": {
+    "default_fee_rate": 0.000146527,
+    "sell_tax_rate": 0.0
+  },
+  "slippage": {
+    "default_slippage_rate": 0.0005,
+    "use_dynamic_slippage_if_orderbook_exists": true
+  },
+  "spread": {
+    "default_spread_rate": 0.0
+  },
+  "market_impact": {
+    "default_market_impact_rate": 0.0
+  },
+  "safety_margin": {
+    "default_safety_margin_rate": 0.001
+  },
+  "gate": {
+    "max_cost_to_alpha_ratio": 0.5,
+    "default_target_net_return": 0.0
+  }
+}
