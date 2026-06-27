@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 from app.execution.kis_mock import MockKisExecution, MockKisOrderReceipt, MockKisPortfolio
@@ -15,6 +16,8 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide
 
 KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
+KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
+_KIS_ENV_FILE_LOADED = False
 
 
 class KisApiError(RuntimeError):
@@ -85,6 +88,7 @@ class KisCredentials:
 
     @classmethod
     def from_env(cls, paper: bool = False) -> "KisCredentials":
+        load_kis_env_file()
         prefix = "KIS_PAPER_" if paper else "KIS_"
         app_key = os.getenv(f"{prefix}APP_KEY") or os.getenv("KIS_APP_KEY", "")
         app_secret = os.getenv(f"{prefix}APP_SECRET") or os.getenv("KIS_APP_SECRET", "")
@@ -175,6 +179,7 @@ class KisDevelopersApiClient:
         access_token: str | None = None,
         token_expires_at: datetime | None = None,
     ) -> None:
+        load_kis_env_file()
         self.paper = _env_bool("KIS_PAPER_TRADING", False) if paper is None else paper
         self.credentials = (
             KisCredentials.from_env(self.paper)
@@ -369,6 +374,7 @@ class KisDevelopersApiClient:
             "ODNO": order_id,
             "INQR_DVSN_3": "00",
             "INQR_DVSN_1": "",
+            "EXCG_ID_DVSN_CD": "KRX",
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
@@ -465,3 +471,26 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def load_kis_env_file(path: str | Path | None = None, override: bool = False) -> bool:
+    """Load local KIS secrets from an ignored env file without printing values."""
+    global _KIS_ENV_FILE_LOADED
+    secrets_path = Path(path) if path is not None else KIS_SECRETS_FILE
+    if _KIS_ENV_FILE_LOADED and path is None and not override:
+        return secrets_path.exists()
+    if not secrets_path.exists():
+        _KIS_ENV_FILE_LOADED = True
+        return False
+    for raw_line in secrets_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        key = name.strip()
+        if not key:
+            continue
+        if override or key not in os.environ:
+            os.environ[key] = value.strip().strip('"').strip("'")
+    _KIS_ENV_FILE_LOADED = True
+    return True

@@ -53,6 +53,22 @@ class SourceMetadata:
     retrieved_at: datetime
     raw_url: str | None = None
     source_id: str | None = None
+    source_type: str = "unknown"
+    trust_level: int = 0
+    observed_at: datetime | None = None
+    latency_sec: float | None = None
+    is_realtime: bool = False
+    is_delayed: bool = False
+    is_synthetic: bool = False
+    is_backfilled: bool = False
+    license_policy: str = "unknown"
+    quality_score: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "trust_level", max(0, min(5, int(self.trust_level))))
+        object.__setattr__(self, "quality_score", max(0.0, min(1.0, float(self.quality_score))))
+        if self.latency_sec is not None:
+            object.__setattr__(self, "latency_sec", max(0.0, float(self.latency_sec)))
 
 
 @dataclass(frozen=True)
@@ -281,6 +297,7 @@ class OrderIntent:
     supporting_factors: tuple[str, ...]
     contradicting_factors: tuple[str, ...]
     source_data_ids: tuple[str, ...]
+    model_uncertainty: float | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +333,12 @@ class RiskRules:
     max_intraday_position_weight: float = 0.025
     max_short_horizon_downside_risk: float = 0.012
     emergency_exit_loss: float = 0.018
+    min_source_trust_level: int = 4
+    min_data_quality_score: float = 0.80
+    max_quote_age_seconds: float = 5.0
+    max_model_uncertainty: float = 0.60
+    synthetic_live_data_allowed: bool = False
+    unknown_source_live_allowed: bool = False
 
 
 @dataclass(frozen=True)

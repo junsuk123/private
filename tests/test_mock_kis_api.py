@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.sample_collectors import collect_sample_market
-from app.execution import KisDevelopersApiClient, MockKisDevelopersApi
+from app.execution import KisCredentials, KisDevelopersApiClient, MockKisDevelopersApi, load_kis_env_file
 from app.goals import NegotiatedGoal
 from app.graph import OntologyReasoner
 from app.graph.builders import build_market_graph
@@ -68,6 +70,36 @@ class RecordingKisTransport:
 
 
 class MockKisApiTest(unittest.TestCase):
+    def test_kis_credentials_can_load_ignored_secret_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "kis_api_keys.env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "KIS_PAPER_APP_KEY=paper-app",
+                        "KIS_PAPER_APP_SECRET=paper-secret",
+                        "KIS_PAPER_ACCOUNT_NO=12345678-01",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "KIS_PAPER_APP_KEY": "",
+                    "KIS_PAPER_APP_SECRET": "",
+                    "KIS_PAPER_ACCOUNT_NO": "",
+                },
+                clear=False,
+            ):
+                self.assertTrue(load_kis_env_file(env_path, override=True))
+                credentials = KisCredentials.from_env(paper=True)
+
+        self.assertEqual(credentials.app_key, "paper-app")
+        self.assertEqual(credentials.app_secret, "paper-secret")
+        self.assertEqual(credentials.account_no, "12345678")
+        self.assertEqual(credentials.account_product_code, "01")
+
     def test_mock_kis_limit_order_fills_and_updates_portfolio(self) -> None:
         markets = collect_sample_market()
         market = markets[0]
@@ -155,6 +187,9 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(receipt.order_id, "0000000001")
         self.assertEqual(execution.status, "FILLED")
         self.assertEqual(portfolio.account.holdings[0].ticker, "005930")
+
+        status_call = next(call for call in transport.calls if call["url"].endswith("/inquire-daily-ccld"))
+        self.assertEqual(status_call["params"]["EXCG_ID_DVSN_CD"], "KRX")
 
 
 def _supportive_npu_scores(markets):

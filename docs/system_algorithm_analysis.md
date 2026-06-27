@@ -2,7 +2,7 @@
 
 This document summarizes the current algorithmic design implemented under `src/app`.
 
-The system is a safe realtime-only investment research, learning, hypothetical-testing, and paper/simulation framework. It combines public research collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, mock KIS paper trading, realtime hypothetical testing, and in-memory streaming simulation. Live automated trading is intentionally disabled.
+The system is a safe realtime-only investment research, learning, hypothetical-testing, paper-trading, and readiness-check framework. It combines public research collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, mock KIS paper trading, KIS paper/live-readiness boundaries, realtime hypothetical testing, and in-memory paper-trading simulation. Live automated trading is intentionally disabled.
 
 ## 1. Top-Level Flow
 
@@ -18,7 +18,7 @@ Research sources
   -> strategy signals
   -> order intents
   -> deterministic risk validation
-  -> mock KIS / realtime hypothetical test / streaming simulation / UI output
+  -> mock KIS / KIS paper-readiness / realtime hypothetical test / paper-trading simulation / UI output
 ```
 
 Primary entry points:
@@ -72,6 +72,8 @@ LLM event classification supports:
 - embedded OpenVINO/Optimum Intel models for NPU-oriented local inference
 
 Prompt ticker hints are capped by `LLM_EVENT_KNOWN_TICKER_PROMPT_LIMIT`, while deterministic matching can still use the complete known ticker map.
+
+Source trust and quality are normalized through `app.data.source_policy`. Broker, exchange, disclosure, and official macro sources receive higher default trust; unofficial chart endpoints, dynamic pages, sample, synthetic, and unknown sources are downgraded or blocked for live decisions.
 
 ## 3. Storage Algorithm
 
@@ -481,6 +483,24 @@ score =
 
 No real brokerage API is called.
 
+## 11.1 KIS Developers Adapter
+
+Implemented in `src/app/execution/kis_real.py`.
+
+The adapter implements the KIS Developers domestic cash-stock REST contract behind the same broker boundary as mock execution:
+
+- environment/secrets loading from `config/secrets/kis_api_keys.env`
+- paper base URL `https://openapivts.koreainvestment.com:29443`
+- live base URL `https://openapi.koreainvestment.com:9443`
+- `/oauth2/tokenP` access-token issuance
+- `/uapi/hashkey` for cash-order POST bodies
+- domestic cash-order TR IDs `VTTC0012U` / `VTTC0011U` for paper buy/sell
+- domestic cash-order TR IDs `TTTC0012U` / `TTTC0011U` for live buy/sell
+- order-status polling with `VTTC8001R` or `TTTC8001R`
+- balance lookup with `VTTC8434R` or `TTTC8434R`
+
+`KIS_PAPER_TRADING=true` selects the virtual domain. `KIS_LIVE_ENABLED=false` blocks order, status, and account calls by default. `scripts/check_kis_connection.py` can issue a token-only check or a read-only balance check with `--account`.
+
 ## 12. Realtime Learning and Testing Algorithms
 
 Implemented in `src/app/realtime/learning.py`.
@@ -512,14 +532,16 @@ data/models/realtime_supervised/
 data/models/hypothetical_testing/
 ```
 
-## 13. Streaming Simulation Algorithm
+The model support layer also includes no-lookahead training-plan summaries, ranked-signal evaluation summaries, a CPU NumPy inference backend, an OpenVINO/NPU backend with CPU fallback, and an OpenVINO export hook. The export hook does not convert an arbitrary model by itself; a concrete trained-model adapter must supply the conversion.
+
+## 13. Paper-Trading Simulation Algorithm
 
 Implemented in `src/app/backtesting/streaming_demo.py` and exposed through `src/app/web.py`.
 
 Start:
 
 ```text
-POST /api/streaming-demo/start
+POST /api/paper-trading/start
 target_return_rate
 period_minutes
 initial_cash
@@ -528,7 +550,7 @@ initial_cash
 Step:
 
 ```text
-POST /api/streaming-demo/step
+POST /api/paper-trading/step
 demo_id
 ```
 
@@ -590,7 +612,7 @@ Concurrency:
 
 - `/api/live-snapshot` uses `run_in_threadpool`.
 - operation-mode starts use a lock and busy status to avoid overlapping starts.
-- streaming demo steps use per-demo locks.
+- paper-trading simulation steps use per-demo locks.
 
 Important endpoints:
 
@@ -608,11 +630,17 @@ Important endpoints:
 - `POST /api/operation-mode/start`
 - `GET /api/operation-mode/status`
 - `POST /api/operation-mode/stop-learning`
-- `POST /api/streaming-demo/start`
-- `POST /api/streaming-demo/step`
-- `GET /api/streaming-demo/status/{demo_id}`
+- `POST /api/paper-trading/start`
+- `POST /api/paper-trading/step`
+- `GET /api/paper-trading/status/{demo_id}`
+- `POST /api/paper-trading/pause/{demo_id}`
+- `POST /api/paper-trading/resume/{demo_id}`
+- `POST /api/paper-trading/cleanup/{demo_id}`
 - `POST /api/mock-kis/orders`
+- `GET /api/mock-kis/orders/{order_id}`
 - `GET /api/mock-kis/portfolio`
+- `POST /api/mock-trading/run`
+- `GET /api/mock-trading/performance`
 
 ## 15. Runtime Modes
 
@@ -622,6 +650,10 @@ Current operation modes:
 
 - `learning`
 - `testing`
+- `paper_trading`
+- `paper_trading_test`
+- `live_readiness`
+- `live_trading_test`
 - `live_trading`
 
 All modes use:
@@ -645,14 +677,15 @@ The system is designed so that:
 - live trading is disabled by default.
 - restricted products are blocked.
 - hypothetical testing reports zero broker orders.
-- streaming simulation changes only in-memory simulated state.
+- paper-trading simulation changes only in-memory simulated state.
+- KIS live-readiness checks do not submit orders.
 
 ## 17. Known Algorithmic Limitations
 
 - Main production indicators are still lightweight snapshots, not a full historical production indicator engine.
 - Some live market/chart sources can be skipped due to robots.txt, missing API keys, source outages, or missing Playwright.
 - Full listed-stock universe catalogs are tracked, but expensive external fetching is intentionally bounded.
-- Streaming simulation sessions are in memory and expire on server restart.
+- Paper-trading simulation sessions are in memory and expire on server restart.
 - Mock LLM judgment is deterministic scoring, not an independent model decision.
 - Risk rules are conservative hard gates, not a full brokerage compliance engine.
 - `live_trading` is a guarded boundary, not automatic execution.
@@ -676,4 +709,5 @@ The system is designed so that:
 - `src/app/realtime/learning.py`: realtime supervised examples and hypothetical tests
 - `src/app/trading/mock_program.py`: mock trading cycle
 - `src/app/execution/kis_mock.py`: mock KIS behavior
+- `src/app/execution/kis_real.py`: KIS Developers REST adapter
 - `src/app/backtesting/streaming_demo.py`: stepwise in-memory simulation

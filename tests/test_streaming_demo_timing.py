@@ -205,7 +205,7 @@ class StreamingDemoTimingTest(unittest.TestCase):
         self.assertGreaterEqual(demo._cash_by_currency["KRW"], 1_000_000)
         self.assertTrue(all(trade.reason == "principal protection reserve" for trade in trades))
 
-    def test_step_api_waits_until_next_simulated_minute_is_due(self) -> None:
+    def test_paper_trading_step_waits_until_next_minute_is_due(self) -> None:
         previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
         previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
         os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
@@ -213,7 +213,7 @@ class StreamingDemoTimingTest(unittest.TestCase):
         client = TestClient(app)
         try:
             start_response = client.post(
-                "/api/streaming-demo/start",
+                "/api/paper-trading/start",
                 json={
                     "target_return_rate": 0.02,
                     "period_minutes": 20,
@@ -224,14 +224,14 @@ class StreamingDemoTimingTest(unittest.TestCase):
             self.assertEqual(start_response.status_code, 200)
             demo_id = start_response.json()["demo_id"]
 
-            early_step = client.post("/api/streaming-demo/step", json={"demo_id": demo_id}).json()
+            early_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
 
             self.assertEqual(early_step["status"], "waiting")
             self.assertEqual(early_step["progress"], 0.0)
             self.assertGreater(early_step["retry_after_seconds"], 50)
 
             _streaming_demos[demo_id]._started_at_monotonic -= 60
-            due_step = client.post("/api/streaming-demo/step", json={"demo_id": demo_id}).json()
+            due_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
 
             self.assertEqual(due_step["status"], "running")
             self.assertEqual(due_step["step"], 1)
@@ -250,18 +250,21 @@ class StreamingDemoTimingTest(unittest.TestCase):
             else:
                 os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
 
-    def test_testing_mode_starts_streaming_buy_sell_loop(self) -> None:
+    def test_paper_trading_mode_starts_buy_sell_loop(self) -> None:
         previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
         previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
         os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
         os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
         client = TestClient(app)
         try:
-            with patch("app.web._start_live_worker"):
+            with (
+                patch("app.web._start_live_worker"),
+                patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "paper"}),
+            ):
                 start_response = client.post(
                     "/api/operation-mode/start",
                     json={
-                        "mode": "testing",
+                        "mode": "paper_trading",
                         "target_return_rate": 0.02,
                         "period_minutes": 20,
                         "initial_cash": 10_000_000,
@@ -271,11 +274,11 @@ class StreamingDemoTimingTest(unittest.TestCase):
             self.assertEqual(start_response.status_code, 200)
             start_payload = start_response.json()
             demo_id = start_payload["demo_id"]
-            self.assertEqual(start_payload["test_status"], "background_collection_started")
+            self.assertEqual(start_payload["paper_trading_status"], "background_collection_started")
             self.assertIn(demo_id, _streaming_demos)
 
             _streaming_demos[demo_id]._started_at_monotonic -= 60
-            step = client.post("/api/streaming-demo/step", json={"demo_id": demo_id}).json()
+            step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
 
             self.assertEqual(step["status"], "running")
             self.assertEqual(step["step"], 1)

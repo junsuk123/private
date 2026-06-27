@@ -33,7 +33,9 @@ This acceleration policy is for inference/runtime preference. It is not a user-f
 The current `OperationModeManager` supports:
 
 - `learning`: realtime data collection and supervised example/model-artifact updates.
-- `testing`: realtime hypothetical trade test using current analysis frames and strategy signals.
+- `testing`: backward-compatible legacy paper-trading replay.
+- `paper_trading` / `paper_trading_test`: KIS paper-trading API check plus local paper-trading flow.
+- `live_readiness` / `live_trading_test`: KIS live-readiness/authentication check without broker orders.
 - `live_trading`: realtime trading gate; automatic execution remains guarded/blocked.
 
 All modes use:
@@ -62,24 +64,27 @@ The learning loop is stopped with:
 POST /api/operation-mode/stop-learning
 ```
 
-## Testing Behavior
+## Paper-Trading and Readiness Behavior
 
-When `POST /api/operation-mode/start` receives `mode = testing`, the app:
+When `POST /api/operation-mode/start` receives `mode = testing`, `paper_trading`, or `paper_trading_test`, the app:
 
 1. Forces a live refresh.
 2. Builds the current analysis context.
 3. Runs `run_hypothetical_realtime_test`.
 4. Writes a hypothetical testing artifact under `data/models/hypothetical_testing`.
 5. Reports `orders_submitted = 0`.
+6. For KIS paper modes, performs the KIS paper API readiness path and keeps live orders disabled.
 
-Testing uses inferred entry/exit prices from adjacent time frames and does not call a broker.
+Legacy testing uses inferred entry/exit prices from adjacent time frames and does not call a broker. KIS paper-trading modes may use the virtual broker domain only.
 
-## Streaming Simulation Behavior
+When `mode = live_readiness` or `live_trading_test`, the app checks KIS live-readiness/authentication boundaries and does not submit broker orders.
 
-Streaming simulation is separate from operation-mode testing. It starts through:
+## Paper-Trading Simulation Behavior
+
+The paper-trading simulation is separate from operation-mode readiness checks. It starts through:
 
 ```text
-POST /api/streaming-demo/start
+POST /api/paper-trading/start
 ```
 
 with:
@@ -88,7 +93,7 @@ with:
 - `period_minutes`
 - `initial_cash`
 
-The UI then calls `/api/streaming-demo/step` on a timer. In realtime simulation mode, one visible synthetic minute is due every wall-clock minute.
+The UI then calls `/api/paper-trading/step` on a timer. In realtime simulation mode, one visible synthetic minute is due every wall-clock minute.
 
 Each step:
 

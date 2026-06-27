@@ -55,10 +55,14 @@ Realtime storage rejects simulated or synthetic records. A row is treated as sim
 
 ## Operation Mode Mapping
 
-The web UI exposes three operation modes through `OperationModeManager`:
+The web UI exposes these operation modes through `OperationModeManager`:
 
 - `learning`: realtime collection and supervised PnL-label artifact updates under `data/models`.
-- `testing`: realtime hypothetical trade testing; no broker orders are submitted.
+- `testing`: backward-compatible legacy paper-trading replay; no live broker orders are submitted.
+- `paper_trading`: KIS paper-trading API check plus local paper-trading flow.
+- `paper_trading_test`: alias for KIS paper-trading checks.
+- `live_readiness`: KIS live-readiness/authentication check; no orders are submitted.
+- `live_trading_test`: alias for live-readiness checks.
 - `live_trading`: realtime trading gate; live brokerage execution remains guarded and blocked by default app flow.
 
 All modes use the unified realtime store:
@@ -70,21 +74,21 @@ data/store
 The runtime policy exposed in `/api/research/diagnostics` states:
 
 ```text
-Learning, testing, and live trading all use the unified realtime data store only.
+Learning, paper trading, live-readiness checks, and live trading all use the unified realtime data store only.
 ```
 
-## Streaming Simulation
+## Paper-Trading Simulation
 
-Streaming simulation is a separate in-memory workflow. It starts through:
+Paper-trading simulation is a separate in-memory workflow. It starts through:
 
 ```text
-POST /api/streaming-demo/start
-POST /api/streaming-demo/step
+POST /api/paper-trading/start
+POST /api/paper-trading/step
 ```
 
 The simulation generates synthetic one-minute charts in memory from the listed universe, screens candidates with ontology/NPU logic, and applies approved mock orders only to simulated cash and holdings. The session is not persisted; restarting the server expires the `demo_id`.
 
-If the UI sends a stale `demo_id`, `/api/streaming-demo/step` returns:
+If the UI sends a stale `demo_id`, `/api/paper-trading/step` returns:
 
 ```text
 HTTP 200
@@ -96,5 +100,5 @@ status = expired
 - Treat `data/store` as the only active research store.
 - Do not copy synthetic rows into `data/store`.
 - Do not save simulated model artifacts into `data/models`.
-- Treat streaming demo state as temporary in-memory state.
+- Treat paper-trading simulation state as temporary in-memory state.
 - Treat `live_trading` as a guarded/manual approval boundary, not automatic execution.

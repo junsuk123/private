@@ -49,8 +49,32 @@ class SemanticFeatureEngineTest(unittest.TestCase):
         self.assertEqual(paths[0].ticker, "TEST")
         self.assertGreaterEqual(paths[0].final_confidence, 0.0)
 
+    def test_missing_volume_ratio_with_positive_return_does_not_crash(self) -> None:
+        records = (
+            _raw("TEST", "volume_spike_ratio", None),
+            _raw("TEST", "return_1d", 0.02),
+        )
 
-def _raw(ticker: str, name: str, value: float) -> RawIndicatorRecord:
+        features = SemanticFeatureEngine().generate(records)
+        names = {feature.feature_name for feature in features}
+
+        self.assertNotIn("VolumeSpike", names)
+        self.assertNotIn("VolumeBackedRise", names)
+
+    def test_missing_volume_ratio_with_negative_return_does_not_crash(self) -> None:
+        records = (
+            _raw("TEST", "volume_spike_ratio", None),
+            _raw("TEST", "return_1d", -0.02),
+        )
+
+        features = SemanticFeatureEngine().generate(records)
+        names = {feature.feature_name for feature in features}
+
+        self.assertNotIn("VolumeSpike", names)
+        self.assertNotIn("VolumeBackedFall", names)
+
+
+def _raw(ticker: str, name: str, value: float | None) -> RawIndicatorRecord:
     return RawIndicatorRecord(
         ticker=ticker,
         as_of=datetime(2026, 1, 1, tzinfo=timezone.utc),

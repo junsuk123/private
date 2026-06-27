@@ -18,6 +18,7 @@ class OntologyNpuStatus:
     batch_size: int
     feature_dim: int
     score_dim: int
+    model_kind: str = "heuristic_linear_scorer"
     last_latency_ms: float | None = None
     last_items: int = 0
     last_batches: int = 0
@@ -25,8 +26,13 @@ class OntologyNpuStatus:
     fallback_reason: str | None = None
 
 
-class OntologyNpuClassifier:
-    """OpenVINO NPU batch scorer for indicator-to-ontology relation features."""
+class OntologyNpuLinearScorer:
+    """Heuristic fixed linear scorer for ontology relation features.
+
+    This is not a trained AI model. OpenVINO/NPU is used only as an optional
+    acceleration backend for the fixed matrix multiply; CPU fallback is always
+    available.
+    """
 
     def __init__(self, batch_size: int = 2048, feature_dim: int = 8, score_dim: int = 6) -> None:
         self.batch_size = batch_size
@@ -88,6 +94,7 @@ class OntologyNpuClassifier:
             batch_size=self.batch_size,
             feature_dim=self.feature_dim,
             score_dim=self.score_dim,
+            model_kind="heuristic_linear_scorer",
             last_latency_ms=self._last_latency_ms,
             last_items=self._last_items,
             last_batches=self._last_batches,
@@ -117,7 +124,7 @@ class OntologyNpuClassifier:
 
             ops = ov.opset8
             x = ops.parameter([self.batch_size, self.feature_dim], ov.Type.f32, name="ontology_features")
-            model = ov.Model([ops.matmul(x, ops.constant(weights), False, False)], [x], "ontology_npu_classifier")
+            model = ov.Model([ops.matmul(x, ops.constant(weights), False, False)], [x], "ontology_npu_linear_scorer")
             core = ov.Core()
             requested = os.getenv("ONTOLOGY_CLASSIFIER_DEVICE", os.getenv("OPENVINO_DEVICE", "NPU"))
             try:
@@ -171,11 +178,14 @@ def _features(market: MarketSnapshot, indicator: IndicatorSnapshot) -> tuple[flo
     )
 
 
-_CLASSIFIER: OntologyNpuClassifier | None = None
+OntologyNpuClassifier = OntologyNpuLinearScorer
+
+
+_CLASSIFIER: OntologyNpuLinearScorer | None = None
 _LOCK = Lock()
 
 
-def get_ontology_npu_classifier() -> OntologyNpuClassifier:
+def get_ontology_npu_classifier() -> OntologyNpuLinearScorer:
     global _CLASSIFIER
     if _CLASSIFIER is None:
         with _LOCK:

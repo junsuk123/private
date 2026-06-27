@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from math import floor
 
+from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report
 from app.schemas.domain import (
     AccountSnapshot,
@@ -53,6 +55,33 @@ class RiskManager:
             and not self.rules.derivatives_allowed
             and not self.rules.leverage_etf_allowed
             and not self.rules.credit_loan_allowed
+        )
+        source = market.source
+        source_type = source.source_type or infer_source_type(source.source_name, source.raw_url)
+        source_trust = source.trust_level if source.trust_level > 0 else default_trust_level(source_type)
+        quality_score = source.quality_score if source.quality_score > 0 else compute_quality_score(source)
+        observed_at = source.observed_at or source.retrieved_at
+        quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - observed_at).total_seconds())
+        live_mode = self.rules.live_trading_enabled
+        checks["source_trust_check"] = (not live_mode) or source_trust >= self.rules.min_source_trust_level
+        checks["data_quality_check"] = (not live_mode) or quality_score >= self.rules.min_data_quality_score
+        checks["synthetic_data_blocked"] = (
+            not live_mode
+            or self.rules.synthetic_live_data_allowed
+            or (not source.is_synthetic and source_type not in {"synthetic", "sample"})
+        )
+        checks["quote_freshness_check"] = (
+            not live_mode
+            or quote_age_seconds <= self.rules.max_quote_age_seconds
+        )
+        checks["model_uncertainty_check"] = (
+            intent.model_uncertainty is None
+            or intent.model_uncertainty <= self.rules.max_model_uncertainty
+        )
+        checks["unknown_source_check"] = (
+            not live_mode
+            or self.rules.unknown_source_live_allowed
+            or source_type != "unknown"
         )
 
         adjusted_weight = min(

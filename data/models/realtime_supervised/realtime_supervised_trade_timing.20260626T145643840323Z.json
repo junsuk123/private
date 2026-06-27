@@ -1,0 +1,645 @@
+{
+  "artifact": {
+    "example_count": 35,
+    "examples": [
+      {
+        "as_of": "2026-06-25T19:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 23,
+          "execution_count": 0,
+          "impact_score": 18.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.51,
+          "signal_score": 0.6000000000000001
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 0.6000000000000001,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-25T23:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 35,
+          "execution_count": 0,
+          "impact_score": 28.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.51,
+          "signal_score": 0.6000000000000001
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 0.6000000000000001,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-26T11:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 8,
+          "execution_count": 0,
+          "impact_score": 6.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.51,
+          "signal_score": 0.6000000000000001
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 0.6000000000000001,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-25T19:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 23,
+          "execution_count": 0,
+          "impact_score": 18.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.65,
+          "signal_score": 2.0
+        },
+        "label": 0,
+        "predicted_action": "BUY",
+        "predicted_score": 2.0,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "005930"
+      },
+      {
+        "as_of": "2026-06-25T23:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 35,
+          "execution_count": 0,
+          "impact_score": 28.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.65,
+          "signal_score": 2.0
+        },
+        "label": 0,
+        "predicted_action": "BUY",
+        "predicted_score": 2.0,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "005930"
+      },
+      {
+        "as_of": "2026-06-26T12:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 1,
+          "execution_count": 0,
+          "impact_score": 0.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.65,
+          "signal_score": 2.0
+        },
+        "label": 0,
+        "predicted_action": "BUY",
+        "predicted_score": 2.0,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "005930"
+      },
+      {
+        "as_of": "2026-06-26T12:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 8,
+          "execution_count": 0,
+          "impact_score": 6.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.65,
+          "signal_score": 2.0
+        },
+        "label": 0,
+        "predicted_action": "BUY",
+        "predicted_score": 2.0,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "005930"
+      },
+      {
+        "as_of": "2026-06-25T17:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 9,
+          "execution_count": 0,
+          "impact_score": 7.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T17:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 22,
+          "execution_count": 0,
+          "impact_score": 17.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T19:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 45,
+          "execution_count": 0,
+          "impact_score": 36.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T23:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 35,
+          "execution_count": 0,
+          "impact_score": 28.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T23:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 14,
+          "execution_count": 0,
+          "impact_score": 11.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T00:00:00+00:00",
+        "feature_snapshot": {
+          "event_count": 29,
+          "execution_count": 0,
+          "impact_score": 23.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T00:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 32,
+          "execution_count": 0,
+          "impact_score": 20.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T02:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 35,
+          "execution_count": 0,
+          "impact_score": 23.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T03:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 24,
+          "execution_count": 0,
+          "impact_score": 14.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T04:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 10,
+          "execution_count": 0,
+          "impact_score": 8.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T05:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 11,
+          "execution_count": 0,
+          "impact_score": 7.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T06:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 12,
+          "execution_count": 0,
+          "impact_score": 8.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T06:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 11,
+          "execution_count": 0,
+          "impact_score": 7.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T07:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 13,
+          "execution_count": 0,
+          "impact_score": 8.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T07:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 15,
+          "execution_count": 0,
+          "impact_score": 10.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T10:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 22,
+          "execution_count": 0,
+          "impact_score": 12.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T10:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 25,
+          "execution_count": 0,
+          "impact_score": 15.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T11:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 25,
+          "execution_count": 0,
+          "impact_score": 15.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T11:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 33,
+          "execution_count": 0,
+          "impact_score": 21.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T12:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 31,
+          "execution_count": 0,
+          "impact_score": 20.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T12:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 38,
+          "execution_count": 0,
+          "impact_score": 25.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-26T13:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 40,
+          "execution_count": 0,
+          "impact_score": 27.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.6100000000000001,
+          "signal_score": 1.6
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.6,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
+        "as_of": "2026-06-25T19:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 4,
+          "execution_count": 0,
+          "impact_score": 3.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      },
+      {
+        "as_of": "2026-06-25T19:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 10,
+          "execution_count": 0,
+          "impact_score": 8.0,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      },
+      {
+        "as_of": "2026-06-26T00:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 12,
+          "execution_count": 0,
+          "impact_score": -9.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      },
+      {
+        "as_of": "2026-06-26T04:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 13,
+          "execution_count": 0,
+          "impact_score": -10.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      },
+      {
+        "as_of": "2026-06-26T08:45:00+00:00",
+        "feature_snapshot": {
+          "event_count": 12,
+          "execution_count": 0,
+          "impact_score": -9.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      },
+      {
+        "as_of": "2026-06-26T12:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 16,
+          "execution_count": 0,
+          "impact_score": -6.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.5700000000000001,
+          "signal_score": 1.2000000000000002
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 1.2000000000000002,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "SPY"
+      }
+    ],
+    "positive_labels": 0
+  },
+  "metadata": {
+    "label_source": "inference_action_plus_realtime_realized_pnl"
+  },
+  "model_family": "realtime_supervised",
+  "model_name": "realtime_supervised:trade_timing",
+  "saved_at": "2026-06-26T14:56:43.840323+00:00",
+  "simulated": false
+}

@@ -4,7 +4,7 @@
 
 The system separates probabilistic reasoning from deterministic control. Classifiers, semantic layers, ontology screening, and strategy scoring can explain, classify, rank, tune, and propose. They cannot directly execute live trades.
 
-Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved orders are limit orders with manual approval required. The current app supports mock/paper and hypothetical execution paths only; live automated brokerage execution remains blocked.
+Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved orders are limit orders with manual approval required. The current app supports mock, local paper, KIS paper-readiness, live-readiness, hypothetical, and in-memory simulation paths. Live automated brokerage execution remains blocked unless future manual approval gates deliberately enable it.
 
 ## Runtime Flow
 
@@ -20,7 +20,7 @@ Research sources
   -> strategy signals
   -> order intents
   -> risk validation
-  -> mock KIS / hypothetical testing / streaming simulation / UI output
+  -> mock KIS / KIS paper-readiness / hypothetical testing / paper-trading simulation / UI output
 ```
 
 Detailed flow:
@@ -35,8 +35,8 @@ Detailed flow:
 8. The ontology reasoner infers buy candidates, risk-adjusted sizing, contradictions, and reasoning paths.
 9. Strategy modules combine indicator, ontology, and domestic investor-flow evidence to produce `StrategySignal` and `OrderIntent` records.
 10. `RiskManager` validates each intent against hard rules.
-11. Approved intents can become mock KIS orders, hypothetical test records, or streaming-simulation trades only.
-12. Audit logging records inputs, mode changes, refreshes, decisions, rejections, and outputs.
+11. Approved intents can become mock KIS orders, local paper-trading orders, hypothetical test records, or paper-trading simulation trades only.
+12. Audit logging records inputs, mode changes, refreshes, decisions, rejections, and outputs, with recursive redaction for credentials, tokens, account numbers, and broker secrets.
 
 ## Public Data Layer
 
@@ -69,6 +69,8 @@ data/synthetic_disabled/
 
 `ModelArtifactStore` writes versioned JSON artifacts and `<model>.latest.json` files under `data/models`. It rejects simulated model artifacts.
 
+`app.data.source_policy` centralizes source-type inference, trust defaults, quality scoring, and live-decision eligibility. Official broker/exchange/disclosure sources receive the highest trust, while dynamic pages, unofficial chart endpoints, sample, synthetic, and unknown sources are downgraded or blocked for live decisions.
+
 ## Web Runtime
 
 `run.py` inserts `src` into `sys.path` and calls `app.run.main`. `src/app/run.py` performs startup checks, selects a port unless strict mode is requested, then starts `uvicorn app.web:app`.
@@ -89,20 +91,29 @@ Important UI/API paths:
 - `POST /api/live-snapshot`: goal-aware live snapshot, executed in a threadpool
 - `POST /api/assess-goal`: target feasibility and compromise goals
 - `POST /api/start`: accepted-goal mock KIS paper-trading run
-- `POST /api/operation-mode/start`: learning, testing, or live-trading mode start
+- `POST /api/operation-mode/start`: learning, legacy testing, KIS paper-trading, live-readiness, or live-trading mode start
 - `GET /api/operation-mode/status`: operation and learning state
 - `POST /api/operation-mode/stop-learning`: stop realtime learning collection
-- `POST /api/streaming-demo/start`: start in-memory streaming simulation
-- `POST /api/streaming-demo/step`: run one visible simulation step when due
+- `POST /api/paper-trading/start`: start the current paper-trading simulation session
+- `POST /api/paper-trading/step`: advance the current paper-trading simulation when due
+- `GET /api/paper-trading/status/{demo_id}`: current paper-trading session state
+- `POST /api/paper-trading/pause/{demo_id}`: pause a paper-trading session
+- `POST /api/paper-trading/resume/{demo_id}`: resume a paper-trading session
+- `POST /api/paper-trading/cleanup/{demo_id}`: remove an expired paper-trading session
 - `POST /api/mock-kis/orders`: mock KIS limit order endpoint
+- `GET /api/mock-kis/orders/{order_id}`: mock order status
 - `GET /api/mock-kis/portfolio`: mock portfolio state
+- `POST /api/mock-trading/run`: deterministic mock trading cycle
+- `GET /api/mock-trading/performance`: mock-trading performance summary
 
 ## Operation Modes
 
 Implemented in `src/app/realtime/mode_manager.py`.
 
 - `learning`: realtime collection with supervised PnL-label artifact updates.
-- `testing`: realtime hypothetical test with `orders_submitted = 0`.
+- `testing`: backward-compatible legacy paper-trading replay.
+- `paper_trading` / `paper_trading_test`: KIS paper-trading API check plus local paper-trading flow.
+- `live_readiness` / `live_trading_test`: KIS live authentication/readiness check; no broker orders are submitted.
 - `live_trading`: realtime trading gate; live brokerage execution remains guarded/blocked.
 
 All modes use the unified realtime data store and model root. Synthetic data is not allowed as input to these modes.
@@ -147,17 +158,21 @@ Rejects orders that violate live-trading disablement, action/type rules, daily l
 
 ### Order Executor
 
-Accepts only `FinalOrder` objects. The current implementation supports mock/paper interfaces. The real KIS client skeleton is isolated behind broker boundaries and is disabled by default.
+Accepts only `FinalOrder` objects. The current implementation supports mock/paper interfaces. `KisDevelopersApiClient` implements KIS domestic cash-stock REST calls for token issuance, hashkey creation, cash limit orders, order-status polling, and balance lookup. It loads ignored local secrets from `config/secrets/kis_api_keys.env`, chooses paper or live base URLs by mode, and remains disabled unless `KIS_LIVE_ENABLED=true`.
 
-### Streaming Simulation
+### Paper-Trading Simulation
 
-`StreamingAcceleratedDemo` maintains an in-memory session. It generates synthetic one-minute charts for selected universe candidates, screens/ranks candidates, builds ontology evidence, generates goal-directed intents, validates them through `RiskManager`, and updates simulated cash/holdings/trades.
+`StreamingAcceleratedDemo` is the current in-memory paper-trading engine despite the legacy class name. It generates synthetic one-minute charts for selected universe candidates, screens/ranks candidates, builds ontology evidence, generates goal-directed intents, validates them through `RiskManager`, and updates simulated cash/holdings/trades.
 
-If a stale or missing `demo_id` is sent to `/api/streaming-demo/step`, the API returns HTTP 200 with `status = expired` so the UI can stop cleanly.
+If a stale or missing `demo_id` is sent to `/api/paper-trading/step`, the API returns HTTP 200 with `status = expired` so the UI can stop cleanly.
 
 ### Audit and Monitoring
 
-Audit logs are append-only JSONL records with timestamps and structured payloads.
+Audit logs are append-only JSONL records with timestamps and structured payloads. Recursive redaction masks common credential, token, account, authorization, and broker-secret fields before data is written.
+
+### Model and Inference Hooks
+
+The model layer currently provides no-lookahead dataset rows, training-plan summaries, ranked-signal evaluation summaries, a CPU NumPy signal backend, an OpenVINO/NPU signal backend with CPU fallback, and an OpenVINO export hook. Concrete production model conversion is still intentionally explicit and must be supplied by a trained model adapter.
 
 ## Current Implementation Choice
 

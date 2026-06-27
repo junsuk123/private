@@ -24,7 +24,7 @@ from starlette import routing as starlette_routing
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.llm_classifier import event_llm_runtime_status
-from app.execution import MockKisDevelopersApi, PaperOrderExecutor
+from app.execution import KisApiError, KisDevelopersApiClient, MockKisDevelopersApi, PaperOrderExecutor
 from app.graph import get_ontology_runtime
 from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise_goals
 from app.pipeline import build_analysis_context
@@ -135,7 +135,7 @@ LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     60,
     int(os.getenv("LEARNING_COLLECTION_INTERVAL_SECONDS", "3600")),
 )
-AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "false").lower() in {"1", "true", "yes", "on"}
+AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "true").lower() not in {"0", "false", "no", "off"}
 
 _live_lock = threading.Lock()
 _refresh_guard = threading.Lock()
@@ -196,9 +196,9 @@ def _current_data_policy() -> dict[str, Any]:
       "primary_store": _get_store_root().as_posix(),
       "analysis_input_stores": [_get_store_root().as_posix()],
       "synthetic_data_allowed": False,
-      "orders_in_testing": False,
+      "orders_in_paper_trading": False,
       "model_root": "data/models",
-      "rule": "Learning, testing, and live trading all use the unified realtime data store only.",
+      "rule": "Learning, paper trading, and live trading all use the unified realtime data store only.",
   }
 
 
@@ -345,7 +345,7 @@ def _clear_live_analysis_cache_unlocked() -> None:
 def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
     if AUTO_START_LIVE_WORKER:
-      _start_live_worker()
+      _start_live_worker("learning")
 
 
 @app.on_event("shutdown")
@@ -483,7 +483,7 @@ def realtime_runtime() -> JSONResponse:
                 "model_inference": os.getenv("LLM_EVENT_DEVICE", "NPU"),
                 "model_backend": os.getenv("LLM_EVENT_INFERENCE_BACKEND", "openvino"),
                 "ontology_classification": "openvino_npu_with_cpu_fallback",
-                "deterministic_simulation": "cpu_worker_after_npu_screening",
+                "deterministic_paper_trading_engine": "cpu_worker_after_npu_screening",
                 "risk_and_order_rules": "cpu_worker",
                 "openvino_cache_dir": os.getenv("OPENVINO_CACHE_DIR", "data/runtime/openvino_cache"),
             },
@@ -495,40 +495,10 @@ def realtime_runtime() -> JSONResponse:
 async def operation_mode_start(request: Request) -> JSONResponse:
     payload = await request.json()
     return _json(_operation_mode_start_response(payload))
-    mode = str(payload.get("mode", "testing"))
-    state = OperationModeManager().start(mode)
-    _operation_mode_state["active"] = state
-    audit.record("operation_mode_started", {"mode_state": state})
-    
-    result = _to_jsonable(state)
-    result["mode_state"] = state
-    
-    if mode == "testing":
-      target_return_rate = float(payload.get("target_return_rate", 0.02))
-      if target_return_rate > 1:
-        target_return_rate /= 100.0
-      period_minutes = int(payload.get("period_minutes", 390))
-      demo_id = _start_streaming_demo(
-          target_return_rate=target_return_rate,
-          period_minutes=period_minutes,
-          initial_cash=float(payload.get("initial_cash", 10_000_000)),
-          seed=int(payload.get("seed", 42)),
-      )
-      demo = _streaming_demos.get(demo_id)
-      if demo:
-        result["demo_id"] = demo_id
-        result["demo_status"] = "initialized"
-        result["target_return_rate"] = target_return_rate
-        result["period_minutes"] = period_minutes
-        result["initial_cash"] = float(payload.get("initial_cash", 10_000_000))
-        result["universe_count"] = len(demo._bars_by_ticker)
-        result["demo_message"] = "시뮬레이션 테스트가 시작되었습니다. 목표 수익률과 목표 시간으로 자동 진행됩니다."
-    
-    return _json(result)
 
 
 def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
-    mode = str(payload.get("mode", "testing"))
+    mode = str(payload.get("mode", "paper_trading"))
     if not _operation_mode_lock.acquire(blocking=False):
       return {
           "ok": False,
@@ -554,9 +524,9 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       if mode == "learning":
         _start_live_worker(mode)
         result["training_status"] = "continuous_collection_started"
-        result["training_message"] = "Realtime learning will update model artifacts until you press the stop button."
+        result["training_message"] = "Realtime learning and information collection continue while the server is running."
 
-      if mode == "testing":
+      if mode in {"testing", "paper_trading", "paper_trading_test"}:
         target_return_rate = float(payload.get("target_return_rate", 0.02))
         if target_return_rate > 1:
           target_return_rate /= 100.0
@@ -573,8 +543,9 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
             profit_gain=profit_gain,
         )
         demo = _streaming_demos.get(demo_id)
-        _start_live_worker(mode)
-        result["test_status"] = "background_collection_started"
+        _start_live_worker("learning")
+        result["paper_trading_status"] = "background_collection_started"
+        result["paper_trading_kind"] = "legacy_paper_trading" if mode == "testing" else "kis_paper_api"
         result["demo_id"] = demo_id
         result["demo_status"] = "initialized"
         result["target_return_rate"] = target_return_rate
@@ -583,9 +554,26 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["acceleration_factor"] = acceleration_factor
         result["profit_gain"] = max(0.25, min(4.0, profit_gain))
         result["universe_count"] = len(demo._bars_by_ticker) if demo is not None else 0
-        result["test_message"] = (
-            "Realtime testing started in the background; hypothetical trades only, "
-            "no broker orders will be submitted. Streaming simulated buy/sell is running in-app."
+        if mode in {"paper_trading", "paper_trading_test"}:
+          result["kis_connection"] = _kis_connection_probe(paper=True, include_account=True)
+          result["paper_trading_message"] = (
+              "KIS paper trading API mode started. The dashboard checks the virtual broker connection "
+              "and runs the in-app buy/sell loop; live orders remain blocked."
+          )
+        else:
+          result["paper_trading_message"] = (
+              "Legacy paper-trading replay started in the background; "
+              "no live broker orders will be submitted."
+          )
+
+      if mode in {"live_readiness", "live_trading_test"}:
+        _start_live_worker("learning")
+        result["live_readiness_status"] = "checked"
+        result["live_readiness_kind"] = "kis_live_readiness"
+        result["kis_connection"] = _kis_connection_probe(paper=False, include_account=False)
+        result["live_readiness_message"] = (
+            "KIS live readiness was checked without order submission. "
+            "Live trading execution gates remain disabled unless explicitly enabled."
         )
 
       _set_operation_request(False, "started", f"{mode} started", None)
@@ -604,6 +592,35 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       }
     finally:
       _operation_mode_lock.release()
+
+
+def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[str, Any]:
+    mode = "paper" if paper else "live"
+    try:
+      client = KisDevelopersApiClient(paper=paper, enabled=include_account)
+      token = client.issue_access_token()
+      result: dict[str, Any] = {
+          "ok": True,
+          "mode": mode,
+          "base_url": client.endpoints.base_url,
+          "token_issued": bool(token),
+          "token_length": len(token),
+          "account_suffix": f"...{client.credentials.account_no[-2:]}" if client.credentials.account_no else "",
+      }
+      if include_account:
+        portfolio = client.get_portfolio()
+        result["account_checked"] = True
+        result["holdings"] = len(portfolio.account.holdings)
+        result["cash"] = portfolio.account.cash
+      else:
+        result["account_checked"] = False
+      return result
+    except (KisApiError, RuntimeError, OSError) as exc:
+      return {
+          "ok": False,
+          "mode": mode,
+          "error": str(exc),
+      }
 
 
 @app.get("/api/operation-mode/status")
@@ -631,16 +648,15 @@ async def operation_mode_status() -> JSONResponse:
 
 @app.post("/api/operation-mode/stop-learning")
 async def operation_mode_stop_learning() -> JSONResponse:
-    _stop_live_worker()
+    _start_live_worker("learning")
     with _live_lock:
-      _operation_mode_state["active"] = None
-      _clear_live_analysis_cache_unlocked()
-    audit.record("learning_collection_stopped", {"stopped_at": datetime.now(timezone.utc).isoformat()})
+      _append_collection_log_unlocked("scheduled", "Continuous learning remains active while the server is running")
+    audit.record("learning_collection_continues", {"checked_at": datetime.now(timezone.utc).isoformat()})
     return _json(
         {
             "ok": True,
-            "status": "stopped",
-            "message": "Learning data collection has stopped.",
+            "status": "continuous",
+            "message": "Learning and information collection continue while the server is running.",
             "learning": _learning_state_snapshot(),
             "progress": _live_snapshot()["progress"],
             "collection_log": _live_snapshot()["collection_log"],
@@ -842,7 +858,7 @@ async def start_program(request: Request) -> JSONResponse:
         {
             "started": True,
             "mode": "mock_kis_paper_trading",
-            "message": "선택한 목표 기준으로 모의 KIS 자동매매 데모를 시작했습니다. 실거래는 비활성화되어 있습니다.",
+            "message": "?좏깮??紐⑺몴 湲곗??쇰줈 紐⑥쓽 KIS ?먮룞留ㅻℓ ?곕え瑜??쒖옉?덉뒿?덈떎. ?ㅺ굅?섎뒗 鍮꾪솢?깊솕?섏뼱 ?덉뒿?덈떎.",
             "accepted_goal": goal,
             "llm_judgment": run.llm_judgment,
             "ontology_evidence": run.ontology_evidence,
@@ -901,11 +917,13 @@ def mock_kis_portfolio() -> JSONResponse:
     return _json(broker.get_portfolio())
 
 
-@app.post("/api/streaming-demo/start")
-async def streaming_demo_start(request: Request) -> JSONResponse:
-    """스트리밍 데모를 시작합니다 (10배 가속)."""
+@app.post("/api/paper-trading/start")
+async def paper_trading_start(request: Request) -> JSONResponse:
     payload = await request.json()
-    
+    return _json(_paper_trading_start_response(payload))
+
+
+def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
     target_return_rate = float(payload.get("target_return_rate", 0.02))
     if "period_minutes" in payload:
       period_minutes = int(payload.get("period_minutes", 390))
@@ -926,80 +944,20 @@ async def streaming_demo_start(request: Request) -> JSONResponse:
         profit_gain=profit_gain,
     )
     
-    return _json({
+    return {
         "demo_id": demo_id,
         "status": "initialized",
         "progress": 0.0,
         "acceleration_factor": acceleration_factor,
         "profit_gain": max(0.25, min(4.0, profit_gain)),
-        "message": "시뮬레이션 데모가 시작되었습니다. 단계별 진행하기 위해 /api/streaming-demo/step을 호출하세요.",
-    })
+        "message": "모의투자가 시작되었습니다. 단계 진행은 /api/paper-trading/step을 호출하세요.",
+    }
 
 
-@app.post("/api/streaming-demo/step")
-async def streaming_demo_step(request: Request) -> JSONResponse:
-    """스트리밍 데모를 한 스텝 진행합니다."""
+@app.post("/api/paper-trading/step")
+async def paper_trading_step(request: Request) -> JSONResponse:
     payload = await request.json()
     return _json(await run_in_threadpool(_streaming_demo_step_response, payload))
-    demo_id = str(payload.get("demo_id", ""))
-    
-    if demo_id not in _streaming_demos:
-        return _json({
-            "demo_id": demo_id,
-            "status": "expired",
-            "progress": 0.0,
-            "message": "Simulation session expired. Start a new simulation test.",
-        })
-    
-    demo = _streaming_demos[demo_id]
-    result = demo.run_step()
-    
-    if result is None:
-        # 완료됨
-        final = demo.get_final_results()
-        return _json({
-            "demo_id": demo_id,
-            "status": "completed",
-            "progress": 100.0,
-            "message": "데모가 완료되었습니다.",
-            "final_results": final,
-        })
-    
-    # 스텝 결과 반환
-    time_scaler = demo.get_time_scaler()
-    virtual_time = time_scaler.get_virtual_time() if time_scaler else None
-    final = demo.get_final_results() if demo.is_complete() else None
-    
-    return _json({
-        "demo_id": demo_id,
-        "status": "completed" if final is not None else "running",
-        "universe_count": result.universe_ticker_count,
-        "active_ticker_count": result.active_ticker_count,
-        "step": result.visible_step,
-        "raw_step": result.step_index,
-        "chart_bar": result.step_index,
-        "progress": result.progress_percent,
-        "timestamp": result.timestamp,
-        "virtual_time": virtual_time,
-        "prices": result.prices,
-        "account": {
-            "cash": result.cash,
-            "account_value": result.account_value,
-            "return_rate": result.return_rate,
-            "base_currency": result.base_currency,
-            "cash_by_currency": result.cash_by_currency,
-            "account_value_krw": result.account_value_krw,
-            "usd_krw_rate": result.usd_krw_rate,
-        },
-        "principal_protection": _to_jsonable(result.principal_protection),
-        "profit_gain": _to_jsonable(result.profit_gain),
-        "currency_by_ticker": result.currency_by_ticker,
-        "holdings": result.holdings,
-        "trades_in_step": len(result.trades_in_step),
-        "cumulative_trades": result.cumulative_trades,
-        "trades": [_to_jsonable(t) for t in result.trades_in_step],
-        "final_results": final,
-    })
 
 
 def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1009,7 +967,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "demo_id": demo_id,
             "status": "expired",
             "progress": 0.0,
-            "message": "Simulation session expired. Start a new simulation test.",
+            "message": "Paper trading session expired. Start a new paper trading run.",
         }
 
     step_lock = _streaming_demo_step_locks.setdefault(demo_id, threading.Lock())
@@ -1019,7 +977,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "demo_id": demo_id,
             "status": "busy",
             "progress": demo.get_progress() if demo is not None else 0.0,
-            "message": "Simulation step is already running.",
+            "message": "Paper trading step is already running.",
         }
 
     try:
@@ -1032,7 +990,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "progress": demo.get_progress(),
                 "seconds_until_next_step": round(wait_seconds, 1),
                 "retry_after_seconds": round(wait_seconds, 1),
-                "message": "Waiting for the next real-time one-minute simulation bar.",
+                "message": "Waiting for the next one-minute paper trading bar.",
             }
         result = demo.run_step()
         candidate_selection = demo.get_candidate_selection()
@@ -1041,7 +999,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "demo_id": demo_id,
                 "status": "completed",
                 "progress": 100.0,
-                "message": "Simulation completed.",
+                "message": "Paper trading completed.",
                 "final_results": demo.get_final_results(),
                 "ontology_filter_1": _candidate_selection_payload(candidate_selection),
             }
@@ -1160,9 +1118,9 @@ def _save_streaming_step_realtime_records(demo_id: str, result: Any) -> dict[str
     }
 
 
-@app.get("/api/streaming-demo/status/{demo_id}")
+@app.get("/api/paper-trading/status/{demo_id}")
 def streaming_demo_status(demo_id: str) -> JSONResponse:
-    """스트리밍 데모의 현재 상태를 조회합니다."""
+    """?ㅽ듃由щ컢 ?곕え???꾩옱 ?곹깭瑜?議고쉶?⑸땲??"""
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -1180,9 +1138,9 @@ def streaming_demo_status(demo_id: str) -> JSONResponse:
     })
 
 
-@app.post("/api/streaming-demo/pause/{demo_id}")
+@app.post("/api/paper-trading/pause/{demo_id}")
 async def streaming_demo_pause(demo_id: str) -> JSONResponse:
-    """스트리밍 데모를 일시 정지합니다."""
+    """?ㅽ듃由щ컢 ?곕え瑜??쇱떆 ?뺤??⑸땲??"""
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -1196,9 +1154,9 @@ async def streaming_demo_pause(demo_id: str) -> JSONResponse:
     })
 
 
-@app.post("/api/streaming-demo/resume/{demo_id}")
+@app.post("/api/paper-trading/resume/{demo_id}")
 async def streaming_demo_resume(demo_id: str) -> JSONResponse:
-    """일시 정지된 스트리밍 데모를 다시 시작합니다."""
+    """?쇱떆 ?뺤????ㅽ듃由щ컢 ?곕え瑜??ㅼ떆 ?쒖옉?⑸땲??"""
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -1212,9 +1170,9 @@ async def streaming_demo_resume(demo_id: str) -> JSONResponse:
     })
 
 
-@app.post("/api/streaming-demo/cleanup/{demo_id}")
+@app.post("/api/paper-trading/cleanup/{demo_id}")
 async def streaming_demo_cleanup(demo_id: str) -> JSONResponse:
-    """스트리밍 데모를 정리합니다."""
+    """?ㅽ듃由щ컢 ?곕え瑜??뺣━?⑸땲??"""
     with _streaming_demos_lock:
         if demo_id in _streaming_demos:
             del _streaming_demos[demo_id]
@@ -1223,7 +1181,7 @@ async def streaming_demo_cleanup(demo_id: str) -> JSONResponse:
     return _json({
         "demo_id": demo_id,
         "status": "cleaned_up",
-        "message": "데모가 정리되었습니다.",
+        "message": "?곕え媛 ?뺣━?섏뿀?듬땲??",
     })
 
 
@@ -1274,12 +1232,12 @@ def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
     if goal_mode and goal_mode != "rate":
         raise HTTPException(
             status_code=400,
-            detail="목표 수익률만 사용합니다.",
+            detail="紐⑺몴 ?섏씡瑜좊쭔 ?ъ슜?⑸땲??",
         )
     if not has_rate:
         raise HTTPException(
             status_code=400,
-            detail="목표 수익률을 입력하세요.",
+            detail="紐⑺몴 ?섏씡瑜좎쓣 ?낅젰?섏꽭??",
         )
 
     parsed_rate = float(target_return_rate) / 100.0
@@ -1513,9 +1471,9 @@ def _format_research_progress_message(source_key: str, completed: int, total: in
     retry_target, attempt = _split_retry_source_key(source_key)
     retry_label = _format_source_label(retry_target)
     if attempt:
-      return f"재시도 중 · {retry_label} · {attempt}"
-    return f"재시도 중 · {retry_label}"
-  return f"자료 수집 중 · {label} · {completed}/{max(1, total)}"
+      return f"?ъ떆??以?쨌 {retry_label} 쨌 {attempt}"
+    return f"?ъ떆??以?쨌 {retry_label}"
+  return f"?먮즺 ?섏쭛 以?쨌 {label} 쨌 {completed}/{max(1, total)}"
 
 
 def _split_retry_source_key(source_key: str) -> tuple[str, str | None]:
@@ -1534,11 +1492,11 @@ def _format_source_label(source_key: str) -> str:
     raw, _ = _split_retry_source_key(source_key)
   prefix, _, remainder = raw.partition(":")
   labels = {
-    "rss": "RSS 뉴스",
-    "html": "HTML 페이지",
-    "dynamic": "동적 페이지",
-    "stooq": "Stooq 시세",
-    "yahoo_chart": "Yahoo 차트",
+    "rss": "RSS ?댁뒪",
+    "html": "HTML ?섏씠吏",
+    "dynamic": "?숈쟻 ?섏씠吏",
+    "stooq": "Stooq ?쒖꽭",
+    "yahoo_chart": "Yahoo 李⑦듃",
     "fred": "FRED",
     "ecos": "ECOS",
     "opendart": "OpenDART",
@@ -1682,8 +1640,8 @@ def _refresh_live_cache() -> None:
       if learning_mode == "learning":
         _set_live_progress(76, "learning", "Updating realtime supervised model artifacts")
         model_paths = update_realtime_model_artifacts(ModelArtifactStore(), realtime_examples)
-      elif learning_mode == "testing":
-        _set_live_progress(76, "testing", "Calculating hypothetical realized PnL without orders")
+      elif learning_mode in {"testing", "paper_trading", "paper_trading_test"}:
+        _set_live_progress(76, "paper_trading", "Calculating paper trading realized PnL")
         test_result = run_hypothetical_realtime_test(context.temporal_frames, context.signals)
         model_paths = update_realtime_model_artifacts(ModelArtifactStore(), realtime_examples, test_result)
       _set_live_progress(84, "graph", "Persisting ontology graph and reasoning paths")
@@ -2265,9 +2223,9 @@ def _build_reasoning_steps(reasoning_paths: tuple[Any, ...]) -> list[dict[str, A
     for path in reasoning_paths:
         confidence = round(float(path.confidence) * 100, 1)
         groups = (
-            ("supporting_triples", "긍정 근거 확인", "support"),
-            ("contradicting_triples", "상충 근거 확인", "contradiction"),
-            ("risk_triples", "리스크 근거 확인", "risk"),
+            ("supporting_triples", "湲띿젙 洹쇨굅 ?뺤씤", "support"),
+            ("contradicting_triples", "?곸땐 洹쇨굅 ?뺤씤", "contradiction"),
+            ("risk_triples", "由ъ뒪??洹쇨굅 ?뺤씤", "risk"),
         )
         for attr, title, tone in groups:
             for triple_text in getattr(path, attr, ()):
@@ -2291,8 +2249,8 @@ def _build_reasoning_steps(reasoning_paths: tuple[Any, ...]) -> list[dict[str, A
             {
                 "path_id": path.path_id,
                 "ticker": path.ticker,
-                "title": "결론 산출",
-                "description": f"{path.ticker}: {path.conclusion} · 신뢰도 {confidence:.1f}%",
+                "title": "寃곕줎 ?곗텧",
+                "description": f"{path.ticker}: {path.conclusion} 쨌 ?좊ː??{confidence:.1f}%",
                 "nodes": [path.ticker, path.conclusion],
                 "links": [{"source": path.ticker, "target": path.conclusion, "predicate": "supportsSignal"}],
                 "tone": "conclusion" if path.conclusion == "BuyCandidate" else "watch",
@@ -2337,7 +2295,7 @@ HTML = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
-  <title>개인 투자 분석 시스템</title>
+  <title>媛쒖씤 ?ъ옄 遺꾩꽍 ?쒖뒪??/title>
   <style>
     :root {
       --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2430; --muted: #667085;
@@ -2461,6 +2419,46 @@ HTML = """
     .ontology-panel .muted { color: #cbd5e1; }
     #ontologyCanvas { width: 100%; height: 760px; display: block; }
     #ontologyTooltip { position: absolute; z-index: 3; pointer-events: none; min-width: 160px; max-width: 260px; padding: 8px 10px; border-radius: 6px; background: rgba(15,23,42,.92); color: #fff; border: 1px solid rgba(255,255,255,.18); font-size: 12px; transform: translate(12px, 12px); display: none; }
+    @media (min-width: 901px) {
+      .shell { grid-template-columns: 300px minmax(0, 1fr); }
+      aside { padding: 14px; max-height: 100vh; overflow: auto; }
+      main { padding: 14px; }
+      h1 { font-size: 20px; margin-bottom: 10px; }
+      h2 { font-size: 14px; margin-bottom: 8px; }
+      .grid { gap: 10px; align-items: start; }
+      .panel { padding: 12px; }
+      .metric { font-size: 22px; }
+      .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+      .stat { padding: 9px; }
+      .stat strong { font-size: 18px; }
+      .field { margin-bottom: 9px; }
+      input, button { height: 34px; font-size: 13px; }
+      .mode-grid { grid-template-columns: 1fr; gap: 6px; }
+      .mode-grid button { min-height: 38px; padding: 7px 9px; }
+      .work-status { margin-top: 8px; padding: 9px; }
+      .flow-panel { grid-template-columns: 1fr 1fr; gap: 6px; }
+      .flow-step { grid-template-columns: 16px minmax(0, 1fr); padding: 7px; }
+      .flow-dot { width: 14px; height: 14px; border-width: 2px; }
+      .collection-log-chart,
+      .collection-log-list,
+      .data-volume-wrap,
+      .warning-list,
+      #sourceVolumeList,
+      #output,
+      #relations { display: none !important; }
+      #learningStatusCard .bar { height: 8px; }
+      #streamingDemoContainer { display: block; }
+      #streamingDemoContainer .score-row { grid-template-columns: 84px minmax(0, 1fr); margin: 6px 0; }
+      #streamingDemoContainer .score-row .mini-chart { display: none; }
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+      .choice { padding: 10px; min-height: 96px; }
+      .choice .metric { font-size: 20px; }
+      .table-wrap { max-height: 160px; }
+      table.live-table { font-size: 11px; }
+      .live-table th, .live-table td { padding: 6px 7px; }
+      .ontology-scene { min-height: 700px; }
+      #ontologyCanvas { height: 700px; }
+    }
     @media (max-width: 900px) {
       .shell { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -2477,71 +2475,71 @@ HTML = """
 <body>
   <div class="shell">
     <aside>
-      <h1>개인 투자 분석 시스템</h1>
-      <div class="status" id="gate">목표가 확정될 때까지 프로그램은 시작되지 않습니다.</div>
-      <h2>운영 모드</h2>
-      <div class="mode-step-label">실시간 통합 데이터 기준</div>
+      <h1>媛쒖씤 ?ъ옄 遺꾩꽍 ?쒖뒪??/h1>
+      <div class="status" id="gate">紐⑺몴媛 ?뺤젙???뚭퉴吏 ?꾨줈洹몃옩? ?쒖옉?섏? ?딆뒿?덈떎.</div>
+      <h2>?댁쁺 紐⑤뱶</h2>
+      <div class="mode-step-label">?ㅼ떆媛??듯빀 ?곗씠??湲곗?</div>
       <div class="mode-grid" id="modeActionGrid">
-        <button type="button" id="modeLearningButton" onclick="startSelectedOperationMode('training')">학습<small>실시간 데이터 + 손익 라벨</small></button>
-        <button type="button" id="modeLearningStopButton" class="secondary" onclick="stopLearningCollection()" disabled>학습 종료<small>수집 중지</small></button>
-        <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('testing')">테스트<small>실제 주문 없이 가상 손익</small></button>
-        <button type="button" id="modeLiveButton" onclick="startOperationMode('live_trading')">실전<small>리스크 게이트 적용</small></button>
+        <button type="button" id="modeLearningButton" onclick="startSelectedOperationMode('training')">?숈뒿<small>?ㅼ떆媛??곗씠??+ ?먯씡 ?쇰꺼</small></button>
+        <button type="button" id="modeLearningStopButton" class="secondary" onclick="stopLearningCollection()" disabled>?숈뒿 醫낅즺<small>?섏쭛 以묒?</small></button>
+        <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('paper')">?뚯뒪??small>?ㅼ젣 二쇰Ц ?놁씠 媛???먯씡</small></button>
+        <button type="button" id="modeLiveButton" onclick="startOperationMode('live_trading')">?ㅼ쟾<small>由ъ뒪??寃뚯씠???곸슜</small></button>
       </div>
       <div class="work-status active">
-        <strong id="operationModeStatus">모드 대기</strong>
-        <div class="muted" id="runtimeStatus">NPU 상태 확인 중</div>
+        <strong id="operationModeStatus">紐⑤뱶 ?湲?/strong>
+        <div class="muted" id="runtimeStatus">NPU ?곹깭 ?뺤씤 以?/div>
       </div>
       <div class="work-status active" id="learningStatusCard">
-        <strong id="learningStatusTitle">학습 현황</strong>
-        <div class="muted" id="learningStatusMessage">실시간 상태를 확인하는 중입니다.</div>
+        <strong id="learningStatusTitle">?숈뒿 ?꾪솴</strong>
+        <div class="muted" id="learningStatusMessage">?ㅼ떆媛??곹깭瑜??뺤씤?섎뒗 以묒엯?덈떎.</div>
         <div class="bar"><span id="learningStatusProgress" style="width:0%"></span></div>
-        <div class="muted" id="learningStatusMeta" style="margin-top:8px;">대기 중</div>
+        <div class="muted" id="learningStatusMeta" style="margin-top:8px;">?湲?以?/div>
         <canvas class="collection-log-chart" id="learningCollectionChart" width="280" height="64"></canvas>
         <div class="collection-log-list" id="learningCollectionLog"></div>
       </div>
       <div class="work-status active">
-        <strong>시스템 흐름</strong>
+        <strong>?쒖뒪???먮쫫</strong>
         <div class="flow-panel" id="systemFlowPanel">
-          <div class="flow-step" data-flow-step="mode"><i class="flow-dot"></i><div><strong>모드</strong><span>학습/테스트 선택 대기</span></div></div>
-          <div class="flow-step" data-flow-step="data"><i class="flow-dot"></i><div><strong>데이터</strong><span>실시간 자료 상태 확인 중</span></div></div>
-          <div class="flow-step" data-flow-step="analysis"><i class="flow-dot"></i><div><strong>분석</strong><span>목표 가능성 또는 전략 계산 대기</span></div></div>
-          <div class="flow-step" data-flow-step="simulation"><i class="flow-dot"></i><div><strong>모의 진행</strong><span>시뮬레이션 대기</span></div></div>
+          <div class="flow-step" data-flow-step="mode"><i class="flow-dot"></i><div><strong>紐⑤뱶</strong><span>?숈뒿/?뚯뒪???좏깮 ?湲?/span></div></div>
+          <div class="flow-step" data-flow-step="data"><i class="flow-dot"></i><div><strong>?곗씠??/strong><span>?ㅼ떆媛??먮즺 ?곹깭 ?뺤씤 以?/span></div></div>
+          <div class="flow-step" data-flow-step="analysis"><i class="flow-dot"></i><div><strong>遺꾩꽍</strong><span>紐⑺몴 媛?μ꽦 ?먮뒗 ?꾨왂 怨꾩궛 ?湲?/span></div></div>
+          <div class="flow-step" data-flow-step="simulation"><i class="flow-dot"></i><div><strong>紐⑥쓽 吏꾪뻾</strong><span>?쒕??덉씠???湲?/span></div></div>
         </div>
       </div>
       <form id="goalForm">
-        <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
-        <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
-        <div class="field"><label for="initialCash">시뮬레이션 예수금 (원)</label><input id="initialCash" name="initial_cash" type="number" min="100000" step="100000" value="10000000" placeholder="예: 10000000"></div>
-        <button type="submit">가능성 분석</button>
-        <button class="secondary" id="loadResearch" type="button">자료 불러오기</button>
+        <div class="field"><label for="targetReturn">紐⑺몴 ?섏씡瑜?(%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="?? 5"></div>
+        <div class="field"><label for="targetMinutes">紐⑺몴 ?쒓컙 (遺?</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="?? 390"></div>
+        <div class="field"><label for="initialCash">?쒕??덉씠???덉닔湲?(??</label><input id="initialCash" name="initial_cash" type="number" min="100000" step="100000" value="10000000" placeholder="?? 10000000"></div>
+        <button type="submit">媛?μ꽦 遺꾩꽍</button>
+        <button class="secondary" id="loadResearch" type="button">?먮즺 遺덈윭?ㅺ린</button>
         <div class="work-status" id="workStatus">
-          <strong id="workTitle">작업 대기 중</strong>
-          <div class="muted" id="workMessage">버튼을 누르면 진행 현황이 표시됩니다.</div>
+          <strong id="workTitle">?묒뾽 ?湲?以?/strong>
+          <div class="muted" id="workMessage">踰꾪듉???꾨Ⅴ硫?吏꾪뻾 ?꾪솴???쒖떆?⑸땲??</div>
           <div class="bar"><span id="workProgress"></span></div>
         </div>
-        <div class="field"><label for="profitGain">수익률 게인</label><input id="profitGain" name="profit_gain" type="number" min="0.25" max="4" step="0.25" value="1" placeholder="예: 1.5"></div>
+        <div class="field"><label for="profitGain">?섏씡瑜?寃뚯씤</label><input id="profitGain" name="profit_gain" type="number" min="0.25" max="4" step="0.25" value="1" placeholder="?? 1.5"></div>
       </form>
       <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
-      <h2>시뮬레이션 테스트</h2>
-      <div class="note">시뮬레이션 테스트는 위에서 입력한 목표 수익률과 목표 시간으로 자동 진행됩니다.</div>
+      <h2>?쒕??덉씠???뚯뒪??/h2>
+      <div class="note">?쒕??덉씠???뚯뒪?몃뒗 ?꾩뿉???낅젰??紐⑺몴 ?섏씡瑜좉낵 紐⑺몴 ?쒓컙?쇰줈 ?먮룞 吏꾪뻾?⑸땲??</div>
       <div class="work-status active" id="streamingDemoContainer" style="display:none;">
-        <strong id="streamingDemoStatus">대기 중</strong>
+        <strong id="streamingDemoStatus">?湲?以?/strong>
         <div class="bar"><span id="streamingDemoProgress" style="width:0%"></span></div>
         <div style="margin-top: 10px; font-size: 12px;">
           <div class="score-row">
-            <span class="score-label">예수금:</span>
-            <span class="score-value" id="streamingDeposit">₩0</span>
+            <span class="score-label">?덉닔湲?</span>
+            <span class="score-value" id="streamingDeposit">??</span>
           </div>
           <div class="score-row">
-            <span class="score-label">투자금:</span>
-            <span class="score-value" id="streamingInvested">₩0</span>
+            <span class="score-label">?ъ옄湲?</span>
+            <span class="score-value" id="streamingInvested">??</span>
           </div>
           <div class="score-row">
-            <span class="score-label">수익금:</span>
-            <span class="score-value" id="streamingProfit">₩0</span>
+            <span class="score-label">?섏씡湲?</span>
+            <span class="score-value" id="streamingProfit">??</span>
           </div>
           <div class="score-row">
-            <span class="score-label">수익률:</span>
+            <span class="score-label">?섏씡瑜?</span>
             <span class="score-value" id="streamingReturnRate">0%</span>
             <canvas class="mini-chart" id="streamingReturnChart" width="280" height="74"></canvas>
           </div>
@@ -2551,17 +2549,17 @@ HTML = """
     </aside>
     <main>
       <div class="grid">
-        <section class="panel span-4"><h2>포트폴리오</h2><div class="metric" id="equity">-</div><div class="muted">총 평가금액</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">예치금 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
-        <section class="panel span-4"><h2>모의 수익률</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">수익금 -</span><span class="chip" id="mockEquity">평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">선택한 목표로 시작하면 모의 KIS 포트폴리오 수익률이 표시됩니다.</p></section>
+        <section class="panel span-4"><h2>?ы듃?대━??/h2><div class="metric" id="equity">-</div><div class="muted">珥??됯?湲덉븸</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">?덉튂湲?-</span><span class="chip" id="cashWeight">?꾧툑 鍮꾩쨷 -</span></div></section>
+        <section class="panel span-4"><h2>紐⑥쓽 ?섏씡瑜?/h2><div class="metric" id="mockReturn">?湲?以?/div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">?섏씡湲?-</span><span class="chip" id="mockEquity">?됯?湲?-</span><span class="chip" id="mockTarget">紐⑺몴 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">?좏깮??紐⑺몴濡??쒖옉?섎㈃ 紐⑥쓽 KIS ?ы듃?대━???섏씡瑜좎씠 ?쒖떆?⑸땲??</p></section>
         <section class="panel span-8">
-          <h2>달성 가능성</h2>
-          <div class="metric" id="feasibility">대기 중</div>
+          <h2>?ъ꽦 媛?μ꽦</h2>
+          <div class="metric" id="feasibility">?湲?以?/div>
           <div class="bar"><span id="feasibilityBar"></span></div>
           <div id="scoreBreakdown" style="margin-top:14px;"></div>
-          <p class="muted" id="summary">목표를 입력하면 시장 자료, 온톨로지 관계, 리스크 압력을 바탕으로 달성 가능성을 계산합니다.</p>
+          <p class="muted" id="summary">紐⑺몴瑜??낅젰?섎㈃ ?쒖옣 ?먮즺, ?⑦넧濡쒖? 愿怨? 由ъ뒪???뺣젰??諛뷀깢?쇰줈 ?ъ꽦 媛?μ꽦??怨꾩궛?⑸땲??</p>
         </section>
         <section class="panel span-12">
-          <h2>실시간 자료 진단 <span class="muted" id="liveRefreshBadge">갱신 대기</span></h2>
+          <h2>?ㅼ떆媛??먮즺 吏꾨떒 <span class="muted" id="liveRefreshBadge">媛깆떊 ?湲?/span></h2>
           <div class="stats" id="diagnosticStats"></div>
           <div class="stats" id="storeStats" style="margin-top:10px;"></div>
           <div class="warning-list" id="collectionWarnings"></div>
@@ -2572,60 +2570,60 @@ HTML = """
         </section>
         <section class="ontology-scene ontology-wide-layout">
           <div class="ontology-toolbar">
-            <span class="ontology-badge">3D 온톨로지 네트워크</span>
-            <span class="ontology-badge" id="ontologyCounts">노드 - · 관계 -</span>
-            <button id="resetGraph" type="button">시점 초기화</button>
-            <button id="toggleLabels" type="button">라벨 켜기</button>
-            <button id="toggleReasoning" type="button">추론 일시정지</button>
-            <span class="ontology-badge" id="reasoningBadge">추론 단계 -</span>
+            <span class="ontology-badge">3D ?⑦넧濡쒖? ?ㅽ듃?뚰겕</span>
+            <span class="ontology-badge" id="ontologyCounts">?몃뱶 - 쨌 愿怨?-</span>
+            <button id="resetGraph" type="button">?쒖젏 珥덇린??/button>
+            <button id="toggleLabels" type="button">?쇰꺼 耳쒓린</button>
+            <button id="toggleReasoning" type="button">異붾줎 ?쇱떆?뺤?</button>
+            <span class="ontology-badge" id="reasoningBadge">異붾줎 ?④퀎 -</span>
             <div class="ontology-filter" id="ontologyFilters">
-              <label><input type="checkbox" value="ticker" checked>종목</label>
-              <label><input type="checkbox" value="event" checked>이벤트</label>
-              <label><input type="checkbox" value="temporal" checked>시간축</label>
-              <label><input type="checkbox" value="support" checked>긍정</label>
-              <label><input type="checkbox" value="risk" checked>리스크</label>
-              <label><input type="checkbox" value="contradiction" checked>상충</label>
-              <label><input type="checkbox" value="sector" checked>섹터</label>
+              <label><input type="checkbox" value="ticker" checked>醫낅ぉ</label>
+              <label><input type="checkbox" value="event" checked>?대깽??/label>
+              <label><input type="checkbox" value="temporal" checked>?쒓컙異?/label>
+              <label><input type="checkbox" value="support" checked>湲띿젙</label>
+              <label><input type="checkbox" value="risk" checked>由ъ뒪??/label>
+              <label><input type="checkbox" value="contradiction" checked>?곸땐</label>
+              <label><input type="checkbox" value="sector" checked>?뱁꽣</label>
               <label><input type="checkbox" value="pipeline" checked>Pipeline</label>
               <label><input type="checkbox" value="tuning" checked>Tuning</label>
               <label><input type="checkbox" value="parameter" checked>Parameter</label>
               <label><input type="checkbox" value="metric" checked>Metric</label>
-              <label><input type="checkbox" value="entity" checked>개체</label>
+              <label><input type="checkbox" value="entity" checked>媛쒖껜</label>
             </div>
           </div>
           <canvas id="ontologyCanvas"></canvas>
           <div class="ontology-panel" id="ontologyPanel">
-            <strong>노드를 선택하세요</strong>
-            <div class="muted">마우스를 올리거나 클릭하면 노드 종류와 연결 관계를 확인할 수 있습니다.</div>
+            <strong>?몃뱶瑜??좏깮?섏꽭??/strong>
+            <div class="muted">留덉슦?ㅻ? ?щ━嫄곕굹 ?대┃?섎㈃ ?몃뱶 醫낅쪟? ?곌껐 愿怨꾨? ?뺤씤?????덉뒿?덈떎.</div>
           </div>
           <div class="reasoning-strip">
             <div>
-              <strong id="reasoningTitle">실시간 추론 대기</strong>
-              <span id="reasoningMeta">그래프를 불러오면 추론 경로가 순차적으로 강조됩니다.</span>
+              <strong id="reasoningTitle">?ㅼ떆媛?異붾줎 ?湲?/strong>
+              <span id="reasoningMeta">洹몃옒?꾨? 遺덈윭?ㅻ㈃ 異붾줎 寃쎈줈媛 ?쒖감?곸쑝濡?媛뺤“?⑸땲??</span>
               <div class="reasoning-progress"><span id="reasoningProgress"></span></div>
             </div>
-            <div id="reasoningDescription">활성화되는 노드와 엣지가 밝게 빛나며 현재 판단 근거를 보여줍니다.</div>
+            <div id="reasoningDescription">?쒖꽦?붾릺???몃뱶? ?ｌ?媛 諛앷쾶 鍮쏅굹硫??꾩옱 ?먮떒 洹쇨굅瑜?蹂댁뿬以띾땲??</div>
           </div>
           <div class="ontology-legend">
-            <span class="legend-item"><span class="legend-dot" style="background:#38bdf8"></span>종목</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#f97316"></span>뉴스/이벤트</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span>시간축</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>긍정 신호</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>리스크</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#d946ef"></span>상충 요인</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#84cc16"></span>섹터</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#38bdf8"></span>醫낅ぉ</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f97316"></span>?댁뒪/?대깽??/span>
+            <span class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span>?쒓컙異?/span>
+            <span class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>湲띿젙 ?좏샇</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>由ъ뒪??/span>
+            <span class="legend-item"><span class="legend-dot" style="background:#d946ef"></span>?곸땐 ?붿씤</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#84cc16"></span>?뱁꽣</span>
             <span class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>Pipeline</span>
             <span class="legend-item"><span class="legend-dot" style="background:#eab308"></span>Tuning</span>
             <span class="legend-item"><span class="legend-dot" style="background:#ec4899"></span>Parameter</span>
             <span class="legend-item"><span class="legend-dot" style="background:#94a3b8"></span>Metric</span>
-            <span class="legend-item"><span class="legend-dot" style="background:#f8fafc"></span>개체</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f8fafc"></span>媛쒖껜</span>
           </div>
           <div id="ontologyTooltip"></div>
         </section>
-        <section class="panel span-12"><h2>목표 타협안</h2><div class="cards" id="choices"></div><div style="margin-top:14px;"><button id="startButton" disabled>선택한 목표로 시작</button> <button class="secondary" id="resetButton" type="button">초기화</button></div></section>
-        <section class="panel span-12"><h2>실시간 모의 진행</h2><div class="stats" id="mockRunStats"></div><div class="grid" style="margin-top:12px;"><div class="span-12"><h2>최근 체결 및 종료 청산</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>구분</th><th>종목</th><th>수량</th><th>가격/금액</th></tr></thead><tbody id="mockExecutions"><tr><td colspan="4">체결 내역 없음</td></tr></tbody></table></div><div style="margin-top: 12px;"><h2>스트리밍 데모 거래</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>금액</th></tr></thead><tbody id="streamingTradeList"><tr><td colspan="4">거래 없음</td></tr></tbody></table></div></div></div></div></section>
-        <section class="panel span-4"><h2>온톨로지 신호</h2><div class="chips" id="relations"></div></section>
-        <section class="panel span-8"><h2>자료 및 프로그램 출력</h2><div class="log" id="output">아직 실행되지 않았습니다.</div></section>
+        <section class="panel span-12"><h2>紐⑺몴 ??묒븞</h2><div class="cards" id="choices"></div><div style="margin-top:14px;"><button id="startButton" disabled>?좏깮??紐⑺몴濡??쒖옉</button> <button class="secondary" id="resetButton" type="button">珥덇린??/button></div></section>
+        <section class="panel span-12"><h2>?ㅼ떆媛?紐⑥쓽 吏꾪뻾</h2><div class="stats" id="mockRunStats"></div><div class="grid" style="margin-top:12px;"><div class="span-12"><h2>理쒓렐 泥닿껐 諛?醫낅즺 泥?궛</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>援щ텇</th><th>醫낅ぉ</th><th>?섎웾</th><th>媛寃?湲덉븸</th></tr></thead><tbody id="mockExecutions"><tr><td colspan="4">泥닿껐 ?댁뿭 ?놁쓬</td></tr></tbody></table></div><div style="margin-top: 12px;"><h2>?ㅽ듃由щ컢 ?곕え 嫄곕옒</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>醫낅ぉ</th><th>援щ텇</th><th>?섎웾</th><th>湲덉븸</th></tr></thead><tbody id="streamingTradeList"><tr><td colspan="4">嫄곕옒 ?놁쓬</td></tr></tbody></table></div></div></div></div></section>
+        <section class="panel span-4"><h2>?⑦넧濡쒖? ?좏샇</h2><div class="chips" id="relations"></div></section>
+        <section class="panel span-8"><h2>?먮즺 諛??꾨줈洹몃옩 異쒕젰</h2><div class="log" id="output">?꾩쭅 ?ㅽ뻾?섏? ?딆븯?듬땲??</div></section>
       </div>
     </main>
   </div>
@@ -2648,18 +2646,50 @@ HTML = """
     const fmtWon = new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 });
     const fmtUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-    function formatMoney(value, currency = 'KRW') {
-      const amount = Number(value || 0);
-      return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(amount) : fmtWon.format(amount);
+    function applyCompactKoreanDashboard() {
+      document.title = 'Paper Trading Dashboard';
+      const title = document.querySelector('aside h1');
+      if (title) title.textContent = 'Paper Trading Dashboard';
+      const gate = document.getElementById('gate');
+      if (gate) gate.textContent = 'Learning and collection continue automatically while the server is running.';
+      const stepLabel = document.querySelector('.mode-step-label');
+      if (stepLabel) stepLabel.textContent = 'Operation Mode';
+      const learningButton = document.getElementById('modeLearningButton');
+      const paperButton = document.getElementById('modeTestingButton');
+      const liveButton = document.getElementById('modeLiveButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      if (learningButton) {
+        learningButton.innerHTML = 'Learning status<small>Runs while server is open</small>';
+        learningButton.onclick = () => loadLearningStatus();
+      }
+      if (paperButton) {
+        paperButton.innerHTML = 'Paper trading API<small>KIS virtual broker</small>';
+        paperButton.onclick = () => startSelectedOperationMode('paper');
+      }
+      if (liveButton) {
+        liveButton.innerHTML = 'Live readiness<small>Auth check without orders</small>';
+        liveButton.onclick = () => startSelectedOperationMode('live_test');
+      }
+      if (refreshButton) {
+        refreshButton.innerHTML = 'Refresh status<small>Collection stays active</small>';
+        refreshButton.disabled = false;
+        refreshButton.onclick = () => loadLearningStatus();
+      }
+      const flowCopy = {
+        mode: ['Mode', 'Paper trading or live readiness'],
+        data: ['Collection', 'Auto refresh while server runs'],
+        analysis: ['Learning', 'Realtime store updates'],
+        simulation: ['Paper trading', 'Waiting for KIS/API state'],
+      };
+      document.querySelectorAll('#systemFlowPanel .flow-step').forEach((step) => {
+        const copy = flowCopy[step.dataset.flowStep];
+        if (!copy) return;
+        const strong = step.querySelector('strong');
+        const span = step.querySelector('span');
+        if (strong) strong.textContent = copy[0];
+        if (span) span.textContent = copy[1];
+      });
     }
-
-    function formatCashByCurrency(account = {}) {
-      const cashByCurrency = account.cash_by_currency || {};
-      const krw = Number(cashByCurrency.KRW ?? account.cash ?? 0);
-      const usd = Number(cashByCurrency.USD ?? 0);
-      return `원화 ${fmtWon.format(krw)} / 달러 ${fmtUsd.format(usd)}`;
-    }
-
     async function loadStatus() {
       const data = await (await fetch('/api/status')).json();
       renderStatus(data);
@@ -2684,11 +2714,11 @@ HTML = """
         }
         /*
         if (progress.stage === 'error') {
-          renderSystemFlow({ data: 'error' }, { data: progress.message || '데이터 갱신 실패' });
+          renderSystemFlow({ data: 'error' }, { data: progress.message || '?곗씠??媛깆떊 ?ㅽ뙣' });
         } else if (data.is_refreshing || progress.active) {
-          renderSystemFlow({ data: 'active' }, { data: progress.message || '데이터 갱신 중' });
+          renderSystemFlow({ data: 'active' }, { data: progress.message || '?곗씠??媛깆떊 以? });
         } else if ((progress.percent || 0) >= 100) {
-          renderSystemFlow({ data: 'done', analysis: 'done' }, { data: '데이터 캐시 준비 완료', analysis: '분석 캐시 준비 완료' });
+          renderSystemFlow({ data: 'done', analysis: 'done' }, { data: '?곗씠??罹먯떆 以鍮??꾨즺', analysis: '遺꾩꽍 罹먯떆 以鍮??꾨즺' });
         }
         */
       } catch (error) {
@@ -2713,7 +2743,7 @@ HTML = """
 
     async function loadOntologyGraph() {
       const data = await (await fetch('/api/ontology/graph')).json();
-      document.getElementById('ontologyCounts').textContent = `노드 ${data.counts.nodes} · 관계 ${data.counts.links}`;
+      document.getElementById('ontologyCounts').textContent = `?몃뱶 ${data.counts.nodes} 쨌 愿怨?${data.counts.links}`;
       lastGraphSignature = graphSignature(data);
       await renderOntologyGraph(data);
     }
@@ -2724,47 +2754,48 @@ HTML = """
       const policy = data.short_horizon_policy || {};
       const eventLlm = data.event_llm || {};
       const ontologyNpu = data.ontology_npu || {};
-      const npuLabel = accel.uses_npu ? 'NPU 사용 중' : `CPU fallback (${accel.active_backend || '-'})`;
-      const llmLabel = eventLlm.available ? `LLM ${eventLlm.provider || '-'} ready` : `LLM 대기: ${eventLlm.reason || 'not configured'}`;
+      const npuLabel = accel.uses_npu ? 'NPU active' : `CPU fallback (${accel.active_backend || '-'})`;
+      const llmLabel = eventLlm.available ? `LLM ${eventLlm.provider || '-'} ready` : `LLM waiting ${eventLlm.reason || 'not configured'}`;
       const ontologyNpuLabel = ontologyNpu.uses_npu
-        ? `온톨로지 NPU ${ontologyNpu.last_items || 0}건 ${ontologyNpu.last_latency_ms ? `${ontologyNpu.last_latency_ms}ms` : 'ready'}`
-        : `온톨로지 NPU fallback ${ontologyNpu.backend || '-'}`;
+        ? `Ontology NPU ${ontologyNpu.last_items || 0} rows ${ontologyNpu.last_latency_ms ? `${ontologyNpu.last_latency_ms}ms` : 'ready'}`
+        : `Ontology fallback ${ontologyNpu.backend || '-'}`;
       document.getElementById('runtimeStatus').textContent =
-        `${npuLabel} · ${ontologyNpuLabel} · ${llmLabel} · ${accel.latency_profile || 'low_latency'} · 예측 ${((accel.prediction_horizons_seconds || []).join('/'))}초 · 포지션 cap ${((policy.max_position_weight_intraday || 0) * 100).toFixed(1)}%`;
+        `${npuLabel} | ${ontologyNpuLabel} | ${llmLabel} | ${accel.latency_profile || 'low_latency'} | horizons ${((accel.prediction_horizons_seconds || []).join('/'))}s | cap ${((policy.max_position_weight_intraday || 0) * 100).toFixed(1)}%`;
       if (data.operation_mode) renderOperationMode(data.operation_mode);
     }
-
     function selectedOperationMode(action) {
       if (action === 'training') return 'learning';
-      if (action === 'testing') return 'testing';
+      if (action === 'testing' || action === 'paper') return 'paper_trading';
+      if (action === 'live_test') return 'live_readiness';
       return 'live_trading';
     }
 
     function updateModeButtons() {
       const learningButton = document.getElementById('modeLearningButton');
-      const stopLearningButton = document.getElementById('modeLearningStopButton');
-      const testingButton = document.getElementById('modeTestingButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
-      if (!learningButton || !testingButton) return;
+      if (!learningButton || !paperButton) return;
       learningButton.disabled = operationRequestActive;
-      if (stopLearningButton) stopLearningButton.disabled = true;
-      testingButton.disabled = operationRequestActive;
+      paperButton.disabled = operationRequestActive;
       if (liveButton) liveButton.disabled = operationRequestActive;
-      learningButton.innerHTML = '학습<small>실시간 데이터 + 손익 라벨</small>';
-      testingButton.innerHTML = '테스트<small>실제 주문 없이 가상 손익</small>';
+      if (refreshButton) refreshButton.disabled = false;
+      learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
+      paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
+      if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
+      if (refreshButton) refreshButton.innerHTML = '상태 새로고침<small>수집은 중단하지 않음</small>';
     }
 
     function setModeButtonsLocked(locked) {
       const learningButton = document.getElementById('modeLearningButton');
-      const stopLearningButton = document.getElementById('modeLearningStopButton');
-      const testingButton = document.getElementById('modeTestingButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
-      if (!learningButton || !testingButton) return;
       const enabled = !locked;
-      learningButton.disabled = !enabled;
-      if (stopLearningButton && locked) stopLearningButton.disabled = true;
-      testingButton.disabled = !enabled;
+      if (learningButton) learningButton.disabled = !enabled;
+      if (paperButton) paperButton.disabled = !enabled;
       if (liveButton) liveButton.disabled = !enabled;
+      if (refreshButton) refreshButton.disabled = false;
     }
 
     function renderSystemFlow(states = {}, messages = {}) {
@@ -2772,9 +2803,7 @@ HTML = """
         const key = step.dataset.flowStep;
         const state = states[key] || 'idle';
         step.classList.remove('active', 'done', 'error');
-        if (state === 'active' || state === 'done' || state === 'error') {
-          step.classList.add(state);
-        }
+        if (state === 'active' || state === 'done' || state === 'error') step.classList.add(state);
         const label = step.querySelector('span');
         if (label && messages[key]) label.textContent = messages[key];
       });
@@ -2782,12 +2811,29 @@ HTML = """
 
     function modeLabel(mode) {
       return {
-        learning: '학습',
-        testing: '테스트',
-        live_trading: '실전 테스트'
+        learning: '수집/학습',
+        testing: '레거시 모의투자',
+        paper_trading: '모의투자 API',
+        live_readiness: '실전 준비 점검',
+        live_trading: '실전 투자 진행',
       }[mode] || mode || '운영 모드';
     }
 
+    function isPaperTradingMode(mode) {
+      return mode === 'testing' || mode === 'paper_trading';
+    }
+
+    function isTradingCheckMode(mode) {
+      return isPaperTradingMode(mode) || mode === 'live_readiness';
+    }
+
+    function operationStarted(data) {
+      return Boolean(data.paper_trading_status || data.live_readiness_status || data.training_status);
+    }
+
+    function startsStreamingLoop(mode, data) {
+      return isPaperTradingMode(mode) && data && data.demo_id;
+    }
     async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 20000) {
       if (!timeoutMs || timeoutMs <= 0) {
         const response = await fetch(url, options);
@@ -2807,51 +2853,45 @@ HTML = """
 
     async function startOperationMode(mode, options = {}) {
       if (operationRequestActive) {
-        document.getElementById('runtimeStatus').textContent = '이미 모드 시작 요청을 처리 중입니다.';
+        document.getElementById('runtimeStatus').textContent = 'Another operation request is already running.';
         return;
       }
       operationRequestActive = true;
       renderSystemFlow({
-        environment: 'done',
         mode: 'active',
         data: 'idle',
         analysis: 'idle',
-        simulation: mode === 'testing' ? 'active' : 'idle',
+        simulation: isTradingCheckMode(mode) ? 'active' : 'idle',
       }, {
-        mode: `${modeLabel(mode)} 시작 요청 중`,
-        simulation: mode === 'testing' ? '테스트 손익 계산 준비 중' : '테스트 대기',
+        mode: `${modeLabel(mode)} start requested`,
+        simulation: isPaperTradingMode(mode) ? 'Preparing paper trading' : 'Checking live readiness',
       });
-      document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} 시작 요청 중...`;
-      document.getElementById('runtimeStatus').textContent = '서버 응답을 기다리는 중입니다.';
-      document.getElementById('output').textContent = `${modeLabel(mode)} 시작 요청을 보냈습니다.`;
-      const learningButton = document.getElementById('modeLearningButton');
-      const testingButton = document.getElementById('modeTestingButton');
+      document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} start requested...`;
+      document.getElementById('runtimeStatus').textContent = 'Waiting for server response.';
+      document.getElementById('output').textContent = `${modeLabel(mode)} request sent.`;
       setModeButtonsLocked(true);
       try {
         const data = await fetchJsonWithTimeout('/api/operation-mode/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, ...options })
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode, ...options })
         }, 45000);
-        if (data.ok === false) {
-          throw new Error(data.message || data.status || 'operation mode request failed');
-        }
+        if (data.ok === false) throw new Error(data.message || data.status || 'operation mode request failed');
         renderOperationMode(data);
         updateLearningStopButton(data.learning);
-        const testingStarted = mode === 'testing' && data.test_status === 'background_collection_started';
+        const started = operationStarted(data);
         renderSystemFlow({
-          environment: 'done',
           mode: 'done',
-          data: mode === 'learning' || testingStarted ? 'active' : 'done',
-          analysis: 'idle',
-          simulation: testingStarted ? 'active' : mode === 'testing' ? 'done' : 'idle',
+          data: mode === 'learning' || started ? 'active' : 'done',
+          analysis: mode === 'learning' ? 'active' : 'idle',
+          simulation: started && isTradingCheckMode(mode) ? 'active' : 'idle',
         }, {
-          mode: `${modeLabel(mode)} 시작됨`,
-          data: mode.includes('training') ? '학습 데이터 갱신 중' : '데이터 준비 완료',
-          simulation: mode === 'testing' ? '가상 실현손익 계산 완료' : '테스트 대기',
+          mode: `${modeLabel(mode)} started`,
+          data: 'Collection and learning continue',
+          simulation: isPaperTradingMode(mode) ? 'Paper trading running' : 'Live readiness checked',
         });
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-        if (mode === 'testing' && data.demo_id) {
+        if (startsStreamingLoop(mode, data)) {
           document.getElementById('streamingDemoContainer').style.display = 'block';
           streamingDemoId = data.demo_id;
           streamingDemoRunning = true;
@@ -2866,24 +2906,20 @@ HTML = """
           if (streamingDemoTimer) window.clearTimeout(streamingDemoTimer);
           renderStreamingPerformance({
             progress: 0,
-            account: {
-              cash: streamingInitialCash,
-              account_value: streamingInitialCash,
-              return_rate: 0,
-            },
+            account: { cash: streamingInitialCash, account_value: streamingInitialCash, return_rate: 0 },
             status: 'running',
           });
           drawStreamingReturnChart();
           autoRunStreamingDemo(true);
         }
         loadRealtimeRuntime().catch((error) => {
-          document.getElementById('runtimeStatus').textContent = `NPU 상태 확인 실패: ${error.message || error}`;
+          document.getElementById('runtimeStatus').textContent = `Runtime status failed: ${error.message || error}`;
         });
       } catch (error) {
         const message = error.name === 'AbortError'
-          ? '서버 응답 시간이 초과되었습니다. 잠시 후 다시 눌러주세요.'
+          ? 'Server response timed out. Try again shortly.'
           : String(error && error.message ? error.message : error);
-        document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} 시작 실패`;
+        document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} start failed`;
         document.getElementById('runtimeStatus').textContent = message;
         document.getElementById('output').textContent = message;
         renderSystemFlow({ mode: 'error' }, { mode: message });
@@ -2891,15 +2927,15 @@ HTML = """
       } finally {
         operationRequestActive = false;
         setModeButtonsLocked(false);
+        updateModeButtons();
       }
     }
-
     async function startSelectedOperationMode(action) {
       const mode = selectedOperationMode(action);
       if (!mode) return;
       const goal = currentGoalPayload();
-      if (!goal && action === 'testing') {
-        document.getElementById('output').textContent = '목표 수익률과 목표 시간(분)을 먼저 입력하세요.';
+      if (!goal && (action === 'testing' || action === 'paper')) {
+        document.getElementById('output').textContent = 'Enter target return, target time, and paper-trading cash first.';
         return;
       }
       const options = goal ? {
@@ -2913,7 +2949,7 @@ HTML = """
     async function stopLearningCollection() {
       const stopLearningButton = document.getElementById('modeLearningStopButton');
       if (stopLearningButton) stopLearningButton.disabled = true;
-      document.getElementById('learningStatusMessage').textContent = '학습 데이터 수집을 종료하는 중입니다.';
+      document.getElementById('learningStatusMessage').textContent = '?숈뒿 ?곗씠???섏쭛??醫낅즺?섎뒗 以묒엯?덈떎.';
       try {
         const data = await fetchJsonWithTimeout('/api/operation-mode/stop-learning', {
           method: 'POST',
@@ -2936,28 +2972,28 @@ HTML = """
 
     function renderOperationMode(data) {
       const labels = {
-        learning: '학습',
-        testing: '테스트',
-        live_trading: '실제 투자 진행'
+        learning: 'Learning',
+        testing: 'Legacy paper trading',
+        paper_trading: 'Paper trading API',
+        live_readiness: 'Live readiness',
+        live_trading: 'Live trading',
       };
-      const mode = labels[data.mode] || data.mode || '모드 대기';
-      document.getElementById('operationModeStatus').textContent =
-        `${mode} · ${data.execution_label || ''}` + (data.demo_message ? ` · ${data.demo_message}` : '');
-      document.getElementById('gate').textContent =
-        data.mode === 'learning'
-          ? '실제 투자 학습 모드입니다. 현 시장 데이터는 학습에만 사용되고 주문은 금지됩니다.'
-          : data.mode === 'live_trading'
-            ? '실제 투자 진행 모드입니다. 자동 주문은 차단되고 리스크/승인 게이트가 우선합니다.'
-            : '테스트 모드입니다. 실제 주문 없이 가상 체결 손익만 계산합니다.';
+      const mode = labels[data.mode] || data.mode || 'Mode waiting';
+      const message = data.paper_trading_message || data.live_readiness_message || data.training_message || data.execution_label || '';
+      document.getElementById('operationModeStatus').textContent = `${mode} | ${message}`;
+      document.getElementById('gate').textContent = data.mode === 'paper_trading'
+        ? 'Paper trading mode uses the KIS virtual broker and blocks live orders.'
+        : data.mode === 'live_readiness'
+          ? 'Live readiness checks authentication and state without submitting orders.'
+          : 'Learning and collection continue while the server is running.';
     }
-
     async function loadOperationModeStatus() {
       const data = await fetchJsonWithTimeout('/api/operation-mode/status', {}, 8000);
       const request = data.request || {};
       if (request.busy) {
-        renderSystemFlow({ mode: 'active' }, { mode: request.message || '요청 처리 중' });
+        renderSystemFlow({ mode: 'active' }, { mode: request.message || 'Request running' });
       } else if (request.stage === 'error') {
-        renderSystemFlow({ mode: 'error' }, { mode: request.last_error || request.message || '요청 실패' });
+        renderSystemFlow({ mode: 'error' }, { mode: request.last_error || request.message || 'Request failed' });
       }
       updateLearningStopButton(data.learning);
       if (Array.isArray(data.collection_log)) {
@@ -2967,25 +3003,24 @@ HTML = """
       if (data.active) renderOperationMode(data.active);
       return data;
     }
-
     document.getElementById('goalForm').addEventListener('submit', async (event) => {
       event.preventDefault();
       const payload = currentGoalPayload();
       if (!payload) {
-        document.getElementById('output').textContent = '목표 수익률과 목표 시간(분)을 입력하세요.';
+        document.getElementById('output').textContent = 'Enter target return, target time, and paper-trading cash.';
         return;
       }
-      const stopProgress = startLocalProgress('가능성 분석 중', '현재 확보된 스냅샷으로 목표 가능성을 계산하고 있습니다.');
+      const stopProgress = startLocalProgress('Assessing feasibility', 'Calculating goal feasibility from current data and ontology.');
       setBusy(true);
       try {
         lastGoalPayload = payload;
         const res = await fetch('/api/assess-goal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         if (!res.ok) throw new Error(await res.text());
         renderAssessment(await res.json());
-        setWorkStatus('가능성 분석 완료', '목표 달성 가능성과 타협안을 계산했습니다.', 100, true);
+        setWorkStatus('Assessment complete', 'Goal feasibility and alternatives were calculated.', 100, true);
       } catch (error) {
         document.getElementById('output').textContent = String(error && error.message ? error.message : error);
-        setWorkStatus('가능성 분석 실패', String(error && error.message ? error.message : error), 100, true);
+        setWorkStatus('Assessment failed', String(error && error.message ? error.message : error), 100, true);
       } finally {
         stopProgress();
         setBusy(false);
@@ -2993,22 +3028,21 @@ HTML = """
     });
 
     document.getElementById('loadResearch').addEventListener('click', async () => {
-      const stopProgress = startProgressPolling('자료 수집 시작 중', '전체 상장 universe와 설정된 자료 수집을 준비하고 있습니다.');
+      const stopProgress = startProgressPolling('Starting collection', 'Information collection continues in the background.');
       setBusy(true);
       try {
         const data = await (await fetch('/api/research/refresh', { method: 'POST' })).json();
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
         await loadDiagnostics();
-        setWorkStatus('자료 수집 시작', '수집은 백그라운드에서 진행됩니다. 진행률 패널에서 상태를 확인하세요.', 35, false);
+        setWorkStatus('Collection started', 'Collection is running in the background.', 35, false);
       } catch (error) {
         document.getElementById('output').textContent = String(error && error.message ? error.message : error);
-        setWorkStatus('자료 불러오기 실패', String(error && error.message ? error.message : error), 100, true);
+        setWorkStatus('Collection failed', String(error && error.message ? error.message : error), 100, true);
       } finally {
         stopProgress();
         setBusy(false);
       }
     });
-
     function renderAssessment(data, options = {}) {
       if (data.session_id) sessionId = data.session_id;
       const previousSelection = selectedGoal;
@@ -3017,10 +3051,10 @@ HTML = """
       document.getElementById('feasibility').textContent = `${assessment.feasibility_percent}%`;
       document.getElementById('feasibilityBar').style.width = `${assessment.feasibility_percent}%`;
       document.getElementById('scoreBreakdown').innerHTML = `
-        ${scoreRow('시장 지지', assessment.market_support_percent, 'good')}
-        ${scoreRow('리스크 압력', assessment.risk_pressure_percent, 'warn')}
-        ${scoreRow('목표 난이도', assessment.annualized_drag_percent, 'bad')}
-        ${scoreRow('연환산 목표', Math.min(100, assessment.annualized_required_return * 100), 'bad', `${(assessment.annualized_required_return * 100).toFixed(1)}%`)}
+        ${scoreRow('Market support', assessment.market_support_percent, 'good')}
+        ${scoreRow('Risk pressure', assessment.risk_pressure_percent, 'warn')}
+        ${scoreRow('Goal drag', assessment.annualized_drag_percent, 'bad')}
+        ${scoreRow('Annual target', Math.min(100, assessment.annualized_required_return * 100), 'bad', `${(assessment.annualized_required_return * 100).toFixed(1)}%`)}
       `;
       document.getElementById('summary').textContent = assessment.reasoning.join(' ');
       document.getElementById('relations').innerHTML = assessment.ontology_relations.slice(0, 10).map((item) => `<span class="chip">${item}</span>`).join('');
@@ -3029,7 +3063,7 @@ HTML = """
       data.compromises.forEach((goal, index) => {
         const div = document.createElement('div');
         div.className = 'choice';
-        div.innerHTML = `<strong>${translateGoalLabel(goal.label)}</strong><div class="metric">${goal.feasibility_percent}%</div><div class="muted">수익률 ${(goal.target_return_rate * 100).toFixed(2)}%</div><div class="muted">수익금 ${fmtWon.format(goal.target_profit_amount)}</div><div class="muted">기간 ${goal.period_days}일</div>`;
+        div.innerHTML = `<strong>${translateGoalLabel(goal.label)}</strong><div class="metric">${goal.feasibility_percent}%</div><div class="muted">Return ${(goal.target_return_rate * 100).toFixed(2)}%</div><div class="muted">Profit ${fmtWon.format(goal.target_profit_amount)}</div><div class="muted">Period ${goal.period_days}d</div>`;
         div.addEventListener('click', () => {
           document.querySelectorAll('.choice').forEach((node) => node.classList.remove('selected'));
           div.classList.add('selected');
@@ -3043,7 +3077,6 @@ HTML = """
         if ((options.preserveSelection && sameAsPrevious) || (!options.preserveSelection && index === 0)) div.click();
       });
     }
-
     function currentGoalPayload() {
       const form = document.getElementById('goalForm');
       const payload = Object.fromEntries(new FormData(form).entries());
@@ -3100,19 +3133,7 @@ HTML = """
     function updateModeActionCopy() {
       updateModeButtons();
       document.getElementById('operationModeStatus').textContent =
-        '실시간 통합 데이터 기준으로 학습, 테스트, 실전 중 하나를 선택하세요.';
-      return;
-      /*
-      const state = 'realtime'
-        ? '시뮬레이션'
-        : 'realtime' === 'unused'
-          ? '실전'
-          : '환경';
-      const label = true
-        ? `${state} 환경을 선택했습니다. 다음으로 학습 또는 테스트를 고르세요.`
-        : '먼저 실전 또는 시뮬레이션을 선택하세요.';
-      document.getElementById('operationModeStatus').textContent = label;
-      */
+        'Choose learning status, paper trading, or live readiness.';
     }
 
     document.querySelectorAll('#unusedEnvironmentGrid button').forEach((button) => {
@@ -3180,12 +3201,11 @@ HTML = """
     }
 
     async function refreshLiveSnapshot() {
-      if (streamingDemoRunning || operationRequestActive) {
-        return;
-      }
+      if (streamingDemoRunning || operationRequestActive) return;
       if (liveRefreshBusy) return;
       liveRefreshBusy = true;
       const badge = document.getElementById('liveRefreshBadge');
+      if (badge) badge.textContent = 'Refreshing';
       try {
         const goal = currentGoalPayload();
         if (goal) lastGoalPayload = goal;
@@ -3200,7 +3220,7 @@ HTML = """
         renderStatus(data.status);
         renderDiagnostics(data.diagnostics);
         const signature = graphSignature(data.graph);
-        document.getElementById('ontologyCounts').textContent = `노드 ${data.graph.counts.nodes} · 관계 ${data.graph.counts.links}`;
+        document.getElementById('ontologyCounts').textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
         if (signature !== lastGraphSignature) {
           lastGraphSignature = signature;
           await renderOntologyGraph(data.graph);
@@ -3208,11 +3228,11 @@ HTML = """
         if (data.assessment && data.compromises) {
           renderAssessment({ assessment: data.assessment, compromises: data.compromises }, { preserveSelection: true });
         }
-        const updatedText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ko-KR') : '대기 중';
-        const errorText = data.status && data.status.last_error ? ` · 오류 ${data.status.last_error}` : '';
-        badge.textContent = `마지막 갱신 ${updatedText}${errorText}`;
+        const updatedText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ko-KR') : 'waiting';
+        const errorText = data.status && data.status.last_error ? ` | error ${data.status.last_error}` : '';
+        if (badge) badge.textContent = `Last refresh ${updatedText}${errorText}`;
       } catch (error) {
-        badge.textContent = '갱신 실패';
+        if (badge) badge.textContent = 'Refresh failed';
         console.error(error);
       } finally {
         liveRefreshBusy = false;
@@ -3227,8 +3247,8 @@ HTML = """
 
     function renderStatus(data) {
       document.getElementById('equity').textContent = fmtWon.format(data.equity);
-      document.getElementById('cash').textContent = `예치금 ${fmtWon.format(data.cash)}`;
-      document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
+      document.getElementById('cash').textContent = `Cash ${fmtWon.format(data.cash)}`;
+      document.getElementById('cashWeight').textContent = `Cash weight ${(data.cash_weight * 100).toFixed(1)}%`;
     }
 
     function renderLearningStatus(data) {
@@ -3237,88 +3257,50 @@ HTML = """
       const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
       const active = Boolean(progress.active || data.is_refreshing || learning.active);
       const stageLabels = {
-        idle: '대기',
-        starting: '시작',
-        research: '자료 수집',
-        storage: '저장',
-        analysis: '분석',
-        graph: '그래프 반영',
-        waiting: '다음 수집 대기',
-        complete: '완료',
-        error: '오류',
+        idle: 'idle', starting: 'starting', research: 'collecting', storage: 'storing',
+        analysis: 'analysis', graph: 'graph', waiting: 'waiting', complete: 'complete', error: 'error',
       };
-      const stage = stageLabels[progress.stage] || progress.stage || '대기';
-      const message = prettyLearningMessage(progress.message || '실시간 상태를 확인하는 중입니다.');
-      document.getElementById('learningStatusTitle').textContent = active ? '학습 진행 중' : '학습 대기 중';
+      const stage = stageLabels[progress.stage] || progress.stage || 'idle';
+      const message = prettyLearningMessage(progress.message || 'Checking status');
+      document.getElementById('learningStatusTitle').textContent = active ? 'Collection/learning running' : 'Collection/learning waiting';
       document.getElementById('learningStatusMessage').textContent = message;
       document.getElementById('learningStatusProgress').style.width = `${percent}%`;
-      document.getElementById('learningStatusMeta').textContent = active
-        ? `${stage} · ${percent.toFixed(1)}% · ${data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ko-KR') : '갱신 중'}`
-        : `${stage} · ${data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ko-KR') : '대기 중'}`;
-      document.getElementById('learningStatusCard').classList.toggle('active', active || percent > 0);
+      document.getElementById('learningStatusMeta').textContent = `${stage} | ${percent.toFixed(1)}%`;
+      document.getElementById('learningStatusCard').classList.toggle('active', true);
     }
 
     function updateLearningStopButton(learning = {}) {
       const stopLearningButton = document.getElementById('modeLearningStopButton');
-      if (stopLearningButton) {
-        stopLearningButton.disabled = !Boolean(learning && learning.active);
-      }
+      if (stopLearningButton) stopLearningButton.disabled = false;
     }
 
     function renderCollectionLog(log = []) {
-      const entries = Array.isArray(log) ? log.slice(-24) : [];
+      const entries = Array.isArray(log) ? log.slice(-8) : [];
       const list = document.getElementById('learningCollectionLog');
       if (list) {
-        if (!entries.length) {
-          list.innerHTML = '<div class="muted">수집 로그가 아직 없습니다.</div>';
-        } else {
-          list.innerHTML = entries.slice().reverse().slice(0, 8).map((entry) => {
-            const counts = entry.counts || {};
-            const totalSeen = Number(counts.events_seen || 0)
-              + Number(counts.raw_records_seen || 0)
-              + Number(counts.market_snapshots_seen || 0)
-              + Number(counts.macro_metrics_seen || 0);
-            const totalStored = Number(counts.events || 0)
-              + Number(counts.raw_records || 0)
-              + Number(counts.market_snapshots || 0)
-              + Number(counts.macro_metrics || 0);
-            const when = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) : '-';
-            const duration = entry.duration_ms ? `${(Number(entry.duration_ms) / 1000).toFixed(1)}s` : '';
-            const detail = totalSeen > 0
-              ? `신규 ${totalStored} · 확인 뉴스 ${counts.events_seen || 0} · 원문 ${counts.raw_records_seen || 0} · 시세 ${counts.market_snapshots_seen || 0}`
-              : (entry.message || '');
-            const status = String(entry.status || 'scheduled');
-            return `<div class="collection-log-item">
-              <span>${when}</span>
-              <span><i class="collection-log-status ${status}"></i><strong>${collectionStatusLabel(status)}</strong> ${detail}</span>
-              <span class="muted">${duration}</span>
-            </div>`;
-          }).join('');
-        }
+        list.innerHTML = entries.length
+          ? entries.slice().reverse().map((entry) => {
+              const when = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) : '-';
+              const status = String(entry.status || 'scheduled');
+              const detail = entry.message || '';
+              return `<div class="collection-log-item"><span>${when}</span><span><i class="collection-log-status ${status}"></i><strong>${collectionStatusLabel(status)}</strong> ${detail}</span><span></span></div>`;
+            }).join('')
+          : '<div class="muted">No collection log yet</div>';
       }
       drawCollectionLogChart(entries);
     }
 
     function maybeRefreshDiagnosticsAfterCollection(log = []) {
       if (!Array.isArray(log) || !log.length) return;
-      const completed = log
-        .filter((entry) => entry && entry.status === 'complete' && entry.cycle != null)
-        .slice(-1)[0];
+      const completed = log.filter((entry) => entry && entry.status === 'complete' && entry.cycle != null).slice(-1)[0];
       if (!completed || completed.cycle === lastRenderedCollectionCycle) return;
       lastRenderedCollectionCycle = completed.cycle;
       loadDiagnostics().catch((error) => console.error(error));
     }
 
     function collectionStatusLabel(status) {
-      return {
-        scheduled: '예약',
-        running: '수집 중',
-        complete: '완료',
-        error: '오류',
-        stopped: '종료',
-      }[status] || status || '상태';
+      return { scheduled: 'scheduled', running: 'running', complete: 'complete', error: 'error', stopped: 'stopped' }[status] || status || 'status';
     }
-
     function drawCollectionLogChart(entries) {
       const canvas = document.getElementById('learningCollectionChart');
       if (!canvas || !canvas.getContext) return;
@@ -3344,23 +3326,15 @@ HTML = """
       const barWidth = Math.max(6, Math.floor((width - 24 - gap * (bars.length - 1)) / Math.max(1, bars.length)));
       bars.forEach((entry, index) => {
         const counts = entry.counts || {};
-        const totalSeen = Number(counts.events_seen || 0)
-          + Number(counts.raw_records_seen || 0)
-          + Number(counts.market_snapshots_seen || 0)
-          + Number(counts.macro_metrics_seen || 0);
+        const totalSeen = Number(counts.events_seen || 0) + Number(counts.raw_records_seen || 0) + Number(counts.market_snapshots_seen || 0) + Number(counts.macro_metrics_seen || 0);
         const value = Math.max(1, totalSeen);
-        const barHeight = entry.status === 'complete'
-          ? Math.min(height - 22, 10 + Math.log10(value + 1) * 18)
-          : entry.status === 'running'
-            ? height - 28
-            : 12;
+        const barHeight = entry.status === 'complete' ? Math.min(height - 22, 10 + Math.log10(value + 1) * 18) : entry.status === 'running' ? height - 28 : 12;
         const x = 12 + index * (barWidth + gap);
         const y = height - 14 - barHeight;
         ctx.fillStyle = collectionStatusColor(entry.status);
         ctx.fillRect(x, y, barWidth, barHeight);
       });
     }
-
     function collectionStatusColor(status) {
       return {
         running: '#0f766e',
@@ -3373,9 +3347,9 @@ HTML = """
 
     function prettyLearningMessage(message) {
       const text = String(message || '').trim();
-      if (!text) return '실시간 상태를 확인하는 중입니다.';
+      if (!text) return '?ㅼ떆媛??곹깭瑜??뺤씤?섎뒗 以묒엯?덈떎.';
       if (text.startsWith('Retrying failed source:')) {
-        return `재시도 중 · ${text.slice('Retrying failed source:'.length).trim()}`;
+        return `?ъ떆??以?쨌 ${text.slice('Retrying failed source:'.length).trim()}`;
       }
       return text;
     }
@@ -3385,53 +3359,41 @@ HTML = """
         const data = await (await fetch('/api/mock-trading/performance')).json();
         renderMockPerformance(data);
       } catch (error) {
-        console.error(error);
+        document.getElementById('mockStatus').textContent = '모의투자 성과 대기 중';
       }
     }
 
     function renderMockPerformance(data) {
-      const returnRate = Number(data.return_rate || 0);
-      const targetRate = Number(data.target_return_rate || 0);
-      const percent = returnRate * 100;
-      const targetPercent = targetRate * 100;
-      const progress = targetRate > 0 ? Math.max(0, Math.min(100, (returnRate / targetRate) * 100)) : 0;
+      if (!data) return;
+      const percent = Number(data.return_rate || 0) * 100;
       document.getElementById('mockReturn').textContent = data.active ? `${percent.toFixed(2)}%` : '대기 중';
-      document.getElementById('mockReturnBar').style.width = `${progress}%`;
-      document.getElementById('mockProfit').textContent = `수익금 ${fmtWon.format(data.profit_amount || 0)}`;
-      document.getElementById('mockEquity').textContent = `평가금 ${fmtWon.format(data.equity || 0)}`;
-      document.getElementById('mockTarget').textContent = `목표 ${targetPercent ? targetPercent.toFixed(2) : '-'}%`;
+      document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
+      document.getElementById('mockProfit').textContent = `수익 ${fmtWon.format(data.profit || 0)}`;
+      document.getElementById('mockEquity').textContent = `평가 ${fmtWon.format(data.equity || 0)}`;
+      document.getElementById('mockTarget').textContent = data.goal ? `목표 ${(Number(data.goal.target_return_rate || 0) * 100).toFixed(2)}%` : '목표 -';
       document.getElementById('mockStatus').textContent = data.active
-        ? (data.target_achieved ? '목표 수익률을 달성했습니다.' : `목표까지 ${(targetPercent - percent).toFixed(2)}%p 남았습니다.`)
-        : '선택한 목표로 시작하면 모의 KIS 포트폴리오 수익률이 표시됩니다.';
-      renderMockRunTables(data);
+        ? `모의투자 진행 중 · 주문 ${data.order_count || 0}건 · 체결 ${data.execution_count || 0}건`
+        : '목표를 선택하면 모의투자 수익률이 표시됩니다.';
     }
-
     function renderStreamingPerformance(data) {
+      if (!data || !data.account) return;
       const account = data.account || {};
+      const returnRate = Number(account.return_rate || 0) * 100;
       const accountValue = Number(account.account_value || streamingInitialCash || 0);
       const cash = Number(account.cash || 0);
-      const returnRate = Number(account.return_rate || 0);
-      const targetRate = data.principal_protection
-        ? Number(data.principal_protection.target_profit_amount || 0) / Math.max(1, accountValue)
-        : Number(streamingTargetReturnRate || 0);
-      const targetPercent = targetRate * 100;
-      const profit = accountValue - Number(streamingInitialCash || 0);
-      const progress = targetRate > 0 ? Math.max(0, Math.min(100, (returnRate / targetRate) * 100)) : 0;
-      const returnPercent = returnRate * 100;
-      const simulatedProgress = Math.max(0, Math.min(100, Number(data.progress || 0)));
+      const initial = Number(streamingInitialCash || accountValue || 0);
+      const profit = accountValue - initial;
+      const simulatedProgress = Number(data.progress || 0);
       streamingReturnSeries.push({ progress: simulatedProgress, returnRate });
       if (streamingReturnSeries.length > 160) streamingReturnSeries.shift();
-      drawStreamingReturnChart();
-
-      document.getElementById('mockReturn').textContent = `${returnPercent.toFixed(2)}%`;
-      document.getElementById('mockReturnBar').style.width = `${progress}%`;
-      document.getElementById('mockProfit').textContent = `수익금 ${fmtWon.format(profit)}`;
-      document.getElementById('mockEquity').textContent = `평가금 ${fmtWon.format(accountValue)}`;
-      document.getElementById('mockTarget').textContent = `목표 ${targetPercent ? targetPercent.toFixed(2) : '-'}%`;
+      document.getElementById('mockReturn').textContent = `${returnRate.toFixed(2)}%`;
+      document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(returnRate)))}%`;
+      document.getElementById('mockProfit').textContent = `수익 ${fmtWon.format(profit)}`;
+      document.getElementById('mockEquity').textContent = `평가 ${fmtWon.format(accountValue)}`;
       document.getElementById('mockStatus').textContent =
-        `가상 차트 기준 ${simulatedProgress.toFixed(1)}% 진행 · 목표 시간 ${streamingTargetMinutes || '-'}분 · 현금 ${fmtWon.format(cash)}`;
+        `모의투자 ${simulatedProgress.toFixed(1)}% 진행 · 목표 시간 ${streamingTargetMinutes || '-'}분 · 현금 ${fmtWon.format(cash)}`;
+      drawStreamingReturnChart();
     }
-
     function drawStreamingReturnChart() {
       const canvas = document.getElementById('streamingReturnChart');
       if (!canvas) return;
@@ -3475,18 +3437,18 @@ HTML = """
       ctx.stroke();
       ctx.fillStyle = '#667085';
       ctx.font = '11px Arial';
-      ctx.fillText(`현재 ${(values[values.length - 1] || 0).toFixed(2)}%`, 8, 15);
-      if (target) ctx.fillText(`목표 ${target.toFixed(2)}%`, width - 82, 15);
+      ctx.fillText(`?꾩옱 ${(values[values.length - 1] || 0).toFixed(2)}%`, 8, 15);
+      if (target) ctx.fillText(`紐⑺몴 ${target.toFixed(2)}%`, width - 82, 15);
     }
 
     function renderMockRunTables(data) {
       const positions = data.positions || [];
       const executions = data.recent_executions || [];
       document.getElementById('mockRunStats').innerHTML = `
-        <div class="stat"><strong>${data.active ? '진행 중' : '대기'}</strong><span class="muted">모의 상태</span></div>
+        <div class="stat"><strong>${data.active ? '진행 중' : '대기'}</strong><span class="muted">모의투자 상태</span></div>
         <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
         <div class="stat"><strong>${data.executions_count || 0}</strong><span class="muted">체결</span></div>
-        <div class="stat"><strong>${positions.length}</strong><span class="muted">미청산 종목</span></div>
+        <div class="stat"><strong>${positions.length}</strong><span class="muted">보유 종목</span></div>
       `;
       const positionTarget = document.getElementById('mockPositions');
       if (positionTarget) positionTarget.innerHTML = positions.length ? positions.map((item) => {
@@ -3511,92 +3473,44 @@ HTML = """
           <td>${item.quantity}</td>
           <td>${formatMoney(item.price || 0, item.currency)}</td>
         </tr>`;
-      }).join('') : '<tr><td colspan="4">체결 내역 없음</td></tr>';
+      }).join('') : '<tr><td colspan="4">체결 이력 없음</td></tr>';
     }
 
-    function startMockPerformancePolling() {
-      if (mockPerformanceTimer) window.clearInterval(mockPerformanceTimer);
-      loadMockPerformance();
-      mockPerformanceTimer = window.setInterval(loadMockPerformance, 2000);
-    }
-
-    function scoreRow(label, percent, tone, displayValue = null) {
-      const value = Math.max(0, Math.min(100, Number(percent) || 0));
-      return `<div class="score-row"><div class="score-label">${label}</div><div class="bar ${tone}"><span style="width:${value}%"></span></div><div class="score-value">${displayValue || `${Math.round(value)}%`}</div></div>`;
-    }
-
-    function renderDiagnostics(data) {
-      const d = data.diagnostics;
+    function renderDiagnostics(data = {}) {
+      const d = data.diagnostics || data || {};
       const liveLabel = d.live_data_present ? '실시간' : '로컬';
-      document.getElementById('diagnosticStats').innerHTML = `
-        <div class="stat"><strong>${liveLabel}</strong><span class="muted">자료 모드</span></div>
-        <div class="stat"><strong>${d.events_count}</strong><span class="muted">뉴스 이벤트</span></div>
-        <div class="stat"><strong>${d.live_source_count}</strong><span class="muted">실시간 출처 URL</span></div>
-        <div class="stat"><strong>${d.market_snapshots_count}</strong><span class="muted">시세 스냅샷</span></div>
-      `;
-      const store = data.store_summary || {};
-      const storedNew = data.stored_new_records || {};
-      const storedNewTotal = Number(storedNew.events || 0)
-        + Number(storedNew.raw_records || 0)
-        + Number(storedNew.market_snapshots || 0)
-        + Number(storedNew.macro_metrics || 0);
-      document.getElementById('storeStats').innerHTML = `
-        <div class="stat"><strong>${store.events || 0}</strong><span class="muted">저장된 이벤트</span></div>
-        <div class="stat"><strong>${store.market_snapshots || 0}</strong><span class="muted">저장된 시세 스냅샷</span></div>
-        <div class="stat"><strong>${storedNewTotal}</strong><span class="muted">최근 신규 저장</span></div>
-        <div class="stat"><strong>${data.store_path || '-'}</strong><span class="muted">저장 위치</span></div>
-      `;
-      renderCollectionWarnings(d);
-      renderDataVolume(data.data_volume || {});
-      return;
-      /*
-      const entries = Object.entries(d.per_ticker || {});
-      document.getElementById('tickerMetrics').innerHTML = entries.map(([ticker, item]) => {
-        const total = Math.max(1, item.events || 0);
-        const pos = item.positive / total * 100;
-        const neu = item.neutral / total * 100;
-        const neg = item.negative / total * 100;
-        return `<div class="ticker-card">
-          <strong>${ticker}</strong>
-          <div class="muted">이벤트 ${item.events}개 · 최신 ${item.latest_event_at || '-'}</div>
-          <div class="sentiment"><span class="pos" style="width:${pos}%"></span><span class="neu" style="width:${neu}%"></span><span class="neg" style="width:${neg}%"></span></div>
-          <div class="chips"><span class="chip">긍정 ${item.positive}</span><span class="chip">중립 ${item.neutral}</span><span class="chip">부정 ${item.negative}</span><span class="chip">실시간 URL ${item.live_source_urls}</span></div>
-        </div>`;
-      }).join('');
-      */
-    }
-
-    function renderCollectionWarnings(d = {}) {
-      const warnings = Array.isArray(d.collection_warnings) ? d.collection_warnings : [];
-      const marketSources = d.external_chart_sources_configured || 0;
-      const items = [...warnings];
-      if (marketSources === 0) {
-        items.push('외부 주식 차트 수집원이 꺼져 있습니다. 현재 시세 스냅샷은 상장 종목 참고값 위주입니다.');
-      }
-      const target = document.getElementById('collectionWarnings');
-      if (!target) return;
-      target.innerHTML = items.map((message) => `<div class="warning-item">${message}</div>`).join('');
-    }
-
-    function renderDataVolume(volume = {}) {
-      drawDataVolumeChart(volume.by_kind || {});
-      const rows = Array.isArray(volume.by_source) ? volume.by_source : [];
-      const marketSources = volume.market_snapshot_sources || {};
-      const sourceList = document.getElementById('sourceVolumeList');
-      if (sourceList) {
-        const topRows = rows
-          .filter((row) => ['events', 'raw_records', 'market_snapshots', 'macro_metrics'].includes(row.kind))
-          .sort((a, b) => Number(b.count || 0) - Number(a.count || 0))
-          .slice(0, 12);
-        const marketSourceText = Object.entries(marketSources)
-          .map(([name, count]) => `${name}: ${count}`)
-          .join(' · ');
-        sourceList.innerHTML = `
-          <div class="muted"><strong>출처별 저장량</strong></div>
-          ${topRows.map((row) => `<div class="source-volume-row"><span>${kindLabelForVolume(row.kind)} · ${row.source_name}</span><strong>${row.count}</strong></div>`).join('')}
-          <div class="muted" style="margin-top:6px;">시세 출처: ${marketSourceText || '없음'}</div>
+      const stats = document.getElementById('diagnosticStats');
+      if (stats) {
+        stats.innerHTML = `
+          <div class="stat"><strong>${liveLabel}</strong><span class="muted">자료 모드</span></div>
+          <div class="stat"><strong>${d.live_source_count || 0}</strong><span class="muted">실시간 출처</span></div>
+          <div class="stat"><strong>${d.external_chart_sources_configured || 0}</strong><span class="muted">차트 출처</span></div>
+          <div class="stat"><strong>${data.graph_triples_count || 0}</strong><span class="muted">온톨로지 관계</span></div>
         `;
       }
+      const store = data.store_summary || {};
+      const storeStats = document.getElementById('storeStats');
+      if (storeStats) {
+        storeStats.innerHTML = `
+          <div class="stat"><strong>${store.events || 0}</strong><span class="muted">이벤트</span></div>
+          <div class="stat"><strong>${store.raw_records || 0}</strong><span class="muted">원문</span></div>
+          <div class="stat"><strong>${store.market_snapshots || 0}</strong><span class="muted">시세</span></div>
+          <div class="stat"><strong>${store.realtime_quotes || 0}</strong><span class="muted">실시간 quote</span></div>
+        `;
+      }
+      const warnings = [...(d.collection_warnings || []), ...(data.skipped_sources || [])].slice(0, 4);
+      const warningList = document.getElementById('collectionWarnings');
+      if (warningList) warningList.innerHTML = warnings.map((item) => `<div class="warning-item">${String(item)}</div>`).join('');
+      renderDataVolume(data.data_volume || {});
+    }
+    function renderDataVolume(volume = {}) {
+      drawDataVolumeChart(volume.by_kind || {});
+      const list = document.getElementById('sourceVolumeList');
+      if (!list) return;
+      const rows = Object.entries(volume.market_snapshot_sources || {}).slice(0, 8);
+      list.innerHTML = rows.length
+        ? rows.map(([name, count]) => `<div class="source-volume-row"><span>${name}</span><strong>${count}</strong></div>`).join('')
+        : '<div class="muted">출처별 데이터 없음</div>';
     }
 
     function drawDataVolumeChart(byKind = {}) {
@@ -3609,59 +3523,28 @@ HTML = """
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, width, height);
       const items = [
-        ['events', '뉴스/이벤트', '#0f766e'],
+        ['events', '이벤트', '#0f766e'],
         ['raw_records', '원문', '#2563eb'],
-        ['market_snapshots', '시세', '#16a34a'],
-        ['macro_metrics', '매크로', '#b45309'],
-      ].map(([key, label, color]) => ({ key, label, color, value: Number(byKind[key] || 0) }));
-      const maxValue = Math.max(1, ...items.map((item) => item.value));
-      ctx.strokeStyle = '#e2e8f0';
-      ctx.beginPath();
-      ctx.moveTo(54, height - 34);
-      ctx.lineTo(width - 16, height - 34);
-      ctx.stroke();
-      const barArea = width - 90;
-      const step = barArea / items.length;
-      items.forEach((item, index) => {
-        const barWidth = Math.min(72, Math.max(34, step * 0.5));
-        const barHeight = Math.max(2, (height - 62) * (item.value / maxValue));
-        const x = 60 + index * step + (step - barWidth) / 2;
-        const y = height - 34 - barHeight;
-        ctx.fillStyle = item.color;
-        ctx.fillRect(x, y, barWidth, barHeight);
-        ctx.fillStyle = '#1d2430';
-        ctx.font = 'bold 13px Arial';
-        ctx.textAlign = 'center';
-        ctx.fillText(String(item.value), x + barWidth / 2, y - 7);
-        ctx.fillStyle = '#667085';
-        ctx.font = '12px Arial';
-        ctx.fillText(item.label, x + barWidth / 2, height - 12);
+        ['market_snapshots', '시세', '#f59e0b'],
+        ['macro_metrics', '매크로', '#7c3aed'],
+        ['realtime_quotes', 'Quote', '#0891b2'],
+        ['realtime_executions', '체결', '#dc2626'],
+      ];
+      const maxValue = Math.max(1, ...items.map(([key]) => Number(byKind[key] || 0)));
+      const barWidth = Math.max(24, Math.floor((width - 36) / items.length) - 10);
+      items.forEach(([key, label, color], index) => {
+        const value = Number(byKind[key] || 0);
+        const h = Math.max(4, Math.round((height - 44) * value / maxValue));
+        const x = 18 + index * (barWidth + 10);
+        const y = height - 24 - h;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, barWidth, h);
+        ctx.fillStyle = '#334155';
+        ctx.font = '11px Arial';
+        ctx.fillText(label, x, height - 8);
+        ctx.fillText(String(value), x, Math.max(12, y - 4));
       });
-      ctx.textAlign = 'left';
-      ctx.fillStyle = '#667085';
-      ctx.font = '12px Arial';
-      ctx.fillText('저장된 수집 데이터 양', 12, 18);
     }
-
-    function kindLabelForVolume(kind) {
-      return {
-        events: '뉴스',
-        raw_records: '원문',
-        market_snapshots: '시세',
-        macro_metrics: '매크로',
-      }[kind] || kind;
-    }
-
-    function translateGoalLabel(label) {
-      const labels = {
-        'Requested target': '요청 목표',
-        'Lower return': '수익률 낮춤',
-        'Longer period': '기간 연장',
-        'Balanced compromise': '균형 타협안'
-      };
-      return labels[label] || label;
-    }
-
     async function renderOntologyGraph(data) {
       const canvas = document.getElementById('ontologyCanvas');
       const tooltip = document.getElementById('ontologyTooltip');
@@ -3671,7 +3554,7 @@ HTML = """
         tooltip.style.display = 'block';
         tooltip.style.left = '12px';
         tooltip.style.top = '52px';
-        tooltip.textContent = '3D 라이브러리를 불러오지 못해 2D로 표시합니다.';
+        tooltip.textContent = '3D ?쇱씠釉뚮윭由щ? 遺덈윭?ㅼ? 紐삵빐 2D濡??쒖떆?⑸땲??';
         return;
       }
 
@@ -3698,7 +3581,7 @@ HTML = """
       const nodes = computeGraphLayout(renderGraph.nodes, renderGraph.links);
       const graphMetrics = buildGraphMetrics(nodes, renderGraph.links);
       document.getElementById('ontologyCounts').textContent =
-        `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${nodes.length}/${renderGraph.links.length}`;
+        `?몃뱶 ${data.counts.nodes} 쨌 愿怨?${data.counts.links} 쨌 ?쒖떆 ${nodes.length}/${renderGraph.links.length}`;
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const raycaster = new THREE.Raycaster();
       const pointer = new THREE.Vector2(99, 99);
@@ -3840,13 +3723,13 @@ HTML = """
       };
       document.getElementById('toggleLabels').onclick = () => {
         labelState.visible = !labelState.visible;
-        document.getElementById('toggleLabels').textContent = labelState.visible ? '라벨 끄기' : '라벨 켜기';
+        document.getElementById('toggleLabels').textContent = labelState.visible ? '?쇰꺼 ?꾧린' : '?쇰꺼 耳쒓린';
         updateVisibility();
       };
       document.getElementById('toggleReasoning').onclick = () => {
         reasoningState.playing = !reasoningState.playing;
         reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
-        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '異붾줎 ?쇱떆?뺤?' : '異붾줎 ?ъ깮';
       };
       document.querySelectorAll('#ontologyFilters input').forEach((input) => {
         input.onchange = () => {
@@ -3892,7 +3775,7 @@ HTML = """
         }
         fitVisibleGraph();
         document.getElementById('ontologyCounts').textContent =
-          `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${visibleCount}/${renderGraph.links.length}`;
+          `?몃뱶 ${data.counts.nodes} 쨌 愿怨?${data.counts.links} 쨌 ?쒖떆 ${visibleCount}/${renderGraph.links.length}`;
       }
 
       function fitVisibleGraph() {
@@ -3912,7 +3795,7 @@ HTML = """
 
       function updateReasoning(now) {
         if (!reasoningState.steps.length) {
-          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          document.getElementById('reasoningBadge').textContent = '異붾줎 ?④퀎 0/0';
           return;
         }
         if (reasoningState.playing) {
@@ -3928,9 +3811,9 @@ HTML = """
         const step = reasoningState.steps[index];
         reasoningState.activeNodeIds = new Set(step.nodes || []);
         reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
-        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
-        document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
-        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningBadge').textContent = `異붾줎 ?④퀎 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningTitle').textContent = step.title || '異붾줎 ?④퀎';
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} 쨌 ?좊ː??${step.confidence_percent ?? '-'}%`;
         document.getElementById('reasoningDescription').textContent = step.description || '';
         document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
         updateVisibility();
@@ -3997,7 +3880,7 @@ HTML = """
           tooltip.style.display = 'block';
           tooltip.style.left = `${Math.min(rect.width - 280, Math.max(8, (pointer.x + 1) * rect.width / 2))}px`;
           tooltip.style.top = `${Math.min(rect.height - 80, Math.max(50, (-pointer.y + 1) * rect.height / 2))}px`;
-          tooltip.innerHTML = `<strong>${hit.object.userData.label}</strong><br>${kindLabel(hit.object.userData.kind)} · 연결 ${degree(hit.object.userData.id, renderGraph.links)}개 · 중요도 ${Number(hit.object.userData.importance_score || 0).toFixed(2)}`;
+          tooltip.innerHTML = `<strong>${hit.object.userData.label}</strong><br>${kindLabel(hit.object.userData.kind)} 쨌 ?곌껐 ${degree(hit.object.userData.id, renderGraph.links)}媛?쨌 以묒슂??${Number(hit.object.userData.importance_score || 0).toFixed(2)}`;
         } else {
           tooltip.style.display = 'none';
         }
@@ -4031,7 +3914,7 @@ HTML = """
       let hoveredNode = null;
 
       document.getElementById('ontologyCounts').textContent =
-        `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${nodes.length}/${renderGraph.links.length}`;
+        `?몃뱶 ${data.counts.nodes} 쨌 愿怨?${data.counts.links} 쨌 ?쒖떆 ${nodes.length}/${renderGraph.links.length}`;
 
       function resize() {
         const rect = canvas.getBoundingClientRect();
@@ -4082,16 +3965,16 @@ HTML = """
         const step = reasoningState.steps[index];
         reasoningState.activeNodeIds = new Set(step.nodes || []);
         reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
-        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
-        document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
-        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningBadge').textContent = `異붾줎 ?④퀎 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningTitle').textContent = step.title || '異붾줎 ?④퀎';
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} 쨌 ?좊ː??${step.confidence_percent ?? '-'}%`;
         document.getElementById('reasoningDescription').textContent = step.description || '';
         document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
       }
 
       function updateReasoning(now) {
         if (!reasoningState.steps.length) {
-          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          document.getElementById('reasoningBadge').textContent = '異붾줎 ?④퀎 0/0';
           return;
         }
         if (!reasoningState.playing) return;
@@ -4171,7 +4054,7 @@ HTML = """
           tooltip.style.display = 'block';
           tooltip.style.left = `${Math.min(rect.width - 280, Math.max(8, p.x + 12))}px`;
           tooltip.style.top = `${Math.min(rect.height - 80, Math.max(50, p.y + 12))}px`;
-          tooltip.innerHTML = `<strong>${hoveredNode.label}</strong><br>${kindLabel(hoveredNode.kind)} · 연결 ${degree(hoveredNode.id, renderGraph.links)}개 · 중요도 ${Number(hoveredNode.importance_score || 0).toFixed(2)}`;
+          tooltip.innerHTML = `<strong>${hoveredNode.label}</strong><br>${kindLabel(hoveredNode.kind)} 쨌 ?곌껐 ${degree(hoveredNode.id, renderGraph.links)}媛?쨌 以묒슂??${Number(hoveredNode.importance_score || 0).toFixed(2)}`;
         } else {
           tooltip.style.display = 'none';
         }
@@ -4209,12 +4092,12 @@ HTML = """
       };
       document.getElementById('toggleLabels').onclick = () => {
         view.labels = !view.labels;
-        document.getElementById('toggleLabels').textContent = view.labels ? '라벨 끄기' : '라벨 켜기';
+        document.getElementById('toggleLabels').textContent = view.labels ? '?쇰꺼 ?꾧린' : '?쇰꺼 耳쒓린';
       };
       document.getElementById('toggleReasoning').onclick = () => {
         reasoningState.playing = !reasoningState.playing;
         reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
-        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '異붾줎 ?쇱떆?뺤?' : '異붾줎 ?ъ깮';
       };
       document.querySelectorAll('#ontologyFilters input').forEach((input) => {
         input.onchange = () => {
@@ -4813,11 +4696,11 @@ HTML = """
       return {
         ticker: '종목',
         event: '뉴스/공시 이벤트',
-        temporal: '시간 동기화 프레임',
+        temporal: '시간축',
         pipeline: '분석 파이프라인',
-        tuning: '파라미터 튜닝 모드',
-        parameter: '튜닝 파라미터',
-        metric: '파이프라인 지표',
+        tuning: '파라미터 조정',
+        parameter: '파라미터',
+        metric: '지표',
         sector: '섹터',
         support: '긍정 신호',
         risk: '리스크 요인',
@@ -4828,10 +4711,9 @@ HTML = """
 
     function shortLabel(label) {
       if (label.startsWith('NEWS:')) return `뉴스 ${label.slice(5, 11)}`;
-      if (label.length > 22) return `${label.slice(0, 20)}…`;
+      if (label.length > 22) return `${label.slice(0, 20)}...`;
       return label;
     }
-
     function degree(nodeId, links) {
       return links.filter((link) => link.source === nodeId || link.target === nodeId).length;
     }
@@ -4861,10 +4743,9 @@ HTML = """
         <strong>${node.label}</strong>
         <div class="muted">종류: ${kindLabel(node.kind)} · 연결 ${degree(node.id, links)}개 · 중요도 ${Number(node.importance_score || 0).toFixed(2)}</div>
         <div style="margin-top:10px;">${related || '<span class="muted">연결 관계 없음</span>'}</div>
-        <div class="muted" style="margin-top:8px;">${hiddenCount > 0 ? `추가 관계 ${hiddenCount}개는 생략되었습니다.` : ''}</div>
+        <div class="muted" style="margin-top:8px;">${hiddenCount > 0 ? `추가 관계 ${hiddenCount}개는 생략했습니다.` : ''}</div>
       `;
     }
-
     function createTextSprite(THREE, text, color) {
       const canvas = document.createElement('canvas');
       const context = canvas.getContext('2d');
@@ -4888,7 +4769,7 @@ HTML = """
     document.getElementById('startButton').addEventListener('click', async () => {
       if (!sessionId || !selectedGoal) return;
       const data = await (await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, selected_goal: selectedGoal }) })).json();
-      document.getElementById('gate').textContent = data.started ? '분석 및 모의 실행 모드로 시작했습니다. 실거래는 비활성화되어 있습니다.' : '시작되지 않았습니다.';
+      document.getElementById('gate').textContent = data.started ? '선택한 목표 기준으로 모의투자를 시작했습니다. 실전 주문은 비활성화되어 있습니다.' : '시작하지 못했습니다.';
       document.getElementById('output').textContent = JSON.stringify(data, null, 2);
       if (data.performance) renderMockPerformance(data.performance);
       if (data.started) startMockPerformancePolling();
@@ -4900,75 +4781,57 @@ HTML = """
       document.getElementById('relations').innerHTML = '';
       document.getElementById('feasibility').textContent = '대기 중';
       document.getElementById('feasibilityBar').style.width = '0%';
-      document.getElementById('summary').textContent = '목표를 입력하면 시장 자료, 온톨로지 관계, 리스크 압력을 바탕으로 달성 가능성을 계산합니다.';
-      document.getElementById('gate').textContent = '목표가 확정될 때까지 프로그램은 시작되지 않습니다.';
-      document.getElementById('output').textContent = '아직 실행되지 않았습니다.';
+      document.getElementById('summary').textContent = '목표를 입력하면 시장 자료와 온톨로지 근거를 바탕으로 가능성을 계산합니다.';
+      document.getElementById('gate').textContent = '학습과 정보 수집은 서버가 켜져 있는 동안 자동으로 계속 진행됩니다.';
+      document.getElementById('output').textContent = '아직 실행하지 않았습니다.';
       document.getElementById('startButton').disabled = true;
       if (mockPerformanceTimer) window.clearInterval(mockPerformanceTimer);
     });
-    
-    // ===== 스트리밍 데모 관련 함수 =====
+
     let streamingDemoId = null;
     let streamingDemoRunning = false;
-    let streamingDemoHistory = [];  // 거래 내역 누적
-    let streamingDemoPrices = {};   // 종목별 마지막 가격
-    let streamingInitialCash = 0;   // 초기 자본 (예수금)
+    let streamingDemoHistory = [];
+    let streamingDemoPrices = {};
+    let streamingInitialCash = 0;
     let streamingTargetReturnRate = 0;
     let streamingTargetMinutes = 0;
-    
+
     async function startStreamingDemo() {
       let targetReturn = parseFloat(document.getElementById('targetReturn')?.value || 0.02);
       if (targetReturn > 1) targetReturn = targetReturn / 100.0;
       const periodMinutes = parseInt(document.getElementById('targetMinutes')?.value || 390);
       const initialCash = Math.max(100000, Number(document.getElementById('initialCash')?.value || 10000000));
       const profitGain = Math.max(0.25, Math.min(4, Number(document.getElementById('profitGain')?.value || 1)));
-      
-      streamingDemoHistory = [];  // 초기화
+      streamingDemoHistory = [];
       streamingDemoPrices = {};
       streamingReturnSeries = [];
-      streamingInitialCash = initialCash;  // 초기 자본 저장
+      streamingInitialCash = initialCash;
       streamingTargetReturnRate = targetReturn;
       streamingTargetMinutes = periodMinutes;
-      
       try {
-        const response = await fetch('/api/streaming-demo/start', {
+        const response = await fetch('/api/paper-trading/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            target_return_rate: targetReturn,
-            period_minutes: periodMinutes,
-            initial_cash: initialCash,
-            profit_gain: profitGain,
-          })
+          body: JSON.stringify({ target_return_rate: targetReturn, period_minutes: periodMinutes, initial_cash: initialCash, profit_gain: profitGain })
         });
         const data = await response.json();
         streamingDemoId = data.demo_id;
         streamingDemoRunning = true;
-        document.getElementById('streamingDemoStatus').textContent = '실행 중...';
+        document.getElementById('streamingDemoStatus').textContent = '모의투자 실행 중...';
         document.getElementById('streamingDemoProgress').style.width = '0%';
-        console.log('Streaming demo started:', data);
       } catch (error) {
-        console.error('Failed to start streaming demo:', error);
         document.getElementById('streamingDemoStatus').textContent = '오류: ' + error.message;
       }
     }
-    
+
     async function runStreamingDemoStep() {
-      if (!streamingDemoId || !streamingDemoRunning) {
-        console.warn('Demo not running');
-        return;
-      }
-      if (streamingStepBusy) {
-        return { status: 'busy', progress: 0 };
-      }
+      if (!streamingDemoId || !streamingDemoRunning) return;
+      if (streamingStepBusy) return { status: 'busy', progress: 0 };
       streamingStepBusy = true;
-      
       try {
-        document.getElementById('streamingDemoStatus').textContent =
-          '전체 상장 종목 NPU 전수 스캔 및 온톨로지/전략/리스크 분석 중...';
-        document.getElementById('mockStatus').textContent =
-          '전체 상장 종목 NPU 전수 스캔 및 온톨로지/전략/리스크 분석 중...';
-        const response = await fetch('/api/streaming-demo/step', {
+        document.getElementById('streamingDemoStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
+        document.getElementById('mockStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
+        const response = await fetch('/api/paper-trading/step', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ demo_id: streamingDemoId }),
@@ -4976,17 +4839,15 @@ HTML = """
         });
         if (!response.ok) {
           streamingStepFailures += 1;
+          const message = response.status === 404 ? '모의투자 세션이 만료되었습니다. 다시 시작하세요.' : `모의투자 업데이트 실패 (${response.status})`;
           if (streamingStepFailures < 3 && response.status >= 500) {
-            const retryMessage = `시뮬레이션 응답 지연, 재시도 중 (${streamingStepFailures}/3)`;
+            const retryMessage = `모의투자 응답 지연, 재시도 중 (${streamingStepFailures}/3)`;
             document.getElementById('streamingDemoStatus').textContent = retryMessage;
             document.getElementById('mockStatus').textContent = retryMessage;
             return { status: 'retrying', progress: 0 };
           }
           streamingDemoRunning = false;
           streamingDemoId = null;
-          const message = response.status === 404
-            ? '시뮬레이션 세션이 만료되었습니다. 시뮬레이션 테스트를 다시 시작하세요.'
-            : `시뮬레이션 업데이트 실패 (${response.status})`;
           document.getElementById('streamingDemoStatus').textContent = message;
           document.getElementById('mockStatus').textContent = message;
           return { status: 'stopped', progress: 0 };
@@ -4995,7 +4856,7 @@ HTML = """
         streamingStepFailures = 0;
         if (data.status === 'waiting') {
           const remaining = Number(data.seconds_until_next_step || 0);
-          const message = `실시간 대기 중 · 다음 1분 bar까지 ${remaining.toFixed(1)}초`;
+          const message = `모의투자 대기 중 · 다음 1분 bar까지 ${remaining.toFixed(1)}초`;
           document.getElementById('streamingDemoStatus').textContent = message;
           document.getElementById('mockStatus').textContent = message;
           return data;
@@ -5003,139 +4864,65 @@ HTML = """
         if (data.status === 'expired') {
           streamingDemoRunning = false;
           streamingDemoId = null;
-          const message = '시뮬레이션 세션이 만료되었습니다. 시뮬레이션 테스트를 다시 시작하세요.';
+          const message = '모의투자 세션이 만료되었습니다. 다시 시작하세요.';
           document.getElementById('streamingDemoStatus').textContent = message;
           document.getElementById('mockStatus').textContent = message;
           return data;
         }
-        
         document.getElementById('streamingDemoProgress').style.width = data.progress + '%';
         if (data.prices && typeof data.prices === 'object') {
-          Object.entries(data.prices).forEach(([ticker, price]) => {
-            streamingDemoPrices[ticker] = Number(price || 0);
-          });
+          Object.entries(data.prices).forEach(([ticker, price]) => { streamingDemoPrices[ticker] = Number(price || 0); });
         }
         document.getElementById('streamingDemoStatus').textContent =
-          `가상 차트 ${data.step || '완료'}분 진행 · 전체 ${data.universe_scanned_count || data.universe_count || '-'}개 NPU 전수 스캔 · 후보 ${data.candidate_ticker_count || data.active_ticker_count || '-'}개 정밀 분석 · bar ${data.chart_bar ?? '-'} · ${(data.progress || 0).toFixed(1)}%`;
-        
-        // 계정 정보 업데이트
+          `모의투자 ${data.step || '완료'}분 진행 · 전체 ${data.universe_scanned_count || data.universe_count || '-'}개 스캔 · 후보 ${data.candidate_ticker_count || data.active_ticker_count || '-'}개 · ${(data.progress || 0).toFixed(1)}%`;
         if (data.account) {
-          const cash = data.account.cash;  // 예수금 = 현재 남아있는 현금
-          const invested = data.account.account_value - data.account.cash;  // 투자금 = 총자산 - 현금
-          const profit = data.account.account_value - streamingInitialCash;  // 수익금 = 총자산 - 초기자본
-          
-          document.getElementById('streamingDeposit').textContent = 
-            formatCashByCurrency(data.account);
-          document.getElementById('streamingInvested').textContent = 
-            fmtWon.format(invested);
-          document.getElementById('streamingProfit').textContent = 
-            fmtWon.format(profit);
-          document.getElementById('streamingReturnRate').textContent = 
-            (data.account.return_rate * 100).toFixed(2) + '%';
+          const cash = data.account.cash;
+          const invested = data.account.account_value - data.account.cash;
+          const profit = data.account.account_value - streamingInitialCash;
+          document.getElementById('streamingDeposit').textContent = formatCashByCurrency(data.account);
+          document.getElementById('streamingInvested').textContent = fmtWon.format(invested);
+          document.getElementById('streamingProfit').textContent = fmtWon.format(profit);
+          document.getElementById('streamingReturnRate').textContent = (data.account.return_rate * 100).toFixed(2) + '%';
           renderStreamingPerformance(data);
-          if (data.principal_protection) {
-            const protection = data.principal_protection;
-            const lockText = protection.principal_locked ? `보호원금 ${fmtWon.format(protection.protected_principal || 0)}` : '원금보존 대기';
-            document.getElementById('mockTarget').textContent =
-              `${lockText} · ${protection.cycle_index || 1}단계 목표 ${fmtWon.format(protection.target_profit_amount || 0)}`;
-          }
         }
-        
-        // 거래 내역 누적
         if (data.trades && data.trades.length > 0) {
-          data.trades.forEach(t => {
-            streamingDemoHistory.unshift(t);
-            streamingDemoPrices[t.ticker] = t.price;
-          });
-          
-          // 최근 체결 테이블 업데이트 (최대 20개)
+          data.trades.forEach(t => { streamingDemoHistory.unshift(t); streamingDemoPrices[t.ticker] = t.price; });
           const executionList = document.getElementById('mockExecutions');
-          if (executionList && streamingDemoHistory.length > 0) {
-            const executionHtml = streamingDemoHistory.slice(0, 20).map(t =>
-              `<tr>
-                <td class="side-${t.side.toLowerCase()}">${t.side}</td>
-                <td>${t.ticker}</td>
-                <td>${t.quantity}</td>
-                <td>${formatMoney(t.price, t.currency)}</td>
-              </tr>`
-            ).join('');
-            executionList.innerHTML = executionHtml;
-          }
-          
-          // 스트리밍 데모 거래 테이블 (최신 거래)
+          if (executionList) executionList.innerHTML = streamingDemoHistory.slice(0, 20).map(t => `<tr><td class="side-${t.side.toLowerCase()}">${t.side}</td><td>${t.ticker}</td><td>${t.quantity}</td><td>${formatMoney(t.price, t.currency)}</td></tr>`).join('');
           const tradeList = document.getElementById('streamingTradeList');
-          if (tradeList) {
-            const tradeHtml = data.trades.map(t => 
-              `<tr><td>${t.ticker}</td><td class="side-${t.side.toLowerCase()}">${t.side}</td>
-               <td>${t.quantity}</td><td>${formatMoney(t.value, t.currency)}${t.currency === 'USD' ? ` (${fmtWon.format(t.value_krw || 0)})` : ''}</td></tr>`
-            ).join('');
-            tradeList.innerHTML = tradeHtml;
-          }
+          if (tradeList) tradeList.innerHTML = data.trades.map(t => `<tr><td>${t.ticker}</td><td class="side-${t.side.toLowerCase()}">${t.side}</td><td>${t.quantity}</td><td>${formatMoney(t.value, t.currency)}${t.currency === 'USD' ? ` (${fmtWon.format(t.value_krw || 0)})` : ''}</td></tr>`).join('');
         }
-        
-        // 보유 종목 테이블 업데이트
-        if (data.holdings && typeof data.holdings === 'object') {
-          const positionList = document.getElementById('mockPositions');
-          if (positionList) {
-            const holdings = Object.entries(data.holdings);
-            if (holdings.length === 0) {
-              positionList.innerHTML = '<tr><td colspan="7">보유 종목 없음</td></tr>';
-            } else {
-              const positionHtml = holdings.map(([ticker, quantity]) => {
-                const price = streamingDemoPrices[ticker] || 0;
-                const currency = (data.currency_by_ticker || {})[ticker] || 'KRW';
-                const marketValue = quantity * price;
-                return `<tr>
-                  <td>${ticker}</td>
-                  <td>${quantity}</td>
-                  <td>${formatMoney(price, currency)}</td>
-                  <td>${formatMoney(price, currency)}</td>
-                  <td>${formatMoney(marketValue, currency)}</td>
-                  <td>-</td>
-                  <td>-</td>
-                </tr>`;
-              }).join('');
-              positionList.innerHTML = positionHtml;
-            }
-          }
-        }
-        
         if (data.status === 'completed') {
           streamingDemoRunning = false;
-          document.getElementById('streamingDemoStatus').textContent = '완료!';
-          console.log('Final results:', data.final_results);
+          document.getElementById('streamingDemoStatus').textContent = '모의투자 완료';
         }
         return data;
       } catch (error) {
-        console.error('Step execution failed:', error);
         streamingStepFailures += 1;
-        const message = `시뮬레이션 응답 지연, 재시도 중 (${Math.min(streamingStepFailures, 3)}/3)`;
+        const message = `모의투자 응답 지연, 재시도 중 (${Math.min(streamingStepFailures, 3)}/3)`;
         if (streamingStepFailures < 3) {
           document.getElementById('streamingDemoStatus').textContent = message;
           document.getElementById('mockStatus').textContent = message;
           return { status: 'retrying', progress: 0 };
         }
         streamingDemoRunning = false;
-        document.getElementById('streamingDemoStatus').textContent = `시뮬레이션 업데이트 실패: ${error.message || error}`;
+        document.getElementById('streamingDemoStatus').textContent = `모의투자 업데이트 실패: ${error.message || error}`;
         return null;
       } finally {
         streamingStepBusy = false;
       }
     }
-    
+
     async function autoRunStreamingDemo(isFirstTick = false) {
       if (!streamingDemoRunning) return;
       const intervalMs = 60000;
       const data = await runStreamingDemoStep();
       if (streamingDemoRunning) {
-        const waitMs = data && data.status === 'waiting'
-          ? Math.max(1000, Number(data.seconds_until_next_step || 60) * 1000)
-          : intervalMs;
+        const waitMs = data && data.status === 'waiting' ? Math.max(1000, Number(data.seconds_until_next_step || 60) * 1000) : intervalMs;
         streamingDemoTimer = setTimeout(() => autoRunStreamingDemo(false), waitMs);
       }
     }
-    
-    // 로드 시 초기화
+    applyCompactKoreanDashboard();
     applyUrlGoalParams();
     updateModeButtons();
     updateModeActionCopy();

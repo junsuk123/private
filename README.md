@@ -1,6 +1,6 @@
 # Personal Multi-Agent Ontology-Based Automated Stock Investment System
 
-Personal-use research system for safe, auditable, explainable stock-investment analysis and realtime-only paper/hypothetical trading experiments.
+Personal-use research system for safe, auditable, explainable stock-investment analysis and realtime-only paper-trading and live-readiness workflows.
 
 The current implementation is intentionally conservative: it collects public/current-market research, builds indicators and ontology evidence, negotiates target feasibility, creates strategy intents, and validates every possible order through deterministic risk rules. Live automated brokerage execution remains blocked.
 
@@ -9,10 +9,12 @@ The current implementation is intentionally conservative: it collects public/cur
 - LLM or LLM-like components never execute trades.
 - AI/semantic/ontology layers may classify events, rank candidates, tune analysis parameters, and produce `OrderIntent` objects.
 - `RiskManager` is the deterministic final gate before an intent can become a `FinalOrder`.
+- Source trust, data quality, freshness, synthetic status, and model uncertainty are checked before live approval can proceed.
 - Approved orders are limit orders with `manual_approval_required=True`.
 - Live automated execution is disabled by default and remains blocked in the current app flow.
+- Synthetic, sample, pseudo, or hash-derived features are allowed only in clearly labeled offline fixtures and must not be used as trusted paper-trading or live-trading evidence.
 - Margin, leverage, derivatives, short selling, credit loans, and leveraged ETFs are rejected.
-- Testing and streaming simulation submit no real broker orders.
+- Paper trading uses the KIS virtual domain or the local paper engine; live-readiness checks do not submit broker orders.
 
 ## Current Scope
 
@@ -26,12 +28,21 @@ Implemented capabilities include:
 - SQLite-backed local research store with stable record keys and retention pruning
 - Lightweight indicator snapshots for the main decision path
 - Ontology graph, event mapping, NPU/CPU ontology candidate screening, and rule-based reasoning paths
+- Source trust policy and lightweight feature provenance labels for measured, estimated, and synthetic fields
 - Goal feasibility negotiation and compromise target generation
 - Rule-based and goal-directed strategy signal generation
 - Deterministic risk validation
-- Mock KIS paper-trading boundary and streaming simulation
-- Realtime learning and hypothetical testing artifacts under `data/models`
+- KIS paper-trading boundary and local paper-trading loop
+- Realtime learning and paper-trading evaluation artifacts under `data/models`
 - Audit logging and diagnostics endpoints
+- Recursive audit redaction for credentials, tokens, account numbers, and broker secrets
+- No-lookahead dataset scaffolding, ranked-signal evaluation summaries, and CPU/OpenVINO inference backend hooks
+
+## Data Trust And Provenance
+
+`SourceMetadata` records source type, trust level, observed/retrieved time, latency, realtime/delayed flags, synthetic/backfilled flags, license policy, and quality score. Legacy metadata defaults to low trust. `app.data.source_policy` centralizes source-type inference, default trust levels, quality scoring, and live-decision validation.
+
+Hash-derived or pseudo quote-like fields in the lightweight ontology filter are marked as synthetic or estimated. Offline fixture paths may use these labeled fields; paper-trading and live/realtime decision paths should reject `is_synthetic=true`, synthetic fields, unknown sources, stale quotes, or low quality scores. `RiskManager` remains the final deterministic authority.
 
 ## Quick Start
 
@@ -63,7 +74,7 @@ If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded lo
 
 ## KIS Developers Broker Adapter
 
-`src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so simulation code can be run with an injected fake KIS transport and later switched to the real transport.
+`src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so the same paper-trading flow can be run with an injected fake KIS transport and later switched to the real transport.
 
 Safe defaults:
 
@@ -73,6 +84,8 @@ Safe defaults:
 - `KIS_ACCOUNT_NO` may be `12345678-01` or paired with `KIS_ACCOUNT_PRODUCT_CODE=01`.
 
 The adapter follows the current KIS guide pattern: `/oauth2/tokenP` for access tokens, `/uapi/hashkey` before cash-order POSTs, and the new domestic cash-order TR IDs `TTTC0011U`/`TTTC0012U` for live and `VTTC0011U`/`VTTC0012U` for paper. Keep token issuance and order calls on the same base URL; mixing paper and live domains will fail at the KIS gateway.
+
+Secrets are loaded automatically from the ignored local file `config/secrets/kis_api_keys.env` when the KIS client starts. Copy `config/secrets/kis_api_keys.env.example` and keep real values out of Git. Use `python scripts/check_kis_connection.py` for a token-only check, or add `--account` for the read-only balance endpoint.
 
 Optional in-process local LLM setup:
 
@@ -105,7 +118,7 @@ Useful individual commands:
 
 ```powershell
 $env:PYTHONPATH="src"
-python -m app.cli demo
+python -m app.cli demo  # legacy local sample pipeline
 python -m app.cli research --config config/research_sources.live.json
 python -m app.cli research --config config/research_sources.demo.json
 python -m unittest discover -s tests
@@ -124,7 +137,7 @@ data/reports/
 data/synthetic_disabled/
 ```
 
-Simulation and synthetic rows are rejected from the realtime research/model stores. Historical `data/live`, `data/sim`, and `data/legacy` files may exist from older phases, but the active web runtime uses `data/store` and `data/models`.
+Synthetic/offline fixture rows are rejected from the realtime research/model stores. Historical `data/live`, `data/sim`, and `data/legacy` files may exist from older phases, but the active web runtime uses `data/store` and `data/models`.
 
 Model artifacts are versioned and also written to `<model>.latest.json` inside each model-family folder.
 
@@ -133,19 +146,23 @@ Model artifacts are versioned and also written to `<model>.latest.json` inside e
 The web operation-mode manager exposes:
 
 ```text
-learning      realtime collection and supervised PnL-label artifact updates
-testing       realtime hypothetical trade test; orders_submitted = 0
-live_trading  realtime trading gate; brokerage execution remains guarded/blocked
+learning        realtime collection and supervised PnL-label artifact updates
+testing         legacy paper-trading replay alias; no live broker orders
+paper_trading   KIS paper-trading API check + local paper buy/sell loop
+paper_trading_test alias for paper_trading
+live_readiness  KIS live-readiness check; no broker orders submitted
+live_trading_test alias for live_readiness
+live_trading    realtime trading gate; brokerage execution remains guarded/blocked
 ```
 
-Streaming simulation is separate from operation-mode testing and starts through:
+The paper-trading loop starts through:
 
 ```text
-POST /api/streaming-demo/start
-POST /api/streaming-demo/step
+POST /api/paper-trading/start
+POST /api/paper-trading/step
 ```
 
-It creates synthetic one-minute charts in memory, uses the listed universe plus ontology/NPU candidate screening, runs goal-directed strategy and `RiskManager`, then applies approved orders only to simulated cash and holdings.
+It creates labeled local one-minute paper-trading bars in memory, uses the listed universe plus ontology CPU/NPU heuristic candidate screening, runs goal-directed strategy and `RiskManager`, then applies approved orders only to virtual cash and holdings.
 
 ## Core Algorithm
 
@@ -160,10 +177,12 @@ Public/current research sources
   -> goal feasibility and strategy scoring
   -> OrderIntent records
   -> deterministic RiskManager validation
-  -> mock KIS / hypothetical test / streaming simulation output
+  -> KIS paper-trading / local paper-trading output
 ```
 
-The first ontology filter screens the full available universe with low-cost quote-like features such as liquidity, volume change, price momentum, foreign/institution flow, halt status, and management-stock status. Only selected candidates continue to heavier graph/strategy stages, with priority tickers retained for visibility.
+The first ontology filter screens the full available universe with low-cost quote-like features such as liquidity, volume change, price momentum, foreign/institution flow, halt status, and management-stock status. In offline fixture mode these quote-like values can be synthetic or estimated and are labeled accordingly. Only selected candidates continue to heavier graph/strategy stages, with priority tickers retained for visibility.
+
+The current ontology NPU path is a heuristic fixed linear scorer accelerated by OpenVINO when available. It is not a trained AI model unless a separately trained/exported model is plugged into the inference backend. CPU fallback remains enabled.
 
 ## Resource Profile
 
@@ -178,7 +197,7 @@ Workload:
 3,686,400 total NPU score rows
 600 time-synchronized frames per iteration
 300 realtime supervised learning examples per iteration
-200 hypothetical trades per iteration
+200 paper-trading evaluation trades per iteration
 model artifacts written on the first and last iteration
 ```
 
@@ -227,8 +246,8 @@ POST /api/start
 POST /api/operation-mode/start
 GET  /api/operation-mode/status
 POST /api/operation-mode/stop-learning
-POST /api/streaming-demo/start
-POST /api/streaming-demo/step
+POST /api/paper-trading/start
+POST /api/paper-trading/step
 POST /api/mock-kis/orders
 GET  /api/mock-kis/portfolio
 ```
@@ -239,7 +258,7 @@ GET  /api/mock-kis/portfolio
 src/app/
   agents/          LLM-facing interfaces and contracts
   audit/           Append-only audit logger
-  backtesting/     Streaming and accelerated simulation tools
+  backtesting/     Local paper-trading and accelerated replay tools
   data/            Public collectors, classifiers, HTTP helpers
   execution/       Mock broker plus KIS Developers REST adapter
   features/        Formula indicators, semantic features, model-row scaffolding
@@ -247,7 +266,7 @@ src/app/
   graph/           Ontology graph, event mapper, NPU classifier, reasoner
   indicators/      Main lightweight IndicatorSnapshot engine
   models/          Dataset and no-lookahead labeling helpers
-  realtime/        Operation modes, acceleration policy, learning/test helpers
+  realtime/        Operation modes, acceleration policy, learning/paper-trading helpers
   research/        Source orchestration, retries, diagnostics
   risk/            Deterministic hard-rule risk manager
   storage/         SQLite research store and model artifact store
@@ -270,8 +289,8 @@ research_notes/
 3. Ontology graph, candidate filtering, and reasoning
 4. Local/remote LLM classification with strict JSON output
 5. Goal-directed strategy and deterministic risk manager
-6. Hypothetical testing and streaming simulation
-7. Paper/mock brokerage workflows
+6. Paper-trading evaluation and local accelerated replay
+7. KIS paper/mock brokerage workflows
 8. Brokerage read-only integration
 9. Manual-approval trading gate
 10. Limited automation only after proven stability and explicit controls

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
+from app.data.source_policy import compute_quality_score
 from app.schemas.domain import InvestorFlowSnapshot, MarketSnapshot
 from app.strategy.investor_flow import assess_domestic_investor_flow
 
@@ -42,6 +43,11 @@ class LightweightMarketSnapshot:
     halt_status: bool
     management_stock_status: bool
     liquidity_score: float
+    is_synthetic: bool = False
+    synthetic_fields: tuple[str, ...] = ()
+    estimated_fields: tuple[str, ...] = ()
+    measured_fields: tuple[str, ...] = ()
+    quality_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,26 @@ def build_lightweight_market_snapshots(
                 halt_status=_stable_unit(f"{stock.ticker}:halt") > 0.997,
                 management_stock_status=_stable_unit(f"{stock.ticker}:management") > 0.996,
                 liquidity_score=round(liquidity_score, 5),
+                is_synthetic=True,
+                synthetic_fields=(
+                    "current_price",
+                    "price_change_rate",
+                    "trading_value",
+                    "trading_volume",
+                    "volume_change_rate",
+                    "market_cap",
+                    "foreign_net_buy",
+                    "institution_net_buy",
+                    "retail_net_buy",
+                    "program_net_buy",
+                    "short_net_change",
+                    "upper_limit_near",
+                    "new_52week_high",
+                    "halt_status",
+                    "management_stock_status",
+                    "liquidity_score",
+                ),
+                quality_score=0.0,
             )
         )
     return tuple(snapshots)
@@ -160,6 +186,32 @@ def build_lightweight_market_snapshots_from_markets(
         momentum = _stable_unit(f"{market.ticker}:analysis-momentum") * 0.18 - 0.06
         volume_change = _stable_unit(f"{market.ticker}:analysis-volume") * 1.8 - 0.35
         flow = market.investor_flow
+        measured_fields = ("current_price", "trading_value", "trading_volume", "liquidity_score")
+        estimated_fields = [
+            "price_change_rate",
+            "volume_change_rate",
+            "market_cap",
+            "new_52week_high",
+        ]
+        if flow is None:
+            estimated_fields.extend(
+                (
+                    "foreign_net_buy",
+                    "institution_net_buy",
+                    "retail_net_buy",
+                    "program_net_buy",
+                    "short_net_change",
+                )
+            )
+        else:
+            measured_fields = measured_fields + (
+                "foreign_net_buy",
+                "institution_net_buy",
+                "retail_net_buy",
+                "program_net_buy",
+                "short_net_change",
+            )
+        quality_score = compute_quality_score(market.source, missing_ratio=len(estimated_fields) / 16)
         snapshots.append(
             LightweightMarketSnapshot(
                 ticker=market.ticker,
@@ -181,9 +233,26 @@ def build_lightweight_market_snapshots_from_markets(
                 halt_status=False,
                 management_stock_status=False,
                 liquidity_score=round(liquidity_score, 5),
+                is_synthetic=market.source.is_synthetic,
+                synthetic_fields=tuple(estimated_fields) if market.source.is_synthetic else (),
+                estimated_fields=tuple(estimated_fields),
+                measured_fields=measured_fields,
+                quality_score=quality_score,
             )
         )
     return tuple(snapshots)
+
+
+def validate_lightweight_snapshots_for_live(
+    snapshots: tuple[LightweightMarketSnapshot, ...],
+) -> tuple[bool, tuple[str, ...]]:
+    reasons: list[str] = []
+    for snapshot in snapshots:
+        if snapshot.is_synthetic or snapshot.synthetic_fields:
+            reasons.append(f"{snapshot.ticker}:synthetic_fields")
+        if snapshot.quality_score <= 0:
+            reasons.append(f"{snapshot.ticker}:data_quality")
+    return not reasons, tuple(reasons)
 
 
 def ontology_filter_1(
