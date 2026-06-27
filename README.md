@@ -252,6 +252,31 @@ POST /api/mock-kis/orders
 GET  /api/mock-kis/portfolio
 ```
 
+## NPU Evidence Acceleration
+
+The ontology pipeline can use OpenVINO/NPU for numeric evidence scoring while
+keeping hard filters, graph reasoning, strategy decisions, `RiskManager`, manual
+approval, and broker execution on CPU-controlled deterministic paths.
+
+Key controls:
+
+- `ONTOLOGY_NPU_ENABLED=true`: enable candidate evidence scoring.
+- `ONTOLOGY_NPU_TOP_K=50`: limit candidates passed into graph reasoning.
+- `ONTOLOGY_NPU_BATCH_SIZE=auto`: choose `512/1024/2048/4096` scoring buckets.
+- `OPENVINO_DEVICE=NPU`: request NPU; CPU fallback is automatic.
+- `EVENT_CLASSIFIER_PROVIDER=keyword`: lightweight event classification default.
+- `SHORT_HORIZON_PREDICTOR_ENABLED=false`: opt-in short-horizon predictor.
+- `ONTOLOGY_GRAPH_SCOPE=candidate_only`: avoid full-universe graph materialization.
+
+Benchmark locally:
+
+```powershell
+python scripts/benchmark_npu_scoring.py --device CPU
+python scripts/benchmark_realtime_pipeline.py --device CPU
+```
+
+See `docs/npu_optimization_audit.md` and `docs/npu_runtime_architecture.md`.
+
 ## Repository Layout
 
 ```text

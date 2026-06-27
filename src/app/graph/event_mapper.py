@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime, timedelta, timezone
+
 from app.graph import KnowledgeGraph
 from app.schemas.domain import ClassifiedEvent, SentimentDirection
 
 
 def add_events_to_graph(graph: KnowledgeGraph, events: tuple[ClassifiedEvent, ...]) -> KnowledgeGraph:
-    for event in events:
+    for event in _fresh_events(events):
         event_node = f"{event.event_type}:{event.event_id}"
         for ticker in event.tickers:
             predicate = "hasRecentNews" if event.event_type == "NEWS" else "hasRecentDisclosure"
@@ -31,6 +34,18 @@ def add_events_to_graph(graph: KnowledgeGraph, events: tuple[ClassifiedEvent, ..
             graph.add(event_node, "generatesSemanticFeature", f"Fact:{fact}", f"{event.source.source_id}:fact:{index}")
 
     return graph
+
+
+def _fresh_events(events: tuple[ClassifiedEvent, ...]) -> tuple[ClassifiedEvent, ...]:
+    scope = os.getenv("ONTOLOGY_GRAPH_SCOPE", "candidate_only").strip().lower()
+    if scope == "full_debug":
+        return events
+    try:
+        ttl_hours = max(1, int(os.getenv("ONTOLOGY_GRAPH_EVENT_TTL_HOURS", "72")))
+    except ValueError:
+        ttl_hours = 72
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+    return tuple(event for event in events if event.event_date >= cutoff)
 
 
 def _is_risk_label(label: str) -> bool:

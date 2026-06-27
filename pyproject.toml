@@ -5,6 +5,7 @@ description = "Safe, auditable personal stock-investment analysis system scaffol
 requires-python = ">=3.11"
 dependencies = [
   "fastapi",
+  "numpy",
   "starlette>=0.40.0,<0.47.0",
   "tzdata",
   "uvicorn"

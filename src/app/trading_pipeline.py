@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from app.data.source_policy import compute_quality_score
+from app.graph.npu_classifier import OntologyNpuLinearScorer
 from app.schemas.domain import InvestorFlowSnapshot, MarketSnapshot
 from app.strategy.investor_flow import assess_domestic_investor_flow
 
@@ -70,6 +72,7 @@ class CandidateSelectionResult:
     api_call_count: int
     full_universe_count: int
     chart_fetch_scope: tuple[str, ...]
+    metrics: dict[str, float | int | str] = field(default_factory=dict)
 
 
 @dataclass
@@ -268,10 +271,11 @@ def ontology_filter_1(
         return cached
 
     started = time.perf_counter()
-    target_count = max(1, min(100, int(target_count)))
+    target_count = max(1, min(_max_top_k(), int(target_count)))
     accepted: list[tuple[float, str]] = []
     rejected: list[str] = []
     traces: list[ReasoningTrace] = []
+    hard_filter_count = 0
 
     for snapshot in snapshots:
         score, decision, fired_rules, reason = _score_lightweight_snapshot(
@@ -308,10 +312,32 @@ def ontology_filter_1(
         traces.append(trace)
         if decision == "CandidateStock":
             accepted.append((score, snapshot.ticker))
+            hard_filter_count += 1
         else:
             rejected.append(snapshot.ticker)
 
-    candidates = tuple(ticker for _score, ticker in sorted(accepted, reverse=True)[:target_count])
+    npu_metrics: dict[str, float | int | str] = {
+        "candidate_count_input": len(snapshots),
+        "candidate_count_after_hard_filter": hard_filter_count,
+    }
+    if _npu_candidate_scoring_enabled() and accepted:
+        npu_candidates, npu_metrics_update = _rank_accepted_with_npu(
+            snapshots,
+            tuple(ticker for _score, ticker in accepted),
+            top_k=target_count,
+        )
+        candidates = npu_candidates
+        npu_metrics.update(npu_metrics_update)
+    else:
+        candidates = tuple(ticker for _score, ticker in sorted(accepted, reverse=True)[:target_count])
+        npu_metrics.update(
+            {
+                "candidate_count_after_npu_topk": len(candidates),
+                "npu_enabled": 0,
+                "device": "CPU_RULES",
+                "top_k": target_count,
+            }
+        )
     result = CandidateSelectionResult(
         candidate_stocks=candidates,
         rejected_stocks=tuple(rejected),
@@ -320,6 +346,7 @@ def ontology_filter_1(
         api_call_count=0,
         full_universe_count=len(snapshots),
         chart_fetch_scope=candidates,
+        metrics=npu_metrics,
     )
     if cache_key:
         _candidate_cache.set(cache_key, result)
@@ -332,6 +359,49 @@ def ontology_filter_1(
         result.api_call_count,
     )
     return result
+
+
+def _rank_accepted_with_npu(
+    snapshots: tuple[LightweightMarketSnapshot, ...],
+    accepted_tickers: tuple[str, ...],
+    *,
+    top_k: int,
+) -> tuple[tuple[str, ...], dict[str, float | int | str]]:
+    snapshot_by_ticker = {snapshot.ticker: snapshot for snapshot in snapshots}
+    rows = []
+    tickers = []
+    for ticker in accepted_tickers:
+        snapshot = snapshot_by_ticker[ticker]
+        tickers.append(ticker)
+        rows.append(
+            (
+                max(0.0, snapshot.price_change_rate),
+                max(0.0, snapshot.volume_change_rate),
+                max(0.0, snapshot.market_cap / 10_000_000_000_000),
+                0.0 if snapshot.trading_value > 0 else 1.0,
+                max(0.0, min(1.0, abs(snapshot.price_change_rate) * 2)),
+                max(0.0, snapshot.price_change_rate + snapshot.volume_change_rate * 0.05),
+                0.50 + max(-0.30, min(0.30, snapshot.price_change_rate)),
+                max(0.0, snapshot.liquidity_score),
+            )
+        )
+    scorer = OntologyNpuLinearScorer(batch_size=os.getenv("ONTOLOGY_NPU_BATCH_SIZE", "auto"))
+    scored = scorer.score_candidates(tickers, rows, top_k=top_k)
+    metrics = dict(scored.profile)
+    metrics["candidate_count_after_npu_topk"] = len(scored.tickers)
+    metrics["npu_enabled"] = 1
+    return scored.tickers, metrics
+
+
+def _npu_candidate_scoring_enabled() -> bool:
+    return os.getenv("ONTOLOGY_NPU_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _max_top_k() -> int:
+    try:
+        return max(1, int(os.getenv("ONTOLOGY_NPU_TOP_K", "50")))
+    except ValueError:
+        return 50
 
 
 def _score_lightweight_snapshot(
