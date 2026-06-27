@@ -98,11 +98,15 @@ The ontology graph exposes this path as `TradingCost -> BreakEvenReturn/NetExpec
 
 ## Short-Horizon Strategy Research Mode
 
-Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.
+Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`, parsed with PyYAML. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.
 
 These modules produce `StrategyCandidate` records, not executable orders. Candidates must pass `TradingCostEngine`, ontology risk semantics, `RealityCheckValidator` where required, and the deterministic `RiskManager`/FinalTradeGate path before any order intent can be considered. The default execution mode is `paper_trading`; `live_trading_enabled` is `false`.
 
-The short-horizon strategies are research infrastructure for paper trading and dry runs. They do not guarantee profits, and passing a backtest or reality check does not imply future performance.
+Reality-check reports can feed `StrategyParameterReestimator`, which proposes conservative parameter updates such as higher target net return, tighter spread limits, disabled failed strategies, and the latest validation id. This is parameter governance for an automatic trading program, not a profit guarantee.
+
+The GUI includes a live auto-trading gate beside the paper-trading controls. It stays blocked unless config and environment flags explicitly allow live trading, KIS live account probing succeeds, and the normal strategy, cost, ontology, RiskManager, and FinalTradeGate checks remain intact.
+
+The short-horizon strategies are research infrastructure for paper trading, dry runs, and gated automatic trading. They do not guarantee profits, and passing a backtest or reality check does not imply future performance.
 
 See `docs/short_term_trading_strategy_design.md` for the full design.
 

@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from app.evaluation import RealityCheckConfig, RealityCheckValidator, StrategyTradeObservation
+from app.evaluation import (
+    RealityCheckConfig,
+    RealityCheckValidator,
+    StrategyParameterReestimator,
+    StrategyTradeObservation,
+)
 
 
 class RealityCheckValidatorTest(unittest.TestCase):
@@ -54,6 +59,36 @@ class RealityCheckValidatorTest(unittest.TestCase):
     def test_requires_trades(self) -> None:
         with self.assertRaises(ValueError):
             RealityCheckValidator().validate(())
+
+    def test_parameter_reestimator_disables_failed_strategy_and_tightens_cost_gates(self) -> None:
+        report = RealityCheckValidator(
+            RealityCheckConfig(train_size=6, test_size=3, bootstrap_iterations=30, target_net_return=0.0)
+        ).validate(_small_gross_return_trades(), strategy_name="short_term_reversal")
+
+        adjustment = StrategyParameterReestimator().reestimate(
+            report,
+            {"enabled": True, "target_net_return": 0.003, "max_spread_rate": 0.0015},
+        )
+
+        self.assertFalse(adjustment.passed)
+        self.assertFalse(adjustment.suggested_parameters["enabled"])
+        self.assertGreater(adjustment.suggested_parameters["target_net_return"], 0.003)
+        self.assertLess(adjustment.suggested_parameters["max_spread_rate"], 0.0015)
+        self.assertTrue(adjustment.suggested_parameters["requires_reality_check_passed"])
+
+    def test_parameter_reestimator_preserves_passed_strategy_with_validation_id(self) -> None:
+        report = RealityCheckValidator(
+            RealityCheckConfig(train_size=8, test_size=4, bootstrap_iterations=50, target_net_return=0.0)
+        ).validate(_profitable_trades(), strategy_name="technical_rule")
+
+        adjustment = StrategyParameterReestimator().reestimate(
+            report,
+            {"enabled": True, "target_net_return": 0.003, "max_spread_rate": 0.0015},
+        )
+
+        self.assertTrue(adjustment.passed)
+        self.assertTrue(adjustment.suggested_parameters["enabled"])
+        self.assertEqual(adjustment.suggested_parameters["last_validation_id"], report.validation_id)
 
 
 def _profitable_trades() -> tuple[StrategyTradeObservation, ...]:

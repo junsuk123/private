@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
+import yaml
+
 from app.data.source_policy import compute_quality_score
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
@@ -386,7 +388,14 @@ def load_short_horizon_strategy_config(
     config_path = Path(path)
     if not config_path.exists():
         return {}
-    return _parse_simple_yaml(config_path.read_text(encoding="utf-8"))
+    loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Short-horizon strategy config must be a mapping: {config_path}")
+    return {
+        str(section): dict(values or {})
+        for section, values in loaded.items()
+        if isinstance(values, dict) or values is None
+    }
 
 
 def build_strategy_candidate_factory_from_config(
@@ -641,37 +650,3 @@ def _stable_unit(value: str) -> float:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") / float(2**64 - 1)
 
-
-def _parse_simple_yaml(text: str) -> dict[str, dict[str, Any]]:
-    parsed: dict[str, dict[str, Any]] = {}
-    current: str | None = None
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        if not line.startswith(" ") and line.endswith(":"):
-            current = line[:-1].strip()
-            parsed[current] = {}
-            continue
-        if current is None or ":" not in line:
-            continue
-        key, value = line.strip().split(":", 1)
-        parsed[current][key.strip()] = _parse_yaml_scalar(value.strip())
-    return parsed
-
-
-def _parse_yaml_scalar(value: str) -> Any:
-    if value in {"true", "True"}:
-        return True
-    if value in {"false", "False"}:
-        return False
-    if value in {"null", "None", "~"}:
-        return None
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        return value[1:-1]
-    try:
-        if any(part in value.lower() for part in (".", "e")):
-            return float(value)
-        return int(value)
-    except ValueError:
-        return value

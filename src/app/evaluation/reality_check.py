@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean, median, pstdev
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from app.cost import CostBreakdown, TradingCostEngine
 from app.evaluation.walk_forward import WalkForwardSplit, walk_forward_splits
@@ -67,6 +67,15 @@ class StrategyValidationReport:
 
 
 @dataclass(frozen=True)
+class StrategyParameterAdjustment:
+    strategy_name: str
+    validation_id: str
+    passed: bool
+    suggested_parameters: dict[str, float | bool | str]
+    reason: str
+
+
+@dataclass(frozen=True)
 class RealityCheckConfig:
     train_size: int = 20
     test_size: int = 10
@@ -78,6 +87,10 @@ class RealityCheckConfig:
     bootstrap_iterations: int = 200
     bootstrap_block_size: int = 5
     min_test_trades: int = 1
+    conservative_target_step: float = 0.001
+    min_target_net_return: float = 0.003
+    max_target_net_return: float = 0.02
+    min_max_spread_rate: float = 0.0005
 
 
 class RealityCheckValidator:
@@ -197,6 +210,73 @@ class RealityCheckValidator:
         )
 
 
+class StrategyParameterReestimator:
+    """Conservative parameter re-estimation from after-cost validation reports."""
+
+    def __init__(self, config: RealityCheckConfig | None = None) -> None:
+        self.config = config or RealityCheckConfig()
+
+    def reestimate(
+        self,
+        report: StrategyValidationReport,
+        current_parameters: dict[str, float | bool | str] | None = None,
+    ) -> StrategyParameterAdjustment:
+        current = dict(current_parameters or {})
+        current_target = float(current.get("target_net_return", self.config.min_target_net_return))
+        current_spread = float(current.get("max_spread_rate", 0.0015))
+        suggested: dict[str, float | bool | str] = {
+            "requires_reality_check_passed": True,
+            "last_validation_id": report.validation_id,
+        }
+
+        if not report.passed:
+            suggested["enabled"] = False
+            suggested["target_net_return"] = min(
+                self.config.max_target_net_return,
+                max(current_target + self.config.conservative_target_step, self.config.min_target_net_return),
+            )
+            suggested["max_spread_rate"] = max(self.config.min_max_spread_rate, current_spread * 0.8)
+            return StrategyParameterAdjustment(
+                strategy_name=report.strategy_name,
+                validation_id=report.validation_id,
+                passed=False,
+                suggested_parameters=suggested,
+                reason="Reality check failed; keep strategy disabled for live use and tighten cost gates.",
+            )
+
+        average_oos_return = _average_return(
+            trade.net_return for trade in _out_of_sample_trades(report)
+        )
+        suggested["enabled"] = bool(current.get("enabled", True))
+        suggested["target_net_return"] = min(
+            self.config.max_target_net_return,
+            max(current_target, self.config.min_target_net_return, average_oos_return * 0.5),
+        )
+        if report.fee_converted_loss_ratio > 0:
+            suggested["max_spread_rate"] = max(self.config.min_max_spread_rate, current_spread * 0.9)
+        else:
+            suggested["max_spread_rate"] = current_spread
+        return StrategyParameterAdjustment(
+            strategy_name=report.strategy_name,
+            validation_id=report.validation_id,
+            passed=True,
+            suggested_parameters=suggested,
+            reason="Reality check passed; update validation id and keep after-cost target conservative.",
+        )
+
+    def reestimate_many(
+        self,
+        reports: Sequence[StrategyValidationReport],
+        current_config: dict[str, dict[str, float | bool | str]] | None = None,
+    ) -> dict[str, dict[str, float | bool | str]]:
+        current_config = current_config or {}
+        overrides: dict[str, dict[str, float | bool | str]] = {}
+        for report in reports:
+            adjustment = self.reestimate(report, current_config.get(report.strategy_name, {}))
+            overrides[report.strategy_name] = adjustment.suggested_parameters
+        return overrides
+
+
 def _out_of_sample_indices(
     evaluated: Sequence[EvaluatedTrade],
     splits: Sequence[WalkForwardSplit],
@@ -206,6 +286,16 @@ def _out_of_sample_indices(
         return tuple(dict.fromkeys(index for split in splits for index in split.test_indices))
     split_at = max(0, len(evaluated) - min(config.test_size, len(evaluated)))
     return tuple(range(split_at, len(evaluated)))
+
+
+def _out_of_sample_trades(report: StrategyValidationReport) -> tuple[EvaluatedTrade, ...]:
+    indices = _out_of_sample_indices(report.evaluated_trades, report.walk_forward_splits, RealityCheckConfig(test_size=report.test_size))
+    return tuple(report.evaluated_trades[index] for index in indices) if indices else report.evaluated_trades
+
+
+def _average_return(returns: Iterable[float]) -> float:
+    values = list(returns)
+    return mean(values) if values else 0.0
 
 
 def _compound_return(returns: Sequence[float]) -> float:

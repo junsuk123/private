@@ -4,6 +4,10 @@ Version: 0.1.0
 Summary: Safe, auditable personal stock-investment analysis system scaffold.
 Requires-Python: >=3.11
 Requires-Dist: fastapi
+Requires-Dist: httpx
+Requires-Dist: numpy
+Requires-Dist: PyYAML
+Requires-Dist: starlette<0.47.0,>=0.40.0
 Requires-Dist: tzdata
 Requires-Dist: uvicorn
 Provides-Extra: npu

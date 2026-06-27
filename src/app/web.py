@@ -49,6 +49,7 @@ from app.schemas.domain import (
 from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
+from app.trading_pipeline import load_short_horizon_strategy_config
 
 
 def _ensure_starlette_router_event_compatibility() -> None:
@@ -136,6 +137,13 @@ LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     int(os.getenv("LEARNING_COLLECTION_INTERVAL_SECONDS", "3600")),
 )
 AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "true").lower() not in {"0", "false", "no", "off"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+  value = os.getenv(name)
+  if value is None:
+    return default
+  return value.strip().lower() in {"1", "true", "yes", "on"}
 
 _live_lock = threading.Lock()
 _refresh_guard = threading.Lock()
@@ -581,6 +589,27 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
               f"KIS 실전 인증 점검을 완료하지 못했습니다: {kis_connection.get('message') or kis_connection.get('error')}. "
               "주문은 보내지 않았고 실전 주문 게이트는 계속 비활성화되어 있습니다."
           )
+
+      if mode == "live_trading":
+        _start_live_worker("learning")
+        config = load_short_horizon_strategy_config()
+        execution_config = config.get("execution", {})
+        config_live_enabled = bool(execution_config.get("live_trading_enabled", False))
+        env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
+        kis_connection = _kis_connection_probe(paper=False, include_account=True)
+        result["kis_connection"] = kis_connection
+        result["live_trading_status"] = "armed" if config_live_enabled and env_live_enabled and kis_connection.get("ok") else "blocked"
+        result["live_trading_enabled_by_config"] = config_live_enabled
+        result["live_trading_enabled_by_env"] = env_live_enabled
+        result["live_trading_message"] = (
+            "Live auto-trading gate is armed. Orders still require StrategyCandidateFactory, "
+            "RealityCheck, ontology checks, RiskManager, and FinalTradeGate approval."
+            if result["live_trading_status"] == "armed"
+            else (
+                "Live auto-trading is blocked. Enable execution.live_trading_enabled in config "
+                "and set LIVE_TRADING_ENABLED=true plus KIS_LIVE_ENABLED=true after validation."
+            )
+        )
 
       _set_operation_request(False, "started", f"{mode} started", None)
       result["request"] = _operation_mode_request_snapshot()
@@ -2540,6 +2569,7 @@ HTML = """
         <button type="button" id="modeLearningStopButton" class="secondary" onclick="stopLearningCollection()" disabled>학습 유지<small>상시 수집 모드</small></button>
         <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
         <button type="button" id="modeLiveButton" onclick="startSelectedOperationMode('live_test')">실전 준비<small>주문 없이 인증 확인</small></button>
+        <button type="button" id="modeLiveTradingButton" class="danger" onclick="startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
       </div>
       <div class="work-status active">
         <strong id="operationModeStatus">모드 대기</strong>
@@ -2605,16 +2635,16 @@ HTML = """
     </aside>
     <main>
       <div class="grid">
-        <section class="panel span-4"><h2>포트폴리오</h2><div class="metric" id="equity">-</div><div class="muted">총 평가금액</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">예치금 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
-        <section class="panel span-4"><h2>모의 수익률</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">수익금 -</span><span class="chip" id="mockEquity">평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">선택한 목표로 시작하면 모의 KIS 포트폴리오 수익률이 표시됩니다.</p></section>
+        <section class="panel span-4"><h2>운용 기준 자금</h2><div class="metric" id="equity">-</div><div class="muted">목표 산정과 리스크 한도 계산에 쓰는 기준 금액</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">기준 현금 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
+        <section class="panel span-4"><h2>Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
         <section class="panel span-4">
-          <h2>증권사 계좌</h2>
-          <div class="metric" id="brokerDeposit">점검 전</div>
+          <h2>증권사 실계좌</h2>
+          <div class="metric" id="brokerDeposit">읽기 전</div>
           <div class="chips" style="margin-top:12px;">
-            <span class="chip" id="brokerHoldings">보유 종목 -</span>
+            <span class="chip" id="brokerHoldings">실보유 종목 -</span>
             <span class="chip" id="brokerAccount">계좌 -</span>
           </div>
-          <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검을 누르면 읽기 전용으로 실제 예수금을 확인합니다.</p>
+          <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.</p>
         </section>
         <section class="panel span-8">
           <h2>달성 가능성</h2>
@@ -2722,6 +2752,7 @@ HTML = """
       const learningButton = document.getElementById('modeLearningButton');
       const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
       const refreshButton = document.getElementById('modeLearningStopButton');
       if (learningButton) {
         learningButton.innerHTML = 'Learning status<small>Runs while server is open</small>';
@@ -2735,13 +2766,17 @@ HTML = """
         liveButton.innerHTML = 'Live readiness<small>Auth check without orders</small>';
         liveButton.onclick = () => startSelectedOperationMode('live_test');
       }
+      if (liveTradingButton) {
+        liveTradingButton.innerHTML = 'Live auto trading<small>Risk-gated execution</small>';
+        liveTradingButton.onclick = () => startSelectedOperationMode('live');
+      }
       if (refreshButton) {
         refreshButton.innerHTML = 'Refresh status<small>Collection stays active</small>';
         refreshButton.disabled = false;
         refreshButton.onclick = () => loadLearningStatus();
       }
       const flowCopy = {
-        mode: ['Mode', 'Paper trading or live readiness'],
+        mode: ['Mode', 'Paper, readiness, or live auto trading'],
         data: ['Collection', 'Auto refresh while server runs'],
         analysis: ['Learning', 'Realtime store updates'],
         simulation: ['Paper trading', 'Waiting for KIS/API state'],
@@ -2831,14 +2866,17 @@ HTML = """
       const refreshButton = document.getElementById('modeLearningStopButton');
       const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
       if (!learningButton || !paperButton) return;
       learningButton.disabled = operationRequestActive;
       paperButton.disabled = operationRequestActive;
       if (liveButton) liveButton.disabled = operationRequestActive;
+      if (liveTradingButton) liveTradingButton.disabled = operationRequestActive;
       if (refreshButton) refreshButton.disabled = false;
       learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
       paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
       if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
+      if (liveTradingButton) liveTradingButton.innerHTML = '실전 투자<small>자동매매 게이트</small>';
       if (refreshButton) refreshButton.innerHTML = '상태 새로고침<small>수집은 중단하지 않음</small>';
     }
 
@@ -2847,10 +2885,12 @@ HTML = """
       const refreshButton = document.getElementById('modeLearningStopButton');
       const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
       const enabled = !locked;
       if (learningButton) learningButton.disabled = !enabled;
       if (paperButton) paperButton.disabled = !enabled;
       if (liveButton) liveButton.disabled = !enabled;
+      if (liveTradingButton) liveTradingButton.disabled = !enabled;
       if (refreshButton) refreshButton.disabled = false;
     }
 
@@ -2880,11 +2920,11 @@ HTML = """
     }
 
     function isTradingCheckMode(mode) {
-      return isPaperTradingMode(mode) || mode === 'live_readiness';
+      return isPaperTradingMode(mode) || mode === 'live_readiness' || mode === 'live_trading';
     }
 
     function operationStarted(data) {
-      return Boolean(data.paper_trading_status || data.live_readiness_status || data.training_status);
+      return Boolean(data.paper_trading_status || data.live_readiness_status || data.live_trading_status || data.training_status);
     }
 
     function startsStreamingLoop(mode, data) {
@@ -2920,7 +2960,7 @@ HTML = """
         simulation: isTradingCheckMode(mode) ? 'active' : 'idle',
       }, {
         mode: `${modeLabel(mode)} start requested`,
-        simulation: isPaperTradingMode(mode) ? 'Preparing paper trading' : 'Checking live readiness',
+        simulation: isPaperTradingMode(mode) ? 'Preparing paper trading' : (mode === 'live_trading' ? 'Checking live auto-trading gate' : 'Checking live readiness'),
       });
       document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} start requested...`;
       document.getElementById('runtimeStatus').textContent = 'Waiting for server response.';
@@ -2944,7 +2984,7 @@ HTML = """
         }, {
           mode: `${modeLabel(mode)} started`,
           data: 'Collection and learning continue',
-          simulation: isPaperTradingMode(mode) ? 'Paper trading running' : 'Live readiness checked',
+          simulation: isPaperTradingMode(mode) ? 'Paper trading running' : (mode === 'live_trading' ? 'Live auto-trading gate checked' : 'Live readiness checked'),
         });
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
         if (startsStreamingLoop(mode, data)) {
@@ -3035,15 +3075,17 @@ HTML = """
         live_trading: 'Live trading',
       };
       const mode = labels[data.mode] || data.mode || 'Mode waiting';
-      const message = data.paper_trading_message || data.live_readiness_message || data.training_message || data.execution_label || '';
+      const message = data.paper_trading_message || data.live_readiness_message || data.live_trading_message || data.training_message || data.execution_label || '';
       document.getElementById('operationModeStatus').textContent = `${mode} | ${message}`;
       const connection = data.kis_connection || {};
-      if (data.mode === 'live_readiness') renderBrokerAccountCard(connection);
+      if (data.mode === 'live_readiness' || data.mode === 'live_trading') renderBrokerAccountCard(connection);
       document.getElementById('gate').textContent = data.mode === 'paper_trading'
         ? 'Paper trading mode uses the KIS virtual broker and blocks live orders.'
         : data.mode === 'live_readiness'
           ? 'Live readiness checks authentication and state without submitting orders.'
-          : 'Learning and collection continue while the server is running.';
+          : data.mode === 'live_trading'
+            ? `Live auto-trading gate ${data.live_trading_status || 'checked'}; RiskManager and FinalTradeGate remain mandatory.`
+            : 'Learning and collection continue while the server is running.';
     }
 
     function renderBrokerAccountCard(connection = {}) {
@@ -3057,24 +3099,24 @@ HTML = """
       if (connection.account_checked) {
         const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
         depositTarget.textContent = fmtWon.format(deposit);
-        holdingsTarget.textContent = `보유 종목 ${connection.holdings || 0}개`;
-        statusTarget.textContent = 'KIS 잔고 조회 완료 · 주문 없음';
+        holdingsTarget.textContent = `실보유 종목 ${connection.holdings || 0}개`;
+        statusTarget.textContent = 'KIS 실계좌 읽기 완료 · 주문 제출 없음';
         document.getElementById('runtimeStatus').textContent =
-          `실제 계좌 예수금 ${fmtWon.format(deposit)} · 보유 종목 ${connection.holdings || 0}개 · 주문 없음`;
+          `실계좌 예수금 ${fmtWon.format(deposit)} · 실보유 종목 ${connection.holdings || 0}개 · 주문 제출 없음`;
         return;
       }
       if (connection.ok === false) {
         depositTarget.textContent = '조회 실패';
-        holdingsTarget.textContent = '보유 종목 -';
+        holdingsTarget.textContent = '실보유 종목 -';
         statusTarget.textContent = connection.message || connection.error || 'KIS 계좌 조회에 실패했습니다.';
         if (connection.retry_after_seconds) {
           statusTarget.textContent += ` ${connection.retry_after_seconds}초 후 다시 시도하세요.`;
         }
         return;
       }
-      depositTarget.textContent = '점검 전';
-      holdingsTarget.textContent = '보유 종목 -';
-      statusTarget.textContent = '실전 준비 점검을 누르면 읽기 전용으로 실제 예수금을 확인합니다.';
+      depositTarget.textContent = '읽기 전';
+      holdingsTarget.textContent = '실보유 종목 -';
+      statusTarget.textContent = '실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.';
     }
     async function loadOperationModeStatus() {
       const data = await fetchJsonWithTimeout('/api/operation-mode/status', {}, 8000);
@@ -3336,8 +3378,8 @@ HTML = """
 
     function renderStatus(data) {
       document.getElementById('equity').textContent = fmtWon.format(data.equity);
-      document.getElementById('cash').textContent = `Cash ${fmtWon.format(data.cash)}`;
-      document.getElementById('cashWeight').textContent = `Cash weight ${(data.cash_weight * 100).toFixed(1)}%`;
+      document.getElementById('cash').textContent = `기준 현금 ${fmtWon.format(data.cash)}`;
+      document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
     }
 
     function renderLearningStatus(data) {
@@ -3448,7 +3490,7 @@ HTML = """
         const data = await (await fetch('/api/mock-trading/performance')).json();
         renderMockPerformance(data);
       } catch (error) {
-        document.getElementById('mockStatus').textContent = '모의투자 성과 대기 중';
+        document.getElementById('mockStatus').textContent = 'Paper trading 성과 대기 중';
       }
     }
 
@@ -3457,12 +3499,12 @@ HTML = """
       const percent = Number(data.return_rate || 0) * 100;
       document.getElementById('mockReturn').textContent = data.active ? `${percent.toFixed(2)}%` : '대기 중';
       document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
-      document.getElementById('mockProfit').textContent = `수익 ${fmtWon.format(data.profit || 0)}`;
-      document.getElementById('mockEquity').textContent = `평가 ${fmtWon.format(data.equity || 0)}`;
+      document.getElementById('mockProfit').textContent = `모의 손익 ${fmtWon.format(data.profit || 0)}`;
+      document.getElementById('mockEquity').textContent = `모의 평가 ${fmtWon.format(data.equity || 0)}`;
       document.getElementById('mockTarget').textContent = data.goal ? `목표 ${(Number(data.goal.target_return_rate || 0) * 100).toFixed(2)}%` : '목표 -';
       document.getElementById('mockStatus').textContent = data.active
-        ? `모의투자 진행 중 · 주문 ${data.order_count || 0}건 · 체결 ${data.execution_count || 0}건`
-        : '목표를 선택하면 모의투자 수익률이 표시됩니다.';
+        ? `Paper trading 진행 중 · 주문 ${data.order_count || 0}건 · 체결 ${data.execution_count || 0}건`
+        : '실제 계좌와 분리된 paper trading 성과가 표시됩니다.';
     }
     function renderStreamingPerformance(data) {
       if (!data || !data.account) return;
@@ -3477,10 +3519,10 @@ HTML = """
       if (streamingReturnSeries.length > 160) streamingReturnSeries.shift();
       document.getElementById('mockReturn').textContent = `${returnRate.toFixed(2)}%`;
       document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(returnRate)))}%`;
-      document.getElementById('mockProfit').textContent = `수익 ${fmtWon.format(profit)}`;
-      document.getElementById('mockEquity').textContent = `평가 ${fmtWon.format(accountValue)}`;
+      document.getElementById('mockProfit').textContent = `모의 손익 ${fmtWon.format(profit)}`;
+      document.getElementById('mockEquity').textContent = `모의 평가 ${fmtWon.format(accountValue)}`;
       document.getElementById('mockStatus').textContent =
-        `모의투자 ${simulatedProgress.toFixed(1)}% 진행 · 목표 시간 ${streamingTargetMinutes || '-'}분 · 현금 ${fmtWon.format(cash)}`;
+        `Paper trading ${simulatedProgress.toFixed(1)}% 진행 · 목표 시간 ${streamingTargetMinutes || '-'}분 · 모의 현금 ${fmtWon.format(cash)}`;
       drawStreamingReturnChart();
     }
     function drawStreamingReturnChart() {

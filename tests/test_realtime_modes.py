@@ -139,6 +139,46 @@ class RealtimeModesTest(unittest.TestCase):
         kis_probe.assert_called_once_with(paper=False, include_account=True)
         refresh_live.assert_not_called()
 
+    def test_live_trading_button_mode_is_blocked_by_default(self) -> None:
+        client = TestClient(app)
+        with (
+            patch("app.web._start_live_worker") as start_worker,
+            patch(
+                "app.web._kis_connection_probe",
+                return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
+            ) as kis_probe,
+            patch("app.web.load_short_horizon_strategy_config", return_value={"execution": {"live_trading_enabled": False}}),
+            patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "false", "KIS_LIVE_ENABLED": "false"}),
+        ):
+            data = client.post("/api/operation-mode/start", json={"mode": "live_trading"}).json()
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["live_trading_status"], "blocked")
+        self.assertFalse(data["live_trading_enabled_by_config"])
+        self.assertFalse(data["live_trading_enabled_by_env"])
+        self.assertIn("blocked", data["live_trading_message"])
+        start_worker.assert_called_once_with("learning")
+        kis_probe.assert_called_once_with(paper=False, include_account=True)
+
+    def test_live_trading_gate_can_be_armed_only_when_config_and_env_allow(self) -> None:
+        client = TestClient(app)
+        with (
+            patch("app.web._start_live_worker"),
+            patch(
+                "app.web._kis_connection_probe",
+                return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
+            ),
+            patch("app.web.load_short_horizon_strategy_config", return_value={"execution": {"live_trading_enabled": True}}),
+            patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"}),
+        ):
+            data = client.post("/api/operation-mode/start", json={"mode": "live_trading"}).json()
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["live_trading_status"], "armed")
+        self.assertTrue(data["live_trading_enabled_by_config"])
+        self.assertTrue(data["live_trading_enabled_by_env"])
+        self.assertIn("RiskManager", data["live_trading_message"])
+
     def test_stop_learning_endpoint_keeps_continuous_collection_alive(self) -> None:
         client = TestClient(app)
         with patch("app.web._start_live_worker") as start_worker:

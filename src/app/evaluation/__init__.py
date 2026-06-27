@@ -2,6 +2,8 @@ from app.evaluation.reality_check import (
     EvaluatedTrade,
     RealityCheckConfig,
     RealityCheckValidator,
+    StrategyParameterAdjustment,
+    StrategyParameterReestimator,
     StrategyTradeObservation,
     StrategyValidationReport,
 )
@@ -11,6 +13,8 @@ __all__ = [
     "EvaluatedTrade",
     "RealityCheckConfig",
     "RealityCheckValidator",
+    "StrategyParameterAdjustment",
+    "StrategyParameterReestimator",
     "StrategyTradeObservation",
     "StrategyValidationReport",
     "WalkForwardSplit",

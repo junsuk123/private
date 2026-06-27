@@ -127,9 +127,11 @@ ranking_score = excess_return_after_cost
 
 검증을 통과한 report만 `RealityCheckPassed` 태그를 제공한다. 실패하면 `NoOutOfSampleValidation`, `DataSnoopingRisk`가 붙는다.
 
+`StrategyParameterReestimator`는 검증 report를 받아 전략 파라미터 조정안을 만든다. 실패한 전략은 기본적으로 비활성화하고 목표 순수익률을 높이며 스프레드 한도를 더 엄격하게 제안한다. 통과한 전략도 최신 `validation_id`, `requires_reality_check_passed`, 비용 차감 후 성과를 기준으로 보수적인 목표 순수익률을 유지한다.
+
 ## 설정 파일 설명
 
-설정 파일은 `config/short_horizon_strategies.yaml`이다.
+설정 파일은 `config/short_horizon_strategies.yaml`이며 런타임에서는 PyYAML의 `safe_load`로 읽는다.
 
 주요 섹션:
 
@@ -139,6 +141,7 @@ ranking_score = excess_return_after_cost
 - `pair_relative_value`
 - `strategy_candidate_factory`
 - `reality_check`
+- `parameter_reestimation`
 - `execution`
 
 기본값은 보수적이다. `execution.live_trading_enabled`는 `false`이고 `execution.default_mode`는 `paper_trading`이다.
@@ -160,10 +163,12 @@ POST /api/paper-trading/step
 
 단기 전략 Factory는 `trading_pipeline.generate_short_horizon_strategy_candidates(...)`를 통해 paper/dry-run 모드로 호출할 수 있다. live trading 모드를 요청해도 설정에서 `live_trading_enabled: false`이면 후보를 반환하지 않는다.
 
+GUI에는 모의 투자와 별도로 `실전 투자` 버튼이 있다. 이 버튼은 자동매매 프로그램의 live gate를 점검하고 활성화 요청을 시작하지만, 주문 안전장치를 우회하지 않는다. 실전 자동매매는 `execution.live_trading_enabled: true`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, KIS 실계좌 연결 확인, RealityCheck, 온톨로지 위험 판단, RiskManager, FinalTradeGate가 모두 충족되어야만 진행 가능한 구조다.
+
 ## 한계와 주의사항
 
 - 논문 결과는 한국 개별주에 그대로 확정 적용되는 값이 아니다.
 - beta, threshold, spread, liquidity, target net return은 백테스트와 paper trading으로 재검증해야 한다.
 - 과거 성과와 RealityCheck 통과는 미래 성과를 보장하지 않는다.
-- live trading에는 별도 검증, 계좌/주문 제한, 수동 승인 정책이 필요하다.
+- live trading에는 별도 검증, 계좌/주문 제한, 수동 승인 정책이 필요하며 기본값은 항상 차단이다.
 - 데이터 품질, 지연, 호가 공백, 체결 가능성, 세금/수수료 정책 변경은 실전 결과에 큰 영향을 줄 수 있다.

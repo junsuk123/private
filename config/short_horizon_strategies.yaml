@@ -79,6 +79,15 @@ reality_check:
   max_break_even_failure_ratio: 0.5
   max_reality_check_p_value: 0.1
 
+parameter_reestimation:
+  enabled: true
+  mode: "conservative_after_cost"
+  apply_to_live_only_after_reality_check: true
+  min_target_net_return: 0.003
+  max_target_net_return: 0.02
+  conservative_target_step: 0.001
+  min_max_spread_rate: 0.0005
+
 execution:
   live_trading_enabled: false
   default_mode: "paper_trading"
