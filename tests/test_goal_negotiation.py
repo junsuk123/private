@@ -42,6 +42,29 @@ class GoalNegotiationTest(unittest.TestCase):
         self.assertAlmostEqual(assessment.requested_profit_amount, 500_000)
         self.assertGreater(len(assessment.ontology_relations), 0)
 
+    def test_intraday_feasibility_changes_with_goal_difficulty(self) -> None:
+        context = build_analysis_context()
+        easy = assess_goal(
+            GoalRequest(target_return_rate=0.001, target_profit_amount=None, period_days=1, period_minutes=390),
+            context.account,
+            context.markets,
+            context.indicators,
+            context.signals,
+            context.graph,
+        )
+        aggressive = assess_goal(
+            GoalRequest(target_return_rate=0.02, target_profit_amount=None, period_days=1, period_minutes=390),
+            context.account,
+            context.markets,
+            context.indicators,
+            context.signals,
+            context.graph,
+        )
+
+        self.assertGreater(easy.feasibility_percent, aggressive.feasibility_percent)
+        self.assertGreater(easy.feasibility_percent, 3)
+        self.assertEqual(easy.period_minutes, 390)
+
 
 if __name__ == "__main__":
     unittest.main()

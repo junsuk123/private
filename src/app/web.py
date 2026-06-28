@@ -309,6 +309,13 @@ def _last_live_account_basis() -> dict[str, Any] | None:
   return _account_basis_from_kis_connection(connection)
 
 
+def _goal_account_snapshot(context: Any) -> AccountSnapshot:
+  basis = _last_live_account_basis()
+  if basis is None:
+    return context.account
+  return AccountSnapshot(cash=max(0.0, float(basis["equity"])), holdings=(), captured_at=datetime.now(timezone.utc))
+
+
 def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
   try:
     connection = _kis_connection_probe(paper=False, include_account=True)
@@ -1206,15 +1213,31 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_grap
             _live_state["graph_payload"] = cached_graph
             _live_state["graph_payload_context_id"] = id(context)
       graph_payload = cached_graph
+    live_basis = _last_live_account_basis()
+    status_payload = {
+        "cash": context.account.cash,
+        "equity": context.report.equity,
+        "cash_weight": context.report.cash_weight,
+        "basis_source": "realtime_model_account",
+        "account_suffix": None,
+        "daily_pnl_ratio": context.report.daily_pnl_ratio,
+        "updated_at": _iso_or_none(snapshot["last_updated"]),
+        "last_error": snapshot["last_error"],
+    }
+    if live_basis is not None:
+      status_payload.update(
+          {
+              "cash": live_basis["cash"],
+              "equity": live_basis["equity"],
+              "cash_weight": live_basis["cash_weight"],
+              "basis_source": live_basis["source"],
+              "account_suffix": live_basis["account_suffix"],
+              "daily_pnl_ratio": 0.0,
+              "updated_at": datetime.now(timezone.utc),
+          }
+      )
     response: dict[str, Any] = {
-        "status": {
-            "cash": context.account.cash,
-            "equity": context.report.equity,
-            "cash_weight": context.report.cash_weight,
-            "daily_pnl_ratio": context.report.daily_pnl_ratio,
-            "updated_at": _iso_or_none(snapshot["last_updated"]),
-            "last_error": snapshot["last_error"],
-        },
+        "status": status_payload,
         "diagnostics": {
             "research_config": str(DEFAULT_RESEARCH_CONFIG),
             "diagnostics": _diagnostics_with_collection_config(research_result.diagnostics),
@@ -1237,7 +1260,7 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_grap
         goal_request = _parse_goal_request(goal_payload)
         assessment = assess_goal(
             goal_request,
-            context.account,
+            _goal_account_snapshot(context),
             context.markets,
             context.indicators,
             context.signals,
@@ -1259,6 +1282,8 @@ def _lightweight_live_snapshot_response(snapshot: dict[str, Any] | None = None) 
             "cash": cash,
             "equity": equity,
             "cash_weight": float(basis["cash_weight"]) if basis is not None else 0.0,
+            "basis_source": basis["source"] if basis is not None else "warming_up",
+            "account_suffix": basis["account_suffix"] if basis is not None else None,
             "daily_pnl_ratio": 0.0,
             "updated_at": _iso_or_none(snapshot.get("last_updated")),
             "last_error": snapshot.get("last_error"),
@@ -1298,10 +1323,13 @@ def _lightweight_data_volume(summary: dict[str, Any]) -> dict[str, Any]:
 async def assess_goal_api(request: Request) -> JSONResponse:
     payload = await request.json()
     goal_request = _parse_goal_request(payload)
-    context = _get_or_refresh_live()["context"]
+    snapshot = _live_snapshot()
+    context = snapshot.get("context")
+    if context is None:
+      context = _get_or_refresh_live()["context"]
     assessment = assess_goal(
         goal_request,
-        context.account,
+        _goal_account_snapshot(context),
         context.markets,
         context.indicators,
         context.signals,
@@ -1742,6 +1770,7 @@ def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
         target_return_rate=float(target_return_rate) / 100.0 if has_rate else None,
         target_profit_amount=float(target_profit_amount) if has_amount else None,
         period_days=period_days,
+        period_minutes=period_minutes if period_minutes > 0 else None,
     )
 
     if goal_mode and goal_mode != "rate":
@@ -1762,6 +1791,7 @@ def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
         target_return_rate=parsed_rate,
         target_profit_amount=parsed_amount,
         period_days=period_days,
+        period_minutes=period_minutes if period_minutes > 0 else None,
     )
 
 
@@ -1781,10 +1811,11 @@ def _goal_from_payload(payload: dict[str, Any], context: Any) -> NegotiatedGoal:
                 else None
             ),
             period_days=int(selected.get("period_days") or 30),
+            period_minutes=int(selected["period_minutes"]) if selected.get("period_minutes") not in (None, "") else None,
         )
         assessment = assess_goal(
             request,
-            context.account,
+            _goal_account_snapshot(context),
             context.markets,
             context.indicators,
             context.signals,
@@ -3742,6 +3773,18 @@ HTML = """
         renderCollectionLog(data.collection_log);
         maybeRefreshDiagnosticsAfterCollection(data.collection_log);
       }
+      if (data.kis_connection && (data.kis_connection.account_checked || data.kis_connection.ok)) {
+        lastBrokerConnection = data.kis_connection;
+        renderBrokerAccountCard(data.kis_connection);
+        if (!data.active) {
+          const suffix = data.kis_connection.account_suffix || '';
+          const basis = brokerBasisAmount(data.kis_connection);
+          document.getElementById('operationModeStatus').textContent =
+            `Auto live readiness checked | account ${suffix || '-'} | basis ${fmtWon.format(basis || 0)}`;
+          document.getElementById('gate').textContent =
+            'KIS live account is connected read-only. Paper trading and live gate use this account basis.';
+        }
+      }
       if (data.active) renderOperationMode(data.active);
       return data;
     }
@@ -3864,6 +3907,7 @@ HTML = """
       if (!payload) return null;
       return {
         target_return_rate: payload.target_return_rate,
+        period_minutes: payload.period_minutes,
         period_days: payload.period_days,
       };
     }
@@ -3988,6 +4032,16 @@ HTML = """
     }
 
     function renderStatus(data) {
+      if (liveAccountBasis && (!data || data.basis_source !== 'kis_live_account')) {
+        data = {
+          ...(data || {}),
+          cash: liveAccountBasis.cash,
+          equity: liveAccountBasis.equity,
+          cash_weight: liveAccountBasis.cash_weight,
+          basis_source: 'kis_live_account',
+          account_suffix: liveAccountBasis.account_suffix,
+        };
+      }
       document.getElementById('equity').textContent = fmtWon.format(data.equity);
       document.getElementById('cash').textContent = `기준 현금 ${fmtWon.format(data.cash)}`;
       document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;

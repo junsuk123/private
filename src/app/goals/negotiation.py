@@ -13,6 +13,7 @@ class GoalRequest:
     target_return_rate: float | None
     target_profit_amount: float | None
     period_days: int
+    period_minutes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class FeasibilityAssessment:
     market_support_percent: int
     risk_pressure_percent: int
     annualized_drag_percent: int
+    period_minutes: int | None
     deployable_cash: float
     reasoning: tuple[str, ...]
     ontology_relations: tuple[str, ...]
@@ -37,6 +39,7 @@ class NegotiatedGoal:
     period_days: int
     feasibility_percent: int
     label: str
+    period_minutes: int | None = None
 
 
 def assess_goal(
@@ -60,8 +63,8 @@ def assess_goal(
 
     market_support = _market_support(markets, indicators, signals)
     risk_pressure = _risk_pressure(markets, indicators, report.cash_weight)
-    annualized_drag = _annualized_drag(annualized)
-    feasibility = round(max(3, min(96, market_support - risk_pressure - annualized_drag)))
+    goal_drag = _goal_difficulty_drag(requested_return_rate, request.period_days, request.period_minutes)
+    feasibility = _combine_feasibility(market_support, risk_pressure, goal_drag)
 
     reasoning = (
         f"목표 기간 수익률은 {requested_return_rate * 100:.2f}%입니다.",
@@ -79,7 +82,8 @@ def assess_goal(
         feasibility_percent=feasibility,
         market_support_percent=round(market_support),
         risk_pressure_percent=round(risk_pressure),
-        annualized_drag_percent=round(annualized_drag),
+        annualized_drag_percent=round(goal_drag),
+        period_minutes=request.period_minutes,
         deployable_cash=max(0.0, account.cash - report.equity * 0.30),
         reasoning=reasoning,
         ontology_relations=_summarize_relations(graph),
@@ -93,6 +97,7 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
         period_days=assessment.period_days,
         feasibility_percent=assessment.feasibility_percent,
         label="Requested target",
+        period_minutes=assessment.period_minutes,
     )
 
     lower_return = _estimate_feasibility(
@@ -100,6 +105,7 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
         assessment.risk_pressure_percent,
         assessment.requested_return_rate * 0.60,
         assessment.period_days,
+        assessment.period_minutes,
     )
     return_adjusted = NegotiatedGoal(
         target_return_rate=assessment.requested_return_rate * 0.60,
@@ -107,9 +113,15 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
         period_days=assessment.period_days,
         feasibility_percent=lower_return,
         label="Lower return",
+        period_minutes=assessment.period_minutes,
     )
 
     longer_period = max(assessment.period_days + 30, round(assessment.period_days * 1.75))
+    longer_minutes = (
+        max(int(assessment.period_minutes * 1.75), int(assessment.period_minutes + 390))
+        if assessment.period_minutes is not None
+        else None
+    )
     period_adjusted = NegotiatedGoal(
         target_return_rate=assessment.requested_return_rate,
         target_profit_amount=assessment.requested_profit_amount,
@@ -119,12 +131,19 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
             assessment.risk_pressure_percent,
             assessment.requested_return_rate,
             longer_period,
+            longer_minutes,
         ),
         label="Longer period",
+        period_minutes=longer_minutes,
     )
 
     balanced_rate = assessment.requested_return_rate * 0.75
     balanced_period = max(assessment.period_days + 14, round(assessment.period_days * 1.40))
+    balanced_minutes = (
+        max(int(assessment.period_minutes * 1.40), int(assessment.period_minutes + 195))
+        if assessment.period_minutes is not None
+        else None
+    )
     balanced = NegotiatedGoal(
         target_return_rate=balanced_rate,
         target_profit_amount=assessment.requested_profit_amount * 0.75,
@@ -134,8 +153,10 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
             assessment.risk_pressure_percent,
             balanced_rate,
             balanced_period,
+            balanced_minutes,
         ),
         label="Balanced compromise",
+        period_minutes=balanced_minutes,
     )
 
     return tuple(sorted((current, return_adjusted, period_adjusted, balanced), key=lambda g: -g.feasibility_percent))
@@ -185,7 +206,25 @@ def _risk_pressure(
 
 
 def _annualized_drag(annualized_required_return: float) -> float:
-    return 55.0 / (1.0 + exp(-5.0 * (annualized_required_return - 0.18)))
+    return 45.0 / (1.0 + exp(-5.0 * (annualized_required_return - 0.18)))
+
+
+def _goal_difficulty_drag(return_rate: float, period_days: int, period_minutes: int | None = None) -> float:
+    if period_minutes is not None and period_minutes > 0:
+        trading_day_minutes = 390.0
+        trading_days = max(period_minutes / trading_day_minutes, 1.0 / trading_day_minutes)
+        required_daily_return = return_rate / trading_days
+        return 46.0 / (1.0 + exp(-110.0 * (required_daily_return - 0.018)))
+    annualized = (1 + return_rate) ** (365 / period_days) - 1
+    return _annualized_drag(annualized)
+
+
+def _combine_feasibility(market_support_percent: float, risk_pressure_percent: float, goal_drag_percent: float) -> int:
+    score = 50.0
+    score += (market_support_percent - 40.0) * 0.70
+    score -= risk_pressure_percent * 0.55
+    score -= goal_drag_percent
+    return round(max(3, min(96, score)))
 
 
 def _estimate_feasibility(
@@ -193,14 +232,18 @@ def _estimate_feasibility(
     risk_pressure_percent: float,
     return_rate: float,
     period_days: int,
+    period_minutes: int | None = None,
 ) -> int:
-    annualized = (1 + return_rate) ** (365 / period_days) - 1
-    return round(max(3, min(96, market_support_percent - risk_pressure_percent - _annualized_drag(annualized))))
+    goal_drag = _goal_difficulty_drag(return_rate, period_days, period_minutes)
+    return _combine_feasibility(market_support_percent, risk_pressure_percent, goal_drag)
 
 
 def _summarize_relations(graph: KnowledgeGraph) -> tuple[str, ...]:
-    return tuple(
-        f"{triple.subject} --{triple.predicate}--> {triple.object}"
-        for triple in graph.triples()
-        if triple.predicate in {"supportsSignal", "contradictsSignal", "increasesRiskOf"}
-    )
+    relations: list[str] = []
+    for triple in graph.triples():
+        if triple.predicate not in {"supportsSignal", "contradictsSignal", "increasesRiskOf"}:
+            continue
+        relations.append(f"{triple.subject} --{triple.predicate}--> {triple.object}")
+        if len(relations) >= 40:
+            break
+    return tuple(relations)
