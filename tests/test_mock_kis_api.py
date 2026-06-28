@@ -209,6 +209,9 @@ class MockKisApiTest(unittest.TestCase):
                 token_cache_path=token_cache_path,
             )
             self.assertEqual(first.issue_access_token(), "paper-token")
+            cached_payload = json.loads(token_cache_path.read_text(encoding="utf-8"))
+            self.assertEqual(cached_payload["access_token"], "paper-token")
+            self.assertEqual(cached_payload["mode"], "paper")
 
             second = KisDevelopersApiClient(
                 app_key="paper-app",
@@ -223,6 +226,27 @@ class MockKisApiTest(unittest.TestCase):
 
         token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
         self.assertEqual(len(token_calls), 1)
+
+    def test_unwritable_kis_token_cache_blocks_token_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_cache_path = Path(tmp) / "kis_access_token.paper.json"
+            token_cache_path.mkdir()
+            transport = RecordingKisTransport()
+            client = KisDevelopersApiClient(
+                app_key="paper-app",
+                app_secret="paper-secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "KIS token cache path is a directory"):
+                client.issue_access_token()
+
+        token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
+        self.assertEqual(token_calls, [])
 
     def test_expired_kis_access_token_cache_is_refreshed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

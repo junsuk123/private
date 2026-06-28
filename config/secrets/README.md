@@ -45,6 +45,10 @@ be limited, so keep using the cached token until it expires. To intentionally
 force a new token after expiry or revocation, delete the matching cache file and
 run the check again.
 
+Before requesting a new token, the client verifies that the cache path is
+writable. After a token is issued, it writes the cache atomically and reads it
+back to confirm the same token was saved.
+
 PowerShell load example:
 
 ```powershell

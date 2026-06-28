@@ -273,6 +273,7 @@ class KisDevelopersApiClient:
             cached = self._load_cached_token()
             if cached:
                 return cached
+        self._ensure_token_cache_writable()
         response = self.transport.request(
             "POST",
             self._url("/oauth2/tokenP"),
@@ -381,7 +382,7 @@ class KisDevelopersApiClient:
 
     def _write_cached_token(self) -> None:
         if not self._access_token or not self._token_expires_at:
-            return
+            raise RuntimeError("KIS token cache write requested without an access token.")
         payload = {
             "access_token": self._access_token,
             "expires_at": self._token_expires_at.isoformat(),
@@ -394,8 +395,29 @@ class KisDevelopersApiClient:
             tmp_path = self._token_cache_path.with_suffix(f"{self._token_cache_path.suffix}.tmp")
             tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             tmp_path.replace(self._token_cache_path)
-        except OSError:
-            return
+        except OSError as exc:
+            raise RuntimeError(
+                f"KIS access token was issued but could not be saved to {self._token_cache_path}."
+            ) from exc
+        saved = self._load_cached_token()
+        if saved != self._access_token:
+            raise RuntimeError(
+                f"KIS access token was issued but cache verification failed at {self._token_cache_path}."
+            )
+
+    def _ensure_token_cache_writable(self) -> None:
+        if self._token_cache_path.exists() and self._token_cache_path.is_dir():
+            raise RuntimeError(f"KIS token cache path is a directory: {self._token_cache_path}")
+        try:
+            self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            probe_path = self._token_cache_path.with_suffix(f"{self._token_cache_path.suffix}.probe")
+            probe_path.write_text("ok", encoding="utf-8")
+            probe_path.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"KIS token cache is not writable at {self._token_cache_path}; "
+                "fix this before requesting a new access token."
+            ) from exc
 
     def _order_body(self, order: FinalOrder) -> dict[str, str]:
         return {
