@@ -6,6 +6,10 @@ The system separates probabilistic reasoning from deterministic control. Classif
 
 Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved orders are limit orders with manual approval required. The current app supports mock, local paper, KIS paper-readiness, live-readiness, hypothetical, and in-memory simulation paths. Live automated brokerage execution remains blocked unless future manual approval gates deliberately enable it.
 
+![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
+
+The diagram is the high-level companion to this document. The sections below map each box in that flow to the concrete modules and API boundaries in the repository.
+
 ## Runtime Flow
 
 ```text
@@ -77,6 +81,12 @@ data/synthetic_disabled/
 
 `run.ps1` starts the app on strict port `8010` by default, opens a managed browser window when possible, and stops the server when that window closes.
 
+Startup services:
+
+- `AUTO_START_LIVE_WORKER=true` starts realtime collection/learning automatically.
+- `AUTO_START_LIVE_READINESS=true` starts a read-only KIS live-readiness account check automatically.
+- The web UI does not require manual learning, refresh, or live-readiness buttons; it keeps paper trading and the guarded live-trading gate as explicit user actions.
+
 Important UI/API paths:
 
 - `GET /`: single-page web UI
@@ -117,6 +127,8 @@ Implemented in `src/app/realtime/mode_manager.py`.
 - `live_trading`: realtime trading gate; live brokerage execution remains guarded/blocked.
 
 All modes use the unified realtime data store and model root. Synthetic data is not allowed as input to these modes.
+
+`learning` and read-only live-readiness are automatic startup services in the default web runtime. The operation-mode API still supports explicit starts for diagnostics, tests, and controlled manual rechecks.
 
 ## Agent Boundaries
 
@@ -165,6 +177,8 @@ Accepts only `FinalOrder` objects. The current implementation supports mock/pape
 `StreamingAcceleratedDemo` is the current in-memory paper-trading engine despite the legacy class name. It generates synthetic one-minute charts for selected universe candidates, screens/ranks candidates, builds ontology evidence, generates goal-directed intents, validates them through `RiskManager`, and updates simulated cash/holdings/trades.
 
 If a stale or missing `demo_id` is sent to `/api/paper-trading/step`, the API returns HTTP 200 with `status = expired` so the UI can stop cleanly.
+
+Simulation initial cash is automatically resolved from the latest read-only KIS live account basis when available. If a paper-trading start request uses `initial_cash_source = auto` and no basis is cached, the backend attempts one read-only live account refresh before falling back to the default. Profit-gain scaling is not a UI setting; it is derived from target return, target horizon, account size, and live cash weight.
 
 ### Audit and Monitoring
 

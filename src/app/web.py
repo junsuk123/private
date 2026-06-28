@@ -140,6 +140,8 @@ LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     int(os.getenv("LEARNING_COLLECTION_INTERVAL_SECONDS", "3600")),
 )
 AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "true").lower() not in {"0", "false", "no", "off"}
+AUTO_START_LIVE_READINESS = os.getenv("AUTO_START_LIVE_READINESS", "true").lower() not in {"0", "false", "no", "off"}
+_auto_live_readiness_started = False
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -307,13 +309,103 @@ def _last_live_account_basis() -> dict[str, Any] | None:
   return _account_basis_from_kis_connection(connection)
 
 
+def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
+  try:
+    connection = _kis_connection_probe(paper=False, include_account=True)
+  except Exception as exc:  # pragma: no cover - defensive guard around broker/network state
+    audit.record("live_account_basis_auto_refresh_failed", {"error": str(exc)})
+    return None
+  basis = _account_basis_from_kis_connection(connection)
+  if basis is None:
+    return None
+  with _live_lock:
+    _operation_mode_state["last_kis_connection"] = connection
+  return basis
+
+
+def _start_auto_live_readiness_check() -> None:
+  global _auto_live_readiness_started
+  with _live_lock:
+    if _auto_live_readiness_started:
+      return
+    _auto_live_readiness_started = True
+
+  def worker() -> None:
+    _set_operation_request(True, "starting", "Auto live readiness check", None)
+    try:
+      basis = _refresh_live_account_basis_for_auto()
+      if basis is not None:
+        _set_operation_request(False, "checked", "Auto live readiness checked", None)
+        audit.record("auto_live_readiness_checked", {"basis": basis})
+      else:
+        _set_operation_request(False, "error", "Auto live readiness did not return account basis", None)
+        audit.record("auto_live_readiness_missing_basis", {})
+    except Exception as exc:  # pragma: no cover - thread-level safety guard
+      _set_operation_request(False, "error", f"Auto live readiness failed: {exc}", str(exc))
+      audit.record("auto_live_readiness_failed", {"error": str(exc)})
+
+  threading.Thread(target=worker, name="auto-live-readiness", daemon=True).start()
+
+
 def _resolve_operating_initial_cash(payload: dict[str, Any], default: float = 10_000_000) -> float:
   source = str(payload.get("initial_cash_source") or "").lower()
   if source in {"auto", "live", "live_account", "kis_live_account"} or "initial_cash" not in payload:
     basis = _last_live_account_basis()
+    if basis is None and source in {"auto", "live", "live_account", "kis_live_account"}:
+      basis = _refresh_live_account_basis_for_auto()
     if basis is not None:
       return max(1.0, float(basis["equity"]))
   return max(100_000.0, float(payload.get("initial_cash", default)))
+
+
+def _resolved_initial_cash_source(payload: dict[str, Any]) -> str:
+  source = str(payload.get("initial_cash_source") or "").lower()
+  if source in {"auto", "live", "live_account", "kis_live_account"} or "initial_cash" not in payload:
+    if _last_live_account_basis() is not None:
+      return "kis_live_account"
+    return "default_auto"
+  return "manual_legacy"
+
+
+def _normalised_target_return(value: Any, default: float = 0.02) -> float:
+  try:
+    target = float(value)
+  except (TypeError, ValueError):
+    target = default
+  if target > 1:
+    target /= 100.0
+  return max(0.0, target)
+
+
+def _resolve_auto_profit_gain(payload: dict[str, Any], initial_cash: float) -> float:
+  """Derive the simulation gain from the goal, account scale, and live cash mix."""
+  target_return_rate = _normalised_target_return(payload.get("target_return_rate", 0.02))
+  try:
+    period_minutes = max(1, int(payload.get("period_minutes", 390)))
+  except (TypeError, ValueError):
+    period_minutes = 390
+
+  trading_day_minutes = 390.0
+  goal_daily_return = target_return_rate / max(period_minutes / trading_day_minutes, 1.0 / trading_day_minutes)
+  goal_pressure = max(0.35, min(2.75, goal_daily_return / 0.02))
+
+  account_cash_weight = 1.0
+  basis = _last_live_account_basis()
+  if basis is not None:
+    account_cash_weight = max(0.0, min(1.0, float(basis.get("cash_weight", 1.0))))
+  liquidity_factor = 0.85 + (0.30 * account_cash_weight)
+
+  account_size = max(1.0, float(initial_cash))
+  if account_size < 100_000:
+    account_factor = 1.15
+  elif account_size < 1_000_000:
+    account_factor = 1.08
+  else:
+    account_factor = 1.0
+
+  risk_damper = 0.88 if target_return_rate >= 0.05 and period_minutes < trading_day_minutes else 1.0
+  gain = (0.72 + goal_pressure * 0.36) * liquidity_factor * account_factor * risk_damper
+  return max(0.25, min(4.0, gain))
 
 
 def _active_operation_mode() -> str:
@@ -492,6 +584,8 @@ def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
     if AUTO_START_LIVE_WORKER:
       _start_live_worker("learning")
+    if AUTO_START_LIVE_READINESS:
+      _start_auto_live_readiness_check()
 
 
 @app.on_event("shutdown")
@@ -729,14 +823,13 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["training_message"] = "Realtime learning and information collection continue while the server is running."
 
       if mode in {"testing", "paper_trading", "paper_trading_test"}:
-        target_return_rate = float(payload.get("target_return_rate", 0.02))
-        if target_return_rate > 1:
-          target_return_rate /= 100.0
+        target_return_rate = _normalised_target_return(payload.get("target_return_rate", 0.02))
         period_minutes = int(payload.get("period_minutes", 390))
         initial_cash = _resolve_operating_initial_cash(payload)
-        _ensure_initial_principal_configured(max(100_000.0, initial_cash))
+        initial_cash_source = _resolved_initial_cash_source(payload)
+        _ensure_initial_principal_configured(max(1.0, initial_cash))
         acceleration_factor = float(payload.get("acceleration_factor", 60.0))
-        profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
+        profit_gain = _resolve_auto_profit_gain(payload, initial_cash)
         demo_id = _start_streaming_demo(
             target_return_rate=target_return_rate,
             period_minutes=period_minutes,
@@ -753,9 +846,11 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["demo_status"] = "initialized"
         result["target_return_rate"] = target_return_rate
         result["period_minutes"] = period_minutes
-        result["initial_cash"] = max(100_000.0, initial_cash)
+        result["initial_cash"] = max(1.0, initial_cash)
+        result["initial_cash_source"] = initial_cash_source
         result["acceleration_factor"] = acceleration_factor
         result["profit_gain"] = max(0.25, min(4.0, profit_gain))
+        result["profit_gain_source"] = "auto_goal_account_liquidity"
         result["universe_count"] = len(demo._bars_by_ticker) if demo is not None else 0
         if mode in {"paper_trading", "paper_trading_test"}:
           result["kis_connection"] = _kis_connection_probe(paper=True, include_account=True)
@@ -1331,7 +1426,7 @@ async def paper_trading_start(request: Request) -> JSONResponse:
 
 
 def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
-    target_return_rate = float(payload.get("target_return_rate", 0.02))
+    target_return_rate = _normalised_target_return(payload.get("target_return_rate", 0.02))
     if "period_minutes" in payload:
       period_minutes = int(payload.get("period_minutes", 390))
     elif "period_days" in payload:
@@ -1339,10 +1434,11 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
     else:
       period_minutes = 390
     initial_cash = _resolve_operating_initial_cash(payload)
+    initial_cash_source = _resolved_initial_cash_source(payload)
     _ensure_initial_principal_configured(initial_cash)
     seed = int(payload.get("seed", 42))
     acceleration_factor = float(payload.get("acceleration_factor", 1.0))
-    profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
+    profit_gain = _resolve_auto_profit_gain(payload, initial_cash)
     demo_id = _start_streaming_demo(
         target_return_rate=target_return_rate,
         period_minutes=period_minutes,
@@ -1359,9 +1455,10 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         "target_return_rate": target_return_rate,
         "period_minutes": period_minutes,
         "initial_cash": initial_cash,
-        "initial_cash_source": str(payload.get("initial_cash_source") or "form"),
+        "initial_cash_source": initial_cash_source,
         "acceleration_factor": acceleration_factor,
         "profit_gain": max(0.25, min(4.0, profit_gain)),
+        "profit_gain_source": "auto_goal_account_liquidity",
         "message": "모의투자가 시작되었습니다. 단계 진행은 /api/paper-trading/step을 호출하세요.",
     }
 
@@ -2918,10 +3015,7 @@ HTML = """
       <h2>운영 모드</h2>
       <div class="mode-step-label">실시간 통합 데이터 기준</div>
       <div class="mode-grid" id="modeActionGrid">
-        <button type="button" id="modeLearningButton" onclick="startSelectedOperationMode('training')">학습<small>실시간 데이터 + 자동 점검</small></button>
-        <button type="button" id="modeLearningStopButton" class="secondary" onclick="stopLearningCollection()" disabled>학습 유지<small>상시 수집 모드</small></button>
         <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
-        <button type="button" id="modeLiveButton" onclick="startSelectedOperationMode('live_test')">실전 준비<small>주문 없이 인증 확인</small></button>
         <button type="button" id="modeLiveTradingButton" class="danger" onclick="startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
       </div>
       <div class="work-status active">
@@ -2948,15 +3042,13 @@ HTML = """
       <form id="goalForm">
         <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
         <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
-        <div class="field"><label for="initialCash">시뮬레이션 예수금 (원)</label><input id="initialCash" name="initial_cash" type="number" min="1" step="1000" value="10000000" placeholder="예: 10000000"></div>
+        <div class="note" id="autoSimulationBasis">시뮬레이션 예수금과 수익률 게인은 실전 준비 점검에서 읽은 실계좌 기준으로 자동 산정됩니다.</div>
         <button type="submit">가능성 분석</button>
-        <button class="secondary" id="loadResearch" type="button">자료 불러오기</button>
         <div class="work-status" id="workStatus">
           <strong id="workTitle">작업 대기 중</strong>
           <div class="muted" id="workMessage">버튼을 누르면 진행 현황을 표시합니다.</div>
           <div class="bar"><span id="workProgress"></span></div>
         </div>
-        <div class="field"><label for="profitGain">수익률 게인</label><input id="profitGain" name="profit_gain" type="number" min="0.25" max="4" step="0.25" value="1" placeholder="예: 1.5"></div>
       </form>
       <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
       <h2>시뮬레이션 테스트</h2>
@@ -3233,13 +3325,13 @@ HTML = """
       const paperButton = document.getElementById('modeTestingButton');
       const liveButton = document.getElementById('modeLiveButton');
       const liveTradingButton = document.getElementById('modeLiveTradingButton');
-      if (!learningButton || !paperButton) return;
-      learningButton.disabled = operationRequestActive;
+      if (!paperButton) return;
+      if (learningButton) learningButton.disabled = operationRequestActive;
       paperButton.disabled = operationRequestActive;
       if (liveButton) liveButton.disabled = operationRequestActive;
       if (liveTradingButton) liveTradingButton.disabled = operationRequestActive;
       if (refreshButton) refreshButton.disabled = false;
-      learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
+      if (learningButton) learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
       paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
       if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
       if (liveTradingButton) liveTradingButton.innerHTML = '실전 투자<small>자동매매 게이트</small>';
@@ -3397,14 +3489,13 @@ HTML = """
       if (!mode) return;
       const goal = currentGoalPayload();
       if (!goal && (action === 'testing' || action === 'paper')) {
-        document.getElementById('output').textContent = 'Enter target return, target time, and paper-trading cash first.';
+        document.getElementById('output').textContent = 'Enter target return and target time first.';
         return;
       }
       const options = goal ? {
         target_return_rate: goal.target_return_rate,
         period_minutes: goal.period_minutes,
-        initial_cash: goal.initial_cash,
-        initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
+        initial_cash_source: 'auto',
       } : {};
       await startOperationMode(mode, options);
     }
@@ -3584,6 +3675,10 @@ HTML = """
       };
       const initialCashInput = document.getElementById('initialCash');
       if (initialCashInput) initialCashInput.value = String(Math.round(basis));
+      const autoBasisTarget = document.getElementById('autoSimulationBasis');
+      if (autoBasisTarget) {
+        autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(basis)} · 수익률 게인 자동 산정`;
+      }
       renderStatus({
         cash: liveAccountBasis.cash,
         equity: liveAccountBasis.equity,
@@ -3654,7 +3749,7 @@ HTML = """
       event.preventDefault();
       const payload = currentGoalPayload();
       if (!payload) {
-        document.getElementById('output').textContent = 'Enter target return, target time, and paper-trading cash.';
+        document.getElementById('output').textContent = 'Enter target return and target time.';
         return;
       }
       const stopProgress = startLocalProgress('Assessing feasibility', 'Calculating goal feasibility from current data and ontology.');
@@ -3674,22 +3769,25 @@ HTML = """
       }
     });
 
-    document.getElementById('loadResearch').addEventListener('click', async () => {
-      const stopProgress = startProgressPolling('Starting collection', 'Information collection continues in the background.');
-      setBusy(true);
-      try {
-        const data = await (await fetch('/api/research/refresh', { method: 'POST' })).json();
-        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-        await loadDiagnostics();
-        setWorkStatus('Collection started', 'Collection is running in the background.', 35, false);
-      } catch (error) {
-        document.getElementById('output').textContent = String(error && error.message ? error.message : error);
-        setWorkStatus('Collection failed', String(error && error.message ? error.message : error), 100, true);
-      } finally {
-        stopProgress();
-        setBusy(false);
-      }
-    });
+    const loadResearchButton = document.getElementById('loadResearch');
+    if (loadResearchButton) {
+      loadResearchButton.addEventListener('click', async () => {
+        const stopProgress = startProgressPolling('Starting collection', 'Information collection continues in the background.');
+        setBusy(true);
+        try {
+          const data = await (await fetch('/api/research/refresh', { method: 'POST' })).json();
+          document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+          await loadDiagnostics();
+          setWorkStatus('Collection started', 'Collection is running in the background.', 35, false);
+        } catch (error) {
+          document.getElementById('output').textContent = String(error && error.message ? error.message : error);
+          setWorkStatus('Collection failed', String(error && error.message ? error.message : error), 100, true);
+        } finally {
+          stopProgress();
+          setBusy(false);
+        }
+      });
+    }
     function renderAssessment(data, options = {}) {
       if (data.session_id) sessionId = data.session_id;
       const previousSelection = selectedGoal;
@@ -3729,14 +3827,11 @@ HTML = """
       const payload = Object.fromEntries(new FormData(form).entries());
       const targetReturnRate = Number(payload.target_return_rate || 0);
       const periodMinutes = Number(payload.period_minutes || 0);
-      const initialCash = Number(payload.initial_cash || 0);
       if (!targetReturnRate || targetReturnRate < 0) return null;
       if (!periodMinutes || periodMinutes < 1) return null;
-      if (!initialCash || initialCash <= 0) return null;
       return {
         target_return_rate: targetReturnRate,
         period_minutes: periodMinutes,
-        initial_cash: initialCash,
         period_days: Math.max(1, Math.ceil(periodMinutes / 390)),
       };
     }
@@ -3745,15 +3840,11 @@ HTML = """
       const params = new URLSearchParams(window.location.search);
       const targetReturn = params.get('target_return_rate');
       const periodMinutes = params.get('period_minutes');
-      const initialCash = params.get('initial_cash');
       if (targetReturn !== null) {
         document.getElementById('targetReturn').value = targetReturn;
       }
       if (periodMinutes !== null) {
         document.getElementById('targetMinutes').value = periodMinutes;
-      }
-      if (initialCash !== null) {
-        document.getElementById('initialCash').value = initialCash;
       }
       const goal = currentGoalPayload();
       if (goal) lastGoalPayload = goal;
@@ -3764,8 +3855,7 @@ HTML = """
       return {
         target_return_rate: payload.target_return_rate,
         period_minutes: payload.period_minutes,
-        initial_cash: payload.initial_cash,
-        initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
+        initial_cash_source: 'auto',
       };
     }
 
@@ -3910,6 +4000,10 @@ HTML = """
         };
         const initialCashInput = document.getElementById('initialCash');
         if (initialCashInput) initialCashInput.value = String(Math.round(liveAccountBasis.equity));
+        const autoBasisTarget = document.getElementById('autoSimulationBasis');
+        if (autoBasisTarget) {
+          autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(liveAccountBasis.equity)} · 수익률 게인 자동 산정`;
+        }
       }
     }
 
@@ -5570,12 +5664,10 @@ HTML = """
       let targetReturn = parseFloat(document.getElementById('targetReturn')?.value || 0.02);
       if (targetReturn > 1) targetReturn = targetReturn / 100.0;
       const periodMinutes = parseInt(document.getElementById('targetMinutes')?.value || 390);
-      const initialCash = Math.max(1, Number(liveAccountBasis?.equity || document.getElementById('initialCash')?.value || 10000000));
-      const profitGain = Math.max(0.25, Math.min(4, Number(document.getElementById('profitGain')?.value || 1)));
       streamingDemoHistory = [];
       streamingDemoPrices = {};
       streamingReturnSeries = [];
-      streamingInitialCash = initialCash;
+      streamingInitialCash = Math.max(1, Number(liveAccountBasis?.equity || 10000000));
       streamingTargetReturnRate = targetReturn;
       streamingTargetMinutes = periodMinutes;
       try {
@@ -5585,14 +5677,13 @@ HTML = """
           body: JSON.stringify({
             target_return_rate: targetReturn,
             period_minutes: periodMinutes,
-            initial_cash: initialCash,
-            initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
-            profit_gain: profitGain
+            initial_cash_source: 'auto'
           })
         });
         const data = await response.json();
         streamingDemoId = data.demo_id;
         streamingDemoRunning = true;
+        streamingInitialCash = Number(data.initial_cash || streamingInitialCash || 10000000);
         document.getElementById('streamingDemoStatus').textContent = '모의투자 실행 중...';
         document.getElementById('streamingDemoProgress').style.width = '0%';
       } catch (error) {

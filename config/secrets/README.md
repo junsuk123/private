@@ -45,6 +45,11 @@ Live readiness checks use this order:
 2. The live token cache file
 3. A new `/oauth2/tokenP` request, only when no valid token exists
 
+The web server runs a read-only live-readiness account check automatically on
+startup when `AUTO_START_LIVE_READINESS=true` (the default). That startup check
+uses the same token reuse order above and only reads balance/holdings state; it
+does not place orders.
+
 If KIS already issued today's token outside this app and the cache file is not
 present, paste that token into `KIS_LIVE_ACCESS_TOKEN` in
 `config/secrets/kis_api_keys.env`, then run live readiness again. The app will

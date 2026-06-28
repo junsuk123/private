@@ -4,6 +4,8 @@ This document summarizes the current algorithmic design implemented under `src/a
 
 The system is a safe realtime-only investment research, learning, hypothetical-testing, paper-trading, and readiness-check framework. It combines public research collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, mock KIS paper trading, KIS paper/live-readiness boundaries, realtime hypothetical testing, and in-memory paper-trading simulation. Live automated trading is intentionally disabled.
 
+![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
+
 ## 1. Top-Level Flow
 
 ```text
@@ -28,6 +30,8 @@ Primary entry points:
 - `run.ps1`: starts a strict local app server on port `8010`, applies safe realtime/NPU defaults, and opens a managed browser.
 - `src/app/web.py`: FastAPI web UI and API orchestration.
 - `src/app/cli.py`: demo, research, accelerated-demo, and synthetic-data commands.
+
+Default web startup also starts realtime collection/learning and a read-only KIS live-readiness account probe. The UI keeps manual choices focused on target return, target time, paper trading, and the guarded live-trading gate.
 
 ## 2. Data Collection Algorithm
 
@@ -544,7 +548,7 @@ Start:
 POST /api/paper-trading/start
 target_return_rate
 period_minutes
-initial_cash
+initial_cash_source = auto
 ```
 
 Step:
@@ -562,7 +566,9 @@ Initialization:
 4. Run `ontology_filter_1`.
 5. Generate synthetic one-minute charts for selected candidate tickers.
 6. Add warmup bars.
-7. Initialize cash, holdings, trade history, and realtime step timing.
+7. Resolve initial cash from the latest read-only KIS live account basis when available; otherwise use the configured default.
+8. Derive profit-gain scaling from target return, target horizon, account size, and live cash weight.
+9. Initialize cash, holdings, trade history, and realtime step timing.
 
 Each due step:
 
@@ -605,8 +611,10 @@ Implemented in `src/app/web.py`.
 Startup:
 
 - applies realtime acceleration hints
-- starts the live worker only when `AUTO_START_LIVE_WORKER=true`
-- otherwise refreshes on demand through API/UI calls
+- starts realtime collection/learning when `AUTO_START_LIVE_WORKER=true`
+- starts the read-only KIS live-readiness account probe when `AUTO_START_LIVE_READINESS=true`
+- keeps manual UI controls focused on target return, target time, paper trading, and the guarded live-trading gate
+- API refresh/start endpoints remain available for diagnostics and tests
 
 Concurrency:
 

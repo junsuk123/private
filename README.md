@@ -4,6 +4,10 @@ Personal-use research system for safe, auditable, explainable stock-investment a
 
 The current implementation is intentionally conservative: it collects public/current-market research, builds indicators and ontology evidence, negotiates target feasibility, creates strategy intents, and validates every possible order through deterministic risk rules. Live automated brokerage execution remains blocked.
 
+![End-to-end ontology trading system flow](docs/ontology%20base%20trading%20system%20diagram.png)
+
+The repository-level architecture is also documented in `docs/README.md` and `docs/architecture.md`.
+
 ## Safety Model
 
 - LLM or LLM-like components never execute trades.
@@ -33,6 +37,7 @@ Implemented capabilities include:
 - Rule-based and goal-directed strategy signal generation
 - Deterministic risk validation
 - KIS paper-trading boundary and local paper-trading loop
+- Automatic server-start realtime collection/learning and read-only KIS live-readiness account check
 - KIS/BanKIS trading-cost model for fees, sell tax, slippage, spread, break-even return, and net profitability checks
 - Realtime learning and paper-trading evaluation artifacts under `data/models`
 - Audit logging and diagnostics endpoints
@@ -73,6 +78,8 @@ One-command Windows launch:
 
 If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded local model. Otherwise it checks for an Ollama-compatible local server at `127.0.0.1:11434`; if unavailable, event classification falls back to deterministic keyword rules.
 
+On server startup, realtime collection/learning starts automatically when `AUTO_START_LIVE_WORKER=true` (default). A read-only KIS live-readiness account check also runs automatically when `AUTO_START_LIVE_READINESS=true` (default). The UI therefore exposes only the user-facing trading controls: target return, target time, paper trading, and the guarded live-trading gate.
+
 ## KIS Developers Broker Adapter
 
 `src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so the same paper-trading flow can be run with an injected fake KIS transport and later switched to the real transport.
@@ -87,6 +94,8 @@ Safe defaults:
 The adapter follows the current KIS guide pattern: `/oauth2/tokenP` for access tokens, `/uapi/hashkey` before cash-order POSTs, and the new domestic cash-order TR IDs `TTTC0011U`/`TTTC0012U` for live and `VTTC0011U`/`VTTC0012U` for paper. Keep token issuance and order calls on the same base URL; mixing paper and live domains will fail at the KIS gateway.
 
 Secrets are loaded automatically from the ignored local file `config/secrets/kis_api_keys.env` when the KIS client starts. Copy `config/secrets/kis_api_keys.env.example` and keep real values out of Git. Use `python scripts/check_kis_connection.py` for a token-only check, or add `--account` for the read-only balance endpoint.
+
+KIS access tokens are cached under `config/secrets` and reused until expiry, so live-readiness and account-basis checks do not repeatedly request a token during the same 24-hour validity window. If KIS issued today's token outside this app, put it in `KIS_LIVE_ACCESS_TOKEN` or `KIS_ACCESS_TOKEN` so the app can reuse it without issuing another token.
 
 ## Trading Costs And Net Profitability
 
@@ -214,6 +223,8 @@ live_trading_test alias for live_readiness
 live_trading    realtime trading gate; brokerage execution remains guarded/blocked
 ```
 
+The UI no longer requires manual learning, refresh, or live-readiness buttons. `learning` and the read-only live-readiness account probe are automatic server-start services; manual mode starts are still available through the API for tests and diagnostics.
+
 The paper-trading loop starts through:
 
 ```text
@@ -222,6 +233,8 @@ POST /api/paper-trading/step
 ```
 
 It creates labeled local one-minute paper-trading bars in memory, uses the listed universe plus ontology CPU/NPU heuristic candidate screening, runs goal-directed strategy and `RiskManager`, then applies approved orders only to virtual cash and holdings.
+
+`initial_cash` is normally resolved automatically from the most recent read-only KIS live account basis. If no basis is cached, an `initial_cash_source = auto` request attempts a read-only live account refresh before falling back to the configured default. The simulation profit-gain multiplier is derived from the target return, target horizon, account size, and live cash weight rather than exposed as a user setting.
 
 ## Core Algorithm
 

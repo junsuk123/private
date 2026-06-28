@@ -1,5 +1,7 @@
 # NPU and Realtime Hot Path Optimization Audit
 
+This audit corresponds to the performance/engineering notes in `ontology base trading system diagram.png`: vectorized universe screening, optional Rust/PyO3 native screening, top-k-only materialization, rolling feature cache targets, typed storage, and CPU/NPU separated timing profiles.
+
 ## Applied
 
 - `ontology_filter_1` now uses a NumPy vectorized CPU rules path by default.

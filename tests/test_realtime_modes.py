@@ -229,7 +229,103 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertTrue(data["ok"])
         self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(data["initial_cash_source"], "kis_live_account")
+        self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
+        self.assertGreater(data["profit_gain"], 0.25)
         self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+        self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
+
+    def test_paper_trading_start_defaults_to_live_account_and_auto_gain(self) -> None:
+        client = TestClient(app)
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = {
+                "ok": True,
+                "mode": "live",
+                "account_checked": True,
+                "actual_deposit": 450000,
+                "invested_value": 550000,
+                "actual_equity": 1000000,
+                "account_suffix": "...28",
+            }
+        with patch("app.web._start_streaming_demo", return_value="demo-auto") as start_demo:
+            data = client.post(
+                "/api/paper-trading/start",
+                json={
+                    "target_return_rate": 3,
+                    "period_minutes": 120,
+                    "initial_cash_source": "auto",
+                },
+            ).json()
+
+        self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(data["initial_cash_source"], "kis_live_account")
+        self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
+        self.assertEqual(data["target_return_rate"], 0.03)
+        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+        self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
+
+    def test_auto_initial_cash_refreshes_live_account_when_no_basis_is_cached(self) -> None:
+        client = TestClient(app)
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = None
+        live_connection = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 250000,
+            "invested_value": 750000,
+            "actual_equity": 1000000,
+            "account_suffix": "...28",
+        }
+        with (
+            patch("app.web._kis_connection_probe", return_value=live_connection) as probe,
+            patch("app.web._start_streaming_demo", return_value="demo-auto-refresh") as start_demo,
+        ):
+            data = client.post(
+                "/api/paper-trading/start",
+                json={
+                    "target_return_rate": 2,
+                    "period_minutes": 390,
+                    "initial_cash_source": "auto",
+                },
+            ).json()
+
+        probe.assert_called_once_with(paper=False, include_account=True)
+        self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(data["initial_cash_source"], "kis_live_account")
+        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+
+    def test_startup_live_readiness_runs_read_only_account_probe(self) -> None:
+        class ImmediateThread:
+            def __init__(self, target, name=None, daemon=None):
+                self.target = target
+
+            def start(self) -> None:
+                self.target()
+
+        live_connection = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 600000,
+            "invested_value": 400000,
+            "actual_equity": 1000000,
+            "account_suffix": "...28",
+        }
+        with web_module._live_lock:
+            web_module._auto_live_readiness_started = False
+            web_module._operation_mode_state["last_kis_connection"] = None
+
+        with (
+            patch("app.web.threading.Thread", ImmediateThread),
+            patch("app.web._kis_connection_probe", return_value=live_connection) as probe,
+        ):
+            web_module._start_auto_live_readiness_check()
+
+        probe.assert_called_once_with(paper=False, include_account=True)
+        basis = web_module._last_live_account_basis()
+        self.assertIsNotNone(basis)
+        self.assertEqual(basis["equity"], 1000000)
 
     def test_research_diagnostics_uses_lightweight_cached_volume(self) -> None:
         client = TestClient(app)

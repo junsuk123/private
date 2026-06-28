@@ -2,6 +2,8 @@
 
 The semantic feature layer is present as an extensible analysis/modeling layer. The current main web decision path still uses `IndicatorSnapshot` from `src/app/indicators/engine.py` plus lightweight ontology candidate filtering, ontology reasoning, goal feasibility, deterministic strategies, and risk validation.
 
+The repository-level diagram `ontology base trading system diagram.png` summarizes where this layer fits: feature engineering feeds candidate filtering, evidence scoring, ontology reasoning, strategy construction, and finally the deterministic risk gate.
+
 ## Existing Integration Points
 
 - `src/app/data/`: read-only public/sample collectors and raw archive helpers.

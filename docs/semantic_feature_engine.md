@@ -2,6 +2,8 @@
 
 This guide covers the semantic feature subsystem under `src/app/features`. It is an extensible layer for richer indicators, semantic states, graph triples, and model rows.
 
+For the full repository flow, see `ontology base trading system diagram.png`. This guide mainly expands the diagram's feature-engineering and ontology/graph-reasoning stages.
+
 The current web dashboard still uses the lighter `IndicatorSnapshot` decision path as its primary production path. Before that path runs, the current pipeline also applies `ontology_filter_1` from `src/app/trading_pipeline.py` to screen the broad universe with low-cost liquidity, momentum, flow, halt-status, and management-status features. The semantic feature modules are the planned richer replacement/enrichment layer for later stages, not the only source of live dashboard decisions today.
 
 ## Add a New Raw Indicator

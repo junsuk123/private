@@ -2,6 +2,8 @@
 
 The current system uses a realtime-only local data environment. Older live/simulation split directories may still exist in the repository history or under `data/legacy`, but they are not the active web runtime layout.
 
+The end-to-end data, inference, risk, and execution boundary is summarized in `ontology base trading system diagram.png`.
+
 ## Active Layout
 
 - `data/store`: realtime research SQLite store
@@ -77,6 +79,8 @@ The runtime policy exposed in `/api/research/diagnostics` states:
 Learning, paper trading, live-readiness checks, and live trading all use the unified realtime data store only.
 ```
 
+In the default web runtime, realtime collection/learning and the read-only KIS live-readiness account probe start automatically with the server. The UI no longer exposes separate manual learning, refresh, or live-readiness buttons.
+
 ## Paper-Trading Simulation
 
 Paper-trading simulation is a separate in-memory workflow. It starts through:
@@ -87,6 +91,8 @@ POST /api/paper-trading/step
 ```
 
 The simulation generates synthetic one-minute charts in memory from the listed universe, screens candidates with ontology/NPU logic, and applies approved mock orders only to simulated cash and holdings. The session is not persisted; restarting the server expires the `demo_id`.
+
+Simulation cash is not persisted as a separate data environment. It is initialized from the latest read-only KIS live account basis when available, or from the configured default if no account basis can be read.
 
 If the UI sends a stale `demo_id`, `/api/paper-trading/step` returns:
 

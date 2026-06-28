@@ -1,5 +1,7 @@
 # NPU Runtime Architecture
 
+The repository-level flow diagram is `ontology base trading system diagram.png`. In that diagram, this document mainly covers stages 4 and 5: candidate universe filtering and evidence scoring. Risk validation and execution remain CPU/deterministic even when scoring is accelerated.
+
 ## CPU/NPU Split
 
 | Stage | Device | Notes |

@@ -2,6 +2,8 @@
 
 The realtime layer is optimized for responsive UI actions, short-horizon diagnostics, hypothetical testing, and safe local learning. It uses one realtime data environment and never submits automatic live broker orders.
 
+See `ontology base trading system diagram.png` for the repository-level flow from trusted data inputs through candidate scoring, ontology reasoning, risk validation, paper/live-readiness execution, and feedback.
+
 Typical analysis horizons:
 
 - 5 seconds
@@ -47,9 +49,15 @@ data/models
 
 Synthetic and simulation rows are not valid inputs for learning, testing, or live trading.
 
+Default web startup behavior:
+
+- Realtime collection/learning starts automatically when `AUTO_START_LIVE_WORKER=true`.
+- A read-only KIS live-readiness account check starts automatically when `AUTO_START_LIVE_READINESS=true`.
+- The UI intentionally removes manual learning, refresh, and live-readiness buttons. Users set only target return/time and choose paper trading or the guarded live-trading gate.
+
 ## Learning Behavior
 
-When `POST /api/operation-mode/start` receives `mode = learning`, the app starts the live worker. The worker:
+On default server startup, and also when `POST /api/operation-mode/start` receives `mode = learning`, the app starts the live worker. The worker:
 
 1. Refreshes configured public research.
 2. Stores new records in `data/store`.
@@ -58,7 +66,7 @@ When `POST /api/operation-mode/start` receives `mode = learning`, the app starts
 5. Creates supervised examples from adjacent realtime frames and strategy signals.
 6. Writes model artifacts under `data/models/realtime_supervised`.
 
-The learning loop is stopped with:
+The learning loop can still be stopped through the API for diagnostics:
 
 ```text
 POST /api/operation-mode/stop-learning
@@ -79,6 +87,8 @@ Legacy testing uses inferred entry/exit prices from adjacent time frames and doe
 
 When `mode = live_readiness` or `live_trading_test`, the app checks KIS live-readiness/authentication boundaries and does not submit broker orders.
 
+In the default UI, this same read-only live-readiness path runs automatically at server startup and stores the most recent account basis for later paper-trading sizing.
+
 ## Paper-Trading Simulation Behavior
 
 The paper-trading simulation is separate from operation-mode readiness checks. It starts through:
@@ -91,9 +101,11 @@ with:
 
 - `target_return_rate`
 - `period_minutes`
-- `initial_cash`
+- `initial_cash_source = auto` by default
 
 The UI then calls `/api/paper-trading/step` on a timer. In realtime simulation mode, one visible synthetic minute is due every wall-clock minute.
+
+`initial_cash` is computed automatically from the latest read-only KIS live account basis when available. If no cached basis exists, `initial_cash_source = auto` triggers a read-only KIS live account refresh before falling back to the default. The profit-gain multiplier is also automatic and is derived from target return, target horizon, account size, and cash weight.
 
 Each step:
 
