@@ -9,7 +9,7 @@ from app.data.classifier import classify_text_event
 from app.data.sample_collectors import collect_sample_account, collect_sample_market
 from app.graph import KnowledgeGraph, OntologyReasoner, OntologyRuntime
 from app.graph.builders import build_market_graph
-from app.indicators import build_sample_indicators
+from app.indicators import build_sample_indicators, build_trusted_indicators_from_markets, filter_trusted_indicators
 from app.portfolio import build_portfolio_report
 from app.risk import RiskManager
 from app.schemas.domain import (
@@ -57,6 +57,8 @@ class AnalysisContext:
 def build_analysis_context(
     research_result: ResearchRunResult | None = None,
     stored_research: StoredResearch | None = None,
+    *,
+    allow_sample_indicators: bool = False,
 ) -> AnalysisContext:
     account = collect_sample_account()
     sample_markets = collect_sample_market()
@@ -70,7 +72,12 @@ def build_analysis_context(
         markets = tuple(market for market in raw_markets if market.ticker in candidate_set)
     else:
         markets = _limit_markets_for_runtime(raw_markets)
-    indicators = build_sample_indicators(markets)
+    demo_offline_context = allow_sample_indicators or (research_result is None and stored_research is None)
+    indicators = (
+        build_sample_indicators(markets)
+        if demo_offline_context
+        else filter_trusted_indicators(build_trusted_indicators_from_markets(markets))
+    )
     stored_events = stored_research.events if stored_research else ()
     live_events = research_result.events if research_result else ()
     events = _merge_events(

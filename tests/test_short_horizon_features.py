@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.features import OHLCVBar, ShortHorizonFeatureBuilder
+from app.features import OHLCVBar, ShortHorizonFeatureBuilder, TickerRollingFeatureState
 
 
 class ShortHorizonFeatureBuilderTest(unittest.TestCase):
@@ -77,6 +77,50 @@ class ShortHorizonFeatureBuilderTest(unittest.TestCase):
         features = ShortHorizonFeatureBuilder().build(bars)
 
         self.assertAlmostEqual(features.returns_by_window["ret_preclose_30m"], 130 / 100 - 1)
+
+    def test_rolling_state_matches_batch_builder(self) -> None:
+        bars = _minute_bars(45)
+        index_bars = _minute_bars(45, ticker="KOSPI", start_price=2500.0, step=2.0)
+        orderbook = {"best_bid": 143.8, "best_ask": 144.2, "bid_depth": 400_000, "ask_depth": 350_000}
+        daily = (
+            OHLCVBar("TEST", bars[0].as_of - timedelta(days=1), 95, 96, 94, 95, 10_000),
+        )
+
+        state = TickerRollingFeatureState("TEST")
+        for bar in bars:
+            state.add_bar(bar)
+        index_state = TickerRollingFeatureState("KOSPI")
+        for bar in index_bars:
+            index_state.add_bar(bar)
+
+        rolling = state.build(daily_bars=daily, market_index_state=index_state, orderbook=orderbook)
+        batch = ShortHorizonFeatureBuilder().build(
+            bars,
+            daily_bars=daily,
+            market_index_bars=index_bars,
+            orderbook=orderbook,
+        )
+
+        self.assertEqual(rolling.returns_by_window, batch.returns_by_window)
+        self.assertEqual(rolling.realized_volatility, batch.realized_volatility)
+        self.assertEqual(rolling.volume_zscore, batch.volume_zscore)
+        self.assertEqual(rolling.market_alignment_score, batch.market_alignment_score)
+        self.assertEqual(rolling.missing_fields, batch.missing_fields)
+
+    def test_rolling_state_preserves_no_lookahead(self) -> None:
+        bars = _minute_bars(30)
+        as_of = bars[15].as_of
+        state = TickerRollingFeatureState("TEST")
+        for bar in bars:
+            state.add_bar(bar)
+
+        rolling = state.build(as_of=as_of)
+        batch = ShortHorizonFeatureBuilder().build(bars, as_of=as_of)
+
+        self.assertEqual(rolling.timestamp, batch.timestamp)
+        self.assertEqual(rolling.returns_by_window, batch.returns_by_window)
+        self.assertEqual(rolling.realized_volatility, batch.realized_volatility)
+        self.assertEqual(rolling.volume_zscore, batch.volume_zscore)
 
 
 def _minute_bars(

@@ -258,6 +258,66 @@ class LocalResearchStore:
             conn.execute(
                 "create index if not exists idx_records_kind_observed on records(kind, observed_at)"
             )
+            conn.execute(
+                """
+                create table if not exists typed_ohlcv_bars (
+                    ticker text not null,
+                    observed_at text not null,
+                    open real,
+                    high real,
+                    low real,
+                    close real,
+                    volume real,
+                    source_id text,
+                    primary key (ticker, observed_at, source_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists typed_realtime_quotes (
+                    ticker text not null,
+                    observed_at text not null,
+                    price real,
+                    bid real,
+                    ask real,
+                    volume real,
+                    source_id text,
+                    primary key (ticker, observed_at, source_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists typed_market_snapshots (
+                    ticker text not null,
+                    observed_at text not null,
+                    market text,
+                    last_price real,
+                    average_daily_trading_value real,
+                    volatility_20d real,
+                    source_id text,
+                    primary key (ticker, observed_at, source_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                create table if not exists typed_candidate_scores (
+                    ticker text not null,
+                    observed_at text not null,
+                    stage text not null,
+                    score real,
+                    reason_mask integer,
+                    backend text,
+                    primary key (ticker, observed_at, stage, backend)
+                )
+                """
+            )
+            conn.execute("create index if not exists idx_typed_ohlcv_ticker_time on typed_ohlcv_bars(ticker, observed_at)")
+            conn.execute("create index if not exists idx_typed_quotes_ticker_time on typed_realtime_quotes(ticker, observed_at)")
+            conn.execute("create index if not exists idx_typed_market_ticker_time on typed_market_snapshots(ticker, observed_at)")
+            conn.execute("create index if not exists idx_typed_scores_ticker_time on typed_candidate_scores(ticker, observed_at)")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -292,17 +352,17 @@ class LocalResearchStore:
             )
 
         with closing(self._connect()) as conn:
-            for row in rows:
-                cursor = conn.execute(
-                    """
-                    insert or ignore into records
-                      (kind, record_key, observed_at, inserted_at, payload)
-                    values (?, ?, ?, ?, ?)
-                    """,
-                    row,
-                )
-                inserted += int(cursor.rowcount)
+            before = conn.total_changes
+            conn.executemany(
+                """
+                insert or ignore into records
+                  (kind, record_key, observed_at, inserted_at, payload)
+                values (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
             conn.commit()
+            inserted = int(conn.total_changes - before)
         return inserted
 
     def _read_kind(self, kind: str) -> tuple[dict[str, Any], ...]:

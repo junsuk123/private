@@ -26,7 +26,7 @@ from app.storage import LocalResearchStore
 
 def run_demo(research_result: ResearchRunResult | None = None) -> dict[str, Any]:
     store = LocalResearchStore()
-    context = build_analysis_context(research_result, store.load())
+    context = build_analysis_context(research_result, store.load(), allow_sample_indicators=True)
 
     paper_executor = PaperOrderExecutor()
     paper_receipts = tuple(

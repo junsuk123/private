@@ -5,7 +5,17 @@ import hashlib
 from app.schemas.domain import IndicatorSnapshot, MarketSnapshot
 
 
+SAMPLE_INDICATOR_SOURCE_PREFIXES = ("reference:", "sample-indicator:", "demo-indicator:")
+
+
 def build_sample_indicators(markets: tuple[MarketSnapshot, ...]) -> dict[str, IndicatorSnapshot]:
+    """Demo/offline indicator fixture.
+
+    This intentionally produces deterministic reference values for tests and
+    local demos. Production realtime/live-readiness paths must use
+    `build_trusted_indicators_from_markets` or measured indicator records
+    instead.
+    """
     values = {
         "005930": IndicatorSnapshot(
             ticker="005930",
@@ -19,7 +29,7 @@ def build_sample_indicators(markets: tuple[MarketSnapshot, ...]) -> dict[str, In
             rsi_14d=57.0,
             volume_ratio=1.18,
             macro_risk_score=0.38,
-            source_ids=("financial-005930", "market-005930", "macro-kr"),
+            source_ids=("sample-indicator:financial-005930", "sample-indicator:market-005930", "sample-indicator:macro-kr"),
         ),
         "000660": IndicatorSnapshot(
             ticker="000660",
@@ -33,7 +43,7 @@ def build_sample_indicators(markets: tuple[MarketSnapshot, ...]) -> dict[str, In
             rsi_14d=64.0,
             volume_ratio=1.42,
             macro_risk_score=0.43,
-            source_ids=("financial-000660", "market-000660", "macro-kr"),
+            source_ids=("sample-indicator:financial-000660", "sample-indicator:market-000660", "sample-indicator:macro-kr"),
         ),
     }
     indicators: dict[str, IndicatorSnapshot] = {}
@@ -43,6 +53,44 @@ def build_sample_indicators(markets: tuple[MarketSnapshot, ...]) -> dict[str, In
         else:
             indicators[market.ticker] = _reference_indicator(market)
     return indicators
+
+
+def build_trusted_indicators_from_markets(markets: tuple[MarketSnapshot, ...]) -> dict[str, IndicatorSnapshot]:
+    indicators: dict[str, IndicatorSnapshot] = {}
+    for market in markets:
+        if market.source.is_synthetic or market.source.quality_score <= 0:
+            continue
+        source_id = market.source.source_id or f"market:{market.ticker}"
+        indicators[market.ticker] = IndicatorSnapshot(
+            ticker=market.ticker,
+            revenue_growth=None,
+            operating_income_growth=None,
+            operating_margin=None,
+            roe=None,
+            debt_ratio=None,
+            per=None,
+            pbr=None,
+            rsi_14d=None,
+            volume_ratio=None,
+            macro_risk_score=min(0.92, max(0.0, float(market.volatility_20d))),
+            source_ids=(source_id,),
+        )
+    return indicators
+
+
+def is_sample_or_hash_indicator(indicator: IndicatorSnapshot) -> bool:
+    return any(
+        str(source_id).startswith(SAMPLE_INDICATOR_SOURCE_PREFIXES)
+        for source_id in indicator.source_ids
+    )
+
+
+def filter_trusted_indicators(indicators: dict[str, IndicatorSnapshot]) -> dict[str, IndicatorSnapshot]:
+    return {
+        ticker: indicator
+        for ticker, indicator in indicators.items()
+        if not is_sample_or_hash_indicator(indicator)
+    }
 
 
 def _reference_indicator(market: MarketSnapshot) -> IndicatorSnapshot:
@@ -67,7 +115,7 @@ def _reference_indicator(market: MarketSnapshot) -> IndicatorSnapshot:
         rsi_14d=round(rsi, 2),
         volume_ratio=round(volume_ratio, 2),
         macro_risk_score=round(min(0.92, macro_risk), 4),
-        source_ids=(market.source.source_id or f"reference:{market.ticker}",),
+        source_ids=(f"reference:{market.ticker}",),
     )
 
 

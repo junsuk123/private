@@ -128,12 +128,14 @@ class OntologyNpuLinearScorer:
         started_post = time.perf_counter()
         scores = np.vstack(output_chunks) if output_chunks else np.zeros((0, self.score_dim), dtype=np.float32)
         ranking_score = _ranking_score(scores)
+        started_topk = time.perf_counter()
         count = min(max(0, int(top_k)), input_count)
         if count < input_count:
             top_indices = np.argpartition(-ranking_score, count - 1)[:count] if count else np.array([], dtype=np.int64)
             top_indices = top_indices[np.argsort(-ranking_score[top_indices])]
         else:
             top_indices = np.argsort(-ranking_score)
+        topk_ms = (time.perf_counter() - started_topk) * 1000.0
         top_scores = scores[top_indices].astype(np.float32, copy=True)
         top_tickers = tuple(ticker_tuple[int(index)] for index in top_indices)
         postprocess_ms = (time.perf_counter() - started_post) * 1000.0
@@ -144,8 +146,10 @@ class OntologyNpuLinearScorer:
         self._last_batches = batches
         self._last_items_per_second = round(input_count / (total_ms / 1000.0), 2) if total_ms > 0 else None
         self._last_profile = {
+            "feature_build_ms": round(preprocess_ms, 3),
             "preprocess_ms": round(preprocess_ms, 3),
             "inference_ms": round(inference_ms, 3),
+            "topk_ms": round(topk_ms, 3),
             "postprocess_ms": round(postprocess_ms, 3),
             "total_ms": round(total_ms, 3),
             "input_count": input_count,

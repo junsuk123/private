@@ -10,11 +10,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import yaml
+import numpy as np
 
 from app.data.source_policy import compute_quality_score
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
 from app.graph.npu_classifier import OntologyNpuLinearScorer
+from app.native.screening import reason_mask_to_names, screen_candidates_vectorized
 from app.schemas.domain import InvestorFlowSnapshot, MarketSnapshot
 from app.strategy.candidate_factory import (
     StrategyCandidateFactory,
@@ -287,6 +289,119 @@ def ontology_filter_1(
     min_liquidity_score: float = 0.12,
     cache_key: str | None = None,
 ) -> CandidateSelectionResult:
+    if os.getenv("ONTOLOGY_FILTER1_BACKEND", "vectorized").strip().lower() in {"loop", "python_loop", "legacy"}:
+        return _ontology_filter_1_python_loop(
+            snapshots,
+            target_count=target_count,
+            min_trading_value=min_trading_value,
+            min_liquidity_score=min_liquidity_score,
+            cache_key=cache_key,
+        )
+
+    cached = _candidate_cache.get(cache_key) if cache_key else None
+    if cached is not None:
+        return cached
+
+    started = time.perf_counter()
+    target_count = max(1, min(_max_top_k(), int(target_count)))
+    arrays_started = time.perf_counter()
+    tickers = tuple(snapshot.ticker for snapshot in snapshots)
+    markets = tuple(snapshot.market for snapshot in snapshots)
+    vectorized = screen_candidates_vectorized(
+        trading_value=np.fromiter((snapshot.trading_value for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        liquidity_score=np.fromiter((snapshot.liquidity_score for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        volume_change_rate=np.fromiter((snapshot.volume_change_rate for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        price_change_rate=np.fromiter((snapshot.price_change_rate for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        foreign_net_buy=np.fromiter((snapshot.foreign_net_buy for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        institution_net_buy=np.fromiter((snapshot.institution_net_buy for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        retail_net_buy=np.fromiter((snapshot.retail_net_buy for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        program_net_buy=np.fromiter((snapshot.program_net_buy for snapshot in snapshots), dtype=np.float32, count=len(snapshots)),
+        upper_limit_near=np.fromiter((snapshot.upper_limit_near for snapshot in snapshots), dtype=bool, count=len(snapshots)),
+        new_52week_high=np.fromiter((snapshot.new_52week_high for snapshot in snapshots), dtype=bool, count=len(snapshots)),
+        halt_status=np.fromiter((snapshot.halt_status for snapshot in snapshots), dtype=bool, count=len(snapshots)),
+        management_stock_status=np.fromiter((snapshot.management_stock_status for snapshot in snapshots), dtype=bool, count=len(snapshots)),
+        domestic_market=np.fromiter((_is_domestic_snapshot_market(ticker, market) for ticker, market in zip(tickers, markets)), dtype=bool, count=len(snapshots)),
+        min_trading_value=min_trading_value,
+        min_liquidity_score=min_liquidity_score,
+        top_k=target_count,
+    )
+    array_build_ms = (time.perf_counter() - arrays_started) * 1000.0
+    accepted = tuple(
+        sorted(
+            (int(index) for index in vectorized.accepted_indices),
+            key=lambda index: (float(vectorized.scores[index]), tickers[index]),
+            reverse=True,
+        )
+    )
+    candidates = tuple(tickers[index] for index in accepted[:target_count])
+    rejected = tuple(tickers[int(index)] for index in vectorized.rejected_indices)
+
+    npu_metrics: dict[str, float | int | str] = {
+        **vectorized.profile,
+        "candidate_array_build_ms": round(array_build_ms, 3),
+        "candidate_count_input": len(snapshots),
+        "candidate_count_after_hard_filter": len(accepted),
+    }
+    if _npu_candidate_scoring_enabled() and accepted:
+        npu_candidates, npu_metrics_update = _rank_accepted_with_npu(
+            snapshots,
+            tuple(tickers[index] for index in accepted),
+            top_k=target_count,
+        )
+        candidates = npu_candidates
+        npu_metrics.update(npu_metrics_update)
+    else:
+        npu_metrics.update(
+            {
+                "candidate_count_after_npu_topk": len(candidates),
+                "npu_enabled": 0,
+                "device": "CPU_RULES",
+                "top_k": target_count,
+            }
+        )
+
+    trace_indices = _trace_indices_for_screening(tickers, vectorized, candidates)
+    traces = tuple(
+        _trace_from_vectorized_snapshot(
+            snapshots[int(index)],
+            float(vectorized.scores[int(index)]),
+            int(vectorized.reason_masks[int(index)]),
+            accepted=bool(vectorized.hard_reject_masks[int(index)] == 0),
+        )
+        for index in trace_indices
+    )
+    result = CandidateSelectionResult(
+        candidate_stocks=candidates,
+        rejected_stocks=rejected,
+        traces=traces,
+        latency_ms=int((time.perf_counter() - started) * 1000),
+        api_call_count=0,
+        full_universe_count=len(snapshots),
+        chart_fetch_scope=candidates,
+        metrics=npu_metrics,
+    )
+    if cache_key:
+        _candidate_cache.set(cache_key, result)
+    logger.info(
+        "ontology_filter_1 universe=%s candidates=%s rejected=%s latency_ms=%s api_calls=%s backend=%s",
+        result.full_universe_count,
+        len(result.candidate_stocks),
+        len(result.rejected_stocks),
+        result.latency_ms,
+        result.api_call_count,
+        result.metrics.get("backend", "unknown"),
+    )
+    return result
+
+
+def _ontology_filter_1_python_loop(
+    snapshots: tuple[LightweightMarketSnapshot, ...],
+    *,
+    target_count: int = 80,
+    min_trading_value: float = 500_000_000,
+    min_liquidity_score: float = 0.12,
+    cache_key: str | None = None,
+) -> CandidateSelectionResult:
     cached = _candidate_cache.get(cache_key) if cache_key else None
     if cached is not None:
         return cached
@@ -380,6 +495,76 @@ def ontology_filter_1(
         result.api_call_count,
     )
     return result
+
+
+def _trace_indices_for_screening(
+    tickers: tuple[str, ...],
+    vectorized: Any,
+    candidates: tuple[str, ...],
+    reject_sample_size: int = 24,
+) -> tuple[int, ...]:
+    candidate_set = set(candidates)
+    selected = [index for index, ticker in enumerate(tickers) if ticker in candidate_set]
+    rejected = [int(index) for index in vectorized.rejected_indices[:reject_sample_size]]
+    return tuple(dict.fromkeys((*selected, *rejected)))
+
+
+def _trace_from_vectorized_snapshot(
+    snapshot: LightweightMarketSnapshot,
+    score: float,
+    reason_mask: int,
+    *,
+    accepted: bool,
+) -> ReasoningTrace:
+    fired_rules = reason_mask_to_names(reason_mask)
+    decision = "CandidateStock" if accepted else "RejectStock"
+    reason = (
+        "Passed lightweight ontology liquidity and momentum screening."
+        if accepted
+        else _reject_reason_from_mask(reason_mask)
+    )
+    return ReasoningTrace(
+        stock_code=snapshot.ticker,
+        stage="ontology_filter_1",
+        input_features={
+            "current_price": snapshot.current_price,
+            "price_change_rate": snapshot.price_change_rate,
+            "trading_value": snapshot.trading_value,
+            "trading_volume": snapshot.trading_volume,
+            "volume_change_rate": snapshot.volume_change_rate,
+            "market_cap": snapshot.market_cap,
+            "foreign_net_buy": snapshot.foreign_net_buy,
+            "institution_net_buy": snapshot.institution_net_buy,
+            "retail_net_buy": snapshot.retail_net_buy,
+            "program_net_buy": snapshot.program_net_buy,
+            "short_net_change": snapshot.short_net_change,
+            "upper_limit_near": snapshot.upper_limit_near,
+            "new_52week_high": snapshot.new_52week_high,
+            "halt_status": snapshot.halt_status,
+            "management_stock_status": snapshot.management_stock_status,
+            "liquidity_score": snapshot.liquidity_score,
+        },
+        fired_rules=fired_rules,
+        decision=decision,
+        score=round(score, 6),
+        reason=reason,
+    )
+
+
+def _reject_reason_from_mask(reason_mask: int) -> str:
+    names = set(reason_mask_to_names(reason_mask))
+    if "halt_status" in names:
+        return "Trading is halted."
+    if "management_stock_status" in names:
+        return "Management stock status blocks trading."
+    if "insufficient_liquidity" in names:
+        return "Trading value or liquidity score is too low."
+    return "Rejected by lightweight ontology screening."
+
+
+def _is_domestic_snapshot_market(ticker: str, market: str) -> bool:
+    market_name = str(market).upper()
+    return market_name in {"KRX", "KOSPI", "KOSDAQ", "KONEX"} or str(ticker).endswith(".KS") or str(ticker).isdigit()
 
 
 def load_short_horizon_strategy_config(
@@ -649,4 +834,3 @@ def _pipeline_source():
 def _stable_unit(value: str) -> float:
     digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") / float(2**64 - 1)
-

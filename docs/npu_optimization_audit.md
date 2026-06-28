@@ -1,32 +1,39 @@
-# NPU Optimization Audit
+# NPU and Realtime Hot Path Optimization Audit
 
-## Current NPU Usage
+## Applied
 
-- `src/app/graph/npu_classifier.py` owns OpenVINO/NPU candidate evidence scoring with deterministic CPU NumPy fallback.
-- `src/app/trading_pipeline.py` performs CPU hard filtering first, then optional NPU top-k scoring controlled by `ONTOLOGY_NPU_ENABLED`.
-- `src/app/graph/builders.py` consumes NPU scores only as ontology evidence triples.
-- `src/app/realtime/short_horizon_npu_predictor.py` adds an opt-in short-horizon evidence predictor with a CPU linear baseline.
-- `src/app/data/event_classifier*.py` adds a lightweight event classifier interface with keyword fallback.
+- `ontology_filter_1` now uses a NumPy vectorized CPU rules path by default.
+- The legacy loop path remains available with `ONTOLOGY_FILTER1_BACKEND=legacy`.
+- Optional Rust/PyO3 native screening core is implemented under `native/screening_core`.
+- Python automatically uses `screening_core` when installed and otherwise falls back to NumPy.
+- Human-readable screening traces are materialized only for selected candidates and a compact reject sample.
+- NPU candidate scoring keeps top-k before graph materialization.
+- NPU scorer profile now separates:
+  - `feature_build_ms`
+  - `inference_ms`
+  - `topk_ms`
+  - `postprocess_ms`
 
-## CPU-Only Decision Boundaries
+## Preserved Safety Boundaries
 
-- `src/app/risk/manager.py` remains the mandatory final gate for every `OrderIntent`.
-- `src/app/strategy/rule_based.py` still creates intents from deterministic policy and ontology evidence.
-- `src/app/execution/*` remains separate from NPU scoring.
-- Manual approval stays on `FinalOrder.manual_approval_required=True`.
+- Screening and NPU outputs remain evidence only.
+- They do not submit orders.
+- Orders still require strategy construction, `RiskManager`, final gates, and manual approval.
+- Live trading remains disabled by default.
+- Production/realtime indicator paths do not promote `reference:`, `sample-indicator:`, or `demo-indicator:` source ids as trusted evidence.
+- Demo/offline sample indicators are only enabled through explicit demo context wiring.
 
-## NPU-Suitable Modules
+## Rolling Feature Cache
 
-- Numeric candidate ranking over `[N, F]` float32 feature matrices.
-- Lightweight event score inference when a local OpenVINO model exists.
-- Short-horizon expected-return evidence when explicitly enabled.
+- `TickerRollingFeatureState` keeps per-ticker ordered ring buffers for short-horizon bars.
+- It preserves no-lookahead behavior with `as_of` filtering.
+- Tests compare rolling outputs to the batch builder for returns, volatility, volume z-score, market alignment, and missing fields.
 
-## Bottleneck Candidates
+## Remaining Native Work
 
-- Full-universe score dictionaries are replaced by top-k materialization in the default scorer path.
-- Graph materialization is scoped with `ONTOLOGY_GRAPH_SCOPE`, `ONTOLOGY_GRAPH_MAX_TICKERS`, `ONTOLOGY_GRAPH_MAX_EVENTS_PER_TICKER`, and `ONTOLOGY_GRAPH_EVENT_TTL_HOURS`.
-- Realtime candidate metrics now record before/after counts and scorer timing.
-
-## Safety Check
-
-NPU output is treated as evidence only. It does not submit orders, bypass `RiskManager`, disable manual approval, or replace deterministic risk checks.
+- Build/install the optional native module on machines with Rust:
+  - `cd native/screening_core`
+  - `python -m pip install maturin`
+  - `maturin develop --release`
+- The Rust/PyO3 extension accepts contiguous arrays and returns `selected_indices`, `rejected_indices`, `accepted_indices`, `scores`, `reason_masks`, and `hard_reject_masks`.
+- The Rust/PyO3 extension releases the GIL during score and top-k phases.

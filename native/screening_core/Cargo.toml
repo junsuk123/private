@@ -1,0 +1,12 @@
+[package]
+name = "screening_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "screening_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+numpy = "0.21"
+pyo3 = { version = "0.21", features = ["extension-module"] }

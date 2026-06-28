@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from statistics import mean, pstdev
@@ -172,6 +173,187 @@ class ShortHorizonFeatureBuilder:
             if values[name] is None:
                 missing.append(name)
         return values
+
+
+class TickerRollingFeatureState:
+    """Ticker-level ordered ring buffer for short-horizon features.
+
+    The state stores only observed bars and never reads bars after `as_of`.
+    It is intended for realtime/paper/live hot paths that update one bar at a
+    time instead of repeatedly sorting a growing history.
+    """
+
+    def __init__(
+        self,
+        ticker: str,
+        config: ShortHorizonFeatureConfig | None = None,
+        *,
+        max_bars: int | None = None,
+    ) -> None:
+        self.ticker = ticker
+        self.config = config or ShortHorizonFeatureConfig()
+        required = max(
+            (*self.config.return_windows_minutes, *self.config.realized_volatility_windows_minutes, self.config.volume_zscore_window)
+        ) + 2
+        self.max_bars = max_bars or max(256, required)
+        self._bars: deque[OHLCVBar] = deque(maxlen=self.max_bars)
+
+    def update(
+        self,
+        bar: OHLCVBar,
+        *,
+        as_of: datetime | None = None,
+        daily_bars: Sequence[OHLCVBar] = (),
+        market_index_bars: Sequence[OHLCVBar] = (),
+        market_index_state: "TickerRollingFeatureState | None" = None,
+        orderbook: Mapping[str, float | int] | None = None,
+    ) -> ShortHorizonFeatures:
+        self.add_bar(bar)
+        return self.build(
+            as_of=as_of or bar.as_of,
+            daily_bars=daily_bars,
+            market_index_bars=market_index_bars,
+            market_index_state=market_index_state,
+            orderbook=orderbook,
+        )
+
+    def add_bar(self, bar: OHLCVBar) -> None:
+        if bar.ticker != self.ticker:
+            raise ValueError(f"bar ticker {bar.ticker!r} does not match rolling state {self.ticker!r}")
+        if self._bars and bar.as_of < self._bars[-1].as_of:
+            ordered = [item for item in self._bars if item.as_of != bar.as_of]
+            ordered.append(bar)
+            ordered.sort(key=lambda item: item.as_of)
+            self._bars.clear()
+            self._bars.extend(ordered[-self.max_bars :])
+            return
+        if self._bars and bar.as_of == self._bars[-1].as_of:
+            self._bars[-1] = bar
+            return
+        self._bars.append(bar)
+
+    def build(
+        self,
+        *,
+        as_of: datetime | None = None,
+        daily_bars: Sequence[OHLCVBar] = (),
+        market_index_bars: Sequence[OHLCVBar] = (),
+        market_index_state: "TickerRollingFeatureState | None" = None,
+        orderbook: Mapping[str, float | int] | None = None,
+    ) -> ShortHorizonFeatures:
+        visible = self.visible_bars(as_of)
+        if market_index_state is not None:
+            market_index_bars = market_index_state.visible_bars(as_of or (visible[-1].as_of if visible else None))
+        return _build_short_horizon_features_from_ordered(
+            visible,
+            self.config,
+            as_of=as_of,
+            daily_bars=daily_bars,
+            market_index_bars=market_index_bars,
+            orderbook=orderbook,
+        )
+
+    def visible_bars(self, as_of: datetime | None = None) -> tuple[OHLCVBar, ...]:
+        if as_of is None:
+            return tuple(self._bars)
+        return tuple(bar for bar in self._bars if bar.as_of <= as_of)
+
+    @property
+    def bar_count(self) -> int:
+        return len(self._bars)
+
+
+def _build_short_horizon_features_from_ordered(
+    visible: Sequence[OHLCVBar],
+    config: ShortHorizonFeatureConfig,
+    *,
+    as_of: datetime | None = None,
+    daily_bars: Sequence[OHLCVBar] = (),
+    market_index_bars: Sequence[OHLCVBar] = (),
+    orderbook: Mapping[str, float | int] | None = None,
+) -> ShortHorizonFeatures:
+    missing: list[str] = []
+    if not visible:
+        timestamp = as_of or datetime.now()
+        return ShortHorizonFeatures(
+            ticker="",
+            timestamp=timestamp,
+            returns_by_window=_empty_returns(config),
+            realized_volatility=_empty_volatility(config),
+            volume_zscore=None,
+            spread_rate=None,
+            orderbook_depth_score=None,
+            liquidity_score=None,
+            market_alignment_score=None,
+            time_of_day_weight=_time_of_day_weight(timestamp, config),
+            is_valid=False,
+            missing_fields=("minute_bars",),
+        )
+
+    ticker = visible[-1].ticker
+    timestamp = visible[-1].as_of
+    returns: dict[str, float | None] = {}
+    for window in config.return_windows_minutes:
+        name = f"ret_{window}m"
+        returns[name] = _return_from_minutes(visible, window)
+        if returns[name] is None:
+            missing.append(name)
+    returns["ret_1d"] = _daily_return(visible, daily_bars, timestamp)
+    if returns["ret_1d"] is None:
+        missing.append("ret_1d")
+    for window in (10, 30):
+        name = f"ret_open_{window}m"
+        returns[name] = _return_from_session_open(visible, timestamp, window, config)
+        if returns[name] is None:
+            missing.append(name)
+    returns["ret_preclose_30m"] = _return_from_preclose_window(visible, timestamp, 30, config)
+    if returns["ret_preclose_30m"] is None:
+        missing.append("ret_preclose_30m")
+
+    volatility: dict[str, float | None] = {}
+    for window in config.realized_volatility_windows_minutes:
+        name = f"realized_volatility_{window}m"
+        volatility[name] = _realized_volatility(visible, window)
+        if volatility[name] is None:
+            missing.append(name)
+
+    volume_z = _volume_zscore(visible, config.volume_zscore_window)
+    if volume_z is None:
+        missing.append("volume_zscore")
+    spread_rate, depth_score = _orderbook_features(orderbook)
+    if orderbook:
+        if spread_rate is None:
+            missing.append("spread_rate")
+        if depth_score is None:
+            missing.append("orderbook_depth_score")
+    else:
+        missing.extend(["spread_rate", "orderbook_depth_score"])
+    liquidity = _liquidity_score(volume_z, spread_rate, depth_score)
+    if liquidity is None:
+        missing.append("liquidity_score")
+    market_alignment = _market_alignment_score(visible, market_index_bars, timestamp)
+    if market_alignment is None:
+        missing.append("market_alignment_score")
+    time_weight = _time_of_day_weight(timestamp, config)
+    if time_weight is None:
+        missing.append("time_of_day_weight")
+    missing_tuple = tuple(dict.fromkeys(missing))
+    is_valid = all(returns.get(name) is not None for name in config.required_return_windows)
+    is_valid = is_valid and not any(volatility.get(f"realized_volatility_{window}m") is None for window in (5,))
+    return ShortHorizonFeatures(
+        ticker=ticker,
+        timestamp=timestamp,
+        returns_by_window=returns,
+        realized_volatility=volatility,
+        volume_zscore=volume_z,
+        spread_rate=spread_rate,
+        orderbook_depth_score=depth_score,
+        liquidity_score=liquidity,
+        market_alignment_score=market_alignment,
+        time_of_day_weight=time_weight,
+        is_valid=is_valid,
+        missing_fields=missing_tuple,
+    )
 
 
 def _visible_bars(bars: Sequence[OHLCVBar], as_of: datetime | None) -> tuple[OHLCVBar, ...]:

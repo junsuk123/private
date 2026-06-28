@@ -17,6 +17,7 @@ from app.features.short_horizon_features import (
     ShortHorizonFeatureBuilder,
     ShortHorizonFeatureConfig,
     ShortHorizonFeatures,
+    TickerRollingFeatureState,
 )
 from app.features.schemas import (
     FeatureSnapshot,
@@ -46,6 +47,7 @@ __all__ = [
     "ShortHorizonFeatureBuilder",
     "ShortHorizonFeatureConfig",
     "ShortHorizonFeatures",
+    "TickerRollingFeatureState",
     "TextHeuristicSemanticModel",
     "RegimeFormulaParameterTuner",
     "build_parameter_context_features",
