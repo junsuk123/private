@@ -58,6 +58,26 @@ function Stop-ProcessTree {
   Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
 }
 
+function Stop-WorkspaceRunPyProcesses {
+  $workspacePath = (Resolve-Path -LiteralPath $PSScriptRoot).Path.ToLowerInvariant()
+  $currentProcessId = $PID
+  $processes = Get-CimInstance Win32_Process -Filter "name = 'python.exe'" -ErrorAction SilentlyContinue
+  foreach ($process in $processes) {
+    if (-not $process.CommandLine) { continue }
+    if ([int]$process.ProcessId -eq [int]$currentProcessId) { continue }
+    $command = $process.CommandLine.ToLowerInvariant()
+    $isWorkspaceRunPy = $command.Contains("run.py") -and (
+      $command.Contains($workspacePath.ToLowerInvariant()) -or
+      $command.Contains(".\run.py") -or
+      $command.Contains("./run.py")
+    )
+    if ($isWorkspaceRunPy) {
+      Write-Host "Stopping existing workspace run.py process (PID $($process.ProcessId))"
+      Stop-ProcessTree -RootProcessId ([int]$process.ProcessId)
+    }
+  }
+}
+
 function Find-BrowserExecutable {
   $candidates = @(
     (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
@@ -94,6 +114,7 @@ function Wait-LocalAppReady {
 }
 
 Stop-ExistingLocalAppServers
+Stop-WorkspaceRunPyProcesses
 
 Set-DefaultEnv "PYTHONPATH" "src"
 Set-DefaultEnv "APP_ENV" "local"
@@ -153,8 +174,9 @@ Set-DefaultEnv "AUTO_START_LIVE_WORKER" "false"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"
-Set-DefaultEnv "SIM_STRATEGY_CANDIDATES" "1800"
-Set-DefaultEnv "SIM_STREAMING_UNIVERSE_LIMIT" "300"
+Set-DefaultEnv "ONTOLOGY_FILTER1_TARGET_COUNT" "80"
+Set-DefaultEnv "SIM_STRATEGY_CANDIDATES" "160"
+Set-DefaultEnv "SIM_STREAMING_UNIVERSE_LIMIT" "160"
 Set-DefaultEnv "LLM_EVENT_MAX_ITEMS_PER_SOURCE" "1"
 Set-DefaultEnv "LLM_EVENT_MAX_ITEMS_PER_RUN" "1"
 Set-DefaultEnv "LLM_EVENT_KNOWN_TICKER_PROMPT_LIMIT" "80"

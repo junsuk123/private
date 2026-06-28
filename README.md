@@ -96,6 +96,42 @@ Trading-cost defaults live in `config/trading_costs.json`. The default domestic-
 
 The ontology graph exposes this path as `TradingCost -> BreakEvenReturn/NetExpectedReturn -> NetProfitability -> FinalTradeGate`, so the visualization can show how fees, tax, slippage, spread, and market impact affect final approval.
 
+## Principal Protection Framework
+
+The system now has a deterministic principal-protection layer between strategy signal generation and executable orders. AI, ontology, indicators, and strategy code may still produce `OrderIntent` candidates, but `PrincipalProtectionEngine` and `RiskManager` can block or resize BUY orders before a `FinalOrder` is created.
+
+Core formulas:
+
+```text
+P0 = initial principal
+E_t = current equity
+H_t = high-water mark
+F_t = P0 * principal_floor_ratio + profit_lockin_ratio * max(0, H_t - P0)
+C_t = max(0, E_t - F_t - cost_buffer - gap_risk_buffer)
+risk_budget = min(CPPI_multiplier * C_t, daily_budget, weekly_budget, per-trade constraints)
+estimated_trade_loss = stop-loss price loss + buy/sell fees + tax + slippage + spread + market impact
+```
+
+Protection modes:
+
+- `NORMAL_GROWTH`: normal risk limits apply while equity is safely above the protected floor.
+- `PROFIT_ONLY`: new risky trades are limited to calculated growth capital above the protected floor.
+- `DE_RISK`: drawdown control is active; new buys are restricted and exposure reduction is prioritized.
+- `PRINCIPAL_LOCKDOWN`: BUY orders are blocked. SELL/REDUCE actions remain available.
+- `NOT_CONFIGURED`: initial principal has not been set, so the legacy deterministic risk rules remain active.
+
+Configuration is stored in `config/principal_protection.json`; start from `config/principal_protection.example.json` or use the API:
+
+```text
+GET  /api/risk/principal-protection/state
+PUT  /api/risk/principal-protection/config
+POST /api/risk/principal-protection/preview-order
+```
+
+The dashboard shows the current protection mode, protected floor, growth capital, cushion, and risk budget. Every configured principal-protection order decision is written to `logs/principal-protection.jsonl` with the input state, estimated loss, decision, and reason codes.
+
+This framework does not guarantee profit or principal preservation under all market conditions. It explicitly assumes losses, gaps, execution failure, fees, tax, slippage, spread, and market impact can occur.
+
 ## Short-Horizon Strategy Research Mode
 
 Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`, parsed with PyYAML. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.

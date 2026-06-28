@@ -1,0 +1,22 @@
+{
+  "initial_principal": 10000000,
+  "principal_floor_enabled": true,
+  "principal_floor_ratio": 1.0,
+  "profit_lockin_enabled": true,
+  "profit_lockin_ratio": 0.3,
+  "cppi_enabled": true,
+  "cppi_multiplier": 2.0,
+  "max_gap_loss_assumption": 0.12,
+  "cost_buffer_ratio": 0.003,
+  "per_trade_risk_budget_ratio": 0.0025,
+  "daily_risk_budget_ratio": 0.005,
+  "weekly_risk_budget_ratio": 0.015,
+  "max_total_drawdown": 0.05,
+  "fractional_kelly_enabled": false,
+  "fractional_kelly_ratio": 0.25,
+  "cvar_enabled": false,
+  "cvar_confidence": 0.95,
+  "principal_lockdown_enabled": true,
+  "count_unrealized_profit_as_growth": false,
+  "enabled": true
+}

@@ -17,3 +17,4 @@ config/secrets/*
 !config/secrets/
 !config/secrets/*.example
 !config/secrets/README.md
+config/principal_protection.json

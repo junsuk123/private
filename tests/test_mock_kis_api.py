@@ -276,6 +276,37 @@ class MockKisApiTest(unittest.TestCase):
         token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
         self.assertEqual(len(token_calls), 1)
 
+    def test_kis_live_access_token_env_is_reused_without_issuance(self) -> None:
+        transport = RecordingKisTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                "os.environ",
+                {
+                    "KIS_LIVE_ACCESS_TOKEN": "manual-live-token",
+                    "KIS_LIVE_ACCESS_TOKEN_EXPIRES_AT": (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    ).isoformat(),
+                },
+                clear=False,
+            ):
+                client = KisDevelopersApiClient(
+                    app_key="live-app",
+                    app_secret="live-secret",
+                    account_no="12345678-01",
+                    paper=False,
+                    enabled=True,
+                    transport=transport,
+                    token_cache_path=Path(tmp) / "kis_access_token.live.json",
+                )
+                portfolio = client.get_portfolio()
+
+        token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
+        balance_call = next(call for call in transport.calls if call["url"].endswith("/inquire-balance"))
+        self.assertEqual(token_calls, [])
+        self.assertEqual(balance_call["headers"]["authorization"], "Bearer manual-live-token")
+        self.assertEqual(client.token_source, "env")
+        self.assertEqual(portfolio.account.cash, 1_000_000)
+
 
 def _supportive_npu_scores(markets):
     return {market.ticker: (0.2, 0.2, 0.0, 0.0, 0.0, 0.4) for market in markets}

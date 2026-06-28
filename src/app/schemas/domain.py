@@ -24,6 +24,22 @@ class OrderType(StrEnum):
     MARKET = "MARKET"
 
 
+class PrincipalProtectionMode(StrEnum):
+    NORMAL_GROWTH = "NORMAL_GROWTH"
+    PROFIT_ONLY = "PROFIT_ONLY"
+    DE_RISK = "DE_RISK"
+    PRINCIPAL_LOCKDOWN = "PRINCIPAL_LOCKDOWN"
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+
+
+class PrincipalProtectionDecisionAction(StrEnum):
+    ALLOW = "ALLOW"
+    REDUCE_SIZE = "REDUCE_SIZE"
+    BLOCK = "BLOCK"
+    SELL_ONLY = "SELL_ONLY"
+    LOCKDOWN = "LOCKDOWN"
+
+
 class EventType(StrEnum):
     DISCLOSURE = "DISCLOSURE"
     NEWS = "NEWS"
@@ -324,6 +340,61 @@ class FinalOrder:
 
 
 @dataclass(frozen=True)
+class PrincipalProtectionConfig:
+    initial_principal: float = 0.0
+    principal_floor_enabled: bool = True
+    principal_floor_ratio: float = 1.0
+    profit_lockin_enabled: bool = True
+    profit_lockin_ratio: float = 0.30
+    cppi_enabled: bool = True
+    cppi_multiplier: float = 2.0
+    max_gap_loss_assumption: float = 0.12
+    cost_buffer_ratio: float = 0.003
+    per_trade_risk_budget_ratio: float = 0.0025
+    daily_risk_budget_ratio: float = 0.005
+    weekly_risk_budget_ratio: float = 0.015
+    max_total_drawdown: float = 0.05
+    fractional_kelly_enabled: bool = False
+    fractional_kelly_ratio: float = 0.25
+    cvar_enabled: bool = False
+    cvar_confidence: float = 0.95
+    principal_lockdown_enabled: bool = True
+    count_unrealized_profit_as_growth: bool = False
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class PrincipalProtectionState:
+    initial_principal: float
+    current_equity: float
+    protected_floor: float
+    high_watermark: float
+    locked_profit: float
+    cushion: float
+    risk_budget: float
+    available_growth_capital: float
+    current_mode: PrincipalProtectionMode
+    floor_breach_status: bool
+    drawdown_from_high_watermark: float
+    cost_buffer: float
+    gap_risk_buffer: float
+    active_risky_exposure: float
+    reason_codes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PrincipalProtectionDecision:
+    action: PrincipalProtectionDecisionAction
+    state: PrincipalProtectionState
+    allowed: bool
+    reason_codes: tuple[str, ...]
+    explanations: tuple[str, ...]
+    estimated_trade_loss: float = 0.0
+    suggested_quantity: int | None = None
+    max_risky_exposure: float = 0.0
+
+
+@dataclass(frozen=True)
 class RiskRules:
     max_single_stock_weight: float = 0.05
     max_sector_weight: float = 0.25
@@ -350,6 +421,7 @@ class RiskRules:
     max_model_uncertainty: float = 0.60
     synthetic_live_data_allowed: bool = False
     unknown_source_live_allowed: bool = False
+    principal_protection: PrincipalProtectionConfig = field(default_factory=PrincipalProtectionConfig)
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,17 @@ Access tokens are cached under this ignored directory:
 - `config/secrets/kis_access_token.paper.json`
 - `config/secrets/kis_access_token.live.json`
 
+Live readiness checks use this order:
+
+1. A manually supplied `KIS_LIVE_ACCESS_TOKEN` or `KIS_ACCESS_TOKEN`
+2. The live token cache file
+3. A new `/oauth2/tokenP` request, only when no valid token exists
+
+If KIS already issued today's token outside this app and the cache file is not
+present, paste that token into `KIS_LIVE_ACCESS_TOKEN` in
+`config/secrets/kis_api_keys.env`, then run live readiness again. The app will
+use that token for the read-only live account check without issuing a new token.
+
 The token cache is treated like a secret and must not be committed or shared.
 KIS access tokens are valid for about 24 hours, and repeated token issuance can
 be limited, so keep using the cached token until it expires. To intentionally

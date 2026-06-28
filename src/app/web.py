@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -36,12 +36,15 @@ from app.realtime.learning import (
     update_realtime_model_artifacts,
 )
 from app.graph.npu_classifier import get_ontology_npu_classifier
-from app.risk import RiskManager
+from app.risk import PrincipalProtectionEngine, RiskManager
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
     OrderSide,
     OrderType,
+    OrderAction,
+    OrderIntent,
+    PrincipalProtectionConfig,
     RealtimeExecution,
     RealtimeQuote,
     SourceMetadata,
@@ -163,6 +166,7 @@ _streaming_demo_step_locks: dict[str, threading.Lock] = {}
 _operation_mode_lock = threading.Lock()
 _operation_mode_state: dict[str, Any] = {
     "active": None,
+    "last_kis_connection": None,
     "request": {
         "busy": False,
         "stage": "idle",
@@ -176,6 +180,140 @@ _operation_mode_state: dict[str, Any] = {
 
 def _get_store_root() -> Path:
   return Path(os.getenv("REALTIME_STORE_ROOT", "data/store"))
+
+
+def _principal_config_path() -> Path:
+  return Path(os.getenv("PRINCIPAL_PROTECTION_CONFIG", "config/principal_protection.json"))
+
+
+def _principal_state_path() -> Path:
+  return Path(os.getenv("PRINCIPAL_PROTECTION_STATE", "data/store/principal_protection_state.json"))
+
+
+def _load_principal_protection_config() -> PrincipalProtectionConfig:
+  path = _principal_config_path()
+  if not path.exists():
+    return PrincipalProtectionConfig()
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    return PrincipalProtectionConfig()
+  return _principal_config_from_payload(payload)
+
+
+def _save_principal_protection_config(config: PrincipalProtectionConfig) -> None:
+  path = _principal_config_path()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps(_to_jsonable(config), indent=2), encoding="utf-8")
+
+
+def _ensure_initial_principal_configured(initial_principal: float) -> PrincipalProtectionConfig:
+  config = _load_principal_protection_config()
+  if config.initial_principal > 0:
+    return config
+  updated = _principal_config_from_payload({**asdict(config), "initial_principal": max(0.0, float(initial_principal))})
+  _save_principal_protection_config(updated)
+  return updated
+
+
+def _principal_config_from_payload(payload: dict[str, Any]) -> PrincipalProtectionConfig:
+  allowed = {item.name for item in fields(PrincipalProtectionConfig)}
+  values = {key: value for key, value in payload.items() if key in allowed}
+  return PrincipalProtectionConfig(**values)
+
+
+def _load_principal_high_watermark(current_equity: float, config: PrincipalProtectionConfig) -> float | None:
+  path = _principal_state_path()
+  if not path.exists():
+    return max(float(current_equity), float(config.initial_principal or 0.0))
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, json.JSONDecodeError):
+    return max(float(current_equity), float(config.initial_principal or 0.0))
+  try:
+    return max(float(payload.get("high_watermark", 0.0)), float(current_equity), float(config.initial_principal or 0.0))
+  except (TypeError, ValueError):
+    return max(float(current_equity), float(config.initial_principal or 0.0))
+
+
+def _save_principal_high_watermark(high_watermark: float) -> None:
+  path = _principal_state_path()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  payload = {"high_watermark": high_watermark, "updated_at": datetime.now(timezone.utc).isoformat()}
+  path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _principal_capital_allocation(state: Any) -> dict[str, float]:
+  protected = min(float(state.protected_floor), float(state.current_equity))
+  exposed = max(0.0, float(state.active_risky_exposure))
+  growth = max(0.0, float(state.available_growth_capital))
+  locked = max(0.0, float(state.locked_profit))
+  unavailable = max(0.0, float(state.current_equity) - protected - locked - growth)
+  return {
+      "protected_principal": round(protected, 4),
+      "locked_profit": round(locked, 4),
+      "growth_capital": round(growth, 4),
+      "active_exposure": round(exposed, 4),
+      "unavailable_capital": round(unavailable, 4),
+  }
+
+
+def _principal_protection_account_snapshot(config: PrincipalProtectionConfig) -> AccountSnapshot:
+  with _live_lock:
+    context = _live_state.get("context")
+  account = getattr(context, "account", None)
+  if isinstance(account, AccountSnapshot):
+    return account
+  return AccountSnapshot(cash=max(0.0, float(config.initial_principal or 0.0)), holdings=())
+
+
+def _number_or_zero(value: Any) -> float:
+  try:
+    if value in (None, ""):
+      return 0.0
+    return float(str(value).replace(",", ""))
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dict[str, Any] | None:
+  if not connection or not connection.get("account_checked"):
+    return None
+  cash = _number_or_zero(connection.get("actual_deposit") or connection.get("cash") or 0)
+  equity = _number_or_zero(
+      connection.get("actual_equity")
+      or connection.get("equity")
+      or connection.get("account_value")
+      or connection.get("total_evaluation_amount")
+      or 0
+  )
+  invested = _number_or_zero(connection.get("invested_value") or 0)
+  if equity <= 0 and (cash > 0 or invested > 0):
+    equity = cash + invested
+  if equity <= 0:
+    return None
+  return {
+      "cash": cash if cash > 0 else equity,
+      "equity": equity,
+      "cash_weight": max(0.0, min(1.0, (cash if cash > 0 else equity) / equity)),
+      "source": "kis_live_account",
+      "account_suffix": connection.get("account_suffix") or "",
+  }
+
+
+def _last_live_account_basis() -> dict[str, Any] | None:
+  with _live_lock:
+    connection = _operation_mode_state.get("last_kis_connection")
+  return _account_basis_from_kis_connection(connection)
+
+
+def _resolve_operating_initial_cash(payload: dict[str, Any], default: float = 10_000_000) -> float:
+  source = str(payload.get("initial_cash_source") or "").lower()
+  if source in {"auto", "live", "live_account", "kis_live_account"} or "initial_cash" not in payload:
+    basis = _last_live_account_basis()
+    if basis is not None:
+      return max(1.0, float(basis["equity"]))
+  return max(100_000.0, float(payload.get("initial_cash", default)))
 
 
 def _active_operation_mode() -> str:
@@ -275,7 +413,7 @@ def _start_streaming_demo(
   
   if target_return_rate > 1:
     target_return_rate /= 100.0
-  initial_cash = max(100_000.0, float(initial_cash))
+  initial_cash = max(1.0, float(initial_cash))
   acceleration_factor = max(1.0, float(acceleration_factor))
   profit_gain = max(0.25, min(4.0, float(profit_gain)))
   
@@ -368,6 +506,21 @@ def index() -> str:
 
 @app.get("/api/status")
 def status() -> JSONResponse:
+  live_basis = _last_live_account_basis()
+  if live_basis is not None:
+    return _json(
+      {
+        "cash": live_basis["cash"],
+        "equity": live_basis["equity"],
+        "cash_weight": live_basis["cash_weight"],
+        "basis_source": live_basis["source"],
+        "account_suffix": live_basis["account_suffix"],
+        "daily_pnl_ratio": 0.0,
+        "updated_at": datetime.now(timezone.utc),
+        "last_error": None,
+        "risk_rejections": [],
+      }
+    )
   snapshot = _get_or_refresh_live()
   context = snapshot["context"]
   return _json(
@@ -375,6 +528,8 @@ def status() -> JSONResponse:
       "cash": context.account.cash,
       "equity": context.report.equity,
       "cash_weight": context.report.cash_weight,
+      "basis_source": "realtime_model_account",
+      "account_suffix": None,
       "daily_pnl_ratio": context.report.daily_pnl_ratio,
       "updated_at": _iso_or_none(snapshot["last_updated"]),
       "last_error": snapshot["last_error"],
@@ -431,23 +586,26 @@ def configured_research(config_path: str = "config/research_sources.example.json
 
 @app.get("/api/research/diagnostics")
 def research_diagnostics() -> JSONResponse:
-    snapshot = _get_or_refresh_live()
+    snapshot = _live_snapshot()
+    if snapshot["research_result"] is None or snapshot["context"] is None:
+      return _json(_lightweight_diagnostics_response(snapshot))
     research_result = snapshot["research_result"]
     context = snapshot["context"]
+    store_summary = dict(snapshot.get("store_summary") or {})
     return _json(
         {
             "research_config": str(DEFAULT_RESEARCH_CONFIG),
             "diagnostics": _diagnostics_with_collection_config(research_result.diagnostics),
             "skipped_sources": research_result.skipped_sources,
             "stored_new_records": snapshot["stored_new_records"],
-            "store_summary": snapshot["store_summary"],
-            "data_volume": LocalResearchStore(root=_get_store_root()).data_volume(),
+            "store_summary": store_summary,
+            "data_volume": _lightweight_data_volume(store_summary),
             "store_path": str(LocalResearchStore(root=_get_store_root()).db_path),
             "data_policy": _current_data_policy(),
             "events_sample": research_result.events[:5],
-            "market_snapshots": research_result.market_snapshots,
+            "market_snapshots": research_result.market_snapshots[:25],
             "graph_triples_count": len(context.graph.triples()),
-            "reasoning_paths": context.reasoning_paths,
+            "reasoning_paths": context.reasoning_paths[:25],
             "ontology_runtime": context.ontology_runtime.as_dict(),
             "updated_at": _iso_or_none(snapshot["last_updated"]),
             "last_error": snapshot["last_error"],
@@ -455,6 +613,42 @@ def research_diagnostics() -> JSONResponse:
             "refresh_interval_seconds": LIVE_REFRESH_SECONDS,
         }
     )
+
+
+def _lightweight_diagnostics_response(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    snapshot = snapshot or _live_snapshot()
+    store = LocalResearchStore(root=_get_store_root())
+    store_summary = store.summary()
+    diagnostics = {
+        "events_count": int(store_summary.get("events", 0) or 0),
+        "raw_records_count": int(store_summary.get("raw_records", 0) or 0),
+        "market_snapshots_count": int(store_summary.get("market_snapshots", 0) or 0),
+        "macro_metrics_count": int(store_summary.get("macro_metrics", 0) or 0),
+        "skipped_count": 0,
+        "live_source_count": int(store_summary.get("raw_records", 0) or 0),
+        "local_source_count": int(store_summary.get("market_snapshots", 0) or 0),
+        "live_data_present": bool(store_summary.get("events") or store_summary.get("raw_records")),
+        "collection_warnings": ("Analysis cache is still warming; showing stored data summary.",),
+    }
+    return {
+        "research_config": str(DEFAULT_RESEARCH_CONFIG),
+        "diagnostics": _diagnostics_with_collection_config(diagnostics),
+        "skipped_sources": (),
+        "stored_new_records": snapshot.get("stored_new_records", {}),
+        "store_summary": store_summary,
+        "data_volume": _lightweight_data_volume(store_summary),
+        "store_path": str(store.db_path),
+        "data_policy": _current_data_policy(),
+        "events_sample": (),
+        "market_snapshots": (),
+        "graph_triples_count": 0,
+        "reasoning_paths": (),
+        "ontology_runtime": get_ontology_runtime().as_dict(),
+        "updated_at": _iso_or_none(snapshot.get("last_updated")),
+        "last_error": snapshot.get("last_error"),
+        "is_refreshing": snapshot.get("is_refreshing", False),
+        "refresh_interval_seconds": LIVE_REFRESH_SECONDS,
+    }
 
 
 @app.get("/api/ontology/graph")
@@ -539,7 +733,8 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         if target_return_rate > 1:
           target_return_rate /= 100.0
         period_minutes = int(payload.get("period_minutes", 390))
-        initial_cash = float(payload.get("initial_cash", 10_000_000))
+        initial_cash = _resolve_operating_initial_cash(payload)
+        _ensure_initial_principal_configured(max(100_000.0, initial_cash))
         acceleration_factor = float(payload.get("acceleration_factor", 60.0))
         profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
         demo_id = _start_streaming_demo(
@@ -580,6 +775,8 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["live_readiness_kind"] = "kis_live_readiness"
         kis_connection = _kis_connection_probe(paper=False, include_account=True)
         result["kis_connection"] = kis_connection
+        with _live_lock:
+          _operation_mode_state["last_kis_connection"] = kis_connection
         if kis_connection.get("ok"):
           result["live_readiness_message"] = (
               "KIS 실전 인증 점검이 완료되었습니다. 주문은 보내지 않았고 실전 주문 게이트는 계속 비활성화되어 있습니다."
@@ -598,6 +795,8 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
         kis_connection = _kis_connection_probe(paper=False, include_account=True)
         result["kis_connection"] = kis_connection
+        with _live_lock:
+          _operation_mode_state["last_kis_connection"] = kis_connection
         result["live_trading_status"] = "armed" if config_live_enabled and env_live_enabled and kis_connection.get("ok") else "blocked"
         result["live_trading_enabled_by_config"] = config_live_enabled
         result["live_trading_enabled_by_env"] = env_live_enabled
@@ -638,7 +837,10 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
           "ok": True,
           "mode": mode,
           "base_url": client.endpoints.base_url,
-          "token_issued": bool(token),
+          "token_available": bool(token),
+          "token_issued": client.token_source == "issued",
+          "token_source": client.token_source or "unknown",
+          "token_reused": client.token_source in {"cache", "env", "injected"},
           "token_length": len(token),
           "account_suffix": f"...{client.credentials.account_no[-2:]}" if client.credentials.account_no else "",
       }
@@ -646,8 +848,12 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         portfolio = client.get_portfolio()
         result["account_checked"] = True
         result["holdings"] = len(portfolio.account.holdings)
+        result["holdings_count"] = len(portfolio.account.holdings)
         result["cash"] = portfolio.account.cash
         result["actual_deposit"] = portfolio.account.cash
+        result["invested_value"] = portfolio.account.invested_value
+        result["actual_equity"] = portfolio.account.equity
+        result["cash_weight"] = portfolio.account.cash / portfolio.account.equity if portfolio.account.equity > 0 else 0.0
         result["actual_deposit_currency"] = "KRW"
       else:
         result["account_checked"] = False
@@ -675,7 +881,11 @@ def _kis_probe_error_payload(mode: str, exc: KisApiError) -> dict[str, Any]:
     message = raw_message
     retry_after_seconds = None
     if error_code == "EGW00133":
-      message = "KIS 접근토큰 발급 제한입니다. 토큰 발급은 보통 1분당 1회만 허용되므로 잠시 후 다시 시도하세요."
+      message = (
+          "KIS 접근토큰 발급 제한입니다. 이미 발급된 토큰이 있으면 "
+          "config/secrets/kis_api_keys.env의 KIS_LIVE_ACCESS_TOKEN에 넣고 다시 점검하세요. "
+          "캐시 토큰이 있으면 앱은 새 발급 없이 그 토큰으로 실계좌 읽기를 시도합니다."
+      )
       retry_after_seconds = 60
     return {
         "ok": False,
@@ -700,9 +910,15 @@ async def operation_mode_status() -> JSONResponse:
                 "complete": demo.is_complete(),
             }
         )
+    with _live_lock:
+      active = _to_jsonable(_operation_mode_state.get("active"))
+      last_kis_connection = _to_jsonable(_operation_mode_state.get("last_kis_connection"))
+    if isinstance(active, dict) and last_kis_connection and active.get("mode") in {"live_readiness", "live_trading"}:
+      active["kis_connection"] = last_kis_connection
     return _json(
         {
-            "active": _operation_mode_state.get("active"),
+            "active": active,
+            "kis_connection": last_kis_connection,
             "request": _operation_mode_request_snapshot(),
             "learning": _learning_state_snapshot(),
             "collection_log": _live_snapshot()["collection_log"],
@@ -773,27 +989,128 @@ def research_volume() -> JSONResponse:
     )
 
 
+@app.get("/api/risk/principal-protection/state")
+def principal_protection_state() -> JSONResponse:
+    config = _load_principal_protection_config()
+    account = _principal_protection_account_snapshot(config)
+    state = PrincipalProtectionEngine().compute_state(
+        account,
+        account.holdings,
+        realized_pnl=account.realized_pnl_today,
+        unrealized_pnl=account.unrealized_pnl_today,
+        config=config,
+        high_watermark=_load_principal_high_watermark(account.equity, config),
+    )
+    _save_principal_high_watermark(state.high_watermark)
+    return _json(
+        {
+            "config": config,
+            "state": state,
+            "capital_allocation": _principal_capital_allocation(state),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+
+
+@app.put("/api/risk/principal-protection/config")
+async def principal_protection_config_update(request: Request) -> JSONResponse:
+    payload = await request.json()
+    current = _load_principal_protection_config()
+    config = _principal_config_from_payload({**asdict(current), **dict(payload)})
+    _save_principal_protection_config(config)
+    return principal_protection_state()
+
+
+@app.post("/api/risk/principal-protection/preview-order")
+async def principal_protection_preview_order(request: Request) -> JSONResponse:
+    payload = await request.json()
+    snapshot = _get_or_refresh_live()
+    context = snapshot["context"]
+    config = _load_principal_protection_config()
+    ticker = str(payload.get("ticker") or (context.markets[0].ticker if context.markets else ""))
+    market = next((item for item in context.markets if item.ticker == ticker), context.markets[0])
+    action = OrderAction(str(payload.get("action", "BUY")).upper())
+    suggested_weight = float(payload.get("suggested_weight", 0.01))
+    expected_exit_price = float(payload.get("expected_exit_price") or market.last_price * 1.02)
+    quantity = int(payload.get("quantity") or max(0, int(context.account.equity * suggested_weight / max(1e-9, market.last_price))))
+    intent = OrderIntent(
+        ticker=market.ticker,
+        market=market.market,
+        action=action,
+        suggested_weight=suggested_weight,
+        confidence=float(payload.get("confidence", 0.5)),
+        valid_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+        reasoning_summary=("principal protection preview",),
+        supporting_factors=(),
+        contradicting_factors=(),
+        source_data_ids=("preview",),
+        strategy_family="preview",
+        expected_exit_price=expected_exit_price,
+        target_net_return=float(payload.get("target_net_return", 0.0)),
+        strategy_metadata={"stop_loss_price": payload.get("stop_loss_price")},
+    )
+    cost = None
+    if action == OrderAction.BUY and quantity > 0:
+        cost = RiskManager().cost_engine.estimate(
+            symbol=market.ticker,
+            market=market.market,
+            venue="KRX",
+            instrument_type="domestic_stock",
+            entry_price=market.last_price,
+            expected_exit_price=expected_exit_price,
+            quantity=quantity,
+            target_net_return=intent.target_net_return or 0.0,
+            average_daily_trading_value=market.average_daily_trading_value,
+        )
+    decision = PrincipalProtectionEngine().validate_order(
+        intent,
+        context.account,
+        context.account.holdings,
+        market,
+        cost,
+        config,
+        proposed_quantity=quantity,
+        high_watermark=_load_principal_high_watermark(context.account.equity, config),
+    )
+    return _json({"decision": decision, "cost_breakdown": cost.as_dict() if cost else None})
+
+
 @app.post("/api/live-snapshot")
 async def live_snapshot(request: Request) -> JSONResponse:
     payload = await request.json()
     goal_payload = payload.get("goal")
     force_refresh = bool(payload.get("force_refresh", False))
-    return _json(await run_in_threadpool(_live_snapshot_response, goal_payload, force_refresh))
+    include_graph = bool(payload.get("include_graph", False))
+    return _json(await run_in_threadpool(_live_snapshot_response, goal_payload, force_refresh, include_graph))
 
 
-def _live_snapshot_response(goal_payload: Any, force_refresh: bool) -> dict[str, Any]:
-    snapshot = _get_or_refresh_live(force_refresh=force_refresh)
+def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_graph: bool = False) -> dict[str, Any]:
+    snapshot = _live_snapshot()
+    if not force_refresh and not include_graph and (snapshot["context"] is None or snapshot["research_result"] is None):
+      return _lightweight_live_snapshot_response(snapshot)
+    if force_refresh or include_graph:
+      snapshot = _get_or_refresh_live(force_refresh=force_refresh)
     research_result = snapshot["research_result"]
     context = snapshot["context"]
     store_summary = dict(snapshot.get("store_summary") or {})
     lightweight_volume = _lightweight_data_volume(store_summary)
-    graph_payload = snapshot.get("graph_payload")
-    if graph_payload is None or snapshot.get("graph_payload_context_id") != id(context):
-      graph_payload = _graph_payload(context)
-      with _live_lock:
-        if _live_state["context"] is context:
-          _live_state["graph_payload"] = graph_payload
-          _live_state["graph_payload_context_id"] = id(context)
+    graph_triples_count = len(context.graph.triples())
+    graph_payload: dict[str, Any] = {
+        "counts": {
+            "nodes": len(getattr(context.graph, "nodes", {}) or {}),
+            "links": graph_triples_count,
+        },
+        "summary_only": True,
+    }
+    if include_graph:
+      cached_graph = snapshot.get("graph_payload")
+      if cached_graph is None or snapshot.get("graph_payload_context_id") != id(context):
+        cached_graph = _graph_payload(context)
+        with _live_lock:
+          if _live_state["context"] is context:
+            _live_state["graph_payload"] = cached_graph
+            _live_state["graph_payload_context_id"] = id(context)
+      graph_payload = cached_graph
     response: dict[str, Any] = {
         "status": {
             "cash": context.account.cash,
@@ -812,8 +1129,8 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool) -> dict[str,
             "data_volume": lightweight_volume,
             "store_path": str(LocalResearchStore(root=_get_store_root()).db_path),
             "data_policy": _current_data_policy(),
-            "graph_triples_count": len(context.graph.triples()),
-            "reasoning_paths": context.reasoning_paths,
+            "graph_triples_count": graph_triples_count,
+            "reasoning_paths": context.reasoning_paths[:25],
             "ontology_runtime": context.ontology_runtime.as_dict(),
             "is_refreshing": snapshot["is_refreshing"],
             "refresh_interval_seconds": LIVE_REFRESH_SECONDS,
@@ -834,6 +1151,31 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool) -> dict[str,
         response["assessment"] = assessment
         response["compromises"] = build_compromise_goals(assessment)
     return response
+
+
+def _lightweight_live_snapshot_response(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    snapshot = snapshot or _live_snapshot()
+    basis = _last_live_account_basis()
+    diagnostics = _lightweight_diagnostics_response(snapshot)
+    cash = float(basis["cash"]) if basis is not None else 0.0
+    equity = float(basis["equity"]) if basis is not None else cash
+    return {
+        "status": {
+            "cash": cash,
+            "equity": equity,
+            "cash_weight": float(basis["cash_weight"]) if basis is not None else 0.0,
+            "daily_pnl_ratio": 0.0,
+            "updated_at": _iso_or_none(snapshot.get("last_updated")),
+            "last_error": snapshot.get("last_error"),
+        },
+        "diagnostics": diagnostics,
+        "graph": {
+            "counts": {"nodes": 0, "links": 0},
+            "summary_only": True,
+        },
+        "updated_at": _iso_or_none(snapshot.get("last_updated")),
+        "warming_up": True,
+    }
 
 
 def _lightweight_data_volume(summary: dict[str, Any]) -> dict[str, Any]:
@@ -996,7 +1338,8 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       period_minutes = int(payload.get("period_days", 7)) * 390
     else:
       period_minutes = 390
-    initial_cash = max(100_000.0, float(payload.get("initial_cash", 10_000_000)))
+    initial_cash = _resolve_operating_initial_cash(payload)
+    _ensure_initial_principal_configured(initial_cash)
     seed = int(payload.get("seed", 42))
     acceleration_factor = float(payload.get("acceleration_factor", 1.0))
     profit_gain = float(payload.get("profit_gain", payload.get("profit_gain_multiplier", 1.0)))
@@ -1013,6 +1356,10 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         "demo_id": demo_id,
         "status": "initialized",
         "progress": 0.0,
+        "target_return_rate": target_return_rate,
+        "period_minutes": period_minutes,
+        "initial_cash": initial_cash,
+        "initial_cash_source": str(payload.get("initial_cash_source") or "form"),
         "acceleration_factor": acceleration_factor,
         "profit_gain": max(0.25, min(4.0, profit_gain)),
         "message": "모의투자가 시작되었습니다. 단계 진행은 /api/paper-trading/step을 호출하세요.",
@@ -1026,6 +1373,7 @@ async def paper_trading_step(request: Request) -> JSONResponse:
 
 
 def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
+    started_at = time.perf_counter()
     demo_id = str(payload.get("demo_id", ""))
     if demo_id not in _streaming_demos:
         return {
@@ -1033,6 +1381,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "expired",
             "progress": 0.0,
             "message": "Paper trading session expired. Start a new paper trading run.",
+            "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
         }
 
     step_lock = _streaming_demo_step_locks.setdefault(demo_id, threading.Lock())
@@ -1043,6 +1392,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "status": "busy",
             "progress": demo.get_progress() if demo is not None else 0.0,
             "message": "Paper trading step is already running.",
+            "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
         }
 
     try:
@@ -1056,6 +1406,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "seconds_until_next_step": round(wait_seconds, 1),
                 "retry_after_seconds": round(wait_seconds, 1),
                 "message": "Waiting for the next one-minute paper trading bar.",
+                "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
             }
         result = demo.run_step()
         candidate_selection = demo.get_candidate_selection()
@@ -1067,6 +1418,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "message": "Paper trading completed.",
                 "final_results": demo.get_final_results(),
                 "ontology_filter_1": _candidate_selection_payload(candidate_selection),
+                "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
             }
 
         time_scaler = demo.get_time_scaler()
@@ -1110,6 +1462,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "stored_realtime_records": saved_realtime,
             "final_results": final,
             "ontology_filter_1": _candidate_selection_payload(candidate_selection),
+            "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
         }
     finally:
         step_lock.release()
@@ -2595,7 +2948,7 @@ HTML = """
       <form id="goalForm">
         <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
         <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
-        <div class="field"><label for="initialCash">시뮬레이션 예수금 (원)</label><input id="initialCash" name="initial_cash" type="number" min="100000" step="100000" value="10000000" placeholder="예: 10000000"></div>
+        <div class="field"><label for="initialCash">시뮬레이션 예수금 (원)</label><input id="initialCash" name="initial_cash" type="number" min="1" step="1000" value="10000000" placeholder="예: 10000000"></div>
         <button type="submit">가능성 분석</button>
         <button class="secondary" id="loadResearch" type="button">자료 불러오기</button>
         <div class="work-status" id="workStatus">
@@ -2645,6 +2998,17 @@ HTML = """
             <span class="chip" id="brokerAccount">계좌 -</span>
           </div>
           <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.</p>
+        </section>
+        <section class="panel span-4">
+          <h2>원금 보호</h2>
+          <div class="metric" id="principalMode">대기 중</div>
+          <div class="bar"><span id="principalCushionBar"></span></div>
+          <div class="chips" style="margin-top:12px;">
+            <span class="chip" id="principalFloor">보호 바닥 -</span>
+            <span class="chip" id="principalGrowth">성장 자본 -</span>
+            <span class="chip" id="principalBudget">위험 예산 -</span>
+          </div>
+          <p class="muted" id="principalStatus" style="margin-bottom:0;">초기 원금을 설정하면 BUY 주문 전 원금 보호 게이트가 적용됩니다.</p>
         </section>
         <section class="panel span-8">
           <h2>달성 가능성</h2>
@@ -2734,6 +3098,8 @@ HTML = """
     let lastRenderedCollectionCycle = null;
     let mockPerformanceTimer = null;
     let operationRequestActive = false;
+    let lastBrokerConnection = null;
+    let liveAccountBasis = null;
     let streamingStepBusy = false;
     let streamingStepFailures = 0;
     let streamingDemoTimer = null;
@@ -3038,6 +3404,7 @@ HTML = """
         target_return_rate: goal.target_return_rate,
         period_minutes: goal.period_minutes,
         initial_cash: goal.initial_cash,
+        initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
       } : {};
       await startOperationMode(mode, options);
     }
@@ -3077,8 +3444,13 @@ HTML = """
       const mode = labels[data.mode] || data.mode || 'Mode waiting';
       const message = data.paper_trading_message || data.live_readiness_message || data.live_trading_message || data.training_message || data.execution_label || '';
       document.getElementById('operationModeStatus').textContent = `${mode} | ${message}`;
-      const connection = data.kis_connection || {};
-      if (data.mode === 'live_readiness' || data.mode === 'live_trading') renderBrokerAccountCard(connection);
+      if (data.kis_connection && (data.kis_connection.account_checked || data.kis_connection.ok)) {
+        lastBrokerConnection = data.kis_connection;
+      }
+      const connection = data.kis_connection || lastBrokerConnection;
+      if ((data.mode === 'live_readiness' || data.mode === 'live_trading') && connection) {
+        renderBrokerAccountCard(connection);
+      }
       document.getElementById('gate').textContent = data.mode === 'paper_trading'
         ? 'Paper trading mode uses the KIS virtual broker and blocks live orders.'
         : data.mode === 'live_readiness'
@@ -3088,6 +3460,7 @@ HTML = """
             : 'Learning and collection continue while the server is running.';
     }
 
+    /*
     function renderBrokerAccountCard(connection = {}) {
       const depositTarget = document.getElementById('brokerDeposit');
       const holdingsTarget = document.getElementById('brokerHoldings');
@@ -3118,6 +3491,149 @@ HTML = """
       holdingsTarget.textContent = '실보유 종목 -';
       statusTarget.textContent = '실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.';
     }
+    */
+
+    /*
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      const accountSuffix = connection.account_suffix || '-';
+      accountTarget.textContent = `계좌 ${accountSuffix}`;
+      if (connection.account_checked) {
+        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        const basis = brokerBasisAmount(connection);
+        const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        depositTarget.textContent = fmtWon.format(deposit);
+        holdingsTarget.textContent = `실보유 종목 ${holdings}개`;
+        statusTarget.textContent = 'KIS 실계좌 읽기 완료 · 주문 제출 없음';
+        applyLiveAccountBasis(connection);
+        document.getElementById('runtimeStatus').textContent =
+          `KIS live account read complete | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = '조회 실패';
+        holdingsTarget.textContent = '실보유 종목 -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS 계좌 조회에 실패했습니다.';
+        if (connection.retry_after_seconds) {
+          statusTarget.textContent += ` ${connection.retry_after_seconds}초 후 다시 시도하세요.`;
+        }
+        return;
+      }
+      depositTarget.textContent = '읽기 전';
+      holdingsTarget.textContent = '실보유 종목 -';
+      statusTarget.textContent = '실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.';
+    }
+
+    */
+
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      const accountSuffix = connection.account_suffix || '-';
+      accountTarget.textContent = `Account ${accountSuffix}`;
+      if (connection.account_checked) {
+        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        const basis = brokerBasisAmount(connection);
+        const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        depositTarget.textContent = fmtWon.format(deposit);
+        holdingsTarget.textContent = `Holdings ${holdings}`;
+        statusTarget.textContent = 'KIS live account read complete; no order submitted.';
+        applyLiveAccountBasis(connection);
+        document.getElementById('runtimeStatus').textContent =
+          `KIS live account read complete | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = 'Read failed';
+        holdingsTarget.textContent = 'Holdings -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS account lookup failed.';
+        if (connection.retry_after_seconds) {
+          statusTarget.textContent += ` Retry after ${connection.retry_after_seconds}s.`;
+        }
+        return;
+      }
+      depositTarget.textContent = 'Before read';
+      holdingsTarget.textContent = 'Holdings -';
+      statusTarget.textContent = 'Live readiness reads real cash and holdings count only; no order is submitted.';
+    }
+
+    function brokerBasisAmount(connection = {}) {
+      const cash = Number(connection.actual_deposit ?? connection.cash ?? 0);
+      const equity = Number(connection.actual_equity ?? connection.equity ?? connection.account_value ?? connection.total_evaluation_amount ?? 0);
+      const invested = Number(connection.invested_value ?? 0);
+      const basis = equity > 0 ? equity : cash + invested;
+      return basis > 0 ? basis : 0;
+    }
+
+    function applyLiveAccountBasis(connection = {}) {
+      const basis = brokerBasisAmount(connection);
+      if (!basis) return;
+      const cash = Number(connection.actual_deposit ?? connection.cash ?? basis);
+      liveAccountBasis = {
+        cash,
+        equity: basis,
+        cash_weight: basis > 0 ? Math.max(0, Math.min(1, cash / basis)) : 0,
+        account_suffix: connection.account_suffix || '',
+      };
+      const initialCashInput = document.getElementById('initialCash');
+      if (initialCashInput) initialCashInput.value = String(Math.round(basis));
+      renderStatus({
+        cash: liveAccountBasis.cash,
+        equity: liveAccountBasis.equity,
+        cash_weight: liveAccountBasis.cash_weight,
+        basis_source: 'kis_live_account',
+        account_suffix: liveAccountBasis.account_suffix,
+      });
+      const goal = currentGoalPayload();
+      if (goal) lastGoalPayload = goal;
+    }
+
+    function renderPrincipalProtection(data = {}) {
+      const state = data.state || {};
+      const modeTarget = document.getElementById('principalMode');
+      const floorTarget = document.getElementById('principalFloor');
+      const growthTarget = document.getElementById('principalGrowth');
+      const budgetTarget = document.getElementById('principalBudget');
+      const statusTarget = document.getElementById('principalStatus');
+      const barTarget = document.getElementById('principalCushionBar');
+      if (!modeTarget || !floorTarget || !growthTarget || !budgetTarget || !statusTarget || !barTarget) return;
+      const mode = state.current_mode || 'NOT_CONFIGURED';
+      const equity = Number(state.current_equity || 0);
+      const floorValue = Number(state.protected_floor || 0);
+      const cushion = Number(state.cushion || 0);
+      const riskBudget = Number(state.risk_budget || 0);
+      const growth = Number(state.available_growth_capital || 0);
+      const distance = equity - floorValue;
+      const pct = equity > 0 ? Math.max(0, Math.min(100, (cushion / equity) * 100)) : 0;
+      modeTarget.textContent = mode;
+      floorTarget.textContent = `보호 바닥 ${fmtWon.format(floorValue)}`;
+      growthTarget.textContent = `성장 자본 ${fmtWon.format(growth)}`;
+      budgetTarget.textContent = `위험 예산 ${fmtWon.format(riskBudget)}`;
+      barTarget.style.width = `${pct.toFixed(1)}%`;
+      if (mode === 'PRINCIPAL_LOCKDOWN') {
+        statusTarget.textContent = `BUY 차단: 보호 바닥까지 ${fmtWon.format(distance)} 남았습니다. SELL/축소만 허용됩니다.`;
+      } else if (mode === 'DE_RISK') {
+        statusTarget.textContent = 'DE_RISK: 신규 매수는 제한되고 노출 축소를 우선합니다.';
+      } else if (mode === 'NOT_CONFIGURED') {
+        statusTarget.textContent = '초기 원금을 설정하면 원금 보호 바닥과 이익 재투자 예산이 계산됩니다.';
+      } else {
+        statusTarget.textContent = `보호 여유 ${fmtWon.format(cushion)} · 고점 대비 낙폭 ${(Number(state.drawdown_from_high_watermark || 0) * 100).toFixed(2)}%`;
+      }
+    }
+
+    async function loadPrincipalProtectionState() {
+      const data = await fetchJsonWithTimeout('/api/risk/principal-protection/state', {}, 8000);
+      renderPrincipalProtection(data);
+      return data;
+    }
+
     async function loadOperationModeStatus() {
       const data = await fetchJsonWithTimeout('/api/operation-mode/status', {}, 8000);
       const request = data.request || {};
@@ -3216,7 +3732,7 @@ HTML = """
       const initialCash = Number(payload.initial_cash || 0);
       if (!targetReturnRate || targetReturnRate < 0) return null;
       if (!periodMinutes || periodMinutes < 1) return null;
-      if (!initialCash || initialCash < 100000) return null;
+      if (!initialCash || initialCash <= 0) return null;
       return {
         target_return_rate: targetReturnRate,
         period_minutes: periodMinutes,
@@ -3249,6 +3765,7 @@ HTML = """
         target_return_rate: payload.target_return_rate,
         period_minutes: payload.period_minutes,
         initial_cash: payload.initial_cash,
+        initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
       };
     }
 
@@ -3343,18 +3860,22 @@ HTML = """
         const res = await fetch('/api/live-snapshot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ goal: lastGoalPayload, force_refresh: false }),
+          body: JSON.stringify({ goal: lastGoalPayload, force_refresh: false, include_graph: false }),
           signal: AbortSignal.timeout(12000),
         });
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
         renderStatus(data.status);
         renderDiagnostics(data.diagnostics);
-        const signature = graphSignature(data.graph);
-        document.getElementById('ontologyCounts').textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
-        if (signature !== lastGraphSignature) {
-          lastGraphSignature = signature;
-          await renderOntologyGraph(data.graph);
+        if (data.graph && data.graph.counts) {
+          document.getElementById('ontologyCounts').textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
+        }
+        if (data.graph && Array.isArray(data.graph.nodes) && Array.isArray(data.graph.links)) {
+          const signature = graphSignature(data.graph);
+          if (signature !== lastGraphSignature) {
+            lastGraphSignature = signature;
+            await renderOntologyGraph(data.graph);
+          }
         }
         if (data.assessment && data.compromises) {
           renderAssessment({ assessment: data.assessment, compromises: data.compromises }, { preserveSelection: true });
@@ -3380,6 +3901,16 @@ HTML = """
       document.getElementById('equity').textContent = fmtWon.format(data.equity);
       document.getElementById('cash').textContent = `기준 현금 ${fmtWon.format(data.cash)}`;
       document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
+      if (data.basis_source === 'kis_live_account' && Number(data.equity || 0) > 0) {
+        liveAccountBasis = {
+          cash: Number(data.cash || data.equity || 0),
+          equity: Number(data.equity || 0),
+          cash_weight: Number(data.cash_weight || 0),
+          account_suffix: data.account_suffix || '',
+        };
+        const initialCashInput = document.getElementById('initialCash');
+        if (initialCashInput) initialCashInput.value = String(Math.round(liveAccountBasis.equity));
+      }
     }
 
     function renderLearningStatus(data) {
@@ -5039,7 +5570,7 @@ HTML = """
       let targetReturn = parseFloat(document.getElementById('targetReturn')?.value || 0.02);
       if (targetReturn > 1) targetReturn = targetReturn / 100.0;
       const periodMinutes = parseInt(document.getElementById('targetMinutes')?.value || 390);
-      const initialCash = Math.max(100000, Number(document.getElementById('initialCash')?.value || 10000000));
+      const initialCash = Math.max(1, Number(liveAccountBasis?.equity || document.getElementById('initialCash')?.value || 10000000));
       const profitGain = Math.max(0.25, Math.min(4, Number(document.getElementById('profitGain')?.value || 1)));
       streamingDemoHistory = [];
       streamingDemoPrices = {};
@@ -5051,7 +5582,13 @@ HTML = """
         const response = await fetch('/api/paper-trading/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ target_return_rate: targetReturn, period_minutes: periodMinutes, initial_cash: initialCash, profit_gain: profitGain })
+          body: JSON.stringify({
+            target_return_rate: targetReturn,
+            period_minutes: periodMinutes,
+            initial_cash: initialCash,
+            initial_cash_source: liveAccountBasis ? 'live_account' : 'form',
+            profit_gain: profitGain
+          })
         });
         const data = await response.json();
         streamingDemoId = data.demo_id;
@@ -5123,6 +5660,7 @@ HTML = """
           document.getElementById('streamingProfit').textContent = fmtWon.format(profit);
           document.getElementById('streamingReturnRate').textContent = (data.account.return_rate * 100).toFixed(2) + '%';
           renderStreamingPerformance(data);
+          loadPrincipalProtectionState().catch(() => {});
         }
         if (data.trades && data.trades.length > 0) {
           data.trades.forEach(t => { streamingDemoHistory.unshift(t); streamingDemoPrices[t.ticker] = t.price; });
@@ -5166,6 +5704,7 @@ HTML = """
     updateModeButtons();
     updateModeActionCopy();
     loadStatus();
+    loadPrincipalProtectionState().catch(() => {});
     startLearningStatusPolling();
     loadRealtimeRuntime();
     loadOperationModeStatus().catch(() => {});

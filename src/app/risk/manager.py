@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from math import floor
+from pathlib import Path
 
+from app.audit import AuditLogger
 from app.cost import TradingCostEngine
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report
+from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
@@ -14,15 +17,18 @@ from app.schemas.domain import (
     OrderSide,
     OrderType,
     OrderIntent,
+    PrincipalProtectionDecisionAction,
     RiskManagerResult,
     RiskRules,
 )
 
 
 class RiskManager:
-    def __init__(self, rules: RiskRules | None = None) -> None:
+    def __init__(self, rules: RiskRules | None = None, audit_logger: AuditLogger | None = None) -> None:
         self.rules = rules or RiskRules()
         self.cost_engine = TradingCostEngine()
+        self.principal_protection = PrincipalProtectionEngine()
+        self.audit_logger = audit_logger or AuditLogger(Path("logs/principal-protection.jsonl"))
 
     def validate(
         self,
@@ -154,6 +160,55 @@ class RiskManager:
                     orderbook_snapshot=orderbook_snapshot if isinstance(orderbook_snapshot, dict) else None,
                     average_daily_trading_value=market.average_daily_trading_value,
                 )
+                protection = self.principal_protection.validate_order(
+                    intent,
+                    account,
+                    account.holdings,
+                    market,
+                    cost,
+                    self.rules.principal_protection,
+                    proposed_quantity=quantity,
+                )
+                metadata["principal_protection"] = to_jsonable(protection)
+                checks["principal_protection_gate"] = protection.action in {
+                    PrincipalProtectionDecisionAction.ALLOW,
+                    PrincipalProtectionDecisionAction.REDUCE_SIZE,
+                }
+                if protection.action == PrincipalProtectionDecisionAction.REDUCE_SIZE:
+                    quantity = int(protection.suggested_quantity or 0)
+                    if quantity > 0:
+                        cost = self.cost_engine.estimate(
+                            symbol=intent.ticker,
+                            market=intent.market,
+                            venue="KRX",
+                            instrument_type=_instrument_type_for_market(market),
+                            entry_price=market.last_price,
+                            expected_exit_price=float(intent.expected_exit_price),
+                            quantity=quantity,
+                            target_net_return=intent.target_net_return or 0.0,
+                            orderbook_snapshot=orderbook_snapshot if isinstance(orderbook_snapshot, dict) else None,
+                            average_daily_trading_value=market.average_daily_trading_value,
+                        )
+                        metadata["principal_protection_reduced_quantity"] = quantity
+                    else:
+                        checks["principal_protection_gate"] = False
+                if not checks["principal_protection_gate"]:
+                    for reason in protection.reason_codes:
+                        _add_rejection(
+                            reasons,
+                            rejection_log,
+                            reason,
+                            "principal_protection_gate",
+                            {
+                                "decision": str(protection.action),
+                                "estimated_trade_loss": protection.estimated_trade_loss,
+                                "risk_budget": protection.state.risk_budget,
+                                "protected_floor": protection.state.protected_floor,
+                                "cushion": protection.state.cushion,
+                            },
+                        )
+                    approved = False
+                self._record_principal_protection_decision(intent, market, quantity, protection)
                 metadata["cost_breakdown"] = cost.as_dict()
                 metadata["validation_required"] = not bool(intent.validation_id)
                 target_net_return = intent.target_net_return or 0.0
@@ -272,6 +327,28 @@ class RiskManager:
             rejection_reasons=tuple(reasons),
             final_order=final_order,
             metadata=metadata,
+        )
+
+    def _record_principal_protection_decision(
+        self,
+        intent: OrderIntent,
+        market: MarketSnapshot,
+        quantity: int,
+        protection: object,
+    ) -> None:
+        state = getattr(protection, "state", None)
+        if state is not None and getattr(state, "current_mode", None) == "NOT_CONFIGURED":
+            return
+        self.audit_logger.record(
+            "principal_protection_order_decision",
+            {
+                "ticker": intent.ticker,
+                "market": intent.market,
+                "action": intent.action,
+                "quantity": quantity,
+                "entry_price": market.last_price,
+                "decision": to_jsonable(protection),
+            },
         )
 
 

@@ -4,6 +4,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.realtime import OperationMode, OperationModeManager, ShortHorizonRiskPolicy
 from app.schemas.domain import OrderAction, OrderIntent
+from app import web as web_module
 from app.web import app
 
 
@@ -138,6 +140,171 @@ class RealtimeModesTest(unittest.TestCase):
         start_demo.assert_not_called()
         kis_probe.assert_called_once_with(paper=False, include_account=True)
         refresh_live.assert_not_called()
+
+    def test_live_readiness_status_keeps_checked_broker_account(self) -> None:
+        client = TestClient(app)
+        broker_state = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 1000000,
+            "holdings_count": 2,
+            "account_suffix": "...28",
+        }
+        with (
+            patch("app.web._start_live_worker"),
+            patch("app.web._kis_connection_probe", return_value=broker_state),
+            patch("app.web._get_or_refresh_live"),
+        ):
+            started = client.post("/api/operation-mode/start", json={"mode": "live_readiness"}).json()
+            status = client.get("/api/operation-mode/status").json()
+
+        self.assertTrue(started["ok"])
+        self.assertEqual(status["active"]["mode"], "live_readiness")
+        self.assertEqual(status["active"]["kis_connection"]["actual_deposit"], 1000000)
+        self.assertEqual(status["active"]["kis_connection"]["holdings_count"], 2)
+        self.assertEqual(status["kis_connection"]["account_suffix"], "...28")
+
+    def test_status_uses_checked_live_account_as_operating_basis(self) -> None:
+        client = TestClient(app)
+        broker_state = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 800000,
+            "invested_value": 200000,
+            "actual_equity": 1000000,
+            "account_suffix": "...28",
+        }
+        fallback_snapshot = {
+            "context": SimpleNamespace(
+                account=SimpleNamespace(cash=123),
+                report=SimpleNamespace(equity=456, cash_weight=0.27, daily_pnl_ratio=0.0),
+                risk_results=(),
+            ),
+            "last_updated": None,
+            "last_error": None,
+        }
+        with (
+            patch("app.web._start_live_worker"),
+            patch("app.web._kis_connection_probe", return_value=broker_state),
+            patch("app.web._get_or_refresh_live", return_value=fallback_snapshot),
+        ):
+            client.post("/api/operation-mode/start", json={"mode": "live_readiness"})
+            status = client.get("/api/status").json()
+
+        self.assertEqual(status["basis_source"], "kis_live_account")
+        self.assertEqual(status["cash"], 800000)
+        self.assertEqual(status["equity"], 1000000)
+        self.assertEqual(status["cash_weight"], 0.8)
+
+    def test_paper_mode_auto_uses_checked_live_account_basis_as_initial_cash(self) -> None:
+        client = TestClient(app)
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = {
+                "ok": True,
+                "mode": "live",
+                "account_checked": True,
+                "actual_deposit": 700000,
+                "invested_value": 300000,
+                "actual_equity": 1000000,
+                "account_suffix": "...28",
+            }
+        with (
+            patch("app.web._start_live_worker"),
+            patch("app.web._start_streaming_demo", return_value="demo-live-basis") as start_demo,
+            patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "paper"}),
+            patch("app.web._get_or_refresh_live"),
+        ):
+            data = client.post(
+                "/api/operation-mode/start",
+                json={
+                    "mode": "paper_trading",
+                    "target_return_rate": 0.02,
+                    "period_minutes": 20,
+                    "initial_cash": 10000000,
+                    "initial_cash_source": "live_account",
+                },
+            ).json()
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+
+    def test_research_diagnostics_uses_lightweight_cached_volume(self) -> None:
+        client = TestClient(app)
+
+        class Graph:
+            nodes = {"A": object(), "B": object()}
+
+            def triples(self):
+                return (("A", "supports", "B"),)
+
+        snapshot = {
+            "research_result": SimpleNamespace(
+                diagnostics={"events_count": 1, "live_data_present": True},
+                skipped_sources=(),
+                events=("event",),
+                market_snapshots=tuple(range(50)),
+            ),
+            "context": SimpleNamespace(
+                graph=Graph(),
+                reasoning_paths=tuple(range(50)),
+                ontology_runtime=SimpleNamespace(as_dict=lambda: {"uses_npu": False}),
+            ),
+            "stored_new_records": {"events": 1},
+            "store_summary": {"events": 10, "market_snapshots": 20},
+            "last_updated": None,
+            "last_error": None,
+            "is_refreshing": False,
+        }
+        with (
+            patch("app.web._live_snapshot", return_value=snapshot),
+            patch("app.web.LocalResearchStore.data_volume", side_effect=AssertionError("full scan should not run")),
+        ):
+            data = client.get("/api/research/diagnostics").json()
+
+        self.assertEqual(data["data_volume"]["by_kind"]["events"], 10)
+        self.assertEqual(len(data["market_snapshots"]), 25)
+        self.assertEqual(len(data["reasoning_paths"]), 25)
+
+    def test_live_snapshot_default_refresh_omits_full_graph_payload(self) -> None:
+        client = TestClient(app)
+
+        class Graph:
+            nodes = {"A": object(), "B": object()}
+
+            def triples(self):
+                return (("A", "supports", "B"),)
+
+        snapshot = {
+            "research_result": SimpleNamespace(
+                diagnostics={"events_count": 1},
+                skipped_sources=(),
+            ),
+            "context": SimpleNamespace(
+                account=SimpleNamespace(cash=1000),
+                report=SimpleNamespace(equity=1000, cash_weight=1.0, daily_pnl_ratio=0.0),
+                graph=Graph(),
+                reasoning_paths=tuple(range(50)),
+                ontology_runtime=SimpleNamespace(as_dict=lambda: {"uses_npu": False}),
+            ),
+            "store_summary": {"events": 10},
+            "stored_new_records": {},
+            "last_updated": None,
+            "last_error": None,
+            "is_refreshing": False,
+        }
+        with (
+            patch("app.web._live_snapshot", return_value=snapshot),
+            patch("app.web._get_or_refresh_live", side_effect=AssertionError("default refresh should use cache only")),
+            patch("app.web._graph_payload", side_effect=AssertionError("full graph should not be built")),
+        ):
+            data = client.post("/api/live-snapshot", json={"force_refresh": False}).json()
+
+        self.assertTrue(data["graph"]["summary_only"])
+        self.assertEqual(data["graph"]["counts"]["links"], 1)
+        self.assertNotIn("nodes", data["graph"])
 
     def test_live_trading_button_mode_is_blocked_by_default(self) -> None:
         client = TestClient(app)

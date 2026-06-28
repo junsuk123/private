@@ -198,6 +198,7 @@ class KisDevelopersApiClient:
         self.timeout = float(os.getenv("KIS_TIMEOUT_SECONDS", "10"))
         self._access_token = access_token
         self._token_expires_at = token_expires_at
+        self._token_source = "injected" if access_token else None
         self._token_cache_path = (
             Path(token_cache_path)
             if token_cache_path is not None
@@ -270,7 +271,7 @@ class KisDevelopersApiClient:
     def issue_access_token(self, force_refresh: bool = False) -> str:
         self.credentials.validate()
         if not force_refresh:
-            cached = self._load_cached_token()
+            cached = self._load_env_token() or self._load_cached_token()
             if cached:
                 return cached
         self._ensure_token_cache_writable()
@@ -293,8 +294,13 @@ class KisDevelopersApiClient:
         self._token_expires_at = datetime.now(timezone.utc) + timedelta(
             seconds=max(60, expires_in - KIS_TOKEN_CACHE_SKEW_SECONDS)
         )
+        self._token_source = "issued"
         self._write_cached_token()
         return token
+
+    @property
+    def token_source(self) -> str | None:
+        return self._token_source
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
         return self.transport.request(
@@ -357,10 +363,30 @@ class KisDevelopersApiClient:
             return self._access_token
         if self._access_token and self._token_expires_at is None:
             return self._access_token
-        cached = self._load_cached_token(now)
+        cached = self._load_env_token(now) or self._load_cached_token(now)
         if cached:
             return cached
         return self.issue_access_token()
+
+    def _load_env_token(self, now: datetime | None = None) -> str | None:
+        mode_prefix = "KIS_PAPER_" if self.paper else "KIS_LIVE_"
+        token = (
+            os.getenv(f"{mode_prefix}ACCESS_TOKEN")
+            or (None if self.paper else os.getenv("KIS_ACCESS_TOKEN"))
+            or ""
+        ).strip()
+        if not token:
+            return None
+        expires_at = _parse_datetime(
+            os.getenv(f"{mode_prefix}ACCESS_TOKEN_EXPIRES_AT")
+            or (None if self.paper else os.getenv("KIS_ACCESS_TOKEN_EXPIRES_AT"))
+        )
+        if expires_at is not None and expires_at <= (now or datetime.now(timezone.utc)):
+            return None
+        self._access_token = token
+        self._token_expires_at = expires_at
+        self._token_source = "env"
+        return token
 
     def _load_cached_token(self, now: datetime | None = None) -> str | None:
         if not self._token_cache_path.exists():
@@ -378,6 +404,7 @@ class KisDevelopersApiClient:
             return None
         self._access_token = token
         self._token_expires_at = expires_at
+        self._token_source = "cache"
         return token
 
     def _write_cached_token(self) -> None:
