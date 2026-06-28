@@ -30,9 +30,20 @@ python scripts/check_kis_connection.py
 python scripts/check_kis_connection.py --account
 ```
 
-The first command only issues an access token. The second command also calls
-the read-only balance endpoint and never places orders. KIS can reject repeated
-token issuance for about one minute, so wait briefly before retrying.
+The first command makes an access token available. If a valid cached token
+exists, it reuses that token instead of requesting a new one. The second command
+also calls the read-only balance endpoint and never places orders.
+
+Access tokens are cached under this ignored directory:
+
+- `config/secrets/kis_access_token.paper.json`
+- `config/secrets/kis_access_token.live.json`
+
+The token cache is treated like a secret and must not be committed or shared.
+KIS access tokens are valid for about 24 hours, and repeated token issuance can
+be limited, so keep using the cached token until it expires. To intentionally
+force a new token after expiry or revocation, delete the matching cache file and
+run the check again.
 
 PowerShell load example:
 

@@ -17,6 +17,7 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide
 KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
+KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
 
 
@@ -178,6 +179,7 @@ class KisDevelopersApiClient:
         transport: KisTransport | None = None,
         access_token: str | None = None,
         token_expires_at: datetime | None = None,
+        token_cache_path: str | Path | None = None,
     ) -> None:
         load_kis_env_file()
         self.paper = _env_bool("KIS_PAPER_TRADING", False) if paper is None else paper
@@ -196,6 +198,11 @@ class KisDevelopersApiClient:
         self.timeout = float(os.getenv("KIS_TIMEOUT_SECONDS", "10"))
         self._access_token = access_token
         self._token_expires_at = token_expires_at
+        self._token_cache_path = (
+            Path(token_cache_path)
+            if token_cache_path is not None
+            else _default_token_cache_path(self.paper)
+        )
         self._orders: dict[str, FinalOrder] = {}
 
     def place_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
@@ -260,8 +267,12 @@ class KisDevelopersApiClient:
             updated_at=datetime.now(timezone.utc),
         )
 
-    def issue_access_token(self) -> str:
+    def issue_access_token(self, force_refresh: bool = False) -> str:
         self.credentials.validate()
+        if not force_refresh:
+            cached = self._load_cached_token()
+            if cached:
+                return cached
         response = self.transport.request(
             "POST",
             self._url("/oauth2/tokenP"),
@@ -279,8 +290,9 @@ class KisDevelopersApiClient:
         expires_in = int(response.get("expires_in") or 60 * 60 * 24)
         self._access_token = token
         self._token_expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=max(60, expires_in - 60)
+            seconds=max(60, expires_in - KIS_TOKEN_CACHE_SKEW_SECONDS)
         )
+        self._write_cached_token()
         return token
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -344,7 +356,46 @@ class KisDevelopersApiClient:
             return self._access_token
         if self._access_token and self._token_expires_at is None:
             return self._access_token
+        cached = self._load_cached_token(now)
+        if cached:
+            return cached
         return self.issue_access_token()
+
+    def _load_cached_token(self, now: datetime | None = None) -> str | None:
+        if not self._token_cache_path.exists():
+            return None
+        try:
+            payload = json.loads(self._token_cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        token = str(payload.get("access_token") or "")
+        expires_at = _parse_datetime(payload.get("expires_at"))
+        mode = str(payload.get("mode") or "")
+        if not token or expires_at is None or mode != ("paper" if self.paper else "live"):
+            return None
+        if expires_at <= (now or datetime.now(timezone.utc)):
+            return None
+        self._access_token = token
+        self._token_expires_at = expires_at
+        return token
+
+    def _write_cached_token(self) -> None:
+        if not self._access_token or not self._token_expires_at:
+            return
+        payload = {
+            "access_token": self._access_token,
+            "expires_at": self._token_expires_at.isoformat(),
+            "mode": "paper" if self.paper else "live",
+            "base_url": self.endpoints.base_url,
+            "account_suffix": self.credentials.account_no[-2:],
+        }
+        try:
+            self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._token_cache_path.with_suffix(f"{self._token_cache_path.suffix}.tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp_path.replace(self._token_cache_path)
+        except OSError:
+            return
 
     def _order_body(self, order: FinalOrder) -> dict[str, str]:
         return {
@@ -464,6 +515,23 @@ def _to_float(value: Any) -> float:
         return float(str(value).replace(",", ""))
     except ValueError:
         return 0.0
+
+
+def _default_token_cache_path(paper: bool) -> Path:
+    mode = "paper" if paper else "live"
+    return Path(os.getenv("KIS_TOKEN_CACHE_DIR", "config/secrets")) / f"kis_access_token.{mode}.json"
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _env_bool(name: str, default: bool) -> bool:

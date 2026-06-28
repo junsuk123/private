@@ -28,7 +28,7 @@ def main() -> int:
 
     try:
         token = client.issue_access_token()
-        print(f"Token issued: yes, length={len(token)}")
+        print(f"Token available: yes, length={len(token)}")
         if args.account:
             portfolio = client.get_portfolio()
             print(f"Balance lookup: yes, holdings={len(portfolio.account.holdings)}")

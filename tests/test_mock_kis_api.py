@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,26 +158,28 @@ class MockKisApiTest(unittest.TestCase):
 
     def test_paper_kis_client_uses_real_rest_contract_in_mock_cycle(self) -> None:
         transport = RecordingKisTransport()
-        broker = KisDevelopersApiClient(
-            app_key="paper-app",
-            app_secret="paper-secret",
-            account_no="12345678-01",
-            paper=True,
-            enabled=True,
-            transport=transport,
-        )
-        order = FinalOrder(
-            ticker="005930",
-            market="KR",
-            order_type=OrderType.LIMIT,
-            side=OrderSide.BUY,
-            quantity=2,
-            limit_price=70000,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            broker = KisDevelopersApiClient(
+                app_key="paper-app",
+                app_secret="paper-secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=Path(tmp) / "kis_access_token.paper.json",
+            )
+            order = FinalOrder(
+                ticker="005930",
+                market="KR",
+                order_type=OrderType.LIMIT,
+                side=OrderSide.BUY,
+                quantity=2,
+                limit_price=70000,
+            )
 
-        receipt = broker.place_limit_order(order)
-        execution = broker.get_order_status(receipt.order_id)
-        portfolio = broker.get_portfolio()
+            receipt = broker.place_limit_order(order)
+            execution = broker.get_order_status(receipt.order_id)
+            portfolio = broker.get_portfolio()
 
         order_call = next(call for call in transport.calls if call["url"].endswith("/order-cash"))
         self.assertIn("openapivts.koreainvestment.com:29443", order_call["url"])
@@ -190,6 +194,63 @@ class MockKisApiTest(unittest.TestCase):
 
         status_call = next(call for call in transport.calls if call["url"].endswith("/inquire-daily-ccld"))
         self.assertEqual(status_call["params"]["EXCG_ID_DVSN_CD"], "KRX")
+
+    def test_kis_access_token_is_reused_from_cache_across_clients(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_cache_path = Path(tmp) / "kis_access_token.paper.json"
+            transport = RecordingKisTransport()
+            first = KisDevelopersApiClient(
+                app_key="paper-app",
+                app_secret="paper-secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+            self.assertEqual(first.issue_access_token(), "paper-token")
+
+            second = KisDevelopersApiClient(
+                app_key="paper-app",
+                app_secret="paper-secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+            self.assertEqual(second.issue_access_token(), "paper-token")
+
+        token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
+        self.assertEqual(len(token_calls), 1)
+
+    def test_expired_kis_access_token_cache_is_refreshed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_cache_path = Path(tmp) / "kis_access_token.paper.json"
+            token_cache_path.write_text(
+                json.dumps(
+                    {
+                        "access_token": "expired-token",
+                        "expires_at": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                        "mode": "paper",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            transport = RecordingKisTransport()
+            client = KisDevelopersApiClient(
+                app_key="paper-app",
+                app_secret="paper-secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+            self.assertEqual(client.issue_access_token(), "paper-token")
+
+        token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
+        self.assertEqual(len(token_calls), 1)
 
 
 def _supportive_npu_scores(markets):
