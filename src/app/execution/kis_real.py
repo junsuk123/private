@@ -151,6 +151,44 @@ class KisEndpointSet:
             return "VTTC0012U" if self.paper else "TTTC0012U"
         return "VTTC0011U" if self.paper else "TTTC0011U"
 
+    def overseas_tr_id_for_order(self, exchange_code: str, side: OrderSide) -> str:
+        exchange = exchange_code.upper()
+        if side == OrderSide.BUY:
+            tr_id = (
+                "TTTT1002U"
+                if exchange in {"NASD", "NYSE", "AMEX"}
+                else "TTTS1002U"
+                if exchange == "SEHK"
+                else "TTTS0202U"
+                if exchange == "SHAA"
+                else "TTTS0305U"
+                if exchange == "SZAA"
+                else "TTTS0308U"
+                if exchange == "TKSE"
+                else "TTTS0311U"
+                if exchange in {"HASE", "VNSE"}
+                else ""
+            )
+        else:
+            tr_id = (
+                "TTTT1006U"
+                if exchange in {"NASD", "NYSE", "AMEX"}
+                else "TTTS1001U"
+                if exchange == "SEHK"
+                else "TTTS1005U"
+                if exchange == "SHAA"
+                else "TTTS0304U"
+                if exchange == "SZAA"
+                else "TTTS0307U"
+                if exchange == "TKSE"
+                else "TTTS0310U"
+                if exchange in {"HASE", "VNSE"}
+                else ""
+            )
+        if not tr_id:
+            raise ValueError(f"unsupported overseas exchange for KIS order: {exchange_code}")
+        return "V" + tr_id[1:] if self.paper else tr_id
+
     @property
     def order_status_tr_id(self) -> str:
         return "VTTC8001R" if self.paper else "TTTC8001R"
@@ -158,6 +196,10 @@ class KisEndpointSet:
     @property
     def balance_tr_id(self) -> str:
         return "VTTC8434R" if self.paper else "TTTC8434R"
+
+    @property
+    def overseas_present_balance_tr_id(self) -> str:
+        return "VTRP6504R" if self.paper else "CTRP6504R"
 
 
 class KisDevelopersApiClient:
@@ -210,6 +252,8 @@ class KisDevelopersApiClient:
         self._ensure_enabled()
         if order.side not in {OrderSide.BUY, OrderSide.SELL}:
             raise ValueError(f"unsupported KIS order side: {order.side}")
+        if _is_overseas_order(order):
+            return self._place_overseas_limit_order(order)
         body = self._order_body(order)
         response = self._post(
             "/uapi/domestic-stock/v1/trading/order-cash",
@@ -228,6 +272,30 @@ class KisDevelopersApiClient:
             accepted=True,
             status="ACCEPTED",
             message=str(response.get("msg1") or "KIS accepted the order."),
+            order=order,
+            submitted_at=datetime.now(timezone.utc),
+        )
+
+    def _place_overseas_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
+        exchange_code = _overseas_exchange_code(order.market)
+        body = self._overseas_order_body(order, exchange_code)
+        response = self._post(
+            "/uapi/overseas-stock/v1/trading/order",
+            tr_id=self.endpoints.overseas_tr_id_for_order(exchange_code, order.side),
+            body=body,
+            include_hashkey=True,
+        )
+        self._ensure_success(response, "KIS overseas order rejected")
+        output = response.get("output") or {}
+        order_id = str(output.get("ODNO") or output.get("odno") or output.get("KRX_FWDG_ORD_ORGNO") or "")
+        if not order_id:
+            order_id = f"KISOVRS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        self._orders[order_id] = order
+        return MockKisOrderReceipt(
+            order_id=order_id,
+            accepted=True,
+            status="ACCEPTED",
+            message=str(response.get("msg1") or "KIS accepted the overseas order."),
             order=order,
             submitted_at=datetime.now(timezone.utc),
         )
@@ -261,7 +329,15 @@ class KisDevelopersApiClient:
             or summary_row.get("prvs_rcdl_excc_amt")
             or summary_row.get("tot_evlu_amt")
         )
-        account = AccountSnapshot(cash=cash, holdings=holdings)
+        cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
+        foreign_cash_by_currency = self._get_overseas_cash_by_currency()
+        cash_by_currency.update(foreign_cash_by_currency)
+        account = AccountSnapshot(
+            cash=cash,
+            holdings=holdings,
+            base_currency="KRW",
+            cash_by_currency=cash_by_currency,
+        )
         return MockKisPortfolio(
             account=account,
             market_prices={holding.ticker: holding.last_price for holding in holdings},
@@ -459,6 +535,21 @@ class KisDevelopersApiClient:
             "CNDT_PRIC": "",
         }
 
+    def _overseas_order_body(self, order: FinalOrder, exchange_code: str) -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "OVRS_EXCG_CD": exchange_code,
+            "PDNO": order.ticker.upper(),
+            "ORD_QTY": str(int(order.quantity)),
+            "OVRS_ORD_UNPR": _format_overseas_price(order.limit_price),
+            "CTAC_TLNO": "",
+            "MGCO_APTM_ODNO": "",
+            "SLL_TYPE": "00" if order.side == OrderSide.SELL else "",
+            "ORD_SVR_DVSN_CD": "0",
+            "ORD_DVSN": "00",
+        }
+
     def _order_status_params(self, order_id: str, order: FinalOrder | None) -> dict[str, str]:
         today = datetime.now().strftime("%Y%m%d")
         return {
@@ -493,6 +584,35 @@ class KisDevelopersApiClient:
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
         }
+
+    def _overseas_present_balance_params(self, nation_code: str = "000") -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "WCRC_FRCR_DVSN_CD": "02",
+            "NATN_CD": nation_code,
+            "TR_MKET_CD": "00",
+            "INQR_DVSN_CD": "00",
+        }
+
+    def _get_overseas_cash_by_currency(self) -> dict[str, float]:
+        balances: dict[str, float] = {}
+        for nation_code in ("000", "840"):
+            try:
+                response = self._get(
+                    "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+                    tr_id=self.endpoints.overseas_present_balance_tr_id,
+                    params=self._overseas_present_balance_params(nation_code),
+                )
+                self._ensure_success(response, "KIS overseas present balance lookup failed")
+            except KisApiError:
+                if nation_code == "840":
+                    return balances
+                continue
+            balances.update(_foreign_cash_by_currency_from_overseas_response(response, nation_code))
+            if balances:
+                break
+        return balances
 
     def _execution_from_status(
         self,
@@ -564,6 +684,142 @@ def _to_float(value: Any) -> float:
         return float(str(value).replace(",", ""))
     except ValueError:
         return 0.0
+
+
+def _is_overseas_order(order: FinalOrder) -> bool:
+    market = str(order.market or "").upper()
+    return not (order.ticker.isdigit() and len(order.ticker) == 6) or any(
+        token in market
+        for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE")
+    )
+
+
+def _overseas_exchange_code(market: str) -> str:
+    value = str(market or "").upper()
+    if "NASDAQ" in value or "NASD" in value:
+        return "NASD"
+    if "NYSE" in value:
+        return "NYSE"
+    if "AMEX" in value:
+        return "AMEX"
+    if "SEHK" in value or "HONG" in value:
+        return "SEHK"
+    if "SHAA" in value or "SHANGHAI" in value:
+        return "SHAA"
+    if "SZAA" in value or "SHENZHEN" in value:
+        return "SZAA"
+    if "TKSE" in value or "JAPAN" in value or "TOKYO" in value:
+        return "TKSE"
+    if "HASE" in value or "HANOI" in value:
+        return "HASE"
+    if "VNSE" in value or "VIETNAM" in value or "HOCHIMINH" in value:
+        return "VNSE"
+    if value in {"US", "US-LISTED", "GLOBAL", "OVERSEAS"}:
+        return os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper()
+    return value or os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper()
+
+
+def _format_overseas_price(value: float) -> str:
+    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def _cash_by_currency_from_summary(summary_row: dict[str, Any], krw_cash: float) -> dict[str, float]:
+    cash_by_currency: dict[str, float] = {"KRW": float(krw_cash or 0.0)}
+    explicit = summary_row.get("cash_by_currency")
+    if isinstance(explicit, dict):
+        for currency, amount in explicit.items():
+            code = str(currency or "").upper().strip()
+            if code:
+                cash_by_currency[code] = _to_float(amount)
+    foreign = summary_row.get("foreign_cash_by_currency")
+    if isinstance(foreign, dict):
+        for currency, amount in foreign.items():
+            code = str(currency or "").upper().strip()
+            if code and code != "KRW":
+                cash_by_currency[code] = _to_float(amount)
+    aliases = {
+        "USD": ("usd_cash", "usd_deposit", "usd_dnca_amt", "frcr_dnca_amt", "frcr_dncl_amt"),
+        "JPY": ("jpy_cash", "jpy_deposit", "jpy_dnca_amt"),
+        "EUR": ("eur_cash", "eur_deposit", "eur_dnca_amt"),
+        "CNY": ("cny_cash", "cny_deposit", "cny_dnca_amt"),
+        "HKD": ("hkd_cash", "hkd_deposit", "hkd_dnca_amt"),
+    }
+    for currency, keys in aliases.items():
+        for key in keys:
+            if key in summary_row:
+                cash_by_currency[currency] = _to_float(summary_row.get(key))
+                break
+    return cash_by_currency
+
+
+def _foreign_cash_by_currency_from_overseas_response(
+    response: dict[str, Any],
+    nation_code: str = "000",
+) -> dict[str, float]:
+    balances: dict[str, float] = {}
+    for row in _response_rows(response):
+        currency = _currency_from_row(row, nation_code)
+        if not currency or currency == "KRW":
+            continue
+        amount = _foreign_cash_amount_from_row(row)
+        if amount is None:
+            continue
+        balances[currency] = balances.get(currency, 0.0) + amount
+    return balances
+
+
+def _response_rows(value: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        if value and any(
+            key in value
+            for key in (
+                "crcy_cd",
+                "tr_crcy_cd",
+                "frcr_dncl_amt",
+                "frcr_dncl_amt_2",
+                "frcr_drwg_psbl_amt_1",
+                "nxdy_frcr_drwg_psbl_amt",
+            )
+        ):
+            rows.append(value)
+        for item in value.values():
+            rows.extend(_response_rows(item))
+    elif isinstance(value, list):
+        for item in value:
+            rows.extend(_response_rows(item))
+    return rows
+
+
+def _currency_from_row(row: dict[str, Any], nation_code: str) -> str | None:
+    for key in ("crcy_cd", "tr_crcy_cd", "ovrs_crcy_cd", "curr_cd", "currency", "bass_exrt_curr_cd"):
+        value = str(row.get(key) or "").upper().strip()
+        if value:
+            return value
+    if nation_code == "840":
+        return "USD"
+    return None
+
+
+def _foreign_cash_amount_from_row(row: dict[str, Any]) -> float | None:
+    cash_keys = (
+        "frcr_dncl_amt",
+        "frcr_dncl_amt_2",
+        "frcr_dnca_amt",
+        "dnca_frcr_amt",
+        "ord_psbl_frcr_amt",
+        "frcr_ord_psbl_amt",
+        "frcr_buy_psbl_amt",
+        "buy_psbl_frcr_amt",
+        "withdrawable_frcr_amt",
+        "frcr_drwg_psbl_amt_1",
+        "nxdy_frcr_drwg_psbl_amt",
+    )
+    for key in cash_keys:
+        if key in row:
+            return _to_float(row.get(key))
+    return None
 
 
 def _default_token_cache_path(paper: bool) -> Path:

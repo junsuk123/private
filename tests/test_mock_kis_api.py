@@ -68,6 +68,12 @@ class RecordingKisTransport:
                 ],
                 "output2": [{"dnca_tot_amt": "1000000"}],
             }
+        if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+            return {
+                "rt_cd": "0",
+                "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "12.34"}],
+                "output3": {"tot_asst_amt": "9983", "tot_frcr_cblc_smtl": "9983.000000"},
+            }
         raise AssertionError(f"unexpected KIS request: {method} {url}")
 
 
@@ -306,6 +312,8 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(balance_call["headers"]["authorization"], "Bearer manual-live-token")
         self.assertEqual(client.token_source, "env")
         self.assertEqual(portfolio.account.cash, 1_000_000)
+        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 1_000_000)
+        self.assertEqual(portfolio.account.cash_by_currency["USD"], 12.34)
 
 
 def _supportive_npu_scores(markets):

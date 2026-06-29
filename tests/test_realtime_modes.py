@@ -173,6 +173,10 @@ class RealtimeModesTest(unittest.TestCase):
             "mode": "live",
             "account_checked": True,
             "actual_deposit": 800000,
+            "krw_cash": 800000,
+            "cash_by_currency": {"KRW": 800000, "USD": 12.34},
+            "foreign_cash_by_currency": {"USD": 12.34},
+            "base_currency": "KRW",
             "invested_value": 200000,
             "actual_equity": 1000000,
             "account_suffix": "...28",
@@ -196,6 +200,9 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(status["basis_source"], "kis_live_account")
         self.assertEqual(status["cash"], 800000)
+        self.assertEqual(status["krw_cash"], 800000)
+        self.assertEqual(status["cash_by_currency"], {"KRW": 800000.0, "USD": 12.34})
+        self.assertEqual(status["foreign_cash_by_currency"], {"USD": 12.34})
         self.assertEqual(status["equity"], 1000000)
         self.assertEqual(status["cash_weight"], 0.8)
 

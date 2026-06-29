@@ -118,6 +118,10 @@ class CandidateCache:
 
 _candidate_cache = CandidateCache()
 SHORT_HORIZON_STRATEGY_CONFIG_PATH = Path("config/short_horizon_strategies.yaml")
+KRX_SUB_1000_WON_RULE_EFFECTIVE_DATE_LABEL = "2026-07-01"
+KRX_SUB_1000_WON_RULE_EFFECTIVE_AT = datetime(2026, 6, 30, 15, tzinfo=timezone.utc)
+KRX_SUB_1000_WON_PRICE_FLOOR = 1_000.0
+KRX_SUB_1000_WON_REJECT_REASON = "KRX_SUB_1000_WON_DELISTING_RISK"
 
 
 def universe_from_tickers(tickers: Iterable[str]) -> tuple[UniverseStock, ...]:
@@ -328,19 +332,37 @@ def ontology_filter_1(
     array_build_ms = (time.perf_counter() - arrays_started) * 1000.0
     accepted = tuple(
         sorted(
-            (int(index) for index in vectorized.accepted_indices),
+            (
+                int(index)
+                for index in vectorized.accepted_indices
+                if not _is_krx_sub_1000_won_delisting_risk(snapshots[int(index)])
+            ),
             key=lambda index: (float(vectorized.scores[index]), tickers[index]),
             reverse=True,
         )
     )
     candidates = tuple(tickers[index] for index in accepted[:target_count])
-    rejected = tuple(tickers[int(index)] for index in vectorized.rejected_indices)
+    rule_rejected_indices = tuple(
+        index
+        for index, snapshot in enumerate(snapshots)
+        if _is_krx_sub_1000_won_delisting_risk(snapshot)
+    )
+    rejected = tuple(
+        dict.fromkeys(
+            (
+                *(tickers[int(index)] for index in vectorized.rejected_indices),
+                *(tickers[index] for index in rule_rejected_indices),
+            )
+        )
+    )
 
     npu_metrics: dict[str, float | int | str] = {
         **vectorized.profile,
         "candidate_array_build_ms": round(array_build_ms, 3),
         "candidate_count_input": len(snapshots),
         "candidate_count_after_hard_filter": len(accepted),
+        "krx_sub_1000_won_rule_effective": int(_krx_sub_1000_won_rule_active()),
+        "krx_sub_1000_won_rejected": len(rule_rejected_indices),
     }
     if _npu_candidate_scoring_enabled() and accepted:
         npu_candidates, npu_metrics_update = _rank_accepted_with_npu(
@@ -360,9 +382,11 @@ def ontology_filter_1(
             }
         )
 
-    trace_indices = _trace_indices_for_screening(tickers, vectorized, candidates)
+    trace_indices = _trace_indices_for_screening(tickers, vectorized, candidates, rule_rejected_indices)
     traces = tuple(
-        _trace_from_vectorized_snapshot(
+        _krx_sub_1000_won_rejection_trace(snapshots[int(index)])
+        if _is_krx_sub_1000_won_delisting_risk(snapshots[int(index)])
+        else _trace_from_vectorized_snapshot(
             snapshots[int(index)],
             float(vectorized.scores[int(index)]),
             int(vectorized.reason_masks[int(index)]),
@@ -445,6 +469,11 @@ def _ontology_filter_1_python_loop(
             score=round(score, 6),
             reason=reason,
         )
+        if _is_krx_sub_1000_won_delisting_risk(snapshot):
+            trace = _krx_sub_1000_won_rejection_trace(snapshot)
+            traces.append(trace)
+            rejected.append(snapshot.ticker)
+            continue
         traces.append(trace)
         if decision == "CandidateStock":
             accepted.append((score, snapshot.ticker))
@@ -455,6 +484,8 @@ def _ontology_filter_1_python_loop(
     npu_metrics: dict[str, float | int | str] = {
         "candidate_count_input": len(snapshots),
         "candidate_count_after_hard_filter": hard_filter_count,
+        "krx_sub_1000_won_rule_effective": int(_krx_sub_1000_won_rule_active()),
+        "krx_sub_1000_won_rejected": sum(1 for snapshot in snapshots if _is_krx_sub_1000_won_delisting_risk(snapshot)),
     }
     if _npu_candidate_scoring_enabled() and accepted:
         npu_candidates, npu_metrics_update = _rank_accepted_with_npu(
@@ -501,12 +532,13 @@ def _trace_indices_for_screening(
     tickers: tuple[str, ...],
     vectorized: Any,
     candidates: tuple[str, ...],
+    policy_rejected_indices: tuple[int, ...] = (),
     reject_sample_size: int = 24,
 ) -> tuple[int, ...]:
     candidate_set = set(candidates)
     selected = [index for index, ticker in enumerate(tickers) if ticker in candidate_set]
     rejected = [int(index) for index in vectorized.rejected_indices[:reject_sample_size]]
-    return tuple(dict.fromkeys((*selected, *rejected)))
+    return tuple(dict.fromkeys((*selected, *rejected, *policy_rejected_indices[:reject_sample_size])))
 
 
 def _trace_from_vectorized_snapshot(
@@ -560,6 +592,70 @@ def _reject_reason_from_mask(reason_mask: int) -> str:
     if "insufficient_liquidity" in names:
         return "Trading value or liquidity score is too low."
     return "Rejected by lightweight ontology screening."
+
+
+def _is_krx_sub_1000_won_delisting_risk(snapshot: LightweightMarketSnapshot) -> bool:
+    return _is_krx_sub_1000_won_delisting_risk_by_values(snapshot.ticker, snapshot.market, snapshot.current_price)
+
+
+def _is_krx_sub_1000_won_delisting_risk_by_values(ticker: str, market: str, current_price: float) -> bool:
+    if not _krx_sub_1000_won_rule_active():
+        return False
+    if not _is_domestic_snapshot_market(ticker, market):
+        return False
+    try:
+        price = float(current_price)
+    except (TypeError, ValueError):
+        return False
+    return 0 < price < KRX_SUB_1000_WON_PRICE_FLOOR
+
+
+def _krx_sub_1000_won_rule_active(now: datetime | None = None) -> bool:
+    override = os.getenv("KRX_SUB_1000_WON_RULE_ENABLED", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    effective_at = _krx_sub_1000_won_effective_at()
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return current >= effective_at
+
+
+def _krx_sub_1000_won_effective_at() -> datetime:
+    raw = os.getenv("KRX_SUB_1000_WON_RULE_EFFECTIVE_DATE", "").strip()
+    if not raw:
+        return KRX_SUB_1000_WON_RULE_EFFECTIVE_AT
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return KRX_SUB_1000_WON_RULE_EFFECTIVE_AT
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _krx_sub_1000_won_rejection_trace(snapshot: LightweightMarketSnapshot) -> ReasoningTrace:
+    return ReasoningTrace(
+        stock_code=snapshot.ticker,
+        stage="ontology_filter_1",
+        input_features={
+            "current_price": snapshot.current_price,
+            "market": snapshot.market,
+            "rule_effective_date": KRX_SUB_1000_WON_RULE_EFFECTIVE_DATE_LABEL,
+            "price_floor_krw": KRX_SUB_1000_WON_PRICE_FLOOR,
+            "trading_value": snapshot.trading_value,
+            "liquidity_score": snapshot.liquidity_score,
+        },
+        fired_rules=(KRX_SUB_1000_WON_REJECT_REASON,),
+        decision="RejectStock",
+        score=0.0,
+        reason=(
+            "Domestic KRX stock is below the KRW 1,000 low-price delisting-risk floor "
+            "effective from 2026-07-01."
+        ),
+    )
 
 
 def _is_domestic_snapshot_market(ticker: str, market: str) -> bool:

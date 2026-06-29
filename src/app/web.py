@@ -27,8 +27,9 @@ from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
 from app.data.llm_classifier import event_llm_runtime_status
 from app.data.realtime_store import RealtimeMarketDataStore
-from app.execution import KisApiError, KisDevelopersApiClient, MockKisDevelopersApi, PaperOrderExecutor
+from app.execution import KisApiError, KisDevelopersApiClient, LiveExecutionCoordinator, MockKisDevelopersApi, PaperOrderExecutor
 from app.execution.kis_auth import build_kis_client, run_kis_health_check, validate_live_secret_file
+from app.execution.kis_errors import LiveExecutionBlocked
 from app.graph import KnowledgeGraph, get_ontology_runtime
 from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise_goals
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
@@ -59,6 +60,7 @@ from app.schemas.domain import (
     PrincipalProtectionConfig,
     RealtimeExecution,
     RealtimeQuote,
+    RiskRules,
     SourceMetadata,
 )
 from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
@@ -148,9 +150,9 @@ sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
 LIVE_REFRESH_SECONDS = max(5, int(os.getenv("LIVE_REFRESH_SECONDS", "15")))
 LIVE_STALE_SECONDS = max(LIVE_REFRESH_SECONDS * 2, int(os.getenv("LIVE_STALE_SECONDS", "45")))
-ONTOLOGY_UI_NODE_LIMIT = max(40, int(os.getenv("ONTOLOGY_UI_NODE_LIMIT", "180")))
-ONTOLOGY_UI_LINK_LIMIT = max(80, int(os.getenv("ONTOLOGY_UI_LINK_LIMIT", "420")))
-ONTOLOGY_UI_REASONING_STEP_LIMIT = max(10, int(os.getenv("ONTOLOGY_UI_REASONING_STEP_LIMIT", "80")))
+ONTOLOGY_UI_NODE_LIMIT = max(40, int(os.getenv("ONTOLOGY_UI_NODE_LIMIT", "1000")))
+ONTOLOGY_UI_LINK_LIMIT = max(80, int(os.getenv("ONTOLOGY_UI_LINK_LIMIT", "4500")))
+ONTOLOGY_UI_REASONING_STEP_LIMIT = max(10, int(os.getenv("ONTOLOGY_UI_REASONING_STEP_LIMIT", "320")))
 LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     60,
     int(os.getenv("LEARNING_COLLECTION_INTERVAL_SECONDS", "3600")),
@@ -296,10 +298,38 @@ def _number_or_zero(value: Any) -> float:
     return 0.0
 
 
+def _cash_by_currency_payload(
+    cash_by_currency: dict[str, Any] | None,
+    fallback_cash: Any,
+    base_currency: str = "KRW",
+) -> dict[str, float]:
+  result: dict[str, float] = {}
+  if isinstance(cash_by_currency, dict):
+    for currency, amount in cash_by_currency.items():
+      code = str(currency or "").upper().strip()
+      if code:
+        result[code] = _number_or_zero(amount)
+  code = str(base_currency or "KRW").upper().strip() or "KRW"
+  if code not in result:
+    result[code] = _number_or_zero(fallback_cash)
+  return result
+
+
+def _foreign_cash_by_currency(cash_by_currency: dict[str, Any] | None) -> dict[str, float]:
+  if not isinstance(cash_by_currency, dict):
+    return {}
+  return {
+      str(currency).upper(): _number_or_zero(amount)
+      for currency, amount in cash_by_currency.items()
+      if str(currency or "").upper() != "KRW"
+  }
+
+
 def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dict[str, Any] | None:
   if not connection or not connection.get("account_checked"):
     return None
   cash = _number_or_zero(connection.get("actual_deposit") or connection.get("cash") or 0)
+  cash_by_currency = _cash_by_currency_payload(connection.get("cash_by_currency"), cash)
   equity = _number_or_zero(
       connection.get("actual_equity")
       or connection.get("equity")
@@ -314,6 +344,10 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
     return None
   return {
       "cash": cash if cash > 0 else equity,
+      "krw_cash": cash_by_currency.get("KRW", cash if cash > 0 else equity),
+      "cash_by_currency": cash_by_currency,
+      "foreign_cash_by_currency": _foreign_cash_by_currency(cash_by_currency),
+      "base_currency": "KRW",
       "equity": equity,
       "cash_weight": max(0.0, min(1.0, (cash if cash > 0 else equity) / equity)),
       "source": "kis_live_account",
@@ -332,6 +366,20 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
   if basis is None:
     return context.account
   return AccountSnapshot(cash=max(0.0, float(basis["equity"])), holdings=(), captured_at=datetime.now(timezone.utc))
+
+
+def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
+  basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
+  if basis is None:
+    return None
+  cash_by_currency = dict(basis.get("cash_by_currency") or {"KRW": basis.get("cash", 0.0)})
+  return AccountSnapshot(
+      cash=max(0.0, float(basis.get("cash") or 0.0)),
+      holdings=(),
+      base_currency=str(basis.get("base_currency") or "KRW"),
+      cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
+      captured_at=datetime.now(timezone.utc),
+  )
 
 
 def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
@@ -675,6 +723,10 @@ def status() -> JSONResponse:
     return _json(
       {
         "cash": live_basis["cash"],
+        "krw_cash": live_basis["krw_cash"],
+        "cash_by_currency": live_basis["cash_by_currency"],
+        "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
+        "base_currency": live_basis["base_currency"],
         "equity": live_basis["equity"],
         "cash_weight": live_basis["cash_weight"],
         "basis_source": live_basis["source"],
@@ -1148,6 +1200,15 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         result["holdings_count"] = len(portfolio.account.holdings)
         result["cash"] = portfolio.account.cash
         result["actual_deposit"] = portfolio.account.cash
+        cash_by_currency = _cash_by_currency_payload(
+            getattr(portfolio.account, "cash_by_currency", None),
+            portfolio.account.cash,
+            getattr(portfolio.account, "base_currency", "KRW"),
+        )
+        result["krw_cash"] = cash_by_currency.get("KRW", portfolio.account.cash)
+        result["cash_by_currency"] = cash_by_currency
+        result["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
+        result["base_currency"] = getattr(portfolio.account, "base_currency", "KRW")
         result["invested_value"] = portfolio.account.invested_value
         result["actual_equity"] = portfolio.account.equity
         result["cash_weight"] = portfolio.account.cash / portfolio.account.equity if portfolio.account.equity > 0 else 0.0
@@ -1423,6 +1484,10 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_grap
       status_payload.update(
           {
               "cash": live_basis["cash"],
+              "krw_cash": live_basis["krw_cash"],
+              "cash_by_currency": live_basis["cash_by_currency"],
+              "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
+              "base_currency": live_basis["base_currency"],
               "equity": live_basis["equity"],
               "cash_weight": live_basis["cash_weight"],
               "basis_source": live_basis["source"],
@@ -1487,6 +1552,10 @@ def _lightweight_live_snapshot_response(snapshot: dict[str, Any] | None = None) 
     return {
         "status": {
             "cash": cash,
+            "krw_cash": float(basis["krw_cash"]) if basis is not None else cash,
+            "cash_by_currency": basis["cash_by_currency"] if basis is not None else {"KRW": cash},
+            "foreign_cash_by_currency": basis["foreign_cash_by_currency"] if basis is not None else {},
+            "base_currency": basis["base_currency"] if basis is not None else "KRW",
             "equity": equity,
             "cash_weight": float(basis["cash_weight"]) if basis is not None else 0.0,
             "basis_source": basis["source"] if basis is not None else "warming_up",
@@ -2635,7 +2704,19 @@ def _refresh_live_cache() -> None:
       _set_live_progress(48, "storage", "Saving research records")
       stored_counts = store.save_research_result(research_result)
       _set_live_progress(64, "analysis", "Building indicators, ontology graph, and reasoning paths")
-      context = build_analysis_context(research_result, _analysis_research_for_current_mode(store))
+      active_mode = _active_operation_mode()
+      live_account = _live_account_snapshot_for_analysis() if active_mode == "live_trading" else None
+      live_risk_rules = (
+          RiskRules(live_trading_enabled=True)
+          if active_mode == "live_trading"
+          else None
+      )
+      context = build_analysis_context(
+          research_result,
+          _analysis_research_for_current_mode(store),
+          account_override=live_account,
+          risk_rules=live_risk_rules,
+      )
       model_paths: dict[str, str] = {}
       realtime_examples = build_realtime_supervised_examples(context.temporal_frames, context.signals)
       if learning_mode == "learning":
@@ -2655,10 +2736,11 @@ def _refresh_live_cache() -> None:
       )
       _set_live_progress(84, "graph", "Persisting ontology graph and reasoning paths")
       graph_counts = store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
+      live_execution_summary = _run_live_trading_execution_cycle(context) if active_mode == "live_trading" else None
       with _live_lock:
         _live_state["research_result"] = research_result
         _live_state["context"] = context
-        _live_state["context_mode"] = _active_operation_mode()
+        _live_state["context_mode"] = active_mode
         _live_state["graph_payload"] = _graph_payload(context)
         _live_state["graph_payload_context_id"] = id(context)
         _live_state["store_summary"] = store.summary()
@@ -2685,6 +2767,8 @@ def _refresh_live_cache() -> None:
                 "live_feature_frames_built": int(live_feature_collection.get("built", 0) or 0),
                 "live_short_horizon_live_eligible": bool(live_model_artifact.get("live_eligible")),
                 "live_short_horizon_examples": int(live_model_artifact.get("metrics", {}).get("example_count", 0)),
+                "live_execution_attempted": bool(live_execution_summary and live_execution_summary.get("attempted")),
+                "live_orders_submitted": int((live_execution_summary or {}).get("submitted", 0) or 0),
             },
         )
       _set_live_progress(
@@ -2710,6 +2794,98 @@ def _refresh_live_cache() -> None:
     finally:
       with _live_lock:
         _live_state["is_refreshing"] = False
+
+
+def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
+  approved_orders = [
+      result.final_order
+      for result in getattr(context, "risk_results", ()) or ()
+      if getattr(result, "approved", False) and getattr(result, "final_order", None) is not None
+  ]
+  executable_orders = [
+      order
+      for order in approved_orders
+      if _is_live_executable_order(order)
+  ]
+  summary: dict[str, Any] = {
+      "attempted": False,
+      "approved_orders": len(approved_orders),
+      "executable_orders": len(executable_orders),
+      "markets": len(getattr(context, "markets", ()) or ()),
+      "signals": len(getattr(context, "signals", ()) or ()),
+      "intents": len(getattr(context, "intents", ()) or ()),
+      "risk_results": len(getattr(context, "risk_results", ()) or ()),
+      "account_cash": float(getattr(getattr(context, "account", None), "cash", 0.0) or 0.0),
+      "submitted": 0,
+      "blocked": [],
+      "errors": [],
+  }
+  if not approved_orders:
+    rejections = [
+        {
+            "ticker": getattr(result, "ticker", ""),
+            "rejection_reasons": tuple(getattr(result, "rejection_reasons", ()) or ()),
+        }
+        for result in (getattr(context, "risk_results", ()) or ())[:10]
+        if not getattr(result, "approved", False)
+    ]
+    summary["rejections"] = rejections
+    audit.record("live_trading_execution_skipped", {**summary, "reason": "NO_APPROVED_FINAL_ORDERS"})
+    return summary
+  if not executable_orders:
+    summary["skipped_orders"] = [
+        {"ticker": getattr(order, "ticker", ""), "market": getattr(order, "market", "")}
+        for order in approved_orders
+    ]
+    audit.record("live_trading_execution_skipped", {**summary, "reason": "NO_EXECUTABLE_LIVE_FINAL_ORDERS"})
+    return summary
+
+  runtime = evaluate_live_runtime_gates(require_manual_arming=True)
+  if not runtime.ok:
+    summary["blocked"] = list(runtime.failures)
+    audit.record("live_trading_execution_blocked", summary)
+    return summary
+
+  coordinator = LiveExecutionCoordinator(KisDevelopersApiClient(paper=False, enabled=True))
+  for order in executable_orders:
+    summary["attempted"] = True
+    key = f"auto-live:{getattr(order, 'ticker', '')}:{getattr(order, 'side', '')}:{getattr(order, 'quantity', '')}:{getattr(order, 'limit_price', '')}"
+    try:
+      submission = coordinator.submit_final_order(order, idempotency_key=key)
+    except LiveExecutionBlocked as exc:
+      summary["blocked"].append({"ticker": order.ticker, "reason_codes": tuple(exc.reason_codes)})
+      continue
+    except Exception as exc:  # noqa: BLE001 - live cycle must log and continue safely.
+      summary["errors"].append({"ticker": order.ticker, "error_type": exc.__class__.__name__, "message": str(exc)})
+      continue
+    summary["submitted"] += 1
+    audit.record(
+        "live_trading_order_submitted",
+        {
+            "ticker": order.ticker,
+            "quantity": order.quantity,
+            "limit_price": order.limit_price,
+            "broker_order_id": submission.broker_order_id,
+            "status": submission.status,
+            "execution_id": submission.execution_id,
+        },
+    )
+  event = "live_trading_execution_completed" if summary["submitted"] else "live_trading_execution_blocked"
+  audit.record(event, summary)
+  return summary
+
+
+def _is_live_executable_order(order: FinalOrder) -> bool:
+  ticker = str(getattr(order, "ticker", "") or "")
+  market = str(getattr(order, "market", "") or "").upper()
+  if ticker.isdigit() and len(ticker) == 6:
+    return True
+  if not ticker.replace(".", "").replace("-", "").isalnum():
+    return False
+  return any(
+      token in market
+      for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+  )
 
 
 def _get_or_refresh_live(force_refresh: bool = False) -> dict[str, Any]:
@@ -3001,9 +3177,6 @@ def _trim_graph_payload_for_ui(
         if str(link.get("source")) in selected_ids and str(link.get("target")) in selected_ids
     ][:ONTOLOGY_UI_LINK_LIMIT]
 
-    linked_ids = {str(link.get("source")) for link in display_links} | {str(link.get("target")) for link in display_links}
-    if linked_ids:
-        selected_ids &= linked_ids
     display_nodes = [node for node in sorted(nodes, key=node_score, reverse=True) if str(node.get("id")) in selected_ids]
     display_ids = {str(node.get("id")) for node in display_nodes}
     display_steps = [
@@ -3674,6 +3847,8 @@ HTML = """
           <div class="chips" style="margin-top:12px;">
             <span class="chip" id="brokerHoldings">실보유 종목 -</span>
             <span class="chip" id="brokerAccount">계좌 -</span>
+            <span class="chip" id="brokerKrwCash">원화 -</span>
+            <span class="chip" id="brokerForeignCash">외화 -</span>
           </div>
           <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.</p>
         </section>
@@ -3779,9 +3954,15 @@ HTML = """
     let activeOperationMode = null;
     let lastBrokerConnection = null;
     let liveAccountBasis = null;
+    
+    let streamingDemoId = null;
+    let streamingDemoRunning = false;
+    let streamingDemoHistory = [];
+    let streamingDemoPrices = {};
+    let streamingInitialCash = 0;
     let streamingStepBusy = false;
-    let streamingStepFailures = 0;
     let streamingDemoTimer = null;
+    let streamingStepFailures = 0;
     let streamingReturnSeries = [];
     const fmtWon = new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 });
     const fmtUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -3807,6 +3988,28 @@ HTML = """
         return formatMoney(Number(account.cash || 0), account.base_currency || 'KRW');
       }
       return currencies.map((currency) => formatMoney(Number(cashByCurrency[currency] || 0), currency)).join(' / ');
+    }
+
+    function currencyMap(account = {}) {
+      const source = account && account.cash_by_currency && typeof account.cash_by_currency === 'object'
+        ? account.cash_by_currency
+        : {};
+      const result = {};
+      Object.keys(source).forEach((currency) => {
+        const code = String(currency || '').toUpperCase();
+        if (code) result[code] = Number(source[currency] || 0);
+      });
+      if (!Object.prototype.hasOwnProperty.call(result, 'KRW')) {
+        result.KRW = Number(account.krw_cash ?? account.actual_deposit ?? account.cash ?? 0);
+      }
+      return result;
+    }
+
+    function formatForeignCash(account = {}) {
+      const balances = currencyMap(account);
+      const currencies = Object.keys(balances).filter((currency) => currency !== 'KRW').sort();
+      if (!currencies.length) return '-';
+      return currencies.map((currency) => formatMoney(balances[currency], currency)).join(' / ');
     }
 
     function applyCompactKoreanDashboard() {
@@ -3878,7 +4081,10 @@ HTML = """
         } else if (data.is_refreshing || progress.active) {
           renderSystemFlow({ data: 'active' }, { data: progress.message || 'Refreshing data' });
         } else if ((progress.percent || 0) >= 100) {
-          renderSystemFlow({ data: 'done', analysis: 'done' }, { data: 'Data cache ready', analysis: 'Analysis cache ready' });
+          renderSystemFlow({ data: 'done', analysis: 'done' }, {
+            data: progress.message || 'Realtime data collection complete; waiting for next scheduled cycle',
+            analysis: 'Analysis cache ready',
+          });
         }
       } catch (error) {
         renderLearningStatus({
@@ -3994,9 +4200,12 @@ HTML = """
     function renderSystemFlow(states = {}, messages = {}) {
       document.querySelectorAll('#systemFlowPanel .flow-step').forEach((step) => {
         const key = step.dataset.flowStep;
-        const state = states[key] || 'idle';
+        const state = Object.prototype.hasOwnProperty.call(states, key)
+          ? states[key]
+          : (step.dataset.flowState || 'idle');
         step.classList.remove('active', 'done', 'error');
         if (state === 'active' || state === 'done' || state === 'error') step.classList.add(state);
+        step.dataset.flowState = state;
         const label = step.querySelector('span');
         if (label && messages[key]) label.textContent = messages[key];
       });
@@ -4395,25 +4604,33 @@ HTML = """
       const depositTarget = document.getElementById('brokerDeposit');
       const holdingsTarget = document.getElementById('brokerHoldings');
       const accountTarget = document.getElementById('brokerAccount');
+      const krwCashTarget = document.getElementById('brokerKrwCash');
+      const foreignCashTarget = document.getElementById('brokerForeignCash');
       const statusTarget = document.getElementById('brokerStatus');
       if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
       const accountSuffix = connection.account_suffix || '-';
       accountTarget.textContent = `Account ${accountSuffix}`;
       if (connection.account_checked) {
         const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        const balances = currencyMap(connection);
+        const krwCash = Number(balances.KRW ?? deposit);
         const basis = brokerBasisAmount(connection);
         const holdings = connection.holdings_count ?? connection.holdings ?? 0;
-        depositTarget.textContent = fmtWon.format(deposit);
+        depositTarget.textContent = formatCashByCurrency(connection);
+        if (krwCashTarget) krwCashTarget.textContent = `KRW ${fmtWon.format(krwCash)}`;
+        if (foreignCashTarget) foreignCashTarget.textContent = `Foreign ${formatForeignCash(connection)}`;
         holdingsTarget.textContent = `Holdings ${holdings}`;
         statusTarget.textContent = 'KIS live account read complete; no order submitted.';
         applyLiveAccountBasis(connection);
         document.getElementById('runtimeStatus').textContent =
-          `KIS live account read complete | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+          `KIS live account read complete | KRW ${fmtWon.format(krwCash)} | foreign ${formatForeignCash(connection)} | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
         return;
       }
       if (connection.ok === false) {
         depositTarget.textContent = 'Read failed';
         holdingsTarget.textContent = 'Holdings -';
+        if (krwCashTarget) krwCashTarget.textContent = 'KRW -';
+        if (foreignCashTarget) foreignCashTarget.textContent = 'Foreign -';
         statusTarget.textContent = connection.message || connection.error || 'KIS account lookup failed.';
         if (connection.retry_after_seconds) {
           statusTarget.textContent += ` Retry after ${connection.retry_after_seconds}s.`;
@@ -4422,6 +4639,8 @@ HTML = """
       }
       depositTarget.textContent = 'Before read';
       holdingsTarget.textContent = 'Holdings -';
+      if (krwCashTarget) krwCashTarget.textContent = 'KRW -';
+      if (foreignCashTarget) foreignCashTarget.textContent = 'Foreign -';
       statusTarget.textContent = 'Live readiness reads real cash and holdings count only; no order is submitted.';
     }
 
@@ -4439,6 +4658,10 @@ HTML = """
       const cash = Number(connection.actual_deposit ?? connection.cash ?? basis);
       liveAccountBasis = {
         cash,
+        krw_cash: Number((currencyMap(connection).KRW) ?? cash),
+        cash_by_currency: currencyMap(connection),
+        foreign_cash_by_currency: connection.foreign_cash_by_currency || {},
+        base_currency: connection.base_currency || 'KRW',
         equity: basis,
         cash_weight: basis > 0 ? Math.max(0, Math.min(1, cash / basis)) : 0,
         account_suffix: connection.account_suffix || '',
@@ -4451,6 +4674,10 @@ HTML = """
       }
       renderStatus({
         cash: liveAccountBasis.cash,
+        krw_cash: liveAccountBasis.krw_cash,
+        cash_by_currency: liveAccountBasis.cash_by_currency,
+        foreign_cash_by_currency: liveAccountBasis.foreign_cash_by_currency,
+        base_currency: liveAccountBasis.base_currency,
         equity: liveAccountBasis.equity,
         cash_weight: liveAccountBasis.cash_weight,
         basis_source: 'kis_live_account',
@@ -4777,6 +5004,10 @@ HTML = """
         data = {
           ...(data || {}),
           cash: liveAccountBasis.cash,
+          krw_cash: liveAccountBasis.krw_cash,
+          cash_by_currency: liveAccountBasis.cash_by_currency,
+          foreign_cash_by_currency: liveAccountBasis.foreign_cash_by_currency,
+          base_currency: liveAccountBasis.base_currency,
           equity: liveAccountBasis.equity,
           cash_weight: liveAccountBasis.cash_weight,
           basis_source: 'kis_live_account',
@@ -4784,11 +5015,16 @@ HTML = """
         };
       }
       document.getElementById('equity').textContent = fmtWon.format(data.equity);
-      document.getElementById('cash').textContent = `기준 현금 ${fmtWon.format(data.cash)}`;
+      document.getElementById('cash').textContent = `기준 현금 ${formatCashByCurrency(data)}`;
       document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
       if (data.basis_source === 'kis_live_account' && Number(data.equity || 0) > 0) {
+        const balances = currencyMap(data);
         liveAccountBasis = {
           cash: Number(data.cash || data.equity || 0),
+          krw_cash: Number(balances.KRW ?? data.cash ?? 0),
+          cash_by_currency: balances,
+          foreign_cash_by_currency: data.foreign_cash_by_currency || {},
+          base_currency: data.base_currency || 'KRW',
           equity: Number(data.equity || 0),
           cash_weight: Number(data.cash_weight || 0),
           account_suffix: data.account_suffix || '',
@@ -4806,14 +5042,16 @@ HTML = """
       const progress = data.progress || {};
       const learning = data.learning || {};
       const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
-      const active = Boolean(progress.active || data.is_refreshing || learning.active);
+      const active = Boolean(progress.active || data.is_refreshing);
       const stageLabels = {
         idle: 'idle', starting: 'starting', research: 'collecting', storage: 'storing',
         analysis: 'analysis', graph: 'graph', waiting: 'waiting', complete: 'complete', error: 'error',
       };
       const stage = stageLabels[progress.stage] || progress.stage || 'idle';
       const message = prettyLearningMessage(progress.message || 'Checking status');
-      document.getElementById('learningStatusTitle').textContent = active ? 'Collection/learning running' : 'Collection/learning waiting';
+      document.getElementById('learningStatusTitle').textContent = active
+        ? 'Collection running'
+        : (learning.active ? 'Collection complete; background learning scheduled' : 'Collection waiting');
       document.getElementById('learningStatusMessage').textContent = message;
       document.getElementById('learningStatusProgress').style.width = `${percent}%`;
       document.getElementById('learningStatusMeta').textContent = `${stage} | ${percent.toFixed(1)}%`;
@@ -6447,11 +6685,7 @@ HTML = """
       if (mockPerformanceTimer) window.clearInterval(mockPerformanceTimer);
     });
 
-    let streamingDemoId = null;
-    let streamingDemoRunning = false;
-    let streamingDemoHistory = [];
-    let streamingDemoPrices = {};
-    let streamingInitialCash = 0;
+
     let streamingTargetReturnRate = 0;
     let streamingTargetMinutes = 0;
 

@@ -1,0 +1,3209 @@
+
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>개인 투자 분석 시스템</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2430; --muted: #667085;
+      --line: #d9dee7; --accent: #0f766e; --accent-strong: #0b5f59;
+      --warn: #b45309; --chip: #eef6f4;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font-family: Arial, Helvetica, sans-serif; letter-spacing: 0; }
+    .shell { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 100vh; }
+    aside { border-right: 1px solid var(--line); background: #eef2f5; padding: 20px; }
+    main { padding: 22px; }
+    h1 { font-size: 22px; margin: 0 0 18px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    input { width: 100%; height: 40px; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 14px; background: white; }
+    button { height: 40px; border: 0; border-radius: 6px; padding: 0 14px; background: var(--accent); color: white; font-weight: 700; cursor: pointer; }
+    button:hover { background: var(--accent-strong); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.secondary { background: white; color: var(--ink); border: 1px solid var(--line); }
+    .segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 14px; }
+    .segmented label { margin: 0; }
+    .segmented input { position: absolute; opacity: 0; pointer-events: none; }
+    .segmented span { display: block; border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: white; color: var(--ink); font-weight: 700; text-align: center; cursor: pointer; }
+    .segmented input:checked + span { background: var(--accent); border-color: var(--accent); color: white; }
+    .field { margin-bottom: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+    .span-4 { grid-column: span 4; } .span-8 { grid-column: span 8; } .span-12 { grid-column: span 12; }
+    .metric { font-size: 26px; font-weight: 800; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .bar { width: 100%; height: 12px; background: #e6e9ef; border-radius: 999px; overflow: hidden; margin-top: 10px; }
+    .bar > span { display: block; height: 100%; background: var(--accent); width: 0%; }
+    .bar.good > span { background: #067647; }
+    .bar.warn > span { background: #b45309; }
+    .bar.bad > span { background: #b42318; }
+    .score-row { display: grid; grid-template-columns: 140px minmax(160px, 1fr) 58px; gap: 10px; align-items: center; margin: 10px 0; }
+    .score-label { color: var(--muted); font-size: 13px; }
+    .score-value { font-weight: 800; text-align: right; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .stat { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fbfcfe; }
+    .stat strong { display: block; font-size: 22px; margin-bottom: 4px; }
+    .ticker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .ticker-card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: white; }
+    .sentiment { display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: #e6e9ef; margin: 10px 0; }
+    .sentiment span { display: block; height: 100%; }
+    .sentiment .pos { background: #067647; }
+    .sentiment .neu { background: #98a2b3; }
+    .sentiment .neg { background: #b42318; }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .choice { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: white; cursor: pointer; }
+    .choice.selected { border-color: var(--accent); outline: 2px solid #99d5cc; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip { background: var(--chip); color: var(--accent-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; }
+    .log { white-space: pre-wrap; background: #111827; color: #e5e7eb; border-radius: 8px; padding: 14px; min-height: 160px; overflow: auto; font-size: 12px; }
+    .table-wrap { width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    table.live-table { width: 100%; border-collapse: collapse; font-size: 12px; background: white; }
+    .live-table th, .live-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+    .live-table th:first-child, .live-table td:first-child { text-align: left; }
+    .live-table tr:last-child td { border-bottom: 0; }
+    .tone-pos { color: #067647; font-weight: 700; }
+    .tone-neg { color: #b42318; font-weight: 700; }
+    .side-buy { color: #067647; font-weight: 800; }
+    .side-sell { color: #b42318; font-weight: 800; }
+    .status { padding: 10px 12px; border-radius: 8px; background: #fff7ed; color: var(--warn); border: 1px solid #fed7aa; margin-bottom: 14px; }
+    .work-status { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fafc; display: none; }
+    .work-status.active { display: block; }
+    .work-status strong { display: block; margin-bottom: 6px; }
+    .work-status .bar { margin-top: 8px; height: 10px; }
+    .collection-log-chart { width: 100%; height: 64px; margin-top: 10px; display: block; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+    .collection-log-list { margin-top: 8px; display: grid; gap: 6px; max-height: 170px; overflow: auto; }
+    .collection-log-item { display: grid; grid-template-columns: 58px 1fr auto; gap: 8px; align-items: center; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 12px; }
+    .collection-log-item strong { display: inline; margin: 0; font-size: 12px; }
+    .collection-log-status { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 5px; background: #94a3b8; }
+    .collection-log-status.running { background: #0f766e; }
+    .collection-log-status.complete { background: #16a34a; }
+    .collection-log-status.error { background: #dc2626; }
+    .collection-log-status.scheduled, .collection-log-status.stopped { background: #64748b; }
+    .data-volume-wrap { margin-top: 12px; display: grid; grid-template-columns: minmax(260px, 1fr) minmax(220px, 320px); gap: 12px; align-items: stretch; }
+    .data-volume-chart { width: 100%; height: 180px; display: block; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+    .source-volume-list { border: 1px solid var(--line); border-radius: 6px; background: #fff; padding: 10px; max-height: 180px; overflow: auto; display: grid; gap: 6px; }
+    .source-volume-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; font-size: 12px; align-items: center; }
+    .warning-list { margin-top: 10px; display: grid; gap: 6px; }
+    .warning-item { padding: 8px 10px; border-radius: 6px; border: 1px solid #f59e0b; background: #fffbeb; color: #92400e; font-size: 12px; }
+    .mode-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 10px 0 14px; }
+    .mode-grid button { height: auto; min-height: 44px; padding: 8px 10px; text-align: left; }
+    .mode-grid small { display: block; margin-top: 3px; font-weight: 400; opacity: .9; }
+    .mode-step-label { margin: 10px 0 6px; font-size: 12px; color: var(--muted); font-weight: 700; letter-spacing: .02em; }
+    .mode-grid button.active { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(15,118,110,.12); }
+    .mode-grid button:disabled { opacity: .55; cursor: not-allowed; }
+    .flow-panel { display: grid; gap: 7px; margin-top: 14px; }
+    .flow-step { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: center; padding: 8px 9px; border: 1px solid var(--line); border-radius: 6px; background: #fff; font-size: 12px; }
+    .flow-dot { width: 18px; height: 18px; border-radius: 50%; background: #cbd5e1; border: 3px solid #edf2f7; }
+    .flow-step strong { display: block; font-size: 12px; margin: 0 0 2px; }
+    .flow-step span { display: block; color: var(--muted); overflow-wrap: anywhere; }
+    .flow-step.active { border-color: #8bc7be; background: #f0fdfa; }
+    .flow-step.active .flow-dot { background: var(--accent); }
+    .flow-step.done .flow-dot { background: #067647; }
+    .flow-step.error { border-color: #fecaca; background: #fff1f2; }
+    .flow-step.error .flow-dot { background: #b42318; }
+    .mini-chart { width: 100%; height: 74px; margin-top: 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; display: block; }
+    .score-row .mini-chart { grid-column: 1 / -1; }
+    .ontology-scene { grid-column: 1 / -1; order: -1; min-height: 760px; position: relative; overflow: hidden; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #0f172a; }
+    .ontology-wide-layout { width: 100%; margin: 0 0 14px; }
+    .ontology-toolbar { position: absolute; z-index: 2; top: 12px; left: 12px; right: 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: #e5e7eb; }
+    .ontology-toolbar button { height: 34px; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.22); color: #fff; }
+    .ontology-toolbar button:hover { background: rgba(255,255,255,.18); }
+    .ontology-badge { display: inline-flex; align-items: center; min-height: 34px; padding: 0 10px; border-radius: 6px; background: rgba(15,23,42,.72); border: 1px solid rgba(255,255,255,.18); font-size: 13px; }
+    .ontology-filter { display: inline-flex; gap: 4px; padding: 4px; border-radius: 6px; background: rgba(15,23,42,.72); border: 1px solid rgba(255,255,255,.18); }
+    .ontology-filter label { margin: 0; color: #e5e7eb; font-size: 12px; display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px; }
+    .ontology-filter input { width: auto; height: auto; }
+    .reasoning-strip { position: absolute; z-index: 2; left: 12px; right: 12px; bottom: 54px; display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 2fr); gap: 8px; align-items: stretch; pointer-events: none; }
+    .reasoning-strip > div { padding: 9px 10px; border-radius: 6px; background: rgba(15,23,42,.78); border: 1px solid rgba(255,255,255,.18); color: #e5e7eb; font-size: 12px; }
+    .reasoning-strip strong { display: block; color: #fff; margin-bottom: 3px; }
+    .reasoning-progress { height: 5px; margin-top: 7px; border-radius: 999px; background: rgba(255,255,255,.16); overflow: hidden; }
+    .reasoning-progress span { display: block; height: 100%; width: 0%; background: #facc15; }
+    .ontology-legend { position: absolute; z-index: 2; left: 12px; bottom: 12px; display: flex; flex-wrap: wrap; gap: 8px; max-width: calc(100% - 24px); }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; padding: 0 8px; border-radius: 6px; background: rgba(15,23,42,.72); border: 1px solid rgba(255,255,255,.18); color: #e5e7eb; font-size: 12px; }
+    .legend-dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; border: 1px solid rgba(255,255,255,.5); box-shadow: 0 0 0 1px rgba(15,23,42,.35); }
+    .ontology-panel { position: absolute; z-index: 2; top: 58px; right: 12px; width: 260px; max-width: calc(100% - 24px); padding: 12px; border-radius: 8px; background: rgba(15,23,42,.86); border: 1px solid rgba(255,255,255,.18); color: #e5e7eb; font-size: 12px; }
+    .ontology-panel strong { display: block; font-size: 15px; margin-bottom: 6px; color: #fff; }
+    .ontology-panel .muted { color: #cbd5e1; }
+    #ontologyCanvas { width: 100%; height: 760px; display: block; }
+    #ontologyTooltip { position: absolute; z-index: 3; pointer-events: none; min-width: 160px; max-width: 260px; padding: 8px 10px; border-radius: 6px; background: rgba(15,23,42,.92); color: #fff; border: 1px solid rgba(255,255,255,.18); font-size: 12px; transform: translate(12px, 12px); display: none; }
+    @media (min-width: 901px) {
+      .shell { grid-template-columns: 300px minmax(0, 1fr); }
+      aside { padding: 14px; max-height: 100vh; overflow: auto; }
+      main { padding: 14px; }
+      h1 { font-size: 20px; margin-bottom: 10px; }
+      h2 { font-size: 14px; margin-bottom: 8px; }
+      .grid { gap: 10px; align-items: start; }
+      .panel { padding: 12px; }
+      .metric { font-size: 22px; }
+      .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+      .stat { padding: 9px; }
+      .stat strong { font-size: 18px; }
+      .field { margin-bottom: 9px; }
+      input, button { height: 34px; font-size: 13px; }
+      .mode-grid { grid-template-columns: 1fr; gap: 6px; }
+      .mode-grid button { min-height: 38px; padding: 7px 9px; }
+      .work-status { margin-top: 8px; padding: 9px; }
+      .flow-panel { grid-template-columns: 1fr 1fr; gap: 6px; }
+      .flow-step { grid-template-columns: 16px minmax(0, 1fr); padding: 7px; }
+      .flow-dot { width: 14px; height: 14px; border-width: 2px; }
+      .collection-log-chart,
+      .collection-log-list,
+      .data-volume-wrap,
+      .warning-list,
+      #sourceVolumeList,
+      #output,
+      #relations { display: none !important; }
+      #learningStatusCard .bar { height: 8px; }
+      #streamingDemoContainer[hidden] { display: none !important; }
+      #streamingDemoContainer .score-row { grid-template-columns: 84px minmax(0, 1fr); margin: 6px 0; }
+      #streamingDemoContainer .score-row .mini-chart { display: none; }
+      .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+      .choice { padding: 10px; min-height: 96px; }
+      .choice .metric { font-size: 20px; }
+      .table-wrap { max-height: 160px; }
+      table.live-table { font-size: 11px; }
+      .live-table th, .live-table td { padding: 6px 7px; }
+      .ontology-scene { min-height: 700px; }
+      #ontologyCanvas { height: 700px; }
+    }
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      .span-4, .span-8 { grid-column: span 12; }
+      .cards { grid-template-columns: 1fr; }
+      .stats, .ticker-grid { grid-template-columns: 1fr; }
+      .data-volume-wrap { grid-template-columns: 1fr; }
+      .ontology-scene { min-height: 560px; }
+      #ontologyCanvas { height: 560px; }
+      .reasoning-strip { grid-template-columns: 1fr; bottom: 84px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <h1>개인 투자 분석 시스템</h1>
+      <div class="status" id="gate">목표가 확정될 때까지 프로그램은 시작되지 않습니다.</div>
+      <h2>운영 모드</h2>
+      <div class="mode-step-label">실시간 통합 데이터 기준</div>
+      <div class="mode-grid" id="modeActionGrid">
+        <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
+        <button type="button" id="liveFlagsButton" class="secondary" onclick="applyLiveFlags()">실전 플래그 적용<small>주문 없이 게이트만 전환</small></button>
+        <button type="button" id="modeLiveTradingButton" class="danger" onclick="startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
+      </div>
+      <button type="button" id="terminateTradingButton" class="danger" onclick="terminateActiveTrading()" disabled>조기 종료<small>보유분 전량 매도 후 종료</small></button>
+      <div class="work-status active">
+        <strong id="operationModeStatus">모드 대기</strong>
+        <div class="muted" id="runtimeStatus">NPU 상태 확인 중</div>
+      </div>
+      <div class="work-status active" id="learningStatusCard">
+        <strong id="learningStatusTitle">학습 현황</strong>
+        <div class="muted" id="learningStatusMessage">실시간 상태를 확인하는 중입니다.</div>
+        <div class="bar"><span id="learningStatusProgress" style="width:0%"></span></div>
+        <div class="muted" id="learningStatusMeta" style="margin-top:8px;">대기 중</div>
+        <canvas class="collection-log-chart" id="learningCollectionChart" width="280" height="64"></canvas>
+        <div class="collection-log-list" id="learningCollectionLog"></div>
+      </div>
+      <div class="work-status active">
+        <strong>시스템 흐름</strong>
+        <div class="flow-panel" id="systemFlowPanel">
+          <div class="flow-step" data-flow-step="mode"><i class="flow-dot"></i><div><strong>모드</strong><span>학습/모의투자 선택 대기</span></div></div>
+          <div class="flow-step" data-flow-step="data"><i class="flow-dot"></i><div><strong>데이터</strong><span>실시간 자료 상태 확인 중</span></div></div>
+          <div class="flow-step" data-flow-step="analysis"><i class="flow-dot"></i><div><strong>분석</strong><span>목표 가능성 또는 전략 계산 대기</span></div></div>
+          <div class="flow-step" data-flow-step="simulation"><i class="flow-dot"></i><div><strong>모의 진행</strong><span>시뮬레이션 대기</span></div></div>
+        </div>
+      </div>
+      <form id="goalForm">
+        <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
+        <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
+        <div class="note" id="autoSimulationBasis">시뮬레이션 예수금과 수익률 게인은 실전 준비 점검에서 읽은 실계좌 기준으로 자동 산정됩니다.</div>
+        <button type="submit">가능성 분석</button>
+        <div class="work-status" id="workStatus">
+          <strong id="workTitle">작업 대기 중</strong>
+          <div class="muted" id="workMessage">버튼을 누르면 진행 현황을 표시합니다.</div>
+          <div class="bar"><span id="workProgress"></span></div>
+        </div>
+      </form>
+      <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
+      <h2>시뮬레이션 테스트</h2>
+      <div class="note">시뮬레이션 테스트는 위에 입력한 목표 수익률과 목표 시간으로 자동 진행됩니다.</div>
+      <div class="work-status active" id="streamingDemoContainer" hidden>
+        <strong id="streamingDemoStatus">대기 중</strong>
+        <div class="bar"><span id="streamingDemoProgress" style="width:0%"></span></div>
+        <div style="margin-top: 10px; font-size: 12px;">
+          <div class="score-row">
+            <span class="score-label">예수금</span>
+            <span class="score-value" id="streamingDeposit">-</span>
+          </div>
+          <div class="score-row">
+            <span class="score-label">투자금</span>
+            <span class="score-value" id="streamingInvested">-</span>
+          </div>
+          <div class="score-row">
+            <span class="score-label">수익금</span>
+            <span class="score-value" id="streamingProfit">-</span>
+          </div>
+          <div class="score-row">
+            <span class="score-label">수익률</span>
+            <span class="score-value" id="streamingReturnRate">0%</span>
+            <canvas class="mini-chart" id="streamingReturnChart" width="280" height="74"></canvas>
+          </div>
+        </div>
+      </div>
+      </form>
+    </aside>
+    <main>
+      <div class="grid">
+        <section class="panel span-4"><h2>운용 기준 자금</h2><div class="metric" id="equity">-</div><div class="muted">목표 산정과 리스크 한도 계산에 쓰는 기준 금액</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">기준 현금 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
+        <section class="panel span-4"><h2>Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
+        <section class="panel span-4">
+          <h2>증권사 실계좌</h2>
+          <div class="metric" id="brokerDeposit">읽기 전</div>
+          <div class="chips" style="margin-top:12px;">
+            <span class="chip" id="brokerHoldings">실보유 종목 -</span>
+            <span class="chip" id="brokerAccount">계좌 -</span>
+          </div>
+          <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.</p>
+        </section>
+        <section class="panel span-4">
+          <h2>원금 보호</h2>
+          <div class="metric" id="principalMode">대기 중</div>
+          <div class="bar"><span id="principalCushionBar"></span></div>
+          <div class="chips" style="margin-top:12px;">
+            <span class="chip" id="principalFloor">보호 바닥 -</span>
+            <span class="chip" id="principalGrowth">성장 자본 -</span>
+            <span class="chip" id="principalBudget">위험 예산 -</span>
+          </div>
+          <p class="muted" id="principalStatus" style="margin-bottom:0;">초기 원금을 설정하면 BUY 주문 전 원금 보호 게이트가 적용됩니다.</p>
+        </section>
+        <section class="panel span-8">
+          <h2>달성 가능성</h2>
+          <div class="metric" id="feasibility">대기 중</div>
+          <div class="bar"><span id="feasibilityBar"></span></div>
+          <div id="scoreBreakdown" style="margin-top:14px;"></div>
+          <p class="muted" id="summary">목표를 입력하면 시장 자료, 온톨로지 관계, 리스크 정렬을 바탕으로 달성 가능성을 계산합니다.</p>
+        </section>
+        <section class="panel span-12">
+          <h2>실시간 자료 진단 <span class="muted" id="liveRefreshBadge">갱신 대기</span></h2>
+          <div class="stats" id="diagnosticStats"></div>
+          <div class="stats" id="storeStats" style="margin-top:10px;"></div>
+          <div class="warning-list" id="collectionWarnings"></div>
+          <div class="data-volume-wrap">
+            <canvas class="data-volume-chart" id="dataVolumeChart" width="640" height="180"></canvas>
+            <div class="source-volume-list" id="sourceVolumeList"></div>
+          </div>
+        </section>
+        <section class="ontology-scene ontology-wide-layout">
+          <div class="ontology-toolbar">
+            <span class="ontology-badge">3D 온톨로지 네트워크</span>
+            <span class="ontology-badge" id="ontologyCounts">노드 - | 관계 -</span>
+            <button id="resetGraph" type="button">시점 초기화</button>
+            <button id="toggleLabels" type="button">라벨 켜기</button>
+            <button id="toggleReasoning" type="button">추론 일시정지</button>
+            <span class="ontology-badge" id="reasoningBadge">추론 단계 -</span>
+            <div class="ontology-filter" id="ontologyFilters">
+              <label><input type="checkbox" value="ticker" checked>종목</label>
+              <label><input type="checkbox" value="event" checked>이벤트</label>
+              <label><input type="checkbox" value="temporal" checked>시간축</label>
+              <label><input type="checkbox" value="support" checked>긍정</label>
+              <label><input type="checkbox" value="risk" checked>리스크</label>
+              <label><input type="checkbox" value="contradiction" checked>상충</label>
+              <label><input type="checkbox" value="sector" checked>섹터</label>
+              <label><input type="checkbox" value="pipeline" checked>Pipeline</label>
+              <label><input type="checkbox" value="tuning" checked>Tuning</label>
+              <label><input type="checkbox" value="parameter" checked>Parameter</label>
+              <label><input type="checkbox" value="metric" checked>Metric</label>
+              <label><input type="checkbox" value="entity" checked>개체</label>
+            </div>
+          </div>
+          <canvas id="ontologyCanvas"></canvas>
+          <div class="ontology-panel" id="ontologyPanel">
+            <strong>노드를 선택하세요</strong>
+            <div class="muted">마우스를 올리거나 클릭하면 노드 종류와 연결 관계를 확인할 수 있습니다.</div>
+          </div>
+          <div class="reasoning-strip">
+            <div>
+              <strong id="reasoningTitle">실시간 추론 대기</strong>
+              <span id="reasoningMeta">그래프를 불러오면 추론 경로가 순차적으로 강조됩니다.</span>
+              <div class="reasoning-progress"><span id="reasoningProgress"></span></div>
+            </div>
+            <div id="reasoningDescription">활성화된 노드와 엣지가 밝게 빛나며 현재 판단 근거를 보여줍니다.</div>
+          </div>
+          <div class="ontology-legend">
+            <span class="legend-item"><span class="legend-dot" style="background:#38bdf8"></span>종목</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f97316"></span>뉴스/이벤트</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#06b6d4"></span>시간축</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#22c55e"></span>긍정 신호</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#ef4444"></span>리스크</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#d946ef"></span>상충 요인</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#84cc16"></span>섹터</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>Pipeline</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#eab308"></span>Tuning</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#ec4899"></span>Parameter</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#94a3b8"></span>Metric</span>
+            <span class="legend-item"><span class="legend-dot" style="background:#f8fafc"></span>개체</span>
+          </div>
+          <div id="ontologyTooltip"></div>
+        </section>
+        <section class="panel span-12"><h2>목표 대안</h2><div class="cards" id="choices"></div><div style="margin-top:14px;"><button id="startButton" disabled>선택한 목표로 시작</button> <button class="secondary" id="resetButton" type="button">초기화</button></div></section>
+        <section class="panel span-12"><h2>실시간 모의 진행</h2><div class="stats" id="mockRunStats"></div><div class="grid" style="margin-top:12px;"><div class="span-12"><h2>최근 체결 및 종료 청산</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>구분</th><th>종목</th><th>수량</th><th>가격/금액</th></tr></thead><tbody id="mockExecutions"><tr><td colspan="4">체결 내역 없음</td></tr></tbody></table></div><div style="margin-top: 12px;"><h2>스트리밍 데모 거래</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>금액</th></tr></thead><tbody id="streamingTradeList"><tr><td colspan="4">거래 없음</td></tr></tbody></table></div></div></div></div></section>
+        <section class="panel span-4"><h2>온톨로지 신호</h2><div class="chips" id="relations"></div></section>
+        <section class="panel span-8"><h2>자료 및 프로그램 출력</h2><div class="log" id="output">아직 실행하지 않았습니다.</div></section>
+      </div>
+    </main>
+  </div>
+  <script>
+    let sessionId = null;
+    let selectedGoal = null;
+    let graphState = null;
+    let lastGoalPayload = null;
+    let lastGraphSignature = '';
+    let liveRefreshBusy = false;
+    let learningStatusBusy = false;
+    let learningStatusTimer = null;
+    let lastRenderedCollectionCycle = null;
+    let mockPerformanceTimer = null;
+    let operationRequestActive = false;
+    let activeOperationMode = null;
+    let lastBrokerConnection = null;
+    let liveAccountBasis = null;
+    let streamingStepBusy = false;
+    let streamingStepFailures = 0;
+    let streamingDemoTimer = null;
+    let streamingReturnSeries = [];
+    const fmtWon = new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 });
+    const fmtUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    function formatMoney(value, currency = 'KRW') {
+      const numeric = Number(value || 0);
+      return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(numeric) : fmtWon.format(numeric);
+    }
+
+    function formatCashByCurrency(account = {}) {
+      const cashByCurrency = account && account.cash_by_currency && typeof account.cash_by_currency === 'object'
+        ? account.cash_by_currency
+        : null;
+      if (!cashByCurrency) {
+        return formatMoney(Number(account.cash || 0), account.base_currency || 'KRW');
+      }
+      const preferred = ['KRW', 'USD'];
+      const currencies = [
+        ...preferred.filter((currency) => Object.prototype.hasOwnProperty.call(cashByCurrency, currency)),
+        ...Object.keys(cashByCurrency).filter((currency) => !preferred.includes(currency)).sort(),
+      ];
+      if (!currencies.length) {
+        return formatMoney(Number(account.cash || 0), account.base_currency || 'KRW');
+      }
+      return currencies.map((currency) => formatMoney(Number(cashByCurrency[currency] || 0), currency)).join(' / ');
+    }
+
+    function applyCompactKoreanDashboard() {
+      document.title = 'Paper Trading Dashboard';
+      const title = document.querySelector('aside h1');
+      if (title) title.textContent = 'Paper Trading Dashboard';
+      const gate = document.getElementById('gate');
+      if (gate) gate.textContent = 'Learning and collection continue automatically while the server is running.';
+      const stepLabel = document.querySelector('.mode-step-label');
+      if (stepLabel) stepLabel.textContent = 'Operation Mode';
+      const learningButton = document.getElementById('modeLearningButton');
+      const paperButton = document.getElementById('modeTestingButton');
+      const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      if (learningButton) {
+        learningButton.innerHTML = 'Learning status<small>Runs while server is open</small>';
+        learningButton.onclick = () => loadLearningStatus();
+      }
+      if (paperButton) {
+        paperButton.innerHTML = 'Paper trading API<small>KIS virtual broker</small>';
+        paperButton.onclick = () => startSelectedOperationMode('paper');
+      }
+      if (liveButton) {
+        liveButton.innerHTML = 'Live readiness<small>Auth check without orders</small>';
+        liveButton.onclick = () => startSelectedOperationMode('live_test');
+      }
+      if (liveTradingButton) {
+        liveTradingButton.innerHTML = 'Live auto trading<small>Risk-gated execution</small>';
+        liveTradingButton.onclick = () => startSelectedOperationMode('live');
+      }
+      if (refreshButton) {
+        refreshButton.innerHTML = 'Refresh status<small>Collection stays active</small>';
+        refreshButton.disabled = false;
+        refreshButton.onclick = () => loadLearningStatus();
+      }
+      const flowCopy = {
+        mode: ['Mode', 'Paper, readiness, or live auto trading'],
+        data: ['Collection', 'Auto refresh while server runs'],
+        analysis: ['Learning', 'Realtime store updates'],
+        simulation: ['Paper trading', 'Waiting for KIS/API state'],
+      };
+      document.querySelectorAll('#systemFlowPanel .flow-step').forEach((step) => {
+        const copy = flowCopy[step.dataset.flowStep];
+        if (!copy) return;
+        const strong = step.querySelector('strong');
+        const span = step.querySelector('span');
+        if (strong) strong.textContent = copy[0];
+        if (span) span.textContent = copy[1];
+      });
+    }
+    async function loadStatus() {
+      const data = await (await fetch('/api/status')).json();
+      renderStatus(data);
+    }
+
+    async function loadLearningStatus() {
+      if (learningStatusBusy) return;
+      learningStatusBusy = true;
+      try {
+        const data = await (await fetch('/api/live-progress')).json();
+        renderLearningStatus(data);
+        updateLearningStopButton(data.learning);
+        renderCollectionLog(data.collection_log || []);
+        maybeRefreshDiagnosticsAfterCollection(data.collection_log || []);
+        const progress = data.progress || {};
+        if (progress.stage === 'error') {
+          renderSystemFlow({ data: 'error' }, { data: progress.message || 'Data refresh failed' });
+        } else if (data.is_refreshing || progress.active) {
+          renderSystemFlow({ data: 'active' }, { data: progress.message || 'Refreshing data' });
+        } else if ((progress.percent || 0) >= 100) {
+          renderSystemFlow({ data: 'done', analysis: 'done' }, { data: 'Data cache ready', analysis: 'Analysis cache ready' });
+        }
+      } catch (error) {
+        renderLearningStatus({
+          is_refreshing: false,
+          progress: {
+            active: false,
+            percent: 0,
+            stage: 'error',
+            message: String(error && error.message ? error.message : error),
+          },
+        });
+      } finally {
+        learningStatusBusy = false;
+      }
+    }
+
+    async function loadDiagnostics() {
+      try {
+        const data = await (await fetch('/api/research/diagnostics')).json();
+        renderDiagnostics(data);
+      } catch (error) {
+        const message = `Diagnostics error: ${error.message || error}`;
+        const badge = document.getElementById('liveRefreshBadge');
+        if (badge) badge.textContent = message;
+        renderSystemFlow({ data: 'error' }, { data: message });
+        throw error;
+      }
+    }
+
+    async function loadOntologyGraph() {
+      const data = await (await fetch('/api/ontology/graph')).json();
+      const display = data.display_counts || {};
+      const suffix = data.truncated ? ` | shown ${display.nodes || 0}/${data.counts.nodes} nodes, ${display.links || 0}/${data.counts.links} links` : '';
+      document.getElementById('ontologyCounts').textContent = `노드 ${data.counts.nodes} · 관계 ${data.counts.links}`;
+      lastGraphSignature = graphSignature(data);
+      document.getElementById('ontologyCounts').textContent = `Nodes ${data.counts.nodes} | Links ${data.counts.links}${suffix}`;
+      await renderOntologyGraph(data);
+      renderSystemFlow({ analysis: 'done' }, { analysis: 'Ontology graph ready' });
+    }
+
+    async function loadRealtimeRuntime() {
+      const data = await (await fetch('/api/realtime/runtime')).json();
+      const accel = data.acceleration || {};
+      const policy = data.short_horizon_policy || {};
+      const eventLlm = data.event_llm || {};
+      const ontologyNpu = data.ontology_npu || {};
+      const npuLabel = accel.uses_npu ? 'NPU active' : `CPU fallback (${accel.active_backend || '-'})`;
+      const llmLabel = eventLlm.available ? `LLM ${eventLlm.provider || '-'} ready` : `LLM waiting ${eventLlm.reason || 'not configured'}`;
+      const ontologyNpuLabel = ontologyNpu.uses_npu
+        ? `Ontology NPU ${ontologyNpu.last_items || 0} rows ${ontologyNpu.last_latency_ms ? `${ontologyNpu.last_latency_ms}ms` : 'ready'}`
+        : `Ontology fallback ${ontologyNpu.backend || '-'}`;
+      document.getElementById('runtimeStatus').textContent =
+        `${npuLabel} | ${ontologyNpuLabel} | ${llmLabel} | ${accel.latency_profile || 'low_latency'} | horizons ${((accel.prediction_horizons_seconds || []).join('/'))}s | cap ${((policy.max_position_weight_intraday || 0) * 100).toFixed(1)}%`;
+      if (data.operation_mode) renderOperationMode(data.operation_mode);
+    }
+    function selectedOperationMode(action) {
+      if (action === 'training') return 'learning';
+      if (action === 'testing' || action === 'paper') return 'paper_trading';
+      if (action === 'live_test') return 'live_readiness';
+      return 'live_trading';
+    }
+
+    function updateModeButtons() {
+      const learningButton = document.getElementById('modeLearningButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      const paperButton = document.getElementById('modeTestingButton');
+      const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
+      const liveFlagsButton = document.getElementById('liveFlagsButton');
+      if (!paperButton) return;
+      if (learningButton) learningButton.disabled = operationRequestActive;
+      paperButton.disabled = operationRequestActive;
+      if (liveButton) liveButton.disabled = operationRequestActive;
+      if (liveTradingButton) liveTradingButton.disabled = operationRequestActive;
+      if (liveFlagsButton) liveFlagsButton.disabled = operationRequestActive;
+      updateTerminateTradingButton();
+      if (refreshButton) refreshButton.disabled = false;
+      if (learningButton) learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
+      paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
+      if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
+      if (liveTradingButton) liveTradingButton.innerHTML = '실전 투자<small>자동매매 게이트</small>';
+      if (refreshButton) refreshButton.innerHTML = '상태 새로고침<small>수집은 중단하지 않음</small>';
+    }
+
+    function updateTerminateTradingButton() {
+      const button = document.getElementById('terminateTradingButton');
+      if (!button) return;
+      const canTerminate = streamingDemoRunning || activeOperationMode === 'live_trading';
+      button.disabled = operationRequestActive || !canTerminate;
+      button.innerHTML = activeOperationMode === 'live_trading'
+        ? '조기 종료<small>실전 보유분 지정가 전량 매도</small>'
+        : '조기 종료<small>모의 보유분 전량 매도</small>';
+    }
+
+    function setModeButtonsLocked(locked) {
+      const learningButton = document.getElementById('modeLearningButton');
+      const refreshButton = document.getElementById('modeLearningStopButton');
+      const paperButton = document.getElementById('modeTestingButton');
+      const liveButton = document.getElementById('modeLiveButton');
+      const liveTradingButton = document.getElementById('modeLiveTradingButton');
+      const liveFlagsButton = document.getElementById('liveFlagsButton');
+      const terminateButton = document.getElementById('terminateTradingButton');
+      const enabled = !locked;
+      if (learningButton) learningButton.disabled = !enabled;
+      if (paperButton) paperButton.disabled = !enabled;
+      if (liveButton) liveButton.disabled = !enabled;
+      if (liveTradingButton) liveTradingButton.disabled = !enabled;
+      if (liveFlagsButton) liveFlagsButton.disabled = !enabled;
+      if (terminateButton) terminateButton.disabled = locked || !(streamingDemoRunning || activeOperationMode === 'live_trading');
+      if (refreshButton) refreshButton.disabled = false;
+    }
+
+    function renderSystemFlow(states = {}, messages = {}) {
+      document.querySelectorAll('#systemFlowPanel .flow-step').forEach((step) => {
+        const key = step.dataset.flowStep;
+        const state = states[key] || 'idle';
+        step.classList.remove('active', 'done', 'error');
+        if (state === 'active' || state === 'done' || state === 'error') step.classList.add(state);
+        const label = step.querySelector('span');
+        if (label && messages[key]) label.textContent = messages[key];
+      });
+    }
+
+    function modeLabel(mode) {
+      return {
+        learning: '수집/학습',
+        testing: '레거시 모의투자',
+        paper_trading: '모의투자 API',
+        live_readiness: '실전 준비 점검',
+        live_trading: '실전 투자 진행',
+      }[mode] || mode || '운영 모드';
+    }
+
+    function isPaperTradingMode(mode) {
+      return mode === 'testing' || mode === 'paper_trading';
+    }
+
+    function isTradingCheckMode(mode) {
+      return isPaperTradingMode(mode) || mode === 'live_readiness' || mode === 'live_trading';
+    }
+
+    function operationStarted(data) {
+      return Boolean(data.paper_trading_status || data.live_readiness_status || data.live_trading_status || data.training_status);
+    }
+
+    function startsStreamingLoop(mode, data) {
+      return isPaperTradingMode(mode) && data && data.demo_id;
+    }
+
+    function stopStreamingDemoLoop(message = '') {
+      if (streamingDemoTimer) {
+        window.clearTimeout(streamingDemoTimer);
+        streamingDemoTimer = null;
+      }
+      streamingDemoRunning = false;
+      streamingStepBusy = false;
+      streamingDemoId = null;
+      if (activeOperationMode !== 'live_trading') activeOperationMode = null;
+      updateTerminateTradingButton();
+      const container = document.getElementById('streamingDemoContainer');
+      if (container) container.hidden = true;
+      if (message) {
+        const statusNode = document.getElementById('streamingDemoStatus');
+        const mockNode = document.getElementById('mockStatus');
+        if (statusNode) statusNode.textContent = message;
+        if (mockNode) mockNode.textContent = message;
+      }
+    }
+    async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 20000) {
+      if (!timeoutMs || timeoutMs <= 0) {
+        const response = await fetch(url, options);
+        if (!response.ok) throw new Error(await response.text());
+        return await response.json();
+      }
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        if (!response.ok) throw new Error(await response.text());
+        return await response.json();
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+
+    async function fetchWithOptionalTimeout(url, options = {}, timeoutMs = 0) {
+      if (!timeoutMs || typeof AbortController === 'undefined') {
+        return await fetch(url, options);
+      }
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+
+    function renderLiveFlagResult(data) {
+      const failures = data && data.readiness && data.readiness.failures ? data.readiness.failures : {};
+      const failureText = Object.entries(failures).map(([key, value]) => `${key}: ${value}`).join('\n');
+      const liveReady = Boolean(data.live_ready);
+      document.getElementById('operationModeStatus').textContent = liveReady
+        ? 'Live flags applied | readiness gates passed; manual arming is still required.'
+        : 'Live flags applied | waiting for readiness gates.';
+      document.getElementById('runtimeStatus').textContent = data.message || 'Live flag state updated.';
+      document.getElementById('gate').textContent = liveReady
+        ? 'Live flags are active. Orders still require manual arming and FinalOrder approval.'
+        : 'Live flags are active. Live orders remain safely blocked until readiness checks pass.';
+      document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      renderSystemFlow(
+        { mode: liveReady ? 'done' : 'active' },
+        { mode: liveReady ? 'Live flags active' : `Readiness pending${failureText ? `: ${failureText.split('\n')[0]}` : ''}` }
+      );
+    }
+
+    async function applyLiveFlags() {
+      if (operationRequestActive) return;
+      operationRequestActive = true;
+      setModeButtonsLocked(true);
+      document.getElementById('operationModeStatus').textContent = 'Applying live flags...';
+      document.getElementById('runtimeStatus').textContent = 'No order will be submitted by this action.';
+      try {
+        const data = await fetchJsonWithTimeout('/api/live-flags/apply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmation: 'APPLY_LIVE_FLAGS' })
+        }, 30000);
+        renderLiveFlagResult(data);
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error);
+        document.getElementById('operationModeStatus').textContent = 'Live flag apply failed';
+        document.getElementById('runtimeStatus').textContent = message;
+        document.getElementById('output').textContent = message;
+      } finally {
+        operationRequestActive = false;
+        setModeButtonsLocked(false);
+        updateModeButtons();
+      }
+    }
+
+    async function startOperationMode(mode, options = {}) {
+      if (operationRequestActive) {
+        document.getElementById('runtimeStatus').textContent = 'Another operation request is already running.';
+        return;
+      }
+      if (!isPaperTradingMode(mode)) {
+        stopStreamingDemoLoop(`${modeLabel(mode)} requested; paper trading loop stopped.`);
+      }
+      operationRequestActive = true;
+      renderSystemFlow({
+        mode: 'active',
+        data: 'idle',
+        analysis: 'idle',
+        simulation: isTradingCheckMode(mode) ? 'active' : 'idle',
+      }, {
+        mode: `${modeLabel(mode)} start requested`,
+        simulation: isPaperTradingMode(mode) ? 'Preparing paper trading' : (mode === 'live_trading' ? 'Checking live auto-trading gate' : 'Checking live readiness'),
+      });
+      document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} start requested...`;
+      document.getElementById('runtimeStatus').textContent = 'Waiting for server response.';
+      document.getElementById('output').textContent = `${modeLabel(mode)} request sent.`;
+      setModeButtonsLocked(true);
+      try {
+        const data = await fetchJsonWithTimeout('/api/operation-mode/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode, ...options })
+        }, 45000);
+        if (data.ok === false) throw new Error(data.message || data.status || 'operation mode request failed');
+        renderOperationMode(data);
+        updateLearningStopButton(data.learning);
+        const started = operationStarted(data);
+        renderSystemFlow({
+          mode: 'done',
+          data: mode === 'learning' || started ? 'active' : 'done',
+          analysis: mode === 'learning' ? 'active' : 'idle',
+          simulation: started && isTradingCheckMode(mode) ? 'active' : 'idle',
+        }, {
+          mode: `${modeLabel(mode)} started`,
+          data: 'Collection and learning continue',
+          simulation: isPaperTradingMode(mode) ? 'Paper trading running' : (mode === 'live_trading' ? 'Live auto-trading gate checked' : 'Live readiness checked'),
+        });
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+        if (startsStreamingLoop(mode, data)) {
+          document.getElementById('streamingDemoContainer').hidden = false;
+          streamingDemoId = data.demo_id;
+          streamingDemoRunning = true;
+          activeOperationMode = mode;
+          updateTerminateTradingButton();
+          streamingInitialCash = Number(data.initial_cash || options.initial_cash || 10000000);
+          streamingTargetReturnRate = Number(data.target_return_rate || options.target_return_rate || 0);
+          if (streamingTargetReturnRate > 1) streamingTargetReturnRate /= 100.0;
+          streamingTargetMinutes = Number(data.period_minutes || options.period_minutes || 0);
+          streamingDemoHistory = [];
+          streamingDemoPrices = {};
+          streamingReturnSeries = [];
+          streamingStepFailures = 0;
+          if (streamingDemoTimer) window.clearTimeout(streamingDemoTimer);
+          renderStreamingPerformance({
+            progress: 0,
+            account: { cash: streamingInitialCash, account_value: streamingInitialCash, return_rate: 0 },
+            status: 'running',
+          });
+          updateStreamingAccount({
+            account: { cash: streamingInitialCash, account_value: streamingInitialCash, return_rate: 0, base_currency: 'KRW', cash_by_currency: { KRW: streamingInitialCash } },
+          });
+          drawStreamingReturnChart();
+          autoRunStreamingDemo(true);
+        }
+        loadRealtimeRuntime().catch((error) => {
+          document.getElementById('runtimeStatus').textContent = `Runtime status failed: ${error.message || error}`;
+        });
+      } catch (error) {
+        const message = error.name === 'AbortError'
+          ? 'Server response timed out. Try again shortly.'
+          : String(error && error.message ? error.message : error);
+        document.getElementById('operationModeStatus').textContent = `${modeLabel(mode)} start failed`;
+        document.getElementById('runtimeStatus').textContent = message;
+        document.getElementById('output').textContent = message;
+        renderSystemFlow({ mode: 'error' }, { mode: message });
+        loadOperationModeStatus().catch(() => {});
+      } finally {
+        operationRequestActive = false;
+        setModeButtonsLocked(false);
+        updateModeButtons();
+      }
+    }
+    async function startSelectedOperationMode(action) {
+      const mode = selectedOperationMode(action);
+      if (!mode) return;
+      const goal = currentGoalPayload();
+      if (!goal && (action === 'testing' || action === 'paper')) {
+        document.getElementById('output').textContent = 'Enter target return and target time first.';
+        return;
+      }
+      const options = goal ? {
+        target_return_rate: goal.target_return_rate,
+        period_minutes: goal.period_minutes,
+        initial_cash_source: 'auto',
+      } : {};
+      await startOperationMode(mode, options);
+    }
+
+    async function terminateActiveTrading() {
+      if (operationRequestActive) return;
+      if (!streamingDemoRunning && activeOperationMode !== 'live_trading') {
+        document.getElementById('runtimeStatus').textContent = 'No active paper or live trading session to terminate.';
+        return;
+      }
+      operationRequestActive = true;
+      setModeButtonsLocked(true);
+      document.getElementById('operationModeStatus').textContent = 'Early termination requested...';
+      document.getElementById('runtimeStatus').textContent = 'Submitting final liquidation request.';
+      try {
+        const isLiveTermination = activeOperationMode === 'live_trading' && !streamingDemoRunning;
+        const url = isLiveTermination ? '/api/live-trading/terminate' : `/api/paper-trading/terminate/${streamingDemoId}`;
+        const data = await fetchJsonWithTimeout(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, 45000);
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+        if (data.ok === false) {
+          document.getElementById('operationModeStatus').textContent = 'Early termination blocked';
+          document.getElementById('runtimeStatus').textContent = data.message || data.status || 'Termination failed.';
+          return;
+        }
+        if (data.account) updateStreamingAccount(data);
+        if (data.final_results) renderStreamingPerformance({ progress: 100, account: data.account || {}, status: 'terminated' });
+        streamingDemoRunning = false;
+        streamingStepBusy = false;
+        streamingDemoId = null;
+        activeOperationMode = null;
+        document.getElementById('operationModeStatus').textContent = 'Trading terminated';
+        document.getElementById('runtimeStatus').textContent = data.message || 'All current holdings were submitted for liquidation.';
+        const statusNode = document.getElementById('streamingDemoStatus');
+        if (statusNode) statusNode.textContent = '조기 종료 완료';
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error);
+        document.getElementById('operationModeStatus').textContent = 'Early termination failed';
+        document.getElementById('runtimeStatus').textContent = message;
+        document.getElementById('output').textContent = message;
+      } finally {
+        operationRequestActive = false;
+        setModeButtonsLocked(false);
+        updateTerminateTradingButton();
+      }
+    }
+
+    async function stopLearningCollection() {
+      const stopLearningButton = document.getElementById('modeLearningStopButton');
+      if (stopLearningButton) stopLearningButton.disabled = true;
+      document.getElementById('learningStatusMessage').textContent = '학습 데이터 수집 상태를 새로고침하는 중입니다.';
+      try {
+        const data = await fetchJsonWithTimeout('/api/operation-mode/stop-learning', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, 10000);
+        updateLearningStopButton(data.learning);
+        renderCollectionLog(data.collection_log || []);
+        renderLearningStatus({
+          is_refreshing: false,
+          learning: data.learning,
+          progress: data.progress || { active: false, percent: 0, stage: 'idle', message: data.message },
+        });
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+        loadOperationModeStatus().catch(() => {});
+      } catch (error) {
+        document.getElementById('learningStatusMessage').textContent = String(error && error.message ? error.message : error);
+        loadLearningStatus().catch(() => {});
+      }
+    }
+
+    function renderOperationMode(data) {
+      activeOperationMode = data.mode || null;
+      updateTerminateTradingButton();
+      const labels = {
+        learning: 'Learning',
+        testing: 'Legacy paper trading',
+        paper_trading: 'Paper trading API',
+        live_readiness: 'Live readiness',
+        live_trading: 'Live trading',
+      };
+      const mode = labels[data.mode] || data.mode || 'Mode waiting';
+      const message = data.paper_trading_message || data.live_readiness_message || data.live_trading_message || data.training_message || data.execution_label || '';
+      document.getElementById('operationModeStatus').textContent = `${mode} | ${message}`;
+      if (data.kis_connection && (data.kis_connection.account_checked || data.kis_connection.ok)) {
+        lastBrokerConnection = data.kis_connection;
+      }
+      const connection = data.kis_connection || lastBrokerConnection;
+      if ((data.mode === 'live_readiness' || data.mode === 'live_trading') && connection) {
+        renderBrokerAccountCard(connection);
+      }
+      document.getElementById('gate').textContent = data.mode === 'paper_trading'
+        ? 'Paper trading mode uses the KIS virtual broker and blocks live orders.'
+        : data.mode === 'live_readiness'
+          ? 'Live readiness checks authentication and state without submitting orders.'
+          : data.mode === 'live_trading'
+            ? `Live auto-trading gate ${data.live_trading_status || 'checked'}; RiskManager and FinalTradeGate remain mandatory.`
+            : 'Learning and collection continue while the server is running.';
+    }
+
+    /*
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      const accountSuffix = connection.account_suffix || '-';
+      accountTarget.textContent = `계좌 ${accountSuffix}`;
+      if (connection.account_checked) {
+        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        depositTarget.textContent = fmtWon.format(deposit);
+        holdingsTarget.textContent = `실보유 종목 ${connection.holdings || 0}개`;
+        statusTarget.textContent = 'KIS 실계좌 읽기 완료 · 주문 제출 없음';
+        document.getElementById('runtimeStatus').textContent =
+          `실계좌 예수금 ${fmtWon.format(deposit)} · 실보유 종목 ${connection.holdings || 0}개 · 주문 제출 없음`;
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = '조회 실패';
+        holdingsTarget.textContent = '실보유 종목 -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS 계좌 조회에 실패했습니다.';
+        if (connection.retry_after_seconds) {
+          statusTarget.textContent += ` ${connection.retry_after_seconds}초 후 다시 시도하세요.`;
+        }
+        return;
+      }
+      depositTarget.textContent = '읽기 전';
+      holdingsTarget.textContent = '실보유 종목 -';
+      statusTarget.textContent = '실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.';
+    }
+    */
+
+    /*
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      const accountSuffix = connection.account_suffix || '-';
+      accountTarget.textContent = `계좌 ${accountSuffix}`;
+      if (connection.account_checked) {
+        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        const basis = brokerBasisAmount(connection);
+        const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        depositTarget.textContent = fmtWon.format(deposit);
+        holdingsTarget.textContent = `실보유 종목 ${holdings}개`;
+        statusTarget.textContent = 'KIS 실계좌 읽기 완료 · 주문 제출 없음';
+        applyLiveAccountBasis(connection);
+        document.getElementById('runtimeStatus').textContent =
+          `KIS live account read complete | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = '조회 실패';
+        holdingsTarget.textContent = '실보유 종목 -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS 계좌 조회에 실패했습니다.';
+        if (connection.retry_after_seconds) {
+          statusTarget.textContent += ` ${connection.retry_after_seconds}초 후 다시 시도하세요.`;
+        }
+        return;
+      }
+      depositTarget.textContent = '읽기 전';
+      holdingsTarget.textContent = '실보유 종목 -';
+      statusTarget.textContent = '실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.';
+    }
+
+    */
+
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      const accountSuffix = connection.account_suffix || '-';
+      accountTarget.textContent = `Account ${accountSuffix}`;
+      if (connection.account_checked) {
+        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
+        const basis = brokerBasisAmount(connection);
+        const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        depositTarget.textContent = fmtWon.format(deposit);
+        holdingsTarget.textContent = `Holdings ${holdings}`;
+        statusTarget.textContent = 'KIS live account read complete; no order submitted.';
+        applyLiveAccountBasis(connection);
+        document.getElementById('runtimeStatus').textContent =
+          `KIS live account read complete | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = 'Read failed';
+        holdingsTarget.textContent = 'Holdings -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS account lookup failed.';
+        if (connection.retry_after_seconds) {
+          statusTarget.textContent += ` Retry after ${connection.retry_after_seconds}s.`;
+        }
+        return;
+      }
+      depositTarget.textContent = 'Before read';
+      holdingsTarget.textContent = 'Holdings -';
+      statusTarget.textContent = 'Live readiness reads real cash and holdings count only; no order is submitted.';
+    }
+
+    function brokerBasisAmount(connection = {}) {
+      const cash = Number(connection.actual_deposit ?? connection.cash ?? 0);
+      const equity = Number(connection.actual_equity ?? connection.equity ?? connection.account_value ?? connection.total_evaluation_amount ?? 0);
+      const invested = Number(connection.invested_value ?? 0);
+      const basis = equity > 0 ? equity : cash + invested;
+      return basis > 0 ? basis : 0;
+    }
+
+    function applyLiveAccountBasis(connection = {}) {
+      const basis = brokerBasisAmount(connection);
+      if (!basis) return;
+      const cash = Number(connection.actual_deposit ?? connection.cash ?? basis);
+      liveAccountBasis = {
+        cash,
+        equity: basis,
+        cash_weight: basis > 0 ? Math.max(0, Math.min(1, cash / basis)) : 0,
+        account_suffix: connection.account_suffix || '',
+      };
+      const initialCashInput = document.getElementById('initialCash');
+      if (initialCashInput) initialCashInput.value = String(Math.round(basis));
+      const autoBasisTarget = document.getElementById('autoSimulationBasis');
+      if (autoBasisTarget) {
+        autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(basis)} · 수익률 게인 자동 산정`;
+      }
+      renderStatus({
+        cash: liveAccountBasis.cash,
+        equity: liveAccountBasis.equity,
+        cash_weight: liveAccountBasis.cash_weight,
+        basis_source: 'kis_live_account',
+        account_suffix: liveAccountBasis.account_suffix,
+      });
+      const goal = currentGoalPayload();
+      if (goal) lastGoalPayload = goal;
+    }
+
+    function renderPrincipalProtection(data = {}) {
+      const state = data.state || {};
+      const modeTarget = document.getElementById('principalMode');
+      const floorTarget = document.getElementById('principalFloor');
+      const growthTarget = document.getElementById('principalGrowth');
+      const budgetTarget = document.getElementById('principalBudget');
+      const statusTarget = document.getElementById('principalStatus');
+      const barTarget = document.getElementById('principalCushionBar');
+      if (!modeTarget || !floorTarget || !growthTarget || !budgetTarget || !statusTarget || !barTarget) return;
+      const mode = state.current_mode || 'NOT_CONFIGURED';
+      const equity = Number(state.current_equity || 0);
+      const floorValue = Number(state.protected_floor || 0);
+      const cushion = Number(state.cushion || 0);
+      const riskBudget = Number(state.risk_budget || 0);
+      const growth = Number(state.available_growth_capital || 0);
+      const distance = equity - floorValue;
+      const pct = equity > 0 ? Math.max(0, Math.min(100, (cushion / equity) * 100)) : 0;
+      modeTarget.textContent = mode;
+      floorTarget.textContent = `보호 바닥 ${fmtWon.format(floorValue)}`;
+      growthTarget.textContent = `성장 자본 ${fmtWon.format(growth)}`;
+      budgetTarget.textContent = `위험 예산 ${fmtWon.format(riskBudget)}`;
+      barTarget.style.width = `${pct.toFixed(1)}%`;
+      if (mode === 'PRINCIPAL_LOCKDOWN') {
+        statusTarget.textContent = `BUY 차단: 보호 바닥까지 ${fmtWon.format(distance)} 남았습니다. SELL/축소만 허용됩니다.`;
+      } else if (mode === 'DE_RISK') {
+        statusTarget.textContent = 'DE_RISK: 신규 매수는 제한되고 노출 축소를 우선합니다.';
+      } else if (mode === 'NOT_CONFIGURED') {
+        statusTarget.textContent = '초기 원금을 설정하면 원금 보호 바닥과 이익 재투자 예산이 계산됩니다.';
+      } else {
+        statusTarget.textContent = `보호 여유 ${fmtWon.format(cushion)} · 고점 대비 낙폭 ${(Number(state.drawdown_from_high_watermark || 0) * 100).toFixed(2)}%`;
+      }
+    }
+
+    async function loadPrincipalProtectionState() {
+      const data = await fetchJsonWithTimeout('/api/risk/principal-protection/state', {}, 8000);
+      renderPrincipalProtection(data);
+      return data;
+    }
+
+    async function loadOperationModeStatus() {
+      const data = await fetchJsonWithTimeout('/api/operation-mode/status', {}, 8000);
+      const request = data.request || {};
+      if (request.busy) {
+        renderSystemFlow({ mode: 'active' }, { mode: request.message || 'Request running' });
+      } else if (request.stage === 'error') {
+        renderSystemFlow({ mode: 'error' }, { mode: request.last_error || request.message || 'Request failed' });
+      }
+      updateLearningStopButton(data.learning);
+      if (Array.isArray(data.collection_log)) {
+        renderCollectionLog(data.collection_log);
+        maybeRefreshDiagnosticsAfterCollection(data.collection_log);
+      }
+      if (data.kis_connection && (data.kis_connection.account_checked || data.kis_connection.ok)) {
+        lastBrokerConnection = data.kis_connection;
+        renderBrokerAccountCard(data.kis_connection);
+        if (!data.active) {
+          const suffix = data.kis_connection.account_suffix || '';
+          const basis = brokerBasisAmount(data.kis_connection);
+          document.getElementById('operationModeStatus').textContent =
+            `Auto live readiness checked | account ${suffix || '-'} | basis ${fmtWon.format(basis || 0)}`;
+          document.getElementById('gate').textContent =
+            'KIS live account is connected read-only. Paper trading and live gate use this account basis.';
+        }
+      }
+      if (data.active) renderOperationMode(data.active);
+      return data;
+    }
+    document.getElementById('goalForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const payload = currentGoalPayload();
+      if (!payload) {
+        document.getElementById('output').textContent = 'Enter target return and target time.';
+        return;
+      }
+      const stopProgress = startLocalProgress('Assessing feasibility', 'Calculating goal feasibility from current data and ontology.');
+      setBusy(true);
+      try {
+        lastGoalPayload = payload;
+        const data = await fetchJsonWithTimeout('/api/assess-goal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }, 45000);
+        renderAssessment(data);
+        setWorkStatus('Assessment complete', 'Goal feasibility and alternatives were calculated.', 100, true);
+      } catch (error) {
+        document.getElementById('output').textContent = String(error && error.message ? error.message : error);
+        setWorkStatus('Assessment failed', String(error && error.message ? error.message : error), 100, true);
+      } finally {
+        stopProgress();
+        setBusy(false);
+      }
+    });
+
+    const loadResearchButton = document.getElementById('loadResearch');
+    if (loadResearchButton) {
+      loadResearchButton.addEventListener('click', async () => {
+        const stopProgress = startProgressPolling('Starting collection', 'Information collection continues in the background.');
+        setBusy(true);
+        try {
+          const data = await (await fetch('/api/research/refresh', { method: 'POST' })).json();
+          document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+          await loadDiagnostics();
+          setWorkStatus('Collection started', 'Collection is running in the background.', 35, false);
+        } catch (error) {
+          document.getElementById('output').textContent = String(error && error.message ? error.message : error);
+          setWorkStatus('Collection failed', String(error && error.message ? error.message : error), 100, true);
+        } finally {
+          stopProgress();
+          setBusy(false);
+        }
+      });
+    }
+    function renderAssessment(data, options = {}) {
+      if (data.session_id) sessionId = data.session_id;
+      const previousSelection = selectedGoal;
+      if (!options.preserveSelection) selectedGoal = null;
+      const assessment = data.assessment;
+      document.getElementById('feasibility').textContent = `${assessment.feasibility_percent}%`;
+      document.getElementById('feasibilityBar').style.width = `${assessment.feasibility_percent}%`;
+      document.getElementById('scoreBreakdown').innerHTML = `
+        ${scoreRow('Market support', assessment.market_support_percent, 'good')}
+        ${scoreRow('Risk pressure', assessment.risk_pressure_percent, 'warn')}
+        ${scoreRow('Goal drag', assessment.annualized_drag_percent, 'bad')}
+        ${scoreRow('Annual target', Math.min(100, assessment.annualized_required_return * 100), 'bad', `${(assessment.annualized_required_return * 100).toFixed(1)}%`)}
+      `;
+      document.getElementById('summary').textContent = assessment.reasoning.join(' ');
+      document.getElementById('relations').innerHTML = assessment.ontology_relations.slice(0, 10).map((item) => `<span class="chip">${item}</span>`).join('');
+      const choices = document.getElementById('choices');
+      choices.innerHTML = '';
+      data.compromises.forEach((goal, index) => {
+        const div = document.createElement('div');
+        div.className = 'choice';
+        div.innerHTML = `<strong>${translateGoalLabel(goal.label)}</strong><div class="metric">${goal.feasibility_percent}%</div><div class="muted">Return ${(goal.target_return_rate * 100).toFixed(2)}%</div><div class="muted">Profit ${fmtWon.format(goal.target_profit_amount)}</div><div class="muted">Period ${goal.period_days}d</div>`;
+        div.addEventListener('click', () => {
+          document.querySelectorAll('.choice').forEach((node) => node.classList.remove('selected'));
+          div.classList.add('selected');
+          selectedGoal = goal;
+          document.getElementById('startButton').disabled = false;
+        });
+        choices.appendChild(div);
+        const sameAsPrevious = previousSelection && goal.label === previousSelection.label
+          && goal.period_days === previousSelection.period_days
+          && Math.abs(goal.target_return_rate - previousSelection.target_return_rate) < 0.000001;
+        if ((options.preserveSelection && sameAsPrevious) || (!options.preserveSelection && index === 0)) div.click();
+      });
+    }
+    function currentGoalPayload() {
+      const form = document.getElementById('goalForm');
+      const payload = Object.fromEntries(new FormData(form).entries());
+      const targetReturnRate = Number(payload.target_return_rate || 0);
+      const periodMinutes = Number(payload.period_minutes || 0);
+      if (!targetReturnRate || targetReturnRate < 0) return null;
+      if (!periodMinutes || periodMinutes < 1) return null;
+      return {
+        target_return_rate: targetReturnRate,
+        period_minutes: periodMinutes,
+        period_days: Math.max(1, Math.ceil(periodMinutes / 390)),
+      };
+    }
+
+    function applyUrlGoalParams() {
+      const params = new URLSearchParams(window.location.search);
+      const targetReturn = params.get('target_return_rate');
+      const periodMinutes = params.get('period_minutes');
+      if (targetReturn !== null) {
+        document.getElementById('targetReturn').value = targetReturn;
+      }
+      if (periodMinutes !== null) {
+        document.getElementById('targetMinutes').value = periodMinutes;
+      }
+      const goal = currentGoalPayload();
+      if (goal) lastGoalPayload = goal;
+    }
+
+    function applyGoalPayloadToMode(payload) {
+      if (!payload) return {};
+      return {
+        target_return_rate: payload.target_return_rate,
+        period_minutes: payload.period_minutes,
+        initial_cash_source: 'auto',
+      };
+    }
+
+    function currentGoalPayloadForAssessment() {
+      const payload = currentGoalPayload();
+      if (!payload) return null;
+      return {
+        target_return_rate: payload.target_return_rate,
+        period_minutes: payload.period_minutes,
+        period_days: payload.period_days,
+      };
+    }
+
+    function updateModeActionCopy() {
+      updateModeButtons();
+      document.getElementById('operationModeStatus').textContent =
+        'Choose learning status, paper trading, or live readiness.';
+    }
+
+    document.querySelectorAll('#unusedEnvironmentGrid button').forEach((button) => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('#unusedEnvironmentGrid button').forEach((node) => node.classList.remove('active'));
+        button.classList.add('active');
+      });
+    });
+
+    updateModeButtons();
+    updateModeActionCopy();
+
+    function setBusy(isBusy) {
+      document.querySelector('#goalForm button[type="submit"]').disabled = isBusy;
+      document.getElementById('loadResearch').disabled = isBusy;
+    }
+
+    function setWorkStatus(title, message, percent, visible = true) {
+      const box = document.getElementById('workStatus');
+      const bounded = Math.max(0, Math.min(100, Number(percent) || 0));
+      box.classList.toggle('active', visible);
+      document.getElementById('workTitle').textContent = title;
+      document.getElementById('workMessage').textContent = message;
+      document.getElementById('workProgress').style.width = `${bounded}%`;
+    }
+
+    function startProgressPolling(title, fallbackMessage) {
+      let stopped = false;
+      let localPercent = 8;
+      setWorkStatus(title, fallbackMessage, localPercent, true);
+      const timer = window.setInterval(async () => {
+        if (stopped) return;
+        try {
+          const data = await (await fetch('/api/live-progress')).json();
+          const progress = data.progress || {};
+          if (progress.active || data.is_refreshing) {
+            setWorkStatus(title, progress.message || fallbackMessage, progress.percent || localPercent, true);
+            return;
+          }
+        } catch (error) {
+          // Keep the local progress moving even if the progress endpoint is briefly busy.
+        }
+        localPercent = Math.min(92, localPercent + 4);
+        setWorkStatus(title, fallbackMessage, localPercent, true);
+      }, 700);
+      return () => {
+        stopped = true;
+        window.clearInterval(timer);
+      };
+    }
+
+    function startLocalProgress(title, message) {
+      let stopped = false;
+      let percent = 18;
+      setWorkStatus(title, message, percent, true);
+      const timer = window.setInterval(() => {
+        if (stopped) return;
+        percent = Math.min(92, percent + 11);
+        setWorkStatus(title, message, percent, true);
+      }, 250);
+      return () => {
+        stopped = true;
+        window.clearInterval(timer);
+      };
+    }
+
+    async function refreshLiveSnapshot() {
+      if (streamingDemoRunning || operationRequestActive) return;
+      if (liveRefreshBusy) return;
+      liveRefreshBusy = true;
+      const badge = document.getElementById('liveRefreshBadge');
+      if (badge) badge.textContent = 'Refreshing';
+      try {
+        const goal = currentGoalPayload();
+        if (goal) lastGoalPayload = goal;
+        const res = await fetchWithOptionalTimeout('/api/live-snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: lastGoalPayload, force_refresh: false, include_graph: false }),
+        }, 12000);
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        renderStatus(data.status);
+        renderDiagnostics(data.diagnostics);
+        if (data.graph && data.graph.counts) {
+          document.getElementById('ontologyCounts').textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
+        }
+        if (data.graph && Array.isArray(data.graph.nodes) && Array.isArray(data.graph.links)) {
+          const signature = graphSignature(data.graph);
+          if (signature !== lastGraphSignature) {
+            lastGraphSignature = signature;
+            await renderOntologyGraph(data.graph);
+          }
+        }
+        if (data.assessment && data.compromises) {
+          renderAssessment({ assessment: data.assessment, compromises: data.compromises }, { preserveSelection: true });
+        }
+        const updatedText = data.updated_at ? new Date(data.updated_at).toLocaleTimeString('ko-KR') : 'waiting';
+        const errorText = data.status && data.status.last_error ? ` | error ${data.status.last_error}` : '';
+        if (badge) badge.textContent = `Last refresh ${updatedText}${errorText}`;
+      } catch (error) {
+        if (badge) badge.textContent = 'Refresh failed';
+        console.error(error);
+      } finally {
+        liveRefreshBusy = false;
+      }
+    }
+
+    function startLearningStatusPolling() {
+      if (learningStatusTimer) window.clearInterval(learningStatusTimer);
+      loadLearningStatus();
+      learningStatusTimer = window.setInterval(loadLearningStatus, 1500);
+    }
+
+    function renderStatus(data) {
+      if (liveAccountBasis && (!data || data.basis_source !== 'kis_live_account')) {
+        data = {
+          ...(data || {}),
+          cash: liveAccountBasis.cash,
+          equity: liveAccountBasis.equity,
+          cash_weight: liveAccountBasis.cash_weight,
+          basis_source: 'kis_live_account',
+          account_suffix: liveAccountBasis.account_suffix,
+        };
+      }
+      document.getElementById('equity').textContent = fmtWon.format(data.equity);
+      document.getElementById('cash').textContent = `기준 현금 ${fmtWon.format(data.cash)}`;
+      document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
+      if (data.basis_source === 'kis_live_account' && Number(data.equity || 0) > 0) {
+        liveAccountBasis = {
+          cash: Number(data.cash || data.equity || 0),
+          equity: Number(data.equity || 0),
+          cash_weight: Number(data.cash_weight || 0),
+          account_suffix: data.account_suffix || '',
+        };
+        const initialCashInput = document.getElementById('initialCash');
+        if (initialCashInput) initialCashInput.value = String(Math.round(liveAccountBasis.equity));
+        const autoBasisTarget = document.getElementById('autoSimulationBasis');
+        if (autoBasisTarget) {
+          autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(liveAccountBasis.equity)} · 수익률 게인 자동 산정`;
+        }
+      }
+    }
+
+    function renderLearningStatus(data) {
+      const progress = data.progress || {};
+      const learning = data.learning || {};
+      const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
+      const active = Boolean(progress.active || data.is_refreshing || learning.active);
+      const stageLabels = {
+        idle: 'idle', starting: 'starting', research: 'collecting', storage: 'storing',
+        analysis: 'analysis', graph: 'graph', waiting: 'waiting', complete: 'complete', error: 'error',
+      };
+      const stage = stageLabels[progress.stage] || progress.stage || 'idle';
+      const message = prettyLearningMessage(progress.message || 'Checking status');
+      document.getElementById('learningStatusTitle').textContent = active ? 'Collection/learning running' : 'Collection/learning waiting';
+      document.getElementById('learningStatusMessage').textContent = message;
+      document.getElementById('learningStatusProgress').style.width = `${percent}%`;
+      document.getElementById('learningStatusMeta').textContent = `${stage} | ${percent.toFixed(1)}%`;
+      document.getElementById('learningStatusCard').classList.toggle('active', true);
+    }
+
+    function updateLearningStopButton(learning = {}) {
+      const stopLearningButton = document.getElementById('modeLearningStopButton');
+      if (stopLearningButton) stopLearningButton.disabled = false;
+    }
+
+    function renderCollectionLog(log = []) {
+      const entries = Array.isArray(log) ? log.slice(-8) : [];
+      const list = document.getElementById('learningCollectionLog');
+      if (list) {
+        list.innerHTML = entries.length
+          ? entries.slice().reverse().map((entry) => {
+              const when = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) : '-';
+              const status = String(entry.status || 'scheduled');
+              const detail = entry.message || '';
+              return `<div class="collection-log-item"><span>${when}</span><span><i class="collection-log-status ${status}"></i><strong>${collectionStatusLabel(status)}</strong> ${detail}</span><span></span></div>`;
+            }).join('')
+          : '<div class="muted">No collection log yet</div>';
+      }
+      drawCollectionLogChart(entries);
+    }
+
+    function maybeRefreshDiagnosticsAfterCollection(log = []) {
+      if (!Array.isArray(log) || !log.length) return;
+      const completed = log.filter((entry) => entry && entry.status === 'complete' && entry.cycle != null).slice(-1)[0];
+      if (!completed || completed.cycle === lastRenderedCollectionCycle) return;
+      lastRenderedCollectionCycle = completed.cycle;
+      loadDiagnostics().catch((error) => console.error(error));
+    }
+
+    function collectionStatusLabel(status) {
+      return { scheduled: 'scheduled', running: 'running', complete: 'complete', error: 'error', stopped: 'stopped' }[status] || status || 'status';
+    }
+    function drawCollectionLogChart(entries) {
+      const canvas = document.getElementById('learningCollectionChart');
+      if (!canvas || !canvas.getContext) return;
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = '#e2e8f0';
+      ctx.beginPath();
+      ctx.moveTo(8, height - 14);
+      ctx.lineTo(width - 8, height - 14);
+      ctx.stroke();
+      if (!entries.length) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '12px Arial';
+        ctx.fillText('수집 로그 대기 중', 12, 34);
+        return;
+      }
+      const bars = entries.slice(-18);
+      const gap = 4;
+      const barWidth = Math.max(6, Math.floor((width - 24 - gap * (bars.length - 1)) / Math.max(1, bars.length)));
+      bars.forEach((entry, index) => {
+        const counts = entry.counts || {};
+        const totalSeen = Number(counts.events_seen || 0) + Number(counts.raw_records_seen || 0) + Number(counts.market_snapshots_seen || 0) + Number(counts.macro_metrics_seen || 0);
+        const value = Math.max(1, totalSeen);
+        const barHeight = entry.status === 'complete' ? Math.min(height - 22, 10 + Math.log10(value + 1) * 18) : entry.status === 'running' ? height - 28 : 12;
+        const x = 12 + index * (barWidth + gap);
+        const y = height - 14 - barHeight;
+        ctx.fillStyle = collectionStatusColor(entry.status);
+        ctx.fillRect(x, y, barWidth, barHeight);
+      });
+    }
+    function collectionStatusColor(status) {
+      return {
+        running: '#0f766e',
+        complete: '#16a34a',
+        error: '#dc2626',
+        scheduled: '#64748b',
+        stopped: '#64748b',
+      }[status] || '#94a3b8';
+    }
+
+    function prettyLearningMessage(message) {
+      const text = String(message || '').trim();
+      if (!text) return '실시간 상태를 확인하는 중입니다.';
+      if (text.startsWith('Retrying failed source:')) {
+        return `재시도 중 · ${text.slice('Retrying failed source:'.length).trim()}`;
+      }
+      return text;
+    }
+
+    async function loadMockPerformance() {
+      try {
+        const data = await (await fetch('/api/mock-trading/performance')).json();
+        renderMockPerformance(data);
+      } catch (error) {
+        document.getElementById('mockStatus').textContent = 'Paper trading 성과 대기 중';
+      }
+    }
+
+    function renderMockPerformance(data) {
+      if (!data) return;
+      const percent = Number(data.return_rate || 0) * 100;
+      document.getElementById('mockReturn').textContent = data.active ? `${percent.toFixed(2)}%` : '대기 중';
+      document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
+      document.getElementById('mockProfit').textContent = `모의 손익 ${fmtWon.format(data.profit || 0)}`;
+      document.getElementById('mockEquity').textContent = `모의 평가 ${fmtWon.format(data.equity || 0)}`;
+      document.getElementById('mockTarget').textContent = data.goal ? `목표 ${(Number(data.goal.target_return_rate || 0) * 100).toFixed(2)}%` : '목표 -';
+      document.getElementById('mockStatus').textContent = data.active
+        ? `Paper trading 진행 중 · 주문 ${data.order_count || 0}건 · 체결 ${data.execution_count || 0}건`
+        : '실제 계좌와 분리된 paper trading 성과가 표시됩니다.';
+    }
+    function renderStreamingPerformance(data) {
+      if (!data || !data.account) return;
+      const account = data.account || {};
+      const returnRate = Number(account.return_rate || 0) * 100;
+      const accountValue = Number(account.account_value || streamingInitialCash || 0);
+      const cash = Number(account.cash || 0);
+      const initial = Number(streamingInitialCash || accountValue || 0);
+      const profit = accountValue - initial;
+      const simulatedProgress = Number(data.progress || 0);
+      streamingReturnSeries.push({ progress: simulatedProgress, returnRate });
+      if (streamingReturnSeries.length > 160) streamingReturnSeries.shift();
+      document.getElementById('mockReturn').textContent = `${returnRate.toFixed(2)}%`;
+      document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(returnRate)))}%`;
+      document.getElementById('mockProfit').textContent = `모의 손익 ${fmtWon.format(profit)}`;
+      document.getElementById('mockEquity').textContent = `모의 평가 ${fmtWon.format(accountValue)}`;
+      document.getElementById('mockStatus').textContent =
+        `Paper trading ${simulatedProgress.toFixed(1)}% 진행 · 목표 시간 ${streamingTargetMinutes || '-'}분 · 모의 현금 ${fmtWon.format(cash)}`;
+      drawStreamingReturnChart();
+    }
+    function drawStreamingReturnChart() {
+      const canvas = document.getElementById('streamingReturnChart');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = '#e6e9ef';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, height / 2);
+      ctx.lineTo(width, height / 2);
+      ctx.stroke();
+      const points = streamingReturnSeries.length ? streamingReturnSeries : [{ progress: 0, returnRate: 0 }];
+      const values = points.map((p) => Number(p.returnRate || 0) * 100);
+      const target = Number(streamingTargetReturnRate || 0) * 100;
+      const min = Math.min(-0.5, target, ...values);
+      const max = Math.max(0.5, target, ...values);
+      const yFor = (value) => height - 10 - ((value - min) / Math.max(0.001, max - min)) * (height - 20);
+      if (target) {
+        const y = yFor(target);
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = '#b45309';
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.strokeStyle = '#0f766e';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = points.length === 1 ? 8 : (index / (points.length - 1)) * (width - 16) + 8;
+        const y = yFor(Number(point.returnRate || 0) * 100);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      ctx.fillStyle = '#667085';
+      ctx.font = '11px Arial';
+      ctx.fillText(`현재 ${(values[values.length - 1] || 0).toFixed(2)}%`, 8, 15);
+      if (target) ctx.fillText(`목표 ${target.toFixed(2)}%`, width - 82, 15);
+    }
+
+    function renderMockRunTables(data) {
+      const positions = data.positions || [];
+      const executions = data.recent_executions || [];
+      document.getElementById('mockRunStats').innerHTML = `
+        <div class="stat"><strong>${data.active ? '진행 중' : '대기'}</strong><span class="muted">모의투자 상태</span></div>
+        <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
+        <div class="stat"><strong>${data.executions_count || 0}</strong><span class="muted">체결</span></div>
+        <div class="stat"><strong>${positions.length}</strong><span class="muted">보유 종목</span></div>
+      `;
+      const positionTarget = document.getElementById('mockPositions');
+      if (positionTarget) positionTarget.innerHTML = positions.length ? positions.map((item) => {
+        const pnl = Number(item.unrealized_pnl || 0);
+        const rate = Number(item.return_rate || 0) * 100;
+        const tone = pnl >= 0 ? 'tone-pos' : 'tone-neg';
+        return `<tr>
+          <td>${item.ticker}</td>
+          <td>${item.quantity}</td>
+          <td>${formatMoney(item.average_price || 0, item.currency)}</td>
+          <td>${formatMoney(item.last_price || 0, item.currency)}</td>
+          <td>${formatMoney(item.market_value || 0, item.currency)}</td>
+          <td class="${tone}">${fmtWon.format(pnl)}</td>
+          <td class="${tone}">${rate.toFixed(2)}%</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="7">보유 종목 없음</td></tr>';
+      document.getElementById('mockExecutions').innerHTML = executions.length ? executions.slice().reverse().map((item) => {
+        const sideClass = item.side === 'BUY' ? 'side-buy' : 'side-sell';
+        return `<tr>
+          <td class="${sideClass}">${item.side}</td>
+          <td>${item.ticker}</td>
+          <td>${item.quantity}</td>
+          <td>${formatMoney(item.price || 0, item.currency)}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="4">체결 이력 없음</td></tr>';
+    }
+
+    function renderDiagnostics(data = {}) {
+      const d = data.diagnostics || data || {};
+      const liveLabel = d.live_data_present ? '실시간' : '로컬';
+      const stats = document.getElementById('diagnosticStats');
+      if (stats) {
+        stats.innerHTML = `
+          <div class="stat"><strong>${liveLabel}</strong><span class="muted">자료 모드</span></div>
+          <div class="stat"><strong>${d.live_source_count || 0}</strong><span class="muted">실시간 출처</span></div>
+          <div class="stat"><strong>${d.external_chart_sources_configured || 0}</strong><span class="muted">차트 출처</span></div>
+          <div class="stat"><strong>${data.graph_triples_count || 0}</strong><span class="muted">온톨로지 관계</span></div>
+        `;
+      }
+      const store = data.store_summary || {};
+      const storeStats = document.getElementById('storeStats');
+      if (storeStats) {
+        storeStats.innerHTML = `
+          <div class="stat"><strong>${store.events || 0}</strong><span class="muted">이벤트</span></div>
+          <div class="stat"><strong>${store.raw_records || 0}</strong><span class="muted">원문</span></div>
+          <div class="stat"><strong>${store.market_snapshots || 0}</strong><span class="muted">시세</span></div>
+          <div class="stat"><strong>${store.realtime_quotes || 0}</strong><span class="muted">실시간 quote</span></div>
+        `;
+      }
+      const warnings = [...(d.collection_warnings || []), ...(data.skipped_sources || [])].slice(0, 4);
+      const warningList = document.getElementById('collectionWarnings');
+      if (warningList) warningList.innerHTML = warnings.map((item) => `<div class="warning-item">${String(item)}</div>`).join('');
+      renderDataVolume(data.data_volume || {});
+    }
+    function renderDataVolume(volume = {}) {
+      drawDataVolumeChart(volume.by_kind || {});
+      const list = document.getElementById('sourceVolumeList');
+      if (!list) return;
+      const rows = Object.entries(volume.market_snapshot_sources || {}).slice(0, 8);
+      list.innerHTML = rows.length
+        ? rows.map(([name, count]) => `<div class="source-volume-row"><span>${name}</span><strong>${count}</strong></div>`).join('')
+        : '<div class="muted">출처별 데이터 없음</div>';
+    }
+
+    function drawDataVolumeChart(byKind = {}) {
+      const canvas = document.getElementById('dataVolumeChart');
+      if (!canvas || !canvas.getContext) return;
+      const ctx = canvas.getContext('2d');
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, width, height);
+      const items = [
+        ['events', '이벤트', '#0f766e'],
+        ['raw_records', '원문', '#2563eb'],
+        ['market_snapshots', '시세', '#f59e0b'],
+        ['macro_metrics', '매크로', '#7c3aed'],
+        ['realtime_quotes', 'Quote', '#0891b2'],
+        ['realtime_executions', '체결', '#dc2626'],
+      ];
+      const maxValue = Math.max(1, ...items.map(([key]) => Number(byKind[key] || 0)));
+      const barWidth = Math.max(24, Math.floor((width - 36) / items.length) - 10);
+      items.forEach(([key, label, color], index) => {
+        const value = Number(byKind[key] || 0);
+        const h = Math.max(4, Math.round((height - 44) * value / maxValue));
+        const x = 18 + index * (barWidth + 10);
+        const y = height - 24 - h;
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, barWidth, h);
+        ctx.fillStyle = '#334155';
+        ctx.font = '11px Arial';
+        ctx.fillText(label, x, height - 8);
+        ctx.fillText(String(value), x, Math.max(12, y - 4));
+      });
+    }
+    async function renderOntologyGraph(data) {
+      const canvas = document.getElementById('ontologyCanvas');
+      const tooltip = document.getElementById('ontologyTooltip');
+      const THREE = await loadThree();
+      if (!THREE) {
+        renderOntologyGraph2d(data, canvas, tooltip);
+        tooltip.style.display = 'block';
+        tooltip.style.left = '12px';
+        tooltip.style.top = '52px';
+        tooltip.textContent = '3D 라이브러리를 불러오지 못해 2D로 표시합니다.';
+        return;
+      }
+
+      if (graphState) {
+        graphState.stop = true;
+        if (graphState.renderer) graphState.renderer.dispose();
+      }
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0f172a);
+      const camera = new THREE.PerspectiveCamera(52, 1, 0.1, 5000);
+      camera.position.set(0, 0, 760);
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      const root = new THREE.Group();
+      scene.add(root);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.78));
+      const light = new THREE.PointLight(0xffffff, 1.1);
+      light.position.set(300, 280, 500);
+      scene.add(light);
+
+      const renderGraph = prepareRenderableGraph(data.nodes || [], data.links || []);
+      const nodes = computeGraphLayout(renderGraph.nodes, renderGraph.links);
+      const graphMetrics = buildGraphMetrics(nodes, renderGraph.links);
+      document.getElementById('ontologyCounts').textContent =
+        `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${nodes.length}/${renderGraph.links.length}`;
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+      const raycaster = new THREE.Raycaster();
+      const pointer = new THREE.Vector2(99, 99);
+      const nodeMeshes = [];
+      const labelSprites = [];
+      const linkLines = [];
+      const linkGlowLines = [];
+      const nodeMeshById = new Map();
+      const nodeGlowById = new Map();
+      const labelById = new Map();
+      const lineByKey = new Map();
+      const labelState = { visible: false };
+      const reasoningState = {
+        steps: (data.reasoning_steps || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
+        playing: true,
+        currentIndex: -1,
+        startedAt: performance.now(),
+        stepMs: 1450,
+        activeNodeIds: new Set(),
+        activeLinkKeys: new Set(),
+      };
+      const activeKinds = new Set(['ticker', 'event', 'temporal', 'sector', 'support', 'risk', 'contradiction', 'pipeline', 'tuning', 'parameter', 'metric', 'entity']);
+
+      for (const link of renderGraph.links) {
+        const source = nodeMap.get(link.source);
+        const target = nodeMap.get(link.target);
+        if (!source || !target) continue;
+        const geometry = new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(...source.position),
+          new THREE.Vector3(...target.position),
+        ]);
+        const material = new THREE.LineBasicMaterial({ color: edgeColor(link.predicate), transparent: true, opacity: 0.26 });
+        const line = new THREE.Line(geometry, material);
+        line.userData = { source: link.source, target: link.target, predicate: link.predicate };
+        line.userData.baseColor = edgeColor(link.predicate);
+        line.userData.baseOpacity = 0.26;
+        root.add(line);
+        linkLines.push(line);
+        lineByKey.set(linkKey(link.source, link.target, link.predicate), line);
+        const glowMaterial = new THREE.LineBasicMaterial({
+          color: 0x67e8f9,
+          transparent: true,
+          opacity: 0,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const glowLine = new THREE.Line(geometry.clone(), glowMaterial);
+        glowLine.visible = false;
+        glowLine.userData = { source: link.source, target: link.target, predicate: link.predicate };
+        root.add(glowLine);
+        linkGlowLines.push(glowLine);
+      }
+
+      for (const node of nodes) {
+        const radius = nodeRadius(node, graphMetrics);
+        const geometry = new THREE.SphereGeometry(radius, 16, 16);
+        const highlighted = Boolean(node.highlight);
+        const material = new THREE.MeshStandardMaterial({
+          color: nodeColor(node.kind),
+          emissive: nodeColor(node.kind),
+          emissiveIntensity: highlighted ? 0.34 : 0.08,
+          roughness: 0.62,
+        });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.position.set(...node.position);
+        mesh.userData = node;
+        mesh.userData.baseRadius = radius;
+        mesh.userData.baseEmissiveIntensity = highlighted ? 0.34 : 0.08;
+        root.add(mesh);
+        nodeMeshes.push(mesh);
+        nodeMeshById.set(node.id, mesh);
+        const glowGeometry = new THREE.SphereGeometry(radius * 2.35, 18, 18);
+        const glowMaterial = new THREE.MeshBasicMaterial({
+          color: nodeColor(node.kind),
+          transparent: true,
+          opacity: 0,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const glow = new THREE.Mesh(glowGeometry, glowMaterial);
+        glow.position.copy(mesh.position);
+        glow.visible = highlighted;
+        glow.userData = node;
+        root.add(glow);
+        nodeGlowById.set(node.id, glow);
+        const label = createTextSprite(THREE, shortLabel(node.label), nodeColor(node.kind));
+        label.position.set(node.position[0] + 12, node.position[1] + 12, node.position[2]);
+        label.visible = false;
+        label.userData = node;
+        root.add(label);
+        labelSprites.push(label);
+        labelById.set(node.id, label);
+      }
+
+      let dragging = false;
+      let lastX = 0;
+      let lastY = 0;
+      let rotationX = -0.18;
+      let rotationY = 0.34;
+      let targetZoom = 760;
+      let pausedUntil = 0;
+      let visibleCenter = new THREE.Vector3(0, 0, 0);
+      const nodePhysics = {
+        cellSize: 86,
+        homePull: 0.018,
+        damping: 0.82,
+        push: 2.25,
+        maxVelocity: 6.2,
+        velocities: new Map(),
+        homePositions: new Map(),
+      };
+      for (const mesh of nodeMeshes) {
+        nodePhysics.velocities.set(mesh.userData.id, new THREE.Vector3());
+        nodePhysics.homePositions.set(mesh.userData.id, mesh.position.clone());
+      }
+
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        renderer.setSize(rect.width, rect.height, false);
+        camera.aspect = rect.width / Math.max(1, rect.height);
+        camera.updateProjectionMatrix();
+      }
+
+      canvas.addEventListener('pointerdown', (event) => {
+        dragging = true;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        pausedUntil = performance.now() + 2500;
+        canvas.setPointerCapture(event.pointerId);
+      });
+      canvas.addEventListener('pointermove', (event) => {
+        const rect = canvas.getBoundingClientRect();
+        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        if (!dragging) return;
+        rotationY += (event.clientX - lastX) * 0.008;
+        rotationX += (event.clientY - lastY) * 0.008;
+        lastX = event.clientX;
+        lastY = event.clientY;
+      });
+      canvas.addEventListener('pointerup', () => { dragging = false; });
+      canvas.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        targetZoom = Math.max(260, Math.min(1300, targetZoom + event.deltaY * 0.7));
+        pausedUntil = performance.now() + 2200;
+      }, { passive: false });
+      document.getElementById('resetGraph').onclick = () => {
+        rotationX = -0.18;
+        rotationY = 0.34;
+        targetZoom = 760;
+        fitVisibleGraph();
+      };
+      document.getElementById('toggleLabels').onclick = () => {
+        labelState.visible = !labelState.visible;
+        document.getElementById('toggleLabels').textContent = labelState.visible ? '라벨 끄기' : '라벨 켜기';
+        updateVisibility();
+      };
+      document.getElementById('toggleReasoning').onclick = () => {
+        reasoningState.playing = !reasoningState.playing;
+        reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
+        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+      };
+      document.querySelectorAll('#ontologyFilters input').forEach((input) => {
+        input.onchange = () => {
+          if (input.checked) activeKinds.add(input.value);
+          else activeKinds.delete(input.value);
+          updateVisibility();
+        };
+      });
+
+      canvas.addEventListener('click', () => {
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(nodeMeshes.filter((mesh) => mesh.visible), false)[0];
+        if (hit) renderNodePanel(hit.object.userData, data.links);
+      });
+
+      function updateVisibility() {
+        let visibleCount = 0;
+        for (const mesh of nodeMeshes) {
+          mesh.visible = activeKinds.has(mesh.userData.kind);
+          if (mesh.visible) visibleCount += 1;
+        }
+        for (const glow of nodeGlowById.values()) {
+          glow.visible = (glow.userData.highlight || reasoningState.activeNodeIds.has(glow.userData.id)) && activeKinds.has(glow.userData.kind);
+        }
+        for (const sprite of labelSprites) {
+          sprite.visible = (labelState.visible || reasoningState.activeNodeIds.has(sprite.userData.id)) && activeKinds.has(sprite.userData.kind);
+        }
+        for (const line of linkLines) {
+          const source = nodeMap.get(line.userData.source);
+          const target = nodeMap.get(line.userData.target);
+          line.visible = Boolean(source && target && activeKinds.has(source.kind) && activeKinds.has(target.kind));
+        }
+        for (const line of linkGlowLines) {
+          const source = nodeMap.get(line.userData.source);
+          const target = nodeMap.get(line.userData.target);
+          line.visible = Boolean(
+            source
+            && target
+            && activeKinds.has(source.kind)
+            && activeKinds.has(target.kind)
+            && reasoningState.activeLinkKeys.has(linkKey(line.userData.source, line.userData.target, line.userData.predicate))
+          );
+        }
+        fitVisibleGraph();
+        document.getElementById('ontologyCounts').textContent =
+          `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${visibleCount}/${renderGraph.links.length}`;
+      }
+
+      function fitVisibleGraph() {
+        const visibleMeshes = nodeMeshes.filter((mesh) => activeKinds.has(mesh.userData.kind));
+        if (!visibleMeshes.length) {
+          visibleCenter.set(0, 0, 0);
+          return;
+        }
+        const center = new THREE.Vector3(0, 0, 0);
+        let maxDistance = 1;
+        for (const mesh of visibleMeshes) center.add(mesh.position);
+        center.multiplyScalar(1 / visibleMeshes.length);
+        for (const mesh of visibleMeshes) maxDistance = Math.max(maxDistance, mesh.position.distanceTo(center));
+        visibleCenter.copy(center);
+        targetZoom = Math.max(260, Math.min(1300, maxDistance * 2.35 + 280));
+      }
+
+      function gridKeyFor(position) {
+        const cell = nodePhysics.cellSize;
+        return `${Math.floor(position.x / cell)},${Math.floor(position.y / cell)},${Math.floor(position.z / cell)}`;
+      }
+
+      function applyNodeProximityRepulsion() {
+        const visibleMeshes = nodeMeshes.filter((mesh) => mesh.visible);
+        if (visibleMeshes.length < 2) return;
+        const grid = new Map();
+        for (const mesh of visibleMeshes) {
+          const key = gridKeyFor(mesh.position);
+          if (!grid.has(key)) grid.set(key, []);
+          grid.get(key).push(mesh);
+        }
+
+        for (let index = 0; index < visibleMeshes.length; index += 1) {
+          const mesh = visibleMeshes[index];
+          const velocity = nodePhysics.velocities.get(mesh.userData.id);
+          const home = nodePhysics.homePositions.get(mesh.userData.id);
+          if (!velocity || !home) continue;
+
+          velocity.addScaledVector(home.clone().sub(mesh.position), nodePhysics.homePull);
+
+          const cx = Math.floor(mesh.position.x / nodePhysics.cellSize);
+          const cy = Math.floor(mesh.position.y / nodePhysics.cellSize);
+          const cz = Math.floor(mesh.position.z / nodePhysics.cellSize);
+          for (let ox = -1; ox <= 1; ox += 1) {
+            for (let oy = -1; oy <= 1; oy += 1) {
+              for (let oz = -1; oz <= 1; oz += 1) {
+                const bucket = grid.get(`${cx + ox},${cy + oy},${cz + oz}`);
+                if (!bucket) continue;
+                for (const other of bucket) {
+                  if (other === mesh || other.userData.index <= mesh.userData.index) continue;
+                  const otherVelocity = nodePhysics.velocities.get(other.userData.id);
+                  if (!otherVelocity) continue;
+                  const minDistance = mesh.userData.baseRadius + other.userData.baseRadius + 34;
+                  const dx = mesh.position.x - other.position.x;
+                  const dy = mesh.position.y - other.position.y;
+                  const dz = mesh.position.z - other.position.z;
+                  const distanceSq = dx * dx + dy * dy + dz * dz;
+                  if (distanceSq >= minDistance * minDistance) continue;
+                  const distance = Math.sqrt(distanceSq) || 0.001;
+                  const pressure = (1 - distance / minDistance) * nodePhysics.push;
+                  const nx = dx / distance;
+                  const ny = dy / distance;
+                  const nz = dz / distance;
+                  velocity.x += nx * pressure;
+                  velocity.y += ny * pressure;
+                  velocity.z += nz * pressure;
+                  otherVelocity.x -= nx * pressure;
+                  otherVelocity.y -= ny * pressure;
+                  otherVelocity.z -= nz * pressure;
+                }
+              }
+            }
+          }
+        }
+
+        for (const mesh of visibleMeshes) {
+          const velocity = nodePhysics.velocities.get(mesh.userData.id);
+          if (!velocity) continue;
+          velocity.multiplyScalar(nodePhysics.damping);
+          if (velocity.length() > nodePhysics.maxVelocity) velocity.setLength(nodePhysics.maxVelocity);
+          mesh.position.add(velocity);
+        }
+      }
+
+      function syncGraphGeometryPositions() {
+        for (const glow of nodeGlowById.values()) {
+          const mesh = nodeMeshById.get(glow.userData.id);
+          if (mesh) glow.position.copy(mesh.position);
+        }
+        for (const label of labelSprites) {
+          const mesh = nodeMeshById.get(label.userData.id);
+          if (mesh) label.position.set(mesh.position.x + 12, mesh.position.y + 12, mesh.position.z);
+        }
+        for (const line of linkLines) updateLineGeometry(line);
+        for (const line of linkGlowLines) updateLineGeometry(line);
+      }
+
+      function updateLineGeometry(line) {
+        const source = nodeMeshById.get(line.userData.source);
+        const target = nodeMeshById.get(line.userData.target);
+        if (!source || !target) return;
+        const positions = line.geometry.attributes.position;
+        positions.setXYZ(0, source.position.x, source.position.y, source.position.z);
+        positions.setXYZ(1, target.position.x, target.position.y, target.position.z);
+        positions.needsUpdate = true;
+        line.geometry.computeBoundingSphere();
+      }
+
+      function updateReasoning(now) {
+        if (!reasoningState.steps.length) {
+          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          return;
+        }
+        if (reasoningState.playing) {
+          const elapsed = Math.max(0, now - reasoningState.startedAt);
+          const index = Math.floor(elapsed / reasoningState.stepMs) % reasoningState.steps.length;
+          if (index !== reasoningState.currentIndex) setActiveReasoningStep(index);
+        }
+      }
+
+      function setActiveReasoningStep(index) {
+        if (index < 0 || index >= reasoningState.steps.length) return;
+        reasoningState.currentIndex = index;
+        const step = reasoningState.steps[index];
+        reasoningState.activeNodeIds = new Set(step.nodes || []);
+        reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
+        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningDescription').textContent = step.description || '';
+        document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
+        updateVisibility();
+      }
+
+      function applyReasoningGlow(now) {
+        const pulse = 0.62 + Math.sin(now / 135) * 0.38;
+        for (const mesh of nodeMeshes) {
+          const active = reasoningState.activeNodeIds.has(mesh.userData.id);
+          mesh.scale.setScalar(active ? 1.12 + pulse * 0.22 : 1);
+          mesh.material.emissiveIntensity = active ? 1.35 + pulse * 0.95 : mesh.userData.baseEmissiveIntensity;
+          mesh.material.color.setHex(active ? neonColor(mesh.userData.kind) : nodeColor(mesh.userData.kind));
+        }
+        for (const glow of nodeGlowById.values()) {
+          const active = reasoningState.activeNodeIds.has(glow.userData.id);
+          const highlighted = Boolean(glow.userData.highlight);
+          glow.visible = (active || highlighted) && activeKinds.has(glow.userData.kind);
+          glow.scale.setScalar(active ? 1.05 + pulse * 0.35 : 1);
+          glow.material.opacity = active ? 0.22 + pulse * 0.18 : highlighted ? 0.12 + pulse * 0.08 : 0;
+          glow.material.color.setHex(neonColor(glow.userData.kind));
+        }
+        for (const line of linkLines) {
+          const active = reasoningState.activeLinkKeys.has(linkKey(line.userData.source, line.userData.target, line.userData.predicate));
+          line.material.opacity = active ? 1 : line.userData.baseOpacity;
+          line.material.color.setHex(active ? neonEdgeColor(line.userData.predicate) : line.userData.baseColor);
+        }
+        for (const line of linkGlowLines) {
+          const active = reasoningState.activeLinkKeys.has(linkKey(line.userData.source, line.userData.target, line.userData.predicate));
+          const source = nodeMap.get(line.userData.source);
+          const target = nodeMap.get(line.userData.target);
+          line.visible = Boolean(active && source && target && activeKinds.has(source.kind) && activeKinds.has(target.kind));
+          line.material.opacity = active ? 0.42 + pulse * 0.28 : 0;
+          line.material.color.setHex(neonEdgeColor(line.userData.predicate));
+        }
+        for (const [nodeId, label] of labelById.entries()) {
+          if (reasoningState.activeNodeIds.has(nodeId)) {
+            label.material.opacity = 1;
+          }
+        }
+      }
+
+      graphState = { renderer, stop: false };
+      resize();
+      window.addEventListener('resize', resize);
+      if (reasoningState.steps.length) setActiveReasoningStep(0);
+
+      function animate(now) {
+        if (!graphState || graphState.stop) return;
+        requestAnimationFrame(animate);
+        if (!dragging && now > pausedUntil) rotationY += 0.0022;
+        root.rotation.x = rotationX;
+        root.rotation.y = rotationY;
+        root.position.x += (-visibleCenter.x - root.position.x) * 0.08;
+        root.position.y += (-visibleCenter.y - root.position.y) * 0.08;
+        root.position.z += (-visibleCenter.z - root.position.z) * 0.08;
+        camera.position.z += (targetZoom - camera.position.z) * 0.08;
+        updateReasoning(now);
+        applyNodeProximityRepulsion();
+        syncGraphGeometryPositions();
+        applyReasoningGlow(now);
+
+        raycaster.setFromCamera(pointer, camera);
+        const hit = raycaster.intersectObjects(nodeMeshes.filter((mesh) => mesh.visible), false)[0];
+        if (hit) {
+          const rect = canvas.getBoundingClientRect();
+          tooltip.style.display = 'block';
+          tooltip.style.left = `${Math.min(rect.width - 280, Math.max(8, (pointer.x + 1) * rect.width / 2))}px`;
+          tooltip.style.top = `${Math.min(rect.height - 80, Math.max(50, (-pointer.y + 1) * rect.height / 2))}px`;
+          tooltip.innerHTML = `<strong>${hit.object.userData.label}</strong><br>${kindLabel(hit.object.userData.kind)} · 연결 ${degree(hit.object.userData.id, renderGraph.links)}개 · 중요도 ${Number(hit.object.userData.importance_score || 0).toFixed(2)}`;
+        } else {
+          tooltip.style.display = 'none';
+        }
+
+        renderer.render(scene, camera);
+      }
+      requestAnimationFrame(animate);
+      updateVisibility();
+    }
+
+    function renderOntologyGraph2d(data, canvas, tooltip) {
+      if (graphState) graphState.stop = true;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const renderGraph = prepareRenderableGraph(data.nodes || [], data.links || []);
+      const nodes = computeGraphLayout(renderGraph.nodes, renderGraph.links);
+      const graphMetrics = buildGraphMetrics(nodes, renderGraph.links);
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+      const activeKinds = new Set(['ticker', 'event', 'temporal', 'sector', 'support', 'risk', 'contradiction', 'pipeline', 'tuning', 'parameter', 'metric', 'entity']);
+      const reasoningState = {
+        steps: (data.reasoning_steps || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
+        playing: true,
+        currentIndex: -1,
+        startedAt: performance.now(),
+        stepMs: 1450,
+        activeNodeIds: new Set(),
+        activeLinkKeys: new Set(),
+      };
+      const view = { scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0, labels: false, pointerX: -9999, pointerY: -9999 };
+      let hoveredNode = null;
+
+      document.getElementById('ontologyCounts').textContent =
+        `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${nodes.length}/${renderGraph.links.length}`;
+
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+        canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      }
+
+      function project(node) {
+        const rect = canvas.getBoundingClientRect();
+        const [x, y] = node.position || [0, 0, 0];
+        return {
+          x: rect.width / 2 + (x + view.offsetX) * view.scale,
+          y: rect.height / 2 + (y + view.offsetY) * view.scale,
+        };
+      }
+
+      function visibleNode(node) {
+        return activeKinds.has(node.kind);
+      }
+
+      function fitVisibleGraph2d() {
+        const visibleNodes = nodes.filter(visibleNode);
+        if (!visibleNodes.length) {
+          view.scale = 1;
+          view.offsetX = 0;
+          view.offsetY = 0;
+          return;
+        }
+        const xs = visibleNodes.map((node) => (node.position || [0, 0, 0])[0]);
+        const ys = visibleNodes.map((node) => (node.position || [0, 0, 0])[1]);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+        const rect = canvas.getBoundingClientRect();
+        view.offsetX = -((minX + maxX) / 2);
+        view.offsetY = -((minY + maxY) / 2);
+        view.scale = Math.max(0.45, Math.min(2.7, Math.min(rect.width / (width + 120), rect.height / (height + 120))));
+      }
+
+      function setActiveReasoningStep(index) {
+        if (index < 0 || index >= reasoningState.steps.length) return;
+        reasoningState.currentIndex = index;
+        const step = reasoningState.steps[index];
+        reasoningState.activeNodeIds = new Set(step.nodes || []);
+        reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
+        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningDescription').textContent = step.description || '';
+        document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
+      }
+
+      function updateReasoning(now) {
+        if (!reasoningState.steps.length) {
+          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          return;
+        }
+        if (!reasoningState.playing) return;
+        const index = Math.floor(Math.max(0, now - reasoningState.startedAt) / reasoningState.stepMs) % reasoningState.steps.length;
+        if (index !== reasoningState.currentIndex) setActiveReasoningStep(index);
+      }
+
+      function draw(now) {
+        if (!graphState || graphState.stop) return;
+        const rect = canvas.getBoundingClientRect();
+        ctx.clearRect(0, 0, rect.width, rect.height);
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(0, 0, rect.width, rect.height);
+        updateReasoning(now);
+        const pulse = 0.55 + Math.sin(now / 150) * 0.45;
+
+        for (const link of renderGraph.links) {
+          const source = nodeMap.get(link.source);
+          const target = nodeMap.get(link.target);
+          if (!source || !target || !visibleNode(source) || !visibleNode(target)) continue;
+          const a = project(source);
+          const b = project(target);
+          const active = reasoningState.activeLinkKeys.has(linkKey(link.source, link.target, link.predicate));
+          ctx.save();
+          ctx.strokeStyle = intColorToCss(active ? neonEdgeColor(link.predicate) : edgeColor(link.predicate));
+          ctx.globalAlpha = active ? 0.78 : 0.22;
+          ctx.lineWidth = active ? 2.4 + pulse * 1.5 : 0.8;
+          ctx.shadowBlur = active ? 16 : 0;
+          ctx.shadowColor = ctx.strokeStyle;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        hoveredNode = null;
+        let nearestDistance = 18;
+        for (const node of nodes) {
+          if (!visibleNode(node)) continue;
+          const p = project(node);
+          const active = reasoningState.activeNodeIds.has(node.id);
+          const highlighted = Boolean(node.highlight);
+          const radius = nodeRadius(node, graphMetrics) * view.scale * (active ? 1.35 : 1);
+          const color = intColorToCss(active ? neonColor(node.kind) : nodeColor(node.kind));
+          ctx.save();
+          ctx.fillStyle = color;
+          ctx.globalAlpha = 0.92;
+          ctx.shadowBlur = active ? 24 : highlighted ? 14 : 0;
+          ctx.shadowColor = intColorToCss(neonColor(node.kind));
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, Math.max(2.2, radius), 0, Math.PI * 2);
+          ctx.fill();
+          if (highlighted || active) {
+            ctx.globalAlpha = active ? 0.28 + pulse * 0.16 : 0.16;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, Math.max(6, radius * 2.5), 0, Math.PI * 2);
+            ctx.fill();
+          }
+          if (view.labels || active) {
+            ctx.globalAlpha = 0.95;
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = '#e5e7eb';
+            ctx.font = '12px Arial';
+            ctx.fillText(shortLabel(node.label), p.x + radius + 4, p.y - radius - 3);
+          }
+          ctx.restore();
+          const d = Math.hypot(p.x - view.pointerX, p.y - view.pointerY);
+          if (d < nearestDistance) {
+            nearestDistance = d;
+            hoveredNode = node;
+          }
+        }
+
+        if (hoveredNode) {
+          const p = project(hoveredNode);
+          tooltip.style.display = 'block';
+          tooltip.style.left = `${Math.min(rect.width - 280, Math.max(8, p.x + 12))}px`;
+          tooltip.style.top = `${Math.min(rect.height - 80, Math.max(50, p.y + 12))}px`;
+          tooltip.innerHTML = `<strong>${hoveredNode.label}</strong><br>${kindLabel(hoveredNode.kind)} · 연결 ${degree(hoveredNode.id, renderGraph.links)}개 · 중요도 ${Number(hoveredNode.importance_score || 0).toFixed(2)}`;
+        } else {
+          tooltip.style.display = 'none';
+        }
+
+        requestAnimationFrame(draw);
+      }
+
+      canvas.onpointerdown = (event) => {
+        view.dragging = true;
+        view.lastX = event.clientX;
+        view.lastY = event.clientY;
+        canvas.setPointerCapture(event.pointerId);
+      };
+      canvas.onpointermove = (event) => {
+        const rect = canvas.getBoundingClientRect();
+        view.pointerX = event.clientX - rect.left;
+        view.pointerY = event.clientY - rect.top;
+        if (!view.dragging) return;
+        view.offsetX += (event.clientX - view.lastX) / Math.max(0.1, view.scale);
+        view.offsetY += (event.clientY - view.lastY) / Math.max(0.1, view.scale);
+        view.lastX = event.clientX;
+        view.lastY = event.clientY;
+      };
+      canvas.onpointerup = () => { view.dragging = false; };
+      canvas.onpointerleave = () => { view.pointerX = -9999; view.pointerY = -9999; };
+      canvas.onwheel = (event) => {
+        event.preventDefault();
+        view.scale = Math.max(0.45, Math.min(2.7, view.scale * (event.deltaY > 0 ? 0.9 : 1.1)));
+      };
+      canvas.onclick = () => {
+        if (hoveredNode) renderNodePanel(hoveredNode, data.links);
+      };
+      document.getElementById('resetGraph').onclick = () => {
+        fitVisibleGraph2d();
+      };
+      document.getElementById('toggleLabels').onclick = () => {
+        view.labels = !view.labels;
+        document.getElementById('toggleLabels').textContent = view.labels ? '라벨 끄기' : '라벨 켜기';
+      };
+      document.getElementById('toggleReasoning').onclick = () => {
+        reasoningState.playing = !reasoningState.playing;
+        reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
+        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+      };
+      document.querySelectorAll('#ontologyFilters input').forEach((input) => {
+        input.onchange = () => {
+          if (input.checked) activeKinds.add(input.value);
+          else activeKinds.delete(input.value);
+          fitVisibleGraph2d();
+        };
+      });
+
+      graphState = { stop: false, renderer: null };
+      resize();
+      window.addEventListener('resize', resize, { passive: true });
+      fitVisibleGraph2d();
+      if (reasoningState.steps.length) setActiveReasoningStep(0);
+      requestAnimationFrame(draw);
+    }
+
+    function intColorToCss(value) {
+      return `#${Number(value || 0).toString(16).padStart(6, '0')}`;
+    }
+
+    async function loadThree() {
+      if (window.__threeModule) return window.__threeModule;
+      try {
+        window.__threeModule = await import('https://unpkg.com/three@0.165.0/build/three.module.js');
+        return window.__threeModule;
+      } catch (error) {
+        console.error(error);
+        return null;
+      } finally {
+        streamingStepBusy = false;
+      }
+    }
+
+    function prepareRenderableGraph(rawNodes, rawLinks) {
+      const kindOverrides = inferRenderableKinds(rawNodes, rawLinks);
+      const normalizedNodes = rawNodes.map((node) => kindOverrides.has(node.id) ? { ...node, kind: kindOverrides.get(node.id) } : node);
+      const degreeMap = new Map(normalizedNodes.map((node) => [node.id, 0]));
+      for (const link of rawLinks) {
+        const boost = importantPredicate(link.predicate) ? 7 : 1;
+        degreeMap.set(link.source, (degreeMap.get(link.source) || 0) + boost);
+        degreeMap.set(link.target, (degreeMap.get(link.target) || 0) + boost);
+      }
+      const scoreNode = (node) => Number(node.importance_score || 0) + (degreeMap.get(node.id) || 0) * 0.02 + (node.highlight ? 3 : 0);
+      const byScore = (a, b) => scoreNode(b) - scoreNode(a);
+      const priorityKind = { support: 9, risk: 9, contradiction: 9, pipeline: 7.2, tuning: 7, parameter: 6.6, metric: 6, sector: 5.7, ticker: 5.2, event: 4.8, temporal: 4.4, entity: 1 };
+      const nodes = normalizedNodes
+        .slice()
+        .sort((a, b) => {
+          const kindScore = (priorityKind[b.kind] || 0) - (priorityKind[a.kind] || 0);
+          if (kindScore) return kindScore;
+          return byScore(a, b);
+        });
+      const selected = new Set(nodes.map((node) => node.id));
+      const links = rawLinks
+        .filter((link) => selected.has(link.source) && selected.has(link.target))
+        .sort((a, b) => Number(importantPredicate(b.predicate)) - Number(importantPredicate(a.predicate)));
+      return { nodes, links };
+    }
+
+    function inferRenderableKinds(rawNodes, rawLinks) {
+      const fixedKinds = new Set(['ticker', 'event', 'temporal', 'pipeline', 'tuning', 'parameter', 'metric', 'sector']);
+      const nodeById = new Map(rawNodes.map((node) => [node.id, node]));
+      const overrides = new Map();
+      const assign = (id, kind) => {
+        const node = nodeById.get(id);
+        if (!node || fixedKinds.has(node.kind)) return;
+        if (overrides.get(id) === 'risk') return;
+        if (kind === 'risk' || !overrides.has(id)) overrides.set(id, kind);
+      };
+      for (const link of rawLinks) {
+        if (link.predicate === 'supportsSignal' || link.predicate === 'decreasesRiskOf') {
+          assign(link.source, 'support');
+          assign(link.target, 'support');
+        } else if (link.predicate === 'increasesRiskOf') {
+          assign(link.source, 'risk');
+          assign(link.target, 'risk');
+        } else if (link.predicate === 'contradictsSignal') {
+          assign(link.source, 'contradiction');
+          assign(link.target, 'contradiction');
+        }
+      }
+      return overrides;
+    }
+
+    function importantPredicate(predicate) {
+      return [
+        'supportsSignal',
+        'increasesRiskOf',
+        'contradictsSignal',
+        'decreasesRiskOf',
+        'generatesSemanticFeature',
+        'hasTechnicalIndicator',
+        'hasRecentNews',
+        'hasRecentDisclosure',
+        'selectsCandidate',
+        'feedsStage',
+        'tunesParameter',
+        'hasTunedValue',
+        'containsFrame',
+        'hasTimeFrame',
+        'observesTicker',
+        'containsEvent',
+        'occursInTimeBucket',
+        'usesMarketSnapshot',
+        'containsQuote',
+        'containsExecution',
+        'usesRawSource',
+        'hasMacroContext',
+        'hasImpactScore',
+        'hasTuningMode',
+        'adjustsStage',
+        'producesTunedValue',
+        'appliesToStage',
+        'usesOntologySignal',
+        'calibratesSignal',
+        'raisesTuningPressure',
+        'requiresApprovalFrom',
+        'observedUniverseCount',
+        'selectedCandidateCount',
+        'fetchesChartsFor',
+      ].includes(predicate);
+    }
+
+    function computeGraphLayout(rawNodes, rawLinks) {
+      const nodes = rawNodes.map((node, index) => ({ ...node, index }));
+      if (!nodes.length) return nodes;
+      if (nodes.length > 700) return computeFastClusterLayout(nodes, rawLinks);
+
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+      const links = rawLinks.filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
+      const adjacency = new Map(nodes.map((node) => [node.id, new Set()]));
+      const degreeMap = new Map(nodes.map((node) => [node.id, 0]));
+      for (const link of links) {
+        adjacency.get(link.source).add(link.target);
+        adjacency.get(link.target).add(link.source);
+        degreeMap.set(link.source, degreeMap.get(link.source) + 1);
+        degreeMap.set(link.target, degreeMap.get(link.target) + 1);
+      }
+
+      const anchors = {
+        ticker: [0, 0, 0],
+        support: [-130, 95, 95],
+        risk: [155, 90, -95],
+        contradiction: [160, -85, 115],
+        sector: [-165, -105, -100],
+        entity: [0, -165, 120],
+        event: [-15, 150, -125],
+        temporal: [-95, -155, 20],
+        pipeline: [145, -130, -35],
+        tuning: [135, 20, 150],
+        parameter: [205, -35, 125],
+        metric: [215, 115, 25],
+      };
+      const positions = new Map();
+      const velocities = new Map();
+
+      nodes.forEach((node) => {
+        const seed = seededUnit(node.id || node.label || String(node.index));
+        const anchor = anchors[node.kind] || [0, 0, 0];
+        const importance = Math.max(0, Math.min(1, Number(node.importance_score || 0)));
+        const spread = node.kind === 'ticker' ? 95 : 185 - importance * 55;
+        const angleA = seed * Math.PI * 2;
+        const angleB = seededUnit(`${node.id}:z`) * Math.PI * 2;
+        positions.set(node.id, {
+          x: anchor[0] + Math.cos(angleA) * spread * (0.35 + seededUnit(`${node.id}:rx`) * 0.65),
+          y: anchor[1] + Math.sin(angleA) * spread * (0.35 + seededUnit(`${node.id}:ry`) * 0.65),
+          z: anchor[2] + Math.sin(angleB) * spread * (0.25 + seededUnit(`${node.id}:rz`) * 0.55),
+        });
+        velocities.set(node.id, { x: 0, y: 0, z: 0 });
+      });
+
+      const iterations = Math.max(45, Math.min(230, Math.floor(14000 / Math.max(1, nodes.length))));
+      for (let iteration = 0; iteration < iterations; iteration += 1) {
+        const cooling = 1 - iteration / iterations;
+        for (let i = 0; i < nodes.length; i += 1) {
+          const a = nodes[i];
+          const pa = positions.get(a.id);
+          const va = velocities.get(a.id);
+          for (let j = i + 1; j < nodes.length; j += 1) {
+            const b = nodes[j];
+            const pb = positions.get(b.id);
+            const vb = velocities.get(b.id);
+            let dx = pa.x - pb.x;
+            let dy = pa.y - pb.y;
+            let dz = pa.z - pb.z;
+            let distance = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.001;
+            const connected = adjacency.get(a.id).has(b.id);
+            const minDistance = connected ? 48 : 82;
+            if (distance < minDistance) distance = minDistance;
+            const repulsion = (connected ? 1200 : 4200) / (distance * distance);
+            dx /= distance; dy /= distance; dz /= distance;
+            va.x += dx * repulsion; va.y += dy * repulsion; va.z += dz * repulsion;
+            vb.x -= dx * repulsion; vb.y -= dy * repulsion; vb.z -= dz * repulsion;
+          }
+        }
+
+        for (const link of links) {
+          const source = positions.get(link.source);
+          const target = positions.get(link.target);
+          const vs = velocities.get(link.source);
+          const vt = velocities.get(link.target);
+          const dx = target.x - source.x;
+          const dy = target.y - source.y;
+          const dz = target.z - source.z;
+          const distance = Math.sqrt(dx * dx + dy * dy + dz * dz) || 0.001;
+          const desired = linkLength(link.predicate);
+          const force = (distance - desired) * (0.006 + cooling * 0.004) * linkStrength(link.predicate);
+          const nx = dx / distance;
+          const ny = dy / distance;
+          const nz = dz / distance;
+          vs.x += nx * force; vs.y += ny * force; vs.z += nz * force;
+          vt.x -= nx * force; vt.y -= ny * force; vt.z -= nz * force;
+        }
+
+        for (const node of nodes) {
+          const p = positions.get(node.id);
+          const v = velocities.get(node.id);
+          const anchor = anchors[node.kind] || [0, 0, 0];
+          const degree = degreeMap.get(node.id) || 0;
+          const anchorPull = node.kind === 'ticker' ? 0.004 : 0.0018;
+          const centerPull = 0.0009 + Math.min(0.002, degree * 0.00018);
+          v.x += (anchor[0] - p.x) * anchorPull - p.x * centerPull;
+          v.y += (anchor[1] - p.y) * anchorPull - p.y * centerPull;
+          v.z += (anchor[2] - p.z) * anchorPull - p.z * centerPull;
+          v.x *= 0.78; v.y *= 0.78; v.z *= 0.78;
+          p.x += v.x * (0.8 + cooling * 0.45);
+          p.y += v.y * (0.8 + cooling * 0.45);
+          p.z += v.z * (0.8 + cooling * 0.45);
+        }
+      }
+
+      let cx = 0, cy = 0, cz = 0;
+      for (const node of nodes) {
+        const p = positions.get(node.id);
+        cx += p.x; cy += p.y; cz += p.z;
+      }
+      cx /= nodes.length; cy /= nodes.length; cz /= nodes.length;
+
+      let maxRadius = 1;
+      for (const node of nodes) {
+        const p = positions.get(node.id);
+        p.x -= cx; p.y -= cy; p.z -= cz;
+        maxRadius = Math.max(maxRadius, Math.sqrt(p.x * p.x + p.y * p.y + p.z * p.z));
+      }
+      const scale = Math.min(1.55, 340 / maxRadius);
+      return nodes.map((node) => {
+        const p = positions.get(node.id);
+        return {
+          ...node,
+          position: [
+            p.x * scale,
+            p.y * scale,
+            p.z * scale,
+          ],
+        };
+      });
+    }
+
+    function computeSemanticLayout(nodes, rawLinks) {
+      const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+      const links = (rawLinks || []).filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
+      const adjacency = new Map(nodes.map((node) => [node.id, new Set()]));
+      const degreeMap = new Map(nodes.map((node) => [node.id, 0]));
+      for (const link of links) {
+        adjacency.get(link.source).add(link.target);
+        adjacency.get(link.target).add(link.source);
+        degreeMap.set(link.source, degreeMap.get(link.source) + 1);
+        degreeMap.set(link.target, degreeMap.get(link.target) + 1);
+      }
+
+      const positions = new Map();
+      const velocities = new Map();
+      const semanticDrift = {
+        ticker: [0, 0],
+        event: [-120, -80],
+        temporal: [-40, -135],
+        pipeline: [125, -75],
+        tuning: [130, 92],
+        parameter: [190, 118],
+        support: [-95, 95],
+        risk: [65, 112],
+        contradiction: [15, 150],
+        sector: [-160, 40],
+        metric: [210, -20],
+        entity: [0, 0],
+      };
+      for (const node of nodes) {
+        const seed = seededUnit(node.id || node.label || String(node.index));
+        const angle = seed * Math.PI * 2;
+        const radius = 45 + seededUnit(`${node.id}:semantic-radius`) * 310;
+        const drift = semanticDrift[node.kind] || [0, 0];
+        const importance = Math.min(1, Math.max(0, Number(node.importance_score || 0) / 10));
+        positions.set(node.id, {
+          x: Math.cos(angle) * radius * (1 - importance * 0.35) + drift[0],
+          y: Math.sin(angle) * radius * (1 - importance * 0.35) + drift[1],
+        });
+        velocities.set(node.id, { x: 0, y: 0 });
+      }
+
+      const iterations = Math.max(55, Math.min(120, Math.floor(18000 / Math.max(120, nodes.length))));
+      const sampleStep = Math.max(1, Math.floor(nodes.length / 260));
+      for (let iteration = 0; iteration < iterations; iteration += 1) {
+        const cooling = 1 - iteration / iterations;
+        for (let i = 0; i < nodes.length; i += 1) {
+          const a = nodes[i];
+          const pa = positions.get(a.id);
+          const va = velocities.get(a.id);
+          for (let j = i + 1; j < nodes.length; j += sampleStep) {
+            const b = nodes[j];
+            if (a.id === b.id) continue;
+            const pb = positions.get(b.id);
+            const vb = velocities.get(b.id);
+            let dx = pa.x - pb.x;
+            let dy = pa.y - pb.y;
+            let distance = Math.sqrt(dx * dx + dy * dy) || 0.001;
+            const connected = adjacency.get(a.id).has(b.id);
+            const minDistance = connected ? 30 : 48;
+            if (distance < minDistance) distance = minDistance;
+            const crowd = Math.max(0.62, Math.min(1.15, Math.log10(nodes.length + 10) / 2.6));
+            const force = (connected ? 900 : 2600 * sampleStep) * crowd / (distance * distance);
+            dx /= distance;
+            dy /= distance;
+            va.x += dx * force;
+            va.y += dy * force;
+            vb.x -= dx * force;
+            vb.y -= dy * force;
+          }
+        }
+
+        for (const link of links) {
+          const source = positions.get(link.source);
+          const target = positions.get(link.target);
+          const vs = velocities.get(link.source);
+          const vt = velocities.get(link.target);
+          const dx = target.x - source.x;
+          const dy = target.y - source.y;
+          const distance = Math.sqrt(dx * dx + dy * dy) || 0.001;
+          const desired = linkLength(link.predicate);
+          const force = (distance - desired) * (0.010 + cooling * 0.007) * linkStrength(link.predicate);
+          const nx = dx / distance;
+          const ny = dy / distance;
+          vs.x += nx * force;
+          vs.y += ny * force;
+          vt.x -= nx * force;
+          vt.y -= ny * force;
+        }
+
+        for (const node of nodes) {
+          const p = positions.get(node.id);
+          const v = velocities.get(node.id);
+          const drift = semanticDrift[node.kind] || [0, 0];
+          const degree = degreeMap.get(node.id) || 0;
+          const centerPull = 0.0011 + Math.min(0.0024, degree * 0.00016);
+          const driftPull = node.kind === 'ticker' ? 0.0005 : 0.0012;
+          v.x += (drift[0] - p.x) * driftPull - p.x * centerPull;
+          v.y += (drift[1] - p.y) * driftPull - p.y * centerPull;
+          v.x *= 0.74;
+          v.y *= 0.74;
+          p.x += v.x * (0.85 + cooling * 0.28);
+          p.y += v.y * (0.85 + cooling * 0.28);
+        }
+      }
+
+      let cx = 0;
+      let cy = 0;
+      for (const node of nodes) {
+        const p = positions.get(node.id);
+        cx += p.x;
+        cy += p.y;
+      }
+      cx /= nodes.length;
+      cy /= nodes.length;
+      let maxRadius = 1;
+      for (const node of nodes) {
+        const p = positions.get(node.id);
+        p.x -= cx;
+        p.y -= cy;
+        maxRadius = Math.max(maxRadius, Math.sqrt(p.x * p.x + p.y * p.y));
+      }
+      const scale = Math.min(1.35, 360 / maxRadius);
+      return nodes.map((node) => {
+        const p = positions.get(node.id);
+        return { ...node, position: [p.x * scale, p.y * scale, 0] };
+      });
+    }
+
+    function computeFastClusterLayout(nodes, rawLinks) {
+      const degreeMap = new Map(nodes.map((node) => [node.id, 0]));
+      for (const link of rawLinks || []) {
+        degreeMap.set(link.source, (degreeMap.get(link.source) || 0) + 1);
+        degreeMap.set(link.target, (degreeMap.get(link.target) || 0) + 1);
+      }
+      const shells = {
+        ticker: { center: [0, 0, 0], radius: 245, xScale: 1.18, yScale: 0.88, zScale: 0.92, offset: 0.2 },
+        support: { center: [-135, 90, 120], radius: 95, xScale: 0.95, yScale: 0.85, zScale: 1.25, offset: 0.9 },
+        risk: { center: [145, 90, -115], radius: 115, xScale: 1.0, yScale: 0.9, zScale: 1.18, offset: 1.7 },
+        contradiction: { center: [155, -90, 125], radius: 125, xScale: 0.95, yScale: 0.95, zScale: 1.22, offset: 2.5 },
+        sector: { center: [-180, -115, -105], radius: 130, xScale: 1.05, yScale: 0.86, zScale: 1.08, offset: 3.1 },
+        event: { center: [-10, 165, -145], radius: 165, xScale: 1.22, yScale: 0.72, zScale: 1.28, offset: 3.8 },
+        temporal: { center: [-110, -170, 35], radius: 110, xScale: 0.8, yScale: 0.95, zScale: 1.3, offset: 4.3 },
+        pipeline: { center: [140, -150, -45], radius: 105, xScale: 0.9, yScale: 0.9, zScale: 1.25, offset: 4.8 },
+        tuning: { center: [135, 20, 165], radius: 105, xScale: 0.85, yScale: 0.85, zScale: 1.3, offset: 5.2 },
+        parameter: { center: [215, -45, 135], radius: 95, xScale: 0.75, yScale: 0.9, zScale: 1.2, offset: 5.6 },
+        metric: { center: [225, 115, 30], radius: 100, xScale: 0.82, yScale: 0.9, zScale: 1.12, offset: 6.0 },
+        entity: { center: [0, -165, 130], radius: 165, xScale: 1.15, yScale: 0.78, zScale: 1.22, offset: 6.4 },
+      };
+      const grouped = new Map();
+      for (const node of nodes) {
+        if (!grouped.has(node.kind)) grouped.set(node.kind, []);
+        grouped.get(node.kind).push(node);
+      }
+      const positioned = [];
+      const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+      for (const [kind, group] of grouped.entries()) {
+        const shell = shells[kind] || shells.entity;
+        group.sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0));
+        group.forEach((node, index) => {
+          const t = group.length === 1 ? 0.5 : (index + 0.5) / group.length;
+          const zUnit = 1 - 2 * t;
+          const radial = Math.sqrt(Math.max(0, 1 - zUnit * zUnit));
+          const angle = shell.offset + index * goldenAngle + seededUnit(`${node.id}:angle`) * 0.38;
+          const degree = degreeMap.get(node.id) || 0;
+          const importance = Math.min(1, Math.log1p(Math.max(0, Number(node.importance_score || 0))) / 5.2);
+          const corePull = Math.min(0.42, degree * 0.018 + importance * 0.22);
+          const radius = shell.radius * (1 - corePull) + seededUnit(`${node.id}:radius`) * 52;
+          const [cx, cy, cz] = shell.center;
+          positioned.push({
+            ...node,
+            position: [
+              cx + Math.cos(angle) * radial * radius * shell.xScale,
+              cy + Math.sin(angle) * radial * radius * shell.yScale,
+              cz + zUnit * radius * shell.zScale + (seededUnit(`${node.id}:zfast`) - 0.5) * 42,
+            ],
+          });
+        });
+      }
+      return positioned;
+    }
+
+    function linkLength(predicate) {
+      if (predicate === 'supportsSignal') return 86;
+      if (predicate === 'increasesRiskOf') return 108;
+      if (predicate === 'contradictsSignal') return 112;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 64;
+      if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker') return 62;
+      if (predicate === 'containsEvent' || predicate === 'occursInTimeBucket') return 58;
+      if (predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 60;
+      if (predicate === 'selectsCandidate') return 70;
+      if (predicate === 'feedsStage' || predicate === 'requiresApprovalFrom' || predicate === 'usesCostModel') return 82;
+      if (predicate === 'contains' || predicate === 'produces' || predicate === 'blocksTradeBelow') return 72;
+      if (predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage') return 72;
+      if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue') return 58;
+      if (predicate === 'usesOntologySignal' || predicate === 'calibratesSignal') return 66;
+      if (predicate === 'raisesTuningPressure') return 62;
+      if (predicate === 'belongsToSector' || predicate === 'hasTicker') return 78;
+      return 124;
+    }
+
+    function linkStrength(predicate) {
+      if (predicate === 'supportsSignal') return 1.25;
+      if (predicate === 'increasesRiskOf') return 1.05;
+      if (predicate === 'contradictsSignal') return 1.1;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 1.55;
+      if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker') return 1.65;
+      if (predicate === 'containsEvent' || predicate === 'occursInTimeBucket') return 1.72;
+      if (predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 1.58;
+      if (predicate === 'selectsCandidate') return 1.5;
+      if (predicate === 'feedsStage' || predicate === 'requiresApprovalFrom' || predicate === 'usesCostModel') return 1.35;
+      if (predicate === 'contains' || predicate === 'produces' || predicate === 'blocksTradeBelow') return 1.32;
+      if (predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage') return 1.45;
+      if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue') return 1.7;
+      if (predicate === 'usesOntologySignal' || predicate === 'calibratesSignal') return 1.55;
+      if (predicate === 'raisesTuningPressure') return 1.65;
+      if (predicate === 'belongsToSector' || predicate === 'hasTicker') return 1.35;
+      return 0.9;
+    }
+
+    function seededUnit(value) {
+      const text = String(value);
+      let hash = 2166136261;
+      for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return ((hash >>> 0) % 100000) / 100000;
+    }
+
+    function nodeColor(kind) {
+      return {
+        ticker: 0x38bdf8,
+        event: 0xf97316,
+        temporal: 0x06b6d4,
+        pipeline: 0x2563eb,
+        tuning: 0xeab308,
+        parameter: 0xec4899,
+        metric: 0x94a3b8,
+        sector: 0x84cc16,
+        support: 0x22c55e,
+        risk: 0xef4444,
+        contradiction: 0xd946ef,
+        entity: 0xf8fafc
+      }[kind] || 0xf8fafc;
+    }
+
+    function edgeColor(predicate) {
+      if (predicate === 'supportsSignal') return 0x22c55e;
+      if (predicate === 'increasesRiskOf') return 0xef4444;
+      if (predicate === 'contradictsSignal') return 0xd946ef;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xf97316;
+      if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker' || predicate === 'containsEvent' || predicate === 'occursInTimeBucket' || predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 0x06b6d4;
+      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom' || predicate === 'usesCostModel' || predicate === 'contains' || predicate === 'produces' || predicate === 'blocksTradeBelow') return 0x2563eb;
+      if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue' || predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage' || predicate === 'usesOntologySignal' || predicate === 'calibratesSignal' || predicate === 'raisesTuningPressure') return 0xeab308;
+      return 0x94a3b8;
+    }
+
+    function neonColor(kind) {
+      return {
+        ticker: 0x67e8f9,
+        event: 0xfdba74,
+        temporal: 0x67e8f9,
+        pipeline: 0x93c5fd,
+        tuning: 0xfef08a,
+        parameter: 0xf9a8d4,
+        metric: 0xcbd5e1,
+        sector: 0xd9f99d,
+        support: 0x86efac,
+        risk: 0xfca5a5,
+        contradiction: 0xf0abfc,
+        entity: 0xffffff
+      }[kind] || 0xffffff;
+    }
+
+    function neonEdgeColor(predicate) {
+      if (predicate === 'supportsSignal') return 0x86efac;
+      if (predicate === 'increasesRiskOf') return 0xfca5a5;
+      if (predicate === 'contradictsSignal') return 0xf0abfc;
+      if (predicate === 'hasRecentNews' || predicate === 'hasRecentDisclosure') return 0xfdba74;
+      if (predicate === 'containsFrame' || predicate === 'hasTimeFrame' || predicate === 'observesTicker' || predicate === 'containsEvent' || predicate === 'occursInTimeBucket' || predicate === 'containsQuote' || predicate === 'containsExecution' || predicate === 'usesMarketSnapshot' || predicate === 'usesRawSource' || predicate === 'hasMacroContext' || predicate === 'hasImpactScore') return 0x67e8f9;
+      if (predicate === 'selectsCandidate' || predicate === 'feedsStage' || predicate === 'requiresApprovalFrom' || predicate === 'usesCostModel' || predicate === 'contains' || predicate === 'produces' || predicate === 'blocksTradeBelow') return 0x93c5fd;
+      if (predicate === 'tunesParameter' || predicate === 'hasTunedValue' || predicate === 'producesTunedValue' || predicate === 'hasTuningMode' || predicate === 'adjustsStage' || predicate === 'appliesToStage' || predicate === 'usesOntologySignal' || predicate === 'calibratesSignal' || predicate === 'raisesTuningPressure') return 0xfef08a;
+      return 0x67e8f9;
+    }
+
+    function buildGraphMetrics(nodes, links) {
+      const degreeMap = new Map(nodes.map((node) => [node.id, 0]));
+      for (const link of links || []) {
+        degreeMap.set(link.source, (degreeMap.get(link.source) || 0) + 1);
+        degreeMap.set(link.target, (degreeMap.get(link.target) || 0) + 1);
+      }
+      const degrees = [...degreeMap.values()];
+      const maxDegree = Math.max(1, ...degrees);
+      const averageDegree = degrees.length
+        ? degrees.reduce((sum, value) => sum + value, 0) / degrees.length
+        : 0;
+      return {
+        nodeCount: Math.max(1, nodes.length),
+        linkCount: Math.max(0, (links || []).length),
+        maxDegree,
+        averageDegree,
+        degreeMap,
+      };
+    }
+
+    function nodeRadius(node, metrics = null) {
+      const size = Number(node && node.size);
+      const kind = node && node.kind;
+      const nodeCount = metrics ? metrics.nodeCount : 1;
+      const degree = metrics ? (metrics.degreeMap.get(node.id) || 0) : 0;
+      const maxDegree = metrics ? metrics.maxDegree : 1;
+      const density = metrics ? metrics.linkCount / Math.max(1, metrics.nodeCount) : 0;
+      const crowdScale = Math.max(0.46, Math.min(0.86, 1.02 - Math.log10(nodeCount + 10) * 0.18 - Math.min(0.18, density * 0.018)));
+      const kindBase = kind === 'ticker'
+        ? 8.2
+        : kind === 'event'
+          ? 4.4
+          : kind === 'temporal'
+            ? 4.8
+          : kind === 'sector'
+            ? 5.8
+            : kind === 'pipeline'
+              ? 5.8
+              : kind === 'tuning'
+                ? 5.2
+                : kind === 'parameter'
+                  ? 4.5
+                  : kind === 'metric'
+                    ? 3.8
+                    : 5.1;
+      const backendSize = Number.isFinite(size) && size > 0 ? Math.min(1.35, Math.max(0.82, size / 12)) : 1;
+      const importance = Math.max(0, Math.min(1, Number(node && node.importance_score || 0)));
+      const degreeBoost = Math.log1p(degree) / Math.log1p(maxDegree);
+      const radius = kindBase * backendSize * crowdScale * (0.82 + importance * 0.32 + degreeBoost * 0.42);
+      return Math.max(2.8, Math.min(13.5, radius));
+    }
+
+    function kindLabel(kind) {
+      return {
+        ticker: '종목',
+        event: '뉴스/공시 이벤트',
+        temporal: '시간축',
+        pipeline: '분석 파이프라인',
+        tuning: '파라미터 조정',
+        parameter: '파라미터',
+        metric: '지표',
+        sector: '섹터',
+        support: '긍정 신호',
+        risk: '리스크 요인',
+        contradiction: '상충 요인',
+        entity: '개체'
+      }[kind] || kind;
+    }
+
+    function shortLabel(label) {
+      if (label.startsWith('NEWS:')) return `뉴스 ${label.slice(5, 11)}`;
+      if (label.length > 22) return `${label.slice(0, 20)}...`;
+      return label;
+    }
+    function degree(nodeId, links) {
+      return links.filter((link) => link.source === nodeId || link.target === nodeId).length;
+    }
+
+    function linkKey(source, target, predicate) {
+      return `${source}::${predicate}::${target}`;
+    }
+
+    function graphSignature(graph) {
+      const counts = graph.counts || {};
+      const latestStep = (graph.reasoning_steps || []).map((step) => `${step.path_id}:${step.title}:${step.description}`).join('|');
+      return `${counts.nodes || 0}:${counts.links || 0}:${latestStep}`;
+    }
+
+    function renderNodePanel(node, links) {
+      const nodeLinks = links.filter((link) => link.source === node.id || link.target === node.id);
+      const related = nodeLinks
+        .slice(0, 20)
+        .map((link) => {
+          const other = link.source === node.id ? link.target : link.source;
+          const direction = link.source === node.id ? '나감' : '들어옴';
+          return `<div>${direction} <strong>${link.predicate}</strong> ${shortLabel(other)}</div>`;
+        })
+        .join('');
+      const hiddenCount = Math.max(0, nodeLinks.length - 20);
+      document.getElementById('ontologyPanel').innerHTML = `
+        <strong>${node.label}</strong>
+        <div class="muted">종류: ${kindLabel(node.kind)} · 연결 ${degree(node.id, links)}개 · 중요도 ${Number(node.importance_score || 0).toFixed(2)}</div>
+        <div style="margin-top:10px;">${related || '<span class="muted">연결 관계 없음</span>'}</div>
+        <div class="muted" style="margin-top:8px;">${hiddenCount > 0 ? `추가 관계 ${hiddenCount}개는 생략했습니다.` : ''}</div>
+      `;
+    }
+    function createTextSprite(THREE, text, color) {
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      canvas.width = 512;
+      canvas.height = 128;
+      context.font = 'bold 42px Arial';
+      context.fillStyle = 'rgba(15, 23, 42, 0.78)';
+      context.fillRect(0, 18, 512, 72);
+      context.strokeStyle = `#${color.toString(16).padStart(6, '0')}`;
+      context.lineWidth = 4;
+      context.strokeRect(2, 20, 508, 68);
+      context.fillStyle = '#ffffff';
+      context.fillText(text, 18, 67);
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(130, 32, 1);
+      return sprite;
+    }
+
+    document.getElementById('startButton').addEventListener('click', async () => {
+      if (!sessionId || !selectedGoal) return;
+      const data = await (await fetch('/api/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId, selected_goal: selectedGoal }) })).json();
+      document.getElementById('gate').textContent = data.started ? '선택한 목표 기준으로 모의투자를 시작했습니다. 실전 주문은 비활성화되어 있습니다.' : '시작하지 못했습니다.';
+      document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      if (data.performance) renderMockPerformance(data.performance);
+      if (data.started) startMockPerformancePolling();
+    });
+
+    document.getElementById('resetButton').addEventListener('click', () => {
+      sessionId = null; selectedGoal = null;
+      document.getElementById('choices').innerHTML = '';
+      document.getElementById('relations').innerHTML = '';
+      document.getElementById('feasibility').textContent = '대기 중';
+      document.getElementById('feasibilityBar').style.width = '0%';
+      document.getElementById('summary').textContent = '목표를 입력하면 시장 자료와 온톨로지 근거를 바탕으로 가능성을 계산합니다.';
+      document.getElementById('gate').textContent = '학습과 정보 수집은 서버가 켜져 있는 동안 자동으로 계속 진행됩니다.';
+      document.getElementById('output').textContent = '아직 실행하지 않았습니다.';
+      document.getElementById('startButton').disabled = true;
+      if (mockPerformanceTimer) window.clearInterval(mockPerformanceTimer);
+    });
+
+    let streamingDemoId = null;
+    let streamingDemoRunning = false;
+    let streamingDemoHistory = [];
+    let streamingDemoPrices = {};
+    let streamingInitialCash = 0;
+    let streamingTargetReturnRate = 0;
+    let streamingTargetMinutes = 0;
+
+    async function startStreamingDemo() {
+      let targetReturn = parseFloat(document.getElementById('targetReturn')?.value || 0.02);
+      if (targetReturn > 1) targetReturn = targetReturn / 100.0;
+      const periodMinutes = parseInt(document.getElementById('targetMinutes')?.value || 390);
+      streamingDemoHistory = [];
+      streamingDemoPrices = {};
+      streamingReturnSeries = [];
+      streamingInitialCash = Math.max(1, Number(liveAccountBasis?.equity || 10000000));
+      streamingTargetReturnRate = targetReturn;
+      streamingTargetMinutes = periodMinutes;
+      try {
+        const response = await fetch('/api/paper-trading/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            target_return_rate: targetReturn,
+            period_minutes: periodMinutes,
+            initial_cash_source: 'auto'
+          })
+        });
+        const data = await response.json();
+        streamingDemoId = data.demo_id;
+        streamingDemoRunning = true;
+        activeOperationMode = 'paper_trading';
+        updateTerminateTradingButton();
+        streamingInitialCash = Number(data.initial_cash || streamingInitialCash || 10000000);
+        document.getElementById('streamingDemoContainer').hidden = false;
+        document.getElementById('streamingDemoStatus').textContent = '모의투자 실행 중...';
+        document.getElementById('streamingDemoProgress').style.width = '0%';
+      } catch (error) {
+        document.getElementById('streamingDemoStatus').textContent = '오류: ' + error.message;
+      }
+    }
+
+    async function runStreamingDemoStep() {
+      if (!streamingDemoId || !streamingDemoRunning) return;
+      if (streamingStepBusy) return { status: 'busy', progress: 0 };
+      streamingStepBusy = true;
+      const requestedDemoId = streamingDemoId;
+      try {
+        document.getElementById('streamingDemoStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
+        document.getElementById('mockStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
+        const response = await fetchWithOptionalTimeout('/api/paper-trading/step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ demo_id: requestedDemoId }),
+        }, 120000);
+        if (!response.ok) {
+          streamingStepFailures += 1;
+          const message = response.status === 404 ? '모의투자 세션이 만료되었습니다. 다시 시작하세요.' : `모의투자 업데이트 실패 (${response.status})`;
+          if (streamingStepFailures < 3 && response.status >= 500) {
+            const retryMessage = `모의투자 응답 지연, 재시도 중 (${streamingStepFailures}/3)`;
+            document.getElementById('streamingDemoStatus').textContent = retryMessage;
+            document.getElementById('mockStatus').textContent = retryMessage;
+            return { status: 'retrying', progress: 0 };
+          }
+          streamingDemoRunning = false;
+          streamingDemoId = null;
+          document.getElementById('streamingDemoStatus').textContent = message;
+          document.getElementById('mockStatus').textContent = message;
+          return { status: 'stopped', progress: 0 };
+        }
+        const data = await response.json();
+        if (!streamingDemoRunning || requestedDemoId !== streamingDemoId) {
+          return { status: 'stale', progress: 0 };
+        }
+        streamingStepFailures = 0;
+        updateStreamingAccount(data);
+        if (data.status === 'waiting') {
+          const remaining = Number(data.seconds_until_next_step || 0);
+          const message = `모의투자 대기 중 · 다음 1분 bar까지 ${remaining.toFixed(1)}초`;
+          document.getElementById('streamingDemoStatus').textContent = message;
+          document.getElementById('mockStatus').textContent = message;
+          return data;
+        }
+        if (data.status === 'expired') {
+          streamingDemoRunning = false;
+          streamingDemoId = null;
+          const message = '모의투자 세션이 만료되었습니다. 다시 시작하세요.';
+          document.getElementById('streamingDemoStatus').textContent = message;
+          document.getElementById('mockStatus').textContent = message;
+          return data;
+        }
+        document.getElementById('streamingDemoProgress').style.width = data.progress + '%';
+        if (data.prices && typeof data.prices === 'object') {
+          Object.entries(data.prices).forEach(([ticker, price]) => { streamingDemoPrices[ticker] = Number(price || 0); });
+        }
+        document.getElementById('streamingDemoStatus').textContent =
+          `모의투자 ${data.step || '완료'}분 진행 · 전체 ${data.universe_scanned_count || data.universe_count || '-'}개 스캔 · 후보 ${data.candidate_ticker_count || data.active_ticker_count || '-'}개 · ${(data.progress || 0).toFixed(1)}%`;
+        if (data.account) {
+          renderStreamingPerformance(data);
+          loadPrincipalProtectionState().catch(() => {});
+        }
+        if (data.trades && data.trades.length > 0) {
+          data.trades.forEach(t => { streamingDemoHistory.unshift(t); streamingDemoPrices[t.ticker] = t.price; });
+          const executionList = document.getElementById('mockExecutions');
+          if (executionList) executionList.innerHTML = streamingDemoHistory.slice(0, 20).map(t => `<tr><td class="side-${t.side.toLowerCase()}">${t.side}</td><td>${t.ticker}</td><td>${t.quantity}</td><td>${formatMoney(t.price, t.currency)}</td></tr>`).join('');
+          const tradeList = document.getElementById('streamingTradeList');
+          if (tradeList) tradeList.innerHTML = data.trades.map(t => `<tr><td>${t.ticker}</td><td class="side-${t.side.toLowerCase()}">${t.side}</td><td>${t.quantity}</td><td>${formatMoney(t.value, t.currency)}${t.currency === 'USD' ? ` (${fmtWon.format(t.value_krw || 0)})` : ''}</td></tr>`).join('');
+        }
+        if (data.status === 'completed') {
+          streamingDemoRunning = false;
+          document.getElementById('streamingDemoStatus').textContent = '모의투자 완료';
+        }
+        return data;
+      } catch (error) {
+        streamingStepFailures += 1;
+        const message = `모의투자 응답 지연, 재시도 중 (${Math.min(streamingStepFailures, 3)}/3)`;
+        document.getElementById('output').textContent = `Paper trading step error: ${error.message || error}`;
+        if (streamingStepFailures < 3) {
+          document.getElementById('streamingDemoStatus').textContent = message;
+          document.getElementById('mockStatus').textContent = message;
+          return { status: 'retrying', progress: 0 };
+        }
+        streamingDemoRunning = false;
+        document.getElementById('streamingDemoStatus').textContent = `모의투자 업데이트 실패: ${error.message || error}`;
+        return null;
+      } finally {
+        streamingStepBusy = false;
+      }
+    }
+
+    function updateStreamingAccount(data) {
+      if (!data || !data.account) return;
+      const cash = Number(data.account.cash || 0);
+      const accountValue = Number(data.account.account_value || cash);
+      const invested = Math.max(0, accountValue - cash);
+      const profit = accountValue - streamingInitialCash;
+      document.getElementById('streamingDeposit').textContent = formatCashByCurrency(data.account);
+      document.getElementById('streamingInvested').textContent = fmtWon.format(invested);
+      document.getElementById('streamingProfit').textContent = fmtWon.format(profit);
+      document.getElementById('streamingReturnRate').textContent = (Number(data.account.return_rate || 0) * 100).toFixed(2) + '%';
+    }
+
+    async function autoRunStreamingDemo(isFirstTick = false) {
+      if (!streamingDemoRunning) return;
+      const intervalMs = 60000;
+      const data = await runStreamingDemoStep();
+      if (streamingDemoRunning) {
+        const waitMs = data && data.status === 'waiting' ? Math.max(1000, Number(data.seconds_until_next_step || 60) * 1000) : intervalMs;
+        streamingDemoTimer = setTimeout(() => autoRunStreamingDemo(false), waitMs);
+      }
+    }
+    applyCompactKoreanDashboard();
+    applyUrlGoalParams();
+    updateModeButtons();
+    updateModeActionCopy();
+    loadStatus();
+    loadPrincipalProtectionState().catch(() => {});
+    startLearningStatusPolling();
+    loadRealtimeRuntime();
+    loadOperationModeStatus().catch(() => {});
+    loadDiagnostics();
+    loadOntologyGraph();
+    loadMockPerformance();
+    refreshLiveSnapshot();
+    setInterval(() => loadOperationModeStatus().catch(() => {}), 3000);
+    setInterval(refreshLiveSnapshot, 5000);
+  </script>
+</body>
+</html>

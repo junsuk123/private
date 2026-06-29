@@ -118,8 +118,8 @@ class LiveExecutionCoordinator:
             raise LiveExecutionBlocked(("QUANTITY_NOT_POSITIVE",))
         if order.limit_price <= 0:
             raise LiveExecutionBlocked(("LIMIT_PRICE_NOT_POSITIVE",))
-        if not order.ticker.isdigit() or len(order.ticker) != 6:
-            raise LiveExecutionBlocked(("INVALID_KRX_SYMBOL",))
+        if not _supported_live_symbol(order):
+            raise LiveExecutionBlocked(("INVALID_LIVE_SYMBOL",))
 
     @staticmethod
     def _payload_hash(order: FinalOrder) -> str:
@@ -140,3 +140,15 @@ def _parse_dt(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _supported_live_symbol(order: FinalOrder) -> bool:
+    ticker = str(order.ticker or "")
+    market = str(order.market or "").upper()
+    if ticker.isdigit() and len(ticker) == 6:
+        return True
+    overseas_market = any(
+        token in market
+        for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+    )
+    return overseas_market and ticker.replace(".", "").replace("-", "").isalnum()

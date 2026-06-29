@@ -21,6 +21,7 @@ from app.schemas.domain import (
     PortfolioStatusReport,
     ReasoningPath,
     RiskManagerResult,
+    RiskRules,
     SourceMetadata,
     StrategySignal,
     TimeSynchronizedTickerFrame,
@@ -59,8 +60,10 @@ def build_analysis_context(
     stored_research: StoredResearch | None = None,
     *,
     allow_sample_indicators: bool = False,
+    account_override: AccountSnapshot | None = None,
+    risk_rules: RiskRules | None = None,
 ) -> AnalysisContext:
-    account = collect_sample_account()
+    account = account_override or collect_sample_account()
     sample_markets = collect_sample_market()
     stored_markets = stored_research.market_snapshots if stored_research else ()
     live_markets = research_result.market_snapshots if research_result else ()
@@ -110,9 +113,8 @@ def build_analysis_context(
     signals = generate_strategy_signals(markets, indicators, graph)
     intents = generate_order_intents(markets, indicators, signals)
     market_by_ticker = {market.ticker: market for market in markets}
-    risk_results = tuple(
-        RiskManager().validate(intent, account, market_by_ticker[intent.ticker]) for intent in intents
-    )
+    risk_manager = RiskManager(risk_rules) if risk_rules is not None else RiskManager()
+    risk_results = tuple(risk_manager.validate(intent, account, market_by_ticker[intent.ticker]) for intent in intents)
 
     return AnalysisContext(
         account=account,

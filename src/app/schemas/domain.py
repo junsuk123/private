@@ -112,6 +112,8 @@ class AccountSnapshot:
     holdings: tuple[Holding, ...]
     realized_pnl_today: float = 0.0
     unrealized_pnl_today: float = 0.0
+    base_currency: str = "KRW"
+    cash_by_currency: dict[str, float] = field(default_factory=dict)
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
