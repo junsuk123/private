@@ -1,0 +1,84 @@
+{
+  "artifact_id": "live_short_horizon.20260629T054130390668Z",
+  "classification": {
+    "bias": -27.13780566307584,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      4876.07871130639,
+      1902.1225231585295,
+      1651.479505138249,
+      191.69790266878846,
+      -0.4454505463044243,
+      15.489004445590227,
+      -1.882262034226143e-05,
+      -1.8251563035181573e-05,
+      7.704014347456145,
+      84.93430919325405,
+      -5128.175617267227,
+      875.8820807421326,
+      0.002070749787627205,
+      0.0
+    ]
+  },
+  "created_at": "2026-06-29T05:41:30.390668+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio"
+  ],
+  "feature_schema_hash": "1e4901681fc317af588b8441",
+  "label_definition": "label=1 when forward_net_return_bps > 20 after costs",
+  "live_eligible": true,
+  "metrics": {
+    "auc": 1.0,
+    "avg_forward_net_return_bps_top_k": 22.202479772515666,
+    "example_count": 227.0,
+    "negative_labels": 191.0,
+    "positive_labels": 36.0,
+    "precision_at_k": 0.8
+  },
+  "reason_codes": [],
+  "regression": {
+    "bias": 104.2494945127829,
+    "family": "linear_regression_sgd",
+    "weights": [
+      -827.9362121740372,
+      6.1764317359614616,
+      7037.997640157428,
+      -12169.276760547658,
+      -0.014707554591973884,
+      38.23038715456315,
+      3.757235565491711e-05,
+      -6.469253113810412e-05,
+      -36.6854717681763,
+      -173.15667504650924,
+      -20402.670398566148,
+      73.48521457912655,
+      -0.037137041364154216,
+      0.0
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.48,
+    "minimum_expected_net_return_bps": 20.0,
+    "minimum_probability_success": 0.55
+  },
+  "training_data": {
+    "label_rule": "next_collected_return_1m_after_costs_bps > 20",
+    "row_count": 227,
+    "schema_hash": "1e4901681fc317af588b8441",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames"
+  }
+}

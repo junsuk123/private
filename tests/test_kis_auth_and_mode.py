@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.execution.kis_auth import issue_websocket_approval_key, run_kis_health_check
+from app.execution.kis_auth import issue_websocket_approval_key, run_kis_health_check, validate_live_secret_file
 from app.execution.kis_errors import KisModeMismatchError
 from app.execution.kis_real import KisDevelopersApiClient
 from app.execution.kis_types import KisMode
@@ -30,6 +30,29 @@ class RecordingKisTransport:
 
 
 class KisAuthAndModeTest(unittest.TestCase):
+    def test_live_secret_validation_requires_only_used_live_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "kis_api_keys.env"
+            path.write_text(
+                "\n".join(
+                    [
+                        "KIS_APP_KEY=app",
+                        "KIS_APP_SECRET=secret",
+                        "KIS_ACCOUNT_NO=12345678",
+                        "KIS_ACCOUNT_PRODUCT_CODE=01",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = validate_live_secret_file(path)
+
+        self.assertTrue(result["file_exists"])
+        self.assertTrue(result["KIS_APP_KEY"])
+        self.assertTrue(result["KIS_APP_SECRET"])
+        self.assertTrue(result["KIS_ACCOUNT_NO"])
+        self.assertTrue(result["KIS_ACCOUNT_PRODUCT_CODE"])
+
     def test_mode_mismatch_is_blocked(self) -> None:
         with self.assertRaises(KisModeMismatchError):
             validate_kis_mode(KisMode(paper=True, live_enabled=False, base_url="https://openapi.koreainvestment.com:9443"))

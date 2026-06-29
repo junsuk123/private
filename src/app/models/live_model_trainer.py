@@ -29,7 +29,8 @@ def train_live_short_horizon_model(
     if not ok:
         if force_live_ineligible_reason:
             reasons = (*reasons, force_live_ineligible_reason)
-        artifact = _artifact_payload(feature_names, [0.0] * len(feature_names), 0.0, [0.0] * len(feature_names), 0.0, {}, False, reasons)
+        metrics = _dataset_metrics(rows)
+        artifact = _artifact_payload(feature_names, [0.0] * len(feature_names), 0.0, [0.0] * len(feature_names), 0.0, metrics, False, reasons)
         registry.save(artifact)
         return artifact
     x = [[float(row["features"][name]) for name in feature_names] for row in rows]
@@ -96,6 +97,19 @@ def _artifact_payload(
         "live_eligible": live_eligible,
         "reason_codes": list(reason_codes),
         "label_definition": "label=1 when forward_net_return_bps > 20 after costs",
+    }
+
+
+def _dataset_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
+    labels = [int(row.get("label", 0)) for row in rows]
+    returns = [float(row.get("forward_net_return_bps", 0.0)) for row in rows]
+    return {
+        "example_count": float(len(rows)),
+        "positive_labels": float(sum(labels)),
+        "negative_labels": float(len(labels) - sum(labels)),
+        "max_forward_net_return_bps": max(returns) if returns else 0.0,
+        "min_forward_net_return_bps": min(returns) if returns else 0.0,
+        "avg_forward_net_return_bps": sum(returns) / len(returns) if returns else 0.0,
     }
 
 

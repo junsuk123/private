@@ -1,6 +1,6 @@
 {
   "order_type": "LIMIT_ONLY",
-  "allow_market_orders": false,
+  "allow_market_orders": true,
   "max_unfilled_order_age_seconds": 120,
   "poll_order_status_interval_seconds": 3,
   "max_order_status_poll_seconds": 180,

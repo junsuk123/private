@@ -148,6 +148,9 @@ sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
 LIVE_REFRESH_SECONDS = max(5, int(os.getenv("LIVE_REFRESH_SECONDS", "15")))
 LIVE_STALE_SECONDS = max(LIVE_REFRESH_SECONDS * 2, int(os.getenv("LIVE_STALE_SECONDS", "45")))
+ONTOLOGY_UI_NODE_LIMIT = max(40, int(os.getenv("ONTOLOGY_UI_NODE_LIMIT", "180")))
+ONTOLOGY_UI_LINK_LIMIT = max(80, int(os.getenv("ONTOLOGY_UI_LINK_LIMIT", "420")))
+ONTOLOGY_UI_REASONING_STEP_LIMIT = max(10, int(os.getenv("ONTOLOGY_UI_REASONING_STEP_LIMIT", "80")))
 LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     60,
     int(os.getenv("LEARNING_COLLECTION_INTERVAL_SECONDS", "3600")),
@@ -931,7 +934,7 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
     except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
       record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
     secrets = validate_live_secret_file()
-    record("kis_secret_file", all(secrets.values()), "missing KIS secret file or required keys")
+    record("kis_secret_file", _kis_secret_file_gate_ok(secrets), "missing KIS secret file or required keys")
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
     record("live_flags", runtime.ok, ",".join(runtime.failures) if runtime.failures else None)
     if include_kis_health:
@@ -944,6 +947,19 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
     else:
       record("kis_health_deferred", True)
     return {"ok": not failures, "gates": gates, "failures": failures}
+
+
+def _kis_secret_file_gate_ok(secrets: dict[str, bool]) -> bool:
+  return all(
+      bool(secrets.get(key))
+      for key in (
+          "file_exists",
+          "KIS_APP_KEY",
+          "KIS_APP_SECRET",
+          "KIS_ACCOUNT_NO",
+          "KIS_ACCOUNT_PRODUCT_CODE",
+      )
+  )
 
 
 def _live_model_readiness_failure_message(exc: Exception) -> str:
@@ -2578,7 +2594,12 @@ def _live_worker_loop() -> None:
       next_at = datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
       _live_state["learning_next_collection_at"] = next_at if learning_active else None
     if learning_active:
-      _set_live_progress(100, "waiting", f"Next internet and chart data collection starts at {next_at.astimezone().strftime('%H:%M')}")
+      _set_live_progress(
+          100,
+          "waiting",
+          f"Next internet and chart data collection starts at {next_at.astimezone().strftime('%H:%M')}",
+          active=False,
+      )
     slept = 0.0
     while slept < interval_seconds:
       time.sleep(0.5)
@@ -2666,15 +2687,11 @@ def _refresh_live_cache() -> None:
                 "live_short_horizon_examples": int(live_model_artifact.get("metrics", {}).get("example_count", 0)),
             },
         )
-      with _live_lock:
-        keep_active = bool(_live_state.get("learning_active")) and not bool(_live_state.get("stop"))
       _set_live_progress(
           100,
-          "complete",
-          "Learning collection cycle completed; continuing until stop is pressed"
-          if keep_active
-          else "Live analysis cache is ready",
-          active=keep_active,
+          "waiting",
+          "Live analysis cache is ready; background learning will run at the next scheduled cycle",
+          active=False,
       )
     except Exception as exc:
       error_traceback = traceback.format_exc()
@@ -2898,16 +2915,102 @@ def _graph_payload(context: Any) -> dict[str, Any]:
             score = round(importance.get(node_id, 0.0), 4)
             nodes[node_id] = _node_payload(node_id, score, event_meta.get(node_id), kind_overrides.get(str(node_id)))
 
+    display_nodes, display_links, display_steps = _trim_graph_payload_for_ui(
+        list(nodes.values()),
+        links,
+        _build_reasoning_steps(context.reasoning_paths),
+    )
     return {
-        "nodes": list(nodes.values()),
-        "links": links,
-        "reasoning_steps": _build_reasoning_steps(context.reasoning_paths),
+        "nodes": display_nodes,
+        "links": display_links,
+        "reasoning_steps": display_steps,
         "counts": {"nodes": len(nodes), "links": len(links)},
+        "display_counts": {"nodes": len(display_nodes), "links": len(display_links)},
+        "truncated": len(display_nodes) < len(nodes) or len(display_links) < len(links),
         "runtime": context.ontology_runtime.as_dict(),
         "candidate_selection": _candidate_selection_payload(getattr(context, "candidate_selection", None)),
         "parameter_tuning": tuple(getattr(context, "parameter_tuning", ()) or ()),
         "temporal_frame_count": len(tuple(getattr(context, "temporal_frames", ()) or ())),
     }
+
+
+def _trim_graph_payload_for_ui(
+    nodes: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+    reasoning_steps: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if len(nodes) <= ONTOLOGY_UI_NODE_LIMIT and len(links) <= ONTOLOGY_UI_LINK_LIMIT:
+        return nodes, links, reasoning_steps[:ONTOLOGY_UI_REASONING_STEP_LIMIT]
+
+    node_by_id = {str(node.get("id")): node for node in nodes}
+    degree: dict[str, int] = {node_id: 0 for node_id in node_by_id}
+    for link in links:
+        source = str(link.get("source"))
+        target = str(link.get("target"))
+        degree[source] = degree.get(source, 0) + 1
+        degree[target] = degree.get(target, 0) + 1
+
+    preferred_kinds = {
+        "ticker": 7.0,
+        "support": 6.5,
+        "risk": 6.5,
+        "contradiction": 6.5,
+        "pipeline": 5.5,
+        "tuning": 5.0,
+        "parameter": 4.5,
+        "metric": 4.0,
+        "sector": 3.5,
+        "event": 3.0,
+        "temporal": 2.0,
+        "entity": 1.0,
+    }
+
+    def node_score(node: dict[str, Any]) -> float:
+        node_id = str(node.get("id"))
+        return (
+            float(node.get("importance_score") or 0.0)
+            + degree.get(node_id, 0) * 0.18
+            + preferred_kinds.get(str(node.get("kind") or ""), 0.0)
+            + (8.0 if node.get("highlight") else 0.0)
+        )
+
+    selected_ids = {
+        str(node.get("id"))
+        for node in sorted(nodes, key=node_score, reverse=True)[:ONTOLOGY_UI_NODE_LIMIT]
+    }
+
+    def link_score(link: dict[str, Any]) -> float:
+        predicate = str(link.get("predicate") or "")
+        source = str(link.get("source"))
+        target = str(link.get("target"))
+        predicate_boost = 10.0 if predicate in {
+            "supportsSignal",
+            "increasesRiskOf",
+            "contradictsSignal",
+            "hasRecentNews",
+            "hasRecentDisclosure",
+            "selectsCandidate",
+            "feedsStage",
+            "tunesParameter",
+        } else 0.0
+        return predicate_boost + node_score(node_by_id.get(source, {})) + node_score(node_by_id.get(target, {}))
+
+    display_links = [
+        link
+        for link in sorted(links, key=link_score, reverse=True)
+        if str(link.get("source")) in selected_ids and str(link.get("target")) in selected_ids
+    ][:ONTOLOGY_UI_LINK_LIMIT]
+
+    linked_ids = {str(link.get("source")) for link in display_links} | {str(link.get("target")) for link in display_links}
+    if linked_ids:
+        selected_ids &= linked_ids
+    display_nodes = [node for node in sorted(nodes, key=node_score, reverse=True) if str(node.get("id")) in selected_ids]
+    display_ids = {str(node.get("id")) for node in display_nodes}
+    display_steps = [
+        step for step in reasoning_steps
+        if any(str(node_id) in display_ids for node_id in step.get("nodes", ()))
+    ][:ONTOLOGY_UI_REASONING_STEP_LIMIT]
+    return display_nodes, display_links, display_steps
 
 
 def _node_payload(
@@ -3793,15 +3896,27 @@ HTML = """
     }
 
     async function loadDiagnostics() {
-      const data = await (await fetch('/api/research/diagnostics')).json();
-      renderDiagnostics(data);
+      try {
+        const data = await (await fetch('/api/research/diagnostics')).json();
+        renderDiagnostics(data);
+      } catch (error) {
+        const message = `Diagnostics error: ${error.message || error}`;
+        const badge = document.getElementById('liveRefreshBadge');
+        if (badge) badge.textContent = message;
+        renderSystemFlow({ data: 'error' }, { data: message });
+        throw error;
+      }
     }
 
     async function loadOntologyGraph() {
       const data = await (await fetch('/api/ontology/graph')).json();
+      const display = data.display_counts || {};
+      const suffix = data.truncated ? ` | shown ${display.nodes || 0}/${data.counts.nodes} nodes, ${display.links || 0}/${data.counts.links} links` : '';
       document.getElementById('ontologyCounts').textContent = `노드 ${data.counts.nodes} · 관계 ${data.counts.links}`;
       lastGraphSignature = graphSignature(data);
+      document.getElementById('ontologyCounts').textContent = `Nodes ${data.counts.nodes} | Links ${data.counts.links}${suffix}`;
       await renderOntologyGraph(data);
+      renderSystemFlow({ analysis: 'done' }, { analysis: 'Ontology graph ready' });
     }
 
     async function loadRealtimeRuntime() {

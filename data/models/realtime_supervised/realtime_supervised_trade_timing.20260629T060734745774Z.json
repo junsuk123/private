@@ -41,9 +41,9 @@
       {
         "as_of": "2026-06-29T06:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 15,
+          "event_count": 12,
           "execution_count": 0,
-          "impact_score": 12.0,
+          "impact_score": 9.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -59,9 +59,9 @@
       {
         "as_of": "2026-06-28T22:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 24,
+          "event_count": 32,
           "execution_count": 0,
-          "impact_score": 19.2,
+          "impact_score": 25.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -77,9 +77,9 @@
       {
         "as_of": "2026-06-28T22:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 66,
+          "event_count": 74,
           "execution_count": 0,
-          "impact_score": 52.8,
+          "impact_score": 59.2,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -95,9 +95,9 @@
       {
         "as_of": "2026-06-29T01:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 94,
+          "event_count": 102,
           "execution_count": 0,
-          "impact_score": 75.2,
+          "impact_score": 81.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -149,9 +149,9 @@
       {
         "as_of": "2026-06-29T05:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 55,
+          "event_count": 53,
           "execution_count": 0,
-          "impact_score": 42.4,
+          "impact_score": 40.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -167,9 +167,9 @@
       {
         "as_of": "2026-06-29T05:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 55,
+          "event_count": 50,
           "execution_count": 0,
-          "impact_score": 42.4,
+          "impact_score": 38.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -185,9 +185,9 @@
       {
         "as_of": "2026-06-28T22:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 24,
+          "event_count": 32,
           "execution_count": 0,
-          "impact_score": 19.2,
+          "impact_score": 25.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -203,9 +203,9 @@
       {
         "as_of": "2026-06-28T22:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 66,
+          "event_count": 74,
           "execution_count": 0,
-          "impact_score": 52.8,
+          "impact_score": 59.2,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -221,9 +221,9 @@
       {
         "as_of": "2026-06-28T22:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 67,
+          "event_count": 75,
           "execution_count": 0,
-          "impact_score": 53.6,
+          "impact_score": 60.0,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -239,9 +239,9 @@
       {
         "as_of": "2026-06-29T01:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 95,
+          "event_count": 103,
           "execution_count": 0,
-          "impact_score": 76.0,
+          "impact_score": 82.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -257,9 +257,9 @@
       {
         "as_of": "2026-06-29T05:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 53,
+          "event_count": 51,
           "execution_count": 0,
-          "impact_score": 42.4,
+          "impact_score": 40.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -275,9 +275,9 @@
       {
         "as_of": "2026-06-29T05:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 53,
+          "event_count": 48,
           "execution_count": 0,
-          "impact_score": 42.4,
+          "impact_score": 38.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -293,9 +293,9 @@
       {
         "as_of": "2026-06-28T22:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 24,
+          "event_count": 32,
           "execution_count": 0,
-          "impact_score": 19.2,
+          "impact_score": 25.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.0,
@@ -316,6 +316,6 @@
   },
   "model_family": "realtime_supervised",
   "model_name": "realtime_supervised:trade_timing",
-  "saved_at": "2026-06-29T06:18:06.940226+00:00",
+  "saved_at": "2026-06-29T06:07:34.745774+00:00",
   "simulated": false
 }

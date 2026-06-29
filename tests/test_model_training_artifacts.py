@@ -32,6 +32,8 @@ class ModelTrainingArtifactsTest(unittest.TestCase):
 
         self.assertFalse(artifact["live_eligible"])
         self.assertIn("INSUFFICIENT_POSITIVE_LABELS", artifact["reason_codes"])
+        self.assertEqual(artifact["metrics"]["example_count"], float(len(rows)))
+        self.assertEqual(artifact["metrics"]["positive_labels"], 0.0)
 
 
 def _rows() -> list[dict]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 
 DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
+DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
 
 
 def collect_live_feature_frames_from_realtime_store(
@@ -64,7 +66,7 @@ def train_live_short_horizon_from_collected_features(
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
-            "label_rule": "next_collected_return_1m_after_costs_bps > 20",
+            "label_rule": "first_collected_return_1m_after_30s_after_costs_bps > 20",
             "schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
         },
     )
@@ -108,7 +110,14 @@ def build_live_training_rows_from_feature_journal(journal_path: str | Path) -> l
     rows: list[dict[str, Any]] = []
     for symbol, symbol_frames in by_symbol.items():
         ordered = _dedupe_sorted_frames(symbol_frames)
-        for current, nxt in zip(ordered, ordered[1:], strict=False):
+        for index, current in enumerate(ordered):
+            nxt = _next_frame_after_minimum_horizon(
+                ordered,
+                index,
+                minimum_forward_seconds=DEFAULT_LABEL_MIN_FORWARD_SECONDS,
+            )
+            if nxt is None:
+                continue
             features = {
                 name: float(current["values"].get(name, 0.0))
                 for name in LIVE_SHORT_HORIZON_SCHEMA.feature_names
@@ -172,6 +181,33 @@ def _dedupe_sorted_frames(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         deduped.append(frame)
     return deduped
+
+
+def _next_frame_after_minimum_horizon(
+    frames: list[dict[str, Any]],
+    index: int,
+    *,
+    minimum_forward_seconds: float,
+) -> dict[str, Any] | None:
+    current_time = _parse_frame_time(frames[index])
+    if current_time is None:
+        return frames[index + 1] if index + 1 < len(frames) else None
+    cutoff = current_time + timedelta(seconds=minimum_forward_seconds)
+    for candidate in frames[index + 1 :]:
+        candidate_time = _parse_frame_time(candidate)
+        if candidate_time is None or candidate_time >= cutoff:
+            return candidate
+    return None
+
+
+def _parse_frame_time(frame: dict[str, Any]) -> datetime | None:
+    value = frame.get("decision_time")
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _annotate_saved_artifact(artifact: dict[str, Any], registry: ModelArtifactRegistry, training_data: dict[str, Any]) -> None:

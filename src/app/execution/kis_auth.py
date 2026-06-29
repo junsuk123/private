@@ -21,9 +21,8 @@ REQUIRED_KIS_KEYS = (
     "KIS_APP_SECRET",
     "KIS_ACCOUNT_NO",
     "KIS_ACCOUNT_PRODUCT_CODE",
-    "KIS_HTS_ID",
-    "KIS_CUSTTYPE",
 )
+OPTIONAL_KIS_KEYS = ("KIS_HTS_ID", "KIS_CUSTTYPE")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -56,11 +55,14 @@ def validate_kis_mode(mode: KisMode) -> None:
 
 
 def validate_live_secret_file(path: str | Path = "config/secrets/kis_api_keys.env") -> dict[str, bool]:
-    load_kis_env_file(path)
+    load_kis_env_file(path, override=True)
     secret_path = Path(path)
     results = {"file_exists": secret_path.exists()}
     for key in REQUIRED_KIS_KEYS:
         results[key] = bool(os.getenv(key, "").strip())
+    for key in OPTIONAL_KIS_KEYS:
+        value = os.getenv(key, "").strip()
+        results[key] = bool(value) if key != "KIS_CUSTTYPE" else bool(value or "P")
     return results
 
 
