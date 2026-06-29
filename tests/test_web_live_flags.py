@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from app import web as web_module
 from app.web import LIVE_FLAG_VALUES, app
 
 
@@ -45,6 +46,23 @@ class WebLiveFlagsTest(unittest.TestCase):
             for key, value in LIVE_FLAG_VALUES.items():
                 self.assertEqual(os.environ[key], value)
                 self.assertEqual(payload["flags"][key], value)
+
+    def test_readiness_reports_model_artifact_reason_not_exception_class(self) -> None:
+        with (
+            patch("app.web.load_live_trading_safety_config"),
+            patch("app.web.load_order_execution_config"),
+            patch("app.web.validate_live_secret_file", return_value={"app_key": True, "app_secret": True, "account_no": True}),
+            patch("app.web.evaluate_live_runtime_gates", return_value=type("Gate", (), {"ok": True, "failures": ()})()),
+            patch("app.web.ModelArtifactRegistry") as registry_cls,
+        ):
+            registry_cls.return_value.load_latest_live_eligible.side_effect = RuntimeError(
+                "NO_LIVE_ELIGIBLE_MODEL_ARTIFACT"
+            )
+
+            readiness = web_module._web_live_readiness_summary()
+
+        self.assertFalse(readiness["ok"])
+        self.assertEqual(readiness["failures"]["live_eligible_model"], "NO_LIVE_ELIGIBLE_MODEL_ARTIFACT")
 
     def test_homepage_inline_script_is_valid_javascript(self) -> None:
         if shutil.which("node") is None:

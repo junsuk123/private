@@ -297,6 +297,44 @@ class StreamingDemoTimingTest(unittest.TestCase):
             else:
                 os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
 
+    def test_paper_trading_terminate_liquidates_current_holdings(self) -> None:
+        previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
+        previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
+        os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
+        os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
+        client = TestClient(app)
+        try:
+            start_payload = client.post(
+                "/api/paper-trading/start",
+                json={
+                    "target_return_rate": 0.02,
+                    "period_minutes": 20,
+                    "initial_cash": 10_000_000,
+                    "acceleration_factor": 120,
+                },
+            ).json()
+            demo_id = start_payload["demo_id"]
+            _streaming_demos[demo_id]._started_at_monotonic -= 60
+            step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
+            self.assertGreater(step["cumulative_trades"], 0)
+
+            terminated = client.post(f"/api/paper-trading/terminate/{demo_id}").json()
+
+            self.assertTrue(terminated["ok"])
+            self.assertEqual(terminated["status"], "terminated")
+            self.assertGreaterEqual(terminated["sell_order_count"], 1)
+            self.assertTrue(all(trade["side"] == "SELL" for trade in terminated["trades"]))
+            self.assertEqual(_streaming_demos[demo_id]._holdings, {})
+        finally:
+            if previous_limit is None:
+                os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)
+            else:
+                os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = previous_limit
+            if previous_target is None:
+                os.environ.pop("ONTOLOGY_FILTER1_TARGET_COUNT", None)
+            else:
+                os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
+
 
 if __name__ == "__main__":
     unittest.main()

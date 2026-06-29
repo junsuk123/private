@@ -13,7 +13,7 @@ from app.trading_pipeline import (
 def test_short_horizon_config_loads_conservative_execution_defaults() -> None:
     config = load_short_horizon_strategy_config()
 
-    assert config["execution"]["live_trading_enabled"] is False
+    assert config["execution"]["live_trading_enabled"] is True
     assert config["execution"]["default_mode"] == "paper_trading"
     assert config["strategy_candidate_factory"]["paper_only"] is True
     assert config["reality_check"]["required_for_live"] is True

@@ -89,6 +89,6 @@ parameter_reestimation:
   min_max_spread_rate: 0.0005
 
 execution:
-  live_trading_enabled: false
+  live_trading_enabled: true
   default_mode: "paper_trading"
   allow_dry_run: true

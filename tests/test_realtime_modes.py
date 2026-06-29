@@ -394,6 +394,50 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["graph"]["counts"]["links"], 1)
         self.assertNotIn("nodes", data["graph"])
 
+    def test_force_refresh_schedules_collection_without_blocking_request(self) -> None:
+        snapshot = {
+            "research_result": SimpleNamespace(),
+            "context": SimpleNamespace(),
+            "context_mode": "paper_trading",
+            "store_summary": {},
+            "stored_new_records": {},
+            "last_updated": datetime.now(),
+            "last_error": None,
+            "is_refreshing": False,
+            "progress": {},
+            "learning": {},
+            "collection_log": [],
+            "graph_payload": None,
+            "graph_payload_context_id": None,
+        }
+        with (
+            patch("app.web._active_operation_mode", return_value="paper_trading"),
+            patch("app.web._live_snapshot", return_value=snapshot),
+            patch("app.web._ensure_background_refresh") as ensure_refresh,
+            patch("app.web._refresh_live_cache", side_effect=AssertionError("collection must run in the background")),
+        ):
+            result = web_module._get_or_refresh_live(force_refresh=True)
+
+        self.assertIs(result, snapshot)
+        ensure_refresh.assert_called_once()
+
+    def test_mode_cache_clear_preserves_store_summary_for_diagnostics(self) -> None:
+        with web_module._live_lock:
+            previous = dict(web_module._live_state.get("store_summary") or {})
+            try:
+                web_module._live_state["store_summary"] = {
+                    "events": 7,
+                    "raw_records": 8,
+                    "market_snapshots": 9,
+                    "macro_metrics": 1,
+                }
+                web_module._clear_live_analysis_cache_unlocked()
+
+                self.assertEqual(web_module._live_state["store_summary"]["events"], 7)
+                self.assertEqual(web_module._live_state["store_summary"]["market_snapshots"], 9)
+            finally:
+                web_module._live_state["store_summary"] = previous
+
     def test_live_trading_button_mode_is_blocked_by_default(self) -> None:
         client = TestClient(app)
         with (

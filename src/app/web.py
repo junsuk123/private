@@ -31,6 +31,10 @@ from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
+from app.models.live_training_pipeline import (
+    collect_live_feature_frames_from_realtime_store,
+    train_live_short_horizon_from_collected_features,
+)
 from app.pipeline import build_analysis_context
 from app.research import ResearchRunResult, ResearchService
 from app.realtime import OperationModeManager, RealtimeAccelerationPolicy, ShortHorizonRiskPolicy
@@ -585,6 +589,7 @@ def _start_streaming_demo(
 
 
 _live_worker: threading.Thread | None = None
+_refresh_worker: threading.Thread | None = None
 _live_state: dict[str, Any] = {
     "context": None,
     "research_result": None,
@@ -616,12 +621,18 @@ _live_state: dict[str, Any] = {
 
 
 def _clear_live_analysis_cache_unlocked() -> None:
+  store_summary = dict(_live_state.get("store_summary") or {})
+  if not store_summary:
+    try:
+      store_summary = LocalResearchStore(root=_get_store_root()).summary()
+    except Exception:  # noqa: BLE001 - cache clearing must never block mode changes.
+      store_summary = {}
   _live_state["context"] = None
   _live_state["research_result"] = None
   _live_state["context_mode"] = None
   _live_state["graph_payload"] = None
   _live_state["graph_payload_context_id"] = None
-  _live_state["store_summary"] = {}
+  _live_state["store_summary"] = store_summary
   _live_state["stored_new_records"] = {}
 
 
@@ -900,9 +911,15 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
     try:
       artifact = ModelArtifactRegistry().load_latest_live_eligible()
       model_ok = artifact.feature_schema_hash == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
-      record("live_eligible_model", model_ok, None if model_ok else "feature schema mismatch")
+      record(
+          "live_eligible_model",
+          model_ok,
+          None
+          if model_ok
+          else f"FEATURE_SCHEMA_MISMATCH expected={LIVE_SHORT_HORIZON_SCHEMA.schema_hash} actual={artifact.feature_schema_hash}",
+      )
     except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
-      record("live_eligible_model", False, exc.__class__.__name__)
+      record("live_eligible_model", False, str(exc) or exc.__class__.__name__)
     secrets = validate_live_secret_file()
     record("kis_secret_file", all(secrets.values()), "missing KIS secret file or required keys")
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
@@ -1595,6 +1612,118 @@ def mock_kis_order_status(order_id: str) -> JSONResponse:
     return _json(broker.get_order_status(order_id))
 
 
+@app.post("/api/paper-trading/terminate/{demo_id}")
+async def streaming_demo_terminate(demo_id: str) -> JSONResponse:
+    return _json(await run_in_threadpool(_streaming_demo_terminate_response, demo_id))
+
+
+def _streaming_demo_terminate_response(demo_id: str) -> dict[str, Any]:
+    step_lock = _streaming_demo_step_locks.setdefault(demo_id, threading.Lock())
+    if not step_lock.acquire(blocking=False):
+        demo = _streaming_demos.get(demo_id)
+        return {
+            "ok": False,
+            "demo_id": demo_id,
+            "status": "busy",
+            "account": _streaming_demo_account_payload(demo),
+            "message": "Paper trading is processing a step. Try termination again in a moment.",
+        }
+    try:
+        demo = _streaming_demos.get(demo_id)
+        if demo is None:
+            return {"ok": False, "demo_id": demo_id, "status": "expired", "message": "Paper trading session not found."}
+        current_step = int(getattr(demo, "_current_step", 0) or 0)
+        prices = {
+            ticker: float(bars[min(max(0, current_step), len(bars) - 1)].close)
+            for ticker, bars in getattr(demo, "_bars_by_ticker", {}).items()
+            if bars
+        }
+        trades = demo._liquidate_holdings(prices, datetime.now(timezone.utc))
+        if hasattr(demo, "_current_step") and hasattr(demo, "_timestamps"):
+            demo._current_step = len(getattr(demo, "_timestamps", ()))
+        return {
+            "ok": True,
+            "demo_id": demo_id,
+            "status": "terminated",
+            "liquidated": True,
+            "sell_order_count": len(trades),
+            "trades": [_to_jsonable(trade) for trade in trades],
+            "account": _streaming_demo_account_payload(demo),
+            "final_results": demo.get_final_results(),
+            "message": "Paper trading terminated after selling all current simulated holdings.",
+        }
+    finally:
+        step_lock.release()
+
+
+@app.post("/api/live-trading/terminate")
+async def live_trading_terminate() -> JSONResponse:
+    return _json(await run_in_threadpool(_live_trading_terminate_response))
+
+
+def _live_trading_terminate_response() -> dict[str, Any]:
+    with _live_lock:
+        active = _operation_mode_state.get("active")
+    active_mode = getattr(active, "mode", None)
+    active_mode_value = getattr(active_mode, "value", active_mode)
+    if active_mode_value != "live_trading":
+        return {"ok": False, "status": "not_live_trading", "message": "Live trading is not the active operation mode."}
+    config = load_short_horizon_strategy_config()
+    config_live_enabled = bool(config.get("execution", {}).get("live_trading_enabled", False))
+    env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
+    runtime = evaluate_live_runtime_gates(require_manual_arming=True)
+    if not (config_live_enabled and env_live_enabled and runtime.ok):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "live_trading_enabled_by_config": config_live_enabled,
+            "live_trading_enabled_by_env": env_live_enabled,
+            "runtime_gate_failures": runtime.failures,
+            "message": "Live termination sell orders are blocked until live config, env flags, and manual arming gates pass.",
+        }
+    client = KisDevelopersApiClient(paper=False, enabled=True)
+    portfolio = client.get_portfolio()
+    receipts = []
+    executions = []
+    skipped = []
+    for holding in portfolio.account.holdings:
+        quantity = int(getattr(holding, "quantity", 0) or 0)
+        limit_price = float(getattr(holding, "last_price", 0.0) or getattr(holding, "average_price", 0.0) or 0.0)
+        if quantity <= 0 or limit_price <= 0:
+            skipped.append({"ticker": holding.ticker, "quantity": quantity, "last_price": limit_price})
+            continue
+        order = FinalOrder(
+            ticker=holding.ticker,
+            market=holding.market or "KR",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            limit_price=limit_price,
+            manual_approval_required=False,
+        )
+        receipt = client.place_limit_order(order)
+        receipts.append(receipt)
+        try:
+            executions.append(client.get_order_status(receipt.order_id))
+        except Exception as exc:  # noqa: BLE001 - the sell order was submitted; status lookup is best effort.
+            executions.append({"order_id": receipt.order_id, "status": "STATUS_LOOKUP_FAILED", "message": str(exc)})
+    with _live_lock:
+        _operation_mode_state["active"] = None
+    audit.record(
+        "live_trading_terminated",
+        {"submitted_sell_orders": len(receipts), "skipped_holdings": skipped, "account_equity": portfolio.account.equity},
+    )
+    return {
+        "ok": True,
+        "status": "terminated",
+        "submitted_sell_orders": len(receipts),
+        "skipped_holdings": skipped,
+        "receipts": receipts,
+        "executions": executions,
+        "message": "Live trading termination submitted limit SELL orders for all current KIS holdings.",
+    }
+
+
 @app.get("/api/mock-kis/portfolio")
 def mock_kis_portfolio() -> JSONResponse:
     context = _get_or_refresh_live()["context"]
@@ -2263,11 +2392,14 @@ def _operation_mode_request_snapshot() -> dict[str, Any]:
 
 
 def _ensure_background_refresh() -> None:
-  snapshot = _live_snapshot()
-  if snapshot["is_refreshing"]:
-    return
-  worker = threading.Thread(target=_refresh_live_cache, name="operation-mode-refresh", daemon=True)
-  worker.start()
+  global _refresh_worker
+  with _live_lock:
+    if bool(_live_state["is_refreshing"]):
+      return
+    if _refresh_worker is not None and _refresh_worker.is_alive():
+      return
+    _refresh_worker = threading.Thread(target=_refresh_live_cache, name="operation-mode-refresh", daemon=True)
+    _refresh_worker.start()
 
 
 def _start_live_worker(learning_mode: str | None = None) -> None:
@@ -2366,6 +2498,14 @@ def _refresh_live_cache() -> None:
         _set_live_progress(76, "paper_trading", "Calculating paper trading realized PnL")
         test_result = run_hypothetical_realtime_test(context.temporal_frames, context.signals)
         model_paths = update_realtime_model_artifacts(ModelArtifactStore(), realtime_examples, test_result)
+      _set_live_progress(80, "learning", "Collecting live feature frames and training live short-horizon model")
+      live_feature_collection = collect_live_feature_frames_from_realtime_store()
+      live_model_artifact = train_live_short_horizon_from_collected_features()
+      model_paths["live_short_horizon"] = str(
+          ModelArtifactRegistry().latest_path
+          if live_model_artifact.get("live_eligible")
+          else ModelArtifactRegistry().root / f"{live_model_artifact['artifact_id']}.json"
+      )
       _set_live_progress(84, "graph", "Persisting ontology graph and reasoning paths")
       graph_counts = store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
       with _live_lock:
@@ -2395,6 +2535,9 @@ def _refresh_live_cache() -> None:
                 "temporal_frames": len(context.temporal_frames),
                 "supervised_examples": len(realtime_examples),
                 "model_artifacts": len(model_paths),
+                "live_feature_frames_built": int(live_feature_collection.get("built", 0) or 0),
+                "live_short_horizon_live_eligible": bool(live_model_artifact.get("live_eligible")),
+                "live_short_horizon_examples": int(live_model_artifact.get("metrics", {}).get("example_count", 0)),
             },
         )
       with _live_lock:
@@ -2432,7 +2575,12 @@ def _get_or_refresh_live(force_refresh: bool = False) -> dict[str, Any]:
   cache_matches_mode = snapshot.get("context_mode") == current_mode
   if snapshot["context"] is not None and cache_matches_mode and not force_refresh:
     return snapshot
+  if force_refresh:
+    _ensure_background_refresh()
+    if snapshot["context"] is not None and cache_matches_mode:
+      return snapshot
   if (snapshot["context"] is None or not cache_matches_mode) and not force_refresh:
+    _ensure_background_refresh()
     _build_current_snapshot_from_store()
     return _live_snapshot()
   last_updated = snapshot["last_updated"]
@@ -2441,7 +2589,7 @@ def _get_or_refresh_live(force_refresh: bool = False) -> dict[str, Any]:
     or (datetime.now() - last_updated).total_seconds() > LIVE_STALE_SECONDS
   )
   if force_refresh or stale or snapshot["context"] is None:
-    _refresh_live_cache()
+    _ensure_background_refresh()
     snapshot = _live_snapshot()
 
   if snapshot["context"] is None or snapshot["research_result"] is None:
@@ -3189,7 +3337,7 @@ HTML = """
       #output,
       #relations { display: none !important; }
       #learningStatusCard .bar { height: 8px; }
-      #streamingDemoContainer { display: block; }
+      #streamingDemoContainer[hidden] { display: none !important; }
       #streamingDemoContainer .score-row { grid-template-columns: 84px minmax(0, 1fr); margin: 6px 0; }
       #streamingDemoContainer .score-row .mini-chart { display: none; }
       .cards { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
@@ -3226,6 +3374,7 @@ HTML = """
         <button type="button" id="liveFlagsButton" class="secondary" onclick="applyLiveFlags()">실전 플래그 적용<small>주문 없이 게이트만 전환</small></button>
         <button type="button" id="modeLiveTradingButton" class="danger" onclick="startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
       </div>
+      <button type="button" id="terminateTradingButton" class="danger" onclick="terminateActiveTrading()" disabled>조기 종료<small>보유분 전량 매도 후 종료</small></button>
       <div class="work-status active">
         <strong id="operationModeStatus">모드 대기</strong>
         <div class="muted" id="runtimeStatus">NPU 상태 확인 중</div>
@@ -3261,7 +3410,7 @@ HTML = """
       <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
       <h2>시뮬레이션 테스트</h2>
       <div class="note">시뮬레이션 테스트는 위에 입력한 목표 수익률과 목표 시간으로 자동 진행됩니다.</div>
-      <div class="work-status active" id="streamingDemoContainer" style="display:none;">
+      <div class="work-status active" id="streamingDemoContainer" hidden>
         <strong id="streamingDemoStatus">대기 중</strong>
         <div class="bar"><span id="streamingDemoProgress" style="width:0%"></span></div>
         <div style="margin-top: 10px; font-size: 12px;">
@@ -3398,6 +3547,7 @@ HTML = """
     let lastRenderedCollectionCycle = null;
     let mockPerformanceTimer = null;
     let operationRequestActive = false;
+    let activeOperationMode = null;
     let lastBrokerConnection = null;
     let liveAccountBasis = null;
     let streamingStepBusy = false;
@@ -3406,6 +3556,29 @@ HTML = """
     let streamingReturnSeries = [];
     const fmtWon = new Intl.NumberFormat('ko-KR', { style: 'currency', currency: 'KRW', maximumFractionDigits: 0 });
     const fmtUsd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    function formatMoney(value, currency = 'KRW') {
+      const numeric = Number(value || 0);
+      return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(numeric) : fmtWon.format(numeric);
+    }
+
+    function formatCashByCurrency(account = {}) {
+      const cashByCurrency = account && account.cash_by_currency && typeof account.cash_by_currency === 'object'
+        ? account.cash_by_currency
+        : null;
+      if (!cashByCurrency) {
+        return formatMoney(Number(account.cash || 0), account.base_currency || 'KRW');
+      }
+      const preferred = ['KRW', 'USD'];
+      const currencies = [
+        ...preferred.filter((currency) => Object.prototype.hasOwnProperty.call(cashByCurrency, currency)),
+        ...Object.keys(cashByCurrency).filter((currency) => !preferred.includes(currency)).sort(),
+      ];
+      if (!currencies.length) {
+        return formatMoney(Number(account.cash || 0), account.base_currency || 'KRW');
+      }
+      return currencies.map((currency) => formatMoney(Number(cashByCurrency[currency] || 0), currency)).join(' / ');
+    }
 
     function applyCompactKoreanDashboard() {
       document.title = 'Paper Trading Dashboard';
@@ -3540,12 +3713,23 @@ HTML = """
       if (liveButton) liveButton.disabled = operationRequestActive;
       if (liveTradingButton) liveTradingButton.disabled = operationRequestActive;
       if (liveFlagsButton) liveFlagsButton.disabled = operationRequestActive;
+      updateTerminateTradingButton();
       if (refreshButton) refreshButton.disabled = false;
       if (learningButton) learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
       paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
       if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
       if (liveTradingButton) liveTradingButton.innerHTML = '실전 투자<small>자동매매 게이트</small>';
       if (refreshButton) refreshButton.innerHTML = '상태 새로고침<small>수집은 중단하지 않음</small>';
+    }
+
+    function updateTerminateTradingButton() {
+      const button = document.getElementById('terminateTradingButton');
+      if (!button) return;
+      const canTerminate = streamingDemoRunning || activeOperationMode === 'live_trading';
+      button.disabled = operationRequestActive || !canTerminate;
+      button.innerHTML = activeOperationMode === 'live_trading'
+        ? '조기 종료<small>실전 보유분 지정가 전량 매도</small>'
+        : '조기 종료<small>모의 보유분 전량 매도</small>';
     }
 
     function setModeButtonsLocked(locked) {
@@ -3555,12 +3739,14 @@ HTML = """
       const liveButton = document.getElementById('modeLiveButton');
       const liveTradingButton = document.getElementById('modeLiveTradingButton');
       const liveFlagsButton = document.getElementById('liveFlagsButton');
+      const terminateButton = document.getElementById('terminateTradingButton');
       const enabled = !locked;
       if (learningButton) learningButton.disabled = !enabled;
       if (paperButton) paperButton.disabled = !enabled;
       if (liveButton) liveButton.disabled = !enabled;
       if (liveTradingButton) liveTradingButton.disabled = !enabled;
       if (liveFlagsButton) liveFlagsButton.disabled = !enabled;
+      if (terminateButton) terminateButton.disabled = locked || !(streamingDemoRunning || activeOperationMode === 'live_trading');
       if (refreshButton) refreshButton.disabled = false;
     }
 
@@ -3609,6 +3795,10 @@ HTML = """
       streamingDemoRunning = false;
       streamingStepBusy = false;
       streamingDemoId = null;
+      if (activeOperationMode !== 'live_trading') activeOperationMode = null;
+      updateTerminateTradingButton();
+      const container = document.getElementById('streamingDemoContainer');
+      if (container) container.hidden = true;
       if (message) {
         const statusNode = document.getElementById('streamingDemoStatus');
         const mockNode = document.getElementById('mockStatus');
@@ -3733,9 +3923,11 @@ HTML = """
         });
         document.getElementById('output').textContent = JSON.stringify(data, null, 2);
         if (startsStreamingLoop(mode, data)) {
-          document.getElementById('streamingDemoContainer').style.display = 'block';
+          document.getElementById('streamingDemoContainer').hidden = false;
           streamingDemoId = data.demo_id;
           streamingDemoRunning = true;
+          activeOperationMode = mode;
+          updateTerminateTradingButton();
           streamingInitialCash = Number(data.initial_cash || options.initial_cash || 10000000);
           streamingTargetReturnRate = Number(data.target_return_rate || options.target_return_rate || 0);
           if (streamingTargetReturnRate > 1) streamingTargetReturnRate /= 100.0;
@@ -3790,6 +3982,51 @@ HTML = """
       await startOperationMode(mode, options);
     }
 
+    async function terminateActiveTrading() {
+      if (operationRequestActive) return;
+      if (!streamingDemoRunning && activeOperationMode !== 'live_trading') {
+        document.getElementById('runtimeStatus').textContent = 'No active paper or live trading session to terminate.';
+        return;
+      }
+      operationRequestActive = true;
+      setModeButtonsLocked(true);
+      document.getElementById('operationModeStatus').textContent = 'Early termination requested...';
+      document.getElementById('runtimeStatus').textContent = 'Submitting final liquidation request.';
+      try {
+        const isLiveTermination = activeOperationMode === 'live_trading' && !streamingDemoRunning;
+        const url = isLiveTermination ? '/api/live-trading/terminate' : `/api/paper-trading/terminate/${streamingDemoId}`;
+        const data = await fetchJsonWithTimeout(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, 45000);
+        document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+        if (data.ok === false) {
+          document.getElementById('operationModeStatus').textContent = 'Early termination blocked';
+          document.getElementById('runtimeStatus').textContent = data.message || data.status || 'Termination failed.';
+          return;
+        }
+        if (data.account) updateStreamingAccount(data);
+        if (data.final_results) renderStreamingPerformance({ progress: 100, account: data.account || {}, status: 'terminated' });
+        streamingDemoRunning = false;
+        streamingStepBusy = false;
+        streamingDemoId = null;
+        activeOperationMode = null;
+        document.getElementById('operationModeStatus').textContent = 'Trading terminated';
+        document.getElementById('runtimeStatus').textContent = data.message || 'All current holdings were submitted for liquidation.';
+        const statusNode = document.getElementById('streamingDemoStatus');
+        if (statusNode) statusNode.textContent = '조기 종료 완료';
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error);
+        document.getElementById('operationModeStatus').textContent = 'Early termination failed';
+        document.getElementById('runtimeStatus').textContent = message;
+        document.getElementById('output').textContent = message;
+      } finally {
+        operationRequestActive = false;
+        setModeButtonsLocked(false);
+        updateTerminateTradingButton();
+      }
+    }
+
     async function stopLearningCollection() {
       const stopLearningButton = document.getElementById('modeLearningStopButton');
       if (stopLearningButton) stopLearningButton.disabled = true;
@@ -3815,6 +4052,8 @@ HTML = """
     }
 
     function renderOperationMode(data) {
+      activeOperationMode = data.mode || null;
+      updateTerminateTradingButton();
       const labels = {
         learning: 'Learning',
         testing: 'Legacy paper trading',
@@ -5998,7 +6237,10 @@ HTML = """
         const data = await response.json();
         streamingDemoId = data.demo_id;
         streamingDemoRunning = true;
+        activeOperationMode = 'paper_trading';
+        updateTerminateTradingButton();
         streamingInitialCash = Number(data.initial_cash || streamingInitialCash || 10000000);
+        document.getElementById('streamingDemoContainer').hidden = false;
         document.getElementById('streamingDemoStatus').textContent = '모의투자 실행 중...';
         document.getElementById('streamingDemoProgress').style.width = '0%';
       } catch (error) {
