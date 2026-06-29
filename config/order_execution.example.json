@@ -1,0 +1,9 @@
+{
+  "order_type": "LIMIT_ONLY",
+  "allow_market_orders": false,
+  "max_unfilled_order_age_seconds": 120,
+  "poll_order_status_interval_seconds": 3,
+  "max_order_status_poll_seconds": 180,
+  "cancel_stale_unfilled_orders": true,
+  "idempotency_ttl_seconds": 86400
+}

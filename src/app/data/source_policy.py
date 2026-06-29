@@ -85,3 +85,31 @@ def is_allowed_for_live_decision(
     if quality < min_quality:
         reasons.append("data_quality_check")
     return not reasons, reasons
+
+
+def is_allowed_for_live_buy_market_data(
+    metadata: SourceMetadata,
+    *,
+    max_age_seconds: float,
+    min_quality: float,
+    now: object | None = None,
+) -> tuple[bool, list[str]]:
+    from datetime import datetime, timezone
+
+    current = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+    reasons: list[str] = []
+    allowed, base_reasons = is_allowed_for_live_decision(metadata, 5, min_quality)
+    reasons.extend(reason.upper() for reason in base_reasons)
+    observed_at = metadata.observed_at or metadata.retrieved_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age = max(0.0, (current - observed_at).total_seconds())
+    if age > max_age_seconds:
+        reasons.append("MARKET_DATA_STALE")
+    if not metadata.is_realtime:
+        reasons.append("MARKET_DATA_NOT_REALTIME")
+    if metadata.is_delayed:
+        reasons.append("DELAYED_MARKET_DATA_BLOCKED")
+    if metadata.is_backfilled:
+        reasons.append("BACKFILLED_MARKET_DATA_BLOCKED")
+    return allowed and not reasons, list(dict.fromkeys(reasons))

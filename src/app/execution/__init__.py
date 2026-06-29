@@ -8,6 +8,7 @@ from app.execution.kis_real import (
     KisEndpointSet,
     load_kis_env_file,
 )
+from app.execution.live_execution_coordinator import LiveExecutionCoordinator
 
 __all__ = [
     "DisabledLiveOrderExecutor",
@@ -18,6 +19,7 @@ __all__ = [
     "KisCredentials",
     "KisEndpointSet",
     "load_kis_env_file",
+    "LiveExecutionCoordinator",
     "MockKisExecution",
     "MockKisOrderReceipt",
     "MockKisPortfolio",

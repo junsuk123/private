@@ -18,3 +18,9 @@ config/secrets/*
 !config/secrets/*.example
 !config/secrets/README.md
 config/principal_protection.json
+config/live_trading_safety.json
+config/trading_costs.json
+config/tradable_universe.json
+config/model_training.json
+config/realtime_market_data.json
+config/order_execution.json

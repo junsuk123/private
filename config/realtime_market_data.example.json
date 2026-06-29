@@ -1,0 +1,15 @@
+{
+  "symbols": ["005930", "000660"],
+  "max_quote_age_ms": 3000,
+  "max_orderbook_age_ms": 3000,
+  "persist_ticks": true,
+  "persist_orderbook": true,
+  "minute_bar_window": 1,
+  "allow_rest_fallback_for_buy_evidence": false,
+  "source_policy": {
+    "block_synthetic": true,
+    "block_mock": true,
+    "block_delayed": true,
+    "block_unknown": true
+  }
+}

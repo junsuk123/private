@@ -1,0 +1,12 @@
+{
+  "minimum_examples": 500,
+  "minimum_positive_labels": 30,
+  "minimum_negative_labels": 30,
+  "minimum_symbols": 10,
+  "minimum_trading_days": 5,
+  "validation_method": "walk_forward",
+  "live_eligible_min_auc": 0.55,
+  "live_eligible_min_precision_at_k": 0.35,
+  "live_eligible_max_drawdown": 0.03,
+  "feature_schema_version": "live_short_horizon_v1"
+}

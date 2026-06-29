@@ -1,0 +1,23 @@
+{
+  "max_quote_age_ms": 3000,
+  "max_orderbook_age_ms": 3000,
+  "minimum_source_quality_score": 0.85,
+  "minimum_model_confidence": 0.6,
+  "minimum_probability_success": 0.55,
+  "minimum_expected_net_return_bps": 20,
+  "maximum_spread_bps": 30,
+  "maximum_volatility_5m_bps": 300,
+  "maximum_single_order_pct_of_cash": 0.05,
+  "maximum_position_pct_of_equity": 0.1,
+  "maximum_orders_per_day": 10,
+  "maximum_orders_per_symbol_per_day": 2,
+  "order_cooldown_seconds": 300,
+  "market_orders_allowed": false,
+  "require_trained_model": true,
+  "allow_heuristic_fallback_in_live": false,
+  "require_principal_protection": true,
+  "require_recent_readiness_report": true,
+  "readiness_report_max_age_seconds": 1800,
+  "require_manual_arming": true,
+  "arming_ttl_seconds": 900
+}

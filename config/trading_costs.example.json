@@ -1,0 +1,10 @@
+{
+  "broker_buy_fee_rate": "USER_MUST_SET",
+  "broker_sell_fee_rate": "USER_MUST_SET",
+  "sell_transaction_tax_rate": "USER_MUST_SET",
+  "minimum_fee_krw": 0,
+  "slippage_bps_default": 10,
+  "market_impact_bps_default": 5,
+  "safety_margin_bps": 5,
+  "notes": "User must verify current Korea Investment Securities fee plan and applicable Korean stock transaction tax before live trading."
+}

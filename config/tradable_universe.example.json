@@ -1,0 +1,16 @@
+{
+  "markets": ["KRX", "KOSDAQ"],
+  "cash_stock_only": true,
+  "exclude_etf": true,
+  "exclude_etn": true,
+  "exclude_elw": true,
+  "exclude_preferred_shares": true,
+  "exclude_spac": true,
+  "exclude_trading_halt": true,
+  "exclude_investment_warning": true,
+  "minimum_average_volume": 100000,
+  "minimum_trade_count": 100,
+  "maximum_spread_bps": 30,
+  "minimum_orderbook_depth_krw": 10000000,
+  "regular_session_only": true
+}
