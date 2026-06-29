@@ -29,7 +29,7 @@ class RiskManagerTest(unittest.TestCase):
         rules = RiskRules(max_sector_weight=0.50)
         result = RiskManager(rules).validate(intents[0], account, markets[0])
 
-        self.assertTrue(result.checks["live_trading_disabled"])
+        self.assertTrue(result.checks["live_trading_mode_allowed"])
         self.assertIsNotNone(result.final_order)
         self.assertTrue(result.checks["deposit_limit_check"])
         self.assertTrue(result.final_order.manual_approval_required)

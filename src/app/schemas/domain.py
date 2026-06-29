@@ -114,6 +114,7 @@ class AccountSnapshot:
     unrealized_pnl_today: float = 0.0
     base_currency: str = "KRW"
     cash_by_currency: dict[str, float] = field(default_factory=dict)
+    cash_equivalent_krw: float | None = None
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -122,7 +123,8 @@ class AccountSnapshot:
 
     @property
     def equity(self) -> float:
-        return self.cash + self.invested_value
+        cash_basis = self.cash if self.cash_equivalent_krw is None else self.cash_equivalent_krw
+        return cash_basis + self.invested_value
 
     def holdings_by_ticker(self) -> dict[str, float]:
         return {holding.ticker: holding.market_value for holding in self.holdings}

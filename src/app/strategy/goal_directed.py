@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from math import expm1, isfinite, log1p
 
 from app.goals import NegotiatedGoal
 from app.graph import KnowledgeGraph
@@ -14,6 +15,9 @@ from app.schemas.domain import (
     StrategySignal,
 )
 from app.strategy.rule_based import _ontology_flow_adjustment
+
+
+MAX_ANNUALIZED_REQUIRED_RETURN = 1_000_000.0
 
 
 @dataclass(frozen=True)
@@ -33,7 +37,7 @@ def build_goal_execution_plan(
     indicators: dict[str, IndicatorSnapshot],
     graph: KnowledgeGraph,
 ) -> GoalExecutionPlan:
-    annualized = (1 + goal.target_return_rate) ** (365 / goal.period_days) - 1
+    annualized = _safe_annualized_return(goal.target_return_rate, goal.period_days)
     signals = tuple(
         _score_market(goal, annualized, market, indicators.get(market.ticker), graph)
         for market in markets
@@ -160,6 +164,19 @@ def _score_market(
         contradicting_factors=tuple(contradiction),
         reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
     )
+
+
+def _safe_annualized_return(return_rate: float, period_days: int) -> float:
+    if period_days <= 0:
+        raise ValueError("period_days must be positive")
+    rate = float(return_rate)
+    if not isfinite(rate) or rate <= 0:
+        raise ValueError("target return must be a positive finite number")
+    annualized_log_return = log1p(rate) * (365.0 / max(1, period_days))
+    cap_log_return = log1p(MAX_ANNUALIZED_REQUIRED_RETURN)
+    if annualized_log_return >= cap_log_return:
+        return MAX_ANNUALIZED_REQUIRED_RETURN
+    return expm1(annualized_log_return)
 
 
 def _action_from_score(score: float, compounding_mode: bool = False) -> OrderAction:

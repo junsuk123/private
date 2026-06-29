@@ -394,11 +394,22 @@ def _to_jsonable(value: Any) -> Any:
 def _source(data: dict[str, Any]):
     from app.schemas.domain import SourceMetadata
 
+    observed_at = data.get("observed_at")
     return SourceMetadata(
         source_name=data["source_name"],
         retrieved_at=datetime.fromisoformat(data["retrieved_at"]),
         raw_url=data.get("raw_url"),
         source_id=data.get("source_id"),
+        source_type=str(data.get("source_type", "unknown")),
+        trust_level=int(data.get("trust_level", 0) or 0),
+        observed_at=datetime.fromisoformat(observed_at) if observed_at else None,
+        latency_sec=_optional_float(data.get("latency_sec")),
+        is_realtime=bool(data.get("is_realtime", False)),
+        is_delayed=bool(data.get("is_delayed", False)),
+        is_synthetic=bool(data.get("is_synthetic", False)),
+        is_backfilled=bool(data.get("is_backfilled", False)),
+        license_policy=str(data.get("license_policy", "unknown")),
+        quality_score=float(data.get("quality_score", 0.0) or 0.0),
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from app.graph import KnowledgeGraph
@@ -22,6 +23,7 @@ ONTOLOGY_FLOW_CONTRA_WEIGHTS = {
     "SuspectedSmartMoneyDistribution": 0.30,
     "BuyCandidate": 0.25,
 }
+MARKET_CONTEXT_BUY_THRESHOLD = 1.0
 
 
 def generate_strategy_signals(
@@ -34,15 +36,27 @@ def generate_strategy_signals(
     for market in markets:
         indicator = indicators.get(market.ticker)
         if indicator is None:
+            score = 0.0
+            supporting: list[str] = []
+            contradicting: list[str] = ["MissingFundamentalIndicators"]
+            market_score, market_support, market_contra = _market_context_adjustment(market)
+            flow_score, flow_support, flow_contra = _ontology_flow_adjustment(graph, market.ticker)
+            score += market_score + flow_score
+            supporting.extend(market_support)
+            supporting.extend(flow_support)
+            contradicting.extend(market_contra)
+            contradicting.extend(flow_contra)
+            action = OrderAction.BUY if score >= MARKET_CONTEXT_BUY_THRESHOLD else OrderAction.HOLD
+            confidence = max(0.0, min(0.72, 0.38 + score * 0.12))
             signals.append(
                 StrategySignal(
                     ticker=market.ticker,
-                    action=OrderAction.HOLD,
-                    confidence=0.0,
-                    score=0.0,
-                    supporting_factors=(),
-                    contradicting_factors=("MissingIndicators",),
-                    reasoning_path_ids=(),
+                    action=action,
+                    confidence=confidence,
+                    score=score,
+                    supporting_factors=tuple(supporting),
+                    contradicting_factors=tuple(contradicting),
+                    reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
                 )
             )
             continue
@@ -106,7 +120,7 @@ def generate_order_intents(
             continue
 
         market = market_by_ticker[signal.ticker]
-        indicator = indicators[signal.ticker]
+        indicator = indicators.get(signal.ticker)
         suggested_weight = min(0.05, max(0.01, signal.confidence * 0.05))
         if "InformedOrderFlowImbalance" in signal.supporting_factors:
             suggested_weight = min(0.05, suggested_weight * 1.08)
@@ -120,26 +134,100 @@ def generate_order_intents(
                 suggested_weight=suggested_weight,
                 confidence=signal.confidence,
                 valid_until=datetime.now(timezone.utc) + timedelta(hours=6),
-                reasoning_summary=(
-                    "Positive growth and profitability indicators support a buy candidate.",
-                    "Contradicting factors are retained for deterministic risk review.",
-                    "Domestic investor-flow evidence is supplied by ontology triples when available.",
-                ),
+                reasoning_summary=_intent_reasoning_summary(indicator is not None),
                 supporting_factors=signal.supporting_factors,
                 contradicting_factors=signal.contradicting_factors,
-                source_data_ids=indicator.source_ids,
                 strategy_family="rule_based",
-                signal_name="fundamental_ontology_buy",
+                signal_name="fundamental_ontology_buy" if indicator is not None else "market_context_ontology_buy",
                 expected_exit_price=market.last_price * (1 + gross_expected_return),
                 expected_holding_minutes=360,
                 gross_expected_return=gross_expected_return,
                 target_net_return=0.0,
                 ontology_tags=tuple(signal.supporting_factors),
-                strategy_metadata={"score": signal.score},
+                source_data_ids=(
+                    indicator.source_ids
+                    if indicator is not None
+                    else (market.source.source_id or f"market:{market.ticker}",)
+                ),
+                validation_id=_live_market_validation_id(market, signal),
+                strategy_metadata={"score": signal.score, "indicator_available": indicator is not None},
             )
         )
 
     return tuple(intents)
+
+
+def _market_context_adjustment(market: MarketSnapshot) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
+    score = 0.0
+    supporting: list[str] = []
+    contradicting: list[str] = []
+    if market.average_daily_trading_value >= 1_000_000_000:
+        score += 0.45
+        supporting.append("HighLiquidity")
+    else:
+        contradicting.append("LowLiquidity")
+    if 0 < market.volatility_20d <= 0.06:
+        score += 0.35
+        supporting.append("ControlledVolatility")
+    elif market.volatility_20d > 0.08:
+        score -= 0.45
+        contradicting.append("HighVolatility")
+    if _is_overseas_market(market) and market.average_daily_trading_value >= 1_000_000_000:
+        score += 0.25
+        supporting.append("OverseasLiquidVenue")
+    flow = market.investor_flow
+    if flow is not None:
+        if flow.price_change_rate >= 0.012:
+            score += 0.45
+            supporting.append("PositivePriceMomentum")
+        elif flow.price_change_rate <= -0.012:
+            score -= 0.35
+            contradicting.append("NegativePriceMomentum")
+        if flow.volume_change_rate >= 0.5:
+            score += 0.25
+            supporting.append("VolumeExpansion")
+    return score, tuple(supporting), tuple(contradicting)
+
+
+def _intent_reasoning_summary(has_indicator: bool) -> tuple[str, ...]:
+    if has_indicator:
+        return (
+            "Positive growth and profitability indicators support a buy candidate.",
+            "Contradicting factors are retained for deterministic risk review.",
+            "Domestic investor-flow evidence is supplied by ontology triples when available.",
+        )
+    return (
+        "Trusted fundamental indicators are unavailable, so the candidate uses market context only.",
+        "Liquidity, volatility, venue, and ontology flow evidence are retained for deterministic risk review.",
+        "Live execution still requires RiskManager, reality-check validation, and runtime arming gates.",
+    )
+
+
+def _is_overseas_market(market: MarketSnapshot) -> bool:
+    market_name = str(market.market or "").upper()
+    ticker = str(market.ticker or "").upper()
+    domestic = market_name in {"KRX", "KOSPI", "KOSDAQ", "KONEX"} or ticker.endswith(".KS") or ticker.isdigit()
+    return not domestic
+
+
+def _live_market_validation_id(market: MarketSnapshot, signal: StrategySignal) -> str | None:
+    source = market.source
+    if source.source_type != "broker_api":
+        return None
+    if source.trust_level < 5 or source.quality_score < 0.8 or not source.is_realtime:
+        return None
+    observed_at = source.observed_at or source.retrieved_at
+    payload = "|".join(
+        (
+            market.ticker,
+            market.market,
+            f"{market.last_price:.8f}",
+            f"{signal.score:.6f}",
+            observed_at.isoformat(),
+            source.source_id or "",
+        )
+    )
+    return "broker-reality-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
 
 def _ontology_flow_adjustment(graph: KnowledgeGraph, ticker: str) -> tuple[float, tuple[str, ...], tuple[str, ...]]:

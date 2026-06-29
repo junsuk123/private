@@ -206,6 +206,33 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(status["equity"], 1000000)
         self.assertEqual(status["cash_weight"], 0.8)
 
+    def test_status_includes_foreign_cash_krw_in_operating_cash(self) -> None:
+        client = TestClient(app)
+        broker_state = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 800000,
+            "krw_cash": 800000,
+            "foreign_cash_krw": 12000,
+            "cash": 812000,
+            "cash_by_currency": {"KRW": 800000, "USD": 10.0},
+            "foreign_cash_by_currency": {"USD": 10.0},
+            "base_currency": "KRW",
+            "invested_value": 188000,
+            "actual_equity": 1000000,
+            "account_suffix": "...28",
+        }
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = broker_state
+
+        status = client.get("/api/status").json()
+
+        self.assertEqual(status["cash"], 812000)
+        self.assertEqual(status["krw_cash"], 800000)
+        self.assertEqual(status["foreign_cash_krw"], 12000)
+        self.assertEqual(status["cash_weight"], 0.812)
+
     def test_paper_mode_auto_uses_checked_live_account_basis_as_initial_cash(self) -> None:
         client = TestClient(app)
         with web_module._live_lock:

@@ -65,6 +65,20 @@ class GoalNegotiationTest(unittest.TestCase):
         self.assertGreater(easy.feasibility_percent, 3)
         self.assertEqual(easy.period_minutes, 390)
 
+    def test_extreme_return_goal_does_not_overflow(self) -> None:
+        context = build_analysis_context()
+        assessment = assess_goal(
+            GoalRequest(target_return_rate=1_000_000.0, target_profit_amount=None, period_days=1),
+            context.account,
+            context.markets,
+            context.indicators,
+            context.signals,
+            context.graph,
+        )
+
+        self.assertEqual(assessment.annualized_required_return, 1_000_000.0)
+        self.assertGreaterEqual(assessment.feasibility_percent, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

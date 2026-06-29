@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.execution.kis_mock import MockKisExecution, MockKisOrderReceipt, MockKisPortfolio
-from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide
+from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnapshot, OrderSide, SourceMetadata
 
 
 KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
@@ -330,18 +330,102 @@ class KisDevelopersApiClient:
             or summary_row.get("tot_evlu_amt")
         )
         cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
-        foreign_cash_by_currency = self._get_overseas_cash_by_currency()
+        foreign_cash_by_currency, overseas_assets_krw = self._get_overseas_cash_balance()
         cash_by_currency.update(foreign_cash_by_currency)
+        cash_equivalent_krw = cash + overseas_assets_krw
         account = AccountSnapshot(
             cash=cash,
             holdings=holdings,
             base_currency="KRW",
             cash_by_currency=cash_by_currency,
+            cash_equivalent_krw=cash_equivalent_krw,
         )
         return MockKisPortfolio(
             account=account,
             market_prices={holding.ticker: holding.last_price for holding in holdings},
             updated_at=datetime.now(timezone.utc),
+        )
+
+    def get_market_snapshot(
+        self,
+        ticker: str,
+        market: str,
+        *,
+        company_name: str | None = None,
+        sector: str | None = None,
+    ) -> MarketSnapshot:
+        self._ensure_enabled()
+        symbol = ticker.upper().strip()
+        market_name = market.upper().strip()
+        if _is_overseas_market_name(market_name, symbol):
+            return self._get_overseas_market_snapshot(symbol, market_name, company_name=company_name, sector=sector)
+        return self._get_domestic_market_snapshot(symbol, market_name, company_name=company_name, sector=sector)
+
+    def _get_domestic_market_snapshot(
+        self,
+        ticker: str,
+        market: str,
+        *,
+        company_name: str | None = None,
+        sector: str | None = None,
+    ) -> MarketSnapshot:
+        response = self._get(
+            "/uapi/domestic-stock/v1/quotations/inquire-price",
+            tr_id="FHKST01010100",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker},
+        )
+        self._ensure_success(response, "KIS domestic quote lookup failed")
+        output = response.get("output") or {}
+        now = datetime.now(timezone.utc)
+        price = _first_float(output, "stck_prpr", "prpr", "last", "close")
+        volume = _first_float(output, "acml_vol", "cntg_vol", "tvol")
+        trading_value = _first_float(output, "acml_tr_pbmn", "hts_avls", "tamt")
+        if trading_value <= 0:
+            trading_value = price * max(0.0, volume)
+        volatility = abs(_first_float(output, "prdy_ctrt", "rate", "prdy_vrss_sign")) / 100.0
+        return MarketSnapshot(
+            ticker=ticker,
+            market=market or "KRX",
+            company_name=company_name or ticker,
+            sector=sector or "Unknown",
+            last_price=price,
+            average_daily_trading_value=trading_value,
+            volatility_20d=max(0.005, min(0.20, volatility or 0.03)),
+            source=_broker_quote_source(ticker, "domestic", now),
+        )
+
+    def _get_overseas_market_snapshot(
+        self,
+        ticker: str,
+        market: str,
+        *,
+        company_name: str | None = None,
+        sector: str | None = None,
+    ) -> MarketSnapshot:
+        exchange_code = _overseas_quote_exchange_code(market)
+        response = self._get(
+            "/uapi/overseas-price/v1/quotations/price",
+            tr_id="HHDFS00000300",
+            params={"AUTH": "", "EXCD": exchange_code, "SYMB": ticker},
+        )
+        self._ensure_success(response, "KIS overseas quote lookup failed")
+        output = response.get("output") or {}
+        now = datetime.now(timezone.utc)
+        price = _first_float(output, "last", "ovrs_nmix_prpr", "stck_prpr", "base")
+        volume = _first_float(output, "tvol", "acml_vol", "pvol")
+        trading_value = _first_float(output, "tamt", "acml_tr_pbmn")
+        if trading_value <= 0:
+            trading_value = price * max(0.0, volume)
+        volatility = abs(_first_float(output, "rate", "prdy_ctrt")) / 100.0
+        return MarketSnapshot(
+            ticker=ticker,
+            market=market or "US-LISTED",
+            company_name=company_name or ticker,
+            sector=sector or "Unknown",
+            last_price=price,
+            average_daily_trading_value=trading_value,
+            volatility_20d=max(0.005, min(0.20, volatility or 0.03)),
+            source=_broker_quote_source(ticker, "overseas", now),
         )
 
     def issue_access_token(self, force_refresh: bool = False) -> str:
@@ -595,8 +679,9 @@ class KisDevelopersApiClient:
             "INQR_DVSN_CD": "00",
         }
 
-    def _get_overseas_cash_by_currency(self) -> dict[str, float]:
+    def _get_overseas_cash_balance(self) -> tuple[dict[str, float], float]:
         balances: dict[str, float] = {}
+        overseas_assets_krw = 0.0
         for nation_code in ("000", "840"):
             try:
                 response = self._get(
@@ -607,12 +692,13 @@ class KisDevelopersApiClient:
                 self._ensure_success(response, "KIS overseas present balance lookup failed")
             except KisApiError:
                 if nation_code == "840":
-                    return balances
+                    return balances, overseas_assets_krw
                 continue
             balances.update(_foreign_cash_by_currency_from_overseas_response(response, nation_code))
-            if balances:
+            overseas_assets_krw = max(overseas_assets_krw, _overseas_assets_krw_from_response(response))
+            if balances or overseas_assets_krw > 0:
                 break
-        return balances
+        return balances, overseas_assets_krw
 
     def _execution_from_status(
         self,
@@ -686,6 +772,37 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _first_float(data: dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = _to_float(data.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _broker_quote_source(ticker: str, scope: str, observed_at: datetime) -> SourceMetadata:
+    return SourceMetadata(
+        source_name="KIS broker quote",
+        retrieved_at=observed_at,
+        raw_url=f"kis://quotations/{scope}/{ticker}",
+        source_id=f"kis-quote:{scope}:{ticker}:{observed_at.isoformat()}",
+        source_type="broker_api",
+        trust_level=5,
+        observed_at=observed_at,
+        latency_sec=0.0,
+        is_realtime=True,
+        license_policy="broker_account",
+        quality_score=1.0,
+    )
+
+
+def _is_overseas_market_name(market: str, ticker: str) -> bool:
+    return not (ticker.isdigit() and len(ticker) == 6) or any(
+        token in market
+        for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+    )
+
+
 def _is_overseas_order(order: FinalOrder) -> bool:
     market = str(order.market or "").upper()
     return not (order.ticker.isdigit() and len(order.ticker) == 6) or any(
@@ -717,6 +834,21 @@ def _overseas_exchange_code(market: str) -> str:
     if value in {"US", "US-LISTED", "GLOBAL", "OVERSEAS"}:
         return os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper()
     return value or os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper()
+
+
+def _overseas_quote_exchange_code(market: str) -> str:
+    value = _overseas_exchange_code(market)
+    return {
+        "NASD": "NAS",
+        "NYSE": "NYS",
+        "AMEX": "AMS",
+        "SEHK": "HKS",
+        "SHAA": "SHS",
+        "SZAA": "SZS",
+        "TKSE": "TSE",
+        "HASE": "HNX",
+        "VNSE": "HSX",
+    }.get(value, value)
 
 
 def _format_overseas_price(value: float) -> str:
@@ -769,6 +901,29 @@ def _foreign_cash_by_currency_from_overseas_response(
     return balances
 
 
+def _overseas_assets_krw_from_response(response: dict[str, Any]) -> float:
+    best = 0.0
+    for row in _response_rows(response):
+        for key in (
+            "ovrs_tot_asst_amt",
+            "frcr_evlu_tota",
+            "frcr_evlu_amt2",
+            "wcrc_frcr_evlu_amt",
+            "krw_evlu_amt",
+            "evlu_amt_wcrc",
+            "wcrc_tot_evlu_amt",
+            "wcrc_tot_asst_amt",
+        ):
+            if key in row:
+                best = max(best, _to_float(row.get(key)))
+        if best <= 0:
+            amount = _foreign_cash_amount_from_row(row)
+            rate = _exchange_rate_from_row(row)
+            if amount is not None and rate > 0:
+                best = max(best, amount * rate)
+    return best
+
+
 def _response_rows(value: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if isinstance(value, dict):
@@ -781,6 +936,20 @@ def _response_rows(value: Any) -> list[dict[str, Any]]:
                 "frcr_dncl_amt_2",
                 "frcr_drwg_psbl_amt_1",
                 "nxdy_frcr_drwg_psbl_amt",
+                "tot_asst_amt",
+                "ovrs_tot_asst_amt",
+                "frcr_evlu_tota",
+                "tot_evlu_amt",
+                "frcr_evlu_amt2",
+                "tot_frcr_cblc_smtl",
+                "wcrc_frcr_evlu_amt",
+                "krw_evlu_amt",
+                "evlu_amt_wcrc",
+                "wcrc_tot_evlu_amt",
+                "wcrc_tot_asst_amt",
+                "bass_exrt",
+                "aply_exrt",
+                "frst_bltn_exrt",
             )
         ):
             rows.append(value)
@@ -820,6 +989,22 @@ def _foreign_cash_amount_from_row(row: dict[str, Any]) -> float | None:
         if key in row:
             return _to_float(row.get(key))
     return None
+
+
+def _exchange_rate_from_row(row: dict[str, Any]) -> float:
+    for key in (
+        "bass_exrt",
+        "aply_exrt",
+        "frst_bltn_exrt",
+        "exrt",
+        "exchange_rate",
+        "usd_krw_rate",
+    ):
+        if key in row:
+            rate = _to_float(row.get(key))
+            if rate > 0:
+                return rate
+    return 0.0
 
 
 def _default_token_cache_path(paper: bool) -> Path:

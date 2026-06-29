@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -53,6 +53,7 @@ from app.risk import PrincipalProtectionEngine, RiskManager
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
+    MarketSnapshot,
     OrderSide,
     OrderType,
     OrderAction,
@@ -67,7 +68,7 @@ from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
-from app.trading_pipeline import load_short_horizon_strategy_config
+from app.trading_pipeline import build_lightweight_market_snapshots_from_markets, load_short_horizon_strategy_config, ontology_filter_1
 
 
 def _ensure_starlette_router_event_compatibility() -> None:
@@ -223,6 +224,20 @@ def _load_principal_protection_config() -> PrincipalProtectionConfig:
   return _principal_config_from_payload(payload)
 
 
+def _principal_config_with_live_account_basis(config: PrincipalProtectionConfig) -> PrincipalProtectionConfig:
+  basis = _last_live_account_basis()
+  if basis is None:
+    return config
+  equity = max(0.0, float(basis.get("equity") or 0.0))
+  if equity <= 0:
+    return config
+  if abs(float(config.initial_principal or 0.0) - equity) < 1.0:
+    return config
+  updated = _principal_config_from_payload({**asdict(config), "initial_principal": equity})
+  _save_principal_protection_config(updated)
+  return updated
+
+
 def _save_principal_protection_config(config: PrincipalProtectionConfig) -> None:
   path = _principal_config_path()
   path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,6 +296,17 @@ def _principal_capital_allocation(state: Any) -> dict[str, float]:
 
 
 def _principal_protection_account_snapshot(config: PrincipalProtectionConfig) -> AccountSnapshot:
+  live_basis = _last_live_account_basis()
+  if live_basis is not None:
+    cash_by_currency = dict(live_basis.get("cash_by_currency") or {})
+    return AccountSnapshot(
+        cash=max(0.0, float(live_basis.get("krw_cash") or 0.0)),
+        holdings=(),
+        base_currency=str(live_basis.get("base_currency") or "KRW"),
+        cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
+        cash_equivalent_krw=max(0.0, float(live_basis.get("equity") or 0.0)),
+        captured_at=datetime.now(timezone.utc),
+    )
   with _live_lock:
     context = _live_state.get("context")
   account = getattr(context, "account", None)
@@ -328,8 +354,12 @@ def _foreign_cash_by_currency(cash_by_currency: dict[str, Any] | None) -> dict[s
 def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dict[str, Any] | None:
   if not connection or not connection.get("account_checked"):
     return None
-  cash = _number_or_zero(connection.get("actual_deposit") or connection.get("cash") or 0)
-  cash_by_currency = _cash_by_currency_payload(connection.get("cash_by_currency"), cash)
+  krw_cash = _number_or_zero(connection.get("krw_cash") or connection.get("actual_deposit") or 0)
+  cash = _number_or_zero(connection.get("cash") or connection.get("cash_equivalent_krw") or krw_cash)
+  cash_by_currency = _cash_by_currency_payload(connection.get("cash_by_currency"), krw_cash)
+  foreign_cash_krw = _number_or_zero(connection.get("foreign_cash_krw") or 0)
+  if cash <= 0:
+    cash = krw_cash + foreign_cash_krw
   equity = _number_or_zero(
       connection.get("actual_equity")
       or connection.get("equity")
@@ -344,7 +374,8 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
     return None
   return {
       "cash": cash if cash > 0 else equity,
-      "krw_cash": cash_by_currency.get("KRW", cash if cash > 0 else equity),
+      "krw_cash": cash_by_currency.get("KRW", krw_cash if krw_cash > 0 else equity),
+      "foreign_cash_krw": foreign_cash_krw,
       "cash_by_currency": cash_by_currency,
       "foreign_cash_by_currency": _foreign_cash_by_currency(cash_by_currency),
       "base_currency": "KRW",
@@ -365,7 +396,13 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
   basis = _last_live_account_basis()
   if basis is None:
     return context.account
-  return AccountSnapshot(cash=max(0.0, float(basis["equity"])), holdings=(), captured_at=datetime.now(timezone.utc))
+  return AccountSnapshot(
+      cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
+      holdings=(),
+      cash_by_currency=dict(basis.get("cash_by_currency") or {}),
+      cash_equivalent_krw=max(0.0, float(basis["equity"])),
+      captured_at=datetime.now(timezone.utc),
+  )
 
 
 def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
@@ -374,10 +411,11 @@ def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
     return None
   cash_by_currency = dict(basis.get("cash_by_currency") or {"KRW": basis.get("cash", 0.0)})
   return AccountSnapshot(
-      cash=max(0.0, float(basis.get("cash") or 0.0)),
+      cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
       holdings=(),
       base_currency=str(basis.get("base_currency") or "KRW"),
       cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
+      cash_equivalent_krw=max(0.0, float(basis.get("cash") or 0.0)),
       captured_at=datetime.now(timezone.utc),
   )
 
@@ -675,6 +713,8 @@ _live_state: dict[str, Any] = {
     "collection_log": [],
     "graph_payload": None,
     "graph_payload_context_id": None,
+    "live_execution_summary": None,
+    "refresh_requested_after_current": False,
 }
 
 
@@ -724,6 +764,7 @@ def status() -> JSONResponse:
       {
         "cash": live_basis["cash"],
         "krw_cash": live_basis["krw_cash"],
+        "foreign_cash_krw": live_basis["foreign_cash_krw"],
         "cash_by_currency": live_basis["cash_by_currency"],
         "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
         "base_currency": live_basis["base_currency"],
@@ -1158,6 +1199,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "and set LIVE_TRADING_ENABLED=true plus KIS_LIVE_ENABLED=true after validation."
             )
         )
+        _ensure_background_refresh()
 
       _set_operation_request(False, "started", f"{mode} started", None)
       result["request"] = _operation_mode_request_snapshot()
@@ -1198,20 +1240,44 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         result["account_checked"] = True
         result["holdings"] = len(portfolio.account.holdings)
         result["holdings_count"] = len(portfolio.account.holdings)
-        result["cash"] = portfolio.account.cash
-        result["actual_deposit"] = portfolio.account.cash
+        result["positions"] = [
+            {
+                "ticker": holding.ticker,
+                "market": holding.market,
+                "quantity": holding.quantity,
+                "average_price": holding.average_price,
+                "last_price": holding.last_price,
+                "market_value": holding.market_value,
+                "unrealized_pnl": holding.unrealized_pnl,
+                "return_rate": (
+                    holding.unrealized_pnl / (holding.quantity * holding.average_price)
+                    if holding.quantity > 0 and holding.average_price > 0
+                    else 0.0
+                ),
+                "currency": "KRW",
+            }
+            for holding in portfolio.account.holdings
+        ]
         cash_by_currency = _cash_by_currency_payload(
             getattr(portfolio.account, "cash_by_currency", None),
             portfolio.account.cash,
             getattr(portfolio.account, "base_currency", "KRW"),
         )
+        krw_cash = cash_by_currency.get("KRW", portfolio.account.cash)
+        cash_equivalent_krw = _number_or_zero(getattr(portfolio.account, "cash_equivalent_krw", None))
+        if cash_equivalent_krw <= 0:
+          cash_equivalent_krw = portfolio.account.cash
+        foreign_cash_krw = max(0.0, cash_equivalent_krw - krw_cash)
+        result["cash"] = cash_equivalent_krw
+        result["actual_deposit"] = krw_cash
         result["krw_cash"] = cash_by_currency.get("KRW", portfolio.account.cash)
+        result["foreign_cash_krw"] = foreign_cash_krw
         result["cash_by_currency"] = cash_by_currency
         result["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
         result["base_currency"] = getattr(portfolio.account, "base_currency", "KRW")
         result["invested_value"] = portfolio.account.invested_value
         result["actual_equity"] = portfolio.account.equity
-        result["cash_weight"] = portfolio.account.cash / portfolio.account.equity if portfolio.account.equity > 0 else 0.0
+        result["cash_weight"] = cash_equivalent_krw / portfolio.account.equity if portfolio.account.equity > 0 else 0.0
         result["actual_deposit_currency"] = "KRW"
       else:
         result["account_checked"] = False
@@ -1349,7 +1415,7 @@ def research_volume() -> JSONResponse:
 
 @app.get("/api/risk/principal-protection/state")
 def principal_protection_state() -> JSONResponse:
-    config = _load_principal_protection_config()
+    config = _principal_config_with_live_account_basis(_load_principal_protection_config())
     account = _principal_protection_account_snapshot(config)
     state = PrincipalProtectionEngine().compute_state(
         account,
@@ -1384,7 +1450,7 @@ async def principal_protection_preview_order(request: Request) -> JSONResponse:
     payload = await request.json()
     snapshot = _get_or_refresh_live()
     context = snapshot["context"]
-    config = _load_principal_protection_config()
+    config = _principal_config_with_live_account_basis(_load_principal_protection_config())
     ticker = str(payload.get("ticker") or (context.markets[0].ticker if context.markets else ""))
     market = next((item for item in context.markets if item.ticker == ticker), context.markets[0])
     action = OrderAction(str(payload.get("action", "BUY")).upper())
@@ -1485,6 +1551,7 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_grap
           {
               "cash": live_basis["cash"],
               "krw_cash": live_basis["krw_cash"],
+              "foreign_cash_krw": live_basis["foreign_cash_krw"],
               "cash_by_currency": live_basis["cash_by_currency"],
               "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
               "base_currency": live_basis["base_currency"],
@@ -1553,6 +1620,7 @@ def _lightweight_live_snapshot_response(snapshot: dict[str, Any] | None = None) 
         "status": {
             "cash": cash,
             "krw_cash": float(basis["krw_cash"]) if basis is not None else cash,
+            "foreign_cash_krw": float(basis["foreign_cash_krw"]) if basis is not None else 0.0,
             "cash_by_currency": basis["cash_by_currency"] if basis is not None else {"KRW": cash},
             "foreign_cash_by_currency": basis["foreign_cash_by_currency"] if basis is not None else {},
             "base_currency": basis["base_currency"] if basis is not None else "KRW",
@@ -2167,6 +2235,52 @@ def mock_trading_performance() -> JSONResponse:
     return _json(_mock_performance(context))
 
 
+@app.get("/api/live-trading/progress")
+def live_trading_progress() -> JSONResponse:
+    try:
+      connection = _kis_connection_probe(paper=False, include_account=True)
+    except Exception as exc:  # pragma: no cover - broker/network defensive boundary
+      connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
+    if connection.get("account_checked"):
+      with _live_lock:
+        _operation_mode_state["last_kis_connection"] = connection
+    basis = _account_basis_from_kis_connection(connection) or _last_live_account_basis()
+    positions = list(connection.get("positions") or [])
+    snapshot = _live_snapshot()
+    execution_summary = snapshot.get("live_execution_summary") or {}
+    active_mode = None
+    with _live_lock:
+      active = _operation_mode_state.get("active")
+      active_mode = getattr(getattr(active, "mode", None), "value", getattr(active, "mode", None))
+    equity = float(basis["equity"]) if basis is not None else 0.0
+    cash = float(basis["cash"]) if basis is not None else 0.0
+    initial = equity
+    return _json(
+        {
+            "active": active_mode == "live_trading",
+            "mode": "live_trading",
+            "account_checked": bool(connection.get("account_checked")),
+            "connection": connection,
+            "cash": cash,
+            "krw_cash": float(basis["krw_cash"]) if basis is not None else 0.0,
+            "foreign_cash_krw": float(basis.get("foreign_cash_krw") or 0.0) if basis is not None else 0.0,
+            "cash_by_currency": basis["cash_by_currency"] if basis is not None else {},
+            "foreign_cash_by_currency": basis["foreign_cash_by_currency"] if basis is not None else {},
+            "equity": equity,
+            "initial_equity": initial,
+            "profit": equity - initial,
+            "return_rate": 0.0,
+            "positions": positions,
+            "orders_count": 0,
+            "executions_count": 0,
+            "recent_executions": [],
+            "execution_summary": execution_summary,
+            "updated_at": datetime.now(timezone.utc),
+            "message": "KIS live account progress refreshed from read-only balance lookup.",
+        }
+    )
+
+
 def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
     period_minutes = int(payload.get("period_minutes") or 0)
     period_days = int(payload.get("period_days") or 0)
@@ -2516,6 +2630,7 @@ def _ensure_background_refresh() -> None:
   global _refresh_worker
   with _live_lock:
     if bool(_live_state["is_refreshing"]):
+      _live_state["refresh_requested_after_current"] = True
       return
     if _refresh_worker is not None and _refresh_worker.is_alive():
       return
@@ -2711,12 +2826,30 @@ def _refresh_live_cache() -> None:
           if active_mode == "live_trading"
           else None
       )
+      analysis_research = _analysis_research_for_current_mode(store)
+      context_research_result = research_result
+      live_broker_quote_summary: dict[str, Any] | None = None
+      if active_mode == "live_trading":
+        analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots(analysis_research)
+        context_research_result = replace(research_result, market_snapshots=())
+        analysis_research = _live_broker_only_research(analysis_research)
       context = build_analysis_context(
-          research_result,
-          _analysis_research_for_current_mode(store),
+          context_research_result,
+          analysis_research,
           account_override=live_account,
           risk_rules=live_risk_rules,
       )
+      if active_mode == "live_trading":
+        analysis_research, buy_quote_summary = _with_live_broker_quotes_for_context_intents(analysis_research, context)
+        if int(buy_quote_summary.get("quotes", 0) or 0) > 0:
+          live_broker_quote_summary = _merge_quote_summaries(live_broker_quote_summary, buy_quote_summary)
+          analysis_research = _live_broker_only_research(analysis_research)
+          context = build_analysis_context(
+              context_research_result,
+              analysis_research,
+              account_override=live_account,
+              risk_rules=live_risk_rules,
+          )
       model_paths: dict[str, str] = {}
       realtime_examples = build_realtime_supervised_examples(context.temporal_frames, context.signals)
       if learning_mode == "learning":
@@ -2743,6 +2876,7 @@ def _refresh_live_cache() -> None:
         _live_state["context_mode"] = active_mode
         _live_state["graph_payload"] = _graph_payload(context)
         _live_state["graph_payload_context_id"] = id(context)
+        _live_state["live_execution_summary"] = live_execution_summary
         _live_state["store_summary"] = store.summary()
         _live_state["stored_new_records"] = {**stored_counts, **graph_counts}
         _live_state["last_updated"] = datetime.now()
@@ -2767,6 +2901,7 @@ def _refresh_live_cache() -> None:
                 "live_feature_frames_built": int(live_feature_collection.get("built", 0) or 0),
                 "live_short_horizon_live_eligible": bool(live_model_artifact.get("live_eligible")),
                 "live_short_horizon_examples": int(live_model_artifact.get("metrics", {}).get("example_count", 0)),
+                "live_broker_quotes": int((live_broker_quote_summary or {}).get("quotes", 0) or 0),
                 "live_execution_attempted": bool(live_execution_summary and live_execution_summary.get("attempted")),
                 "live_orders_submitted": int((live_execution_summary or {}).get("submitted", 0) or 0),
             },
@@ -2792,11 +2927,189 @@ def _refresh_live_cache() -> None:
       audit.record("live_refresh_failed", {"error": str(exc), "traceback": error_traceback})
       _set_live_progress(100, "error", str(exc), active=False)
     finally:
+      start_followup_refresh = False
       with _live_lock:
         _live_state["is_refreshing"] = False
+        start_followup_refresh = bool(_live_state.get("refresh_requested_after_current")) and not bool(_live_state.get("stop"))
+        _live_state["refresh_requested_after_current"] = False
+      if start_followup_refresh:
+        with _live_lock:
+          global _refresh_worker
+          _refresh_worker = threading.Thread(target=_refresh_live_cache, name="operation-mode-refresh-followup", daemon=True)
+          _refresh_worker.start()
+
+
+def _with_live_broker_market_snapshots(stored: StoredResearch) -> tuple[StoredResearch, dict[str, Any]]:
+  markets = tuple(getattr(stored, "market_snapshots", ()) or ())
+  if not markets:
+    return stored, {"quotes": 0, "errors": [], "message": "no stored markets available for broker quote overlay"}
+  try:
+    limit = max(1, int(os.getenv("LIVE_BROKER_QUOTE_LIMIT", "80")))
+  except ValueError:
+    limit = 80
+  client = KisDevelopersApiClient(paper=False, enabled=True)
+  quoted: list[MarketSnapshot] = []
+  errors: list[dict[str, str]] = []
+  targets = _candidate_live_quote_markets(markets)
+  for market in targets[:limit]:
+    try:
+      snapshot = client.get_market_snapshot(
+          market.ticker,
+          market.market,
+          company_name=market.company_name,
+          sector=market.sector,
+      )
+    except Exception as exc:  # noqa: BLE001 - one quote failure should not stop the live refresh.
+      errors.append({"ticker": market.ticker, "market": market.market, "error": str(exc)})
+      continue
+    if snapshot.last_price > 0:
+      quoted.append(snapshot)
+  if not quoted:
+    audit.record(
+        "live_broker_quote_overlay_empty",
+        {"requested": min(limit, len(markets)), "errors": errors[:10]},
+    )
+    return stored, {"quotes": 0, "errors": errors[:10], "message": "KIS broker quote overlay did not return usable quotes"}
+  by_ticker = {market.ticker: market for market in markets}
+  for snapshot in quoted:
+    by_ticker[snapshot.ticker] = snapshot
+  merged = tuple(by_ticker.values())
+  summary = {"quotes": len(quoted), "requested": min(limit, len(markets)), "errors": errors[:10]}
+  audit.record("live_broker_quote_overlay_applied", summary)
+  return replace(stored, market_snapshots=merged), summary
+
+
+def _candidate_live_quote_markets(markets: tuple[MarketSnapshot, ...]) -> tuple[MarketSnapshot, ...]:
+  prioritized = _prioritized_live_quote_markets(markets)
+  by_ticker = {market.ticker: market for market in prioritized}
+  candidate_tickers: list[str] = []
+  try:
+    snapshots = build_lightweight_market_snapshots_from_markets(markets)
+    selection = ontology_filter_1(snapshots, target_count=max(80, min(160, len(markets))))
+    candidate_tickers.extend(selection.candidate_stocks)
+  except Exception as exc:  # noqa: BLE001 - quote overlay can still use priority fallback.
+    audit.record("live_broker_quote_candidate_selection_failed", {"error": str(exc)})
+  for ticker in ("MSFT", "AAPL", "NVDA", "QQQ", "SOXX", "SPY", "005930", "000660"):
+    candidate_tickers.append(ticker)
+  selected: list[MarketSnapshot] = []
+  seen: set[str] = set()
+  for ticker in candidate_tickers:
+    market = by_ticker.get(ticker)
+    if market is not None and ticker not in seen:
+      selected.append(market)
+      seen.add(ticker)
+  for market in prioritized:
+    if market.ticker not in seen:
+      selected.append(market)
+      seen.add(market.ticker)
+  return tuple(selected)
+
+
+def _with_live_broker_quotes_for_context_intents(stored: StoredResearch, context: Any) -> tuple[StoredResearch, dict[str, Any]]:
+  markets_by_ticker = {market.ticker: market for market in tuple(getattr(context, "markets", ()) or ())}
+  targets: list[MarketSnapshot] = []
+  seen: set[str] = set()
+  for intent in tuple(getattr(context, "intents", ()) or ()):
+    ticker = str(getattr(intent, "ticker", "") or "")
+    market = markets_by_ticker.get(ticker)
+    if market is None or ticker in seen or market.source.source_type == "broker_api":
+      continue
+    targets.append(market)
+    seen.add(ticker)
+  if not targets:
+    return stored, {"quotes": 0, "requested": 0, "errors": []}
+  updated, summary = _with_live_broker_market_snapshots_for_targets(stored, tuple(targets))
+  audit.record("live_broker_quote_intent_overlay_applied", summary)
+  return updated, summary
+
+
+def _live_broker_only_research(stored: StoredResearch) -> StoredResearch:
+  broker_markets = tuple(
+      market
+      for market in tuple(getattr(stored, "market_snapshots", ()) or ())
+      if market.source.source_type == "broker_api"
+      and market.source.trust_level >= 5
+      and market.source.quality_score >= 0.8
+      and market.source.is_realtime
+      and market.last_price > 0
+  )
+  return replace(stored, market_snapshots=broker_markets)
+
+
+def _with_live_broker_market_snapshots_for_targets(
+  stored: StoredResearch,
+  targets: tuple[MarketSnapshot, ...],
+) -> tuple[StoredResearch, dict[str, Any]]:
+  client = KisDevelopersApiClient(paper=False, enabled=True)
+  quoted: list[MarketSnapshot] = []
+  errors: list[dict[str, str]] = []
+  for market in targets:
+    try:
+      snapshot = client.get_market_snapshot(
+          market.ticker,
+          market.market,
+          company_name=market.company_name,
+          sector=market.sector,
+      )
+    except Exception as exc:  # noqa: BLE001 - one quote failure should not stop the live refresh.
+      errors.append({"ticker": market.ticker, "market": market.market, "error": str(exc)})
+      continue
+    if snapshot.last_price > 0:
+      quoted.append(snapshot)
+  if not quoted:
+    return stored, {"quotes": 0, "requested": len(targets), "errors": errors[:10]}
+  by_ticker = {market.ticker: market for market in tuple(getattr(stored, "market_snapshots", ()) or ())}
+  for snapshot in quoted:
+    by_ticker[snapshot.ticker] = snapshot
+  return replace(stored, market_snapshots=tuple(by_ticker.values())), {
+      "quotes": len(quoted),
+      "requested": len(targets),
+      "errors": errors[:10],
+  }
+
+
+def _merge_quote_summaries(base: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:
+  merged = dict(base or {})
+  merged["quotes"] = int(merged.get("quotes", 0) or 0) + int(extra.get("quotes", 0) or 0)
+  merged["requested"] = int(merged.get("requested", 0) or 0) + int(extra.get("requested", 0) or 0)
+  merged["errors"] = [*(merged.get("errors", []) or []), *(extra.get("errors", []) or [])][:10]
+  return merged
+
+
+def _prioritized_live_quote_markets(markets: tuple[MarketSnapshot, ...]) -> tuple[MarketSnapshot, ...]:
+  def priority(market: MarketSnapshot) -> tuple[int, float, str]:
+    source = market.source
+    trusted = source.source_type == "broker_api" or "kis" in source.source_name.lower()
+    reference = source.source_name == "listed_universe_reference"
+    overseas = _is_overseas_market_for_web(market)
+    return (
+        0 if trusted else 1 if overseas else 2 if not reference else 3,
+        -float(market.average_daily_trading_value or 0.0),
+        market.ticker,
+    )
+
+  deduped: dict[str, MarketSnapshot] = {}
+  for market in sorted(markets, key=priority):
+    deduped.setdefault(market.ticker, market)
+  return tuple(deduped.values())
+
+
+def _is_overseas_market_for_web(market: MarketSnapshot) -> bool:
+  market_name = str(market.market or "").upper()
+  ticker = str(market.ticker or "").upper()
+  return not (ticker.isdigit() and len(ticker) == 6) and not market_name in {"KRX", "KOSPI", "KOSDAQ", "KONEX"}
 
 
 def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
+  intents_count = len(getattr(context, "intents", ()) or ())
+  risk_results_count = len(getattr(context, "risk_results", ()) or ())
+  signals = tuple(getattr(context, "signals", ()) or ())
+  buy_signals_count = sum(1 for signal in signals if getattr(signal, "action", None) == OrderAction.BUY)
+  account = getattr(context, "account", None)
+  account_cash = float(getattr(account, "cash", 0.0) or 0.0)
+  account_cash_equivalent = float(getattr(account, "cash_equivalent_krw", 0.0) or 0.0)
+  if account_cash_equivalent <= 0:
+    account_cash_equivalent = account_cash
   approved_orders = [
       result.final_order
       for result in getattr(context, "risk_results", ()) or ()
@@ -2812,14 +3125,39 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
       "approved_orders": len(approved_orders),
       "executable_orders": len(executable_orders),
       "markets": len(getattr(context, "markets", ()) or ()),
-      "signals": len(getattr(context, "signals", ()) or ()),
-      "intents": len(getattr(context, "intents", ()) or ()),
-      "risk_results": len(getattr(context, "risk_results", ()) or ()),
-      "account_cash": float(getattr(getattr(context, "account", None), "cash", 0.0) or 0.0),
+      "signals": len(signals),
+      "buy_signals": buy_signals_count,
+      "hold_signals": max(0, len(signals) - buy_signals_count),
+      "intents": intents_count,
+      "risk_results": risk_results_count,
+      "account_cash": account_cash,
+      "account_cash_equivalent_krw": account_cash_equivalent,
       "submitted": 0,
       "blocked": [],
       "errors": [],
   }
+  runtime_snapshot = evaluate_live_runtime_gates(require_manual_arming=True)
+  summary["runtime_gate"] = {"ok": runtime_snapshot.ok, "failures": tuple(runtime_snapshot.failures)}
+  if intents_count <= 0:
+    summary["reason"] = "NO_ORDER_INTENTS"
+    summary["diagnostics"] = {
+        "signals_present": summary["signals"] > 0,
+        "buy_signals_present": buy_signals_count > 0,
+        "markets_present": summary["markets"] > 0,
+        "message": (
+            "Realtime signals were collected, but none became live order intents for the current "
+            "market/account state."
+        ),
+    }
+    audit.record("live_trading_execution_skipped", summary)
+    return summary
+  if risk_results_count <= 0:
+    summary["reason"] = "NO_RISK_RESULTS"
+    summary["diagnostics"] = {
+        "message": "Order intents were not converted into RiskManager results for live execution.",
+    }
+    audit.record("live_trading_execution_skipped", summary)
+    return summary
   if not approved_orders:
     rejections = [
         {
@@ -2830,17 +3168,19 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
         if not getattr(result, "approved", False)
     ]
     summary["rejections"] = rejections
-    audit.record("live_trading_execution_skipped", {**summary, "reason": "NO_APPROVED_FINAL_ORDERS"})
+    summary["reason"] = "NO_APPROVED_FINAL_ORDERS"
+    audit.record("live_trading_execution_skipped", summary)
     return summary
   if not executable_orders:
     summary["skipped_orders"] = [
         {"ticker": getattr(order, "ticker", ""), "market": getattr(order, "market", "")}
         for order in approved_orders
     ]
-    audit.record("live_trading_execution_skipped", {**summary, "reason": "NO_EXECUTABLE_LIVE_FINAL_ORDERS"})
+    summary["reason"] = "NO_EXECUTABLE_LIVE_FINAL_ORDERS"
+    audit.record("live_trading_execution_skipped", summary)
     return summary
 
-  runtime = evaluate_live_runtime_gates(require_manual_arming=True)
+  runtime = runtime_snapshot
   if not runtime.ok:
     summary["blocked"] = list(runtime.failures)
     audit.record("live_trading_execution_blocked", summary)
@@ -2971,6 +3311,7 @@ def _live_snapshot() -> dict[str, Any]:
       "collection_log": list(_live_state.get("collection_log") or ()),
       "graph_payload": _live_state.get("graph_payload"),
       "graph_payload_context_id": _live_state.get("graph_payload_context_id"),
+      "live_execution_summary": _live_state.get("live_execution_summary"),
     }
 
 
@@ -3933,7 +4274,7 @@ HTML = """
           <div id="ontologyTooltip"></div>
         </section>
         <section class="panel span-12"><h2>목표 대안</h2><div class="cards" id="choices"></div><div style="margin-top:14px;"><button id="startButton" disabled>선택한 목표로 시작</button> <button class="secondary" id="resetButton" type="button">초기화</button></div></section>
-        <section class="panel span-12"><h2>실시간 모의 진행</h2><div class="stats" id="mockRunStats"></div><div class="grid" style="margin-top:12px;"><div class="span-12"><h2>최근 체결 및 종료 청산</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>구분</th><th>종목</th><th>수량</th><th>가격/금액</th></tr></thead><tbody id="mockExecutions"><tr><td colspan="4">체결 내역 없음</td></tr></tbody></table></div><div style="margin-top: 12px;"><h2>스트리밍 데모 거래</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>금액</th></tr></thead><tbody id="streamingTradeList"><tr><td colspan="4">거래 없음</td></tr></tbody></table></div></div></div></div></section>
+        <section class="panel span-12"><h2 id="runProgressTitle">실시간 모의 진행</h2><div class="stats" id="mockRunStats"></div><div class="grid" style="margin-top:12px;"><div class="span-12"><h2 id="executionTableTitle">최근 체결 및 종료 청산</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>구분</th><th>종목</th><th>수량</th><th>가격/금액</th></tr></thead><tbody id="mockExecutions"><tr><td colspan="4">체결 내역 없음</td></tr></tbody></table></div><div style="margin-top: 12px;"><h2>스트리밍 데모 거래</h2><div class="table-wrap"><table class="live-table"><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>금액</th></tr></thead><tbody id="streamingTradeList"><tr><td colspan="4">거래 없음</td></tr></tbody></table></div></div></div></div></section>
         <section class="panel span-4"><h2>온톨로지 신호</h2><div class="chips" id="relations"></div></section>
         <section class="panel span-8"><h2>자료 및 프로그램 출력</h2><div class="log" id="output">아직 실행하지 않았습니다.</div></section>
       </div>
@@ -4359,6 +4700,10 @@ HTML = """
         }, 45000);
         if (data.ok === false) throw new Error(data.message || data.status || 'operation mode request failed');
         renderOperationMode(data);
+        if (mode === 'live_trading') {
+          activeOperationMode = 'live_trading';
+          loadMockPerformance().catch(() => {});
+        }
         updateLearningStopButton(data.learning);
         const started = operationStarted(data);
         renderSystemFlow({
@@ -4659,6 +5004,7 @@ HTML = """
       liveAccountBasis = {
         cash,
         krw_cash: Number((currencyMap(connection).KRW) ?? cash),
+        foreign_cash_krw: Number(connection.foreign_cash_krw || Math.max(0, cash - Number((currencyMap(connection).KRW) ?? 0))),
         cash_by_currency: currencyMap(connection),
         foreign_cash_by_currency: connection.foreign_cash_by_currency || {},
         base_currency: connection.base_currency || 'KRW',
@@ -4675,6 +5021,7 @@ HTML = """
       renderStatus({
         cash: liveAccountBasis.cash,
         krw_cash: liveAccountBasis.krw_cash,
+        foreign_cash_krw: liveAccountBasis.foreign_cash_krw,
         cash_by_currency: liveAccountBasis.cash_by_currency,
         foreign_cash_by_currency: liveAccountBasis.foreign_cash_by_currency,
         base_currency: liveAccountBasis.base_currency,
@@ -5005,6 +5352,7 @@ HTML = """
           ...(data || {}),
           cash: liveAccountBasis.cash,
           krw_cash: liveAccountBasis.krw_cash,
+          foreign_cash_krw: liveAccountBasis.foreign_cash_krw,
           cash_by_currency: liveAccountBasis.cash_by_currency,
           foreign_cash_by_currency: liveAccountBasis.foreign_cash_by_currency,
           base_currency: liveAccountBasis.base_currency,
@@ -5022,6 +5370,7 @@ HTML = """
         liveAccountBasis = {
           cash: Number(data.cash || data.equity || 0),
           krw_cash: Number(balances.KRW ?? data.cash ?? 0),
+          foreign_cash_krw: Number(data.foreign_cash_krw || Math.max(0, Number(data.cash || 0) - Number(balances.KRW || 0))),
           cash_by_currency: balances,
           foreign_cash_by_currency: data.foreign_cash_by_currency || {},
           base_currency: data.base_currency || 'KRW',
@@ -5144,16 +5493,59 @@ HTML = """
     }
 
     async function loadMockPerformance() {
-      try {
-        const data = await (await fetch('/api/mock-trading/performance')).json();
+      if (activeOperationMode === 'live_trading') {
+        const data = await (await fetch('/api/live-trading/progress')).json();
+        data.display_mode = 'live';
         renderMockPerformance(data);
+        renderMockRunTables(data);
+        return;
+      }
+      try {
+        const liveMode = activeOperationMode === 'live_trading';
+        const data = await (await fetch(liveMode ? '/api/live-trading/progress' : '/api/mock-trading/performance')).json();
+        data.display_mode = liveMode ? 'live' : 'paper';
+        renderMockPerformance(data);
+        renderMockRunTables(data);
       } catch (error) {
         document.getElementById('mockStatus').textContent = 'Paper trading 성과 대기 중';
       }
     }
 
+    function liveExecutionReasonLabel(summary) {
+      const reason = String((summary && summary.reason) || '').trim();
+      const labels = {
+        NO_ORDER_INTENTS: '주문 후보 없음',
+        NO_RISK_RESULTS: '리스크 평가 없음',
+        NO_APPROVED_FINAL_ORDERS: '승인 주문 없음',
+        NO_EXECUTABLE_LIVE_FINAL_ORDERS: '실행 가능 주문 없음',
+      };
+      return labels[reason] || (reason ? reason : '실행 평가 대기');
+    }
+
     function renderMockPerformance(data) {
       if (!data) return;
+      const isLive = data.display_mode === 'live' || data.mode === 'live_trading' || activeOperationMode === 'live_trading';
+      if (isLive) {
+        const panelTitle = document.getElementById('runProgressTitle');
+        const tableTitle = document.getElementById('executionTableTitle');
+        if (panelTitle) panelTitle.textContent = '실시간 실전 진행';
+        if (tableTitle) tableTitle.textContent = '실전 계좌 보유 및 최근 체결';
+        const percent = Number(data.return_rate || 0) * 100;
+        document.getElementById('mockReturn').textContent = `${percent.toFixed(2)}%`;
+        document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
+        document.getElementById('mockProfit').textContent = `실전 손익 ${fmtWon.format(data.profit || 0)}`;
+        document.getElementById('mockEquity').textContent = `실전 평가 ${fmtWon.format(data.equity || 0)}`;
+        document.getElementById('mockTarget').textContent = '목표 -';
+        const summary = data.execution_summary || {};
+        const executionText = `실행 ${liveExecutionReasonLabel(summary)} · 신호 ${Number(summary.signals || 0)} · BUY ${Number(summary.buy_signals || 0)} · 후보 ${Number(summary.intents || 0)} · 승인 ${Number(summary.approved_orders || 0)} · 제출 ${Number(summary.submitted || 0)}`;
+        document.getElementById('mockStatus').textContent =
+          `KIS 실계좌 기준 갱신 · 평가 ${fmtWon.format(data.equity || 0)} · 현금 ${formatCashByCurrency(data)} · ${executionText}`;
+        return;
+      }
+      const panelTitle = document.getElementById('runProgressTitle');
+      const tableTitle = document.getElementById('executionTableTitle');
+      if (panelTitle) panelTitle.textContent = '실시간 모의 진행';
+      if (tableTitle) tableTitle.textContent = '최근 체결 및 종료 청산';
       const percent = Number(data.return_rate || 0) * 100;
       document.getElementById('mockReturn').textContent = data.active ? `${percent.toFixed(2)}%` : '대기 중';
       document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
@@ -5233,12 +5625,21 @@ HTML = """
     function renderMockRunTables(data) {
       const positions = data.positions || [];
       const executions = data.recent_executions || [];
+      const isLive = data.display_mode === 'live' || data.mode === 'live_trading' || activeOperationMode === 'live_trading';
       document.getElementById('mockRunStats').innerHTML = `
         <div class="stat"><strong>${data.active ? '진행 중' : '대기'}</strong><span class="muted">모의투자 상태</span></div>
         <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
         <div class="stat"><strong>${data.executions_count || 0}</strong><span class="muted">체결</span></div>
         <div class="stat"><strong>${positions.length}</strong><span class="muted">보유 종목</span></div>
       `;
+      if (isLive) {
+        document.getElementById('mockRunStats').innerHTML = `
+          <div class="stat"><strong>${data.active ? '진행 중' : '실계좌 조회'}</strong><span class="muted">실전투자 상태</span></div>
+          <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
+          <div class="stat"><strong>${data.executions_count || 0}</strong><span class="muted">체결</span></div>
+          <div class="stat"><strong>${positions.length}</strong><span class="muted">보유 종목</span></div>
+        `;
+      }
       const positionTarget = document.getElementById('mockPositions');
       if (positionTarget) positionTarget.innerHTML = positions.length ? positions.map((item) => {
         const pnl = Number(item.unrealized_pnl || 0);
@@ -5263,6 +5664,9 @@ HTML = """
           <td>${formatMoney(item.price || 0, item.currency)}</td>
         </tr>`;
       }).join('') : '<tr><td colspan="4">체결 이력 없음</td></tr>';
+      if (isLive && !executions.length) {
+        document.getElementById('mockExecutions').innerHTML = '<tr><td colspan="4">실시간 체결 내역은 주문 추적기에 기록되면 표시됩니다.</td></tr>';
+      }
     }
 
     function renderDiagnostics(data = {}) {
@@ -6847,6 +7251,7 @@ HTML = """
     refreshLiveSnapshot();
     setInterval(() => loadOperationModeStatus().catch(() => {}), 3000);
     setInterval(refreshLiveSnapshot, 5000);
+    setInterval(() => loadMockPerformance().catch(() => {}), 3000);
   </script>
 </body>
 </html>

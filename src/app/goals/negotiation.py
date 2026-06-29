@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp
+from math import exp, expm1, isfinite, log1p
 
 from app.graph import KnowledgeGraph
 from app.portfolio import build_portfolio_report
 from app.schemas.domain import AccountSnapshot, IndicatorSnapshot, MarketSnapshot, StrategySignal
+
+
+MAX_ANNUALIZED_REQUIRED_RETURN = 1_000_000.0
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,7 @@ def assess_goal(
 
     requested_return_rate = _resolve_requested_return_rate(request, report.equity)
     requested_profit_amount = requested_return_rate * report.equity
-    annualized = (1 + requested_return_rate) ** (365 / request.period_days) - 1
+    annualized = _safe_annualized_return(requested_return_rate, request.period_days)
 
     market_support = _market_support(markets, indicators, signals)
     risk_pressure = _risk_pressure(markets, indicators, report.cash_weight)
@@ -164,9 +167,9 @@ def build_compromise_goals(assessment: FeasibilityAssessment) -> tuple[Negotiate
 
 def _resolve_requested_return_rate(request: GoalRequest, equity: float) -> float:
     if request.target_return_rate is not None and request.target_return_rate > 0:
-        return request.target_return_rate
+        return _finite_positive(request.target_return_rate)
     if request.target_profit_amount is not None and request.target_profit_amount > 0:
-        return request.target_profit_amount / equity
+        return _finite_positive(request.target_profit_amount / equity)
     raise ValueError("target_return_rate or target_profit_amount is required")
 
 
@@ -215,8 +218,26 @@ def _goal_difficulty_drag(return_rate: float, period_days: int, period_minutes: 
         trading_days = max(period_minutes / trading_day_minutes, 1.0 / trading_day_minutes)
         required_daily_return = return_rate / trading_days
         return 46.0 / (1.0 + exp(-110.0 * (required_daily_return - 0.018)))
-    annualized = (1 + return_rate) ** (365 / period_days) - 1
+    annualized = _safe_annualized_return(return_rate, period_days)
     return _annualized_drag(annualized)
+
+
+def _safe_annualized_return(return_rate: float, period_days: int) -> float:
+    if period_days <= 0:
+        raise ValueError("period_days must be positive")
+    rate = _finite_positive(return_rate)
+    annualized_log_return = log1p(rate) * (365.0 / max(1, period_days))
+    cap_log_return = log1p(MAX_ANNUALIZED_REQUIRED_RETURN)
+    if annualized_log_return >= cap_log_return:
+        return MAX_ANNUALIZED_REQUIRED_RETURN
+    return expm1(annualized_log_return)
+
+
+def _finite_positive(value: float) -> float:
+    parsed = float(value)
+    if not isfinite(parsed) or parsed <= 0:
+        raise ValueError("target return must be a positive finite number")
+    return parsed
 
 
 def _combine_feasibility(market_support_percent: float, risk_pressure_percent: float, goal_drag_percent: float) -> int:

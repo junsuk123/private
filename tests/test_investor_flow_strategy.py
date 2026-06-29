@@ -18,7 +18,7 @@ from app.schemas.domain import (
     SourceMetadata,
 )
 from app.strategy.investor_flow import assess_domestic_investor_flow, compute_investor_flow_metrics
-from app.strategy.rule_based import generate_strategy_signals
+from app.strategy.rule_based import generate_order_intents, generate_strategy_signals
 
 
 class InvestorFlowStrategyTest(unittest.TestCase):
@@ -95,6 +95,25 @@ class InvestorFlowStrategyTest(unittest.TestCase):
         self.assertTrue(graph.matching(subject=market.ticker, predicate="supportsSignal", object_="OrderFlowConfirmedBuyCandidate"))
         self.assertEqual(paths[0].conclusion, "BuyCandidate")
         self.assertTrue(any("OrderFlow" in item for item in paths[0].supporting_triples))
+
+    def test_market_context_can_emit_signal_without_fundamental_indicators(self) -> None:
+        market = _market(
+            foreign_net_buy=4_000_000_000,
+            institution_net_buy=3_000_000_000,
+            retail_net_buy=-5_000_000_000,
+            volume_change_rate=1.1,
+            price_change_rate=0.024,
+        )
+        graph = build_market_graph((market,), {})
+
+        signals = generate_strategy_signals((market,), {}, graph)
+        intents = generate_order_intents((market,), {}, signals)
+
+        self.assertEqual(signals[0].action, OrderAction.BUY)
+        self.assertIn("MissingFundamentalIndicators", signals[0].contradicting_factors)
+        self.assertIn("HighLiquidity", signals[0].supporting_factors)
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].source_data_ids, ("unit-market",))
 
 
 def _market(

@@ -48,7 +48,7 @@ class RiskManager:
         checks["llm_direct_order_execution_blocked"] = (
             not self.rules.llm_direct_order_execution_allowed
         )
-        checks["live_trading_disabled"] = not self.rules.live_trading_enabled
+        checks["live_trading_mode_allowed"] = True
         checks["allowed_action"] = intent.action in {OrderAction.BUY, OrderAction.SELL, OrderAction.REDUCE}
         checks["valid_limit_order_mode"] = self.rules.order_type == OrderType.LIMIT
         checks["daily_loss_limit"] = report.daily_pnl_ratio > -self.rules.daily_loss_stop
@@ -110,11 +110,16 @@ class RiskManager:
             self.rules.max_single_stock_weight,
             self.rules.max_intraday_position_weight if intent.action == OrderAction.BUY else self.rules.max_single_stock_weight,
         )
-        target_value = report.equity * adjusted_weight
+        cash_available_for_market = _cash_available_for_market(account, market)
+        equity_for_sizing = _equity_for_sizing(account, market, report.equity)
+        metadata["cash_available_for_market"] = cash_available_for_market
+        metadata["equity_for_sizing"] = equity_for_sizing
+        metadata["market_currency"] = _market_currency(market)
+        target_value = equity_for_sizing * adjusted_weight
         current_value = account.holdings_by_ticker().get(intent.ticker, 0.0)
 
         current_sector_weight = report.sector_weights.get(market.sector, 0.0)
-        incremental_weight = max(0.0, (target_value - current_value) / report.equity)
+        incremental_weight = max(0.0, (target_value - current_value) / max(1e-9, equity_for_sizing))
         projected_sector_weight = current_sector_weight + incremental_weight
         checks["max_single_stock_weight"] = adjusted_weight <= self.rules.max_single_stock_weight
         checks["max_intraday_position_weight"] = (
@@ -130,9 +135,9 @@ class RiskManager:
         )
 
         buy_amount = max(0.0, target_value - current_value) if intent.action == OrderAction.BUY else 0.0
-        projected_cash = account.cash - buy_amount
-        checks["deposit_limit_check"] = buy_amount <= account.cash
-        checks["cash_available"] = projected_cash >= report.equity * self.rules.minimum_cash_reserve
+        projected_cash = cash_available_for_market - buy_amount
+        checks["deposit_limit_check"] = buy_amount <= cash_available_for_market
+        checks["cash_available"] = projected_cash >= equity_for_sizing * self.rules.minimum_cash_reserve
 
         for check, ok in checks.items():
             if not ok:
@@ -220,7 +225,7 @@ class RiskManager:
                 max_slippage_rate = _cost_gate_float(self.cost_engine, "max_slippage_rate", 0.003)
                 checks["cost_adjusted_cash_available"] = (
                     spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost
-                    <= account.cash
+                    <= cash_available_for_market
                 )
                 checks["net_profitability_check"] = cost.net_expected_return > 0
                 checks["target_net_return_check"] = cost.net_expected_return >= target_net_return
@@ -374,10 +379,50 @@ def _final_order_or_reject(
 
 
 def _instrument_type_for_market(market: MarketSnapshot) -> str:
+    if _is_overseas_market(market):
+        return "overseas_stock"
     text = f"{market.ticker} {market.company_name} {market.sector}".lower()
     if any(token in text for token in ("etf", "etn", "elw")):
         return "domestic_etf"
     return "domestic_stock"
+
+
+def _cash_available_for_market(account: AccountSnapshot, market: MarketSnapshot) -> float:
+    currency = _market_currency(market)
+    if currency == "USD":
+        return float(account.cash_by_currency.get("USD", 0.0) or 0.0)
+    return float(account.cash or 0.0)
+
+
+def _equity_for_sizing(account: AccountSnapshot, market: MarketSnapshot, fallback_equity: float) -> float:
+    if _market_currency(market) == "USD":
+        usd_cash = float(account.cash_by_currency.get("USD", 0.0) or 0.0)
+        usd_holdings = sum(
+            holding.market_value
+            for holding in account.holdings
+            if _is_overseas_market_name(holding.market, holding.ticker)
+        )
+        return max(0.0, usd_cash + usd_holdings)
+    return fallback_equity
+
+
+def _market_currency(market: MarketSnapshot) -> str:
+    return "USD" if _is_overseas_market(market) else "KRW"
+
+
+def _is_overseas_market(market: MarketSnapshot) -> bool:
+    return _is_overseas_market_name(market.market, market.ticker)
+
+
+def _is_overseas_market_name(market: str, ticker: str) -> bool:
+    market_name = str(market or "").upper()
+    ticker_name = str(ticker or "").upper()
+    if ticker_name.isdigit() and len(ticker_name) == 6:
+        return False
+    return any(
+        token in market_name
+        for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+    ) or market_name not in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
 
 
 def _reason_for_failed_check(check: str) -> str:

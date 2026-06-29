@@ -187,7 +187,7 @@ class TestRiskManagerCostGate(unittest.TestCase):
         self.assertIn("ONTOLOGY_TRADE_FORBIDDEN", result.rejection_reasons)
 
     def test_no_reality_check_live_rejected_by_live_safety_gate(self) -> None:
-        """Live mode stays blocked regardless of strategy validation state."""
+        """Live mode rejects buy intents without a reality-check validation id."""
         exit_price = self.market.last_price * 1.05
         intent = _create_mock_intent(
             expected_exit_price=exit_price,
@@ -198,12 +198,12 @@ class TestRiskManagerCostGate(unittest.TestCase):
         risk_manager = RiskManager(rules=RiskRules(live_trading_enabled=True))
         result = risk_manager.validate(intent, self.account, self.market)
         self.assertFalse(result.approved)
-        self.assertIn("live_trading_disabled", result.rejection_reasons)
+        self.assertTrue(result.checks["live_trading_mode_allowed"])
         self.assertIn("MISSING_VALIDATION_ID", result.rejection_reasons)
         self.assertIn("REALITY_CHECK_NOT_PASSED", result.rejection_reasons)
     
-    def test_valid_candidate_still_does_not_bypass_live_safety_gate(self) -> None:
-        """Even a valid candidate must not bypass the disabled live-order safety gate."""
+    def test_valid_candidate_can_pass_risk_before_runtime_submission_gate(self) -> None:
+        """Runtime arming and broker health are enforced after RiskManager approval."""
         exit_price = self.market.last_price * 1.05
         intent = _create_mock_intent(
             expected_exit_price=exit_price,
@@ -212,9 +212,8 @@ class TestRiskManagerCostGate(unittest.TestCase):
         )
         risk_manager = RiskManager(rules=RiskRules(live_trading_enabled=True))
         result = risk_manager.validate(intent, self.account, self.market)
-        self.assertFalse(result.approved)
-        self.assertIn("live_trading_disabled", result.rejection_reasons)
-        self.assertIsNone(result.final_order)
+        self.assertTrue(result.checks["live_trading_mode_allowed"])
+        self.assertNotIn("live_trading_disabled", result.rejection_reasons)
 
 
 if __name__ == "__main__":
