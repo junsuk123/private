@@ -4,6 +4,8 @@ import argparse
 import json
 import socket
 import sys
+import threading
+import traceback
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,8 +42,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.skip_startup_checks:
-        startup = run_startup_checks(Path(args.research_config))
-        print(json.dumps(_to_jsonable(startup), indent=2, ensure_ascii=False, sort_keys=True))
+        _run_startup_checks_in_background(Path(args.research_config))
 
     port = args.port if args.strict_port else _find_available_port(args.host, args.port)
     if port != args.port:
@@ -49,6 +50,22 @@ def main() -> None:
 
     print(f"Web UI: http://{args.host}:{port}")
     uvicorn.run("app.web:app", host=args.host, port=port, app_dir="src", reload=False)
+
+
+def _run_startup_checks_in_background(research_config: Path) -> None:
+    def worker() -> None:
+        audit = AuditLogger(Path("logs/startup.jsonl"))
+        try:
+            startup = run_startup_checks(research_config)
+            print(json.dumps(_to_jsonable(startup), indent=2, ensure_ascii=False, sort_keys=True))
+        except Exception as exc:  # noqa: BLE001 - startup checks must not block the web server.
+            audit.record(
+                "startup_checks_failed",
+                {"error": str(exc), "traceback": traceback.format_exc()},
+            )
+            print(f"Startup checks failed in background: {str(exc) or exc.__class__.__name__}")
+
+    threading.Thread(target=worker, name="startup-checks", daemon=True).start()
 
 
 def run_startup_checks(research_config: Path) -> dict[str, Any]:

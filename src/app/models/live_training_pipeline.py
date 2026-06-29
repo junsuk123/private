@@ -13,10 +13,14 @@ from app.models.live_model_trainer import train_live_short_horizon_model
 from app.models.model_artifact_registry import ModelArtifactRegistry
 
 
+DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
+DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
+
+
 def collect_live_feature_frames_from_realtime_store(
     *,
-    db_path: str | Path = "data/store/realtime_market_data.sqlite3",
-    journal_path: str | Path = "logs/live-feature-frames.jsonl",
+    db_path: str | Path = DEFAULT_REALTIME_STORE_PATH,
+    journal_path: str | Path = DEFAULT_FEATURE_JOURNAL_PATH,
     symbols: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     db_path = Path(db_path)
@@ -38,7 +42,7 @@ def collect_live_feature_frames_from_realtime_store(
 
 def train_live_short_horizon_from_collected_features(
     *,
-    journal_path: str | Path = "logs/live-feature-frames.jsonl",
+    journal_path: str | Path = DEFAULT_FEATURE_JOURNAL_PATH,
     registry: ModelArtifactRegistry | None = None,
     minimum_examples: int = 30,
     minimum_positive_labels: int = 5,
@@ -65,6 +69,29 @@ def train_live_short_horizon_from_collected_features(
         },
     )
     return artifact
+
+
+def live_training_status(
+    *,
+    db_path: str | Path = DEFAULT_REALTIME_STORE_PATH,
+    journal_path: str | Path = DEFAULT_FEATURE_JOURNAL_PATH,
+    registry: ModelArtifactRegistry | None = None,
+) -> dict[str, Any]:
+    db_path = Path(db_path)
+    journal_path = Path(journal_path)
+    registry = registry or ModelArtifactRegistry()
+    rows = build_live_training_rows_from_feature_journal(journal_path)
+    latest_ineligible = _latest_saved_artifact(registry)
+    return {
+        "realtime_store_exists": db_path.exists(),
+        "realtime_store_path": str(db_path),
+        "feature_journal_exists": journal_path.exists(),
+        "feature_journal_path": str(journal_path),
+        "feature_frame_lines": _line_count(journal_path),
+        "training_rows": len(rows),
+        "latest_live_eligible_exists": registry.latest_path.exists(),
+        "latest_ineligible_artifact": latest_ineligible,
+    }
 
 
 def build_live_training_rows_from_feature_journal(journal_path: str | Path) -> list[dict[str, Any]]:
@@ -157,3 +184,31 @@ def _annotate_saved_artifact(artifact: dict[str, Any], registry: ModelArtifactRe
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["training_data"] = training_data
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _line_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def _latest_saved_artifact(registry: ModelArtifactRegistry) -> dict[str, Any] | None:
+    candidates = sorted(
+        (path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        return None
+    try:
+        payload = json.loads(candidates[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"path": str(candidates[0]), "readable": False}
+    return {
+        "artifact_id": str(payload.get("artifact_id") or candidates[0].stem),
+        "path": str(candidates[0]),
+        "live_eligible": bool(payload.get("live_eligible")),
+        "reason_codes": tuple(str(item) for item in payload.get("reason_codes") or ()),
+        "example_count": int(float((payload.get("metrics") or {}).get("example_count") or 0)),
+        "training_rows": int((payload.get("training_data") or {}).get("row_count") or 0),
+    }

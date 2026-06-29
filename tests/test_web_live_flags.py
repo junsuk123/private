@@ -54,6 +54,15 @@ class WebLiveFlagsTest(unittest.TestCase):
             patch("app.web.validate_live_secret_file", return_value={"app_key": True, "app_secret": True, "account_no": True}),
             patch("app.web.evaluate_live_runtime_gates", return_value=type("Gate", (), {"ok": True, "failures": ()})()),
             patch("app.web.ModelArtifactRegistry") as registry_cls,
+            patch(
+                "app.web.live_training_status",
+                return_value={
+                    "training_rows": 0,
+                    "feature_frame_lines": 0,
+                    "realtime_store_exists": False,
+                    "latest_ineligible_artifact": None,
+                },
+            ),
         ):
             registry_cls.return_value.load_latest_live_eligible.side_effect = RuntimeError(
                 "NO_LIVE_ELIGIBLE_MODEL_ARTIFACT"
@@ -62,7 +71,9 @@ class WebLiveFlagsTest(unittest.TestCase):
             readiness = web_module._web_live_readiness_summary()
 
         self.assertFalse(readiness["ok"])
-        self.assertEqual(readiness["failures"]["live_eligible_model"], "NO_LIVE_ELIGIBLE_MODEL_ARTIFACT")
+        self.assertIn("NO_LIVE_ELIGIBLE_MODEL_ARTIFACT", readiness["failures"]["live_eligible_model"])
+        self.assertIn("training_rows=0", readiness["failures"]["live_eligible_model"])
+        self.assertIn("realtime_store=missing", readiness["failures"]["live_eligible_model"])
 
     def test_homepage_inline_script_is_valid_javascript(self) -> None:
         if shutil.which("node") is None:

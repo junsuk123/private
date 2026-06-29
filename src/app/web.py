@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import inspect
 import json
@@ -23,7 +24,9 @@ from starlette import routing as starlette_routing
 
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
+from app.data.kis_realtime import run_kis_realtime_websocket_collector
 from app.data.llm_classifier import event_llm_runtime_status
+from app.data.realtime_store import RealtimeMarketDataStore
 from app.execution import KisApiError, KisDevelopersApiClient, MockKisDevelopersApi, PaperOrderExecutor
 from app.execution.kis_auth import build_kis_client, run_kis_health_check, validate_live_secret_file
 from app.graph import KnowledgeGraph, get_ontology_runtime
@@ -33,6 +36,7 @@ from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.models.live_training_pipeline import (
     collect_live_feature_frames_from_realtime_store,
+    live_training_status,
     train_live_short_horizon_from_collected_features,
 )
 from app.pipeline import build_analysis_context
@@ -150,6 +154,7 @@ LEARNING_COLLECTION_INTERVAL_SECONDS = max(
 )
 AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "true").lower() not in {"0", "false", "no", "off"}
 AUTO_START_LIVE_READINESS = os.getenv("AUTO_START_LIVE_READINESS", "true").lower() not in {"0", "false", "no", "off"}
+AUTO_START_KIS_REALTIME_COLLECTOR = os.getenv("AUTO_START_KIS_REALTIME_COLLECTOR", "true").lower() not in {"0", "false", "no", "off"}
 _auto_live_readiness_started = False
 
 
@@ -161,6 +166,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 _live_lock = threading.Lock()
 _refresh_guard = threading.Lock()
+_kis_realtime_collector_stop = threading.Event()
 _mock_kis_lock = threading.Lock()
 _mock_kis: MockKisDevelopersApi | None = None
 _mock_trading_state: dict[str, Any] = {
@@ -590,6 +596,7 @@ def _start_streaming_demo(
 
 _live_worker: threading.Thread | None = None
 _refresh_worker: threading.Thread | None = None
+_kis_realtime_collector_worker: threading.Thread | None = None
 _live_state: dict[str, Any] = {
     "context": None,
     "research_result": None,
@@ -639,6 +646,8 @@ def _clear_live_analysis_cache_unlocked() -> None:
 @app.on_event("startup")
 def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
+    if AUTO_START_KIS_REALTIME_COLLECTOR:
+      _start_kis_realtime_collector()
     if AUTO_START_LIVE_WORKER:
       _start_live_worker("learning")
     if AUTO_START_LIVE_READINESS:
@@ -647,6 +656,7 @@ def _startup_live_worker() -> None:
 
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
+    _stop_kis_realtime_collector()
     _stop_live_worker()
 
 
@@ -919,7 +929,7 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
           else f"FEATURE_SCHEMA_MISMATCH expected={LIVE_SHORT_HORIZON_SCHEMA.schema_hash} actual={artifact.feature_schema_hash}",
       )
     except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
-      record("live_eligible_model", False, str(exc) or exc.__class__.__name__)
+      record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
     secrets = validate_live_secret_file()
     record("kis_secret_file", all(secrets.values()), "missing KIS secret file or required keys")
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
@@ -934,6 +944,32 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
     else:
       record("kis_health_deferred", True)
     return {"ok": not failures, "gates": gates, "failures": failures}
+
+
+def _live_model_readiness_failure_message(exc: Exception) -> str:
+  base = str(exc) or exc.__class__.__name__
+  if base not in {"NO_LIVE_ELIGIBLE_MODEL_ARTIFACT", "LATEST_MODEL_NOT_LIVE_ELIGIBLE"}:
+    return base
+  try:
+    status = live_training_status()
+  except Exception:  # noqa: BLE001 - readiness must not fail because diagnostics failed.
+    return base
+  detail = [
+      base,
+      f"training_rows={int(status.get('training_rows') or 0)}",
+      f"feature_frames={int(status.get('feature_frame_lines') or 0)}",
+      f"realtime_store={'present' if status.get('realtime_store_exists') else 'missing'}",
+  ]
+  artifact = status.get("latest_ineligible_artifact")
+  if isinstance(artifact, dict) and artifact:
+    reasons = ",".join(str(item) for item in artifact.get("reason_codes") or ())
+    examples = int(artifact.get("example_count") or 0)
+    detail.append(f"latest_ineligible={artifact.get('artifact_id')} examples={examples}")
+    if reasons:
+      detail.append(f"reasons={reasons}")
+  else:
+    detail.append("latest_ineligible=none")
+  return " ".join(detail)
 
 
 @app.post("/api/operation-mode/start")
@@ -2400,6 +2436,96 @@ def _ensure_background_refresh() -> None:
       return
     _refresh_worker = threading.Thread(target=_refresh_live_cache, name="operation-mode-refresh", daemon=True)
     _refresh_worker.start()
+
+
+def _start_kis_realtime_collector() -> None:
+  global _kis_realtime_collector_worker
+  with _live_lock:
+    if _kis_realtime_collector_worker is not None and _kis_realtime_collector_worker.is_alive():
+      return
+    _kis_realtime_collector_stop.clear()
+    _append_collection_log_unlocked(
+        "scheduled",
+        "KIS realtime tick and orderbook collector is starting in parallel",
+    )
+    _kis_realtime_collector_worker = threading.Thread(
+        target=_kis_realtime_collector_loop,
+        name="kis-realtime-collector",
+        daemon=True,
+    )
+    _kis_realtime_collector_worker.start()
+
+
+def _stop_kis_realtime_collector() -> None:
+  worker: threading.Thread | None
+  _kis_realtime_collector_stop.set()
+  with _live_lock:
+    worker = _kis_realtime_collector_worker
+    _append_collection_log_unlocked("stopped", "KIS realtime collector stopped")
+  if worker is not None:
+    worker.join(timeout=2.0)
+
+
+def _kis_realtime_collector_loop() -> None:
+  symbols = _load_realtime_collection_symbols()
+  if not symbols:
+    with _live_lock:
+      _append_collection_log_unlocked("error", "KIS realtime collector has no symbols configured")
+    return
+  while not _kis_realtime_collector_stop.is_set():
+    try:
+      counts = asyncio.run(
+          run_kis_realtime_websocket_collector(
+              symbols=symbols,
+              store=RealtimeMarketDataStore(),
+              stop_event=_kis_realtime_collector_stop,
+          )
+      )
+      with _live_lock:
+        _append_collection_log_unlocked(
+            "complete",
+            "KIS realtime collector ended",
+            counts=counts,
+        )
+      if not _kis_realtime_collector_stop.is_set():
+        time.sleep(2.0)
+    except Exception as exc:  # noqa: BLE001 - keep app startup alive and surface collector failures.
+      with _live_lock:
+        _append_collection_log_unlocked(
+            "error",
+            f"KIS realtime collector failed: {str(exc) or exc.__class__.__name__}",
+        )
+      if _kis_realtime_collector_stop.wait(30.0):
+        return
+
+
+def _load_realtime_collection_symbols(path: str | Path = "config/realtime_market_data.json") -> tuple[str, ...]:
+  config_path = Path(path)
+  fallback_path = Path("config/realtime_market_data.example.json")
+  data: dict[str, Any] = {}
+  for candidate in (config_path, fallback_path):
+    if not candidate.exists():
+      continue
+    try:
+      loaded = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+      continue
+    if isinstance(loaded, dict):
+      data = loaded
+      break
+  symbols = data.get("symbols") or os.getenv("KIS_REALTIME_SYMBOLS", "").split(",")
+  normalized: list[str] = []
+  for item in symbols if isinstance(symbols, list) else []:
+    text = str(item).strip()
+    if not text:
+      continue
+    normalized.append(text.zfill(6) if text.isdigit() else text)
+  if not normalized:
+    for item in os.getenv("KIS_REALTIME_SYMBOLS", "").split(","):
+      text = item.strip()
+      if text:
+        normalized.append(text.zfill(6) if text.isdigit() else text)
+  return tuple(dict.fromkeys(normalized))
 
 
 def _start_live_worker(learning_mode: str | None = None) -> None:

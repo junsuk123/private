@@ -19,16 +19,17 @@ def evaluate_market_data_health(
     tick = store.latest_tick(symbol)
     orderbook = store.latest_orderbook(symbol)
     reasons: list[str] = []
-    quote_count = 1 if tick is not None else 0
+    quote_source = tick or orderbook
+    quote_count = 1 if quote_source is not None else 0
     orderbook_count = 1 if orderbook is not None else 0
 
-    if tick is None:
+    if quote_source is None:
         reasons.append("QUOTE_COUNT_ZERO")
     else:
-        age_ms = max(0.0, (now - tick.received_at).total_seconds() * 1000)
+        age_ms = max(0.0, (now - quote_source.received_at).total_seconds() * 1000)
         if age_ms > max_quote_age_ms:
             reasons.append("QUOTE_STALE")
-        if tick.source != KIS_REALTIME_SOURCE:
+        if quote_source.source != KIS_REALTIME_SOURCE:
             reasons.append("QUOTE_SOURCE_NOT_KIS_REALTIME")
 
     if orderbook is None:
@@ -49,7 +50,7 @@ def evaluate_market_data_health(
         checked_at=now,
         quote_count=quote_count,
         orderbook_count=orderbook_count,
-        latest_tick_at=tick.received_at if tick else None,
+        latest_tick_at=quote_source.received_at if quote_source else None,
         latest_orderbook_at=orderbook.received_at if orderbook else None,
         max_quote_age_ms=max_quote_age_ms,
         max_orderbook_age_ms=max_orderbook_age_ms,

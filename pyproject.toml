@@ -10,7 +10,8 @@ dependencies = [
   "PyYAML",
   "starlette>=0.40.0,<0.47.0",
   "tzdata",
-  "uvicorn"
+  "uvicorn",
+  "websockets"
 ]
 
 [project.optional-dependencies]

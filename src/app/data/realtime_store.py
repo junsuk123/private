@@ -236,7 +236,7 @@ class RealtimeMarketDataStore:
                        trade_direction, sequence_key, raw_checksum, latency_ms
                 from realtime_ticks
                 where symbol = ?
-                order by exchange_timestamp desc, received_at desc
+                order by received_at desc, exchange_timestamp desc
                 limit 1
                 """,
                 (symbol,),
@@ -264,7 +264,7 @@ class RealtimeMarketDataStore:
                        sequence_key, raw_checksum, latency_ms
                 from realtime_orderbook
                 where symbol = ?
-                order by exchange_timestamp desc, received_at desc
+                order by received_at desc, exchange_timestamp desc
                 limit 1
                 """,
                 (symbol,),
@@ -309,6 +309,34 @@ class RealtimeMarketDataStore:
                 sequence_key=row[7],
                 raw_checksum=row[8],
                 latency_ms=float(row[9]),
+            )
+            for row in rows
+        )
+
+    def recent_orderbooks(self, symbol: str, since: datetime) -> tuple[RealtimeOrderbookSnapshot, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                select symbol, exchange_timestamp, received_at, source, levels_json,
+                       sequence_key, raw_checksum, latency_ms
+                from realtime_orderbook
+                where symbol = ? and exchange_timestamp >= ?
+                order by exchange_timestamp asc
+                """,
+                (symbol, since.isoformat()),
+            ).fetchall()
+        from app.data.realtime_types import OrderbookLevel
+
+        return tuple(
+            RealtimeOrderbookSnapshot(
+                symbol=row[0],
+                exchange_timestamp=_parse_dt(row[1]),
+                received_at=_parse_dt(row[2]),
+                source=row[3],
+                levels=tuple(OrderbookLevel(**item) for item in json.loads(row[4])),
+                sequence_key=row[5],
+                raw_checksum=row[6],
+                latency_ms=float(row[7]),
             )
             for row in rows
         )

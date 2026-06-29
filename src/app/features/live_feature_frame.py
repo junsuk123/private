@@ -71,10 +71,28 @@ class LiveFeatureFrameBuilder:
         since = decision_time - timedelta(minutes=3)
         ticks = tuple(tick for tick in self.store.recent_ticks(symbol, since) if tick.exchange_timestamp <= decision_time)
         orderbook = self.store.latest_orderbook(symbol)
-        if not ticks or orderbook is None:
+        orderbooks = tuple(
+            book
+            for book in self.store.recent_orderbooks(symbol, since)
+            if book.exchange_timestamp <= decision_time
+        )
+        if orderbook is None:
             raise FeatureFrameError("MISSING_SOURCE_RECORDS")
-        prices = [tick.price for tick in ticks]
-        volumes = [max(0, tick.volume) for tick in ticks]
+        if ticks:
+            prices = [tick.price for tick in ticks]
+            volumes = [max(0, tick.volume) for tick in ticks]
+            source_record_ids = tuple(tick.record_id for tick in ticks)
+            latest_source_received_at = ticks[-1].received_at
+        elif orderbooks:
+            valid_books = tuple(book for book in orderbooks if book.best_bid > 0 and book.best_ask > 0)
+            prices = [(book.best_bid + book.best_ask) / 2 for book in valid_books]
+            volumes = [max(0, book.total_bid_volume + book.total_ask_volume) for book in valid_books]
+            source_record_ids = tuple(book.record_id for book in valid_books)
+            latest_source_received_at = valid_books[-1].received_at if valid_books else orderbook.received_at
+        else:
+            raise FeatureFrameError("MISSING_SOURCE_RECORDS")
+        if not prices:
+            raise FeatureFrameError("MISSING_SOURCE_RECORDS")
         total_volume = sum(volumes)
         vwap = (
             sum(price * volume for price, volume in zip(prices, volumes, strict=True)) / total_volume
@@ -105,11 +123,11 @@ class LiveFeatureFrameBuilder:
         provenance = FeatureProvenance(
             symbol=symbol,
             decision_time=decision_time,
-            tick_record_ids=tuple(tick.record_id for tick in ticks),
+            tick_record_ids=source_record_ids,
             orderbook_record_id=orderbook.record_id,
             source="kis_realtime_websocket",
             max_input_age_ms=max(
-                (decision_time - ticks[-1].received_at).total_seconds() * 1000,
+                (decision_time - latest_source_received_at).total_seconds() * 1000,
                 (decision_time - orderbook.received_at).total_seconds() * 1000,
             ),
         )

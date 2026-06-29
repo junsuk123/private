@@ -26,6 +26,16 @@ class LiveFeatureFrameTest(unittest.TestCase):
         self.assertEqual(len(frame.values), len(LIVE_SHORT_HORIZON_SCHEMA.feature_names))
         self.assertGreater(len(frame.provenance.source_record_ids), 0)
 
+    def test_feature_frame_can_use_kis_orderbook_when_trade_ticks_are_sparse(self) -> None:
+        now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            _seed_orderbooks_only(store, now)
+            frame = LiveFeatureFrameBuilder(store, journal_path=Path(tmp) / "features.jsonl").build("005930", decision_time=now)
+
+        self.assertEqual(frame.feature_schema_hash, LIVE_SHORT_HORIZON_SCHEMA.schema_hash)
+        self.assertGreater(len(frame.provenance.source_record_ids), 0)
+
 
 def _seed(store: RealtimeMarketDataStore, now: datetime) -> None:
     ticks = tuple(
@@ -53,6 +63,21 @@ def _seed(store: RealtimeMarketDataStore, now: datetime) -> None:
             ),
         )
     )
+
+
+def _seed_orderbooks_only(store: RealtimeMarketDataStore, now: datetime) -> None:
+    books = tuple(
+        RealtimeOrderbookSnapshot(
+            symbol="005930",
+            exchange_timestamp=now - timedelta(seconds=120 - i * 10),
+            received_at=now - timedelta(seconds=120 - i * 10),
+            source=KIS_REALTIME_SOURCE,
+            levels=(OrderbookLevel(70000 + i * 10, 1000 + i, 70100 + i * 10, 900 + i),),
+            sequence_key=f"book:{i}",
+        )
+        for i in range(13)
+    )
+    store.save_orderbooks(books)
 
 
 if __name__ == "__main__":

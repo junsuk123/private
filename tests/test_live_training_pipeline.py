@@ -15,6 +15,7 @@ from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.live_training_pipeline import (
     build_live_training_rows_from_feature_journal,
     collect_live_feature_frames_from_realtime_store,
+    live_training_status,
     train_live_short_horizon_from_collected_features,
 )
 from app.models.model_artifact_registry import ModelArtifactRegistry
@@ -75,6 +76,18 @@ class LiveTrainingPipelineTest(unittest.TestCase):
 
             self.assertEqual(result["built"], 1)
             self.assertTrue(journal.exists())
+
+    def test_status_explains_missing_live_training_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            status = live_training_status(
+                db_path=Path(tmp) / "missing.sqlite3",
+                journal_path=Path(tmp) / "missing.jsonl",
+                registry=ModelArtifactRegistry(Path(tmp) / "models"),
+            )
+
+        self.assertFalse(status["realtime_store_exists"])
+        self.assertEqual(status["training_rows"], 0)
+        self.assertEqual(status["feature_frame_lines"], 0)
 
 
 def _write_frames(path: Path, *, count: int) -> None:
