@@ -229,6 +229,9 @@ class StreamingDemoTimingTest(unittest.TestCase):
             self.assertEqual(early_step["status"], "waiting")
             self.assertEqual(early_step["progress"], 0.0)
             self.assertGreater(early_step["retry_after_seconds"], 50)
+            self.assertIn("account", early_step)
+            self.assertEqual(early_step["account"]["cash"], 10_000_000)
+            self.assertEqual(early_step["account"]["account_value"], 10_000_000)
 
             _streaming_demos[demo_id]._started_at_monotonic -= 60
             due_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()

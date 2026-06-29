@@ -26,7 +26,7 @@ from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.llm_classifier import event_llm_runtime_status
 from app.execution import KisApiError, KisDevelopersApiClient, MockKisDevelopersApi, PaperOrderExecutor
 from app.execution.kis_auth import build_kis_client, run_kis_health_check, validate_live_secret_file
-from app.graph import get_ontology_runtime
+from app.graph import KnowledgeGraph, get_ontology_runtime
 from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise_goals
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
@@ -860,23 +860,25 @@ async def live_flags_apply(request: Request) -> JSONResponse:
 
 
 def _live_flags_status_payload(applied: bool = False) -> dict[str, Any]:
-    readiness = _web_live_readiness_summary()
+    readiness = _web_live_readiness_summary(include_kis_health=False)
+    live_ready = bool(readiness["ok"])
     return {
-        "ok": readiness["ok"],
+        "ok": True,
         "applied": applied,
+        "live_ready": live_ready,
         "flags": {key: os.getenv(key) for key in LIVE_FLAG_VALUES},
         "manual_arming_required": True,
         "orders_submitted": False,
         "readiness": readiness,
         "message": (
-            "Live flags are set, but orders still require readiness success and manual arming."
-            if readiness["ok"]
-            else "Live flags can be set, but live orders remain blocked by failed readiness gates."
+            "Live flags are active. Orders still require readiness success and manual arming."
+            if live_ready
+            else "Live flags are active. Live orders remain safely blocked until readiness gates pass."
         ),
     }
 
 
-def _web_live_readiness_summary() -> dict[str, Any]:
+def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str, Any]:
     gates: dict[str, bool] = {}
     failures: dict[str, str] = {}
 
@@ -905,19 +907,22 @@ def _web_live_readiness_summary() -> dict[str, Any]:
     record("kis_secret_file", all(secrets.values()), "missing KIS secret file or required keys")
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
     record("live_flags", runtime.ok, ",".join(runtime.failures) if runtime.failures else None)
-    try:
-      client = build_kis_client(enabled=True)
-      health = run_kis_health_check(client, include_account=True, include_websocket=True)
-      record("kis_health", health.ok, ",".join(f"{key}:{value}" for key, value in health.failures.items()))
-    except Exception as exc:  # noqa: BLE001 - never throw secrets or raw credential state to UI.
-      record("kis_health", False, exc.__class__.__name__)
+    if include_kis_health:
+      try:
+        client = build_kis_client(enabled=True)
+        health = run_kis_health_check(client, include_account=True, include_websocket=True)
+        record("kis_health", health.ok, ",".join(f"{key}:{value}" for key, value in health.failures.items()))
+      except Exception as exc:  # noqa: BLE001 - never throw secrets or raw credential state to UI.
+        record("kis_health", False, exc.__class__.__name__)
+    else:
+      record("kis_health_deferred", True)
     return {"ok": not failures, "gates": gates, "failures": failures}
 
 
 @app.post("/api/operation-mode/start")
 async def operation_mode_start(request: Request) -> JSONResponse:
     payload = await request.json()
-    return _json(_operation_mode_start_response(payload))
+    return _json(await run_in_threadpool(_operation_mode_start_response, payload))
 
 
 def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1455,24 +1460,41 @@ def _lightweight_data_volume(summary: dict[str, Any]) -> dict[str, Any]:
 @app.post("/api/assess-goal")
 async def assess_goal_api(request: Request) -> JSONResponse:
     payload = await request.json()
+    return _json(await run_in_threadpool(_assess_goal_response, payload))
+
+
+def _assess_goal_response(payload: dict[str, Any]) -> dict[str, Any]:
     goal_request = _parse_goal_request(payload)
     snapshot = _live_snapshot()
     context = snapshot.get("context")
     if context is None:
-      context = _get_or_refresh_live()["context"]
-    assessment = assess_goal(
-        goal_request,
-        _goal_account_snapshot(context),
-        context.markets,
-        context.indicators,
-        context.signals,
-        context.graph,
-    )
+      basis = _last_live_account_basis()
+      account = AccountSnapshot(
+          cash=max(1.0, float(basis["equity"])) if basis is not None else 10_000_000.0,
+          holdings=(),
+      )
+      assessment = assess_goal(goal_request, account, (), {}, (), KnowledgeGraph())
+      provisional = True
+    else:
+      assessment = assess_goal(
+          goal_request,
+          _goal_account_snapshot(context),
+          context.markets,
+          context.indicators,
+          context.signals,
+          context.graph,
+      )
+      provisional = False
     compromises = build_compromise_goals(assessment)
     session_id = str(uuid4())
     sessions[session_id] = {"assessment": assessment, "compromises": compromises, "started": False}
     audit.record("goal_assessment", {"session_id": session_id, "assessment": assessment})
-    return _json({"session_id": session_id, "assessment": assessment, "compromises": compromises})
+    return {
+        "session_id": session_id,
+        "assessment": assessment,
+        "compromises": compromises,
+        "provisional": provisional,
+    }
 
 
 @app.post("/api/start")
@@ -1649,6 +1671,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
             "demo_id": demo_id,
             "status": "busy",
             "progress": demo.get_progress() if demo is not None else 0.0,
+            "account": _streaming_demo_account_payload(demo),
             "message": "Paper trading step is already running.",
             "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
         }
@@ -1661,6 +1684,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "demo_id": demo_id,
                 "status": "waiting",
                 "progress": demo.get_progress(),
+                "account": _streaming_demo_account_payload(demo),
                 "seconds_until_next_step": round(wait_seconds, 1),
                 "retry_after_seconds": round(wait_seconds, 1),
                 "message": "Waiting for the next one-minute paper trading bar.",
@@ -1675,6 +1699,7 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
                 "progress": 100.0,
                 "message": "Paper trading completed.",
                 "final_results": demo.get_final_results(),
+                "account": _streaming_demo_account_payload(demo),
                 "ontology_filter_1": _candidate_selection_payload(candidate_selection),
                 "step_latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
             }
@@ -1724,6 +1749,24 @@ def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
         }
     finally:
         step_lock.release()
+
+
+def _streaming_demo_account_payload(demo: Any | None) -> dict[str, Any] | None:
+    if demo is None:
+        return None
+    cash = float(getattr(demo, "_cash", 0.0) or 0.0)
+    initial_cash = max(1.0, float(getattr(demo, "initial_cash", 1.0) or 1.0))
+    cash_by_currency = dict(getattr(demo, "_cash_by_currency", {}) or {})
+    account_value = cash
+    return {
+        "cash": round(cash, 2),
+        "account_value": round(account_value, 2),
+        "return_rate": round((account_value - initial_cash) / initial_cash, 6),
+        "base_currency": "KRW",
+        "cash_by_currency": {str(key): round(float(value), 2) for key, value in sorted(cash_by_currency.items())},
+        "account_value_krw": round(account_value, 2),
+        "usd_krw_rate": 0.0,
+    }
 
 
 def _candidate_selection_payload(selection: Any | None) -> dict[str, Any] | None:
@@ -3557,6 +3600,22 @@ HTML = """
     function startsStreamingLoop(mode, data) {
       return isPaperTradingMode(mode) && data && data.demo_id;
     }
+
+    function stopStreamingDemoLoop(message = '') {
+      if (streamingDemoTimer) {
+        window.clearTimeout(streamingDemoTimer);
+        streamingDemoTimer = null;
+      }
+      streamingDemoRunning = false;
+      streamingStepBusy = false;
+      streamingDemoId = null;
+      if (message) {
+        const statusNode = document.getElementById('streamingDemoStatus');
+        const mockNode = document.getElementById('mockStatus');
+        if (statusNode) statusNode.textContent = message;
+        if (mockNode) mockNode.textContent = message;
+      }
+    }
     async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 20000) {
       if (!timeoutMs || timeoutMs <= 0) {
         const response = await fetch(url, options);
@@ -3590,15 +3649,19 @@ HTML = """
     function renderLiveFlagResult(data) {
       const failures = data && data.readiness && data.readiness.failures ? data.readiness.failures : {};
       const failureText = Object.entries(failures).map(([key, value]) => `${key}: ${value}`).join('\\n');
-      document.getElementById('operationModeStatus').textContent = data.ok
+      const liveReady = Boolean(data.live_ready);
+      document.getElementById('operationModeStatus').textContent = liveReady
         ? 'Live flags applied | readiness gates passed; manual arming is still required.'
-        : 'Live flags applied | live orders remain blocked by readiness gates.';
+        : 'Live flags applied | waiting for readiness gates.';
       document.getElementById('runtimeStatus').textContent = data.message || 'Live flag state updated.';
-      document.getElementById('gate').textContent = data.ok
+      document.getElementById('gate').textContent = liveReady
         ? 'Live flags are active. Orders still require manual arming and FinalOrder approval.'
-        : 'Live flags are active, but failed readiness gates continue to block orders.';
+        : 'Live flags are active. Live orders remain safely blocked until readiness checks pass.';
       document.getElementById('output').textContent = JSON.stringify(data, null, 2);
-      if (failureText) renderSystemFlow({ mode: 'error' }, { mode: failureText.split('\\n')[0] });
+      renderSystemFlow(
+        { mode: liveReady ? 'done' : 'active' },
+        { mode: liveReady ? 'Live flags active' : `Readiness pending${failureText ? `: ${failureText.split('\\n')[0]}` : ''}` }
+      );
     }
 
     async function applyLiveFlags() {
@@ -3630,6 +3693,9 @@ HTML = """
       if (operationRequestActive) {
         document.getElementById('runtimeStatus').textContent = 'Another operation request is already running.';
         return;
+      }
+      if (!isPaperTradingMode(mode)) {
+        stopStreamingDemoLoop(`${modeLabel(mode)} requested; paper trading loop stopped.`);
       }
       operationRequestActive = true;
       renderSystemFlow({
@@ -3683,6 +3749,9 @@ HTML = """
             progress: 0,
             account: { cash: streamingInitialCash, account_value: streamingInitialCash, return_rate: 0 },
             status: 'running',
+          });
+          updateStreamingAccount({
+            account: { cash: streamingInitialCash, account_value: streamingInitialCash, return_rate: 0, base_currency: 'KRW', cash_by_currency: { KRW: streamingInitialCash } },
           });
           drawStreamingReturnChart();
           autoRunStreamingDemo(true);
@@ -3989,9 +4058,12 @@ HTML = """
       setBusy(true);
       try {
         lastGoalPayload = payload;
-        const res = await fetch('/api/assess-goal', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        if (!res.ok) throw new Error(await res.text());
-        renderAssessment(await res.json());
+        const data = await fetchJsonWithTimeout('/api/assess-goal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }, 45000);
+        renderAssessment(data);
         setWorkStatus('Assessment complete', 'Goal feasibility and alternatives were calculated.', 100, true);
       } catch (error) {
         document.getElementById('output').textContent = String(error && error.message ? error.message : error);
@@ -5938,13 +6010,14 @@ HTML = """
       if (!streamingDemoId || !streamingDemoRunning) return;
       if (streamingStepBusy) return { status: 'busy', progress: 0 };
       streamingStepBusy = true;
+      const requestedDemoId = streamingDemoId;
       try {
         document.getElementById('streamingDemoStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
         document.getElementById('mockStatus').textContent = '모의투자 종목 스캔 및 매매 판단 중...';
         const response = await fetchWithOptionalTimeout('/api/paper-trading/step', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ demo_id: streamingDemoId }),
+          body: JSON.stringify({ demo_id: requestedDemoId }),
         }, 120000);
         if (!response.ok) {
           streamingStepFailures += 1;
@@ -5962,7 +6035,11 @@ HTML = """
           return { status: 'stopped', progress: 0 };
         }
         const data = await response.json();
+        if (!streamingDemoRunning || requestedDemoId !== streamingDemoId) {
+          return { status: 'stale', progress: 0 };
+        }
         streamingStepFailures = 0;
+        updateStreamingAccount(data);
         if (data.status === 'waiting') {
           const remaining = Number(data.seconds_until_next_step || 0);
           const message = `모의투자 대기 중 · 다음 1분 bar까지 ${remaining.toFixed(1)}초`;
@@ -5985,13 +6062,6 @@ HTML = """
         document.getElementById('streamingDemoStatus').textContent =
           `모의투자 ${data.step || '완료'}분 진행 · 전체 ${data.universe_scanned_count || data.universe_count || '-'}개 스캔 · 후보 ${data.candidate_ticker_count || data.active_ticker_count || '-'}개 · ${(data.progress || 0).toFixed(1)}%`;
         if (data.account) {
-          const cash = data.account.cash;
-          const invested = data.account.account_value - data.account.cash;
-          const profit = data.account.account_value - streamingInitialCash;
-          document.getElementById('streamingDeposit').textContent = formatCashByCurrency(data.account);
-          document.getElementById('streamingInvested').textContent = fmtWon.format(invested);
-          document.getElementById('streamingProfit').textContent = fmtWon.format(profit);
-          document.getElementById('streamingReturnRate').textContent = (data.account.return_rate * 100).toFixed(2) + '%';
           renderStreamingPerformance(data);
           loadPrincipalProtectionState().catch(() => {});
         }
@@ -6022,6 +6092,18 @@ HTML = """
       } finally {
         streamingStepBusy = false;
       }
+    }
+
+    function updateStreamingAccount(data) {
+      if (!data || !data.account) return;
+      const cash = Number(data.account.cash || 0);
+      const accountValue = Number(data.account.account_value || cash);
+      const invested = Math.max(0, accountValue - cash);
+      const profit = accountValue - streamingInitialCash;
+      document.getElementById('streamingDeposit').textContent = formatCashByCurrency(data.account);
+      document.getElementById('streamingInvested').textContent = fmtWon.format(invested);
+      document.getElementById('streamingProfit').textContent = fmtWon.format(profit);
+      document.getElementById('streamingReturnRate').textContent = (Number(data.account.return_rate || 0) * 100).toFixed(2) + '%';
     }
 
     async function autoRunStreamingDemo(isFirstTick = false) {

@@ -39,7 +39,8 @@ class WebLiveFlagsTest(unittest.TestCase):
             payload = response.json()
 
             self.assertEqual(response.status_code, 200)
-            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["live_ready"])
             self.assertFalse(payload["orders_submitted"])
             for key, value in LIVE_FLAG_VALUES.items():
                 self.assertEqual(os.environ[key], value)
