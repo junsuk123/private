@@ -54,6 +54,22 @@ class OrderTransport:
         if url.endswith("/uapi/overseas-stock/v1/trading/daytime-order"):
             self.order_count += 1
             return {"rt_cd": "0", "msg1": "daytime accepted", "output": {"ODNO": "DAY000010"}}
+        if url.endswith("/uapi/overseas-stock/v1/trading/inquire-ccnl"):
+            return {
+                "rt_cd": "0",
+                "output": [
+                    {
+                        "odno": "OVRS000010",
+                        "pdno": "SOXX",
+                        "sll_buy_dvsn_cd": "02",
+                        "ft_ord_qty": "1",
+                        "ft_ccld_qty": "0",
+                        "nccs_qty": "1",
+                        "ft_ord_unpr3": "624.71000000",
+                        "ft_ccld_unpr3": "0.00000000",
+                    }
+                ],
+            }
         raise AssertionError(f"unexpected request: {url}")
 
 
@@ -132,6 +148,31 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
         self.assertEqual(order_call["body"]["ORD_QTY"], "1")
         self.assertEqual(order_call["body"]["OVRS_ORD_UNPR"], "624.71")
         self.assertEqual(submitted.broker_order_id, "OVRS000010")
+
+    def test_overseas_order_status_uses_overseas_ccnl_and_reports_open_quantity(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            client = KisDevelopersApiClient(
+                app_key="app",
+                app_secret="secret",
+                account_no="12345678-01",
+                base_url="https://openapi.koreainvestment.com:9443",
+                paper=False,
+                enabled=True,
+                transport=transport,
+                token_cache_path=Path(tmp) / "token.json",
+            )
+            client._orders["OVRS000010"] = _overseas_order()
+
+            execution = client.get_order_status("OVRS000010")
+
+        status_call = next(call for call in transport.calls if call["url"].endswith("/overseas-stock/v1/trading/inquire-ccnl"))
+        self.assertEqual(status_call["headers"]["tr_id"], "TTTS3035R")
+        self.assertEqual(status_call["params"]["SLL_BUY_DVSN"], "02")
+        self.assertEqual(status_call["params"]["CCLD_NCCS_DVSN"], "00")
+        self.assertEqual(execution.ticker, "SOXX")
+        self.assertEqual(execution.status, "OPEN")
+        self.assertEqual(execution.quantity, 0)
 
     def test_live_submission_routes_us_daytime_order_to_daytime_api(self) -> None:
         transport = OrderTransport()

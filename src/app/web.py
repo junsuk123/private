@@ -53,6 +53,7 @@ from app.risk import PrincipalProtectionEngine, RiskManager
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
+    Holding,
     MarketSnapshot,
     OrderSide,
     OrderType,
@@ -158,8 +159,8 @@ sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
 LIVE_REFRESH_SECONDS = max(5, int(os.getenv("LIVE_REFRESH_SECONDS", "15")))
 LIVE_STALE_SECONDS = max(LIVE_REFRESH_SECONDS * 2, int(os.getenv("LIVE_STALE_SECONDS", "45")))
-ONTOLOGY_UI_NODE_LIMIT = max(40, int(os.getenv("ONTOLOGY_UI_NODE_LIMIT", "1000")))
-ONTOLOGY_UI_LINK_LIMIT = max(80, int(os.getenv("ONTOLOGY_UI_LINK_LIMIT", "4500")))
+ONTOLOGY_UI_NODE_LIMIT = max(40, int(os.getenv("ONTOLOGY_UI_NODE_LIMIT", "360")))
+ONTOLOGY_UI_LINK_LIMIT = max(80, int(os.getenv("ONTOLOGY_UI_LINK_LIMIT", "900")))
 ONTOLOGY_UI_REASONING_STEP_LIMIT = max(10, int(os.getenv("ONTOLOGY_UI_REASONING_STEP_LIMIT", "320")))
 LEARNING_COLLECTION_INTERVAL_SECONDS = max(
     60,
@@ -197,6 +198,7 @@ _operation_mode_lock = threading.Lock()
 _operation_mode_state: dict[str, Any] = {
     "active": None,
     "last_kis_connection": None,
+    "last_kis_connection_checked_at": None,
     "request": {
         "busy": False,
         "stage": "idle",
@@ -207,6 +209,13 @@ _operation_mode_state: dict[str, Any] = {
     },
       "live_trading_baseline_equity": None,
 }
+
+
+def _kis_account_cache_seconds() -> float:
+  try:
+    return max(1.0, float(os.getenv("KIS_ACCOUNT_CACHE_SECONDS", "10")))
+  except ValueError:
+    return 10.0
 
 
 def _get_store_root() -> Path:
@@ -395,7 +404,33 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "cash_weight": max(0.0, min(1.0, cash / equity)),
       "source": "kis_live_account",
       "account_suffix": connection.get("account_suffix") or "",
+      "positions": list(connection.get("positions") or ()),
   }
+
+
+def _holdings_from_live_positions(positions: Any) -> tuple[Holding, ...]:
+  holdings: list[Holding] = []
+  for position in tuple(positions or ()):
+    if not isinstance(position, dict):
+      continue
+    ticker = str(position.get("ticker") or "").upper().strip()
+    quantity = int(_number_or_zero(position.get("quantity")))
+    if not ticker or quantity <= 0:
+      continue
+    currency = str(position.get("currency") or "").upper()
+    market = str(position.get("market") or ("KR" if currency == "KRW" else "NASDAQ"))
+    holdings.append(
+        Holding(
+            ticker=ticker,
+            market=market,
+            company_name=ticker,
+            sector="Unknown",
+            quantity=quantity,
+            average_price=_number_or_zero(position.get("average_price")),
+            last_price=_number_or_zero(position.get("last_price")),
+        )
+    )
+  return tuple(holdings)
 
 
 def _last_live_account_basis() -> dict[str, Any] | None:
@@ -455,7 +490,7 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
     return context.account
   return AccountSnapshot(
       cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
-      holdings=(),
+      holdings=_holdings_from_live_positions(basis.get("positions")),
       cash_by_currency=dict(basis.get("cash_by_currency") or {}),
       cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis["cash"])),
       captured_at=datetime.now(timezone.utc),
@@ -469,7 +504,7 @@ def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
   cash_by_currency = dict(basis.get("cash_by_currency") or {"KRW": basis.get("cash", 0.0)})
   return AccountSnapshot(
       cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
-      holdings=(),
+      holdings=_holdings_from_live_positions(basis.get("positions")),
       base_currency=str(basis.get("base_currency") or "KRW"),
       cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
       cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis.get("cash") or 0.0)),
@@ -521,6 +556,11 @@ def _live_risk_rules_for_account(account: AccountSnapshot | None) -> RiskRules:
 
 
 def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
+  cached = _cached_kis_connection_probe(paper=False, include_account=True)
+  if cached.get("account_checked"):
+    basis = _account_basis_from_kis_connection(cached)
+    if basis is not None:
+      return basis
   try:
     connection = _kis_connection_probe(paper=False, include_account=True)
   except Exception as exc:  # pragma: no cover - defensive guard around broker/network state
@@ -532,7 +572,35 @@ def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
     return None
   with _live_lock:
     _operation_mode_state["last_kis_connection"] = _connection_with_account_basis(connection, basis)
+    _operation_mode_state["last_kis_connection_checked_at"] = time.time()
   return basis
+
+
+def _cached_kis_connection_probe(
+    paper: bool,
+    include_account: bool = False,
+    *,
+    max_age_seconds: float | None = None,
+) -> dict[str, Any]:
+  if paper or not include_account:
+    return _kis_connection_probe(paper=paper, include_account=include_account)
+  now = time.time()
+  ttl = _kis_account_cache_seconds() if max_age_seconds is None else max(0.0, float(max_age_seconds))
+  with _live_lock:
+    cached = _operation_mode_state.get("last_kis_connection")
+    checked_at = _operation_mode_state.get("last_kis_connection_checked_at")
+  if isinstance(cached, dict) and cached.get("account_checked") and isinstance(checked_at, (int, float)):
+    if now - float(checked_at) <= ttl:
+      return dict(cached)
+  connection = _kis_connection_probe(paper=False, include_account=True)
+  previous = _last_live_account_basis()
+  basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous)
+  if connection.get("account_checked") and basis is not None:
+    connection = _connection_with_account_basis(connection, basis)
+  with _live_lock:
+    _operation_mode_state["last_kis_connection"] = connection
+    _operation_mode_state["last_kis_connection_checked_at"] = now
+  return dict(connection)
 
 
 def _start_auto_live_readiness_check() -> None:
@@ -1015,8 +1083,11 @@ def _lightweight_diagnostics_response(snapshot: dict[str, Any] | None = None) ->
 
 @app.get("/api/ontology/graph")
 def ontology_graph() -> JSONResponse:
-    snapshot = _get_or_refresh_live()
-    context = snapshot["context"]
+    snapshot = _live_snapshot()
+    context = snapshot.get("context")
+    if context is None:
+      _ensure_background_refresh()
+      return _json(_empty_graph_payload(snapshot))
     payload = snapshot.get("graph_payload")
     if payload is None or snapshot.get("graph_payload_context_id") != id(context):
       payload = _graph_payload(context)
@@ -1288,6 +1359,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["kis_connection"] = kis_connection
         with _live_lock:
           _operation_mode_state["last_kis_connection"] = kis_connection
+          _operation_mode_state["last_kis_connection_checked_at"] = time.time()
         if kis_connection.get("ok"):
           result["live_readiness_message"] = (
               "KIS 실전 인증 점검이 완료되었습니다. 주문은 보내지 않았고 실전 주문 게이트는 계속 비활성화되어 있습니다."
@@ -1308,6 +1380,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["kis_connection"] = kis_connection
         with _live_lock:
           _operation_mode_state["last_kis_connection"] = kis_connection
+          _operation_mode_state["last_kis_connection_checked_at"] = time.time()
         runtime_gate = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
         result["runtime_gate"] = {"ok": runtime_gate.ok, "failures": tuple(runtime_gate.failures)}
         result["live_order_journal"] = _live_order_journal_snapshot()
@@ -1398,7 +1471,13 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
           cash_equivalent_krw = portfolio.account.cash
         foreign_cash_krw = max(0.0, cash_equivalent_krw - krw_cash)
         usd_cash = _number_or_zero(cash_by_currency.get("USD", 0.0))
-        usd_krw_rate = foreign_cash_krw / usd_cash if usd_cash > 0 and foreign_cash_krw > 0 else 0.0
+        usd_position_value = sum(
+            _number_or_zero(position.get("market_value"))
+            for position in result["positions"]
+            if str(position.get("currency") or "").upper() == "USD"
+        )
+        usd_rate_base = usd_cash + usd_position_value
+        usd_krw_rate = foreign_cash_krw / usd_rate_base if usd_rate_base > 0 and foreign_cash_krw > 0 else 0.0
         invested_value_krw = 0.0
         for position in result["positions"]:
           currency = str(position.get("currency") or "KRW").upper()
@@ -1429,7 +1508,7 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
             "domestic_balance": "TTTC8434R /uapi/domestic-stock/v1/trading/inquire-balance",
             "domestic_orderable_cash": "TTTC8908R /uapi/domestic-stock/v1/trading/inquire-psbl-order",
             "overseas_balance": "TTTS3012R /uapi/overseas-stock/v1/trading/inquire-balance",
-            "overseas_present_balance": "TTTS6059R /uapi/overseas-stock/v1/trading/inquire-present-balance",
+            "overseas_present_balance": "CTRP6504R /uapi/overseas-stock/v1/trading/inquire-present-balance",
             "overseas_orderable_cash": "TTTS3007R /uapi/overseas-stock/v1/trading/inquire-psamount",
         }
       else:
@@ -2393,20 +2472,11 @@ def mock_trading_performance() -> JSONResponse:
 
 @app.get("/api/live-trading/progress")
 def live_trading_progress() -> JSONResponse:
-    connection = _operation_mode_state.get("last_kis_connection")
-    if connection is None:
-      try:
-        connection = _kis_connection_probe(paper=False, include_account=True)
-      except Exception as exc:  # pragma: no cover - broker/network defensive boundary
-        connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
-      previous_basis = _last_live_account_basis()
-      basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous_basis)
-      if connection.get("account_checked") and basis is not None:
-        connection = _connection_with_account_basis(connection, basis)
-        with _live_lock:
-          _operation_mode_state["last_kis_connection"] = connection
-    else:
-      basis = _last_live_account_basis()
+    try:
+      connection = _cached_kis_connection_probe(paper=False, include_account=True)
+    except Exception as exc:  # pragma: no cover - broker/network defensive boundary
+      connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
+    basis = _last_live_account_basis()
     positions = list(connection.get("positions") or [])
     snapshot = _live_snapshot()
     execution_summary = snapshot.get("live_execution_summary") or {}
@@ -2480,10 +2550,11 @@ def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", li
             events.append(event)
     except OSError:
       events = []
-    recent_events = events[-max(1, limit):]
+    enriched_events = _enrich_live_order_events(events)
+    recent_events = enriched_events[-max(1, limit):]
     recent_orders = [_live_order_event_payload(event) for event in recent_events]
     recent_orders = [item for item in recent_orders if item]
-    all_orders = [_live_order_event_payload(event) for event in events]
+    all_orders = [_live_order_event_payload(event) for event in enriched_events]
     all_orders = [item for item in all_orders if item]
     recent_executions = [
         item
@@ -2501,25 +2572,62 @@ def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", li
     }
 
 
+def _enrich_live_order_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    attempts: dict[str, dict[str, Any]] = {}
+    enriched: list[dict[str, Any]] = []
+    for event in events:
+      copied = dict(event)
+      payload = dict(copied.get("payload") or {}) if isinstance(copied.get("payload"), dict) else {}
+      event_type = str(copied.get("event_type") or "")
+      primary_key = str(payload.get("idempotency_key") or "")
+      execution_key = str(payload.get("execution_id") or "")
+      if event_type == "live_order_submission_attempt":
+        if primary_key:
+          attempts[primary_key] = payload
+        if execution_key:
+          attempts[execution_key] = payload
+      elif event_type in {"live_order_submitted", "live_order_status"}:
+        attempt = attempts.get(primary_key) or attempts.get(execution_key)
+        if attempt and "order" not in payload and isinstance(attempt.get("order"), dict):
+          payload["order"] = attempt["order"]
+          copied["payload"] = payload
+      enriched.append(copied)
+    return enriched
+
+
 def _live_order_event_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     event_type = str(event.get("event_type") or "")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     if not event_type.startswith("live_"):
       return None
     order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+    ticker = str(payload.get("ticker") or order.get("ticker") or "")
+    market = str(payload.get("market") or order.get("market") or "")
+    quantity = payload.get("quantity") or order.get("quantity") or ""
+    limit_price = payload.get("limit_price") or order.get("limit_price") or ""
+    currency = "USD" if _is_us_order_market(market, ticker) else "KRW"
     return {
         "event_type": event_type,
         "recorded_at": event.get("recorded_at"),
-        "ticker": payload.get("ticker") or order.get("ticker") or "",
-        "market": payload.get("market") or order.get("market") or "",
+        "ticker": ticker,
+        "market": market,
         "side": payload.get("side") or order.get("side") or "",
-        "quantity": payload.get("quantity") or order.get("quantity") or "",
-        "limit_price": payload.get("limit_price") or order.get("limit_price") or "",
+        "quantity": quantity,
+        "limit_price": limit_price,
+        "notional": _number_or_zero(quantity) * _number_or_zero(limit_price),
+        "currency": currency,
         "broker_order_id": payload.get("broker_order_id") or "",
         "status": payload.get("status") or "",
         "reason_codes": payload.get("reason_codes") or payload.get("blocked") or (),
         "error": payload.get("error") or payload.get("message") or "",
     }
+
+
+def _is_us_order_market(market: str, ticker: str) -> bool:
+    market_upper = str(market or "").upper()
+    if any(token in market_upper for token in ("US", "NASDAQ", "NYSE", "AMEX", "NASD")):
+      return True
+    return bool(ticker) and not (ticker.isdigit() and len(ticker) == 6)
 
 
 def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
@@ -3007,7 +3115,8 @@ def _live_worker_loop() -> None:
       if _live_state["stop"]:
         break
       learning_active = bool(_live_state.get("learning_active"))
-      interval_seconds = LEARNING_COLLECTION_INTERVAL_SECONDS if learning_active else LIVE_REFRESH_SECONDS
+      active_mode = _active_operation_mode()
+      interval_seconds = _live_worker_interval_seconds(learning_active, active_mode)
       next_at = datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
       _live_state["learning_next_collection_at"] = next_at if learning_active else None
     if learning_active:
@@ -3028,6 +3137,12 @@ def _live_worker_loop() -> None:
       should_refresh = not _live_state["is_refreshing"]
     if should_refresh:
       _refresh_live_cache()
+
+
+def _live_worker_interval_seconds(learning_active: bool, active_mode: str | None) -> int:
+  if active_mode == "live_trading":
+    return LIVE_REFRESH_SECONDS
+  return LEARNING_COLLECTION_INTERVAL_SECONDS if learning_active else LIVE_REFRESH_SECONDS
 
 
 def _refresh_live_cache() -> None:
@@ -3085,6 +3200,7 @@ def _refresh_live_cache() -> None:
           live_broker_targets = _live_broker_targets_for_active_session(analysis_research)
           live_broker_targets = _merge_market_targets(
               live_broker_targets,
+              _live_holding_quote_targets(live_account),
               _live_affordable_krx_discovery_targets(analysis_research, live_account, live_broker_targets),
               _live_affordable_us_discovery_targets(analysis_research, live_account, live_broker_targets),
           )
@@ -3451,6 +3567,22 @@ def _placeholder_live_market(ticker: str, market: str | None = None) -> MarketSn
   )
 
 
+def _live_holding_quote_targets(account: AccountSnapshot | None) -> tuple[MarketSnapshot, ...]:
+  if account is None:
+    return ()
+  targets: list[MarketSnapshot] = []
+  for holding in tuple(getattr(account, "holdings", ()) or ()):
+    ticker = str(getattr(holding, "ticker", "") or "").upper().strip()
+    if not ticker:
+      continue
+    market = str(getattr(holding, "market", "") or "")
+    group = _ticker_market_group_for_live_trading(ticker, market)
+    if group not in set(_active_live_market_groups()):
+      continue
+    targets.append(_placeholder_live_market(ticker, "KOSDAQ" if group == "KRX" else "NASDAQ"))
+  return tuple(targets)
+
+
 def _live_affordable_krx_discovery_targets(
     stored: Any,
     account: AccountSnapshot | None,
@@ -3546,15 +3678,14 @@ def _live_affordable_us_discovery_targets(
       str(getattr(item, "ticker", item) or "").upper().strip()
       for item in tuple(existing_targets or ())
   }
+  excluded = _held_or_recent_buy_tickers(account)
   candidates: list[MarketSnapshot] = []
   stored_markets = tuple(getattr(stored, "market_snapshots", ()) or ())
-  for market in sorted(
-      stored_markets,
-      key=lambda item: float(getattr(item, "last_price", 0.0) or 0.0),
-  ):
+  for market in _rotated_affordable_markets(stored_markets):
     ticker = str(getattr(market, "ticker", "") or "").upper().strip()
     if (
         ticker in seen
+        or ticker in excluded
         or not ticker
         or _ticker_market_group_for_live_trading(ticker, getattr(market, "market", "")) != "US"
     ):
@@ -3570,9 +3701,9 @@ def _live_affordable_us_discovery_targets(
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("live_affordable_us_universe_load_failed", {"error": str(exc)})
       universe = ()
-    for symbol in universe:
+    for symbol in _rotated_symbols(tuple(universe)):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
-      if ticker in seen or not ticker:
+      if ticker in seen or ticker in excluded or not ticker:
         continue
       candidates.append(_placeholder_live_market(ticker, "NASDAQ"))
       seen.add(ticker)
@@ -3585,6 +3716,83 @@ def _live_affordable_us_discovery_targets(
         {"targets": len(candidates), "usd_cash": usd_cash, "limit": limit},
     )
   return tuple(candidates)
+
+
+def _held_or_recent_buy_tickers(account: AccountSnapshot | None) -> set[str]:
+  excluded = {
+      str(getattr(holding, "ticker", "") or "").upper().strip()
+      for holding in tuple(getattr(account, "holdings", ()) or ())
+      if str(getattr(holding, "ticker", "") or "").strip()
+  }
+  excluded.update(_recent_live_buy_tickers())
+  return excluded
+
+
+def _recent_live_buy_tickers(path: str | Path = "logs/live-orders.jsonl") -> set[str]:
+  try:
+    cooldown_seconds = max(0, int(os.getenv("LIVE_BUY_TICKER_COOLDOWN_SECONDS", "21600")))
+  except ValueError:
+    cooldown_seconds = 21600
+  if cooldown_seconds <= 0:
+    return set()
+  cutoff = datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)
+  tickers: set[str] = set()
+  try:
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+  except OSError:
+    return tickers
+  for line in lines[-200:]:
+    try:
+      event = json.loads(line)
+    except json.JSONDecodeError:
+      continue
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+    side = str(payload.get("side") or order.get("side") or "").upper()
+    if side != "BUY":
+      continue
+    recorded_at = _parse_iso_datetime(event.get("recorded_at"))
+    if recorded_at is not None and recorded_at < cutoff:
+      continue
+    ticker = str(payload.get("ticker") or order.get("ticker") or "").upper().strip()
+    if ticker:
+      tickers.add(ticker)
+  return tickers
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+  if not value:
+    return None
+  try:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=timezone.utc)
+  return parsed.astimezone(timezone.utc)
+
+
+def _rotated_affordable_markets(markets: tuple[MarketSnapshot, ...]) -> tuple[MarketSnapshot, ...]:
+  ordered = tuple(
+      sorted(
+          markets,
+          key=lambda item: (
+              round(float(getattr(item, "last_price", 0.0) or 0.0), 2),
+              str(getattr(item, "ticker", "") or ""),
+          ),
+      )
+  )
+  if not ordered:
+    return ()
+  offset = datetime.now(timezone.utc).toordinal() % len(ordered)
+  return ordered[offset:] + ordered[:offset]
+
+
+def _rotated_symbols(symbols: tuple[Any, ...]) -> tuple[Any, ...]:
+  if not symbols:
+    return ()
+  offset = datetime.now(timezone.utc).toordinal() % len(symbols)
+  return symbols[offset:] + symbols[:offset]
 
 
 def _live_realtime_feature_symbols_for_active_session(context: Any, now_utc: Any | None = None) -> tuple[str, ...]:
@@ -3726,8 +3934,14 @@ def _live_broker_only_research(stored: StoredResearch, *, account: AccountSnapsh
     return replace(stored, market_snapshots=())
   broker_markets: list[MarketSnapshot] = []
   rejected: list[dict[str, Any]] = []
+  held_tickers = {
+      str(getattr(holding, "ticker", "") or "").upper().strip()
+      for holding in tuple(getattr(account, "holdings", ()) or ())
+  }
   for market in source_markets:
     reason = ""
+    ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+    is_held_position = ticker in held_tickers
     if market.source.source_type != "broker_api":
       reason = "NOT_BROKER_API"
     elif market.source.trust_level < 5:
@@ -3738,7 +3952,7 @@ def _live_broker_only_research(stored: StoredResearch, *, account: AccountSnapsh
       reason = "NOT_REALTIME"
     elif market.last_price <= 0:
       reason = "PRICE_NOT_POSITIVE"
-    elif not is_market_affordable_for_account(market, account):
+    elif not is_held_position and not is_market_affordable_for_account(market, account):
       reason = "INSUFFICIENT_CASH_FOR_ONE_SHARE"
     elif not _is_open_live_market_ticker(market.ticker, market.market):
       reason = "MARKET_SESSION_CLOSED"
@@ -3947,9 +4161,24 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
     return summary
 
   coordinator = LiveExecutionCoordinator(KisDevelopersApiClient(paper=False, enabled=True))
+  session_key = _live_trading_session_key()
+  max_submissions = _live_max_auto_order_submissions_per_cycle()
   for order in executable_orders:
+    if summary["submitted"] >= max_submissions:
+      summary.setdefault("submission_fit_skipped_orders", []).append(
+          {
+              "ticker": getattr(order, "ticker", ""),
+              "market": getattr(order, "market", ""),
+              "reason": "MAX_AUTO_ORDERS_PER_CYCLE_REACHED",
+              "limit": max_submissions,
+          }
+      )
+      continue
     summary["attempted"] = True
-    key = f"auto-live:{getattr(order, 'ticker', '')}:{getattr(order, 'side', '')}:{getattr(order, 'quantity', '')}:{getattr(order, 'limit_price', '')}"
+    key = (
+        f"auto-live:{session_key}:{getattr(order, 'ticker', '')}:{_order_side_name(order)}:"
+        f"{getattr(order, 'quantity', '')}:{getattr(order, 'limit_price', '')}"
+    )
     try:
       submission = coordinator.submit_final_order(order, idempotency_key=key)
     except LiveExecutionBlocked as exc:
@@ -3973,6 +4202,23 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
   event = "live_trading_execution_completed" if summary["submitted"] else "live_trading_execution_blocked"
   audit.record(event, summary)
   return summary
+
+
+def _live_max_auto_order_submissions_per_cycle() -> int:
+  try:
+    return max(1, int(os.getenv("LIVE_MAX_AUTO_ORDERS_PER_CYCLE", "1")))
+  except ValueError:
+    return 1
+
+
+def _live_trading_session_key() -> str:
+  with _live_lock:
+    active = _operation_mode_state.get("active")
+  if isinstance(active, dict):
+    started_at = str(active.get("started_at") or "")
+    if started_at:
+      return re.sub(r"[^0-9A-Za-z]+", "", started_at)[:32]
+  return datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
 
 
 def _is_live_executable_order(order: FinalOrder) -> bool:
@@ -4278,6 +4524,25 @@ def _graph_payload(context: Any) -> dict[str, Any]:
         "candidate_selection": _candidate_selection_payload(getattr(context, "candidate_selection", None)),
         "parameter_tuning": tuple(getattr(context, "parameter_tuning", ()) or ()),
         "temporal_frame_count": len(tuple(getattr(context, "temporal_frames", ()) or ())),
+    }
+
+
+def _empty_graph_payload(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+    snapshot = snapshot or {}
+    return {
+        "nodes": [],
+        "links": [],
+        "reasoning_steps": [],
+        "counts": {"nodes": 0, "links": 0},
+        "display_counts": {"nodes": 0, "links": 0},
+        "truncated": False,
+        "runtime": get_ontology_runtime().as_dict(),
+        "candidate_selection": None,
+        "parameter_tuning": (),
+        "temporal_frame_count": 0,
+        "warming": True,
+        "is_refreshing": bool(snapshot.get("is_refreshing")),
+        "last_error": snapshot.get("last_error"),
     }
 
 
@@ -6590,18 +6855,23 @@ HTML = """
         </tr>`;
       }).join('') : '<tr><td colspan="7">보유 종목 없음</td></tr>';
       document.getElementById('mockExecutions').innerHTML = orderRows.length ? orderRows.slice().reverse().map((item) => {
-        const side = item.side || item.event_type || item.status || '-';
+        const side = orderSideLabel(item);
         const sideClass = side === 'BUY' ? 'side-buy' : side === 'SELL' ? 'side-sell' : '';
-        const price = item.price ?? item.limit_price ?? 0;
-        const quantity = item.quantity || item.status || '-';
+        const price = Number(item.price ?? item.limit_price ?? 0);
+        const quantityValue = Number(item.quantity || 0);
+        const quantity = quantityValue > 0 ? quantityValue : (item.status || '-');
         const ticker = item.ticker || item.market || item.event_type || '-';
-        const currency = item.currency || (item.market === 'US-LISTED' ? 'USD' : 'KRW');
-        const detail = item.broker_order_id || item.error || (Array.isArray(item.reason_codes) ? item.reason_codes.join(', ') : item.reason_codes) || '';
+        const currency = orderCurrency(item);
+        const amount = Number(item.notional ?? (price * quantityValue) ?? 0);
+        const detail = item.broker_order_id ? `주문 ${item.broker_order_id}` : (item.error || (Array.isArray(item.reason_codes) ? item.reason_codes.join(', ') : item.reason_codes) || '');
+        const priceAmount = price > 0
+          ? `${formatMoney(price, currency)} / ${formatMoney(amount, currency)}${detail ? ` · ${detail}` : ''}`
+          : detail || '-';
         return `<tr>
           <td class="${sideClass}">${side}</td>
           <td>${ticker}</td>
           <td>${quantity}</td>
-          <td>${price ? formatMoney(price, currency) : detail || '-'}</td>
+          <td>${priceAmount}</td>
         </tr>`;
       }).join('') : '<tr><td colspan="4">체결 이력 없음</td></tr>';
       if (isLive && !orderRows.length) {
@@ -6611,6 +6881,23 @@ HTML = """
         document.getElementById('mockExecutions').innerHTML = '<tr><td colspan="4">실시간 체결 내역은 주문 추적기에 기록되면 표시됩니다.</td></tr>';
         document.getElementById('mockExecutions').innerHTML = emptyLiveOrderText;
       }
+    }
+
+    function orderSideLabel(item = {}) {
+      const side = String(item.side || '').toUpperCase();
+      if (side === 'BUY' || side === 'SELL') return side;
+      if (item.event_type === 'live_order_submitted') return item.status || 'SUBMITTED';
+      return item.event_type || item.status || '-';
+    }
+
+    function orderCurrency(item = {}) {
+      const explicit = String(item.currency || '').toUpperCase();
+      if (explicit) return explicit;
+      const market = String(item.market || '').toUpperCase();
+      const ticker = String(item.ticker || '');
+      if (market.includes('US') || market.includes('NASDAQ') || market.includes('NYSE') || market.includes('AMEX') || market.includes('NASD')) return 'USD';
+      if (ticker && !(ticker.match(/^[0-9]{6}$/))) return 'USD';
+      return 'KRW';
     }
 
     function renderDiagnostics(data = {}) {
@@ -7469,7 +7756,7 @@ HTML = """
     function computeGraphLayout(rawNodes, rawLinks) {
       const nodes = rawNodes.map((node, index) => ({ ...node, index }));
       if (!nodes.length) return nodes;
-      if (nodes.length > 700) return computeFastClusterLayout(nodes, rawLinks);
+      if (nodes.length > 240) return computeFastClusterLayout(nodes, rawLinks);
 
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const links = rawLinks.filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));

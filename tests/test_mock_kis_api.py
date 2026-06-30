@@ -76,6 +76,8 @@ class RecordingKisTransport:
                 "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "12.34", "bass_exrt": "1300"}],
                 "output3": {"tot_asst_amt": "9983", "tot_frcr_cblc_smtl": "9983.000000"},
             }
+        if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+            return {"rt_cd": "0", "output": {"ord_psbl_amt": "12.34"}}
         raise AssertionError(f"unexpected KIS request: {method} {url}")
 
 
@@ -365,6 +367,53 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(portfolio.account.cash_by_currency["KRW"], 750_000)
         self.assertEqual(portfolio.account.securities_market_value, 142_000)
         self.assertEqual(portfolio.account.equity, 892_000)
+
+    def test_kis_portfolio_uses_overseas_orderable_cash_not_total_usd_balance(self) -> None:
+        class OverseasOrderableTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "2401"}]}
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "2401"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": []}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output2": [
+                            {
+                                "crcy_cd": "USD",
+                                "frcr_dncl_amt_2": "3.22",
+                                "frcr_drwg_psbl_amt_1": "0.49",
+                                "bass_exrt": "1545.0",
+                            }
+                        ],
+                        "output3": {"tot_asst_amt": "9974", "tot_frcr_cblc_smtl": "9974"},
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_amt": "0.49"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        transport = OverseasOrderableTransport()
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=transport,
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 2401)
+        self.assertEqual(portfolio.account.cash_by_currency["USD"], 0.49)
+        self.assertEqual(portfolio.account.equity, 9974)
+        psamount_call = next(call for call in transport.calls if call["url"].endswith("/inquire-psamount"))
+        self.assertEqual(psamount_call["params"]["OVRS_ORD_UNPR"], "1")
+        self.assertEqual(psamount_call["params"]["ITEM_CD"], "AAPL")
 
     def test_kis_balance_does_not_treat_total_evaluation_as_cash(self) -> None:
         class BalanceOnlyTransport(RecordingKisTransport):

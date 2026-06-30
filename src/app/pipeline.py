@@ -153,12 +153,16 @@ def _augment_live_cash_fit_signals(
 ) -> tuple[StrategySignal, ...]:
     if risk_rules is None or not risk_rules.live_trading_enabled:
         return signals
+    held_tickers = _held_tickers(account)
     market_by_ticker = {market.ticker: market for market in markets}
     signal_by_ticker = {signal.ticker: signal for signal in signals}
     augmented: list[StrategySignal] = []
     for signal in signals:
         market = market_by_ticker.get(signal.ticker)
         if market is None or signal.action is OrderAction.BUY:
+            augmented.append(signal)
+            continue
+        if _normalise_ticker(signal.ticker) in held_tickers:
             augmented.append(signal)
             continue
         if not _is_live_cash_fit_market(market, account, risk_rules):
@@ -192,6 +196,8 @@ def _augment_live_cash_fit_signals(
         )
     missing_markets = [market for market in markets if market.ticker not in signal_by_ticker]
     for market in missing_markets:
+        if _normalise_ticker(market.ticker) in held_tickers:
+            continue
         if not _is_live_cash_fit_market(market, account, risk_rules):
             continue
         augmented.append(
@@ -288,12 +294,15 @@ def _adjust_live_cash_fit_intents(
     if risk_rules is None or not risk_rules.live_trading_enabled:
         return intents
     market_by_ticker = {market.ticker: market for market in markets}
+    held_tickers = _held_tickers(account)
     equity = max(1.0, float(account.equity or 0.0))
     adjusted: list[OrderIntent] = []
     for intent in intents:
         market = market_by_ticker.get(intent.ticker)
         if market is None or "CashFitOneShare" not in set(intent.supporting_factors):
             adjusted.append(intent)
+            continue
+        if intent.action is OrderAction.BUY and _normalise_ticker(intent.ticker) in held_tickers:
             continue
         one_share_weight = min(1.0, max(float(intent.suggested_weight), (float(market.last_price) * 1.025) / equity))
         adjusted.append(
@@ -316,6 +325,18 @@ def _adjust_live_cash_fit_intents(
             )
         )
     return tuple(adjusted)
+
+
+def _held_tickers(account: AccountSnapshot) -> set[str]:
+    return {
+        _normalise_ticker(holding.ticker)
+        for holding in tuple(account.holdings or ())
+        if str(holding.ticker or "").strip()
+    }
+
+
+def _normalise_ticker(ticker: str) -> str:
+    return str(ticker or "").upper().strip()
 
 
 def _add_account_position_state_to_graph(graph: KnowledgeGraph, account: AccountSnapshot) -> None:

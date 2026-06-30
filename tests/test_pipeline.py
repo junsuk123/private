@@ -7,9 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.pipeline import build_analysis_context
+from app.pipeline import _augment_live_cash_fit_signals, build_analysis_context
 from app.cli import run_demo
-from app.schemas.domain import AccountSnapshot, MarketSnapshot, RiskRules, SourceMetadata
+from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderAction, RiskRules, SourceMetadata, StrategySignal
 from app.storage import StoredResearch
 
 
@@ -71,6 +71,38 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("MSFT", filtered_tickers)
         self.assertGreaterEqual(context.affordability_filter["by_currency"]["KRW"]["filtered"], 1)
         self.assertEqual(context.affordability_filter["by_currency"]["USD"]["filtered"], 1)
+
+    def test_live_cash_fit_signal_does_not_rebuy_existing_holding(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(
+            source_name="KIS broker quote",
+            retrieved_at=now,
+            source_type="broker_api",
+            trust_level=5,
+            observed_at=now,
+            is_realtime=True,
+            quality_score=1.0,
+        )
+        markets = (
+            MarketSnapshot("AAME", "NASDAQ", "Held US", "Technology", 1.72, 10_000_000_000, 0.02, source),
+            MarketSnapshot("MICRO", "NASDAQ", "New US", "Technology", 1.18, 10_000_000_000, 0.02, source),
+        )
+        signals = (
+            StrategySignal("AAME", OrderAction.HOLD, 0.51, 0.2, (), (), ()),
+            StrategySignal("MICRO", OrderAction.HOLD, 0.51, 0.2, (), (), ()),
+        )
+        account = AccountSnapshot(
+            cash=2401.0,
+            holdings=(Holding("AAME", "NASDAQ", "Held US", "Technology", 1, 1.72, 1.72),),
+            cash_by_currency={"KRW": 2401.0, "USD": 2.18},
+            cash_equivalent_krw=7377.99,
+        )
+
+        augmented = _augment_live_cash_fit_signals(markets, signals, account, RiskRules(live_trading_enabled=True))
+        actions = {signal.ticker: signal.action for signal in augmented}
+
+        self.assertEqual(actions["AAME"], OrderAction.HOLD)
+        self.assertEqual(actions["MICRO"], OrderAction.BUY)
 
 
 if __name__ == "__main__":

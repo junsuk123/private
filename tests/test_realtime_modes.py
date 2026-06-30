@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.realtime import OperationMode, OperationModeManager, ShortHorizonRiskPolicy
-from app.schemas.domain import AccountSnapshot, MarketSnapshot, OrderAction, OrderIntent, SourceMetadata
+from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderAction, OrderIntent, SourceMetadata
 from app.storage import StoredResearch
 from app import web as web_module
 from app.web import app
@@ -703,6 +703,42 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(tuple(market.ticker for market in filtered.market_snapshots), ("PENNY", "000001"))
 
+    def test_live_broker_research_keeps_held_overseas_positions_even_when_not_buy_affordable(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(
+            source_name="KIS broker quote",
+            retrieved_at=now,
+            source_type="broker_api",
+            trust_level=5,
+            observed_at=now,
+            is_realtime=True,
+            quality_score=1.0,
+        )
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(
+                MarketSnapshot("AAME", "NASDAQ", "Held US", "Technology", 1.72, 10_000_000, 0.02, source),
+                MarketSnapshot("AAPL", "NASDAQ", "Apple", "Technology", 287.5, 10_000_000, 0.02, source),
+            ),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+        account = AccountSnapshot(
+            cash=2401.0,
+            holdings=(Holding("AAME", "NASDAQ", "Held US", "Technology", 1, 1.71, 1.72),),
+            cash_by_currency={"KRW": 2401.0, "USD": 0.49},
+            cash_equivalent_krw=7376.28,
+        )
+
+        with patch("app.web._active_live_market_groups", return_value=("US",)):
+            filtered = web_module._live_broker_only_research(stored, account=account)
+
+        self.assertEqual(tuple(market.ticker for market in filtered.market_snapshots), ("AAME",))
+
     def test_live_broker_targets_include_domestic_and_overseas_candidates(self) -> None:
         now = datetime.now(timezone.utc)
         source = SourceMetadata(
@@ -754,12 +790,91 @@ class RealtimeModesTest(unittest.TestCase):
         with (
             patch("app.web._is_live_market_extended_open", return_value=True),
             patch("app.web.load_us_listed_universe", return_value=("PENNY", "MICRO", "BIG")),
+            patch("app.web._rotated_symbols", side_effect=lambda symbols: symbols),
             patch.dict("os.environ", {"LIVE_US_AFFORDABLE_DISCOVERY_LIMIT": "2"}),
         ):
             targets = web_module._live_affordable_us_discovery_targets(stored, account)
 
         self.assertEqual(tuple(target.ticker for target in targets), ("PENNY", "MICRO"))
         self.assertTrue(all(target.market == "NASDAQ" for target in targets))
+
+    def test_live_affordable_us_discovery_excludes_held_and_recent_buy_tickers(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(source_name="listed_universe_reference", retrieved_at=now)
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+        account = AccountSnapshot(
+            cash=2401.0,
+            holdings=(Holding("PENNY", "NASDAQ", "PENNY", "Unknown", 1, 1.1, 1.1),),
+            cash_by_currency={"KRW": 2401.0, "USD": 3.22},
+            cash_equivalent_krw=7364.63,
+        )
+
+        with (
+            patch("app.web._is_live_market_extended_open", return_value=True),
+            patch("app.web.load_us_listed_universe", return_value=("PENNY", "MICRO", "BIG")),
+            patch("app.web._recent_live_buy_tickers", return_value={"MICRO"}),
+            patch("app.web._rotated_symbols", side_effect=lambda symbols: symbols),
+            patch.dict("os.environ", {"LIVE_US_AFFORDABLE_DISCOVERY_LIMIT": "2"}),
+        ):
+            targets = web_module._live_affordable_us_discovery_targets(stored, account)
+
+        self.assertEqual(tuple(target.ticker for target in targets), ("BIG",))
+
+    def test_live_trading_worker_uses_live_refresh_interval_even_when_learning_is_active(self) -> None:
+        self.assertEqual(
+            web_module._live_worker_interval_seconds(True, "live_trading"),
+            web_module.LIVE_REFRESH_SECONDS,
+        )
+        self.assertEqual(
+            web_module._live_worker_interval_seconds(True, "learning"),
+            web_module.LEARNING_COLLECTION_INTERVAL_SECONDS,
+        )
+
+    def test_live_probe_uses_orderable_usd_without_inflating_us_position_krw(self) -> None:
+        class FakeKisClient:
+            class Endpoints:
+                base_url = "https://openapi.koreainvestment.com:9443"
+
+            class Credentials:
+                account_no = "12345678"
+
+            endpoints = Endpoints()
+            credentials = Credentials()
+            token_source = "cache"
+
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def issue_access_token(self) -> str:
+                return "token"
+
+            def get_portfolio(self):
+                account = AccountSnapshot(
+                    cash=2401.0,
+                    holdings=(
+                        Holding("AACG", "NASD", "AACG", "Unknown", 1, 1.01, 1.01),
+                        Holding("AAME", "NASD", "AAME", "Unknown", 1, 1.71, 1.71),
+                    ),
+                    cash_by_currency={"KRW": 2401.0, "USD": 0.49},
+                    cash_equivalent_krw=7376.28,
+                )
+                return SimpleNamespace(account=account)
+
+        with patch("app.web.KisDevelopersApiClient", FakeKisClient):
+            connection = web_module._kis_connection_probe(paper=False, include_account=True)
+
+        self.assertEqual(connection["cash_by_currency"]["USD"], 0.49)
+        self.assertAlmostEqual(connection["positions"][0]["market_value_krw"], 1565.0, delta=5.0)
+        self.assertLess(connection["invested_value"], 5000.0)
 
     def test_live_execution_reports_market_closed_when_no_trading_session_is_open(self) -> None:
         context = SimpleNamespace(

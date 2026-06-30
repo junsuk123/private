@@ -218,6 +218,10 @@ class KisEndpointSet:
     def overseas_orderable_cash_tr_id(self) -> str:
         return "VTTS3007R" if self.paper else "TTTS3007R"
 
+    @property
+    def overseas_order_status_tr_id(self) -> str:
+        return "VTTS3035R" if self.paper else "TTTS3035R"
+
 
 class KisDevelopersApiClient:
     """KIS Developers REST broker adapter for domestic cash stock orders.
@@ -325,6 +329,8 @@ class KisDevelopersApiClient:
     def get_order_status(self, order_id: str) -> MockKisExecution:
         self._ensure_enabled()
         order = self._orders.get(order_id)
+        if order is not None and _is_overseas_market_name(order.market, order.ticker):
+            return self._get_overseas_order_status(order_id, order)
         params = self._order_status_params(order_id, order)
         response = self._get(
             "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
@@ -334,6 +340,21 @@ class KisDevelopersApiClient:
         self._ensure_success(response, "KIS order-status lookup failed")
         row = _first_response_row(response)
         return self._execution_from_status(order_id, row, order)
+
+    def _get_overseas_order_status(self, order_id: str, order: FinalOrder) -> MockKisExecution:
+        response = self._get(
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl",
+            tr_id=self.endpoints.overseas_order_status_tr_id,
+            params=self._overseas_order_status_params(order),
+        )
+        self._ensure_success(response, "KIS overseas order-status lookup failed")
+        rows = [
+            row
+            for row in _response_rows(response)
+            if str(row.get("odno") or row.get("ODNO") or "") == order_id
+        ]
+        row = rows[0] if rows else _first_response_row(response)
+        return self._overseas_execution_from_status(order_id, row, order)
 
     def get_portfolio(self) -> MockKisPortfolio:
         self._ensure_enabled()
@@ -376,7 +397,9 @@ class KisDevelopersApiClient:
             foreign_orderable = self._get_overseas_orderable_cash_by_currency()
         except Exception:
             foreign_orderable = {}
-        foreign_cash_by_currency.update(foreign_orderable)
+        foreign_cash_by_currency.update(
+            {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
+        )
         if domestic_error is not None and not foreign_cash_by_currency and foreign_cash_krw <= 0:
             raise domestic_error
         cash_by_currency.update(foreign_cash_by_currency)
@@ -708,6 +731,28 @@ class KisDevelopersApiClient:
             "CTX_AREA_NK100": "",
         }
 
+    def _overseas_order_status_params(self, order: FinalOrder) -> dict[str, str]:
+        today = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=2)).strftime("%Y%m%d")
+        exchange_code = _overseas_exchange_code(order.market)
+        side = "02" if order.side == OrderSide.BUY else "01"
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "PDNO": "%",
+            "ORD_STRT_DT": start,
+            "ORD_END_DT": today,
+            "SLL_BUY_DVSN": side,
+            "CCLD_NCCS_DVSN": "00",
+            "OVRS_EXCG_CD": exchange_code,
+            "SORT_SQN": "DS",
+            "ORD_DT": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+
     def _balance_params(self) -> dict[str, str]:
         return {
             "CANO": self.credentials.account_no,
@@ -794,7 +839,7 @@ class KisDevelopersApiClient:
                 if nation_code == "840":
                     return balances, foreign_cash_krw, total_assets_krw
                 continue
-            balances.update(_foreign_cash_by_currency_from_overseas_response(response, nation_code))
+            balances.update(_foreign_orderable_cash_by_currency_from_overseas_response(response, nation_code))
             foreign_cash_krw = max(foreign_cash_krw, _foreign_cash_krw_from_overseas_response(response))
             total_assets_krw = max(total_assets_krw, _total_assets_krw_from_overseas_response(response))
             if balances or foreign_cash_krw > 0 or total_assets_krw > 0:
@@ -802,13 +847,14 @@ class KisDevelopersApiClient:
         return balances, foreign_cash_krw, total_assets_krw
 
     def _overseas_orderable_cash_params(self, currency: str = "USD", exchange_code: str = "NASD") -> dict[str, str]:
+        default_item = os.getenv("KIS_OVERSEAS_ORDERABLE_ITEM_CD", "AAPL").strip().upper() or "AAPL"
         return {
             "CANO": self.credentials.account_no,
             "ACNT_PRDT_CD": self.credentials.account_product_code,
             "OVRS_EXCG_CD": exchange_code,
             "TR_CRCY_CD": currency,
-            "ORD_UNPR": "",
-            "ITEM_CD": "",
+            "OVRS_ORD_UNPR": "1",
+            "ITEM_CD": default_item,
         }
 
     def _get_overseas_orderable_cash_by_currency(self) -> dict[str, float]:
@@ -849,6 +895,34 @@ class KisDevelopersApiClient:
             executed_value=quantity * price,
             status=status,
             message=str(row.get("ord_tmd") or "KIS order status received."),
+            executed_at=datetime.now(timezone.utc),
+        )
+
+    def _overseas_execution_from_status(
+        self,
+        order_id: str,
+        row: dict[str, Any],
+        order: FinalOrder | None,
+    ) -> MockKisExecution:
+        ordered_quantity = int(_to_float(row.get("ft_ord_qty") or row.get("ord_qty") or 0))
+        filled_quantity = int(_to_float(row.get("ft_ccld_qty") or row.get("tot_ccld_qty") or 0))
+        open_quantity = int(_to_float(row.get("nccs_qty") or max(0, ordered_quantity - filled_quantity)))
+        price = _first_float(row, "ft_ccld_unpr3", "ft_ord_unpr3")
+        ticker = str(row.get("pdno") or (order.ticker if order else ""))
+        side_code = str(row.get("sll_buy_dvsn_cd") or "")
+        side = order.side if order else (OrderSide.SELL if side_code == "01" else OrderSide.BUY)
+        status = "FILLED" if filled_quantity > 0 and open_quantity <= 0 else "OPEN"
+        if filled_quantity > 0 and open_quantity > 0:
+            status = "PARTIALLY_FILLED"
+        return MockKisExecution(
+            order_id=order_id,
+            ticker=ticker,
+            side=side,
+            quantity=filled_quantity,
+            price=price,
+            executed_value=filled_quantity * price,
+            status=status,
+            message=str(row.get("prcs_stat_name") or row.get("ord_tmd") or "KIS overseas order status received."),
             executed_at=datetime.now(timezone.utc),
         )
 
@@ -1134,6 +1208,22 @@ def _foreign_cash_by_currency_from_overseas_response(
     return balances
 
 
+def _foreign_orderable_cash_by_currency_from_overseas_response(
+    response: dict[str, Any],
+    nation_code: str = "000",
+) -> dict[str, float]:
+    balances: dict[str, float] = {}
+    for row in _response_rows(response):
+        currency = _currency_from_row(row, nation_code)
+        if not currency or currency == "KRW":
+            continue
+        amount = _foreign_orderable_cash_amount_from_row(row)
+        if amount is None:
+            continue
+        balances[currency] = max(balances.get(currency, 0.0), amount)
+    return balances
+
+
 def _foreign_cash_krw_from_overseas_response(response: dict[str, Any]) -> float:
     best = 0.0
     for row in _response_rows(response):
@@ -1187,6 +1277,11 @@ def _response_rows(value: Any) -> list[dict[str, Any]]:
                 "ovrs_ord_psbl_amt",
                 "max_ord_psbl_amt",
                 "frcr_ord_psbl_amt1",
+                "odno",
+                "nccs_qty",
+                "ft_ord_qty",
+                "ft_ccld_qty",
+                "ft_ord_unpr3",
             )
         ):
             rows.append(value)
@@ -1223,6 +1318,23 @@ def _foreign_cash_amount_from_row(row: dict[str, Any]) -> float | None:
         "nxdy_frcr_drwg_psbl_amt",
     )
     for key in cash_keys:
+        if key in row:
+            return _to_float(row.get(key))
+    return None
+
+
+def _foreign_orderable_cash_amount_from_row(row: dict[str, Any]) -> float | None:
+    orderable_keys = (
+        "frcr_drwg_psbl_amt_1",
+        "nxdy_frcr_drwg_psbl_amt",
+        "ord_psbl_frcr_amt",
+        "frcr_ord_psbl_amt",
+        "frcr_ord_psbl_amt1",
+        "frcr_buy_psbl_amt",
+        "buy_psbl_frcr_amt",
+        "withdrawable_frcr_amt",
+    )
+    for key in orderable_keys:
         if key in row:
             return _to_float(row.get(key))
     return None

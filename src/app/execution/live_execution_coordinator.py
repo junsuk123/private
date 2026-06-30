@@ -98,6 +98,7 @@ class LiveExecutionCoordinator:
             "broker_order_id": broker_order_id,
             "status": status,
             "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "order": asdict(order),
         }
         self.idempotency_store.put(key, payload_hash, status, result)
         self.journal.record("live_order_submitted", {**result, "idempotency_key": key})
