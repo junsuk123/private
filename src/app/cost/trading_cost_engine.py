@@ -14,6 +14,17 @@ DEFAULT_TRADING_COST_CONFIG: dict[str, Any] = {
         "KRX": {"buy_fee_rate": 0.000140527, "sell_fee_rate": 0.000140527, "sell_tax_rate": 0.002},
         "NXT": {"buy_fee_rate": 0.000130527, "sell_fee_rate": 0.000130527, "sell_tax_rate": 0.002},
     },
+    "overseas_stock": {
+        "NASD": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
+        "NYSE": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
+        "AMEX": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
+        "SEHK": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0013},
+        "SHAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
+        "SZAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
+        "TKSE": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0},
+        "HASE": {"buy_fee_rate": 0.0040, "sell_fee_rate": 0.0040, "sell_tax_rate": 0.0010},
+        "VNSE": {"buy_fee_rate": 0.0040, "sell_fee_rate": 0.0040, "sell_tax_rate": 0.0010},
+    },
     "domestic_etf_etn_elw": {"default_fee_rate": 0.000146527, "sell_tax_rate": 0.0},
     "slippage": {"default_slippage_rate": 0.0005, "use_dynamic_slippage_if_orderbook_exists": True},
     "spread": {"default_spread_rate": 0.0},
@@ -179,7 +190,13 @@ class TradingCostEngine:
     ) -> FeePolicy:
         venue = (venue or "KRX").upper()
         instrument_type = instrument_type or "domestic_stock"
-        if instrument_type in {"domestic_etf", "domestic_etn", "domestic_elw", "etf", "etn", "elw"}:
+        if instrument_type == "overseas_stock":
+            overseas = self.config.get("overseas_stock", {})
+            policy = overseas.get(venue) or overseas.get("NASD") or DEFAULT_TRADING_COST_CONFIG["overseas_stock"]["NASD"]
+            buy_fee_rate = float(policy.get("buy_fee_rate", 0.0025))
+            sell_fee_rate = float(policy.get("sell_fee_rate", 0.0025))
+            sell_tax_rate = float(policy.get("sell_tax_rate", 0.0))
+        elif instrument_type in {"domestic_etf", "domestic_etn", "domestic_elw", "etf", "etn", "elw"}:
             product = self.config.get("domestic_etf_etn_elw", {})
             buy_fee_rate = sell_fee_rate = float(product.get("default_fee_rate", 0.000146527))
             sell_tax_rate = float(product.get("sell_tax_rate", 0.0))

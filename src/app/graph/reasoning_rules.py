@@ -19,6 +19,7 @@ RISK_SIGNALS = {
     "RiskAdjustedSizing",
     "WaitOrTakeProfit",
     "TradeForbidden",
+    "ConcentratedPositionRisk",
 }
 HARD_RISK_FEATURES = {
     "CostBurdenHigh",
@@ -78,6 +79,10 @@ def build_semantic_reasoning_paths(
 def _select_signal(confidence: float, positive: tuple[str, ...], risk: tuple[str, ...]) -> str:
     if any(feature in HARD_RISK_FEATURES for feature in risk):
         return "TradeForbidden"
+    if "ConcentratedPositionRisk" in risk:
+        return "SellCandidate"
+    if any(feature in {"SellCandidate"} for feature in risk):
+        return "SellCandidate"
     if risk and confidence < 0.45:
         return "ReduceRiskCandidate"
     if "CostEfficientTrade" in positive and len(positive) >= 2 and not risk:

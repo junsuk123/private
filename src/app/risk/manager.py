@@ -122,6 +122,10 @@ class RiskManager:
         metadata["cash_available_for_market"] = cash_available_for_market
         metadata["equity_for_sizing"] = equity_for_sizing
         metadata["market_currency"] = _market_currency(market)
+        venue = _venue_for_market(market)
+        instrument_type = _instrument_type_for_market(market)
+        metadata["venue"] = venue
+        metadata["instrument_type"] = instrument_type
         target_value = equity_for_sizing * adjusted_weight
         current_value = account.holdings_by_ticker().get(intent.ticker, 0.0)
 
@@ -142,6 +146,14 @@ class RiskManager:
         )
 
         buy_amount = max(0.0, target_value - current_value) if intent.action == OrderAction.BUY else 0.0
+        if (
+            intent.action == OrderAction.BUY
+            and buy_amount > 0.0
+            and buy_amount < market.last_price
+            and cash_available_for_market >= market.last_price
+        ):
+            # If one share is affordable, avoid zero-quantity rejects caused by tiny target weights.
+            buy_amount = float(market.last_price)
         projected_cash = cash_available_for_market - buy_amount
         checks["deposit_limit_check"] = buy_amount <= cash_available_for_market
         checks["cash_available"] = projected_cash >= equity_for_sizing * self.rules.minimum_cash_reserve
@@ -156,7 +168,7 @@ class RiskManager:
         final_order = None
         approved = not reasons
         if approved and intent.action == OrderAction.BUY:
-            spend = max(0.0, target_value - current_value)
+            spend = buy_amount
             quantity = floor(spend / market.last_price)
             metadata["estimated_order_quantity"] = quantity
             metadata["minimum_one_share_cash_required"] = float(market.last_price)
@@ -165,8 +177,8 @@ class RiskManager:
                 cost = self.cost_engine.estimate(
                     symbol=intent.ticker,
                     market=intent.market,
-                    venue="KRX",
-                    instrument_type=_instrument_type_for_market(market),
+                    venue=venue,
+                    instrument_type=instrument_type,
                     entry_price=market.last_price,
                     expected_exit_price=float(intent.expected_exit_price),
                     quantity=quantity,
@@ -194,8 +206,8 @@ class RiskManager:
                         cost = self.cost_engine.estimate(
                             symbol=intent.ticker,
                             market=intent.market,
-                            venue="KRX",
-                            instrument_type=_instrument_type_for_market(market),
+                            venue=venue,
+                            instrument_type=instrument_type,
                             entry_price=market.last_price,
                             expected_exit_price=float(intent.expected_exit_price),
                             quantity=quantity,
@@ -226,7 +238,7 @@ class RiskManager:
                 metadata["cost_breakdown"] = cost.as_dict()
                 metadata["validation_required"] = not bool(intent.validation_id)
                 target_net_return = intent.target_net_return or 0.0
-                policy = self.cost_engine.policy_for(venue="KRX", instrument_type=_instrument_type_for_market(market))
+                policy = self.cost_engine.policy_for(venue=venue, instrument_type=instrument_type)
                 notional = max(1e-9, cost.entry_price * cost.quantity)
                 spread_rate = cost.spread_cost / notional
                 slippage_rate = cost.slippage_cost / notional
@@ -326,7 +338,14 @@ class RiskManager:
                     },
                 )
             if approved:
-                final_order = _final_order_or_reject(intent, market, OrderSide.BUY, quantity, reasons)
+                final_order = _final_order_or_reject(
+                    intent,
+                    market,
+                    OrderSide.BUY,
+                    quantity,
+                    reasons,
+                    self.rules.manual_approval_required,
+                )
                 approved = final_order is not None
         elif approved and intent.action in {OrderAction.SELL, OrderAction.REDUCE}:
             if current_value <= 0:
@@ -335,7 +354,14 @@ class RiskManager:
             else:
                 sell_value = current_value if intent.action == OrderAction.SELL else max(0.0, current_value - target_value)
                 quantity = floor(sell_value / market.last_price)
-                final_order = _final_order_or_reject(intent, market, OrderSide.SELL, quantity, reasons)
+                final_order = _final_order_or_reject(
+                    intent,
+                    market,
+                    OrderSide.SELL,
+                    quantity,
+                    reasons,
+                    self.rules.manual_approval_required,
+                )
                 approved = final_order is not None
         elif approved:
             approved = False
@@ -386,6 +412,7 @@ def _final_order_or_reject(
     side: OrderSide,
     quantity: int,
     reasons: list[str],
+    manual_approval_required: bool,
 ) -> FinalOrder | None:
     if quantity <= 0:
         reasons.append("INSUFFICIENT_CASH_FOR_ONE_SHARE")
@@ -397,7 +424,7 @@ def _final_order_or_reject(
         side=side,
         quantity=quantity,
         limit_price=market.last_price,
-        manual_approval_required=True,
+        manual_approval_required=manual_approval_required,
     )
 
 
@@ -408,6 +435,29 @@ def _instrument_type_for_market(market: MarketSnapshot) -> str:
     if any(token in text for token in ("etf", "etn", "elw")):
         return "domestic_etf"
     return "domestic_stock"
+
+
+def _venue_for_market(market: MarketSnapshot) -> str:
+    market_name = str(market.market or "").upper()
+    if "NASDAQ" in market_name or "NASD" in market_name or market_name in {"US", "US-LISTED", "OVERSEAS"}:
+        return "NASD"
+    if "NYSE" in market_name:
+        return "NYSE"
+    if "AMEX" in market_name:
+        return "AMEX"
+    if "SEHK" in market_name or "HONG" in market_name:
+        return "SEHK"
+    if "SHAA" in market_name or "SHANGHAI" in market_name:
+        return "SHAA"
+    if "SZAA" in market_name or "SHENZHEN" in market_name:
+        return "SZAA"
+    if "TKSE" in market_name or "TOKYO" in market_name or "JAPAN" in market_name:
+        return "TKSE"
+    if "HASE" in market_name or "HANOI" in market_name:
+        return "HASE"
+    if "VNSE" in market_name or "VIETNAM" in market_name or "HOCHIMINH" in market_name:
+        return "VNSE"
+    return "KRX"
 
 
 def _cash_available_for_market(account: AccountSnapshot, market: MarketSnapshot) -> float:

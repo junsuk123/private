@@ -41,6 +41,8 @@ class OrderTransport:
             return {"HASH": "hash"}
         if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
             return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "1000000"}]}
+        if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+            return {"rt_cd": "0", "output": {"ord_psbl_cash": "1000000"}}
         if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
             return {"rt_cd": "0", "output1": [], "output2": []}
         if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
@@ -49,6 +51,9 @@ class OrderTransport:
         if url.endswith("/uapi/overseas-stock/v1/trading/order"):
             self.order_count += 1
             return {"rt_cd": "0", "msg1": "overseas accepted", "output": {"ODNO": "OVRS000010"}}
+        if url.endswith("/uapi/overseas-stock/v1/trading/daytime-order"):
+            self.order_count += 1
+            return {"rt_cd": "0", "msg1": "daytime accepted", "output": {"ODNO": "DAY000010"}}
         raise AssertionError(f"unexpected request: {url}")
 
 
@@ -57,7 +62,14 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
             coordinator = self._coordinator(tmp, transport)
-            with patch.dict("os.environ", {}, clear=True):
+            env = {
+                "LIVE_TRADING_ENABLED": "false",
+                "KIS_LIVE_ENABLED": "false",
+                "KIS_PAPER_TRADING": "true",
+                "LIVE_ORDER_SUBMIT_ENABLED": "false",
+                "KILL_SWITCH_ENABLED": "true",
+            }
+            with patch.dict("os.environ", env, clear=True):
                 with self.assertRaises(LiveExecutionBlocked) as raised:
                     coordinator.submit_final_order(_order(), idempotency_key="unit")
 
@@ -120,6 +132,60 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
         self.assertEqual(order_call["body"]["ORD_QTY"], "1")
         self.assertEqual(order_call["body"]["OVRS_ORD_UNPR"], "624.71")
         self.assertEqual(submitted.broker_order_id, "OVRS000010")
+
+    def test_live_submission_routes_us_daytime_order_to_daytime_api(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            arming_path = Path("config/secrets/live_trading_armed.json")
+            create_arming_file(arming_path, ttl_seconds=60)
+            coordinator = self._coordinator(tmp, transport)
+            env = {
+                "LIVE_TRADING_ENABLED": "true",
+                "KIS_LIVE_ENABLED": "true",
+                "KIS_PAPER_TRADING": "false",
+                "LIVE_ORDER_SUBMIT_ENABLED": "true",
+                "KILL_SWITCH_ENABLED": "false",
+                "KIS_FORCE_OVERSEAS_DAYTIME_ORDER": "true",
+            }
+            try:
+                with patch.dict("os.environ", env, clear=True):
+                    submitted = coordinator.submit_final_order(_overseas_order(), idempotency_key="us-daytime-order")
+            finally:
+                try:
+                    arming_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        order_call = next(call for call in transport.calls if call["url"].endswith("/overseas-stock/v1/trading/daytime-order"))
+        self.assertEqual(order_call["headers"]["tr_id"], "TTTS6036U")
+        self.assertEqual(order_call["body"]["OVRS_EXCG_CD"], "NASD")
+        self.assertEqual(submitted.broker_order_id, "DAY000010")
+
+    def test_domestic_order_can_use_after_hours_order_division(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            arming_path = Path("config/secrets/live_trading_armed.json")
+            create_arming_file(arming_path, ttl_seconds=60)
+            coordinator = self._coordinator(tmp, transport)
+            env = {
+                "LIVE_TRADING_ENABLED": "true",
+                "KIS_LIVE_ENABLED": "true",
+                "KIS_PAPER_TRADING": "false",
+                "LIVE_ORDER_SUBMIT_ENABLED": "true",
+                "KILL_SWITCH_ENABLED": "false",
+                "KIS_DOMESTIC_ORD_DVSN": "07",
+            }
+            try:
+                with patch.dict("os.environ", env, clear=True):
+                    coordinator.submit_final_order(_order(), idempotency_key="krx-after-hours")
+            finally:
+                try:
+                    arming_path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        order_call = next(call for call in transport.calls if call["url"].endswith("/domestic-stock/v1/trading/order-cash"))
+        self.assertEqual(order_call["body"]["ORD_DVSN"], "07")
 
     def _coordinator(self, tmp: str, transport: OrderTransport) -> LiveExecutionCoordinator:
         client = KisDevelopersApiClient(

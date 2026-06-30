@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,11 @@ from app.web import app
 
 
 class RealtimeModesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = None
+            web_module._operation_mode_state["live_trading_baseline_equity"] = None
+
     def test_learning_uses_unified_realtime_data_and_disallows_orders(self) -> None:
         state = OperationModeManager().start(OperationMode.LEARNING)
 
@@ -207,7 +214,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(status["equity"], 1000000)
         self.assertEqual(status["cash_weight"], 0.8)
 
-    def test_status_includes_foreign_cash_krw_in_operating_cash(self) -> None:
+    def test_status_keeps_orderable_krw_cash_separate_from_foreign_cash(self) -> None:
         client = TestClient(app)
         broker_state = {
             "ok": True,
@@ -229,10 +236,57 @@ class RealtimeModesTest(unittest.TestCase):
 
         status = client.get("/api/status").json()
 
-        self.assertEqual(status["cash"], 812000)
+        self.assertEqual(status["cash"], 800000)
+        self.assertEqual(status["cash_equivalent_krw"], 812000)
         self.assertEqual(status["krw_cash"], 800000)
         self.assertEqual(status["foreign_cash_krw"], 12000)
-        self.assertEqual(status["cash_weight"], 0.812)
+        self.assertEqual(status["cash_weight"], 0.8)
+
+    def test_status_and_live_snapshot_use_same_live_account_cash_basis(self) -> None:
+        client = TestClient(app)
+        broker_state = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 2401,
+            "krw_cash": 2401,
+            "foreign_cash_krw": 4963.63,
+            "cash": 2401,
+            "cash_equivalent_krw": 7364.63,
+            "cash_by_currency": {"KRW": 2401, "USD": 3.22},
+            "foreign_cash_by_currency": {"USD": 3.22},
+            "base_currency": "KRW",
+            "invested_value": 2580,
+            "actual_equity": 9944.63,
+            "account_suffix": "...28",
+        }
+        snapshot = {
+            "research_result": SimpleNamespace(diagnostics={}, skipped_sources=()),
+            "context": SimpleNamespace(
+                account=SimpleNamespace(cash=10_000_000),
+                report=SimpleNamespace(equity=10_000_000, cash_weight=1.0, daily_pnl_ratio=0.0),
+                graph=SimpleNamespace(nodes={}, triples=lambda: ()),
+                reasoning_paths=(),
+                ontology_runtime=SimpleNamespace(as_dict=lambda: {"uses_npu": False}),
+                risk_results=(),
+            ),
+            "is_refreshing": False,
+            "store_summary": {},
+            "stored_new_records": {},
+            "last_updated": None,
+            "last_error": None,
+        }
+        with web_module._live_lock:
+            web_module._operation_mode_state["last_kis_connection"] = broker_state
+        with patch("app.web._live_snapshot", return_value=snapshot):
+            status = client.get("/api/status").json()
+            live_snapshot = client.post("/api/live-snapshot", json={"force_refresh": False, "include_graph": False}).json()
+
+        self.assertEqual(status["cash"], 2401)
+        self.assertEqual(live_snapshot["status"]["cash"], 2401)
+        self.assertEqual(status["cash_equivalent_krw"], 7364.63)
+        self.assertEqual(live_snapshot["status"]["cash_equivalent_krw"], 7364.63)
+        self.assertEqual(status["equity"], live_snapshot["status"]["equity"])
 
     def test_paper_mode_auto_uses_checked_live_account_basis_as_initial_cash(self) -> None:
         client = TestClient(app)
@@ -264,11 +318,11 @@ class RealtimeModesTest(unittest.TestCase):
             ).json()
 
         self.assertTrue(data["ok"])
-        self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(data["initial_cash"], 700000)
         self.assertEqual(data["initial_cash_source"], "kis_live_account")
         self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
         self.assertGreater(data["profit_gain"], 0.25)
-        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 700000)
         self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
 
     def test_paper_trading_start_defaults_to_live_account_and_auto_gain(self) -> None:
@@ -293,11 +347,11 @@ class RealtimeModesTest(unittest.TestCase):
                 },
             ).json()
 
-        self.assertEqual(data["initial_cash"], 1000000)
+        self.assertEqual(data["initial_cash"], 450000)
         self.assertEqual(data["initial_cash_source"], "kis_live_account")
         self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
         self.assertEqual(data["target_return_rate"], 0.03)
-        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 1000000)
+        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 450000)
         self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
 
     def test_auto_initial_cash_uses_default_without_blocking_when_no_basis_is_cached(self) -> None:
@@ -491,6 +545,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertFalse(data["live_trading_enabled_by_config"])
         self.assertFalse(data["live_trading_enabled_by_env"])
         self.assertIn("blocked", data["live_trading_message"])
+        self.assertFalse(data["runtime_gate"]["ok"])
         start_worker.assert_called_once_with("learning")
         kis_probe.assert_called_once_with(paper=False, include_account=True)
 
@@ -503,6 +558,7 @@ class RealtimeModesTest(unittest.TestCase):
                 return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
             ),
             patch("app.web.load_short_horizon_strategy_config", return_value={"execution": {"live_trading_enabled": True}}),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
             patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"}),
         ):
             data = client.post("/api/operation-mode/start", json={"mode": "live_trading"}).json()
@@ -511,7 +567,85 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["live_trading_status"], "armed")
         self.assertTrue(data["live_trading_enabled_by_config"])
         self.assertTrue(data["live_trading_enabled_by_env"])
+        self.assertTrue(data["runtime_gate"]["ok"])
         self.assertIn("RiskManager", data["live_trading_message"])
+
+    def test_live_order_journal_snapshot_reports_submitted_and_blocked_orders(self) -> None:
+        events = [
+            {
+                "event_type": "live_order_blocked",
+                "recorded_at": "2026-06-30T00:00:00+00:00",
+                "payload": {
+                    "order": {"ticker": "005930", "market": "KR", "side": "BUY", "quantity": 1, "limit_price": 70000},
+                    "reason_codes": ["LIVE_ORDER_SUBMIT_ENABLED_NOT_TRUE"],
+                },
+            },
+            {
+                "event_type": "live_order_submitted",
+                "recorded_at": "2026-06-30T00:01:00+00:00",
+                "payload": {
+                    "order": {"ticker": "SOXX", "market": "US-LISTED", "side": "BUY", "quantity": 1, "limit_price": 624.71},
+                    "broker_order_id": "OVRS000010",
+                    "status": "submitted",
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            journal_path = Path(tmp) / "live-orders.jsonl"
+            journal_path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+
+            snapshot = web_module._live_order_journal_snapshot(journal_path)
+
+        self.assertEqual(snapshot["orders_count"], 2)
+        self.assertEqual(snapshot["submitted_count"], 1)
+        self.assertEqual(snapshot["blocked_count"], 1)
+        self.assertEqual(snapshot["recent_orders"][0]["ticker"], "005930")
+        self.assertEqual(snapshot["recent_executions"][0]["broker_order_id"], "OVRS000010")
+
+    def test_live_trading_progress_exposes_runtime_gate_and_order_journal(self) -> None:
+        client = TestClient(app)
+        journal = {
+            "path": "logs/live-orders.jsonl",
+            "orders_count": 1,
+            "submitted_count": 0,
+            "blocked_count": 1,
+            "error_count": 0,
+            "recent_orders": [
+                {
+                    "event_type": "live_order_blocked",
+                    "ticker": "005930",
+                    "market": "KR",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "limit_price": 70000,
+                    "reason_codes": ("MANUAL_ARMING_FILE_MISSING",),
+                }
+            ],
+            "recent_executions": [],
+        }
+        connection = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 800000,
+            "krw_cash": 800000,
+            "cash": 800000,
+            "invested_value": 200000,
+            "actual_equity": 1000000,
+        }
+        with (
+            patch("app.web._kis_connection_probe", return_value=connection),
+            patch("app.web._live_snapshot", return_value={"live_execution_summary": {"submitted": 0}}),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=False, failures=("MANUAL_ARMING_FILE_MISSING",))),
+            patch("app.web._live_order_journal_snapshot", return_value=journal),
+        ):
+            data = client.get("/api/live-trading/progress").json()
+
+        self.assertFalse(data["runtime_gate"]["ok"])
+        self.assertEqual(data["orders_count"], 1)
+        self.assertEqual(data["live_order_journal"]["blocked_count"], 1)
+        self.assertEqual(data["recent_orders"][0]["ticker"], "005930")
+        self.assertIn("MANUAL_ARMING_FILE_MISSING", data["message"])
 
     def test_stop_learning_endpoint_keeps_continuous_collection_alive(self) -> None:
         client = TestClient(app)
@@ -564,7 +698,8 @@ class RealtimeModesTest(unittest.TestCase):
             cash_equivalent_krw=9983.0,
         )
 
-        filtered = web_module._live_broker_only_research(stored, account=account)
+        with patch("app.web._active_live_market_groups", return_value=("US", "KRX")):
+            filtered = web_module._live_broker_only_research(stored, account=account)
 
         self.assertEqual(tuple(market.ticker for market in filtered.market_snapshots), ("PENNY", "000001"))
 
@@ -591,9 +726,67 @@ class RealtimeModesTest(unittest.TestCase):
             ),
         )
 
-        targets = web_module._live_broker_targets_for_active_session(stored)
+        with patch("app.web._active_live_market_groups", return_value=("US", "KRX")):
+            targets = web_module._live_broker_targets_for_active_session(stored)
 
         self.assertEqual(targets, ("005930", "MSFT"))
+
+    def test_live_affordable_us_discovery_adds_symbols_for_small_usd_balance(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(source_name="listed_universe_reference", retrieved_at=now)
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+        account = AccountSnapshot(
+            cash=2401.0,
+            holdings=(),
+            cash_by_currency={"KRW": 2401.0, "USD": 3.22},
+            cash_equivalent_krw=7364.63,
+        )
+
+        with (
+            patch("app.web._is_live_market_extended_open", return_value=True),
+            patch("app.web.load_us_listed_universe", return_value=("PENNY", "MICRO", "BIG")),
+            patch.dict("os.environ", {"LIVE_US_AFFORDABLE_DISCOVERY_LIMIT": "2"}),
+        ):
+            targets = web_module._live_affordable_us_discovery_targets(stored, account)
+
+        self.assertEqual(tuple(target.ticker for target in targets), ("PENNY", "MICRO"))
+        self.assertTrue(all(target.market == "NASDAQ" for target in targets))
+
+    def test_live_execution_reports_market_closed_when_no_trading_session_is_open(self) -> None:
+        context = SimpleNamespace(
+            intents=(),
+            risk_results=(),
+            signals=(),
+            markets=(),
+            account=AccountSnapshot(cash=2401.0, holdings=(), cash_by_currency={"KRW": 2401.0}),
+        )
+
+        with patch("app.web._active_live_market_groups", return_value=()):
+            summary = web_module._run_live_trading_execution_cycle(context)
+
+        self.assertEqual(summary["reason"], "MARKET_SESSION_CLOSED")
+        self.assertEqual(summary["diagnostics"]["message"], "No supported KIS live trading session is open.")
+
+    def test_live_market_extended_session_includes_us_premarket(self) -> None:
+        premarket = datetime(2026, 6, 30, 10, 30, tzinfo=timezone.utc)
+
+        self.assertTrue(web_module._is_live_market_extended_open("US", premarket))
+        self.assertFalse(web_module._is_live_market_core_open("US", premarket))
+
+    def test_live_market_extended_session_includes_krx_after_hours(self) -> None:
+        after_hours = datetime(2026, 6, 30, 7, 30, tzinfo=timezone.utc)
+
+        self.assertTrue(web_module._is_live_market_extended_open("KRX", after_hours))
+        self.assertFalse(web_module._is_live_market_core_open("KRX", after_hours))
 
 
 if __name__ == "__main__":

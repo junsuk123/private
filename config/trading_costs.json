@@ -29,12 +29,12 @@
     "default_market_impact_rate": 0.0
   },
   "safety_margin": {
-    "default_safety_margin_rate": 0.001
+    "default_safety_margin_rate": 0.0005
   },
   "gate": {
-    "max_cost_to_alpha_ratio": 0.5,
+    "max_cost_to_alpha_ratio": 0.8,
     "default_target_net_return": 0.0,
-    "max_spread_rate": 0.003,
-    "max_slippage_rate": 0.003
+    "max_spread_rate": 0.004,
+    "max_slippage_rate": 0.004
   }
 }

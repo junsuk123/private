@@ -18,6 +18,8 @@ SUPPORT_WEIGHTS = {
     "OrderFlowPriceConfirmation": 0.09,
     "SuspectedSmartMoneyAccumulation": 0.08,
     "OrderFlowConfirmedBuyCandidate": 0.10,
+    "CashFitOneShare": 0.07,
+    "AffordableByAccountCash": 0.08,
     "SectorMomentum": 0.08,
 }
 CONTRADICTION_WEIGHTS = {
@@ -28,6 +30,7 @@ CONTRADICTION_WEIGHTS = {
     "RetailDemandMeetsInformedSelling": 0.11,
     "OrderFlowPriceDivergence": 0.10,
     "SuspectedSmartMoneyDistribution": 0.12,
+    "CashBelowOneSharePrice": 0.18,
 }
 RISK_WEIGHTS = {
     "MacroRateRisk": 0.14,
@@ -36,6 +39,7 @@ RISK_WEIGHTS = {
     "LiquidityRisk": 0.20,
     "OrderFlowDistributionRisk": 0.16,
     "ThinLiquidityPriceImpactRisk": 0.14,
+    "InsufficientAccountCashRisk": 0.20,
 }
 
 
@@ -125,12 +129,16 @@ class OntologyReasoner:
                 self.graph.add(subject, "supportsSignal", "OrderFlowConfirmedBuyCandidate", "reasoner:ofi-price-impact")
             if "InformedOrderFlowDistribution" in contra_objects:
                 self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:ofi-distribution")
+            if {"CashFitOneShare", "AffordableByAccountCash"}.issubset(support_objects):
+                self.graph.add(subject, "supportsSignal", "AccountCashFeasibleBuyCandidate", "reasoner:account-cash")
+            if "CashBelowOneSharePrice" in contra_objects:
+                self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:account-cash")
 
     def _infer_risk_adjustments(self) -> None:
         for triple in self.graph.matching(predicate="increasesRiskOf"):
             if triple.object in {"MacroRateRisk", "VolatilityRisk", "NegativeEventRisk"}:
                 self.graph.add(triple.subject, "requiresSizingAdjustment", "RiskAdjustedSizing", "reasoner:risk-sizing")
-            if triple.object in {"OrderFlowDistributionRisk", "ThinLiquidityPriceImpactRisk"}:
+            if triple.object in {"OrderFlowDistributionRisk", "ThinLiquidityPriceImpactRisk", "InsufficientAccountCashRisk"}:
                 self.graph.add(triple.subject, "requiresSizingAdjustment", "RiskAdjustedSizing", "reasoner:flow-risk-sizing")
 
 

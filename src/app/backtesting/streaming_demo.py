@@ -265,7 +265,7 @@ class StreamingAcceleratedDemo:
         indicators = {ticker: universe_indicators[ticker] for ticker in candidate_tickers if ticker in universe_indicators}
         
         # 그래프 구축 및 추론
-        graph = build_market_graph(markets, indicators, npu_scores=npu_scores)
+        graph = build_market_graph(markets, indicators, npu_scores=npu_scores, account=account)
         OntologyReasoner(graph).infer()
         
         # 전략 실행

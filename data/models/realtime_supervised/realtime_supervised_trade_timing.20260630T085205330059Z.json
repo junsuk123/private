@@ -1,0 +1,14 @@
+{
+  "artifact": {
+    "example_count": 0,
+    "examples": [],
+    "positive_labels": 0
+  },
+  "metadata": {
+    "label_source": "inference_action_plus_realtime_realized_pnl"
+  },
+  "model_family": "realtime_supervised",
+  "model_name": "realtime_supervised:trade_timing",
+  "saved_at": "2026-06-30T08:52:05.330059+00:00",
+  "simulated": false
+}

@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 
 from app.graph import KnowledgeGraph
-from app.schemas.domain import ClassifiedEvent, IndicatorSnapshot, MarketSnapshot
+from app.market_affordability import affordability_for_market
+from app.schemas.domain import AccountSnapshot, ClassifiedEvent, IndicatorSnapshot, MarketSnapshot
 from app.graph.event_mapper import add_events_to_graph
 from app.graph.npu_classifier import get_ontology_npu_classifier
 from app.strategy.investor_flow import assess_domestic_investor_flow
@@ -14,6 +15,7 @@ def build_market_graph(
     indicators: dict[str, IndicatorSnapshot],
     events: tuple[ClassifiedEvent, ...] = (),
     npu_scores: dict[str, tuple[float, ...]] | None = None,
+    account: AccountSnapshot | None = None,
 ) -> KnowledgeGraph:
     graph = KnowledgeGraph()
     markets = _scope_markets(markets)
@@ -25,6 +27,7 @@ def build_market_graph(
         graph.add(company, "hasTicker", market.ticker, market.source.source_id)
         graph.add(company, "belongsToSector", market.sector, market.source.source_id)
         graph.add(market.ticker, "isListedOn", market.market, market.source.source_id)
+        _add_account_affordability_to_graph(graph, market, account)
         _add_investor_flow_to_graph(graph, market)
 
         indicator = indicators.get(market.ticker)
@@ -120,3 +123,23 @@ def _add_investor_flow_to_graph(graph: KnowledgeGraph, market: MarketSnapshot) -
         graph.add(market.ticker, "contradictsSignal", factor, source_id)
     for factor in assessment.risk_factors:
         graph.add(market.ticker, "increasesRiskOf", factor, source_id)
+
+
+def _add_account_affordability_to_graph(
+    graph: KnowledgeGraph,
+    market: MarketSnapshot,
+    account: AccountSnapshot | None,
+) -> None:
+    if account is None:
+        return
+    result = affordability_for_market(market, account)
+    evidence_id = f"account-affordability:{market.ticker}:{account.captured_at.isoformat()}"
+    graph.add(market.ticker, "hasMarketCurrency", result.currency, evidence_id)
+    graph.add(market.ticker, "hasOneSharePrice", f"{result.last_price:.6f}", evidence_id)
+    graph.add(market.ticker, "hasAvailableCashForMarket", f"{result.available_cash:.6f}", evidence_id)
+    if result.affordable:
+        graph.add(market.ticker, "supportsSignal", "CashFitOneShare", evidence_id)
+        graph.add(market.ticker, "supportsSignal", "AffordableByAccountCash", evidence_id)
+    else:
+        graph.add(market.ticker, "contradictsSignal", "CashBelowOneSharePrice", evidence_id)
+        graph.add(market.ticker, "increasesRiskOf", "InsufficientAccountCashRisk", evidence_id)

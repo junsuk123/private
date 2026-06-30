@@ -492,7 +492,7 @@ def run_accelerated_demo(
         account = _account_from_state(cash, holdings, prices, timestamp)
         markets = _markets_at(bars_by_ticker, step)
         indicators = _indicators_at(bars_by_ticker, step)
-        graph = build_market_graph(markets, indicators)
+        graph = build_market_graph(markets, indicators, account=account)
         OntologyReasoner(graph).infer()
         plan = build_goal_execution_plan(goal, account, markets, indicators, graph)
         market_by_ticker = {market.ticker: market for market in markets}
@@ -742,6 +742,7 @@ def _account_from_state(
             quantity=quantity,
             average_price=prices[ticker],
             last_price=prices[ticker],
+            opened_at=timestamp,
         )
         for ticker, quantity in sorted(holdings.items())
         if quantity > 0

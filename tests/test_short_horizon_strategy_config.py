@@ -10,13 +10,13 @@ from app.trading_pipeline import (
 )
 
 
-def test_short_horizon_config_loads_conservative_execution_defaults() -> None:
+def test_short_horizon_config_loads_live_execution_defaults() -> None:
     config = load_short_horizon_strategy_config()
 
     assert config["execution"]["live_trading_enabled"] is True
     assert config["execution"]["default_mode"] == "paper_trading"
     assert config["strategy_candidate_factory"]["paper_only"] is False
-    assert config["reality_check"]["required_for_live"] is True
+    assert config["reality_check"]["required_for_live"] is False
 
 
 def test_pipeline_blocks_live_mode_when_config_disables_live_trading() -> None:
@@ -38,8 +38,8 @@ def test_factory_builds_from_loaded_config() -> None:
     factory = build_strategy_candidate_factory_from_config(load_short_horizon_strategy_config())
 
     assert factory.config.paper_only is False
-    assert factory.config.max_cost_to_alpha_ratio == 0.5
-    assert factory.config.max_spread_rate == 0.0015
+    assert factory.config.max_cost_to_alpha_ratio == 0.8
+    assert factory.config.max_spread_rate == 0.0025
 
 
 def _features() -> ShortHorizonFeatures:

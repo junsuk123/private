@@ -29,7 +29,7 @@ def build_portfolio_report(account: AccountSnapshot) -> PortfolioStatusReport:
 
     return PortfolioStatusReport(
         equity=equity,
-        cash_weight=account.cash / equity,
+        cash_weight=account.pure_cash / equity,
         position_weights=position_weights,
         sector_weights=sector_weights,
         daily_pnl_ratio=daily_pnl_ratio,

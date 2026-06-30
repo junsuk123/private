@@ -189,6 +189,11 @@ class KisEndpointSet:
             raise ValueError(f"unsupported overseas exchange for KIS order: {exchange_code}")
         return "V" + tr_id[1:] if self.paper else tr_id
 
+    def overseas_daytime_tr_id_for_order(self, side: OrderSide) -> str:
+        if side == OrderSide.BUY:
+            return "VTTT6036U" if self.paper else "TTTS6036U"
+        return "VTTT6037U" if self.paper else "TTTS6037U"
+
     @property
     def order_status_tr_id(self) -> str:
         return "VTTC8001R" if self.paper else "TTTC8001R"
@@ -198,8 +203,20 @@ class KisEndpointSet:
         return "VTTC8434R" if self.paper else "TTTC8434R"
 
     @property
+    def orderable_cash_tr_id(self) -> str:
+        return "VTTC8908R" if self.paper else "TTTC8908R"
+
+    @property
     def overseas_present_balance_tr_id(self) -> str:
         return "VTRP6504R" if self.paper else "CTRP6504R"
+
+    @property
+    def overseas_balance_tr_id(self) -> str:
+        return "VTTS3012R" if self.paper else "TTTS3012R"
+
+    @property
+    def overseas_orderable_cash_tr_id(self) -> str:
+        return "VTTS3007R" if self.paper else "TTTS3007R"
 
 
 class KisDevelopersApiClient:
@@ -279,9 +296,14 @@ class KisDevelopersApiClient:
     def _place_overseas_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
         exchange_code = _overseas_exchange_code(order.market)
         body = self._overseas_order_body(order, exchange_code)
+        path = "/uapi/overseas-stock/v1/trading/order"
+        tr_id = self.endpoints.overseas_tr_id_for_order(exchange_code, order.side)
+        if _is_us_daytime_order_session(order.market):
+            path = "/uapi/overseas-stock/v1/trading/daytime-order"
+            tr_id = self.endpoints.overseas_daytime_tr_id_for_order(order.side)
         response = self._post(
-            "/uapi/overseas-stock/v1/trading/order",
-            tr_id=self.endpoints.overseas_tr_id_for_order(exchange_code, order.side),
+            path,
+            tr_id=tr_id,
             body=body,
             include_hashkey=True,
         )
@@ -329,27 +351,45 @@ class KisDevelopersApiClient:
             holdings = tuple(self._holding_from_balance(row) for row in response.get("output1") or ())
             summary = response.get("output2") or response.get("output3") or []
             summary_row = summary[0] if isinstance(summary, list) and summary else summary
-            cash = _to_float(
-                summary_row.get("dnca_tot_amt")
-                or summary_row.get("prvs_rcdl_excc_amt")
-                or summary_row.get("tot_evlu_amt")
-            )
+            cash = _domestic_cash_from_balance_summary(summary_row, holdings)
+            try:
+                orderable_cash = self._get_domestic_orderable_cash()
+            except KisApiError:
+                orderable_cash = 0.0
+            if orderable_cash > 0:
+                cash = orderable_cash
             cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
         except KisApiError as exc:
             domestic_error = exc
+        overseas_holdings: tuple[Holding, ...] = ()
         try:
-            foreign_cash_by_currency, overseas_assets_krw = self._get_overseas_cash_balance()
+            overseas_holdings = self._get_overseas_holdings()
+        except Exception:
+            overseas_holdings = ()
+        try:
+            foreign_cash_by_currency, foreign_cash_krw, total_assets_krw = self._get_overseas_cash_balance()
         except KisApiError:
             if domestic_error is not None:
                 raise domestic_error
             raise
-        if domestic_error is not None and not foreign_cash_by_currency and overseas_assets_krw <= 0:
+        try:
+            foreign_orderable = self._get_overseas_orderable_cash_by_currency()
+        except Exception:
+            foreign_orderable = {}
+        foreign_cash_by_currency.update(foreign_orderable)
+        if domestic_error is not None and not foreign_cash_by_currency and foreign_cash_krw <= 0:
             raise domestic_error
         cash_by_currency.update(foreign_cash_by_currency)
-        cash_equivalent_krw = cash + overseas_assets_krw
+        all_holdings = holdings + overseas_holdings
+        domestic_position_value = sum(max(0.0, holding.market_value) for holding in holdings)
+        raw_position_value = sum(max(0.0, holding.market_value) for holding in all_holdings)
+        cash_equivalent_krw = cash + foreign_cash_krw
+        has_overseas_assets = bool(overseas_holdings) or foreign_cash_krw > 0
+        if has_overseas_assets and total_assets_krw >= cash + domestic_position_value:
+            cash_equivalent_krw = max(0.0, total_assets_krw - raw_position_value)
         account = AccountSnapshot(
             cash=cash,
-            holdings=holdings,
+            holdings=all_holdings,
             base_currency="KRW",
             cash_by_currency=cash_by_currency,
             cash_equivalent_krw=cash_equivalent_krw,
@@ -625,7 +665,7 @@ class KisDevelopersApiClient:
             "CANO": self.credentials.account_no,
             "ACNT_PRDT_CD": self.credentials.account_product_code,
             "PDNO": order.ticker,
-            "ORD_DVSN": "00",
+            "ORD_DVSN": _domestic_order_division_code(),
             "ORD_QTY": str(int(order.quantity)),
             "ORD_UNPR": str(int(round(order.limit_price))),
             "EXCG_ID_DVSN_CD": "KRX",
@@ -683,6 +723,27 @@ class KisDevelopersApiClient:
             "CTX_AREA_NK100": "",
         }
 
+    def _domestic_orderable_cash_params(self) -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "PDNO": "",
+            "ORD_UNPR": "",
+            "ORD_DVSN": "00",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+
+    def _get_domestic_orderable_cash(self) -> float:
+        response = self._get(
+            "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            tr_id=self.endpoints.orderable_cash_tr_id,
+            params=self._domestic_orderable_cash_params(),
+        )
+        self._ensure_success(response, "KIS domestic orderable-cash lookup failed")
+        output = response.get("output") or {}
+        return _first_float(output, "ord_psbl_cash")
+
     def _overseas_present_balance_params(self, nation_code: str = "000") -> dict[str, str]:
         return {
             "CANO": self.credentials.account_no,
@@ -693,9 +754,34 @@ class KisDevelopersApiClient:
             "INQR_DVSN_CD": "00",
         }
 
-    def _get_overseas_cash_balance(self) -> tuple[dict[str, float], float]:
+    def _overseas_balance_params(self, exchange_code: str = "") -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "OVRS_EXCG_CD": exchange_code,
+            "TR_CRCY_CD": "USD",
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+
+    def _get_overseas_holdings(self) -> tuple[Holding, ...]:
+        response = self._get(
+            "/uapi/overseas-stock/v1/trading/inquire-balance",
+            tr_id=self.endpoints.overseas_balance_tr_id,
+            params=self._overseas_balance_params(),
+        )
+        self._ensure_success(response, "KIS overseas balance lookup failed")
+        holdings = tuple(
+            holding
+            for row in _response_rows(response)
+            if (holding := self._overseas_holding_from_balance(row)) is not None
+        )
+        return holdings
+
+    def _get_overseas_cash_balance(self) -> tuple[dict[str, float], float, float]:
         balances: dict[str, float] = {}
-        overseas_assets_krw = 0.0
+        foreign_cash_krw = 0.0
+        total_assets_krw = 0.0
         for nation_code in ("000", "840"):
             try:
                 response = self._get(
@@ -706,13 +792,41 @@ class KisDevelopersApiClient:
                 self._ensure_success(response, "KIS overseas present balance lookup failed")
             except KisApiError:
                 if nation_code == "840":
-                    return balances, overseas_assets_krw
+                    return balances, foreign_cash_krw, total_assets_krw
                 continue
             balances.update(_foreign_cash_by_currency_from_overseas_response(response, nation_code))
-            overseas_assets_krw = max(overseas_assets_krw, _overseas_assets_krw_from_response(response))
-            if balances or overseas_assets_krw > 0:
+            foreign_cash_krw = max(foreign_cash_krw, _foreign_cash_krw_from_overseas_response(response))
+            total_assets_krw = max(total_assets_krw, _total_assets_krw_from_overseas_response(response))
+            if balances or foreign_cash_krw > 0 or total_assets_krw > 0:
                 break
-        return balances, overseas_assets_krw
+        return balances, foreign_cash_krw, total_assets_krw
+
+    def _overseas_orderable_cash_params(self, currency: str = "USD", exchange_code: str = "NASD") -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "OVRS_EXCG_CD": exchange_code,
+            "TR_CRCY_CD": currency,
+            "ORD_UNPR": "",
+            "ITEM_CD": "",
+        }
+
+    def _get_overseas_orderable_cash_by_currency(self) -> dict[str, float]:
+        balances: dict[str, float] = {}
+        for currency, exchange in (("USD", "NASD"),):
+            try:
+                response = self._get(
+                    "/uapi/overseas-stock/v1/trading/inquire-psamount",
+                    tr_id=self.endpoints.overseas_orderable_cash_tr_id,
+                    params=self._overseas_orderable_cash_params(currency, exchange),
+                )
+                self._ensure_success(response, "KIS overseas orderable-cash lookup failed")
+            except KisApiError:
+                continue
+            amount = _overseas_orderable_amount_from_response(response)
+            if amount > 0:
+                balances[currency] = amount
+        return balances
 
     def _execution_from_status(
         self,
@@ -742,6 +856,7 @@ class KisDevelopersApiClient:
         quantity = int(_to_float(row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
         average_price = _to_float(row.get("pchs_avg_pric") or 0)
         last_price = _to_float(row.get("prpr") or row.get("bfdy_cprs_icdc") or average_price)
+        opened_at = self._holding_opened_at_from_balance(row)
         return Holding(
             ticker=str(row.get("pdno") or ""),
             market="KR",
@@ -750,7 +865,46 @@ class KisDevelopersApiClient:
             quantity=quantity,
             average_price=average_price,
             last_price=last_price,
+            opened_at=opened_at,
         )
+
+    def _overseas_holding_from_balance(self, row: dict[str, Any]) -> Holding | None:
+        ticker = str(
+            row.get("ovrs_pdno")
+            or row.get("pdno")
+            or row.get("symb")
+            or row.get("prdt_code")
+            or ""
+        ).upper().strip()
+        quantity = int(_to_float(row.get("ovrs_cblc_qty") or row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
+        if not ticker or quantity <= 0:
+            return None
+        average_price = _first_float(row, "pchs_avg_pric", "avg_unpr", "frcr_pchs_amt1")
+        last_price = _first_float(row, "now_pric2", "ovrs_now_pric1", "last", "prpr", "evlu_pfls_rt")
+        if last_price <= 0:
+            market_value = _first_float(row, "ovrs_stck_evlu_amt", "frcr_evlu_amt", "evlu_amt", "pchs_amt")
+            last_price = market_value / quantity if market_value > 0 else average_price
+        return Holding(
+            ticker=ticker,
+            market=_overseas_exchange_code(str(row.get("ovrs_excg_cd") or row.get("tr_mket_name") or "")),
+            company_name=str(row.get("ovrs_item_name") or row.get("prdt_name") or ticker),
+            sector="Unknown",
+            quantity=quantity,
+            average_price=average_price,
+            last_price=last_price,
+            opened_at=self._holding_opened_at_from_balance(row),
+        )
+
+    @staticmethod
+    def _holding_opened_at_from_balance(row: dict[str, Any]) -> datetime | None:
+        for date_key in ("pchs_dt", "acqs_dt", "bns_dt", "ord_dt", "buy_dt"):
+            value = str(row.get(date_key) or "").strip()
+            if len(value) == 8 and value.isdigit():
+                try:
+                    return datetime.strptime(value, "%Y%m%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+        return None
 
     def _url(self, path: str) -> str:
         return f"{self.endpoints.base_url.rstrip('/')}/{path.lstrip('/')}"
@@ -791,6 +945,31 @@ def _first_float(data: dict[str, Any], *keys: str) -> float:
         value = _to_float(data.get(key))
         if value > 0:
             return value
+    return 0.0
+
+
+def _domestic_cash_from_balance_summary(summary_row: dict[str, Any], holdings: tuple[Holding, ...]) -> float:
+    explicit_cash = _first_float(
+        summary_row,
+        "dnca_tot_amt",
+        "prvs_rcdl_excc_amt",
+        "d2_auto_rdpt_amt",
+        "cash",
+    )
+    if explicit_cash > 0:
+        return explicit_cash
+    total_evaluation = _first_float(summary_row, "tot_evlu_amt", "tot_asst_amt", "real_nass_amt")
+    stock_evaluation = _first_float(
+        summary_row,
+        "scts_evlu_amt",
+        "evlu_amt_smtl_amt",
+        "pchs_amt_smtl_amt",
+        "stock_evlu_amt",
+    )
+    if stock_evaluation <= 0:
+        stock_evaluation = sum(max(0.0, holding.market_value) for holding in holdings)
+    if total_evaluation > 0 and stock_evaluation > 0:
+        return max(0.0, total_evaluation - stock_evaluation)
     return 0.0
 
 
@@ -870,6 +1049,46 @@ def _format_overseas_price(value: float) -> str:
     return text if text else "0"
 
 
+def _domestic_order_division_code(now: datetime | None = None) -> str:
+    forced = os.getenv("KIS_DOMESTIC_ORD_DVSN", "").strip()
+    if forced:
+        return forced
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return "00"
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(ZoneInfo("Asia/Seoul"))
+    minute = local.hour * 60 + local.minute
+    if 8 * 60 + 30 <= minute < 8 * 60 + 40:
+        return "05"
+    if 15 * 60 + 40 <= minute < 16 * 60:
+        return "06"
+    if 16 * 60 <= minute <= 18 * 60:
+        return "07"
+    return "00"
+
+
+def _is_us_daytime_order_session(market: str, now: datetime | None = None) -> bool:
+    market_name = str(market or "").upper()
+    if not any(token in market_name for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "OVERSEAS")):
+        return False
+    if os.getenv("KIS_FORCE_OVERSEAS_DAYTIME_ORDER", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(ZoneInfo("Asia/Seoul"))
+    minute = local.hour * 60 + local.minute
+    return local.weekday() < 5 and 9 * 60 <= minute <= 16 * 60 + 50
+
+
 def _cash_by_currency_from_summary(summary_row: dict[str, Any], krw_cash: float) -> dict[str, float]:
     cash_by_currency: dict[str, float] = {"KRW": float(krw_cash or 0.0)}
     explicit = summary_row.get("cash_by_currency")
@@ -915,26 +1134,22 @@ def _foreign_cash_by_currency_from_overseas_response(
     return balances
 
 
-def _overseas_assets_krw_from_response(response: dict[str, Any]) -> float:
+def _foreign_cash_krw_from_overseas_response(response: dict[str, Any]) -> float:
     best = 0.0
     for row in _response_rows(response):
-        for key in (
-            "ovrs_tot_asst_amt",
-            "frcr_evlu_tota",
-            "frcr_evlu_amt2",
-            "wcrc_frcr_evlu_amt",
-            "krw_evlu_amt",
-            "evlu_amt_wcrc",
-            "wcrc_tot_evlu_amt",
-            "wcrc_tot_asst_amt",
-        ):
+        amount = _foreign_cash_amount_from_row(row)
+        rate = _exchange_rate_from_row(row)
+        if amount is not None and rate > 0:
+            best = max(best, amount * rate)
+    return best
+
+
+def _total_assets_krw_from_overseas_response(response: dict[str, Any]) -> float:
+    best = 0.0
+    for row in _response_rows(response):
+        for key in ("tot_asst_amt", "tot_asst_amt2", "tot_frcr_cblc_smtl"):
             if key in row:
                 best = max(best, _to_float(row.get(key)))
-        if best <= 0:
-            amount = _foreign_cash_amount_from_row(row)
-            rate = _exchange_rate_from_row(row)
-            if amount is not None and rate > 0:
-                best = max(best, amount * rate)
     return best
 
 
@@ -964,6 +1179,14 @@ def _response_rows(value: Any) -> list[dict[str, Any]]:
                 "bass_exrt",
                 "aply_exrt",
                 "frst_bltn_exrt",
+                "ovrs_pdno",
+                "ovrs_item_name",
+                "ovrs_cblc_qty",
+                "ovrs_stck_evlu_amt",
+                "ord_psbl_amt",
+                "ovrs_ord_psbl_amt",
+                "max_ord_psbl_amt",
+                "frcr_ord_psbl_amt1",
             )
         ):
             rows.append(value)
@@ -1003,6 +1226,24 @@ def _foreign_cash_amount_from_row(row: dict[str, Any]) -> float | None:
         if key in row:
             return _to_float(row.get(key))
     return None
+
+
+def _overseas_orderable_amount_from_response(response: dict[str, Any]) -> float:
+    best = 0.0
+    for row in _response_rows(response):
+        for key in (
+            "ord_psbl_amt",
+            "ovrs_ord_psbl_amt",
+            "max_ord_psbl_amt",
+            "frcr_ord_psbl_amt1",
+            "frcr_ord_psbl_amt",
+            "buy_psbl_amt",
+            "ord_psbl_frcr_amt",
+            "frcr_buy_psbl_amt",
+        ):
+            if key in row:
+                best = max(best, _to_float(row.get(key)))
+    return best
 
 
 def _exchange_rate_from_row(row: dict[str, Any]) -> float:

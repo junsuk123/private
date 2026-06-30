@@ -68,6 +68,8 @@ class RecordingKisTransport:
                 ],
                 "output2": [{"dnca_tot_amt": "1000000"}],
             }
+        if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+            return {"rt_cd": "0", "output": {"ord_psbl_cash": "1000000"}}
         if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
             return {
                 "rt_cd": "0",
@@ -200,6 +202,12 @@ class MockKisApiTest(unittest.TestCase):
 
         status_call = next(call for call in transport.calls if call["url"].endswith("/inquire-daily-ccld"))
         self.assertEqual(status_call["params"]["EXCG_ID_DVSN_CD"], "KRX")
+        orderable_cash_call = next(call for call in transport.calls if call["url"].endswith("/inquire-psbl-order"))
+        self.assertEqual(orderable_cash_call["headers"]["tr_id"], "VTTC8908R")
+        self.assertEqual(orderable_cash_call["params"]["PDNO"], "")
+        self.assertEqual(orderable_cash_call["params"]["ORD_UNPR"], "")
+        self.assertEqual(orderable_cash_call["params"]["CMA_EVLU_AMT_ICLD_YN"], "N")
+        self.assertEqual(orderable_cash_call["params"]["OVRS_ICLD_YN"], "N")
 
     def test_kis_access_token_is_reused_from_cache_across_clients(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -316,6 +324,88 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(portfolio.account.equity, 1_158_042)
         self.assertEqual(portfolio.account.cash_by_currency["KRW"], 1_000_000)
         self.assertEqual(portfolio.account.cash_by_currency["USD"], 12.34)
+
+    def test_kis_portfolio_uses_domestic_orderable_cash_before_deposit_total(self) -> None:
+        class OrderableCashTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [
+                            {
+                                "pdno": "005930",
+                                "prdt_name": "Samsung Electronics",
+                                "hldg_qty": "2",
+                                "pchs_avg_pric": "70000",
+                                "prpr": "71000",
+                            }
+                        ],
+                        "output2": [{"dnca_tot_amt": "1000000"}],
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "750000"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {"rt_cd": "0", "output2": [], "output3": {"tot_asst_amt": "0"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=True,
+            enabled=True,
+            transport=OrderableCashTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.cash, 750_000)
+        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 750_000)
+        self.assertEqual(portfolio.account.securities_market_value, 142_000)
+        self.assertEqual(portfolio.account.equity, 892_000)
+
+    def test_kis_balance_does_not_treat_total_evaluation_as_cash(self) -> None:
+        class BalanceOnlyTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [
+                            {
+                                "pdno": "005930",
+                                "prdt_name": "Samsung Electronics",
+                                "hldg_qty": "2",
+                                "pchs_avg_pric": "70000",
+                                "prpr": "71000",
+                            }
+                        ],
+                        "output2": [{"tot_evlu_amt": "1142000", "scts_evlu_amt": "142000"}],
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "1", "msg1": "temporary orderable cash lookup failure"}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {"rt_cd": "0", "output2": [], "output3": {"tot_asst_amt": "999999999"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=True,
+            enabled=True,
+            transport=BalanceOnlyTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.cash, 1_000_000)
+        self.assertEqual(portfolio.account.cash_equivalent_krw, 1_000_000)
+        self.assertEqual(portfolio.account.securities_market_value, 142_000)
+        self.assertEqual(portfolio.account.equity, 1_142_000)
 
 
 def _supportive_npu_scores(markets):

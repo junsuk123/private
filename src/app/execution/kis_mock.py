@@ -135,6 +135,7 @@ class MockKisDevelopersApi:
                 quantity=order.quantity,
                 average_price=price,
                 last_price=price,
+                opened_at=datetime.now(timezone.utc),
             )
         else:
             total_quantity = current.quantity + order.quantity

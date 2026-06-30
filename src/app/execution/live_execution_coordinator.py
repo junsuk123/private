@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.config import OrderExecutionConfig, load_order_execution_config
+from app.config.live_config import LiveConfigError, load_live_trading_safety_config
 from app.execution.idempotency_store import IdempotencyStore
+from app.execution.kis_real import KisApiError
 from app.execution.kis_auth import run_kis_health_check
 from app.execution.kis_errors import LiveExecutionBlocked
 from app.execution.kis_types import LiveOrderSubmission
@@ -66,9 +69,25 @@ class LiveExecutionCoordinator:
         try:
             receipt = self.broker.place_limit_order(order)
         except Exception as exc:
+            error_payload: dict[str, Any] | None = None
+            if isinstance(exc, KisApiError):
+                response = getattr(exc, "response", None)
+                if isinstance(response, dict):
+                    error_payload = {
+                        "rt_cd": response.get("rt_cd"),
+                        "msg_cd": response.get("msg_cd"),
+                        "msg1": response.get("msg1"),
+                        "http_status": response.get("http_status"),
+                    }
             self.journal.record(
                 "live_order_submission_error",
-                {"execution_id": execution_id, "idempotency_key": key, "error_type": exc.__class__.__name__},
+                {
+                    "execution_id": execution_id,
+                    "idempotency_key": key,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                    "error_payload": error_payload,
+                },
             )
             raise
 
@@ -101,8 +120,9 @@ class LiveExecutionCoordinator:
         return snapshot
 
     def _preflight_failures(self) -> list[str]:
+        require_manual_arming = _require_manual_arming()
         failures = list(
-            evaluate_live_runtime_gates(require_manual_arming=True).failures
+            evaluate_live_runtime_gates(require_manual_arming=require_manual_arming).failures
         )
         health = run_kis_health_check(self.broker, include_account=True, include_websocket=True)
         if not health.ok:
@@ -152,3 +172,13 @@ def _supported_live_symbol(order: FinalOrder) -> bool:
         for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
     )
     return overseas_market and ticker.replace(".", "").replace("-", "").isalnum()
+
+
+def _require_manual_arming() -> bool:
+    env_value = os.getenv("REQUIRE_MANUAL_ARMING")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        return bool(load_live_trading_safety_config().require_manual_arming)
+    except LiveConfigError:
+        return True

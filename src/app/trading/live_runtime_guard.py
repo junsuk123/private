@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 ARMING_FILE = Path("config/secrets/live_trading_armed.json")
+SECRETS_ENV_FILE = Path("config/secrets/kis_api_keys.env")
 
 
 @dataclass(frozen=True)
@@ -19,8 +20,26 @@ class LiveRuntimeGateResult:
 def env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
+        value = _env_from_secrets_file(name)
+    if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_from_secrets_file(name: str) -> str | None:
+    if not SECRETS_ENV_FILE.exists():
+        return None
+    try:
+        for raw_line in SECRETS_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == name:
+                return value.strip()
+    except OSError:
+        return None
+    return None
 
 
 def live_flag_failures() -> list[str]:

@@ -26,6 +26,8 @@ class RecordingKisTransport:
             return {"approval_key": "approval"}
         if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
             return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "1000000"}]}
+        if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+            return {"rt_cd": "0", "output": {"ord_psbl_cash": "1000000"}}
         if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
             return {"rt_cd": "0", "output1": []}
         raise AssertionError(f"unexpected request: {url}")

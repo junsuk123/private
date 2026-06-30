@@ -68,7 +68,7 @@ from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
-from app.backtesting.accelerated_demo import load_krx_listed_universe
+from app.backtesting.accelerated_demo import load_krx_listed_universe, load_us_listed_universe
 from app.market_affordability import (
     cash_available_for_market,
     is_market_affordable_for_account,
@@ -205,6 +205,7 @@ _operation_mode_state: dict[str, Any] = {
         "updated_at": None,
         "last_error": None,
     },
+      "live_trading_baseline_equity": None,
 }
 
 
@@ -235,12 +236,12 @@ def _principal_config_with_live_account_basis(config: PrincipalProtectionConfig)
   basis = _last_live_account_basis()
   if basis is None:
     return config
-  equity = max(0.0, float(basis.get("equity") or 0.0))
-  if equity <= 0:
+  principal_cash = max(0.0, float(basis.get("cash") or 0.0))
+  if principal_cash <= 0:
     return config
-  if abs(float(config.initial_principal or 0.0) - equity) < 1.0:
+  if abs(float(config.initial_principal or 0.0) - principal_cash) < 1.0:
     return config
-  updated = _principal_config_from_payload({**asdict(config), "initial_principal": equity})
+  updated = _principal_config_from_payload({**asdict(config), "initial_principal": principal_cash})
   _save_principal_protection_config(updated)
   return updated
 
@@ -311,7 +312,7 @@ def _principal_protection_account_snapshot(config: PrincipalProtectionConfig) ->
         holdings=(),
         base_currency=str(live_basis.get("base_currency") or "KRW"),
         cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
-        cash_equivalent_krw=max(0.0, float(live_basis.get("equity") or 0.0)),
+        cash_equivalent_krw=max(0.0, float(live_basis.get("cash_equivalent_krw") or live_basis.get("cash") or 0.0)),
         captured_at=datetime.now(timezone.utc),
     )
   with _live_lock:
@@ -362,11 +363,11 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   if not connection or not connection.get("account_checked"):
     return None
   krw_cash = _number_or_zero(connection.get("krw_cash") or connection.get("actual_deposit") or 0)
-  cash = _number_or_zero(connection.get("cash") or connection.get("cash_equivalent_krw") or krw_cash)
+  cash = krw_cash if krw_cash > 0 else _number_or_zero(connection.get("cash") or 0)
   cash_by_currency = _cash_by_currency_payload(connection.get("cash_by_currency"), krw_cash)
   foreign_cash_krw = _number_or_zero(connection.get("foreign_cash_krw") or 0)
   if cash <= 0:
-    cash = krw_cash + foreign_cash_krw
+    cash = krw_cash
   equity = _number_or_zero(
       connection.get("actual_equity")
       or connection.get("equity")
@@ -379,15 +380,19 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
     equity = cash + invested
   if equity <= 0:
     return None
+  cash = max(0.0, cash)
+  krw_cash_value = max(0.0, cash_by_currency.get("KRW", krw_cash))
   return {
-      "cash": cash if cash > 0 else equity,
-      "krw_cash": cash_by_currency.get("KRW", krw_cash if krw_cash > 0 else equity),
+      "cash": cash,
+      "krw_cash": krw_cash_value,
       "foreign_cash_krw": foreign_cash_krw,
+      "cash_equivalent_krw": cash + foreign_cash_krw,
       "cash_by_currency": cash_by_currency,
       "foreign_cash_by_currency": _foreign_cash_by_currency(cash_by_currency),
       "base_currency": "KRW",
       "equity": equity,
-      "cash_weight": max(0.0, min(1.0, (cash if cash > 0 else equity) / equity)),
+      "invested_value": invested,
+      "cash_weight": max(0.0, min(1.0, cash / equity)),
       "source": "kis_live_account",
       "account_suffix": connection.get("account_suffix") or "",
   }
@@ -421,7 +426,8 @@ def _merge_live_account_basis_with_previous(
   merged["cash_by_currency"] = cash_by_currency
   merged["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
   merged["krw_cash"] = previous_krw_cash
-  merged["cash"] = max(_number_or_zero(merged.get("cash")), previous_krw_cash + foreign_cash_krw)
+  merged["cash"] = max(_number_or_zero(merged.get("cash")), previous_krw_cash)
+  merged["cash_equivalent_krw"] = max(_number_or_zero(merged.get("cash_equivalent_krw")), previous_krw_cash + foreign_cash_krw)
   merged["equity"] = max(_number_or_zero(merged.get("equity")), previous_krw_cash + foreign_cash_krw)
   if _number_or_zero(merged.get("equity")) > 0:
     merged["cash_weight"] = max(0.0, min(1.0, _number_or_zero(merged.get("cash")) / _number_or_zero(merged.get("equity"))))
@@ -431,12 +437,14 @@ def _merge_live_account_basis_with_previous(
 def _connection_with_account_basis(connection: dict[str, Any], basis: dict[str, Any]) -> dict[str, Any]:
   merged = dict(connection)
   merged["cash"] = basis.get("cash", merged.get("cash"))
+  merged["cash_equivalent_krw"] = basis.get("cash_equivalent_krw", merged.get("cash_equivalent_krw"))
   merged["actual_deposit"] = basis.get("krw_cash", merged.get("actual_deposit"))
   merged["krw_cash"] = basis.get("krw_cash", merged.get("krw_cash"))
   merged["foreign_cash_krw"] = basis.get("foreign_cash_krw", merged.get("foreign_cash_krw"))
   merged["cash_by_currency"] = basis.get("cash_by_currency", merged.get("cash_by_currency"))
   merged["foreign_cash_by_currency"] = basis.get("foreign_cash_by_currency", merged.get("foreign_cash_by_currency"))
   merged["actual_equity"] = basis.get("equity", merged.get("actual_equity"))
+  merged["invested_value"] = basis.get("invested_value", merged.get("invested_value"))
   merged["cash_weight"] = basis.get("cash_weight", merged.get("cash_weight"))
   return merged
 
@@ -449,7 +457,7 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
       cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
       holdings=(),
       cash_by_currency=dict(basis.get("cash_by_currency") or {}),
-      cash_equivalent_krw=max(0.0, float(basis["equity"])),
+      cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis["cash"])),
       captured_at=datetime.now(timezone.utc),
   )
 
@@ -464,32 +472,51 @@ def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
       holdings=(),
       base_currency=str(basis.get("base_currency") or "KRW"),
       cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
-      cash_equivalent_krw=max(0.0, float(basis.get("cash") or 0.0)),
+      cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis.get("cash") or 0.0)),
       captured_at=datetime.now(timezone.utc),
   )
 
 
 def _live_risk_rules_for_account(account: AccountSnapshot | None) -> RiskRules:
+  try:
+    safety = load_live_trading_safety_config()
+  except LiveConfigError:
+    safety = None
+
   if account is None:
-    return RiskRules(live_trading_enabled=True)
+    if safety is None:
+      return RiskRules(live_trading_enabled=True)
+    return RiskRules(
+        live_trading_enabled=True,
+        max_single_stock_weight=max(0.01, float(safety.maximum_position_pct_of_equity)),
+        max_intraday_position_weight=max(0.01, float(safety.maximum_single_order_pct_of_cash)),
+      max_sector_weight=1.0,
+      minimum_cash_reserve=0.05,
+        max_trades_per_day=max(1, int(safety.maximum_orders_per_day)),
+        max_volatility=max(0.001, float(safety.maximum_volatility_5m_bps) / 10_000.0),
+        min_data_quality_score=max(0.0, min(1.0, float(safety.minimum_source_quality_score))),
+        max_quote_age_seconds=max(1.0, float(safety.max_quote_age_ms) / 1000.0),
+        manual_approval_required=bool(safety.require_manual_arming),
+    )
+
   equity = max(0.0, float(account.equity or 0.0))
-  try:
-    small_account_threshold = max(0.0, float(os.getenv("LIVE_SMALL_ACCOUNT_THRESHOLD_KRW", "50000")))
-  except ValueError:
-    small_account_threshold = 50000.0
-  if equity <= 0 or equity > small_account_threshold:
-    return RiskRules(live_trading_enabled=True)
-  try:
-    min_adv = max(1.0, float(os.getenv("LIVE_SMALL_ACCOUNT_MIN_ADV_KRW", "100000000")))
-  except ValueError:
-    min_adv = 100000000.0
+  if safety is None:
+    return RiskRules(
+        live_trading_enabled=True,
+        min_average_daily_trading_value=max(1_000.0, equity * 0.02),
+    )
   return RiskRules(
       live_trading_enabled=True,
-      max_single_stock_weight=1.0,
-      max_intraday_position_weight=1.0,
+      max_single_stock_weight=max(0.01, float(safety.maximum_position_pct_of_equity)),
+      max_intraday_position_weight=max(0.01, float(safety.maximum_single_order_pct_of_cash)),
       max_sector_weight=1.0,
-      minimum_cash_reserve=0.0,
-      min_average_daily_trading_value=min_adv,
+      minimum_cash_reserve=0.05,
+      max_trades_per_day=max(1, int(safety.maximum_orders_per_day)),
+      max_volatility=max(0.001, float(safety.maximum_volatility_5m_bps) / 10_000.0),
+      min_data_quality_score=max(0.0, min(1.0, float(safety.minimum_source_quality_score))),
+      max_quote_age_seconds=max(1.0, float(safety.max_quote_age_ms) / 1000.0),
+      manual_approval_required=bool(safety.require_manual_arming),
+      min_average_daily_trading_value=max(1_000.0, equity * 0.02),
   )
 
 
@@ -537,7 +564,7 @@ def _resolve_operating_initial_cash(payload: dict[str, Any], default: float = 10
   if source in {"auto", "live", "live_account", "kis_live_account"} or "initial_cash" not in payload:
     basis = _last_live_account_basis()
     if basis is not None:
-      return max(1.0, float(basis["equity"]))
+      return max(1.0, float(basis["cash"]))
     if source in {"auto", "live", "live_account", "kis_live_account"}:
       _start_auto_live_readiness_check()
   return max(100_000.0, float(payload.get("initial_cash", default)))
@@ -806,6 +833,7 @@ def _clear_live_analysis_cache_unlocked() -> None:
   _live_state["graph_payload_context_id"] = None
   _live_state["store_summary"] = store_summary
   _live_state["stored_new_records"] = {}
+  _live_state["live_trading_baseline_equity"] = None
 
 
 @app.on_event("startup")
@@ -837,6 +865,7 @@ def status() -> JSONResponse:
     return _json(
       {
         "cash": live_basis["cash"],
+        "cash_equivalent_krw": live_basis.get("cash_equivalent_krw", live_basis["cash"]),
         "krw_cash": live_basis["krw_cash"],
         "foreign_cash_krw": live_basis["foreign_cash_krw"],
         "cash_by_currency": live_basis["cash_by_currency"],
@@ -852,7 +881,10 @@ def status() -> JSONResponse:
         "risk_rejections": [],
       }
     )
-  snapshot = _get_or_refresh_live()
+  snapshot = _live_snapshot()
+  if snapshot["context"] is None or snapshot["research_result"] is None:
+    _build_current_snapshot_from_store()
+    snapshot = _live_snapshot()
   context = snapshot["context"]
   return _json(
     {
@@ -1028,9 +1060,20 @@ LIVE_FLAG_VALUES = {
     "KIS_LIVE_ENABLED": "true",
     "KIS_PAPER_TRADING": "false",
     "LIVE_ORDER_SUBMIT_ENABLED": "true",
-    "REQUIRE_MANUAL_ARMING": "true",
+    "REQUIRE_MANUAL_ARMING": "false",
     "KILL_SWITCH_ENABLED": "false",
 }
+
+
+def _manual_arming_required() -> bool:
+    env_value = os.getenv("REQUIRE_MANUAL_ARMING")
+    if env_value is not None:
+      return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    try:
+      safety = load_live_trading_safety_config()
+      return bool(safety.require_manual_arming)
+    except LiveConfigError:
+      return True
 
 
 @app.get("/api/live-flags/status")
@@ -1053,19 +1096,23 @@ async def live_flags_apply(request: Request) -> JSONResponse:
 def _live_flags_status_payload(applied: bool = False) -> dict[str, Any]:
     readiness = _web_live_readiness_summary(include_kis_health=False)
     live_ready = bool(readiness["ok"])
+    manual_arming_required = _manual_arming_required()
+    if live_ready:
+      if manual_arming_required:
+        message = "Live flags are active. Orders still require readiness success and manual arming."
+      else:
+        message = "Live flags are active. Orders can be submitted when readiness gates pass."
+    else:
+      message = "Live flags are active. Live orders remain safely blocked until readiness gates pass."
     return {
         "ok": True,
         "applied": applied,
         "live_ready": live_ready,
         "flags": {key: os.getenv(key) for key in LIVE_FLAG_VALUES},
-        "manual_arming_required": True,
+        "manual_arming_required": manual_arming_required,
         "orders_submitted": False,
         "readiness": readiness,
-        "message": (
-            "Live flags are active. Orders still require readiness success and manual arming."
-            if live_ready
-            else "Live flags are active. Live orders remain safely blocked until readiness gates pass."
-        ),
+        "message": message,
     }
 
 
@@ -1261,7 +1308,10 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["kis_connection"] = kis_connection
         with _live_lock:
           _operation_mode_state["last_kis_connection"] = kis_connection
-        result["live_trading_status"] = "armed" if config_live_enabled and env_live_enabled and kis_connection.get("ok") else "blocked"
+        runtime_gate = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
+        result["runtime_gate"] = {"ok": runtime_gate.ok, "failures": tuple(runtime_gate.failures)}
+        result["live_order_journal"] = _live_order_journal_snapshot()
+        result["live_trading_status"] = "armed" if config_live_enabled and env_live_enabled and kis_connection.get("ok") and runtime_gate.ok else "blocked"
         result["live_trading_enabled_by_config"] = config_live_enabled
         result["live_trading_enabled_by_env"] = env_live_enabled
         result["live_trading_message"] = (
@@ -1269,10 +1319,15 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
             "RealityCheck, ontology checks, RiskManager, and FinalTradeGate approval."
             if result["live_trading_status"] == "armed"
             else (
-                "Live auto-trading is blocked. Enable execution.live_trading_enabled in config "
-                "and set LIVE_TRADING_ENABLED=true plus KIS_LIVE_ENABLED=true after validation."
+                "Live auto-trading is blocked. Check config/env/runtime gate failures: "
+                + ", ".join(tuple(runtime_gate.failures) or ("CONFIG_OR_KIS_CONNECTION_NOT_READY",))
             )
         )
+        if kis_connection.get("account_checked"):
+          with _live_lock:
+            _operation_mode_state["live_trading_baseline_equity"] = float(
+                kis_connection.get("actual_equity") or kis_connection.get("equity") or kis_connection.get("account_value") or 0.0
+            )
         _ensure_background_refresh()
 
       _set_operation_request(False, "started", f"{mode} started", None)
@@ -1328,7 +1383,7 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
                     if holding.quantity > 0 and holding.average_price > 0
                     else 0.0
                 ),
-                "currency": "KRW",
+                "currency": "KRW" if str(holding.ticker).isdigit() and len(str(holding.ticker)) == 6 else "USD",
             }
             for holding in portfolio.account.holdings
         ]
@@ -1342,17 +1397,41 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         if cash_equivalent_krw <= 0:
           cash_equivalent_krw = portfolio.account.cash
         foreign_cash_krw = max(0.0, cash_equivalent_krw - krw_cash)
-        result["cash"] = cash_equivalent_krw
+        usd_cash = _number_or_zero(cash_by_currency.get("USD", 0.0))
+        usd_krw_rate = foreign_cash_krw / usd_cash if usd_cash > 0 and foreign_cash_krw > 0 else 0.0
+        invested_value_krw = 0.0
+        for position in result["positions"]:
+          currency = str(position.get("currency") or "KRW").upper()
+          market_value = _number_or_zero(position.get("market_value"))
+          if currency == "USD" and usd_krw_rate > 0:
+            position["market_value_krw"] = market_value * usd_krw_rate
+            position["unrealized_pnl_krw"] = _number_or_zero(position.get("unrealized_pnl")) * usd_krw_rate
+          else:
+            position["market_value_krw"] = market_value
+            position["unrealized_pnl_krw"] = _number_or_zero(position.get("unrealized_pnl"))
+          invested_value_krw += _number_or_zero(position.get("market_value_krw"))
+        actual_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
+        if actual_equity <= 0:
+          actual_equity = cash_equivalent_krw + invested_value_krw
+        result["cash"] = krw_cash
+        result["cash_equivalent_krw"] = cash_equivalent_krw
         result["actual_deposit"] = krw_cash
         result["krw_cash"] = cash_by_currency.get("KRW", portfolio.account.cash)
         result["foreign_cash_krw"] = foreign_cash_krw
         result["cash_by_currency"] = cash_by_currency
         result["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
         result["base_currency"] = getattr(portfolio.account, "base_currency", "KRW")
-        result["invested_value"] = portfolio.account.invested_value
-        result["actual_equity"] = portfolio.account.equity
-        result["cash_weight"] = cash_equivalent_krw / portfolio.account.equity if portfolio.account.equity > 0 else 0.0
+        result["invested_value"] = invested_value_krw
+        result["actual_equity"] = actual_equity
+        result["cash_weight"] = krw_cash / actual_equity if actual_equity > 0 else 0.0
         result["actual_deposit_currency"] = "KRW"
+        result["account_api_sources"] = {
+            "domestic_balance": "TTTC8434R /uapi/domestic-stock/v1/trading/inquire-balance",
+            "domestic_orderable_cash": "TTTC8908R /uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            "overseas_balance": "TTTS3012R /uapi/overseas-stock/v1/trading/inquire-balance",
+            "overseas_present_balance": "TTTS6059R /uapi/overseas-stock/v1/trading/inquire-present-balance",
+            "overseas_orderable_cash": "TTTS3007R /uapi/overseas-stock/v1/trading/inquire-psamount",
+        }
       else:
         result["account_checked"] = False
       return result
@@ -1624,6 +1703,7 @@ def _live_snapshot_response(goal_payload: Any, force_refresh: bool, include_grap
       status_payload.update(
           {
               "cash": live_basis["cash"],
+              "cash_equivalent_krw": live_basis.get("cash_equivalent_krw", live_basis["cash"]),
               "krw_cash": live_basis["krw_cash"],
               "foreign_cash_krw": live_basis["foreign_cash_krw"],
               "cash_by_currency": live_basis["cash_by_currency"],
@@ -1693,6 +1773,7 @@ def _lightweight_live_snapshot_response(snapshot: dict[str, Any] | None = None) 
     return {
         "status": {
             "cash": cash,
+            "cash_equivalent_krw": float(basis.get("cash_equivalent_krw") or cash) if basis is not None else cash,
             "krw_cash": float(basis["krw_cash"]) if basis is not None else cash,
             "foreign_cash_krw": float(basis["foreign_cash_krw"]) if basis is not None else 0.0,
             "cash_by_currency": basis["cash_by_currency"] if basis is not None else {"KRW": cash},
@@ -1750,7 +1831,7 @@ def _assess_goal_response(payload: dict[str, Any]) -> dict[str, Any]:
     if context is None:
       basis = _last_live_account_basis()
       account = AccountSnapshot(
-          cash=max(1.0, float(basis["equity"])) if basis is not None else 10_000_000.0,
+          cash=max(1.0, float(basis["cash"])) if basis is not None else 10_000_000.0,
           holdings=(),
       )
       assessment = assess_goal(goal_request, account, (), {}, (), KnowledgeGraph())
@@ -1934,7 +2015,7 @@ def _live_trading_terminate_response() -> dict[str, Any]:
     config = load_short_horizon_strategy_config()
     config_live_enabled = bool(config.get("execution", {}).get("live_trading_enabled", False))
     env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
-    runtime = evaluate_live_runtime_gates(require_manual_arming=True)
+    runtime = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
     if not (config_live_enabled and env_live_enabled and runtime.ok):
         return {
             "ok": False,
@@ -1972,6 +2053,7 @@ def _live_trading_terminate_response() -> dict[str, Any]:
             executions.append({"order_id": receipt.order_id, "status": "STATUS_LOOKUP_FAILED", "message": str(exc)})
     with _live_lock:
         _operation_mode_state["active"] = None
+        _operation_mode_state["live_trading_baseline_equity"] = None
     audit.record(
         "live_trading_terminated",
         {"submitted_sell_orders": len(receipts), "skipped_holdings": skipped, "account_equity": portfolio.account.equity},
@@ -2311,26 +2393,35 @@ def mock_trading_performance() -> JSONResponse:
 
 @app.get("/api/live-trading/progress")
 def live_trading_progress() -> JSONResponse:
-    try:
-      connection = _kis_connection_probe(paper=False, include_account=True)
-    except Exception as exc:  # pragma: no cover - broker/network defensive boundary
-      connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
-    previous_basis = _last_live_account_basis()
-    basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous_basis)
-    if connection.get("account_checked") and basis is not None:
-      connection = _connection_with_account_basis(connection, basis)
-      with _live_lock:
-        _operation_mode_state["last_kis_connection"] = connection
+    connection = _operation_mode_state.get("last_kis_connection")
+    if connection is None:
+      try:
+        connection = _kis_connection_probe(paper=False, include_account=True)
+      except Exception as exc:  # pragma: no cover - broker/network defensive boundary
+        connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
+      previous_basis = _last_live_account_basis()
+      basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous_basis)
+      if connection.get("account_checked") and basis is not None:
+        connection = _connection_with_account_basis(connection, basis)
+        with _live_lock:
+          _operation_mode_state["last_kis_connection"] = connection
+    else:
+      basis = _last_live_account_basis()
     positions = list(connection.get("positions") or [])
     snapshot = _live_snapshot()
     execution_summary = snapshot.get("live_execution_summary") or {}
+    runtime_gate = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
+    journal = _live_order_journal_snapshot()
     active_mode = None
+    baseline_equity = None
     with _live_lock:
       active = _operation_mode_state.get("active")
       active_mode = getattr(getattr(active, "mode", None), "value", getattr(active, "mode", None))
+      baseline_equity = _operation_mode_state.get("live_trading_baseline_equity")
     equity = float(basis["equity"]) if basis is not None else 0.0
     cash = float(basis["cash"]) if basis is not None else 0.0
-    initial = equity
+    initial = float(baseline_equity or equity or 0.0)
+    return_rate = (equity - initial) / initial if initial > 0 else 0.0
     return _json(
         {
             "active": active_mode == "live_trading",
@@ -2338,6 +2429,7 @@ def live_trading_progress() -> JSONResponse:
             "account_checked": bool(connection.get("account_checked")),
             "connection": connection,
             "cash": cash,
+            "cash_equivalent_krw": float(basis.get("cash_equivalent_krw") or cash) if basis is not None else cash,
             "krw_cash": float(basis["krw_cash"]) if basis is not None else 0.0,
             "foreign_cash_krw": float(basis.get("foreign_cash_krw") or 0.0) if basis is not None else 0.0,
             "cash_by_currency": basis["cash_by_currency"] if basis is not None else {},
@@ -2345,16 +2437,89 @@ def live_trading_progress() -> JSONResponse:
             "equity": equity,
             "initial_equity": initial,
             "profit": equity - initial,
-            "return_rate": 0.0,
+            "return_rate": return_rate,
             "positions": positions,
-            "orders_count": 0,
-            "executions_count": 0,
-            "recent_executions": [],
             "execution_summary": execution_summary,
+            "runtime_gate": {"ok": runtime_gate.ok, "failures": tuple(runtime_gate.failures)},
+            "live_order_journal": journal,
+            "orders_count": journal["orders_count"],
+            "executions_count": journal["submitted_count"],
+            "recent_orders": journal["recent_orders"],
+            "recent_executions": journal["recent_executions"],
             "updated_at": datetime.now(timezone.utc),
-            "message": "KIS live account progress refreshed from read-only balance lookup.",
+            "message": (
+                "Live order submission is enabled; approved FinalOrder records may be submitted."
+                if runtime_gate.ok
+                else "Live order submission is blocked by runtime gates: " + ", ".join(runtime_gate.failures)
+            ),
         }
     )
+
+
+def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", limit: int = 20) -> dict[str, Any]:
+    journal_path = Path(path)
+    if not journal_path.exists():
+      return {
+          "path": str(journal_path),
+          "orders_count": 0,
+          "submitted_count": 0,
+          "blocked_count": 0,
+          "error_count": 0,
+          "recent_orders": [],
+          "recent_executions": [],
+      }
+    events: list[dict[str, Any]] = []
+    try:
+      with journal_path.open("r", encoding="utf-8") as file:
+        for line in file:
+          try:
+            event = json.loads(line)
+          except json.JSONDecodeError:
+            continue
+          if isinstance(event, dict):
+            events.append(event)
+    except OSError:
+      events = []
+    recent_events = events[-max(1, limit):]
+    recent_orders = [_live_order_event_payload(event) for event in recent_events]
+    recent_orders = [item for item in recent_orders if item]
+    all_orders = [_live_order_event_payload(event) for event in events]
+    all_orders = [item for item in all_orders if item]
+    recent_executions = [
+        item
+        for item in recent_orders
+        if item.get("event_type") in {"live_order_submitted", "live_order_status", "live_trading_order_submitted"}
+    ]
+    return {
+        "path": str(journal_path),
+        "orders_count": len(all_orders),
+        "submitted_count": sum(1 for event in events if event.get("event_type") in {"live_order_submitted", "live_trading_order_submitted"}),
+        "blocked_count": sum(1 for event in events if event.get("event_type") in {"live_order_blocked", "live_trading_execution_blocked"}),
+        "error_count": sum(1 for event in events if "error" in str(event.get("event_type") or "")),
+        "recent_orders": recent_orders[-limit:],
+        "recent_executions": recent_executions[-limit:],
+    }
+
+
+def _live_order_event_payload(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(event.get("event_type") or "")
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    if not event_type.startswith("live_"):
+      return None
+    order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+    return {
+        "event_type": event_type,
+        "recorded_at": event.get("recorded_at"),
+        "ticker": payload.get("ticker") or order.get("ticker") or "",
+        "market": payload.get("market") or order.get("market") or "",
+        "side": payload.get("side") or order.get("side") or "",
+        "quantity": payload.get("quantity") or order.get("quantity") or "",
+        "limit_price": payload.get("limit_price") or order.get("limit_price") or "",
+        "broker_order_id": payload.get("broker_order_id") or "",
+        "status": payload.get("status") or "",
+        "reason_codes": payload.get("reason_codes") or payload.get("blocked") or (),
+        "error": payload.get("error") or payload.get("message") or "",
+    }
 
 
 def _parse_goal_request(payload: dict[str, Any]) -> GoalRequest:
@@ -2497,15 +2662,7 @@ def _reset_mock_kis_for_context(context: Any, account: AccountSnapshot | None = 
 
 
 def _mock_demo_account(context: Any) -> AccountSnapshot:
-    if context.account.equity >= 5_000_000:
-        return context.account
-    return AccountSnapshot(
-        cash=10_000_000,
-        holdings=context.account.holdings,
-        realized_pnl_today=context.account.realized_pnl_today,
-        unrealized_pnl_today=context.account.unrealized_pnl_today,
-        captured_at=datetime.now(timezone.utc),
-    )
+  return context.account
 
 
 def _mock_performance(context: Any) -> dict[str, Any]:
@@ -2890,35 +3047,63 @@ def _refresh_live_cache() -> None:
     _set_live_progress(5, "starting", "Starting live data refresh")
     try:
       store = LocalResearchStore(root=_get_store_root())
-      _set_live_progress(18, "research", "Collecting configured market, news, and macro sources")
-      research_result = _load_default_research()
-      _set_live_progress(48, "storage", "Saving research records")
-      stored_counts = store.save_research_result(research_result)
-      _set_live_progress(64, "analysis", "Building indicators, ontology graph, and reasoning paths")
       active_mode = _active_operation_mode()
+      if active_mode == "live_trading":
+        _set_live_progress(18, "broker", "Using stored research and live broker quotes for trading")
+        research_result = _empty_live_research_result("live_trading_fast_path")
+        stored_counts = {
+            "events": 0,
+            "raw_records": 0,
+            "market_snapshots": 0,
+            "macro_metrics": 0,
+            "realtime_quotes": 0,
+            "realtime_executions": 0,
+        }
+      else:
+        _set_live_progress(18, "research", "Collecting configured market, news, and macro sources")
+        research_result = _load_default_research()
+        _set_live_progress(48, "storage", "Saving research records")
+        stored_counts = store.save_research_result(research_result)
+      _set_live_progress(64, "analysis", "Building indicators, ontology graph, and reasoning paths")
       live_account = _live_account_snapshot_for_analysis() if active_mode == "live_trading" else None
       live_risk_rules = (
           _live_risk_rules_for_account(live_account)
           if active_mode == "live_trading"
           else None
       )
-      analysis_research = _analysis_research_for_current_mode(store)
+      active_market_groups = _active_live_market_groups() if active_mode == "live_trading" else ()
+      analysis_research = (
+          _empty_stored_research()
+          if active_mode == "live_trading"
+          else _analysis_research_for_current_mode(store)
+      )
       context_research_result = research_result
       live_broker_quote_summary: dict[str, Any] | None = None
       live_affordable_broker_market_count = 0
       if active_mode == "live_trading":
-        live_broker_targets = _live_broker_targets_for_active_session(analysis_research)
-        live_broker_targets = _merge_market_targets(
-            live_broker_targets,
-            _live_affordable_krx_discovery_targets(analysis_research, live_account, live_broker_targets),
-        )
-        if live_broker_targets:
-          analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots_for_targets(
-              analysis_research,
+        if active_market_groups:
+          live_broker_targets = _live_broker_targets_for_active_session(analysis_research)
+          live_broker_targets = _merge_market_targets(
               live_broker_targets,
+              _live_affordable_krx_discovery_targets(analysis_research, live_account, live_broker_targets),
+              _live_affordable_us_discovery_targets(analysis_research, live_account, live_broker_targets),
           )
+          if live_broker_targets:
+            analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots_for_targets(
+                analysis_research,
+                live_broker_targets,
+            )
+          else:
+            analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots(analysis_research)
         else:
-          analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots(analysis_research)
+          live_broker_quote_summary = {
+              "quotes": 0,
+              "requested": 0,
+              "errors": [],
+              "reason": "MARKET_SESSION_CLOSED",
+              "active_groups": (),
+          }
+          analysis_research = replace(analysis_research, market_snapshots=())
         context_research_result = replace(research_result, market_snapshots=())
         analysis_research = _live_broker_only_research(analysis_research, account=live_account)
         live_affordable_broker_market_count = len(tuple(getattr(analysis_research, "market_snapshots", ()) or ()))
@@ -2977,7 +3162,11 @@ def _refresh_live_cache() -> None:
           else ModelArtifactRegistry().root / f"{live_model_artifact['artifact_id']}.json"
       )
       _set_live_progress(84, "graph", "Persisting ontology graph and reasoning paths")
-      graph_counts = store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
+      graph_counts = (
+          {"graph_triples": 0, "reasoning_paths": 0}
+          if active_mode == "live_trading"
+          else store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
+      )
       live_execution_summary = _run_live_trading_execution_cycle(context) if active_mode == "live_trading" else None
       with _live_lock:
         _live_state["research_result"] = research_result
@@ -3053,6 +3242,44 @@ def _refresh_live_cache() -> None:
           _refresh_worker.start()
 
 
+def _empty_live_research_result(reason: str) -> ResearchRunResult:
+  return ResearchRunResult(
+      events=(),
+      raw_records=(),
+      market_snapshots=(),
+      macro_metrics=(),
+      skipped_sources=(),
+      archived_paths=(),
+      diagnostics={
+          "events_count": 0,
+          "raw_records_count": 0,
+          "market_snapshots_count": 0,
+          "macro_metrics_count": 0,
+          "skipped_count": 0,
+          "live_source_count": 0,
+          "local_source_count": 0,
+          "live_data_present": False,
+          "latest_observed_at": None,
+          "source_names": [],
+          "per_ticker": {},
+          "reason": reason,
+      },
+  )
+
+
+def _empty_stored_research() -> StoredResearch:
+  return StoredResearch(
+      events=(),
+      raw_records=(),
+      market_snapshots=(),
+      macro_metrics=(),
+      realtime_quotes=(),
+      realtime_executions=(),
+      graph_triples=(),
+      reasoning_paths=(),
+  )
+
+
 
 _US_LIVE_MARKETS = {"NYSE", "NASDAQ", "AMEX", "ARCA", "BATS", "CBOE", "IEX", "US"}
 _KRX_LIVE_MARKETS = {"KRX", "KOSPI", "KOSDAQ", "KONEX"}
@@ -3100,12 +3327,56 @@ def _is_live_market_core_open(group: str, now_utc: Any | None = None) -> bool:
   return False
 
 
+def _is_live_market_extended_open(group: str, now_utc: Any | None = None) -> bool:
+  """Return True when KIS has a plausible cash-stock order route open.
+
+  KRX supports pre/post after-hours order divisions on the domestic cash order
+  endpoint. US-listed stocks can use the normal overseas route during pre/core/
+  after-market hours, and KIS exposes a separate US daytime-order endpoint during
+  the Korean daytime session.
+  """
+  from datetime import datetime as _datetime
+  from datetime import time as _time
+  from datetime import timezone as _timezone
+  from zoneinfo import ZoneInfo
+
+  current = now_utc or _datetime.now(_timezone.utc)
+  if getattr(current, "tzinfo", None) is None:
+    current = current.replace(tzinfo=_timezone.utc)
+
+  group = str(group or "").upper()
+  if group == "US":
+    eastern = current.astimezone(ZoneInfo("America/New_York"))
+    if eastern.weekday() < 5 and _time(4, 0) <= eastern.time() <= _time(20, 0):
+      return True
+    seoul = current.astimezone(ZoneInfo("Asia/Seoul"))
+    return seoul.weekday() < 5 and _time(9, 0) <= seoul.time() <= _time(16, 50)
+
+  if group == "KRX":
+    local = current.astimezone(ZoneInfo("Asia/Seoul"))
+    if local.weekday() >= 5:
+      return False
+    current_time = local.time()
+    return (
+        _time(8, 30) <= current_time < _time(8, 40)
+        or _time(9, 0) <= current_time <= _time(15, 30)
+        or _time(15, 40) <= current_time <= _time(18, 0)
+    )
+
+  return False
+
+
 def _active_live_market_groups(now_utc: Any | None = None) -> tuple[str, ...]:
   groups = []
   for group in ("US", "KRX"):
-    if _is_live_market_core_open(group, now_utc):
+    if _is_live_market_extended_open(group, now_utc):
       groups.append(group)
   return tuple(groups)
+
+
+def _is_open_live_market_ticker(ticker: str, market: str = "", now_utc: Any | None = None) -> bool:
+  group = _ticker_market_group_for_live_trading(ticker, market)
+  return group in set(_active_live_market_groups(now_utc))
 
 
 def _market_name_by_ticker(records: Any) -> dict[str, str]:
@@ -3121,6 +3392,9 @@ def _market_name_by_ticker(records: Any) -> dict[str, str]:
 def _live_broker_targets_for_active_session(stored: Any, now_utc: Any | None = None) -> tuple[str, ...]:
   """Select domestic and overseas BuyCandidate tickers for broker quote overlay."""
   market_by_ticker = _market_name_by_ticker(getattr(stored, "market_snapshots", ()) or ())
+  open_groups = set(_active_live_market_groups(now_utc))
+  if not open_groups:
+    return ()
   selected: list[str] = []
 
   for path in tuple(getattr(stored, "reasoning_paths", ()) or ()):
@@ -3131,7 +3405,7 @@ def _live_broker_targets_for_active_session(stored: Any, now_utc: Any | None = N
     if not ticker:
       continue
     market_group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
-    if market_group in {"US", "KRX"}:
+    if market_group in open_groups:
       selected.append(ticker)
 
   return tuple(dict.fromkeys(selected))
@@ -3190,6 +3464,8 @@ def _live_affordable_krx_discovery_targets(
   """
   if account is None:
     return ()
+  if not _is_live_market_extended_open("KRX"):
+    return ()
   krw_cash = float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0)
   if krw_cash <= 0:
     return ()
@@ -3242,6 +3518,71 @@ def _live_affordable_krx_discovery_targets(
     audit.record(
         "live_affordable_krx_discovery_targets_added",
         {"targets": len(candidates), "krw_cash": krw_cash, "limit": limit},
+    )
+  return tuple(candidates)
+
+
+def _live_affordable_us_discovery_targets(
+    stored: Any,
+    account: AccountSnapshot | None,
+    existing_targets: tuple[Any, ...] = (),
+) -> tuple[MarketSnapshot, ...]:
+  """Add US symbols for tiny USD balances so live mode can find one-share fits."""
+  if account is None:
+    return ()
+  if not _is_live_market_extended_open("US"):
+    return ()
+  usd_cash = float((account.cash_by_currency or {}).get("USD") or 0.0)
+  if usd_cash <= 0:
+    return ()
+  try:
+    limit = max(0, int(os.getenv("LIVE_US_AFFORDABLE_DISCOVERY_LIMIT", "40")))
+  except ValueError:
+    limit = 40
+  if limit <= 0:
+    return ()
+
+  seen = {
+      str(getattr(item, "ticker", item) or "").upper().strip()
+      for item in tuple(existing_targets or ())
+  }
+  candidates: list[MarketSnapshot] = []
+  stored_markets = tuple(getattr(stored, "market_snapshots", ()) or ())
+  for market in sorted(
+      stored_markets,
+      key=lambda item: float(getattr(item, "last_price", 0.0) or 0.0),
+  ):
+    ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+    if (
+        ticker in seen
+        or not ticker
+        or _ticker_market_group_for_live_trading(ticker, getattr(market, "market", "")) != "US"
+    ):
+      continue
+    candidates.append(market)
+    seen.add(ticker)
+    if len(candidates) >= limit:
+      break
+
+  if len(candidates) < limit:
+    try:
+      universe = load_us_listed_universe(limit=None)
+    except Exception as exc:  # noqa: BLE001 - discovery is optional.
+      audit.record("live_affordable_us_universe_load_failed", {"error": str(exc)})
+      universe = ()
+    for symbol in universe:
+      ticker = str(symbol or "").upper().strip().split(".", 1)[0]
+      if ticker in seen or not ticker:
+        continue
+      candidates.append(_placeholder_live_market(ticker, "NASDAQ"))
+      seen.add(ticker)
+      if len(candidates) >= limit:
+        break
+
+  if candidates:
+    audit.record(
+        "live_affordable_us_discovery_targets_added",
+        {"targets": len(candidates), "usd_cash": usd_cash, "limit": limit},
     )
   return tuple(candidates)
 
@@ -3352,7 +3693,12 @@ def _with_live_broker_quotes_for_context_intents(stored: StoredResearch, context
   for intent in tuple(getattr(context, "intents", ()) or ()):
     ticker = str(getattr(intent, "ticker", "") or "")
     market = markets_by_ticker.get(ticker)
-    if market is None or ticker in seen or market.source.source_type == "broker_api":
+    if (
+        market is None
+        or ticker in seen
+        or market.source.source_type == "broker_api"
+        or not _is_open_live_market_ticker(ticker, market.market)
+    ):
       continue
     targets.append(market)
     seen.add(ticker)
@@ -3364,16 +3710,59 @@ def _with_live_broker_quotes_for_context_intents(stored: StoredResearch, context
 
 
 def _live_broker_only_research(stored: StoredResearch, *, account: AccountSnapshot | None = None) -> StoredResearch:
-  broker_markets = tuple(
-      market
-      for market in tuple(getattr(stored, "market_snapshots", ()) or ())
-      if market.source.source_type == "broker_api"
-      and market.source.trust_level >= 5
-      and market.source.quality_score >= 0.8
-      and market.source.is_realtime
-      and market.last_price > 0
-      and is_market_affordable_for_account(market, account)
-  )
+  source_markets = tuple(getattr(stored, "market_snapshots", ()) or ())
+  active_groups = _active_live_market_groups()
+  if not active_groups:
+    if source_markets:
+      audit.record(
+          "live_broker_only_research_empty",
+          {
+              "input_markets": len(source_markets),
+              "broker_rejections": (),
+              "active_groups": active_groups,
+              "reason": "MARKET_SESSION_CLOSED",
+          },
+      )
+    return replace(stored, market_snapshots=())
+  broker_markets: list[MarketSnapshot] = []
+  rejected: list[dict[str, Any]] = []
+  for market in source_markets:
+    reason = ""
+    if market.source.source_type != "broker_api":
+      reason = "NOT_BROKER_API"
+    elif market.source.trust_level < 5:
+      reason = "LOW_SOURCE_TRUST"
+    elif market.source.quality_score < 0.8:
+      reason = "LOW_SOURCE_QUALITY"
+    elif not market.source.is_realtime:
+      reason = "NOT_REALTIME"
+    elif market.last_price <= 0:
+      reason = "PRICE_NOT_POSITIVE"
+    elif not is_market_affordable_for_account(market, account):
+      reason = "INSUFFICIENT_CASH_FOR_ONE_SHARE"
+    elif not _is_open_live_market_ticker(market.ticker, market.market):
+      reason = "MARKET_SESSION_CLOSED"
+    if reason:
+      if market.source.source_type == "broker_api":
+        rejected.append(
+            {
+                "ticker": market.ticker,
+                "market": market.market,
+                "last_price": market.last_price,
+                "reason": reason,
+            }
+        )
+      continue
+    broker_markets.append(market)
+  if source_markets and not broker_markets:
+    audit.record(
+        "live_broker_only_research_empty",
+        {
+            "input_markets": len(source_markets),
+            "broker_rejections": rejected[:20],
+            "active_groups": active_groups,
+        },
+    )
   return replace(stored, market_snapshots=broker_markets)
 
 
@@ -3456,6 +3845,7 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
   risk_results_count = len(getattr(context, "risk_results", ()) or ())
   signals = tuple(getattr(context, "signals", ()) or ())
   buy_signals_count = sum(1 for signal in signals if getattr(signal, "action", None) == OrderAction.BUY)
+  sell_signals_count = sum(1 for signal in signals if getattr(signal, "action", None) in {OrderAction.SELL, OrderAction.REDUCE})
   account = getattr(context, "account", None)
   account_cash = float(getattr(account, "cash", 0.0) or 0.0)
   account_cash_equivalent = float(getattr(account, "cash_equivalent_krw", 0.0) or 0.0)
@@ -3472,33 +3862,50 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
       if _is_live_executable_order(order)
   ]
   executable_orders, cash_fit_skipped_orders = _cash_fit_executable_orders(executable_orders, account)
+  executable_orders, session_fit_skipped_orders = _session_fit_executable_orders(executable_orders)
+  approved_buy_orders = [order for order in approved_orders if _order_side_name(order) == "BUY"]
+  approved_sell_orders = [order for order in approved_orders if _order_side_name(order) == "SELL"]
+  executable_buy_orders = [order for order in executable_orders if _order_side_name(order) == "BUY"]
+  executable_sell_orders = [order for order in executable_orders if _order_side_name(order) == "SELL"]
   summary: dict[str, Any] = {
       "attempted": False,
       "approved_orders": len(approved_orders),
+      "approved_buy_orders": len(approved_buy_orders),
+      "approved_sell_orders": len(approved_sell_orders),
       "executable_orders": len(executable_orders),
+      "executable_buy_orders": len(executable_buy_orders),
+      "executable_sell_orders": len(executable_sell_orders),
       "markets": len(getattr(context, "markets", ()) or ()),
       "signals": len(signals),
       "buy_signals": buy_signals_count,
-      "hold_signals": max(0, len(signals) - buy_signals_count),
+      "sell_signals": sell_signals_count,
+      "hold_signals": max(0, len(signals) - buy_signals_count - sell_signals_count),
       "intents": intents_count,
       "risk_results": risk_results_count,
       "account_cash": account_cash,
       "account_cash_equivalent_krw": account_cash_equivalent,
+      "holdings_count": len(getattr(account, "holdings", ()) or ()),
       "submitted": 0,
       "blocked": [],
       "errors": [],
       "cash_fit_skipped_orders": cash_fit_skipped_orders,
+        "session_fit_skipped_orders": session_fit_skipped_orders,
   }
-  runtime_snapshot = evaluate_live_runtime_gates(require_manual_arming=True)
+  runtime_snapshot = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
   summary["runtime_gate"] = {"ok": runtime_snapshot.ok, "failures": tuple(runtime_snapshot.failures)}
   if intents_count <= 0:
-    summary["reason"] = "NO_ORDER_INTENTS"
+    active_groups = _active_live_market_groups()
+    summary["active_market_groups"] = active_groups
+    summary["reason"] = "MARKET_SESSION_CLOSED" if not active_groups else "NO_ORDER_INTENTS"
     summary["diagnostics"] = {
         "signals_present": summary["signals"] > 0,
         "buy_signals_present": buy_signals_count > 0,
         "markets_present": summary["markets"] > 0,
+        "active_market_groups": active_groups,
         "message": (
-            "Realtime signals were collected, but none became live order intents for the current "
+            "No supported KIS live trading session is open."
+            if not active_groups
+            else "Realtime signals were collected, but none became live order intents for the current "
             "market/account state."
         ),
     }
@@ -3581,6 +3988,11 @@ def _is_live_executable_order(order: FinalOrder) -> bool:
   )
 
 
+def _order_side_name(order: Any) -> str:
+  side = getattr(order, "side", "")
+  return str(getattr(side, "value", side) or "").upper()
+
+
 def _cash_fit_executable_orders(
     orders: list[FinalOrder],
     account: Any,
@@ -3612,6 +4024,37 @@ def _cash_fit_executable_orders(
               "reason": "WOULD_EXCEED_REMAINING_CASH",
           }
       )
+  return kept, skipped
+
+
+def _session_fit_executable_orders(
+    orders: list[FinalOrder],
+    now_utc: Any | None = None,
+) -> tuple[list[FinalOrder], list[dict[str, Any]]]:
+  if not orders:
+    return orders, []
+  active_groups = set(_active_live_market_groups(now_utc))
+  kept: list[FinalOrder] = []
+  skipped: list[dict[str, Any]] = []
+  for order in orders:
+    ticker = str(getattr(order, "ticker", "") or "")
+    market = str(getattr(order, "market", "") or "")
+    group = _ticker_market_group_for_live_trading(ticker, market)
+    if group in active_groups:
+      kept.append(order)
+      continue
+    skipped.append(
+        {
+            "ticker": ticker,
+            "market": market,
+            "side": _order_side_name(order),
+            "quantity": int(getattr(order, "quantity", 0) or 0),
+            "limit_price": float(getattr(order, "limit_price", 0.0) or 0.0),
+            "required_group": group,
+            "active_groups": tuple(sorted(active_groups)),
+            "reason": "MARKET_SESSION_CLOSED",
+        }
+    )
   return kept, skipped
 
 
@@ -4500,11 +4943,11 @@ HTML = """
       <h2>운영 모드</h2>
       <div class="mode-step-label">실시간 통합 데이터 기준</div>
       <div class="mode-grid" id="modeActionGrid">
-        <button type="button" id="modeTestingButton" onclick="startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
-        <button type="button" id="liveFlagsButton" class="secondary" onclick="applyLiveFlags()">실전 플래그 적용<small>주문 없이 게이트만 전환</small></button>
-        <button type="button" id="modeLiveTradingButton" class="danger" onclick="startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
+        <button type="button" id="modeTestingButton" onclick="window.startSelectedOperationMode && window.startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
+        <button type="button" id="liveFlagsButton" class="secondary" onclick="window.applyLiveFlags && window.applyLiveFlags()">실전 플래그 적용<small>주문 없이 게이트만 전환</small></button>
+        <button type="button" id="modeLiveTradingButton" class="danger" onclick="window.startSelectedOperationMode && window.startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
       </div>
-      <button type="button" id="terminateTradingButton" class="danger" onclick="terminateActiveTrading()" disabled>조기 종료<small>보유분 전량 매도 후 종료</small></button>
+      <button type="button" id="terminateTradingButton" class="danger" onclick="window.terminateActiveTrading && window.terminateActiveTrading()" disabled>조기 종료<small>보유분 전량 매도 후 종료</small></button>
       <div class="work-status active">
         <strong id="operationModeStatus">모드 대기</strong>
         <div class="muted" id="runtimeStatus">NPU 상태 확인 중</div>
@@ -4529,7 +4972,7 @@ HTML = """
       <form id="goalForm">
         <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
         <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
-        <div class="note" id="autoSimulationBasis">시뮬레이션 예수금과 수익률 게인은 실전 준비 점검에서 읽은 실계좌 기준으로 자동 산정됩니다.</div>
+        <div class="note" id="autoSimulationBasis">시뮬레이션 기준자금과 수익률 게인은 실전 준비 점검에서 읽은 실계좌 기준으로 자동 산정됩니다.</div>
         <button type="submit">가능성 분석</button>
         <div class="work-status" id="workStatus">
           <strong id="workTitle">작업 대기 중</strong>
@@ -4567,14 +5010,16 @@ HTML = """
     </aside>
     <main>
       <div class="grid">
-        <section class="panel span-4"><h2>운용 기준 자금</h2><div class="metric" id="equity">-</div><div class="muted">목표 산정과 리스크 한도 계산에 쓰는 기준 금액</div><div class="chips" style="margin-top:12px;"><span class="chip" id="cash">기준 현금 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
-        <section class="panel span-4"><h2>Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
+        <section class="panel span-4"><h2>계좌 기준 운용현금</h2><div class="metric" id="equity">-</div><div class="muted">주문과 paper trading 기준은 총자산이 아니라 KIS 주문가능 원화입니다. 총자산, 외화/해외평가, 보유주식은 참고값으로 따로 표시합니다.</div><div class="chips" style="margin-top:12px;"><span class="chip" id="totalAssets">총자산 -</span><span class="chip" id="cash">주문가능 원화 -</span><span class="chip" id="investedValue">보유주식 -</span><span class="chip" id="krwCash">KRW 현금 -</span><span class="chip" id="foreignCash">외화/해외평가 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
+        <section class="panel span-4"><h2 id="performancePanelTitle">Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
         <section class="panel span-4">
           <h2>증권사 실계좌</h2>
           <div class="metric" id="brokerDeposit">읽기 전</div>
           <div class="chips" style="margin-top:12px;">
             <span class="chip" id="brokerHoldings">실보유 종목 -</span>
             <span class="chip" id="brokerAccount">계좌 -</span>
+            <span class="chip" id="brokerEquity">총자산 -</span>
+            <span class="chip" id="brokerInvested">보유주식 -</span>
             <span class="chip" id="brokerKrwCash">원화 -</span>
             <span class="chip" id="brokerForeignCash">외화 -</span>
           </div>
@@ -4674,10 +5119,14 @@ HTML = """
     let lastGoalPayload = null;
     let lastGraphSignature = '';
     let liveRefreshBusy = false;
+    let statusBusy = false;
+    let diagnosticsBusy = false;
     let learningStatusBusy = false;
     let learningStatusTimer = null;
     let lastRenderedCollectionCycle = null;
     let mockPerformanceTimer = null;
+    let operationModeBusy = false;
+    let liveTradingProgressBusy = false;
     let operationRequestActive = false;
     let activeOperationMode = null;
     let lastBrokerConnection = null;
@@ -4740,6 +5189,19 @@ HTML = """
       return currencies.map((currency) => formatMoney(balances[currency], currency)).join(' / ');
     }
 
+    function accountSnapshotSummary(data = {}) {
+      const equity = Number(data.equity ?? data.actual_equity ?? data.account_value ?? data.total_evaluation_amount ?? 0);
+      const balances = currencyMap(data);
+      const krwCash = Number(data.krw_cash ?? balances.KRW ?? data.actual_deposit ?? 0);
+      const foreignCashKrw = Number(data.foreign_cash_krw ?? 0);
+      const cashFromCurrency = krwCash + Math.max(0, foreignCashKrw);
+      const cash = Number(data.cash ?? data.actual_deposit ?? krwCash);
+      const cashEquivalentKrw = Number(data.cash_equivalent_krw ?? cashFromCurrency);
+      const invested = Math.max(0, equity - cashEquivalentKrw);
+      const cashWeight = Number(data.cash_weight ?? (equity > 0 ? cash / equity : 0));
+      return { equity, cash, cashEquivalentKrw, invested, krwCash, foreignCashKrw, cashByCurrency: balances, foreignCashByCurrency: data.foreign_cash_by_currency || {}, cashWeight };
+    }
+
     function applyCompactKoreanDashboard() {
       document.title = 'Paper Trading Dashboard';
       const title = document.querySelector('aside h1');
@@ -4790,8 +5252,14 @@ HTML = """
       });
     }
     async function loadStatus() {
-      const data = await (await fetch('/api/status')).json();
-      renderStatus(data);
+      if (statusBusy) return;
+      statusBusy = true;
+      try {
+        const data = await (await fetch('/api/status')).json();
+        renderStatus(data);
+      } finally {
+        statusBusy = false;
+      }
     }
 
     async function loadLearningStatus() {
@@ -4830,6 +5298,8 @@ HTML = """
     }
 
     async function loadDiagnostics() {
+      if (diagnosticsBusy) return;
+      diagnosticsBusy = true;
       try {
         const data = await (await fetch('/api/research/diagnostics')).json();
         renderDiagnostics(data);
@@ -4839,6 +5309,8 @@ HTML = """
         if (badge) badge.textContent = message;
         renderSystemFlow({ data: 'error' }, { data: message });
         throw error;
+      } finally {
+        diagnosticsBusy = false;
       }
     }
 
@@ -4965,6 +5437,22 @@ HTML = """
       return isPaperTradingMode(mode) && data && data.demo_id;
     }
 
+    function setPerformancePanelMode(mode, statusMessage = '') {
+      const isLive = mode === 'live_trading' || mode === 'live';
+      const title = document.getElementById('performancePanelTitle');
+      if (title) title.textContent = isLive ? '실전 투자 성과' : 'Paper trading 성과';
+      const profit = document.getElementById('mockProfit');
+      const equity = document.getElementById('mockEquity');
+      const target = document.getElementById('mockTarget');
+      if (profit) profit.textContent = isLive ? '실전 손익 -' : '모의 손익 -';
+      if (equity) equity.textContent = isLive ? '실전 평가금 -' : '모의 평가금 -';
+      if (target) target.textContent = isLive ? '실전 목표 -' : '목표 -';
+      if (statusMessage) {
+        const status = document.getElementById('mockStatus');
+        if (status) status.textContent = statusMessage;
+      }
+    }
+
     function stopStreamingDemoLoop(message = '') {
       if (streamingDemoTimer) {
         window.clearTimeout(streamingDemoTimer);
@@ -4981,7 +5469,7 @@ HTML = """
         const statusNode = document.getElementById('streamingDemoStatus');
         const mockNode = document.getElementById('mockStatus');
         if (statusNode) statusNode.textContent = message;
-        if (mockNode) mockNode.textContent = message;
+        if (mockNode && activeOperationMode !== 'live_trading') mockNode.textContent = message;
       }
     }
     async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 20000) {
@@ -5061,6 +5549,10 @@ HTML = """
       if (operationRequestActive) {
         document.getElementById('runtimeStatus').textContent = 'Another operation request is already running.';
         return;
+      }
+      if (mode === 'live_trading') {
+        activeOperationMode = 'live_trading';
+        setPerformancePanelMode('live_trading', '실전 투자 성과 대기 중 · KIS 계좌와 실주문 게이트를 확인합니다.');
       }
       if (!isPaperTradingMode(mode)) {
         stopStreamingDemoLoop(`${modeLabel(mode)} requested; paper trading loop stopped.`);
@@ -5246,6 +5738,11 @@ HTML = """
       const mode = labels[data.mode] || data.mode || 'Mode waiting';
       const message = data.paper_trading_message || data.live_readiness_message || data.live_trading_message || data.training_message || data.execution_label || '';
       document.getElementById('operationModeStatus').textContent = `${mode} | ${message}`;
+      if (data.mode === 'live_trading') {
+        setPerformancePanelMode('live_trading', '실전 투자 성과 대기 중 · 실행 요약을 갱신합니다.');
+      } else if (data.mode === 'paper_trading') {
+        setPerformancePanelMode('paper_trading');
+      }
       if (data.kis_connection && (data.kis_connection.account_checked || data.kis_connection.ok)) {
         lastBrokerConnection = data.kis_connection;
       }
@@ -5308,6 +5805,8 @@ HTML = """
         const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
         const basis = brokerBasisAmount(connection);
         const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        const submitted = Number((connection.live_order_journal || {}).submitted_count ?? connection.submitted_count ?? 0);
+        const updatedAt = connection.updated_at ? new Date(connection.updated_at).toLocaleTimeString('ko-KR') : new Date().toLocaleTimeString('ko-KR');
         depositTarget.textContent = fmtWon.format(deposit);
         holdingsTarget.textContent = `실보유 종목 ${holdings}개`;
         statusTarget.textContent = 'KIS 실계좌 읽기 완료 · 주문 제출 없음';
@@ -5336,6 +5835,8 @@ HTML = """
       const depositTarget = document.getElementById('brokerDeposit');
       const holdingsTarget = document.getElementById('brokerHoldings');
       const accountTarget = document.getElementById('brokerAccount');
+      const equityTarget = document.getElementById('brokerEquity');
+      const investedTarget = document.getElementById('brokerInvested');
       const krwCashTarget = document.getElementById('brokerKrwCash');
       const foreignCashTarget = document.getElementById('brokerForeignCash');
       const statusTarget = document.getElementById('brokerStatus');
@@ -5343,26 +5844,27 @@ HTML = """
       const accountSuffix = connection.account_suffix || '-';
       accountTarget.textContent = `Account ${accountSuffix}`;
       if (connection.account_checked) {
-        const deposit = Number(connection.actual_deposit ?? connection.cash ?? 0);
-        const balances = currencyMap(connection);
-        const krwCash = Number(balances.KRW ?? deposit);
-        const basis = brokerBasisAmount(connection);
+        const summary = accountSnapshotSummary(connection);
         const holdings = connection.holdings_count ?? connection.holdings ?? 0;
-        depositTarget.textContent = formatCashByCurrency(connection);
-        if (krwCashTarget) krwCashTarget.textContent = `KRW ${fmtWon.format(krwCash)}`;
-        if (foreignCashTarget) foreignCashTarget.textContent = `Foreign ${formatForeignCash(connection)}`;
+        depositTarget.textContent = fmtWon.format(summary.cash);
+        if (equityTarget) equityTarget.textContent = `총자산 ${fmtWon.format(summary.equity)}`;
+        if (investedTarget) investedTarget.textContent = `보유주식 ${fmtWon.format(summary.invested)}`;
+        if (krwCashTarget) krwCashTarget.textContent = `원화 ${fmtWon.format(summary.krwCash)}`;
+        if (foreignCashTarget) foreignCashTarget.textContent = `외화 ${formatForeignCash(connection)}`;
         holdingsTarget.textContent = `Holdings ${holdings}`;
-        statusTarget.textContent = 'KIS live account read complete; no order submitted.';
+        statusTarget.textContent = `KIS 실계좌 실시간 갱신 ${updatedAt} · 제출 ${submitted}건`;
         applyLiveAccountBasis(connection);
         document.getElementById('runtimeStatus').textContent =
-          `KIS live account read complete | KRW ${fmtWon.format(krwCash)} | foreign ${formatForeignCash(connection)} | basis ${fmtWon.format(basis || deposit)} | holdings ${holdings}`;
+          `KIS live account read complete | 총자산 ${fmtWon.format(summary.equity)} | KRW ${fmtWon.format(summary.krwCash)} | 외화 ${formatForeignCash(connection)} | 보유주식 ${fmtWon.format(summary.invested)} | holdings ${holdings}`;
         return;
       }
       if (connection.ok === false) {
         depositTarget.textContent = 'Read failed';
         holdingsTarget.textContent = 'Holdings -';
+        if (equityTarget) equityTarget.textContent = '총자산 -';
+        if (investedTarget) investedTarget.textContent = '보유주식 -';
         if (krwCashTarget) krwCashTarget.textContent = 'KRW -';
-        if (foreignCashTarget) foreignCashTarget.textContent = 'Foreign -';
+        if (foreignCashTarget) foreignCashTarget.textContent = '외화 -';
         statusTarget.textContent = connection.message || connection.error || 'KIS account lookup failed.';
         if (connection.retry_after_seconds) {
           statusTarget.textContent += ` Retry after ${connection.retry_after_seconds}s.`;
@@ -5372,41 +5874,41 @@ HTML = """
       depositTarget.textContent = 'Before read';
       holdingsTarget.textContent = 'Holdings -';
       if (krwCashTarget) krwCashTarget.textContent = 'KRW -';
-      if (foreignCashTarget) foreignCashTarget.textContent = 'Foreign -';
-      statusTarget.textContent = 'Live readiness reads real cash and holdings count only; no order is submitted.';
+      if (foreignCashTarget) foreignCashTarget.textContent = '외화 -';
+      statusTarget.textContent = 'KIS 실계좌 조회 대기 중';
     }
 
     function brokerBasisAmount(connection = {}) {
-      const cash = Number(connection.actual_deposit ?? connection.cash ?? 0);
-      const equity = Number(connection.actual_equity ?? connection.equity ?? connection.account_value ?? connection.total_evaluation_amount ?? 0);
-      const invested = Number(connection.invested_value ?? 0);
-      const basis = equity > 0 ? equity : cash + invested;
-      return basis > 0 ? basis : 0;
+      const summary = accountSnapshotSummary(connection);
+      return Number(summary.cash || 0);
     }
 
     function applyLiveAccountBasis(connection = {}) {
-      const basis = brokerBasisAmount(connection);
+      const summary = accountSnapshotSummary(connection);
+      const basis = Number(summary.cash || 0);
       if (!basis) return;
-      const cash = Number(connection.actual_deposit ?? connection.cash ?? basis);
+      const cash = Number(summary.cash || 0);
       liveAccountBasis = {
         cash,
-        krw_cash: Number((currencyMap(connection).KRW) ?? cash),
-        foreign_cash_krw: Number(connection.foreign_cash_krw || Math.max(0, cash - Number((currencyMap(connection).KRW) ?? 0))),
-        cash_by_currency: currencyMap(connection),
+        cash_equivalent_krw: Number(summary.cashEquivalentKrw || cash),
+        krw_cash: Number(summary.krwCash),
+        foreign_cash_krw: Number(summary.foreignCashKrw),
+        cash_by_currency: summary.cashByCurrency,
         foreign_cash_by_currency: connection.foreign_cash_by_currency || {},
         base_currency: connection.base_currency || 'KRW',
-        equity: basis,
-        cash_weight: basis > 0 ? Math.max(0, Math.min(1, cash / basis)) : 0,
+        equity: Number(summary.equity || basis),
+        cash_weight: Number(summary.cashWeight || 0),
         account_suffix: connection.account_suffix || '',
       };
       const initialCashInput = document.getElementById('initialCash');
       if (initialCashInput) initialCashInput.value = String(Math.round(basis));
       const autoBasisTarget = document.getElementById('autoSimulationBasis');
       if (autoBasisTarget) {
-        autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(basis)} · 수익률 게인 자동 산정`;
+        autoBasisTarget.textContent = `시뮬레이션 기준 현금 ${fmtWon.format(basis)} · 총자산 ${fmtWon.format(summary.equity || basis)}`;
       }
       renderStatus({
         cash: liveAccountBasis.cash,
+        cash_equivalent_krw: liveAccountBasis.cash_equivalent_krw,
         krw_cash: liveAccountBasis.krw_cash,
         foreign_cash_krw: liveAccountBasis.foreign_cash_krw,
         cash_by_currency: liveAccountBasis.cash_by_currency,
@@ -5461,6 +5963,9 @@ HTML = """
     }
 
     async function loadOperationModeStatus() {
+      if (operationModeBusy) return;
+      operationModeBusy = true;
+      try {
       const data = await fetchJsonWithTimeout('/api/operation-mode/status', {}, 8000);
       const request = data.request || {};
       if (request.busy) {
@@ -5487,6 +5992,9 @@ HTML = """
       }
       if (data.active) renderOperationMode(data.active);
       return data;
+      } finally {
+        operationModeBusy = false;
+      }
     }
     document.getElementById('goalForm').addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -5534,6 +6042,20 @@ HTML = """
         }
       });
     }
+
+    function scoreRow(label, value, tone = 'good', valueText = null) {
+      const numeric = Number(value || 0);
+      const bounded = Math.max(0, Math.min(100, numeric));
+      const text = valueText ?? `${bounded.toFixed(1)}%`;
+      const toneClass = tone === 'bad' ? 'score-bad' : tone === 'warn' ? 'score-warn' : 'score-good';
+      return `
+        <div class="score-row">
+          <span>${label}</span>
+          <span class="${toneClass}">${text}</span>
+        </div>
+      `;
+    }
+
     function renderAssessment(data, options = {}) {
       if (data.session_id) sessionId = data.session_id;
       const previousSelection = selectedGoal;
@@ -5738,6 +6260,7 @@ HTML = """
         data = {
           ...(data || {}),
           cash: liveAccountBasis.cash,
+          cash_equivalent_krw: liveAccountBasis.cash_equivalent_krw,
           krw_cash: liveAccountBasis.krw_cash,
           foreign_cash_krw: liveAccountBasis.foreign_cash_krw,
           cash_by_currency: liveAccountBasis.cash_by_currency,
@@ -5749,27 +6272,36 @@ HTML = """
           account_suffix: liveAccountBasis.account_suffix,
         };
       }
-      document.getElementById('equity').textContent = fmtWon.format(data.equity);
-      document.getElementById('cash').textContent = `기준 현금 ${formatCashByCurrency(data)}`;
-      document.getElementById('cashWeight').textContent = `현금 비중 ${(data.cash_weight * 100).toFixed(1)}%`;
+      const summary = accountSnapshotSummary(data);
+      document.getElementById('equity').textContent = fmtWon.format(summary.cash);
+      const totalAssetsTarget = document.getElementById('totalAssets');
+      if (totalAssetsTarget) totalAssetsTarget.textContent = `총자산 ${fmtWon.format(summary.equity)}`;
+      document.getElementById('cash').textContent = `주문가능 원화 ${fmtWon.format(summary.cash)}`;
+      const investedValueTarget = document.getElementById('investedValue');
+      if (investedValueTarget) investedValueTarget.textContent = `보유주식 ${fmtWon.format(summary.invested)}`;
+      const krwCashTarget = document.getElementById('krwCash');
+      if (krwCashTarget) krwCashTarget.textContent = `KRW 현금 ${fmtWon.format(summary.krwCash)}`;
+      const foreignCashTarget = document.getElementById('foreignCash');
+      if (foreignCashTarget) foreignCashTarget.textContent = `외화/해외평가 ${fmtWon.format(summary.foreignCashKrw)}`;
+      document.getElementById('cashWeight').textContent = `현금 비중 ${(summary.cashWeight * 100).toFixed(1)}%`;
       if (data.basis_source === 'kis_live_account' && Number(data.equity || 0) > 0) {
-        const balances = currencyMap(data);
         liveAccountBasis = {
-          cash: Number(data.cash || data.equity || 0),
-          krw_cash: Number(balances.KRW ?? data.cash ?? 0),
-          foreign_cash_krw: Number(data.foreign_cash_krw || Math.max(0, Number(data.cash || 0) - Number(balances.KRW || 0))),
-          cash_by_currency: balances,
-          foreign_cash_by_currency: data.foreign_cash_by_currency || {},
+          cash: Number(summary.cash),
+          cash_equivalent_krw: Number(summary.cashEquivalentKrw),
+          krw_cash: Number(summary.krwCash),
+          foreign_cash_krw: Number(summary.foreignCashKrw),
+          cash_by_currency: summary.cashByCurrency,
+          foreign_cash_by_currency: summary.foreignCashByCurrency,
           base_currency: data.base_currency || 'KRW',
-          equity: Number(data.equity || 0),
-          cash_weight: Number(data.cash_weight || 0),
+          equity: Number(summary.equity),
+          cash_weight: Number(summary.cashWeight || 0),
           account_suffix: data.account_suffix || '',
         };
         const initialCashInput = document.getElementById('initialCash');
-        if (initialCashInput) initialCashInput.value = String(Math.round(liveAccountBasis.equity));
+        if (initialCashInput) initialCashInput.value = String(Math.round(liveAccountBasis.cash));
         const autoBasisTarget = document.getElementById('autoSimulationBasis');
         if (autoBasisTarget) {
-          autoBasisTarget.textContent = `시뮬레이션 예수금 ${fmtWon.format(liveAccountBasis.equity)} · 수익률 게인 자동 산정`;
+          autoBasisTarget.textContent = `시뮬레이션 기준 현금 ${fmtWon.format(liveAccountBasis.cash)} · 총자산 ${fmtWon.format(liveAccountBasis.equity)}`;
         }
       }
     }
@@ -5879,56 +6411,59 @@ HTML = """
       return text;
     }
 
+    function liveExecutionReasonLabel(summary = {}) {
+      if (!summary || typeof summary !== 'object') return '대기';
+      const submitted = Number(summary.submitted || 0);
+      const approvedBuy = Number(summary.approved_buy_orders || 0);
+      const approvedSell = Number(summary.approved_sell_orders || 0);
+      const buySignals = Number(summary.buy_signals || 0);
+      const sellSignals = Number(summary.sell_signals || 0);
+      const blocked = Array.isArray(summary.blocked) ? summary.blocked.length : 0;
+      const errors = Array.isArray(summary.errors) ? summary.errors.length : 0;
+
+      if (submitted > 0) return '주문 제출';
+      if (approvedBuy + approvedSell > 0) return '승인 완료';
+      if (buySignals + sellSignals > 0) return '게이트 심사중';
+      if (blocked > 0) return '게이트 차단';
+      if (errors > 0) return '실행 오류';
+      return '대기';
+    }
+
+    function liveExecutionSummaryText(summary = {}, data = {}) {
+      const runtimeGate = data.runtime_gate || summary.runtime_gate || {};
+      const failures = Array.isArray(runtimeGate.failures) ? runtimeGate.failures : [];
+      const skipped = Array.isArray(summary.cash_fit_skipped_orders) ? summary.cash_fit_skipped_orders.length : 0;
+      const blocked = Array.isArray(summary.blocked) ? summary.blocked.length : 0;
+      const errors = Array.isArray(summary.errors) ? summary.errors.length : 0;
+      const reason = liveExecutionReasonLabel(summary);
+      const gateText = runtimeGate.ok ? '실주문 가능' : `실주문 차단${failures.length ? `: ${failures.join(', ')}` : ''}`;
+      return `실행 ${reason} · 신호 ${Number(summary.signals || 0)} · BUY ${Number(summary.buy_signals || 0)} · SELL/REDUCE ${Number(summary.sell_signals || 0)} · 후보 ${Number(summary.intents || 0)} · 승인 매수 ${Number(summary.approved_buy_orders || 0)} · 승인 매도 ${Number(summary.approved_sell_orders || 0)} · 실행가능 매수 ${Number(summary.executable_buy_orders || 0)} · 실행가능 매도 ${Number(summary.executable_sell_orders || 0)} · 제출 ${Number(summary.submitted || 0)} · 현금부족 제외 ${skipped} · 차단 ${blocked} · 오류 ${errors} · ${gateText}`;
+    }
+
+    function renderLivePerformanceSummary(data = {}) {
+      setPerformancePanelMode('live_trading');
+      const percent = Number(data.return_rate || 0) * 100;
+      document.getElementById('mockReturn').textContent = `${percent.toFixed(2)}%`;
+      document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
+      document.getElementById('mockProfit').textContent = `실전 손익 ${fmtWon.format(data.profit || 0)}`;
+      document.getElementById('mockEquity').textContent = `실전 평가금 ${fmtWon.format(data.equity || 0)}`;
+      document.getElementById('mockTarget').textContent = '실전 목표 -';
+      const accountSummary = accountSnapshotSummary(data);
+      const executionSummary = data.execution_summary || {};
+      document.getElementById('mockStatus').textContent =
+        `KIS 실계좌 기준 갱신 · 총자산 ${fmtWon.format(accountSummary.equity)} · 주문가능 원화 ${fmtWon.format(accountSummary.cash)} · 보유주식 ${fmtWon.format(accountSummary.invested)} · 외화 ${fmtWon.format(accountSummary.foreignCashKrw)} · ${liveExecutionSummaryText(executionSummary, data)}`;
+    }
+
     async function loadMockPerformance() {
       if (activeOperationMode === 'live_trading') {
+        setPerformancePanelMode('live_trading');
         const data = await (await fetch('/api/live-trading/progress')).json();
         data.display_mode = 'live';
-        renderMockPerformance(data);
-        renderMockRunTables(data);
+        window.setTimeout(() => renderLivePerformanceSummary(data), 0);
         return;
       }
-      try {
-        const liveMode = activeOperationMode === 'live_trading';
-        const data = await (await fetch(liveMode ? '/api/live-trading/progress' : '/api/mock-trading/performance')).json();
-        data.display_mode = liveMode ? 'live' : 'paper';
-        renderMockPerformance(data);
-        renderMockRunTables(data);
-      } catch (error) {
-        document.getElementById('mockStatus').textContent = 'Paper trading 성과 대기 중';
-      }
-    }
 
-    function liveExecutionReasonLabel(summary) {
-      const reason = String((summary && summary.reason) || '').trim();
-      const labels = {
-        NO_ORDER_INTENTS: '주문 후보 없음',
-        NO_RISK_RESULTS: '리스크 평가 없음',
-        NO_APPROVED_FINAL_ORDERS: '승인 주문 없음',
-        NO_EXECUTABLE_LIVE_FINAL_ORDERS: '실행 가능 주문 없음',
-      };
-      return labels[reason] || (reason ? reason : '실행 평가 대기');
-    }
-
-    function renderMockPerformance(data) {
-      if (!data) return;
-      const isLive = data.display_mode === 'live' || data.mode === 'live_trading' || activeOperationMode === 'live_trading';
-      if (isLive) {
-        const panelTitle = document.getElementById('runProgressTitle');
-        const tableTitle = document.getElementById('executionTableTitle');
-        if (panelTitle) panelTitle.textContent = '실시간 실전 진행';
-        if (tableTitle) tableTitle.textContent = '실전 계좌 보유 및 최근 체결';
-        const percent = Number(data.return_rate || 0) * 100;
-        document.getElementById('mockReturn').textContent = `${percent.toFixed(2)}%`;
-        document.getElementById('mockReturnBar').style.width = `${Math.max(0, Math.min(100, Math.abs(percent)))}%`;
-        document.getElementById('mockProfit').textContent = `실전 손익 ${fmtWon.format(data.profit || 0)}`;
-        document.getElementById('mockEquity').textContent = `실전 평가 ${fmtWon.format(data.equity || 0)}`;
-        document.getElementById('mockTarget').textContent = '목표 -';
-        const summary = data.execution_summary || {};
-        const executionText = `실행 ${liveExecutionReasonLabel(summary)} · 신호 ${Number(summary.signals || 0)} · BUY ${Number(summary.buy_signals || 0)} · 후보 ${Number(summary.intents || 0)} · 승인 ${Number(summary.approved_orders || 0)} · 제출 ${Number(summary.submitted || 0)}`;
-        document.getElementById('mockStatus').textContent =
-          `KIS 실계좌 기준 갱신 · 평가 ${fmtWon.format(data.equity || 0)} · 현금 ${formatCashByCurrency(data)} · ${executionText}`;
-        return;
-      }
+      const data = await (await fetch('/api/mock-trading/performance')).json();
       const panelTitle = document.getElementById('runProgressTitle');
       const tableTitle = document.getElementById('executionTableTitle');
       if (panelTitle) panelTitle.textContent = '실시간 모의 진행';
@@ -6012,7 +6547,9 @@ HTML = """
     function renderMockRunTables(data) {
       const positions = data.positions || [];
       const executions = data.recent_executions || [];
+      const recentOrders = data.recent_orders || [];
       const isLive = data.display_mode === 'live' || data.mode === 'live_trading' || activeOperationMode === 'live_trading';
+      const orderRows = isLive && recentOrders.length ? recentOrders : executions;
       document.getElementById('mockRunStats').innerHTML = `
         <div class="stat"><strong>${data.active ? '진행 중' : '대기'}</strong><span class="muted">모의투자 상태</span></div>
         <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
@@ -6025,6 +6562,16 @@ HTML = """
           <div class="stat"><strong>${data.orders_count || 0}</strong><span class="muted">주문</span></div>
           <div class="stat"><strong>${data.executions_count || 0}</strong><span class="muted">체결</span></div>
           <div class="stat"><strong>${positions.length}</strong><span class="muted">보유 종목</span></div>
+        `;
+      }
+      if (isLive) {
+        const runtimeGate = data.runtime_gate || {};
+        const journal = data.live_order_journal || {};
+        document.getElementById('mockRunStats').innerHTML = `
+          <div class="stat"><strong>${data.active ? '진행 중' : '실계좌 조회'}</strong><span class="muted">실전투자 상태</span></div>
+          <div class="stat"><strong>${runtimeGate.ok ? '가능' : '차단'}</strong><span class="muted">실주문 게이트</span></div>
+          <div class="stat"><strong>${journal.submitted_count || data.executions_count || 0}</strong><span class="muted">제출</span></div>
+          <div class="stat"><strong>${journal.blocked_count || 0}</strong><span class="muted">차단</span></div>
         `;
       }
       const positionTarget = document.getElementById('mockPositions');
@@ -6042,17 +6589,27 @@ HTML = """
           <td class="${tone}">${rate.toFixed(2)}%</td>
         </tr>`;
       }).join('') : '<tr><td colspan="7">보유 종목 없음</td></tr>';
-      document.getElementById('mockExecutions').innerHTML = executions.length ? executions.slice().reverse().map((item) => {
-        const sideClass = item.side === 'BUY' ? 'side-buy' : 'side-sell';
+      document.getElementById('mockExecutions').innerHTML = orderRows.length ? orderRows.slice().reverse().map((item) => {
+        const side = item.side || item.event_type || item.status || '-';
+        const sideClass = side === 'BUY' ? 'side-buy' : side === 'SELL' ? 'side-sell' : '';
+        const price = item.price ?? item.limit_price ?? 0;
+        const quantity = item.quantity || item.status || '-';
+        const ticker = item.ticker || item.market || item.event_type || '-';
+        const currency = item.currency || (item.market === 'US-LISTED' ? 'USD' : 'KRW');
+        const detail = item.broker_order_id || item.error || (Array.isArray(item.reason_codes) ? item.reason_codes.join(', ') : item.reason_codes) || '';
         return `<tr>
-          <td class="${sideClass}">${item.side}</td>
-          <td>${item.ticker}</td>
-          <td>${item.quantity}</td>
-          <td>${formatMoney(item.price || 0, item.currency)}</td>
+          <td class="${sideClass}">${side}</td>
+          <td>${ticker}</td>
+          <td>${quantity}</td>
+          <td>${price ? formatMoney(price, currency) : detail || '-'}</td>
         </tr>`;
       }).join('') : '<tr><td colspan="4">체결 이력 없음</td></tr>';
-      if (isLive && !executions.length) {
+      if (isLive && !orderRows.length) {
+        const failures = ((data.runtime_gate || {}).failures || []).join(', ');
+        const emptyLiveOrderText = `<tr><td colspan="4">실전 주문 내역 없음${failures ? ` · 게이트 차단: ${failures}` : ''}</td></tr>`;
+        document.getElementById('mockExecutions').innerHTML = emptyLiveOrderText;
         document.getElementById('mockExecutions').innerHTML = '<tr><td colspan="4">실시간 체결 내역은 주문 추적기에 기록되면 표시됩니다.</td></tr>';
+        document.getElementById('mockExecutions').innerHTML = emptyLiveOrderText;
       }
     }
 
@@ -6128,12 +6685,13 @@ HTML = """
     async function renderOntologyGraph(data) {
       const canvas = document.getElementById('ontologyCanvas');
       const tooltip = document.getElementById('ontologyTooltip');
+      renderOntologyGraph2d(data, canvas, tooltip);
+      tooltip.style.display = 'block';
+      tooltip.style.left = '12px';
+      tooltip.style.top = '52px';
+      tooltip.textContent = '2D 폴백으로 그래프를 우선 표시합니다.';
       const THREE = await loadThree();
       if (!THREE) {
-        renderOntologyGraph2d(data, canvas, tooltip);
-        tooltip.style.display = 'block';
-        tooltip.style.left = '12px';
-        tooltip.style.top = '52px';
         tooltip.textContent = '3D 라이브러리를 불러오지 못해 2D로 표시합니다.';
         return;
       }
@@ -7487,7 +8045,7 @@ HTML = """
       streamingDemoHistory = [];
       streamingDemoPrices = {};
       streamingReturnSeries = [];
-      streamingInitialCash = Math.max(1, Number(liveAccountBasis?.equity || 10000000));
+      streamingInitialCash = Math.max(1, Number(liveAccountBasis?.cash || 10000000));
       streamingTargetReturnRate = targetReturn;
       streamingTargetMinutes = periodMinutes;
       try {
@@ -7623,6 +8181,122 @@ HTML = """
         streamingDemoTimer = setTimeout(() => autoRunStreamingDemo(false), waitMs);
       }
     }
+    function renderStatus(data = {}) {
+      if (liveAccountBasis && (!data || data.basis_source !== 'kis_live_account')) {
+        data = {
+          ...(data || {}),
+          cash: liveAccountBasis.cash,
+          cash_equivalent_krw: liveAccountBasis.cash_equivalent_krw,
+          krw_cash: liveAccountBasis.krw_cash,
+          foreign_cash_krw: liveAccountBasis.foreign_cash_krw,
+          cash_by_currency: liveAccountBasis.cash_by_currency,
+          foreign_cash_by_currency: liveAccountBasis.foreign_cash_by_currency,
+          base_currency: liveAccountBasis.base_currency,
+          equity: liveAccountBasis.equity,
+          cash_weight: liveAccountBasis.cash_weight,
+          basis_source: 'kis_live_account',
+          account_suffix: liveAccountBasis.account_suffix,
+        };
+      }
+      const summary = accountSnapshotSummary(data || {});
+      const setText = (id, text) => {
+        const node = document.getElementById(id);
+        if (node) node.textContent = text;
+      };
+      setText('equity', fmtWon.format(summary.cash));
+      setText('totalAssets', `총자산 ${fmtWon.format(summary.equity)}`);
+      setText('cash', `주문가능 원화 ${fmtWon.format(summary.cash)}`);
+      setText('investedValue', `보유주식 ${fmtWon.format(summary.invested)}`);
+      setText('krwCash', `KRW 현금 ${fmtWon.format(summary.krwCash)}`);
+      setText('foreignCash', `외화/해외평가 ${fmtWon.format(summary.foreignCashKrw)}`);
+      setText('cashWeight', `현금 비중 ${(summary.cashWeight * 100).toFixed(1)}%`);
+      if (data.basis_source === 'kis_live_account' && Number(data.equity || 0) > 0) {
+        liveAccountBasis = {
+          cash: Number(summary.cash),
+          cash_equivalent_krw: Number(summary.cashEquivalentKrw),
+          krw_cash: Number(summary.krwCash),
+          foreign_cash_krw: Number(summary.foreignCashKrw),
+          cash_by_currency: summary.cashByCurrency,
+          foreign_cash_by_currency: summary.foreignCashByCurrency,
+          base_currency: data.base_currency || 'KRW',
+          equity: Number(summary.equity),
+          cash_weight: Number(summary.cashWeight || 0),
+          account_suffix: data.account_suffix || '',
+        };
+      }
+    }
+
+    function renderBrokerAccountCard(connection = {}) {
+      const depositTarget = document.getElementById('brokerDeposit');
+      const holdingsTarget = document.getElementById('brokerHoldings');
+      const accountTarget = document.getElementById('brokerAccount');
+      const equityTarget = document.getElementById('brokerEquity');
+      const investedTarget = document.getElementById('brokerInvested');
+      const krwCashTarget = document.getElementById('brokerKrwCash');
+      const foreignCashTarget = document.getElementById('brokerForeignCash');
+      const statusTarget = document.getElementById('brokerStatus');
+      if (!depositTarget || !holdingsTarget || !accountTarget || !statusTarget) return;
+      accountTarget.textContent = `Account ${connection.account_suffix || '-'}`;
+      if (connection.account_checked) {
+        const summary = accountSnapshotSummary(connection);
+        const holdings = connection.holdings_count ?? connection.holdings ?? 0;
+        const submitted = Number((connection.live_order_journal || {}).submitted_count ?? connection.submitted_count ?? 0);
+        const updatedAt = connection.updated_at ? new Date(connection.updated_at).toLocaleTimeString('ko-KR') : new Date().toLocaleTimeString('ko-KR');
+        depositTarget.textContent = fmtWon.format(summary.cash);
+        if (equityTarget) equityTarget.textContent = `총자산 ${fmtWon.format(summary.equity)}`;
+        if (investedTarget) investedTarget.textContent = `보유주식 ${fmtWon.format(summary.invested)}`;
+        if (krwCashTarget) krwCashTarget.textContent = `원화 ${fmtWon.format(summary.krwCash)}`;
+        if (foreignCashTarget) foreignCashTarget.textContent = `외화 ${formatForeignCash(connection)}`;
+        holdingsTarget.textContent = `Holdings ${holdings}`;
+        statusTarget.textContent = `KIS 실계좌 실시간 갱신 ${updatedAt} · 제출 ${submitted}건`;
+        applyLiveAccountBasis(connection);
+        return;
+      }
+      if (connection.ok === false) {
+        depositTarget.textContent = '조회 실패';
+        holdingsTarget.textContent = 'Holdings -';
+        if (equityTarget) equityTarget.textContent = '총자산 -';
+        if (investedTarget) investedTarget.textContent = '보유주식 -';
+        if (krwCashTarget) krwCashTarget.textContent = '원화 -';
+        if (foreignCashTarget) foreignCashTarget.textContent = '외화 -';
+        statusTarget.textContent = connection.message || connection.error || 'KIS 계좌 조회 실패';
+        return;
+      }
+      depositTarget.textContent = '조회 대기';
+      holdingsTarget.textContent = 'Holdings -';
+      if (equityTarget) equityTarget.textContent = '총자산 -';
+      if (investedTarget) investedTarget.textContent = '보유주식 -';
+      if (krwCashTarget) krwCashTarget.textContent = '원화 -';
+      if (foreignCashTarget) foreignCashTarget.textContent = '외화 -';
+      statusTarget.textContent = 'KIS 실계좌 조회 대기 중';
+    }
+
+    async function refreshLiveTradingProgress() {
+      if (activeOperationMode !== 'live_trading') return;
+      if (liveTradingProgressBusy) return;
+      liveTradingProgressBusy = true;
+      try {
+      const data = await (await fetch('/api/live-trading/progress')).json();
+      if (data.connection) {
+        const connection = {
+          ...data.connection,
+          updated_at: data.updated_at,
+          live_order_journal: data.live_order_journal,
+          submitted_count: data.executions_count,
+        };
+        renderBrokerAccountCard(connection);
+      }
+      renderStatus({ ...data, basis_source: 'kis_live_account' });
+      renderLivePerformanceSummary(data);
+      renderMockRunTables({ ...data, display_mode: 'live' });
+      } finally {
+        liveTradingProgressBusy = false;
+      }
+    }
+
+    window.applyLiveFlags = applyLiveFlags;
+    window.startSelectedOperationMode = startSelectedOperationMode;
+    window.terminateActiveTrading = terminateActiveTrading;
     applyCompactKoreanDashboard();
     applyUrlGoalParams();
     updateModeButtons();
@@ -7637,6 +8311,8 @@ HTML = """
     loadMockPerformance();
     refreshLiveSnapshot();
     setInterval(() => loadOperationModeStatus().catch(() => {}), 3000);
+    setInterval(() => loadStatus().catch(() => {}), 3000);
+    setInterval(() => refreshLiveTradingProgress().catch(() => {}), 3000);
     setInterval(refreshLiveSnapshot, 5000);
     setInterval(() => loadMockPerformance().catch(() => {}), 3000);
   </script>

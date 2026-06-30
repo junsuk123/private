@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.graph import KnowledgeGraph
-from app.schemas.domain import IndicatorSnapshot, MarketSnapshot, OrderAction, OrderIntent, StrategySignal
+from app.schemas.domain import AccountSnapshot, Holding, IndicatorSnapshot, MarketSnapshot, OrderAction, OrderIntent, StrategySignal
 
 
 ONTOLOGY_FLOW_SUPPORT_WEIGHTS = {
@@ -25,16 +25,44 @@ ONTOLOGY_FLOW_CONTRA_WEIGHTS = {
     "BuyCandidate": 0.25,
 }
 MARKET_CONTEXT_BUY_THRESHOLD = 1.0
+POSITION_REDUCE_WEIGHT = 0.12
+POSITION_SELL_WEIGHT = 0.24
 
 
 def generate_strategy_signals(
     markets: tuple[MarketSnapshot, ...],
     indicators: dict[str, IndicatorSnapshot],
     graph: KnowledgeGraph,
+    account: AccountSnapshot | None = None,
 ) -> tuple[StrategySignal, ...]:
     signals: list[StrategySignal] = []
+    holdings_by_ticker = {holding.ticker: holding for holding in account.holdings} if account is not None else {}
 
     for market in markets:
+        holding = holdings_by_ticker.get(market.ticker)
+        if holding is not None:
+            position_weight = _holding_position_weight(holding, account)
+            exit_score, exit_support, exit_contra = _holding_exit_adjustment(graph, market.ticker, position_weight, holding)
+            if exit_score <= -0.65 or position_weight >= POSITION_SELL_WEIGHT:
+                action = OrderAction.SELL
+            elif exit_score <= -0.10 or position_weight >= POSITION_REDUCE_WEIGHT:
+                action = OrderAction.REDUCE
+            else:
+                action = OrderAction.HOLD
+            confidence = max(0.0, min(0.9, 0.5 + exit_score * 0.1))
+            signals.append(
+                StrategySignal(
+                    ticker=market.ticker,
+                    action=action,
+                    confidence=confidence,
+                    score=exit_score,
+                    supporting_factors=tuple(exit_support),
+                    contradicting_factors=tuple(exit_contra),
+                    reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
+                )
+            )
+            continue
+
         indicator = indicators.get(market.ticker)
         if indicator is None:
             score = 0.0
@@ -117,15 +145,28 @@ def generate_order_intents(
     intents: list[OrderIntent] = []
 
     for signal in signals:
-        if signal.action is not OrderAction.BUY:
-            continue
-
         market = market_by_ticker[signal.ticker]
         indicator = indicators.get(signal.ticker)
-        suggested_weight = min(0.05, max(0.01, signal.confidence * 0.05))
-        if "InformedOrderFlowImbalance" in signal.supporting_factors:
-            suggested_weight = min(0.05, suggested_weight * 1.08)
-        gross_expected_return = max(0.012, min(0.08, signal.score * 0.012))
+        if signal.action is OrderAction.BUY:
+            suggested_weight = min(0.05, max(0.01, signal.confidence * 0.05))
+            if "InformedOrderFlowImbalance" in signal.supporting_factors:
+                suggested_weight = min(0.05, suggested_weight * 1.08)
+            gross_expected_return = max(0.012, min(0.08, signal.score * 0.012))
+            expected_exit_price = market.last_price * (1 + gross_expected_return)
+            expected_holding_minutes = 360
+            signal_name = "fundamental_ontology_buy" if indicator is not None else "market_context_ontology_buy"
+            reasoning_summary = _intent_reasoning_summary(indicator is not None)
+        else:
+            suggested_weight = 0.0 if signal.action is OrderAction.SELL else 0.01
+            gross_expected_return = 0.0
+            expected_exit_price = market.last_price
+            expected_holding_minutes = 60
+            signal_name = "short_horizon_exit" if signal.action is OrderAction.SELL else "short_horizon_reduce"
+            reasoning_summary = (
+                "The position has exceeded the short-horizon holding window and is being de-risked through the ontology layer.",
+                "Age, unrealized PnL, and ontology risk tags favor an exit before the trade becomes stale.",
+                "RiskManager still enforces cash, source, and execution gates before any final order is issued.",
+            )
 
         intents.append(
             OrderIntent(
@@ -135,13 +176,13 @@ def generate_order_intents(
                 suggested_weight=suggested_weight,
                 confidence=signal.confidence,
                 valid_until=datetime.now(timezone.utc) + timedelta(hours=6),
-                reasoning_summary=_intent_reasoning_summary(indicator is not None),
+                reasoning_summary=reasoning_summary,
                 supporting_factors=signal.supporting_factors,
                 contradicting_factors=signal.contradicting_factors,
                 strategy_family="rule_based",
-                signal_name="fundamental_ontology_buy" if indicator is not None else "market_context_ontology_buy",
-                expected_exit_price=market.last_price * (1 + gross_expected_return),
-                expected_holding_minutes=360,
+                signal_name=signal_name,
+                expected_exit_price=expected_exit_price,
+                expected_holding_minutes=expected_holding_minutes,
                 gross_expected_return=gross_expected_return,
                 target_net_return=0.0,
                 ontology_tags=tuple(signal.supporting_factors),
@@ -234,6 +275,56 @@ def _live_market_validation_id(market: MarketSnapshot, signal: StrategySignal) -
         )
     )
     return "broker-reality-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _holding_position_weight(holding: Holding, account: AccountSnapshot | None) -> float:
+    if account is None or account.equity <= 0:
+        return 0.0
+    return max(0.0, float(holding.market_value) / max(1.0, float(account.equity)))
+
+
+def _holding_exit_adjustment(
+    graph: KnowledgeGraph,
+    ticker: str,
+    position_weight: float,
+    holding: Holding,
+) -> tuple[float, list[str], list[str]]:
+    score = 0.0
+    supporting: list[str] = ["HeldPosition", "WeightBasedExitPolicy"]
+    contradicting: list[str] = []
+
+    support_objects = tuple(triple.object for triple in graph.matching(subject=ticker, predicate="supportsSignal"))
+    risk_objects = tuple(triple.object for triple in graph.matching(subject=ticker, predicate="increasesRiskOf"))
+
+    if position_weight >= POSITION_SELL_WEIGHT:
+        score -= 1.0
+        supporting.append("OverweightPosition")
+    elif position_weight >= POSITION_REDUCE_WEIGHT:
+        score -= 0.55
+        supporting.append("PositionSizedForReduction")
+    elif position_weight <= 0.05:
+        score += 0.15
+        supporting.append("LightPosition")
+
+    if holding.unrealized_pnl <= 0:
+        score -= 0.35
+        contradicting.append("NegativeUnrealizedPnL")
+    else:
+        score += min(0.25, holding.unrealized_pnl / max(1.0, holding.market_value) * 2.0)
+        supporting.append("PositiveUnrealizedPnL")
+
+    if any(item in risk_objects for item in ("ConcentratedPositionRisk", "SellCandidate")):
+        score -= 0.75
+        supporting.append("OntologySellSignal")
+    if "ReduceRiskCandidate" in risk_objects:
+        score -= 0.35
+        supporting.append("OntologyReduceSignal")
+    if any(item in support_objects for item in ("WaitOrTakeProfit", "BreakoutWatch")):
+        score += 0.1
+
+    if position_weight >= POSITION_SELL_WEIGHT or holding.unrealized_pnl <= 0:
+        supporting.append("ReduceRiskCandidate")
+    return score, supporting, contradicting
 
 
 def _ontology_flow_adjustment(graph: KnowledgeGraph, ticker: str) -> tuple[float, tuple[str, ...], tuple[str, ...]]:

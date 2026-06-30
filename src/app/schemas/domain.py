@@ -96,6 +96,7 @@ class Holding:
     quantity: int
     average_price: float
     last_price: float
+    opened_at: datetime | None = None
 
     @property
     def market_value(self) -> float:
@@ -114,6 +115,7 @@ class AccountSnapshot:
     unrealized_pnl_today: float = 0.0
     base_currency: str = "KRW"
     cash_by_currency: dict[str, float] = field(default_factory=dict)
+    position_opened_at_by_ticker: dict[str, datetime] = field(default_factory=dict)
     cash_equivalent_krw: float | None = None
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -122,9 +124,16 @@ class AccountSnapshot:
         return sum(holding.market_value for holding in self.holdings)
 
     @property
+    def securities_market_value(self) -> float:
+        return self.invested_value
+
+    @property
+    def pure_cash(self) -> float:
+        return self.cash if self.cash_equivalent_krw is None else self.cash_equivalent_krw
+
+    @property
     def equity(self) -> float:
-        cash_basis = self.cash if self.cash_equivalent_krw is None else self.cash_equivalent_krw
-        return cash_basis + self.invested_value
+        return self.pure_cash + self.invested_value
 
     def holdings_by_ticker(self) -> dict[str, float]:
         return {holding.ticker: holding.market_value for holding in self.holdings}

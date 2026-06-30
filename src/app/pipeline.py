@@ -32,6 +32,7 @@ from app.research import ResearchRunResult
 from app.storage import StoredResearch
 from app.time_series import add_time_frames_to_graph, build_time_synchronized_frames
 from app.market_affordability import filter_markets_affordable_for_account
+from app.market_affordability import cash_available_for_market
 from app.trading_pipeline import (
     CandidateSelectionResult,
     build_lightweight_market_snapshots_from_markets,
@@ -107,15 +108,17 @@ def build_analysis_context(
         realtime_quotes=realtime_quotes,
         realtime_executions=realtime_executions,
     )
-    graph = build_market_graph(markets, indicators, events)
+    graph = build_market_graph(markets, indicators, events, account=account)
     add_time_frames_to_graph(graph, temporal_frames)
+    _add_account_position_state_to_graph(graph, account)
     parameter_tuning = _ontology_parameter_tuning(markets, indicators, events)
     _add_pipeline_metadata_to_graph(graph, candidate_selection, parameter_tuning, events)
     reasoner = OntologyReasoner(graph)
     reasoner.infer()
     reasoning_paths = reasoner.build_reasoning_paths(tuple(market.ticker for market in markets))
     report = build_portfolio_report(account)
-    signals = generate_strategy_signals(markets, indicators, graph)
+    signals = generate_strategy_signals(markets, indicators, graph, account)
+    signals = _augment_live_liquidity_recovery_signals(markets, signals, account, risk_rules)
     signals = _augment_live_cash_fit_signals(markets, signals, account, risk_rules)
     intents = generate_order_intents(markets, indicators, signals)
     intents = _adjust_live_cash_fit_intents(intents, markets, account, risk_rules)
@@ -205,6 +208,77 @@ def _augment_live_cash_fit_signals(
     return tuple(augmented)
 
 
+def _augment_live_liquidity_recovery_signals(
+    markets: tuple[MarketSnapshot, ...],
+    signals: tuple[StrategySignal, ...],
+    account: AccountSnapshot,
+    risk_rules: RiskRules | None,
+) -> tuple[StrategySignal, ...]:
+    if risk_rules is None or not risk_rules.live_trading_enabled:
+        return signals
+    holdings_by_ticker = {holding.ticker: holding for holding in account.holdings}
+    if not holdings_by_ticker:
+        return signals
+    market_by_ticker = {market.ticker: market for market in markets}
+    domestic_candidates: list[tuple[float, str, float]] = []
+    for ticker, holding in holdings_by_ticker.items():
+        market = market_by_ticker.get(ticker)
+        if market is None:
+            continue
+        market_name = str(market.market or "").upper()
+        if market_name not in {"KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+            continue
+        price = float(market.last_price or 0.0)
+        if price <= 0.0:
+            continue
+        value = max(0.0, float(holding.market_value or 0.0))
+        if value <= 0.0:
+            continue
+        domestic_candidates.append((value, ticker, price))
+    if not domestic_candidates:
+        return signals
+    krw_cash = float(account.cash_by_currency.get("KRW", account.cash) or 0.0)
+    cheapest_price = min(item[2] for item in domestic_candidates)
+    if krw_cash >= cheapest_price:
+        return signals
+
+    target_ticker = max(domestic_candidates, key=lambda item: item[0])[1]
+    signal_by_ticker = {signal.ticker: signal for signal in signals}
+    existing = signal_by_ticker.get(target_ticker)
+    supporting_tail = (
+        "LiquidityRecoveryDeRisk",
+        "LowCashRecoveryMode",
+        "SellToRebuildKRWCash",
+    )
+    if existing is not None:
+        updated = replace(
+            existing,
+            action=OrderAction.SELL,
+            confidence=max(float(existing.confidence), 0.62),
+            score=max(float(existing.score), 1.15),
+            supporting_factors=tuple(dict.fromkeys((*existing.supporting_factors, *supporting_tail))),
+            contradicting_factors=tuple(
+                item
+                for item in existing.contradicting_factors
+                if item not in {"MissingFundamentalIndicators"}
+            ),
+        )
+        return tuple(updated if signal.ticker == target_ticker else signal for signal in signals)
+
+    fallback = StrategySignal(
+        ticker=target_ticker,
+        action=OrderAction.SELL,
+        confidence=0.62,
+        score=1.15,
+        supporting_factors=supporting_tail,
+        contradicting_factors=(),
+        reasoning_path_ids=(),
+    )
+    ordered = [*signals, fallback]
+    ordered.sort(key=lambda item: (0 if item.ticker == target_ticker else 1, item.ticker))
+    return tuple(ordered)
+
+
 def _adjust_live_cash_fit_intents(
     intents: tuple[OrderIntent, ...],
     markets: tuple[MarketSnapshot, ...],
@@ -244,6 +318,27 @@ def _adjust_live_cash_fit_intents(
     return tuple(adjusted)
 
 
+def _add_account_position_state_to_graph(graph: KnowledgeGraph, account: AccountSnapshot) -> None:
+    if not account.holdings:
+        return
+    captured_at = account.captured_at
+    for holding in account.holdings:
+        if account.equity <= 0:
+            continue
+        position_weight = max(0.0, float(holding.market_value) / max(1.0, float(account.equity)))
+        evidence_id = f"account-position:{holding.ticker}:{captured_at.isoformat()}"
+        graph.add(holding.ticker, "hasPositionWeight", f"{position_weight:.4f}", evidence_id)
+        graph.add(holding.ticker, "supportsSignal", "HeldPosition", evidence_id)
+        if position_weight >= 0.24:
+            graph.add(holding.ticker, "increasesRiskOf", "ConcentratedPositionRisk", evidence_id)
+            graph.add(holding.ticker, "supportsSignal", "SellCandidate", evidence_id)
+        elif position_weight >= 0.12:
+            graph.add(holding.ticker, "increasesRiskOf", "ConcentratedPositionRisk", evidence_id)
+            graph.add(holding.ticker, "supportsSignal", "ReduceRiskCandidate", evidence_id)
+        elif position_weight <= 0.05:
+            graph.add(holding.ticker, "supportsSignal", "WaitOrTakeProfit", evidence_id)
+
+
 def _is_live_cash_fit_market(
     market: MarketSnapshot,
     account: AccountSnapshot,
@@ -255,8 +350,7 @@ def _is_live_cash_fit_market(
     price = float(market.last_price or 0.0)
     if price <= 0:
         return False
-    cash_by_currency = account.cash_by_currency or {}
-    available_cash = float(cash_by_currency.get("KRW", account.cash) or account.cash or 0.0)
+    available_cash = cash_available_for_market(account, market)
     if available_cash < price:
         return False
     if market.average_daily_trading_value < max(1.0, risk_rules.min_average_daily_trading_value):

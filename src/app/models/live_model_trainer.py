@@ -89,9 +89,9 @@ def _artifact_payload(
         "classification": {"family": "logistic_regression_sgd", "weights": weights, "bias": bias},
         "regression": {"family": "linear_regression_sgd", "weights": ret_weights, "bias": ret_bias},
         "thresholds": {
-            "minimum_probability_success": 0.55,
-            "minimum_expected_net_return_bps": 20.0,
-            "maximum_uncertainty": 0.48,
+            "minimum_probability_success": 0.51,
+            "minimum_expected_net_return_bps": 10.0,
+            "maximum_uncertainty": 0.49,
         },
         "metrics": metrics,
         "live_eligible": live_eligible,
