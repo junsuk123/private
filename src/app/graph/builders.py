@@ -30,6 +30,15 @@ def build_market_graph(
         _add_account_affordability_to_graph(graph, market, account)
         _add_investor_flow_to_graph(graph, market)
 
+        # 거래량/유동성은 펀더멘털 지표 유무와 무관하게 모든 종목(라이브 US 소형주 포함)에 반영한다.
+        # 단타에서 유동성은 필수 판단 요소이며, 얇은 유동성은 명시적 리스크로 표시한다.
+        adtv = float(market.average_daily_trading_value or 0.0)
+        market_liquidity = min(1.0, adtv / 3_000_000_000) if adtv > 0 else 0.0
+        if market_liquidity > 0.20:
+            graph.add(market.ticker, "supportsSignal", "LiquiditySupport", "market-liquidity")
+        elif adtv > 0 and market_liquidity < 0.03:
+            graph.add(market.ticker, "increasesRiskOf", "ThinLiquidityPriceImpactRisk", "market-liquidity")
+
         indicator = indicators.get(market.ticker)
         if indicator is None:
             continue
@@ -64,8 +73,6 @@ def build_market_graph(
             graph.add(market.ticker, "increasesRiskOf", "VolatilityRisk", market.source.source_id)
         if momentum_score > 0.18 or confidence_score > 0.18:
             graph.add(market.ticker, "supportsSignal", "NpuCompositeMomentum", "npu-indicator-composite")
-        if liquidity_score > 0.20:
-            graph.add(market.ticker, "supportsSignal", "LiquiditySupport", "npu-indicator-liquidity")
 
     return add_events_to_graph(graph, events)
 

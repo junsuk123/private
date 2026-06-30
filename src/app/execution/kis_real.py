@@ -195,6 +195,35 @@ class KisEndpointSet:
         return "VTTT6037U" if self.paper else "TTTS6037U"
 
     @property
+    def order_revise_cancel_tr_id(self) -> str:
+        return "VTTC0013U" if self.paper else "TTTC0013U"
+
+    def overseas_revise_cancel_tr_id(self, exchange_code: str) -> str:
+        exchange = exchange_code.upper()
+        if exchange in {"NASD", "NYSE", "AMEX"}:
+            return "VTTT1004U" if self.paper else "TTTT1004U"
+        tr_id = (
+            "TTTS1003U"
+            if exchange == "SEHK"
+            else "TTTS0302U"
+            if exchange == "SHAA"
+            else "TTTS0306U"
+            if exchange == "SZAA"
+            else "TTTS0309U"
+            if exchange == "TKSE"
+            else "TTTS0312U"
+            if exchange in {"HASE", "VNSE"}
+            else ""
+        )
+        if not tr_id:
+            raise ValueError(f"unsupported overseas exchange for KIS revise/cancel: {exchange_code}")
+        return "V" + tr_id[1:] if self.paper else tr_id
+
+    @property
+    def overseas_daytime_revise_cancel_tr_id(self) -> str:
+        return "VTTT6038U" if self.paper else "TTTS6038U"
+
+    @property
     def order_status_tr_id(self) -> str:
         return "VTTC8001R" if self.paper else "TTTC8001R"
 
@@ -268,6 +297,7 @@ class KisDevelopersApiClient:
             else _default_token_cache_path(self.paper)
         )
         self._orders: dict[str, FinalOrder] = {}
+        self._order_org_numbers: dict[str, str] = {}
 
     def place_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
         self._ensure_enabled()
@@ -288,6 +318,7 @@ class KisDevelopersApiClient:
         if not order_id:
             order_id = f"KIS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         self._orders[order_id] = order
+        self._order_org_numbers[order_id] = str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or "")
         return MockKisOrderReceipt(
             order_id=order_id,
             accepted=True,
@@ -317,6 +348,7 @@ class KisDevelopersApiClient:
         if not order_id:
             order_id = f"KISOVRS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         self._orders[order_id] = order
+        self._order_org_numbers[order_id] = str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or "")
         return MockKisOrderReceipt(
             order_id=order_id,
             accepted=True,
@@ -325,6 +357,59 @@ class KisDevelopersApiClient:
             order=order,
             submitted_at=datetime.now(timezone.utc),
         )
+
+    def amend_limit_order(self, order_id: str, replacement: FinalOrder) -> MockKisOrderReceipt:
+        """Revise an existing unfilled KIS limit order to the replacement quantity/price."""
+        self._ensure_enabled()
+        if _is_overseas_order(replacement):
+            return self._amend_overseas_limit_order(order_id, replacement)
+        body = self._revise_cancel_body(order_id, replacement, revise=True)
+        response = self._post(
+            "/uapi/domestic-stock/v1/trading/order-rvsecncl",
+            tr_id=self.endpoints.order_revise_cancel_tr_id,
+            body=body,
+            include_hashkey=True,
+        )
+        self._ensure_success(response, "KIS order revise rejected")
+        return self._receipt_from_revise_cancel_response(response, replacement, fallback_order_id=order_id)
+
+    def cancel_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
+        self._ensure_enabled()
+        if _is_overseas_order(order):
+            return self._cancel_overseas_order(order_id, order)
+        body = self._revise_cancel_body(order_id, order, revise=False)
+        response = self._post(
+            "/uapi/domestic-stock/v1/trading/order-rvsecncl",
+            tr_id=self.endpoints.order_revise_cancel_tr_id,
+            body=body,
+            include_hashkey=True,
+        )
+        self._ensure_success(response, "KIS order cancel rejected")
+        return self._receipt_from_revise_cancel_response(response, order, fallback_order_id=order_id, status="CANCELED")
+
+    def _amend_overseas_limit_order(self, order_id: str, replacement: FinalOrder) -> MockKisOrderReceipt:
+        exchange_code = _overseas_exchange_code(replacement.market)
+        body = self._overseas_revise_cancel_body(order_id, replacement, exchange_code, revise=True)
+        path = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+        tr_id = self.endpoints.overseas_revise_cancel_tr_id(exchange_code)
+        if _is_us_daytime_order_session(replacement.market):
+            path = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
+            tr_id = self.endpoints.overseas_daytime_revise_cancel_tr_id
+        response = self._post(path, tr_id=tr_id, body=body, include_hashkey=True)
+        self._ensure_success(response, "KIS overseas order revise rejected")
+        return self._receipt_from_revise_cancel_response(response, replacement, fallback_order_id=order_id)
+
+    def _cancel_overseas_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
+        exchange_code = _overseas_exchange_code(order.market)
+        body = self._overseas_revise_cancel_body(order_id, order, exchange_code, revise=False)
+        path = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+        tr_id = self.endpoints.overseas_revise_cancel_tr_id(exchange_code)
+        if _is_us_daytime_order_session(order.market):
+            path = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
+            tr_id = self.endpoints.overseas_daytime_revise_cancel_tr_id
+        response = self._post(path, tr_id=tr_id, body=body, include_hashkey=True)
+        self._ensure_success(response, "KIS overseas order cancel rejected")
+        return self._receipt_from_revise_cancel_response(response, order, fallback_order_id=order_id, status="CANCELED")
 
     def get_order_status(self, order_id: str) -> MockKisExecution:
         self._ensure_enabled()
@@ -710,6 +795,70 @@ class KisDevelopersApiClient:
             "ORD_SVR_DVSN_CD": "0",
             "ORD_DVSN": "00",
         }
+
+    def _revise_cancel_body(self, order_id: str, order: FinalOrder, *, revise: bool) -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "KRX_FWDG_ORD_ORGNO": self._order_org_numbers.get(order_id, ""),
+            "ORGN_ODNO": order_id,
+            "ORD_DVSN": _domestic_order_division_code(),
+            "RVSE_CNCL_DVSN_CD": "01" if revise else "02",
+            "ORD_QTY": str(int(order.quantity)),
+            "ORD_UNPR": str(int(round(order.limit_price))) if revise else "0",
+            "QTY_ALL_ORD_YN": "N" if revise else "Y",
+            "CNDT_PRIC": "",
+            "EXCG_ID_DVSN_CD": "KRX",
+        }
+
+    def _overseas_revise_cancel_body(
+        self,
+        order_id: str,
+        order: FinalOrder,
+        exchange_code: str,
+        *,
+        revise: bool,
+    ) -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "OVRS_EXCG_CD": exchange_code,
+            "PDNO": order.ticker.upper(),
+            "ORGN_ODNO": order_id,
+            "RVSE_CNCL_DVSN_CD": "01" if revise else "02",
+            "ORD_QTY": str(int(order.quantity)),
+            "OVRS_ORD_UNPR": _format_overseas_price(order.limit_price) if revise else "0",
+            "CTAC_TLNO": "",
+            "MGCO_APTM_ODNO": "",
+            "ORD_SVR_DVSN_CD": "0",
+        }
+
+    def _receipt_from_revise_cancel_response(
+        self,
+        response: dict[str, Any],
+        order: FinalOrder,
+        *,
+        fallback_order_id: str,
+        status: str = "ACCEPTED",
+    ) -> MockKisOrderReceipt:
+        output = response.get("output") or {}
+        order_id = str(output.get("ODNO") or output.get("odno") or fallback_order_id)
+        org_no = str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or "")
+        self._orders[order_id] = order
+        if org_no:
+            self._order_org_numbers[order_id] = org_no
+        if order_id != fallback_order_id:
+            self._orders.pop(fallback_order_id, None)
+            if org_no:
+                self._order_org_numbers.pop(fallback_order_id, None)
+        return MockKisOrderReceipt(
+            order_id=order_id,
+            accepted=True,
+            status=status,
+            message=str(response.get("msg1") or "KIS accepted the order revise/cancel request."),
+            order=order,
+            submitted_at=datetime.now(timezone.utc),
+        )
 
     def _order_status_params(self, order_id: str, order: FinalOrder | None) -> dict[str, str]:
         today = datetime.now().strftime("%Y%m%d")
@@ -1119,7 +1268,12 @@ def _overseas_quote_exchange_code(market: str) -> str:
 
 
 def _format_overseas_price(value: float) -> str:
-    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+    # KIS 미국주식 호가 단위: $1 이상은 소수점 2자리, $1 미만은 소수점 4자리까지만 허용(APTR0057).
+    price = float(value)
+    decimals = 2 if price >= 1.0 else 4
+    text = f"{price:.{decimals}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text if text else "0"
 
 

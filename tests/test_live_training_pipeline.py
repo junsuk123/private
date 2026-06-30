@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -39,10 +41,12 @@ class LiveTrainingPipelineTest(unittest.TestCase):
             _write_frames(journal, count=80)
             registry = ModelArtifactRegistry(Path(tmp) / "models")
 
-            artifact = train_live_short_horizon_from_collected_features(
-                journal_path=journal,
-                registry=registry,
-            )
+            # 이 합성 데이터는 20bps 라벨 기준으로 깔끔히 분리되도록 설계됨(운영 기본값은 5bps).
+            with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
+                artifact = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
 
             self.assertTrue(artifact["live_eligible"], artifact["reason_codes"])
             self.assertTrue(registry.latest_path.exists())

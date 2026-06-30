@@ -118,6 +118,62 @@ def _kis_get(path: str, tr_id: str, params: dict[str, str]) -> dict[str, Any]:
     return data
 
 
+def _clean_overseas_symbol(raw: Any) -> str:
+    s = str(raw or "").upper().strip()
+    # KIS rsym 형태(예: DNASAAPL = D + NAS + AAPL)에서 거래소 접두사를 제거한다.
+    for prefix in ("DNAS", "DNYS", "DAMS", "RNAS", "RNYS", "RAMS", "NAS", "NYS", "AMS"):
+        if s.startswith(prefix) and len(s) > len(prefix) and s[len(prefix):].isalpha():
+            return s[len(prefix):]
+    return s
+
+
+def fetch_overseas_volume_surge_symbols(
+    *,
+    exchanges: tuple[str, ...] = ("NAS", "NYS", "AMS"),
+    max_symbols: int = 20,
+) -> dict[str, Any]:
+    """KIS 해외주식 거래량급증(HHDFS76270000)으로 거래량 급증 종목을 받아온다.
+
+    GET /uapi/overseas-stock/v1/ranking/volume-surge. 응답 필드/파라미터는 소스별
+    편차가 있어 방어적으로 파싱한다(실패 시 빈 결과). 단타 매수 후보 발굴에 사용.
+    """
+    selected: list[str] = []
+    errors: dict[str, str] = {}
+    for exchange in exchanges:
+        params = {
+            "AUTH": "",
+            "EXCD": exchange,
+            "NDAY": "0",
+            "PRC1": "0",
+            "PRC2": "0",
+            "VOL_RANG": "0",
+            "KEYB": "",
+        }
+        try:
+            data = _kis_get("/uapi/overseas-stock/v1/ranking/volume-surge", "HHDFS76270000", params)
+        except Exception as exc:  # noqa: BLE001 - best-effort discovery; surface per-exchange errors.
+            errors[exchange] = f"{exc.__class__.__name__}: {exc}"
+            continue
+        rows: list[Any] = []
+        for key in ("output2", "output1", "output"):
+            value = data.get(key)
+            if isinstance(value, list) and value:
+                rows = value
+                break
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = _clean_overseas_symbol(
+                row.get("symb") or row.get("SYMB") or row.get("rsym") or row.get("excd_symb") or ""
+            )
+            if symbol and _is_us_symbol(symbol):
+                selected.append(symbol)
+    unique = tuple(dict.fromkeys(selected))
+    if max_symbols > 0:
+        unique = unique[:max_symbols]
+    return {"symbols": unique, "errors": errors, "ok": not errors}
+
+
 def _is_kr_symbol(symbol: str) -> bool:
     s = str(symbol or "").strip().upper()
     return s.isdigit() and len(s) == 6

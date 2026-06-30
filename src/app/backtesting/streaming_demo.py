@@ -146,7 +146,8 @@ class StreamingAcceleratedDemo:
     output_dir: Path = Path("data/reports")
     seed: int = 42
     tickers: tuple[str, ...] | None = None
-    
+    max_speed: bool = False  # (레거시) 시간 팩터 제거 후 항상 지연 없이 진행하므로 더 이상 속도에 영향 없음
+
     # 내부 상태
     _time_scaler: Optional[TimeScaler] = field(default=None, init=False, repr=False)
     _bars_by_ticker: dict[str, tuple[ChartBar, ...]] = field(default_factory=dict, init=False, repr=False)
@@ -242,11 +243,10 @@ class StreamingAcceleratedDemo:
         if step >= len(self._timestamps):
             return None
         
-        timestamp = self._timestamps[step]
-        
-        # 가상 시간 업데이트
-        virtual_time = self._time_scaler.get_virtual_time()
-        
+        # 시간 팩터 제거: 합성 봉의 가상 시각이 아니라 실제 현재시각으로 데이터를 기록한다.
+        timestamp = datetime.now(timezone.utc)
+        virtual_time = timestamp
+
         prices = _prices_at(self._bars_by_ticker, step)
         usd_krw_rate = _usd_krw_rate()
         currency_by_ticker = self._currency_by_ticker()
@@ -626,19 +626,10 @@ class StreamingAcceleratedDemo:
         return results
 
     def seconds_until_next_step(self) -> float:
-        """Return wall-clock seconds until the next visible simulation minute may run."""
+        """시간 팩터 제거: 봉 간 인위적 지연이 없으므로 항상 0초(즉시 진행)를 반환한다."""
         if not self._initialized:
             self.initialize()
-        if self.is_complete():
-            return 0.0
-
-        warmup_steps = self._warmup_steps()
-        visible_steps_completed = max(0, self._current_step - warmup_steps)
-        scale_factor = self._time_scaler.get_scale_factor() if self._time_scaler else 1.0
-        step_interval_seconds = 60.0 / max(1.0, scale_factor)
-        next_due_seconds = (visible_steps_completed + 1) * step_interval_seconds
-        elapsed_seconds = time.monotonic() - self._started_at_monotonic
-        return max(0.0, next_due_seconds - elapsed_seconds)
+        return 0.0
     
     def is_complete(self) -> bool:
         """데모 진행이 완료되었는지 확인합니다."""
@@ -663,7 +654,7 @@ class StreamingAcceleratedDemo:
         
         final_prices = _prices_at(self._bars_by_ticker, len(self._timestamps) - 1)
         if self._holdings:
-            self._liquidate_holdings(final_prices, self._timestamps[-1])
+            self._liquidate_holdings(final_prices, datetime.now(timezone.utc))
         final_positions = {
             ticker: _to_krw(
                 quantity * final_prices[ticker],

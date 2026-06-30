@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=src python -m pytest \"tests/test_risk_manager.py::RiskManagerTest::test_rejects_when_deposit_is_too_small_for_one_share\" \"tests/test_accelerated_demo.py::AcceleratedDemoTest::test_accelerated_demo_generates_50_symbol_minute_based_simulation\" -q)"
+    ]
+  }
+}

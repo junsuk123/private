@@ -71,6 +71,46 @@ class MockKisDevelopersApi:
             raise KeyError(f"unknown mock KIS order_id: {order_id}")
         return self._executions[order_id]
 
+    def amend_limit_order(self, order_id: str, replacement: FinalOrder) -> MockKisOrderReceipt:
+        if order_id not in self._orders:
+            raise KeyError(f"unknown mock KIS order_id: {order_id}")
+        receipt = MockKisOrderReceipt(
+            order_id=order_id,
+            accepted=True,
+            status="ACCEPTED",
+            message="Mock KIS accepted the limit order amendment.",
+            order=replacement,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        self._orders[order_id] = receipt
+        self._executions[order_id] = self._match_limit_order(order_id, replacement)
+        return receipt
+
+    def cancel_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
+        if order_id not in self._orders:
+            raise KeyError(f"unknown mock KIS order_id: {order_id}")
+        receipt = MockKisOrderReceipt(
+            order_id=order_id,
+            accepted=True,
+            status="CANCELED",
+            message="Mock KIS canceled the limit order.",
+            order=order,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        self._orders[order_id] = receipt
+        self._executions[order_id] = MockKisExecution(
+            order_id=order_id,
+            ticker=order.ticker,
+            side=order.side,
+            quantity=0,
+            price=order.limit_price,
+            executed_value=0.0,
+            status="CANCELED",
+            message="Mock KIS canceled the limit order.",
+            executed_at=datetime.now(timezone.utc),
+        )
+        return receipt
+
     def get_portfolio(self) -> MockKisPortfolio:
         return MockKisPortfolio(
             account=self.account,

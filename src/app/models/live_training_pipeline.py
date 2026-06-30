@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta
@@ -17,6 +18,15 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
+
+
+def _label_min_net_return_bps() -> float:
+    # 단타용으로 라벨을 완화: 비용 차감 후 순수익이 이 값(bps) 초과면 positive.
+    # 기존 20bps는 너무 빡빡해 positive가 ~1%뿐이라 모델이 붕괴했다.
+    try:
+        return float(os.getenv("LIVE_LABEL_MIN_NET_RETURN_BPS", "5.0"))
+    except (TypeError, ValueError):
+        return 5.0
 
 
 def collect_live_feature_frames_from_realtime_store(
@@ -66,7 +76,7 @@ def train_live_short_horizon_from_collected_features(
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
-            "label_rule": "first_collected_return_1m_after_30s_after_costs_bps > 20",
+            "label_rule": f"first_collected_return_1m_after_30s_after_costs_bps > {_label_min_net_return_bps()}",
             "schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
         },
     )
@@ -128,7 +138,7 @@ def build_live_training_rows_from_feature_journal(journal_path: str | Path) -> l
             rows.append(
                 {
                     "features": features,
-                    "label": int(forward_net_return_bps > 20.0),
+                    "label": int(forward_net_return_bps > _label_min_net_return_bps()),
                     "forward_net_return_bps": forward_net_return_bps,
                     "ticker": symbol,
                     "as_of": str(current.get("decision_time") or ""),

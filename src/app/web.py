@@ -69,6 +69,8 @@ from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
+from app.trading.shared_decision_engine import SharedLiveDecisionEngine
+from app.trading.realtime_trading_engine import RealtimeTradingEngine
 from app.backtesting.accelerated_demo import load_krx_listed_universe, load_us_listed_universe
 from app.market_affordability import (
     cash_available_for_market,
@@ -169,6 +171,8 @@ LEARNING_COLLECTION_INTERVAL_SECONDS = max(
 AUTO_START_LIVE_WORKER = os.getenv("AUTO_START_LIVE_WORKER", "true").lower() not in {"0", "false", "no", "off"}
 AUTO_START_LIVE_READINESS = os.getenv("AUTO_START_LIVE_READINESS", "true").lower() not in {"0", "false", "no", "off"}
 AUTO_START_KIS_REALTIME_COLLECTOR = os.getenv("AUTO_START_KIS_REALTIME_COLLECTOR", "true").lower() not in {"0", "false", "no", "off"}
+# 안전 기본값: 실시간 거래 엔진은 서버 기동 시 자동 시작하지 않는다(live_trading 모드 진입 시 시작).
+AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").lower() in {"1", "true", "yes", "on"}
 _auto_live_readiness_started = False
 
 
@@ -813,6 +817,7 @@ def _start_streaming_demo(
   seed: int = 42,
   acceleration_factor: float = 1.0,
   profit_gain: float = 1.0,
+  max_speed: bool = False,
 ) -> str:
   """Start a streaming accelerated demo and return demo_id."""
   demo_id = str(uuid4())
@@ -820,12 +825,14 @@ def _start_streaming_demo(
   if target_return_rate > 1:
     target_return_rate /= 100.0
   initial_cash = max(1.0, float(initial_cash))
-  acceleration_factor = max(1.0, float(acceleration_factor))
+  # 시간 팩터 제거: 배속/가상시간을 쓰지 않고 항상 실시간(1.0배) 기준으로 동작한다.
+  # acceleration_factor 인자는 하위 호환을 위해 남겨두지만 더 이상 속도에 영향을 주지 않는다.
+  acceleration_factor = 1.0
   profit_gain = max(0.25, min(4.0, float(profit_gain)))
-  
+
   demo = StreamingAcceleratedDemo(
       config=TimeScalerConfig(
-          mode=TimeMode.ACCELERATED if acceleration_factor > 1 else TimeMode.REALTIME,
+          mode=TimeMode.REALTIME,
           acceleration_factor=acceleration_factor,
       ),
       target_return_rate=target_return_rate,
@@ -833,6 +840,7 @@ def _start_streaming_demo(
       initial_cash=initial_cash,
       profit_gain_multiplier=profit_gain,
       seed=seed,
+      max_speed=max_speed,
   )
   demo.initialize()
   
@@ -855,6 +863,11 @@ def _start_streaming_demo(
 _live_worker: threading.Thread | None = None
 _refresh_worker: threading.Thread | None = None
 _kis_realtime_collector_worker: threading.Thread | None = None
+# 실시간 거래 엔진: 학습 워커(_live_worker)와 완전히 독립된 스레드/상태.
+_realtime_trading_worker: threading.Thread | None = None
+_realtime_trading_stop = threading.Event()
+_realtime_trading_engine: Any | None = None
+_realtime_trading_lock = threading.Lock()
 _live_state: dict[str, Any] = {
     "context": None,
     "research_result": None,
@@ -913,10 +926,13 @@ def _startup_live_worker() -> None:
       _start_live_worker("learning")
     if AUTO_START_LIVE_READINESS:
       _start_auto_live_readiness_check()
+    if AUTO_START_REALTIME_TRADING:
+      _start_realtime_trading_engine()
 
 
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
+    _stop_realtime_trading_engine()
     _stop_kis_realtime_collector()
     _stop_live_worker()
 
@@ -1315,6 +1331,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         initial_cash_source = _resolved_initial_cash_source(payload)
         _ensure_initial_principal_configured(max(1.0, initial_cash))
         acceleration_factor = float(payload.get("acceleration_factor", 60.0))
+        max_speed = bool(payload.get("max_speed", True))
         profit_gain = _resolve_auto_profit_gain(payload, initial_cash)
         demo_id = _start_streaming_demo(
             target_return_rate=target_return_rate,
@@ -1323,10 +1340,12 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
             seed=int(payload.get("seed", 42)),
             acceleration_factor=acceleration_factor,
             profit_gain=profit_gain,
+            max_speed=max_speed,
         )
         demo = _streaming_demos.get(demo_id)
-        _start_live_worker("learning")
-        result["paper_trading_status"] = "background_collection_started"
+        # 학습 플로우와 거래 플로우는 독립적으로 동작한다: 거래 시작은 학습 워커를 건드리지 않는다.
+        # 학습은 서버 기동 시(AUTO_START_LIVE_WORKER) 또는 learning 모드에서 별도로 제어된다.
+        result["paper_trading_status"] = "trading_loop_started_independently"
         result["paper_trading_kind"] = "legacy_paper_trading" if mode == "testing" else "kis_paper_api"
         result["demo_id"] = demo_id
         result["demo_status"] = "initialized"
@@ -1352,7 +1371,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
           )
 
       if mode in {"live_readiness", "live_trading_test"}:
-        _start_live_worker("learning")
+        # 거래/점검 플로우는 학습 워커와 독립적으로 동작한다.
         result["live_readiness_status"] = "checked"
         result["live_readiness_kind"] = "kis_live_readiness"
         kis_connection = _kis_connection_probe(paper=False, include_account=True)
@@ -1371,7 +1390,11 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
           )
 
       if mode == "live_trading":
-        _start_live_worker("learning")
+        # 거래 플로우는 학습 워커와 독립적으로 동작한다(학습은 별도 제어).
+        # 실시간 틱 수집기 + 독립 실시간 거래 엔진을 가동한다.
+        # (주문의 실제 전송은 LiveExecutionCoordinator의 안전 게이트가 최종 결정한다.)
+        _start_kis_realtime_collector()
+        _start_realtime_trading_engine()
         config = load_short_horizon_strategy_config()
         execution_config = config.get("execution", {})
         config_live_enabled = bool(execution_config.get("live_trading_enabled", False))
@@ -2079,6 +2102,19 @@ def _streaming_demo_terminate_response(demo_id: str) -> dict[str, Any]:
         step_lock.release()
 
 
+@app.get("/api/realtime-trading/status")
+def realtime_trading_status() -> JSONResponse:
+    with _realtime_trading_lock:
+        engine = _realtime_trading_engine
+        running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+    return _json({
+        "ok": True,
+        "running": running,
+        "auto_start": AUTO_START_REALTIME_TRADING,
+        "status": engine.get_status() if engine is not None else None,
+    })
+
+
 @app.post("/api/live-trading/terminate")
 async def live_trading_terminate() -> JSONResponse:
     return _json(await run_in_threadpool(_live_trading_terminate_response))
@@ -2091,6 +2127,8 @@ def _live_trading_terminate_response() -> dict[str, Any]:
     active_mode_value = getattr(active_mode, "value", active_mode)
     if active_mode_value != "live_trading":
         return {"ok": False, "status": "not_live_trading", "message": "Live trading is not the active operation mode."}
+    # 청산 전에 실시간 거래 엔진을 멈춰 신규 주문 유입을 차단한다.
+    _stop_realtime_trading_engine()
     config = load_short_horizon_strategy_config()
     config_live_enabled = bool(config.get("execution", {}).get("live_trading_enabled", False))
     env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
@@ -2173,7 +2211,8 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
     initial_cash_source = _resolved_initial_cash_source(payload)
     _ensure_initial_principal_configured(initial_cash)
     seed = int(payload.get("seed", 42))
-    acceleration_factor = float(payload.get("acceleration_factor", 1.0))
+    acceleration_factor = float(payload.get("acceleration_factor", 60.0))
+    max_speed = bool(payload.get("max_speed", True))
     profit_gain = _resolve_auto_profit_gain(payload, initial_cash)
     demo_id = _start_streaming_demo(
         target_return_rate=target_return_rate,
@@ -2182,6 +2221,7 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         seed=seed,
         acceleration_factor=acceleration_factor,
         profit_gain=profit_gain,
+        max_speed=max_speed,
     )
     
     return {
@@ -3007,6 +3047,162 @@ def _stop_kis_realtime_collector() -> None:
     worker.join(timeout=2.0)
 
 
+def _build_realtime_trading_engine() -> RealtimeTradingEngine:
+  store = RealtimeMarketDataStore()
+  account = _live_account_snapshot_for_analysis()
+  rules = _live_risk_rules_for_account(account)
+  decision_engine = SharedLiveDecisionEngine(store, risk_manager=RiskManager(rules))
+  coordinator = LiveExecutionCoordinator(KisDevelopersApiClient(paper=False, enabled=True))
+  return RealtimeTradingEngine(
+      decision_engine=decision_engine,
+      coordinator=coordinator,
+      account_provider=_live_account_snapshot_for_analysis,
+      candidate_symbols_provider=_realtime_buy_candidates,
+      session_open_provider=lambda: bool(_active_live_market_groups()),
+      ontology_graph_provider=_latest_ontology_graph,
+      market_open_provider=_is_open_live_market_ticker,
+  )
+
+
+def _realtime_buy_candidates() -> tuple[str, ...]:
+  """실시간 매수 후보 = 설정 심볼 + 스토어에 신선한 틱이 있는 종목(시장 개장 종목만 엔진이 추림).
+
+  설정 심볼만 쓰면 후보가 KR 2종목뿐이라 미국 장중에 매수가 전혀 평가되지 않는다.
+  스토어에 데이터가 흐르는 종목을 후보로 넓혀 매수·매도가 함께 판단되게 한다.
+  """
+  max_age = float(os.getenv("REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", "120"))
+  limit = max(1, int(float(os.getenv("REALTIME_BUY_CANDIDATE_LIMIT", "30"))))
+  config_symbols = _load_realtime_collection_symbols()
+  fresh: tuple[str, ...] = ()
+  try:
+    since = datetime.now(timezone.utc) - timedelta(seconds=max_age)
+    fresh = RealtimeMarketDataStore().active_symbols(since, limit=limit)
+  except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
+    fresh = ()
+  surge = _cached_volume_surge_symbols()
+  return tuple(dict.fromkeys((*config_symbols, *fresh, *surge)))
+
+
+_volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
+
+
+def _cached_volume_surge_symbols() -> tuple[str, ...]:
+  """KIS 해외주식 거래량급증 종목을 TTL 캐시로 받아 매수 후보에 더한다(미국장 개장 시).
+
+  매 사이클(~1s) API를 때리지 않도록 TTL(기본 60s) 캐시. 비활성/오류 시 빈 결과.
+  """
+  if os.getenv("REALTIME_USE_VOLUME_SURGE_API", "true").lower() in {"0", "false", "no", "off"}:
+    return ()
+  if "US" not in _active_live_market_groups():
+    return ()
+  ttl = float(os.getenv("REALTIME_VOLUME_SURGE_TTL_SEC", "60"))
+  now = time.monotonic()
+  with _live_lock:
+    if now - float(_volume_surge_cache.get("at") or 0.0) < ttl and _volume_surge_cache.get("symbols"):
+      return tuple(_volume_surge_cache.get("symbols") or ())
+  try:
+    from app.trading.us_realtime_bridge import fetch_overseas_volume_surge_symbols
+
+    limit = max(1, int(float(os.getenv("REALTIME_VOLUME_SURGE_LIMIT", "20"))))
+    result = fetch_overseas_volume_surge_symbols(max_symbols=limit)
+    symbols = tuple(result.get("symbols") or ())
+  except Exception:  # noqa: BLE001 - best-effort; never break candidate discovery.
+    symbols = ()
+  with _live_lock:
+    _volume_surge_cache["at"] = now
+    _volume_surge_cache["symbols"] = symbols
+  return symbols
+
+
+def _realtime_engine_execution_summary() -> dict[str, Any] | None:
+  """실시간 거래 엔진의 실제 활동을 대시보드 요약 형식으로 매핑한다.
+
+  옛 _run_live_trading_execution_cycle 요약을 대체해, '실전 투자 성과' 패널이
+  엔진의 제출/차단/오류·매수/매도 평가 수를 그대로 보여주도록 한다.
+  """
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+    running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+  if engine is None:
+    return None
+  status = engine.get_status()
+  last = status.get("last_summary") or {}
+  buy_eval = int(last.get("buy_evaluated", 0) or 0)
+  sell_eval = int(last.get("sell_evaluated", 0) or 0)
+  runtime = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
+  return {
+      "attempted": bool(int(status.get("submitted", 0) or 0) + int(status.get("blocked", 0) or 0) + int(status.get("errors", 0) or 0)),
+      "source": "realtime_trading_engine",
+      "engine_running": running,
+      "signals": buy_eval + sell_eval,
+      "buy_signals": buy_eval,
+      "sell_signals": sell_eval,
+      "intents": buy_eval + sell_eval,
+      "approved_buy_orders": int(status.get("buy_submitted", 0) or 0),
+      "approved_sell_orders": int(status.get("sell_submitted", 0) or 0),
+      "executable_buy_orders": int(status.get("buy_submitted", 0) or 0),
+      "executable_sell_orders": int(status.get("sell_submitted", 0) or 0),
+      "submitted": int(status.get("submitted", 0) or 0),
+      "amended": int(status.get("amended", 0) or 0),
+      "buy_submitted": int(status.get("buy_submitted", 0) or 0),
+      "sell_submitted": int(status.get("sell_submitted", 0) or 0),
+      "blocked": int(status.get("blocked", 0) or 0),
+      "errors": int(status.get("errors", 0) or 0),
+      "skipped_market_closed": int(last.get("skipped_market_closed", 0) or 0),
+      "skipped_cooldown": int(last.get("skipped_cooldown", 0) or 0),
+      "cycles": int(status.get("cycles", 0) or 0),
+      "runtime_gate": {"ok": runtime.ok, "failures": tuple(runtime.failures)},
+      "last_cycle_at": status.get("last_cycle_at"),
+      "recent_events": list(status.get("recent_events") or ())[:10],
+  }
+
+
+def _latest_ontology_graph() -> Any | None:
+  """최신 분석 컨텍스트(학습/새로고침 루프 산출물)의 온톨로지 그래프를 읽어
+  실시간 매도 판단에 반영한다. 없으면 None(매도는 TP/SL로 동작)."""
+  with _live_lock:
+    context = _live_state.get("context")
+  return getattr(context, "graph", None)
+
+
+def _realtime_trading_loop() -> None:
+  global _realtime_trading_engine
+  try:
+    engine = _build_realtime_trading_engine()
+  except Exception as exc:  # noqa: BLE001 - surface build failure, keep server alive.
+    with _live_lock:
+      _append_collection_log_unlocked(
+          "error",
+          f"Realtime trading engine failed to start: {str(exc) or exc.__class__.__name__}",
+      )
+    return
+  with _realtime_trading_lock:
+    _realtime_trading_engine = engine
+  engine.run_forever(_realtime_trading_stop)
+
+
+def _start_realtime_trading_engine() -> None:
+  global _realtime_trading_worker
+  with _realtime_trading_lock:
+    if _realtime_trading_worker is not None and _realtime_trading_worker.is_alive():
+      return
+    _realtime_trading_stop.clear()
+    _realtime_trading_worker = threading.Thread(
+        target=_realtime_trading_loop,
+        name="realtime-trading-engine",
+        daemon=True,
+    )
+    _realtime_trading_worker.start()
+
+
+def _stop_realtime_trading_engine() -> None:
+  _realtime_trading_stop.set()
+  with _realtime_trading_lock:
+    worker = _realtime_trading_worker
+  if worker is not None:
+    worker.join(timeout=3.0)
+
+
 def _kis_realtime_collector_loop() -> None:
   symbols = _load_realtime_collection_symbols()
   if not symbols:
@@ -3283,7 +3479,9 @@ def _refresh_live_cache() -> None:
           if active_mode == "live_trading"
           else store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
       )
-      live_execution_summary = _run_live_trading_execution_cycle(context) if active_mode == "live_trading" else None
+      # 주문 실행은 독립 실시간 거래 엔진(_realtime_trading_*)이 단독 수행한다.
+      # 학습/새로고침 루프는 데이터·모델 수집만 담당하되, 대시보드 요약은 엔진 실제 활동을 반영한다.
+      live_execution_summary = _realtime_engine_execution_summary() if active_mode == "live_trading" else None
       with _live_lock:
         _live_state["research_result"] = research_result
         _live_state["context"] = context
@@ -4230,7 +4428,7 @@ def _is_live_executable_order(order: FinalOrder) -> bool:
     return False
   return any(
       token in market
-      for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+      for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
   )
 
 
@@ -4253,6 +4451,9 @@ def _cash_fit_executable_orders(
   kept: list[FinalOrder] = []
   skipped: list[dict[str, Any]] = []
   for order in sorted(orders, key=lambda item: float(item.limit_price) * int(item.quantity)):
+    if _order_side_name(order) != "BUY":
+      kept.append(order)
+      continue
     currency = "KRW" if str(order.ticker).isdigit() and len(str(order.ticker)) == 6 else "USD"
     required = float(order.limit_price) * int(order.quantity)
     if required <= max(0.0, remaining.get(currency, 0.0)):
@@ -5147,6 +5348,7 @@ HTML = """
     .ontology-panel .muted { color: #cbd5e1; }
     #ontologyCanvas { width: 100%; height: 760px; display: block; }
     #ontologyTooltip { position: absolute; z-index: 3; pointer-events: none; min-width: 160px; max-width: 260px; padding: 8px 10px; border-radius: 6px; background: rgba(15,23,42,.92); color: #fff; border: 1px solid rgba(255,255,255,.18); font-size: 12px; transform: translate(12px, 12px); display: none; }
+    .ontology-scene { display: none !important; }
     @media (min-width: 901px) {
       .shell { grid-template-columns: 300px minmax(0, 1fr); }
       aside { padding: 14px; max-height: 100vh; overflow: auto; }
@@ -5580,14 +5782,24 @@ HTML = """
     }
 
     async function loadOntologyGraph() {
-      const data = await (await fetch('/api/ontology/graph')).json();
-      const display = data.display_counts || {};
-      const suffix = data.truncated ? ` | shown ${display.nodes || 0}/${data.counts.nodes} nodes, ${display.links || 0}/${data.counts.links} links` : '';
-      document.getElementById('ontologyCounts').textContent = `노드 ${data.counts.nodes} · 관계 ${data.counts.links}`;
-      lastGraphSignature = graphSignature(data);
-      document.getElementById('ontologyCounts').textContent = `Nodes ${data.counts.nodes} | Links ${data.counts.links}${suffix}`;
-      await renderOntologyGraph(data);
-      renderSystemFlow({ analysis: 'done' }, { analysis: 'Ontology graph ready' });
+      const canvas = document.getElementById('ontologyCanvas');
+      if (!canvas || canvas.offsetParent === null) return;
+      try {
+        const data = await (await fetch('/api/ontology/graph')).json();
+        if (!data || !data.counts) return;
+        const display = data.display_counts || {};
+        const suffix = data.truncated ? ` | shown ${display.nodes || 0}/${data.counts.nodes} nodes, ${display.links || 0}/${data.counts.links} links` : '';
+        document.getElementById('ontologyCounts').textContent = `Nodes ${data.counts.nodes} | Links ${data.counts.links}${suffix}`;
+        // 그래프가 비었거나(컨텍스트 미준비) 직전과 동일하면 재렌더 생략 — 준비되면 자동으로 그려진다.
+        const signature = graphSignature(data);
+        if (signature === lastGraphSignature && Number(data.counts.nodes || 0) > 0) return;
+        if (Number(data.counts.nodes || 0) <= 0) return;
+        lastGraphSignature = signature;
+        await renderOntologyGraph(data);
+        renderSystemFlow({ analysis: 'done' }, { analysis: 'Ontology graph ready' });
+      } catch (error) {
+        console.error('ontology graph load failed', error);
+      }
     }
 
     async function loadRealtimeRuntime() {
@@ -6490,10 +6702,12 @@ HTML = """
         const data = await res.json();
         renderStatus(data.status);
         renderDiagnostics(data.diagnostics);
-        if (data.graph && data.graph.counts) {
-          document.getElementById('ontologyCounts').textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
+        const ontologyCounts = document.getElementById('ontologyCounts');
+        if (ontologyCounts && data.graph && data.graph.counts) {
+          ontologyCounts.textContent = `Nodes ${data.graph.counts.nodes} | Links ${data.graph.counts.links}`;
         }
-        if (data.graph && Array.isArray(data.graph.nodes) && Array.isArray(data.graph.links)) {
+        const ontologyCanvas = document.getElementById('ontologyCanvas');
+        if (ontologyCanvas && ontologyCanvas.offsetParent !== null && data.graph && Array.isArray(data.graph.nodes) && Array.isArray(data.graph.links)) {
           const signature = graphSignature(data.graph);
           if (signature !== lastGraphSignature) {
             lastGraphSignature = signature;
@@ -7658,8 +7872,6 @@ HTML = """
       } catch (error) {
         console.error(error);
         return null;
-      } finally {
-        streamingStepBusy = false;
       }
     }
 
@@ -8464,7 +8676,9 @@ HTML = """
       const intervalMs = 60000;
       const data = await runStreamingDemoStep();
       if (streamingDemoRunning) {
-        const waitMs = data && data.status === 'waiting' ? Math.max(1000, Number(data.seconds_until_next_step || 60) * 1000) : intervalMs;
+        const nextStepSeconds = Number(data && data.seconds_until_next_step);
+        const paceByBackend = (data && (data.status === 'waiting' || data.status === 'running')) && Number.isFinite(nextStepSeconds);
+        const waitMs = paceByBackend ? Math.max(50, nextStepSeconds * 1000) : intervalMs;
         streamingDemoTimer = setTimeout(() => autoRunStreamingDemo(false), waitMs);
       }
     }
@@ -8594,7 +8808,7 @@ HTML = """
     loadRealtimeRuntime();
     loadOperationModeStatus().catch(() => {});
     loadDiagnostics();
-    loadOntologyGraph();
+    // Ontology graph rendering is intentionally disabled in the GUI.
     loadMockPerformance();
     refreshLiveSnapshot();
     setInterval(() => loadOperationModeStatus().catch(() => {}), 3000);
@@ -8602,6 +8816,7 @@ HTML = """
     setInterval(() => refreshLiveTradingProgress().catch(() => {}), 3000);
     setInterval(refreshLiveSnapshot, 5000);
     setInterval(() => loadMockPerformance().catch(() => {}), 3000);
+    // Ontology graph rendering is intentionally disabled in the GUI.
   </script>
 </body>
 </html>

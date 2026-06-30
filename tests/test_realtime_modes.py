@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.realtime import OperationMode, OperationModeManager, ShortHorizonRiskPolicy
-from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderAction, OrderIntent, SourceMetadata
+from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnapshot, OrderAction, OrderIntent, OrderSide, OrderType, SourceMetadata
 from app.storage import StoredResearch
 from app import web as web_module
 from app.web import app
@@ -95,6 +95,31 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertIn(5, data["acceleration"]["prediction_horizons_seconds"])
         self.assertIn("short_horizon_policy", data)
 
+    def test_cash_fit_keeps_sell_orders_without_cash_requirement(self) -> None:
+        account = AccountSnapshot(cash=0.0, holdings=(), cash_by_currency={"KRW": 0.0, "USD": 0.0})
+        sell_order = FinalOrder(
+            ticker="SOXX",
+            market="NASD",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.SELL,
+            quantity=1,
+            limit_price=500.0,
+        )
+        buy_order = FinalOrder(
+            ticker="QQQ",
+            market="NASD",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=100.0,
+        )
+
+        kept, skipped = web_module._cash_fit_executable_orders([sell_order, buy_order], account)
+
+        self.assertEqual(kept, [sell_order])
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["ticker"], "QQQ")
+
     def test_training_mode_starts_continuous_collection_until_stop(self) -> None:
         client = TestClient(app)
         with patch("app.web._start_live_worker") as start_worker:
@@ -116,7 +141,8 @@ class RealtimeModesTest(unittest.TestCase):
             data = client.post("/api/operation-mode/start", json={"mode": "paper_trading"}).json()
 
         self.assertTrue(data["ok"])
-        self.assertEqual(data["paper_trading_status"], "background_collection_started")
+        # 학습과 거래 플로우는 독립이므로 거래 시작은 학습 워커를 건드리지 않는다.
+        self.assertEqual(data["paper_trading_status"], "trading_loop_started_independently")
         self.assertEqual(data["paper_trading_kind"], "kis_paper_api")
         self.assertEqual(data["demo_id"], "demo-test")
         self.assertEqual(data["demo_status"], "initialized")
@@ -124,7 +150,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["kis_connection"]["mode"], "paper")
         self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
         start_demo.assert_called_once()
-        start_worker.assert_called_once_with("learning")
+        start_worker.assert_not_called()
         kis_probe_background.assert_called_once_with(paper=True, include_account=True)
         refresh_live.assert_not_called()
 
@@ -145,7 +171,8 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["live_readiness_status"], "checked")
         self.assertEqual(data["live_readiness_kind"], "kis_live_readiness")
         self.assertEqual(data["kis_connection"]["mode"], "live")
-        start_worker.assert_called_once_with("learning")
+        # 점검/거래 플로우는 학습 워커와 독립적으로 동작한다.
+        start_worker.assert_not_called()
         start_demo.assert_not_called()
         kis_probe.assert_called_once_with(paper=False, include_account=True)
         refresh_live.assert_not_called()
@@ -531,6 +558,8 @@ class RealtimeModesTest(unittest.TestCase):
         client = TestClient(app)
         with (
             patch("app.web._start_live_worker") as start_worker,
+            patch("app.web._start_kis_realtime_collector"),
+            patch("app.web._start_realtime_trading_engine") as start_engine,
             patch(
                 "app.web._kis_connection_probe",
                 return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
@@ -546,13 +575,17 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertFalse(data["live_trading_enabled_by_env"])
         self.assertIn("blocked", data["live_trading_message"])
         self.assertFalse(data["runtime_gate"]["ok"])
-        start_worker.assert_called_once_with("learning")
+        # 학습 워커는 거래와 독립이므로 호출되지 않고, 실시간 거래 엔진이 대신 가동된다.
+        start_worker.assert_not_called()
+        start_engine.assert_called_once()
         kis_probe.assert_called_once_with(paper=False, include_account=True)
 
     def test_live_trading_gate_can_be_armed_only_when_config_and_env_allow(self) -> None:
         client = TestClient(app)
         with (
             patch("app.web._start_live_worker"),
+            patch("app.web._start_kis_realtime_collector"),
+            patch("app.web._start_realtime_trading_engine"),
             patch(
                 "app.web._kis_connection_probe",
                 return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},

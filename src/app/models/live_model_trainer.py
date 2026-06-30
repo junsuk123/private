@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timezone
 from typing import Any
 
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.models.model_validation import auc_like_score, validate_training_dataset
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def train_live_short_horizon_model(
@@ -43,7 +51,10 @@ def train_live_short_horizon_model(
     auc = auc_like_score(y, probs)
     precision_at_k = _precision_at_k(y, probs, max(1, len(y) // 5))
     avg_return_top = _avg_return_top(returns, probs, max(1, len(y) // 5))
-    live_eligible = auc >= 0.55 and precision_at_k >= 0.35 and avg_return_top > 0
+    min_auc = _env_float("LIVE_MODEL_MIN_AUC", 0.55)
+    min_precision = _env_float("LIVE_MODEL_MIN_PRECISION_AT_K", 0.35)
+    min_avg_return = _env_float("LIVE_MODEL_MIN_AVG_RETURN_BPS", 0.0)
+    live_eligible = auc >= min_auc and precision_at_k >= min_precision and avg_return_top > min_avg_return
     reason_codes = () if live_eligible else ("METRICS_BELOW_LIVE_THRESHOLDS",)
     if force_live_ineligible_reason:
         live_eligible = False
@@ -96,7 +107,7 @@ def _artifact_payload(
         "metrics": metrics,
         "live_eligible": live_eligible,
         "reason_codes": list(reason_codes),
-        "label_definition": "label=1 when forward_net_return_bps > 20 after costs",
+        "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
     }
 
 
@@ -114,14 +125,22 @@ def _dataset_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
 
 
 def _fit_logistic(x: list[list[float]], y: list[int]) -> tuple[list[float], float]:
+    # 클래스 가중치로 불균형(소수 positive)에 대응 — 없으면 모델이 전부 음성(prob≈0)으로 붕괴한다.
     weights = [0.0] * len(x[0])
     bias = 0.0
     lr = 0.08
+    l2 = _env_float("LIVE_MODEL_L2", 0.001)
+    positives = sum(1 for label in y if label == 1)
+    negatives = len(y) - positives
+    total = max(1, len(y))
+    weight_pos = total / (2.0 * positives) if positives else 1.0
+    weight_neg = total / (2.0 * negatives) if negatives else 1.0
     for _ in range(250):
         for row, label in zip(x, y, strict=True):
             pred = _sigmoid(_dot(row, weights) + bias)
-            err = pred - label
-            weights = [w - lr * err * value for w, value in zip(weights, row, strict=True)]
+            class_weight = weight_pos if label == 1 else weight_neg
+            err = (pred - label) * class_weight
+            weights = [w - lr * (err * value + l2 * w) for w, value in zip(weights, row, strict=True)]
             bias -= lr * err
     return weights, bias
 
@@ -130,11 +149,12 @@ def _fit_linear(x: list[list[float]], y: list[float]) -> tuple[list[float], floa
     weights = [0.0] * len(x[0])
     bias = 0.0
     lr = 0.01
+    l2 = _env_float("LIVE_MODEL_L2", 0.001)
     for _ in range(180):
         for row, target in zip(x, y, strict=True):
             pred = _dot(row, weights) + bias
             err = pred - target
-            weights = [w - lr * err * value for w, value in zip(weights, row, strict=True)]
+            weights = [w - lr * (err * value + l2 * w) for w, value in zip(weights, row, strict=True)]
             bias -= lr * err
     return weights, bias
 

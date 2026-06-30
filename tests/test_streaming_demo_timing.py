@@ -205,7 +205,8 @@ class StreamingDemoTimingTest(unittest.TestCase):
         self.assertGreaterEqual(demo._cash_by_currency["KRW"], 1_000_000)
         self.assertTrue(all(trade.reason == "principal protection reserve" for trade in trades))
 
-    def test_paper_trading_step_waits_until_next_minute_is_due(self) -> None:
+    def test_paper_trading_step_runs_immediately_without_time_gate(self) -> None:
+        # 시간 팩터 제거: 봉 간 인위적 지연이 없으므로 첫 스텝이 즉시 실행된다(waiting 없음).
         previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
         previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
         os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
@@ -218,28 +219,18 @@ class StreamingDemoTimingTest(unittest.TestCase):
                     "target_return_rate": 0.02,
                     "period_minutes": 20,
                     "initial_cash": 10_000_000,
-                    "acceleration_factor": 1,
                 },
             )
             self.assertEqual(start_response.status_code, 200)
             demo_id = start_response.json()["demo_id"]
 
-            early_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
-
-            self.assertEqual(early_step["status"], "waiting")
-            self.assertEqual(early_step["progress"], 0.0)
-            self.assertGreater(early_step["retry_after_seconds"], 50)
-            self.assertIn("account", early_step)
-            self.assertEqual(early_step["account"]["cash"], 10_000_000)
-            self.assertEqual(early_step["account"]["account_value"], 10_000_000)
-
-            _streaming_demos[demo_id]._started_at_monotonic -= 60
             due_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
 
             self.assertEqual(due_step["status"], "running")
             self.assertEqual(due_step["step"], 1)
             self.assertEqual(due_step["raw_step"], 15)
             self.assertEqual(due_step["progress"], 5.0)
+            self.assertEqual(due_step["seconds_until_next_step"], 0.0)
             self.assertIn("ontology_filter_1", due_step)
             self.assertLessEqual(due_step["ontology_filter_1"]["chart_fetch_count"], len(TEST_TICKERS))
             self.assertGreaterEqual(due_step["universe_count"], due_step["ontology_filter_1"]["chart_fetch_count"])
@@ -277,10 +268,9 @@ class StreamingDemoTimingTest(unittest.TestCase):
             self.assertEqual(start_response.status_code, 200)
             start_payload = start_response.json()
             demo_id = start_payload["demo_id"]
-            self.assertEqual(start_payload["paper_trading_status"], "background_collection_started")
+            self.assertEqual(start_payload["paper_trading_status"], "trading_loop_started_independently")
             self.assertIn(demo_id, _streaming_demos)
 
-            _streaming_demos[demo_id]._started_at_monotonic -= 60
             step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
 
             self.assertEqual(step["status"], "running")

@@ -17,6 +17,7 @@ The diagram above is the canonical repository-level overview: trusted market and
 - `semantic_feature_engine.md`: semantic feature subsystem, indicator routing, LLM classification, and no-lookahead rules.
 - `semantic_feature_codebase_analysis.md`: codebase-level analysis of semantic feature integration.
 - `current_short_term_trading_audit.md`: historical audit notes from the short-term strategy review.
+- `live_short_horizon_model_decision.md`: decision record (2026-07-01) — buys run via the ontology path; the live ML model stays advisory (AUC≈0.29, not predictive) and is not force-promoted.
 
 ## Acceleration And Native Hot Paths
 

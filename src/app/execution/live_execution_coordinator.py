@@ -73,12 +73,11 @@ class LiveExecutionCoordinator:
             if isinstance(exc, KisApiError):
                 response = getattr(exc, "response", None)
                 if isinstance(response, dict):
-                    error_payload = {
-                        "rt_cd": response.get("rt_cd"),
-                        "msg_cd": response.get("msg_cd"),
-                        "msg1": response.get("msg1"),
-                        "http_status": response.get("http_status"),
-                    }
+                    # 전체 KIS 응답을 보존해 msg1(한글 사유) 등 진단 정보를 남긴다.
+                    error_payload = {str(k): v for k, v in response.items()}
+                    error_payload.setdefault("rt_cd", response.get("rt_cd"))
+                    error_payload.setdefault("msg_cd", response.get("msg_cd"))
+                    error_payload.setdefault("msg1", response.get("msg1"))
             self.journal.record(
                 "live_order_submission_error",
                 {
@@ -119,6 +118,88 @@ class LiveExecutionCoordinator:
         )
         self.journal.record("live_order_status", snapshot)
         return snapshot
+
+    def amend_final_order(self, broker_order_id: str, replacement: FinalOrder) -> LiveOrderSubmission:
+        self._validate_final_order(replacement)
+        failures = self._preflight_failures()
+        if failures:
+            self.journal.record(
+                "live_order_amend_blocked",
+                {"broker_order_id": broker_order_id, "order": replacement, "reason_codes": failures},
+            )
+            raise LiveExecutionBlocked(tuple(failures))
+        execution_id = f"LIVE-AMEND-{uuid4().hex}"
+        self.journal.record(
+            "live_order_amend_attempt",
+            {"execution_id": execution_id, "broker_order_id": broker_order_id, "order": replacement},
+        )
+        try:
+            receipt = self.broker.amend_limit_order(broker_order_id, replacement)
+        except Exception as exc:
+            self.journal.record(
+                "live_order_amend_error",
+                {
+                    "execution_id": execution_id,
+                    "broker_order_id": broker_order_id,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
+        amended_order_id = str(getattr(receipt, "order_id", "") or broker_order_id)
+        self.journal.record(
+            "live_order_amended",
+            {
+                "execution_id": execution_id,
+                "broker_order_id": amended_order_id,
+                "previous_broker_order_id": broker_order_id,
+                "status": str(getattr(receipt, "status", "ACCEPTED")),
+                "order": asdict(replacement),
+            },
+        )
+        return LiveOrderSubmission(
+            execution_id=execution_id,
+            idempotency_key=f"amend:{broker_order_id}",
+            status=str(getattr(receipt, "status", "ACCEPTED")),
+            broker_order_id=amended_order_id,
+            submitted_at=datetime.now(timezone.utc),
+            message=str(getattr(receipt, "message", "")),
+        )
+
+    def cancel_final_order(self, broker_order_id: str, order: FinalOrder) -> LiveOrderSubmission:
+        self._validate_final_order(order)
+        failures = self._preflight_failures()
+        if failures:
+            self.journal.record(
+                "live_order_cancel_blocked",
+                {"broker_order_id": broker_order_id, "order": order, "reason_codes": failures},
+            )
+            raise LiveExecutionBlocked(tuple(failures))
+        execution_id = f"LIVE-CANCEL-{uuid4().hex}"
+        self.journal.record(
+            "live_order_cancel_attempt",
+            {"execution_id": execution_id, "broker_order_id": broker_order_id, "order": order},
+        )
+        receipt = self.broker.cancel_order(broker_order_id, order)
+        canceled_order_id = str(getattr(receipt, "order_id", "") or broker_order_id)
+        self.journal.record(
+            "live_order_canceled",
+            {
+                "execution_id": execution_id,
+                "broker_order_id": canceled_order_id,
+                "previous_broker_order_id": broker_order_id,
+                "status": str(getattr(receipt, "status", "CANCELED")),
+                "order": asdict(order),
+            },
+        )
+        return LiveOrderSubmission(
+            execution_id=execution_id,
+            idempotency_key=f"cancel:{broker_order_id}",
+            status=str(getattr(receipt, "status", "CANCELED")),
+            broker_order_id=canceled_order_id,
+            submitted_at=datetime.now(timezone.utc),
+            message=str(getattr(receipt, "message", "")),
+        )
 
     def _preflight_failures(self) -> list[str]:
         require_manual_arming = _require_manual_arming()
@@ -170,7 +251,7 @@ def _supported_live_symbol(order: FinalOrder) -> bool:
         return True
     overseas_market = any(
         token in market
-        for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
+        for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
     )
     return overseas_market and ticker.replace(".", "").replace("-", "").isalnum()
 

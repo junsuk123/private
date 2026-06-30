@@ -48,12 +48,33 @@ class OrderTransport:
         if url.endswith("/uapi/domestic-stock/v1/trading/order-cash"):
             self.order_count += 1
             return {"rt_cd": "0", "msg1": "accepted", "output": {"ODNO": "0000000010"}}
+        if url.endswith("/uapi/domestic-stock/v1/trading/order-rvsecncl"):
+            self.order_count += 1
+            return {
+                "rt_cd": "0",
+                "msg1": "revised",
+                "output": {"KRX_FWDG_ORD_ORGNO": "06010", "ODNO": "0000000011", "ORD_TMD": "131438"},
+            }
         if url.endswith("/uapi/overseas-stock/v1/trading/order"):
             self.order_count += 1
             return {"rt_cd": "0", "msg1": "overseas accepted", "output": {"ODNO": "OVRS000010"}}
+        if url.endswith("/uapi/overseas-stock/v1/trading/order-rvsecncl"):
+            self.order_count += 1
+            return {
+                "rt_cd": "0",
+                "msg1": "overseas revised",
+                "output": {"KRX_FWDG_ORD_ORGNO": "01790", "ODNO": "OVRS000011", "ORD_TMD": "160710"},
+            }
         if url.endswith("/uapi/overseas-stock/v1/trading/daytime-order"):
             self.order_count += 1
             return {"rt_cd": "0", "msg1": "daytime accepted", "output": {"ODNO": "DAY000010"}}
+        if url.endswith("/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"):
+            self.order_count += 1
+            return {
+                "rt_cd": "0",
+                "msg1": "daytime revised",
+                "output": {"KRX_FWDG_ORD_ORGNO": "01790", "ODNO": "DAY000011", "ORD_TMD": "104202"},
+            }
         if url.endswith("/uapi/overseas-stock/v1/trading/inquire-ccnl"):
             return {
                 "rt_cd": "0",
@@ -227,6 +248,112 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
 
         order_call = next(call for call in transport.calls if call["url"].endswith("/domestic-stock/v1/trading/order-cash"))
         self.assertEqual(order_call["body"]["ORD_DVSN"], "07")
+
+    def test_domestic_sell_revise_uses_rvsecncl_api(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            arming_path = Path("config/secrets/live_trading_armed.json")
+            create_arming_file(arming_path, ttl_seconds=60)
+            coordinator = self._coordinator(tmp, transport)
+            replacement = FinalOrder(
+                ticker="005930",
+                market="KR",
+                order_type=OrderType.LIMIT,
+                side=OrderSide.SELL,
+                quantity=1,
+                limit_price=70500,
+            )
+            env = {
+                "LIVE_TRADING_ENABLED": "true",
+                "KIS_LIVE_ENABLED": "true",
+                "KIS_PAPER_TRADING": "false",
+                "LIVE_ORDER_SUBMIT_ENABLED": "true",
+                "KILL_SWITCH_ENABLED": "false",
+            }
+            try:
+                with patch.dict("os.environ", env, clear=True):
+                    amended = coordinator.amend_final_order("0000000010", replacement)
+            finally:
+                arming_path.unlink(missing_ok=True)
+
+        call = next(call for call in transport.calls if call["url"].endswith("/domestic-stock/v1/trading/order-rvsecncl"))
+        self.assertEqual(call["headers"]["tr_id"], "TTTC0013U")
+        self.assertEqual(call["body"]["ORGN_ODNO"], "0000000010")
+        self.assertEqual(call["body"]["RVSE_CNCL_DVSN_CD"], "01")
+        self.assertEqual(call["body"]["ORD_QTY"], "1")
+        self.assertEqual(call["body"]["ORD_UNPR"], "70500")
+        self.assertEqual(call["body"]["QTY_ALL_ORD_YN"], "N")
+        self.assertEqual(amended.broker_order_id, "0000000011")
+
+    def test_overseas_sell_revise_uses_overseas_rvsecncl_api(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            arming_path = Path("config/secrets/live_trading_armed.json")
+            create_arming_file(arming_path, ttl_seconds=60)
+            coordinator = self._coordinator(tmp, transport)
+            replacement = FinalOrder(
+                ticker="SOXX",
+                market="US-LISTED",
+                order_type=OrderType.LIMIT,
+                side=OrderSide.SELL,
+                quantity=1,
+                limit_price=623.25,
+            )
+            env = {
+                "LIVE_TRADING_ENABLED": "true",
+                "KIS_LIVE_ENABLED": "true",
+                "KIS_PAPER_TRADING": "false",
+                "LIVE_ORDER_SUBMIT_ENABLED": "true",
+                "KILL_SWITCH_ENABLED": "false",
+            }
+            try:
+                with patch.dict("os.environ", env, clear=True):
+                    amended = coordinator.amend_final_order("OVRS000010", replacement)
+            finally:
+                arming_path.unlink(missing_ok=True)
+
+        call = next(call for call in transport.calls if call["url"].endswith("/overseas-stock/v1/trading/order-rvsecncl"))
+        self.assertEqual(call["headers"]["tr_id"], "TTTT1004U")
+        self.assertEqual(call["body"]["OVRS_EXCG_CD"], "NASD")
+        self.assertEqual(call["body"]["PDNO"], "SOXX")
+        self.assertEqual(call["body"]["ORGN_ODNO"], "OVRS000010")
+        self.assertEqual(call["body"]["RVSE_CNCL_DVSN_CD"], "01")
+        self.assertEqual(call["body"]["OVRS_ORD_UNPR"], "623.25")
+        self.assertEqual(amended.broker_order_id, "OVRS000011")
+
+    def test_us_daytime_sell_revise_uses_daytime_rvsecncl_api(self) -> None:
+        transport = OrderTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            arming_path = Path("config/secrets/live_trading_armed.json")
+            create_arming_file(arming_path, ttl_seconds=60)
+            coordinator = self._coordinator(tmp, transport)
+            replacement = FinalOrder(
+                ticker="SOXX",
+                market="US-LISTED",
+                order_type=OrderType.LIMIT,
+                side=OrderSide.SELL,
+                quantity=1,
+                limit_price=623.25,
+            )
+            env = {
+                "LIVE_TRADING_ENABLED": "true",
+                "KIS_LIVE_ENABLED": "true",
+                "KIS_PAPER_TRADING": "false",
+                "LIVE_ORDER_SUBMIT_ENABLED": "true",
+                "KILL_SWITCH_ENABLED": "false",
+                "KIS_FORCE_OVERSEAS_DAYTIME_ORDER": "true",
+            }
+            try:
+                with patch.dict("os.environ", env, clear=True):
+                    amended = coordinator.amend_final_order("DAY000010", replacement)
+            finally:
+                arming_path.unlink(missing_ok=True)
+
+        call = next(call for call in transport.calls if call["url"].endswith("/overseas-stock/v1/trading/daytime-order-rvsecncl"))
+        self.assertEqual(call["headers"]["tr_id"], "TTTS6038U")
+        self.assertEqual(call["body"]["ORGN_ODNO"], "DAY000010")
+        self.assertEqual(call["body"]["RVSE_CNCL_DVSN_CD"], "01")
+        self.assertEqual(amended.broker_order_id, "DAY000011")
 
     def _coordinator(self, tmp: str, transport: OrderTransport) -> LiveExecutionCoordinator:
         client = KisDevelopersApiClient(

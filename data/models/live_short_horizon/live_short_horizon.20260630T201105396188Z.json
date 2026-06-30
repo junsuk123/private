@@ -1,0 +1,86 @@
+{
+  "artifact_id": "live_short_horizon.20260630T201105396188Z",
+  "classification": {
+    "bias": -9.173310633171578,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      564.6753879298855,
+      -1343.8400208952025,
+      161.95332550123035,
+      845.22917564327,
+      -0.002062739428227504,
+      1.9947939996247812,
+      -4.779838782701441e-06,
+      -6.965612133511938e-07,
+      -0.010033357123363021,
+      7.892473426222091,
+      1955.5528079332364,
+      1031.0759772982642,
+      -6.6398246747216355e-06,
+      0.0
+    ]
+  },
+  "created_at": "2026-06-30T20:11:05.397191+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio"
+  ],
+  "feature_schema_hash": "1e4901681fc317af588b8441",
+  "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.59609917420014,
+    "avg_forward_net_return_bps_top_k": -92.4489081018388,
+    "example_count": 14542.0,
+    "negative_labels": 14255.0,
+    "positive_labels": 287.0,
+    "precision_at_k": 0.014786795048143054
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": NaN,
+    "family": "linear_regression_sgd",
+    "weights": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "first_collected_return_1m_after_30s_after_costs_bps > 5.0",
+    "row_count": 14542,
+    "schema_hash": "1e4901681fc317af588b8441",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames"
+  }
+}

@@ -285,6 +285,22 @@ class RealtimeMarketDataStore:
             latency_ms=float(row[7]),
         )
 
+    def active_symbols(self, since: datetime, *, limit: int = 200) -> tuple[str, ...]:
+        """Symbols with at least one tick since the cutoff, most-recent first."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                select symbol, max(received_at) as last_at
+                from realtime_ticks
+                where received_at >= ?
+                group by symbol
+                order by last_at desc
+                limit ?
+                """,
+                (since.isoformat(), int(limit)),
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows if row and row[0])
+
     def recent_ticks(self, symbol: str, since: datetime) -> tuple[RealtimeTradeTick, ...]:
         with closing(self._connect()) as conn:
             rows = conn.execute(

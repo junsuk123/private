@@ -1,0 +1,86 @@
+{
+  "artifact_id": "live_short_horizon.20260630T190336078157Z",
+  "classification": {
+    "bias": -11.45500588614804,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      4228.263303237139,
+      -2009.8308080362217,
+      1564.8861300953488,
+      -569.0428112077475,
+      -0.003703587085313959,
+      -3.7472763110458986,
+      -0.00010161023005796397,
+      2.1990853738554564e-05,
+      0.04868707227507651,
+      3.021286397786377,
+      -4309.604872214876,
+      1239.1939147165826,
+      -5.9619163839672115e-05,
+      0.0
+    ]
+  },
+  "created_at": "2026-06-30T19:03:36.078157+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio"
+  ],
+  "feature_schema_hash": "1e4901681fc317af588b8441",
+  "label_definition": "label=1 when forward_net_return_bps > 20 after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.980705725777309,
+    "avg_forward_net_return_bps_top_k": -25.24725854270224,
+    "example_count": 11373.0,
+    "negative_labels": 11252.0,
+    "positive_labels": 121.0,
+    "precision_at_k": 0.051451187335092345
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": NaN,
+    "family": "linear_regression_sgd",
+    "weights": [
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN,
+      NaN
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "first_collected_return_1m_after_30s_after_costs_bps > 20",
+    "row_count": 11373,
+    "schema_hash": "1e4901681fc317af588b8441",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames"
+  }
+}

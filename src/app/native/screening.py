@@ -132,10 +132,8 @@ def screen_candidates_vectorized(
     institution = np.round(institution_net_buy / norm_value, 6)
     retail = np.round(retail_net_buy / norm_value, 6)
     program = np.round(program_net_buy / norm_value, 6)
-    total = np.round(foreign + institution + retail + program, 6)
     informed = np.round(0.55 * foreign + 0.45 * institution - 0.20 * retail + 0.15 * program, 6)
     absorption = np.round(-(retail * (0.55 * foreign + 0.45 * institution)), 6)
-    lambda_proxy = np.where(np.abs(total) > 0.002, price_change_rate / total, 0.0)
     signed_efficiency = np.round(price_change_rate * informed, 6)
     volume_pressure = np.round(np.maximum(0.0, volume_change_rate), 6)
     flow_raw = (
