@@ -1,0 +1,14 @@
+{
+  "checked_at": "2026-06-30T00:12:57.181482+00:00",
+  "dry_run": true,
+  "failures": {},
+  "gates": {
+    "kis_health": true,
+    "kis_secret_file": true,
+    "live_eligible_model": true,
+    "live_flags_diagnostic": true,
+    "live_trading_safety_config": true,
+    "order_execution_config": true
+  },
+  "no_orders": true
+}

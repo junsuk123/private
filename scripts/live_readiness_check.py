@@ -59,7 +59,14 @@ def main() -> int:
             record("live_eligible_model", False, exc.__class__.__name__)
 
     secrets = validate_live_secret_file()
-    secret_ok = all(secrets.values()) if not args.dry_run else True
+    required_secret_keys = (
+        "file_exists",
+        "KIS_APP_KEY",
+        "KIS_APP_SECRET",
+        "KIS_ACCOUNT_NO",
+        "KIS_ACCOUNT_PRODUCT_CODE",
+    )
+    secret_ok = all(bool(secrets.get(key)) for key in required_secret_keys) if not args.dry_run else True
     record("kis_secret_file", bool(secret_ok), "missing KIS secret file or required keys")
 
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)

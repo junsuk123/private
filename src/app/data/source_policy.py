@@ -53,7 +53,10 @@ def default_trust_level(source_type: str) -> int:
 
 def compute_quality_score(metadata: SourceMetadata, missing_ratio: float = 0.0) -> float:
     missing = max(0.0, min(1.0, missing_ratio))
-    trust = metadata.trust_level if metadata.trust_level > 0 else default_trust_level(metadata.source_type)
+    source_type = metadata.source_type or infer_source_type(metadata.source_name, metadata.raw_url)
+    if source_type == "unknown":
+        source_type = infer_source_type(metadata.source_name, metadata.raw_url)
+    trust = metadata.trust_level if metadata.trust_level > 0 else default_trust_level(source_type)
     score = trust / 5.0
     if metadata.is_synthetic:
         score *= 0.0
@@ -74,6 +77,8 @@ def is_allowed_for_live_decision(
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     source_type = metadata.source_type or infer_source_type(metadata.source_name, metadata.raw_url)
+    if source_type == "unknown":
+        source_type = infer_source_type(metadata.source_name, metadata.raw_url)
     trust = metadata.trust_level if metadata.trust_level > 0 else default_trust_level(source_type)
     quality = metadata.quality_score if metadata.quality_score > 0 else compute_quality_score(metadata)
     if metadata.is_synthetic or source_type in {"synthetic", "sample"}:

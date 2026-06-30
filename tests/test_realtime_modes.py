@@ -12,7 +12,8 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.realtime import OperationMode, OperationModeManager, ShortHorizonRiskPolicy
-from app.schemas.domain import OrderAction, OrderIntent
+from app.schemas.domain import AccountSnapshot, MarketSnapshot, OrderAction, OrderIntent, SourceMetadata
+from app.storage import StoredResearch
 from app import web as web_module
 from app.web import app
 
@@ -529,6 +530,70 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertIn("learning", data)
         self.assertIn("collection_log", data)
         self.assertIn("refresh_interval_seconds", data["learning"])
+
+    def test_live_broker_research_keeps_only_affordable_markets_for_account(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(
+            source_name="KIS broker quote",
+            retrieved_at=now,
+            source_type="broker_api",
+            trust_level=5,
+            observed_at=now,
+            is_realtime=True,
+            quality_score=1.0,
+        )
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(
+                MarketSnapshot("MSFT", "NASDAQ", "Microsoft", "Technology", 367.6, 10_000_000, 0.02, source),
+                MarketSnapshot("PENNY", "NASDAQ", "Affordable US", "Technology", 2.5, 10_000_000, 0.02, source),
+                MarketSnapshot("005930", "KOSPI", "Samsung", "Technology", 323000.0, 10_000_000, 0.02, source),
+                MarketSnapshot("000001", "KOSPI", "Affordable KR", "Technology", 4000.0, 10_000_000, 0.02, source),
+            ),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+        account = AccountSnapshot(
+            cash=5011.0,
+            holdings=(),
+            cash_by_currency={"KRW": 5011.0, "USD": 3.22},
+            cash_equivalent_krw=9983.0,
+        )
+
+        filtered = web_module._live_broker_only_research(stored, account=account)
+
+        self.assertEqual(tuple(market.ticker for market in filtered.market_snapshots), ("PENNY", "000001"))
+
+    def test_live_broker_targets_include_domestic_and_overseas_candidates(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(
+            source_name="listed_universe_reference",
+            retrieved_at=now,
+        )
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(
+                MarketSnapshot("005930", "KOSPI", "Samsung", "Technology", 70_000.0, 10_000_000, 0.02, source),
+                MarketSnapshot("MSFT", "NASDAQ", "Microsoft", "Technology", 367.6, 10_000_000, 0.02, source),
+            ),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(
+                SimpleNamespace(ticker="005930", conclusion="BuyCandidate"),
+                SimpleNamespace(ticker="MSFT", conclusion="BuyCandidate"),
+            ),
+        )
+
+        targets = web_module._live_broker_targets_for_active_session(stored)
+
+        self.assertEqual(targets, ("005930", "MSFT"))
 
 
 if __name__ == "__main__":

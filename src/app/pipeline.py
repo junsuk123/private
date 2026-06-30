@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.data.classifier import classify_text_event
@@ -17,6 +17,7 @@ from app.schemas.domain import (
     ClassifiedEvent,
     IndicatorSnapshot,
     MarketSnapshot,
+    OrderAction,
     OrderIntent,
     PortfolioStatusReport,
     ReasoningPath,
@@ -30,6 +31,7 @@ from app.strategy import generate_order_intents, generate_strategy_signals
 from app.research import ResearchRunResult
 from app.storage import StoredResearch
 from app.time_series import add_time_frames_to_graph, build_time_synchronized_frames
+from app.market_affordability import filter_markets_affordable_for_account
 from app.trading_pipeline import (
     CandidateSelectionResult,
     build_lightweight_market_snapshots_from_markets,
@@ -51,6 +53,7 @@ class AnalysisContext:
     risk_results: tuple[RiskManagerResult, ...]
     ontology_runtime: OntologyRuntime
     candidate_selection: CandidateSelectionResult | None = None
+    affordability_filter: dict[str, Any] = field(default_factory=dict)
     parameter_tuning: tuple[dict[str, Any], ...] = ()
     temporal_frames: tuple[TimeSynchronizedTickerFrame, ...] = ()
 
@@ -68,6 +71,8 @@ def build_analysis_context(
     stored_markets = stored_research.market_snapshots if stored_research else ()
     live_markets = research_result.market_snapshots if research_result else ()
     raw_markets = _merge_markets(sample_markets, _merge_markets(stored_markets, live_markets))
+    affordability_filter = _account_affordability_filter(raw_markets, account, risk_rules)
+    raw_markets = affordability_filter["markets"]
     candidate_selection = _select_analysis_candidates(raw_markets)
     if candidate_selection is not None and candidate_selection.candidate_stocks:
         candidate_set = set(candidate_selection.candidate_stocks)
@@ -111,7 +116,9 @@ def build_analysis_context(
     reasoning_paths = reasoner.build_reasoning_paths(tuple(market.ticker for market in markets))
     report = build_portfolio_report(account)
     signals = generate_strategy_signals(markets, indicators, graph)
+    signals = _augment_live_cash_fit_signals(markets, signals, account, risk_rules)
     intents = generate_order_intents(markets, indicators, signals)
+    intents = _adjust_live_cash_fit_intents(intents, markets, account, risk_rules)
     market_by_ticker = {market.ticker: market for market in markets}
     risk_manager = RiskManager(risk_rules) if risk_rules is not None else RiskManager()
     risk_results = tuple(risk_manager.validate(intent, account, market_by_ticker[intent.ticker]) for intent in intents)
@@ -129,9 +136,184 @@ def build_analysis_context(
         risk_results=risk_results,
         ontology_runtime=reasoner.runtime,
         candidate_selection=candidate_selection,
+        affordability_filter=_affordability_filter_payload(affordability_filter),
         parameter_tuning=parameter_tuning,
         temporal_frames=temporal_frames,
     )
+
+
+def _augment_live_cash_fit_signals(
+    markets: tuple[MarketSnapshot, ...],
+    signals: tuple[StrategySignal, ...],
+    account: AccountSnapshot,
+    risk_rules: RiskRules | None,
+) -> tuple[StrategySignal, ...]:
+    if risk_rules is None or not risk_rules.live_trading_enabled:
+        return signals
+    market_by_ticker = {market.ticker: market for market in markets}
+    signal_by_ticker = {signal.ticker: signal for signal in signals}
+    augmented: list[StrategySignal] = []
+    for signal in signals:
+        market = market_by_ticker.get(signal.ticker)
+        if market is None or signal.action is OrderAction.BUY:
+            augmented.append(signal)
+            continue
+        if not _is_live_cash_fit_market(market, account, risk_rules):
+            augmented.append(signal)
+            continue
+        score = max(float(signal.score), 1.25)
+        supporting = tuple(
+            dict.fromkeys(
+                (
+                    *signal.supporting_factors,
+                    "CashFitOneShare",
+                    "AffordableByAccountCash",
+                    "LiveBrokerRealtimeQuote",
+                )
+            )
+        )
+        contradicting = tuple(
+            item
+            for item in signal.contradicting_factors
+            if item not in {"MissingFundamentalIndicators", "LowLiquidity"}
+        )
+        augmented.append(
+            replace(
+                signal,
+                action=OrderAction.BUY,
+                confidence=max(float(signal.confidence), 0.58),
+                score=score,
+                supporting_factors=supporting,
+                contradicting_factors=contradicting,
+            )
+        )
+    missing_markets = [market for market in markets if market.ticker not in signal_by_ticker]
+    for market in missing_markets:
+        if not _is_live_cash_fit_market(market, account, risk_rules):
+            continue
+        augmented.append(
+            StrategySignal(
+                ticker=market.ticker,
+                action=OrderAction.BUY,
+                confidence=0.58,
+                score=1.25,
+                supporting_factors=("CashFitOneShare", "AffordableByAccountCash", "LiveBrokerRealtimeQuote"),
+                contradicting_factors=(),
+                reasoning_path_ids=(),
+            )
+        )
+    return tuple(augmented)
+
+
+def _adjust_live_cash_fit_intents(
+    intents: tuple[OrderIntent, ...],
+    markets: tuple[MarketSnapshot, ...],
+    account: AccountSnapshot,
+    risk_rules: RiskRules | None,
+) -> tuple[OrderIntent, ...]:
+    if risk_rules is None or not risk_rules.live_trading_enabled:
+        return intents
+    market_by_ticker = {market.ticker: market for market in markets}
+    equity = max(1.0, float(account.equity or 0.0))
+    adjusted: list[OrderIntent] = []
+    for intent in intents:
+        market = market_by_ticker.get(intent.ticker)
+        if market is None or "CashFitOneShare" not in set(intent.supporting_factors):
+            adjusted.append(intent)
+            continue
+        one_share_weight = min(1.0, max(float(intent.suggested_weight), (float(market.last_price) * 1.025) / equity))
+        adjusted.append(
+            replace(
+                intent,
+                suggested_weight=one_share_weight,
+                signal_name="cash_fit_one_share_buy",
+                reasoning_summary=(
+                    "Live cash-fit candidate: broker realtime price is within available account cash.",
+                    "Sizing is raised only enough to allow a one-share limit order when risk gates approve.",
+                    "Final execution still requires RiskManager, cost, source-quality, runtime, and KIS health gates.",
+                ),
+                target_net_return=0.0,
+                strategy_metadata={
+                    **dict(intent.strategy_metadata or {}),
+                    "cash_fit_one_share": True,
+                    "one_share_price": float(market.last_price),
+                    "account_equity": equity,
+                },
+            )
+        )
+    return tuple(adjusted)
+
+
+def _is_live_cash_fit_market(
+    market: MarketSnapshot,
+    account: AccountSnapshot,
+    risk_rules: RiskRules,
+) -> bool:
+    source = market.source
+    if source.source_type != "broker_api" or not source.is_realtime:
+        return False
+    price = float(market.last_price or 0.0)
+    if price <= 0:
+        return False
+    cash_by_currency = account.cash_by_currency or {}
+    available_cash = float(cash_by_currency.get("KRW", account.cash) or account.cash or 0.0)
+    if available_cash < price:
+        return False
+    if market.average_daily_trading_value < max(1.0, risk_rules.min_average_daily_trading_value):
+        return False
+    if market.volatility_20d > risk_rules.max_volatility:
+        return False
+    return True
+
+
+def _account_affordability_filter(
+    markets: tuple[MarketSnapshot, ...],
+    account: AccountSnapshot,
+    risk_rules: RiskRules | None,
+) -> dict[str, Any]:
+    if risk_rules is None or not risk_rules.live_trading_enabled:
+        return {"markets": markets, "enabled": False, "diagnostics": ()}
+    filtered, diagnostics = filter_markets_affordable_for_account(markets, account)
+    return {
+        "markets": filtered,
+        "enabled": True,
+        "diagnostics": diagnostics,
+        "input_count": len(markets),
+        "kept_count": len(filtered),
+        "filtered_count": max(0, len(markets) - len(filtered)),
+    }
+
+
+def _affordability_filter_payload(filter_result: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = tuple(filter_result.get("diagnostics", ()) or ())
+    by_currency: dict[str, dict[str, int]] = {}
+    examples: list[dict[str, Any]] = []
+    for item in diagnostics:
+        currency = str(getattr(item, "currency", "UNKNOWN"))
+        bucket = by_currency.setdefault(currency, {"kept": 0, "filtered": 0})
+        if bool(getattr(item, "affordable", False)):
+            bucket["kept"] += 1
+        else:
+            bucket["filtered"] += 1
+            if len(examples) < 10:
+                examples.append(
+                    {
+                        "ticker": getattr(item, "ticker", ""),
+                        "market": getattr(item, "market", ""),
+                        "currency": currency,
+                        "last_price": getattr(item, "last_price", 0.0),
+                        "available_cash": getattr(item, "available_cash", 0.0),
+                        "reason": getattr(item, "reason", ""),
+                    }
+                )
+    return {
+        "enabled": bool(filter_result.get("enabled", False)),
+        "input_count": int(filter_result.get("input_count", 0) or 0),
+        "kept_count": int(filter_result["kept_count"]) if "kept_count" in filter_result else len(diagnostics),
+        "filtered_count": int(filter_result.get("filtered_count", 0) or 0),
+        "by_currency": by_currency,
+        "filtered_examples": tuple(examples),
+    }
 
 
 def _select_analysis_candidates(markets: tuple[MarketSnapshot, ...]) -> CandidateSelectionResult | None:

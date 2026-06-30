@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta, timezone
 
+from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.graph import KnowledgeGraph
 from app.schemas.domain import IndicatorSnapshot, MarketSnapshot, OrderAction, OrderIntent, StrategySignal
 
@@ -212,9 +213,14 @@ def _is_overseas_market(market: MarketSnapshot) -> bool:
 
 def _live_market_validation_id(market: MarketSnapshot, signal: StrategySignal) -> str | None:
     source = market.source
-    if source.source_type != "broker_api":
+    source_type = source.source_type or infer_source_type(source.source_name, source.raw_url)
+    if source_type == "unknown":
+        source_type = infer_source_type(source.source_name, source.raw_url)
+    trust_level = source.trust_level if source.trust_level > 0 else default_trust_level(source_type)
+    quality_score = source.quality_score if source.quality_score > 0 else compute_quality_score(source)
+    if source_type != "broker_api":
         return None
-    if source.trust_level < 5 or source.quality_score < 0.8 or not source.is_realtime:
+    if trust_level < 5 or quality_score < 0.8 or not source.is_realtime:
         return None
     observed_at = source.observed_at or source.retrieved_at
     payload = "|".join(

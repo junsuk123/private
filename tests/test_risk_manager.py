@@ -12,7 +12,7 @@ from app.data.sample_collectors import collect_sample_account, collect_sample_ma
 from app.indicators import build_sample_indicators
 from app.risk import RiskManager
 from app.schemas import AccountSnapshot, RiskRules
-from app.schemas.domain import OrderAction, OrderIntent, SourceMetadata
+from app.schemas.domain import MarketSnapshot, OrderAction, OrderIntent, SourceMetadata, StrategySignal
 from app.strategy.rule_based import generate_order_intents, generate_strategy_signals
 from app.graph.builders import build_market_graph
 
@@ -45,7 +45,7 @@ class RiskManagerTest(unittest.TestCase):
         result = RiskManager().validate(intent, account, markets[0])
 
         self.assertFalse(result.approved)
-        self.assertIn("quantity_positive", result.rejection_reasons)
+        self.assertIn("INSUFFICIENT_CASH_FOR_ONE_SHARE", result.rejection_reasons)
 
     def test_rejects_duplicate_pending_order(self) -> None:
         account = collect_sample_account()
@@ -105,6 +105,47 @@ class RiskManagerTest(unittest.TestCase):
         self.assertIn("synthetic_data_blocked", result.rejection_reasons)
         self.assertIn("quote_freshness_check", result.rejection_reasons)
         self.assertIn("model_uncertainty_check", result.rejection_reasons)
+
+    def test_live_mode_infers_broker_source_from_kis_name(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(
+            source_name="KIS broker quote",
+            retrieved_at=now,
+            raw_url="kis://quotations/domestic/005930",
+            source_id="kis-quote:domestic:005930:unit",
+            observed_at=now,
+            is_realtime=True,
+        )
+        market = MarketSnapshot(
+            ticker="005930",
+            market="KOSPI",
+            company_name="Samsung Electronics",
+            sector="Technology",
+            last_price=70_000,
+            average_daily_trading_value=100_000_000_000,
+            volatility_20d=0.02,
+            source=source,
+        )
+        signal = StrategySignal(
+            ticker=market.ticker,
+            action=OrderAction.BUY,
+            confidence=0.8,
+            score=2.0,
+            supporting_factors=("HighLiquidity",),
+            contradicting_factors=(),
+            reasoning_path_ids=(),
+        )
+        intent = generate_order_intents((market,), {}, (signal,))[0]
+        account = AccountSnapshot(cash=10_000_000, holdings=(), cash_by_currency={"KRW": 10_000_000})
+
+        result = RiskManager(RiskRules(live_trading_enabled=True)).validate(intent, account, market)
+
+        self.assertTrue(result.checks["source_trust_check"])
+        self.assertTrue(result.checks["data_quality_check"])
+        self.assertTrue(result.checks["unknown_source_check"])
+        self.assertTrue(result.checks["live_validation_id_present"])
+        self.assertTrue(result.approved)
+        self.assertIsNotNone(result.final_order)
 
 
 if __name__ == "__main__":

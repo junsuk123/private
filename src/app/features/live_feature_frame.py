@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,8 +47,8 @@ class LiveFeatureFrameBuilder:
         store: RealtimeMarketDataStore,
         *,
         schema: FeatureSchema = LIVE_SHORT_HORIZON_SCHEMA,
-        max_quote_age_ms: int = 3000,
-        max_orderbook_age_ms: int = 3000,
+        max_quote_age_ms: int = int(os.getenv("LIVE_FEATURE_MAX_QUOTE_AGE_MS", "15000")),
+        max_orderbook_age_ms: int = int(os.getenv("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS", "15000")),
         journal_path: str | Path = "logs/live-feature-frames.jsonl",
     ) -> None:
         self.store = store

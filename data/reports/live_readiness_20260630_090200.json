@@ -1,0 +1,17 @@
+{
+  "checked_at": "2026-06-30T00:02:00.545903+00:00",
+  "dry_run": false,
+  "failures": {
+    "kis_health": "account_read:KisApiError",
+    "kis_secret_file": "missing KIS secret file or required keys"
+  },
+  "gates": {
+    "kis_health": false,
+    "kis_secret_file": false,
+    "live_eligible_model": true,
+    "live_flags": true,
+    "live_trading_safety_config": true,
+    "order_execution_config": true
+  },
+  "no_orders": true
+}

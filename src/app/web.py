@@ -68,6 +68,13 @@ from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
+from app.backtesting.accelerated_demo import load_krx_listed_universe
+from app.market_affordability import (
+    cash_available_for_market,
+    is_market_affordable_for_account,
+    is_overseas_market,
+    market_currency,
+)
 from app.trading_pipeline import build_lightweight_market_snapshots_from_markets, load_short_horizon_strategy_config, ontology_filter_1
 
 
@@ -392,6 +399,48 @@ def _last_live_account_basis() -> dict[str, Any] | None:
   return _account_basis_from_kis_connection(connection)
 
 
+def _merge_live_account_basis_with_previous(
+    basis: dict[str, Any] | None,
+    previous: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+  if basis is None:
+    return previous
+  if previous is None:
+    return basis
+  krw_cash = _number_or_zero(basis.get("krw_cash") or 0)
+  previous_krw_cash = _number_or_zero(previous.get("krw_cash") or 0)
+  foreign_cash_krw = _number_or_zero(basis.get("foreign_cash_krw") or 0)
+  previous_foreign_cash_krw = _number_or_zero(previous.get("foreign_cash_krw") or 0)
+  if krw_cash > 0 or previous_krw_cash <= 0 or foreign_cash_krw <= 0:
+    return basis
+  if previous_foreign_cash_krw > 0 and abs(previous_foreign_cash_krw - foreign_cash_krw) > max(100.0, previous_foreign_cash_krw * 0.05):
+    return basis
+  merged = dict(basis)
+  cash_by_currency = dict(merged.get("cash_by_currency") or {})
+  cash_by_currency["KRW"] = previous_krw_cash
+  merged["cash_by_currency"] = cash_by_currency
+  merged["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
+  merged["krw_cash"] = previous_krw_cash
+  merged["cash"] = max(_number_or_zero(merged.get("cash")), previous_krw_cash + foreign_cash_krw)
+  merged["equity"] = max(_number_or_zero(merged.get("equity")), previous_krw_cash + foreign_cash_krw)
+  if _number_or_zero(merged.get("equity")) > 0:
+    merged["cash_weight"] = max(0.0, min(1.0, _number_or_zero(merged.get("cash")) / _number_or_zero(merged.get("equity"))))
+  return merged
+
+
+def _connection_with_account_basis(connection: dict[str, Any], basis: dict[str, Any]) -> dict[str, Any]:
+  merged = dict(connection)
+  merged["cash"] = basis.get("cash", merged.get("cash"))
+  merged["actual_deposit"] = basis.get("krw_cash", merged.get("actual_deposit"))
+  merged["krw_cash"] = basis.get("krw_cash", merged.get("krw_cash"))
+  merged["foreign_cash_krw"] = basis.get("foreign_cash_krw", merged.get("foreign_cash_krw"))
+  merged["cash_by_currency"] = basis.get("cash_by_currency", merged.get("cash_by_currency"))
+  merged["foreign_cash_by_currency"] = basis.get("foreign_cash_by_currency", merged.get("foreign_cash_by_currency"))
+  merged["actual_equity"] = basis.get("equity", merged.get("actual_equity"))
+  merged["cash_weight"] = basis.get("cash_weight", merged.get("cash_weight"))
+  return merged
+
+
 def _goal_account_snapshot(context: Any) -> AccountSnapshot:
   basis = _last_live_account_basis()
   if basis is None:
@@ -420,17 +469,42 @@ def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
   )
 
 
+def _live_risk_rules_for_account(account: AccountSnapshot | None) -> RiskRules:
+  if account is None:
+    return RiskRules(live_trading_enabled=True)
+  equity = max(0.0, float(account.equity or 0.0))
+  try:
+    small_account_threshold = max(0.0, float(os.getenv("LIVE_SMALL_ACCOUNT_THRESHOLD_KRW", "50000")))
+  except ValueError:
+    small_account_threshold = 50000.0
+  if equity <= 0 or equity > small_account_threshold:
+    return RiskRules(live_trading_enabled=True)
+  try:
+    min_adv = max(1.0, float(os.getenv("LIVE_SMALL_ACCOUNT_MIN_ADV_KRW", "100000000")))
+  except ValueError:
+    min_adv = 100000000.0
+  return RiskRules(
+      live_trading_enabled=True,
+      max_single_stock_weight=1.0,
+      max_intraday_position_weight=1.0,
+      max_sector_weight=1.0,
+      minimum_cash_reserve=0.0,
+      min_average_daily_trading_value=min_adv,
+  )
+
+
 def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
   try:
     connection = _kis_connection_probe(paper=False, include_account=True)
   except Exception as exc:  # pragma: no cover - defensive guard around broker/network state
     audit.record("live_account_basis_auto_refresh_failed", {"error": str(exc)})
     return None
-  basis = _account_basis_from_kis_connection(connection)
+  previous = _last_live_account_basis()
+  basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous)
   if basis is None:
     return None
   with _live_lock:
-    _operation_mode_state["last_kis_connection"] = connection
+    _operation_mode_state["last_kis_connection"] = _connection_with_account_basis(connection, basis)
   return basis
 
 
@@ -2241,10 +2315,12 @@ def live_trading_progress() -> JSONResponse:
       connection = _kis_connection_probe(paper=False, include_account=True)
     except Exception as exc:  # pragma: no cover - broker/network defensive boundary
       connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
-    if connection.get("account_checked"):
+    previous_basis = _last_live_account_basis()
+    basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous_basis)
+    if connection.get("account_checked") and basis is not None:
+      connection = _connection_with_account_basis(connection, basis)
       with _live_lock:
         _operation_mode_state["last_kis_connection"] = connection
-    basis = _account_basis_from_kis_connection(connection) or _last_live_account_basis()
     positions = list(connection.get("positions") or [])
     snapshot = _live_snapshot()
     execution_summary = snapshot.get("live_execution_summary") or {}
@@ -2822,17 +2898,30 @@ def _refresh_live_cache() -> None:
       active_mode = _active_operation_mode()
       live_account = _live_account_snapshot_for_analysis() if active_mode == "live_trading" else None
       live_risk_rules = (
-          RiskRules(live_trading_enabled=True)
+          _live_risk_rules_for_account(live_account)
           if active_mode == "live_trading"
           else None
       )
       analysis_research = _analysis_research_for_current_mode(store)
       context_research_result = research_result
       live_broker_quote_summary: dict[str, Any] | None = None
+      live_affordable_broker_market_count = 0
       if active_mode == "live_trading":
-        analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots(analysis_research)
+        live_broker_targets = _live_broker_targets_for_active_session(analysis_research)
+        live_broker_targets = _merge_market_targets(
+            live_broker_targets,
+            _live_affordable_krx_discovery_targets(analysis_research, live_account, live_broker_targets),
+        )
+        if live_broker_targets:
+          analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots_for_targets(
+              analysis_research,
+              live_broker_targets,
+          )
+        else:
+          analysis_research, live_broker_quote_summary = _with_live_broker_market_snapshots(analysis_research)
         context_research_result = replace(research_result, market_snapshots=())
-        analysis_research = _live_broker_only_research(analysis_research)
+        analysis_research = _live_broker_only_research(analysis_research, account=live_account)
+        live_affordable_broker_market_count = len(tuple(getattr(analysis_research, "market_snapshots", ()) or ()))
       context = build_analysis_context(
           context_research_result,
           analysis_research,
@@ -2843,7 +2932,8 @@ def _refresh_live_cache() -> None:
         analysis_research, buy_quote_summary = _with_live_broker_quotes_for_context_intents(analysis_research, context)
         if int(buy_quote_summary.get("quotes", 0) or 0) > 0:
           live_broker_quote_summary = _merge_quote_summaries(live_broker_quote_summary, buy_quote_summary)
-          analysis_research = _live_broker_only_research(analysis_research)
+          analysis_research = _live_broker_only_research(analysis_research, account=live_account)
+          live_affordable_broker_market_count = len(tuple(getattr(analysis_research, "market_snapshots", ()) or ()))
           context = build_analysis_context(
               context_research_result,
               analysis_research,
@@ -2860,7 +2950,26 @@ def _refresh_live_cache() -> None:
         test_result = run_hypothetical_realtime_test(context.temporal_frames, context.signals)
         model_paths = update_realtime_model_artifacts(ModelArtifactStore(), realtime_examples, test_result)
       _set_live_progress(80, "learning", "Collecting live feature frames and training live short-horizon model")
-      live_feature_collection = collect_live_feature_frames_from_realtime_store()
+      live_feature_symbols = _live_realtime_feature_symbols_for_active_session(context) if active_mode == "live_trading" else None
+      live_us_realtime_bridge_summary = {}
+      if active_mode == "live_trading":
+        try:
+          from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+
+          live_us_realtime_bridge_summary = refresh_us_realtime_for_context_buy_candidates(
+              context,
+              symbols=live_feature_symbols,
+          )
+        except Exception as exc:  # noqa: BLE001 - quote bridge failure should be surfaced through feature errors, not crash refresh.
+          live_us_realtime_bridge_summary = {
+              "ok": False,
+              "symbols": tuple(live_feature_symbols or ()),
+              "saved": {"realtime_ticks": 0, "orderbooks": 0},
+              "touched": {},
+              "errors": {"us_realtime_bridge": f"{exc.__class__.__name__}: {exc}"},
+              "target_source": "context.reasoning_paths",
+          }
+      live_feature_collection = collect_live_feature_frames_from_realtime_store(symbols=live_feature_symbols)
       live_model_artifact = train_live_short_horizon_from_collected_features()
       model_paths["live_short_horizon"] = str(
           ModelArtifactRegistry().latest_path
@@ -2899,6 +3008,11 @@ def _refresh_live_cache() -> None:
                 "supervised_examples": len(realtime_examples),
                 "model_artifacts": len(model_paths),
                 "live_feature_frames_built": int(live_feature_collection.get("built", 0) or 0),
+        "live_us_realtime_bridge_symbols": len(tuple((live_us_realtime_bridge_summary or {}).get("symbols", ()) or ())),
+        "live_us_realtime_bridge_ticks": int(((live_us_realtime_bridge_summary or {}).get("saved", {}) or {}).get("realtime_ticks", 0) or 0),
+        "live_us_realtime_bridge_orderbooks": int(((live_us_realtime_bridge_summary or {}).get("saved", {}) or {}).get("orderbooks", 0) or 0),
+        "live_us_realtime_bridge_errors": len(((live_us_realtime_bridge_summary or {}).get("errors", {}) or {})),
+                "live_affordable_broker_markets": live_affordable_broker_market_count,
                 "live_short_horizon_live_eligible": bool(live_model_artifact.get("live_eligible")),
                 "live_short_horizon_examples": int(live_model_artifact.get("metrics", {}).get("example_count", 0)),
                 "live_broker_quotes": int((live_broker_quote_summary or {}).get("quotes", 0) or 0),
@@ -2938,6 +3052,234 @@ def _refresh_live_cache() -> None:
           _refresh_worker = threading.Thread(target=_refresh_live_cache, name="operation-mode-refresh-followup", daemon=True)
           _refresh_worker.start()
 
+
+
+_US_LIVE_MARKETS = {"NYSE", "NASDAQ", "AMEX", "ARCA", "BATS", "CBOE", "IEX", "US"}
+_KRX_LIVE_MARKETS = {"KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _ticker_market_group_for_live_trading(ticker: str, market: str = "") -> str:
+  """Classify a ticker into the market session used by live execution.
+
+  Numeric six-digit symbols are treated as Korean equities.
+  Alphabetic ETF/equity symbols such as AAPL, MSFT, NVDA, QQQ, SOXX are treated as US.
+  """
+  symbol = str(ticker or "").upper().strip()
+  market_name = str(market or "").upper().strip()
+  if market_name in _KRX_LIVE_MARKETS or (symbol.isdigit() and len(symbol) == 6):
+    return "KRX"
+  if market_name in _US_LIVE_MARKETS or (symbol and not (symbol.isdigit() and len(symbol) == 6)):
+    return "US"
+  return "UNKNOWN"
+
+
+def _is_live_market_core_open(group: str, now_utc: Any | None = None) -> bool:
+  """Return True only during the regular core session for the target market.
+
+  This intentionally does not bypass stale quote/orderbook checks.
+  It only prevents KRX symbols from being used while the US market is the active live session.
+  """
+  from datetime import datetime as _datetime
+  from datetime import time as _time
+  from datetime import timezone as _timezone
+  from zoneinfo import ZoneInfo
+
+  current = now_utc or _datetime.now(_timezone.utc)
+  if getattr(current, "tzinfo", None) is None:
+    current = current.replace(tzinfo=_timezone.utc)
+
+  group = str(group or "").upper()
+  if group == "US":
+    local = current.astimezone(ZoneInfo("America/New_York"))
+    return local.weekday() < 5 and _time(9, 30) <= local.time() <= _time(16, 0)
+
+  if group == "KRX":
+    local = current.astimezone(ZoneInfo("Asia/Seoul"))
+    return local.weekday() < 5 and _time(9, 0) <= local.time() <= _time(15, 30)
+
+  return False
+
+
+def _active_live_market_groups(now_utc: Any | None = None) -> tuple[str, ...]:
+  groups = []
+  for group in ("US", "KRX"):
+    if _is_live_market_core_open(group, now_utc):
+      groups.append(group)
+  return tuple(groups)
+
+
+def _market_name_by_ticker(records: Any) -> dict[str, str]:
+  mapping: dict[str, str] = {}
+  for market in tuple(records or ()):
+    ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+    if not ticker:
+      continue
+    mapping[ticker] = str(getattr(market, "market", "") or "").upper().strip()
+  return mapping
+
+
+def _live_broker_targets_for_active_session(stored: Any, now_utc: Any | None = None) -> tuple[str, ...]:
+  """Select domestic and overseas BuyCandidate tickers for broker quote overlay."""
+  market_by_ticker = _market_name_by_ticker(getattr(stored, "market_snapshots", ()) or ())
+  selected: list[str] = []
+
+  for path in tuple(getattr(stored, "reasoning_paths", ()) or ()):
+    conclusion = str(getattr(path, "conclusion", "") or "")
+    if conclusion != "BuyCandidate":
+      continue
+    ticker = str(getattr(path, "ticker", "") or "").upper().strip()
+    if not ticker:
+      continue
+    market_group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    if market_group in {"US", "KRX"}:
+      selected.append(ticker)
+
+  return tuple(dict.fromkeys(selected))
+
+
+def _merge_market_targets(*groups: tuple[Any, ...]) -> tuple[MarketSnapshot, ...]:
+  merged: list[MarketSnapshot] = []
+  seen: set[str] = set()
+  for group in groups:
+    for item in tuple(group or ()):
+      if isinstance(item, MarketSnapshot):
+        market = item
+      else:
+        ticker = str(item or "").upper().strip()
+        if not ticker:
+          continue
+        market = _placeholder_live_market(ticker)
+      key = market.ticker.upper().strip()
+      if not key or key in seen:
+        continue
+      merged.append(market)
+      seen.add(key)
+  return tuple(merged)
+
+
+def _placeholder_live_market(ticker: str, market: str | None = None) -> MarketSnapshot:
+  now = datetime.now(timezone.utc)
+  symbol = str(ticker or "").upper().strip()
+  return MarketSnapshot(
+      ticker=symbol,
+      market=market or ("KOSDAQ" if symbol.isdigit() and len(symbol) == 6 else "NASDAQ"),
+      company_name=symbol,
+      sector="Unknown",
+      last_price=0.0,
+      average_daily_trading_value=0.0,
+      volatility_20d=0.03,
+      source=SourceMetadata(
+          source_name="live_quote_target",
+          source_id=f"live-quote-target:{symbol}",
+          raw_url=f"local://live-quote-target/{symbol}",
+          retrieved_at=now,
+      ),
+  )
+
+
+def _live_affordable_krx_discovery_targets(
+    stored: Any,
+    account: AccountSnapshot | None,
+    existing_targets: tuple[Any, ...] = (),
+) -> tuple[MarketSnapshot, ...]:
+  """Add KRX 6-digit symbols for small-cash live quote discovery.
+
+  BuyCandidate paths can be empty or dominated by expensive mega-caps. In live mode,
+  quote a bounded set of domestic symbols too so the account-level one-share filter
+  can discover genuinely affordable KRX names from broker prices.
+  """
+  if account is None:
+    return ()
+  krw_cash = float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0)
+  if krw_cash <= 0:
+    return ()
+  try:
+    limit = max(0, int(os.getenv("LIVE_KRX_AFFORDABLE_DISCOVERY_LIMIT", "40")))
+  except ValueError:
+    limit = 40
+  if limit <= 0:
+    return ()
+
+  seen = {
+      str(getattr(item, "ticker", item) or "").upper().strip()
+      for item in tuple(existing_targets or ())
+  }
+  candidates: list[MarketSnapshot] = []
+
+  stored_markets = tuple(getattr(stored, "market_snapshots", ()) or ())
+  for market in sorted(
+      stored_markets,
+      key=lambda item: float(getattr(item, "last_price", 0.0) or 0.0),
+  ):
+    ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+    if (
+        ticker in seen
+        or not (ticker.isdigit() and len(ticker) == 6)
+        or _ticker_market_group_for_live_trading(ticker, getattr(market, "market", "")) != "KRX"
+    ):
+      continue
+    candidates.append(market)
+    seen.add(ticker)
+    if len(candidates) >= limit:
+      break
+
+  if len(candidates) < limit:
+    try:
+      universe = load_krx_listed_universe(limit=None)
+    except Exception as exc:  # noqa: BLE001 - discovery is an optional expansion.
+      audit.record("live_affordable_krx_universe_load_failed", {"error": str(exc)})
+      universe = ()
+    for symbol in universe:
+      ticker = str(symbol or "").upper().split(".", 1)[0]
+      if ticker in seen or not (ticker.isdigit() and len(ticker) == 6):
+        continue
+      candidates.append(_placeholder_live_market(ticker, "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI"))
+      seen.add(ticker)
+      if len(candidates) >= limit:
+        break
+
+  if candidates:
+    audit.record(
+        "live_affordable_krx_discovery_targets_added",
+        {"targets": len(candidates), "krw_cash": krw_cash, "limit": limit},
+    )
+  return tuple(candidates)
+
+
+def _live_realtime_feature_symbols_for_active_session(context: Any, now_utc: Any | None = None) -> tuple[str, ...]:
+  """Limit live feature frame collection to the market that is actually open.
+
+  This prevents stale domestic realtime rows from blocking US live trading cycles.
+  """
+  open_groups = set(_active_live_market_groups(now_utc))
+  if not open_groups:
+    return ()
+
+  markets = tuple(getattr(context, "markets", ()) or ())
+  market_by_ticker = _market_name_by_ticker(markets)
+  selected: list[str] = []
+
+  for path in tuple(getattr(context, "reasoning_paths", ()) or ()):
+    conclusion = str(getattr(path, "conclusion", "") or "")
+    if conclusion != "BuyCandidate":
+      continue
+    ticker = str(getattr(path, "ticker", "") or "").upper().strip()
+    if not ticker:
+      continue
+    market_group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    if market_group in open_groups:
+      selected.append(ticker)
+
+  if not selected:
+    for market in markets:
+      ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+      if not ticker:
+        continue
+      market_group = _ticker_market_group_for_live_trading(ticker, getattr(market, "market", ""))
+      if market_group in open_groups:
+        selected.append(ticker)
+
+  return tuple(dict.fromkeys(selected))
 
 def _with_live_broker_market_snapshots(stored: StoredResearch) -> tuple[StoredResearch, dict[str, Any]]:
   markets = tuple(getattr(stored, "market_snapshots", ()) or ())
@@ -2989,8 +3331,6 @@ def _candidate_live_quote_markets(markets: tuple[MarketSnapshot, ...]) -> tuple[
     candidate_tickers.extend(selection.candidate_stocks)
   except Exception as exc:  # noqa: BLE001 - quote overlay can still use priority fallback.
     audit.record("live_broker_quote_candidate_selection_failed", {"error": str(exc)})
-  for ticker in ("MSFT", "AAPL", "NVDA", "QQQ", "SOXX", "SPY", "005930", "000660"):
-    candidate_tickers.append(ticker)
   selected: list[MarketSnapshot] = []
   seen: set[str] = set()
   for ticker in candidate_tickers:
@@ -3023,7 +3363,7 @@ def _with_live_broker_quotes_for_context_intents(stored: StoredResearch, context
   return updated, summary
 
 
-def _live_broker_only_research(stored: StoredResearch) -> StoredResearch:
+def _live_broker_only_research(stored: StoredResearch, *, account: AccountSnapshot | None = None) -> StoredResearch:
   broker_markets = tuple(
       market
       for market in tuple(getattr(stored, "market_snapshots", ()) or ())
@@ -3032,8 +3372,21 @@ def _live_broker_only_research(stored: StoredResearch) -> StoredResearch:
       and market.source.quality_score >= 0.8
       and market.source.is_realtime
       and market.last_price > 0
+      and is_market_affordable_for_account(market, account)
   )
   return replace(stored, market_snapshots=broker_markets)
+
+
+def _is_market_affordable_for_account(market: MarketSnapshot, account: AccountSnapshot | None) -> bool:
+  return is_market_affordable_for_account(market, account)
+
+
+def _cash_available_for_market_web(account: AccountSnapshot, market: MarketSnapshot) -> float:
+  return cash_available_for_market(account, market)
+
+
+def _market_currency_for_web(market: MarketSnapshot) -> str:
+  return market_currency(market)
 
 
 def _with_live_broker_market_snapshots_for_targets(
@@ -3095,9 +3448,7 @@ def _prioritized_live_quote_markets(markets: tuple[MarketSnapshot, ...]) -> tupl
 
 
 def _is_overseas_market_for_web(market: MarketSnapshot) -> bool:
-  market_name = str(market.market or "").upper()
-  ticker = str(market.ticker or "").upper()
-  return not (ticker.isdigit() and len(ticker) == 6) and not market_name in {"KRX", "KOSPI", "KOSDAQ", "KONEX"}
+  return is_overseas_market(market)
 
 
 def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
@@ -3120,6 +3471,7 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
       for order in approved_orders
       if _is_live_executable_order(order)
   ]
+  executable_orders, cash_fit_skipped_orders = _cash_fit_executable_orders(executable_orders, account)
   summary: dict[str, Any] = {
       "attempted": False,
       "approved_orders": len(approved_orders),
@@ -3135,6 +3487,7 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
       "submitted": 0,
       "blocked": [],
       "errors": [],
+      "cash_fit_skipped_orders": cash_fit_skipped_orders,
   }
   runtime_snapshot = evaluate_live_runtime_gates(require_manual_arming=True)
   summary["runtime_gate"] = {"ok": runtime_snapshot.ok, "failures": tuple(runtime_snapshot.failures)}
@@ -3226,6 +3579,40 @@ def _is_live_executable_order(order: FinalOrder) -> bool:
       token in market
       for token in ("US", "NASDAQ", "NYSE", "AMEX", "SEHK", "SHAA", "SZAA", "TKSE", "HASE", "VNSE", "OVERSEAS")
   )
+
+
+def _cash_fit_executable_orders(
+    orders: list[FinalOrder],
+    account: Any,
+) -> tuple[list[FinalOrder], list[dict[str, Any]]]:
+  if not orders:
+    return orders, []
+  cash_by_currency = dict(getattr(account, "cash_by_currency", {}) or {})
+  remaining: dict[str, float] = {
+      "KRW": float(cash_by_currency.get("KRW", getattr(account, "cash", 0.0)) or 0.0),
+      "USD": float(cash_by_currency.get("USD", 0.0) or 0.0),
+  }
+  kept: list[FinalOrder] = []
+  skipped: list[dict[str, Any]] = []
+  for order in sorted(orders, key=lambda item: float(item.limit_price) * int(item.quantity)):
+    currency = "KRW" if str(order.ticker).isdigit() and len(str(order.ticker)) == 6 else "USD"
+    required = float(order.limit_price) * int(order.quantity)
+    if required <= max(0.0, remaining.get(currency, 0.0)):
+      kept.append(order)
+      remaining[currency] = max(0.0, remaining.get(currency, 0.0) - required)
+    else:
+      skipped.append(
+          {
+              "ticker": order.ticker,
+              "quantity": order.quantity,
+              "limit_price": order.limit_price,
+              "currency": currency,
+              "required_cash": required,
+              "remaining_cash": remaining.get(currency, 0.0),
+              "reason": "WOULD_EXCEED_REMAINING_CASH",
+          }
+      )
+  return kept, skipped
 
 
 def _get_or_refresh_live(force_refresh: bool = False) -> dict[str, Any]:

@@ -1,0 +1,86 @@
+{
+  "artifact_id": "live_short_horizon.20260630T003415552023Z",
+  "classification": {
+    "bias": -9.474677875857811,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      6782.2818609247715,
+      -5516.2845702913355,
+      3304.835213763195,
+      -218.54992150733767,
+      -0.09935194292301822,
+      0.790453253097906,
+      -1.40155918826143e-05,
+      2.087177598356497e-06,
+      -0.2019002748602014,
+      4.26205703180774,
+      -19472.49519041293,
+      -2559.1023732677822,
+      -0.0007397164983662329,
+      0.0
+    ]
+  },
+  "created_at": "2026-06-30T00:34:15.552023+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio"
+  ],
+  "feature_schema_hash": "1e4901681fc317af588b8441",
+  "label_definition": "label=1 when forward_net_return_bps > 20 after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.9997959679378188,
+    "avg_forward_net_return_bps_top_k": -4.800398339847449,
+    "example_count": 2800.0,
+    "negative_labels": 2685.0,
+    "positive_labels": 115.0,
+    "precision_at_k": 0.20535714285714285
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": -14.800369715345605,
+    "family": "linear_regression_sgd",
+    "weights": [
+      3735.0829119599957,
+      -2827.859395065704,
+      -4278.992278234887,
+      3608.512439565825,
+      -1.4452864639546186,
+      -2.876877080587853,
+      -2.3224599987781185e-06,
+      0.00010287367927655364,
+      0.8776753667296662,
+      5.509990710564797,
+      6303.463003423555,
+      3448.322133340289,
+      -0.00676617010462862,
+      0.0
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.48,
+    "minimum_expected_net_return_bps": 20.0,
+    "minimum_probability_success": 0.55
+  },
+  "training_data": {
+    "label_rule": "first_collected_return_1m_after_30s_after_costs_bps > 20",
+    "row_count": 2800,
+    "schema_hash": "1e4901681fc317af588b8441",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames"
+  }
+}

@@ -21,6 +21,11 @@ from app.schemas.domain import (
     RiskManagerResult,
     RiskRules,
 )
+from app.market_affordability import (
+    cash_available_for_market as account_cash_available_for_market,
+    is_overseas_market as account_is_overseas_market,
+    market_currency as account_market_currency,
+)
 
 
 class RiskManager:
@@ -79,6 +84,8 @@ class RiskManager:
         checks["ontology_trade_not_forbidden"] = "TradeForbidden" not in set(intent.ontology_tags)
         source = market.source
         source_type = source.source_type or infer_source_type(source.source_name, source.raw_url)
+        if source_type == "unknown":
+            source_type = infer_source_type(source.source_name, source.raw_url)
         source_trust = source.trust_level if source.trust_level > 0 else default_trust_level(source_type)
         quality_score = source.quality_score if source.quality_score > 0 else compute_quality_score(source)
         observed_at = source.observed_at or source.retrieved_at
@@ -151,6 +158,8 @@ class RiskManager:
         if approved and intent.action == OrderAction.BUY:
             spend = max(0.0, target_value - current_value)
             quantity = floor(spend / market.last_price)
+            metadata["estimated_order_quantity"] = quantity
+            metadata["minimum_one_share_cash_required"] = float(market.last_price)
             if quantity > 0:
                 orderbook_snapshot = intent.strategy_metadata.get("orderbook_snapshot")
                 cost = self.cost_engine.estimate(
@@ -302,6 +311,20 @@ class RiskManager:
                         {"slippage_rate": slippage_rate, "max_slippage_rate": max_slippage_rate},
                     )
                     approved = False
+            else:
+                approved = False
+                _add_rejection(
+                    reasons,
+                    rejection_log,
+                    "INSUFFICIENT_CASH_FOR_ONE_SHARE",
+                    "order_quantity_check",
+                    {
+                        "cash_available": cash_available_for_market,
+                        "last_price": market.last_price,
+                        "target_value": target_value,
+                        "currency": _market_currency(market),
+                    },
+                )
             if approved:
                 final_order = _final_order_or_reject(intent, market, OrderSide.BUY, quantity, reasons)
                 approved = final_order is not None
@@ -365,7 +388,7 @@ def _final_order_or_reject(
     reasons: list[str],
 ) -> FinalOrder | None:
     if quantity <= 0:
-        reasons.append("quantity_positive")
+        reasons.append("INSUFFICIENT_CASH_FOR_ONE_SHARE")
         return None
     return FinalOrder(
         ticker=intent.ticker,
@@ -388,30 +411,28 @@ def _instrument_type_for_market(market: MarketSnapshot) -> str:
 
 
 def _cash_available_for_market(account: AccountSnapshot, market: MarketSnapshot) -> float:
-    currency = _market_currency(market)
-    if currency == "USD":
-        return float(account.cash_by_currency.get("USD", 0.0) or 0.0)
-    return float(account.cash or 0.0)
+    return account_cash_available_for_market(account, market)
 
 
 def _equity_for_sizing(account: AccountSnapshot, market: MarketSnapshot, fallback_equity: float) -> float:
-    if _market_currency(market) == "USD":
-        usd_cash = float(account.cash_by_currency.get("USD", 0.0) or 0.0)
-        usd_holdings = sum(
+    currency = _market_currency(market)
+    if currency != "KRW":
+        foreign_cash = float(account.cash_by_currency.get(currency, 0.0) or 0.0)
+        foreign_holdings = sum(
             holding.market_value
             for holding in account.holdings
             if _is_overseas_market_name(holding.market, holding.ticker)
         )
-        return max(0.0, usd_cash + usd_holdings)
+        return max(0.0, foreign_cash + foreign_holdings)
     return fallback_equity
 
 
 def _market_currency(market: MarketSnapshot) -> str:
-    return "USD" if _is_overseas_market(market) else "KRW"
+    return account_market_currency(market)
 
 
 def _is_overseas_market(market: MarketSnapshot) -> bool:
-    return _is_overseas_market_name(market.market, market.ticker)
+    return account_is_overseas_market(market)
 
 
 def _is_overseas_market_name(market: str, ticker: str) -> bool:

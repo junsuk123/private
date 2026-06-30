@@ -315,22 +315,36 @@ class KisDevelopersApiClient:
 
     def get_portfolio(self) -> MockKisPortfolio:
         self._ensure_enabled()
-        response = self._get(
-            "/uapi/domestic-stock/v1/trading/inquire-balance",
-            tr_id=self.endpoints.balance_tr_id,
-            params=self._balance_params(),
-        )
-        self._ensure_success(response, "KIS portfolio lookup failed")
-        holdings = tuple(self._holding_from_balance(row) for row in response.get("output1") or ())
-        summary = response.get("output2") or response.get("output3") or []
-        summary_row = summary[0] if isinstance(summary, list) and summary else summary
-        cash = _to_float(
-            summary_row.get("dnca_tot_amt")
-            or summary_row.get("prvs_rcdl_excc_amt")
-            or summary_row.get("tot_evlu_amt")
-        )
-        cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
-        foreign_cash_by_currency, overseas_assets_krw = self._get_overseas_cash_balance()
+        domestic_error: KisApiError | None = None
+        holdings: tuple[Holding, ...] = ()
+        cash = 0.0
+        cash_by_currency: dict[str, float] = {"KRW": 0.0}
+        try:
+            response = self._get(
+                "/uapi/domestic-stock/v1/trading/inquire-balance",
+                tr_id=self.endpoints.balance_tr_id,
+                params=self._balance_params(),
+            )
+            self._ensure_success(response, "KIS portfolio lookup failed")
+            holdings = tuple(self._holding_from_balance(row) for row in response.get("output1") or ())
+            summary = response.get("output2") or response.get("output3") or []
+            summary_row = summary[0] if isinstance(summary, list) and summary else summary
+            cash = _to_float(
+                summary_row.get("dnca_tot_amt")
+                or summary_row.get("prvs_rcdl_excc_amt")
+                or summary_row.get("tot_evlu_amt")
+            )
+            cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
+        except KisApiError as exc:
+            domestic_error = exc
+        try:
+            foreign_cash_by_currency, overseas_assets_krw = self._get_overseas_cash_balance()
+        except KisApiError:
+            if domestic_error is not None:
+                raise domestic_error
+            raise
+        if domestic_error is not None and not foreign_cash_by_currency and overseas_assets_krw <= 0:
+            raise domestic_error
         cash_by_currency.update(foreign_cash_by_currency)
         cash_equivalent_krw = cash + overseas_assets_krw
         account = AccountSnapshot(
