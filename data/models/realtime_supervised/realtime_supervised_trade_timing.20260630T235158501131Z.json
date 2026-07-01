@@ -1,7 +1,61 @@
 {
   "artifact": {
-    "example_count": 29,
+    "example_count": 32,
     "examples": [
+      {
+        "as_of": "2026-06-30T17:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 37,
+          "execution_count": 0,
+          "impact_score": 29.6,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.326,
+          "signal_score": -0.45
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.45,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-30T19:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 51,
+          "execution_count": 0,
+          "impact_score": 40.8,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.326,
+          "signal_score": -0.45
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.45,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
+      {
+        "as_of": "2026-06-30T20:30:00+00:00",
+        "feature_snapshot": {
+          "event_count": 63,
+          "execution_count": 0,
+          "impact_score": 50.4,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.326,
+          "signal_score": -0.45
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": -0.45,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "000660"
+      },
       {
         "as_of": "2026-06-30T17:30:00+00:00",
         "feature_snapshot": {
@@ -41,9 +95,9 @@
       {
         "as_of": "2026-06-30T20:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 59,
+          "event_count": 58,
           "execution_count": 0,
-          "impact_score": 47.2,
+          "impact_score": 46.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.434,
@@ -59,9 +113,9 @@
       {
         "as_of": "2026-06-30T22:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 26,
+          "event_count": 24,
           "execution_count": 0,
-          "impact_score": 20.8,
+          "impact_score": 19.2,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.434,
@@ -77,9 +131,9 @@
       {
         "as_of": "2026-06-30T17:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 15,
+          "event_count": 21,
           "execution_count": 0,
-          "impact_score": 12.0,
+          "impact_score": 16.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -95,9 +149,9 @@
       {
         "as_of": "2026-06-30T17:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 75,
+          "event_count": 81,
           "execution_count": 0,
-          "impact_score": 60.0,
+          "impact_score": 64.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -113,9 +167,9 @@
       {
         "as_of": "2026-06-30T18:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 80,
+          "event_count": 86,
           "execution_count": 0,
-          "impact_score": 64.0,
+          "impact_score": 68.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -131,9 +185,9 @@
       {
         "as_of": "2026-06-30T18:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 82,
+          "event_count": 88,
           "execution_count": 0,
-          "impact_score": 65.6,
+          "impact_score": 70.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -149,9 +203,9 @@
       {
         "as_of": "2026-06-30T19:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 96,
+          "event_count": 102,
           "execution_count": 0,
-          "impact_score": 76.8,
+          "impact_score": 81.6,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -167,9 +221,9 @@
       {
         "as_of": "2026-06-30T19:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 107,
+          "event_count": 113,
           "execution_count": 0,
-          "impact_score": 85.6,
+          "impact_score": 90.4,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -185,9 +239,9 @@
       {
         "as_of": "2026-06-30T20:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 109,
+          "event_count": 115,
           "execution_count": 0,
-          "impact_score": 87.2,
+          "impact_score": 92.0,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -203,9 +257,9 @@
       {
         "as_of": "2026-06-30T20:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 139,
+          "event_count": 144,
           "execution_count": 0,
-          "impact_score": 111.2,
+          "impact_score": 115.2,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -221,9 +275,9 @@
       {
         "as_of": "2026-06-30T20:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 151,
+          "event_count": 155,
           "execution_count": 0,
-          "impact_score": 120.8,
+          "impact_score": 124.0,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -238,24 +292,6 @@
       },
       {
         "as_of": "2026-06-30T21:00:00+00:00",
-        "feature_snapshot": {
-          "event_count": 152,
-          "execution_count": 0,
-          "impact_score": 121.6,
-          "macro_count": 0,
-          "quote_count": 0,
-          "signal_confidence": 0.476,
-          "signal_score": 0.8
-        },
-        "label": 0,
-        "predicted_action": "HOLD",
-        "predicted_score": 0.8,
-        "realized_pnl": 0.0,
-        "realized_return": 0.0,
-        "ticker": "AAPL"
-      },
-      {
-        "as_of": "2026-06-30T21:15:00+00:00",
         "feature_snapshot": {
           "event_count": 156,
           "execution_count": 0,
@@ -273,11 +309,29 @@
         "ticker": "AAPL"
       },
       {
+        "as_of": "2026-06-30T21:15:00+00:00",
+        "feature_snapshot": {
+          "event_count": 159,
+          "execution_count": 0,
+          "impact_score": 127.2,
+          "macro_count": 0,
+          "quote_count": 0,
+          "signal_confidence": 0.476,
+          "signal_score": 0.8
+        },
+        "label": 0,
+        "predicted_action": "HOLD",
+        "predicted_score": 0.8,
+        "realized_pnl": 0.0,
+        "realized_return": 0.0,
+        "ticker": "AAPL"
+      },
+      {
         "as_of": "2026-06-30T22:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 85,
+          "event_count": 81,
           "execution_count": 0,
-          "impact_score": 68.0,
+          "impact_score": 64.8,
           "macro_count": 0,
           "quote_count": 0,
           "signal_confidence": 0.476,
@@ -293,17 +347,17 @@
       {
         "as_of": "2026-06-30T17:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 15,
+          "event_count": 21,
           "execution_count": 0,
-          "impact_score": 12.0,
+          "impact_score": 16.8,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -311,17 +365,17 @@
       {
         "as_of": "2026-06-30T17:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 76,
+          "event_count": 82,
           "execution_count": 0,
-          "impact_score": 59.2,
+          "impact_score": 64.0,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -329,17 +383,17 @@
       {
         "as_of": "2026-06-30T18:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 81,
+          "event_count": 87,
           "execution_count": 0,
-          "impact_score": 63.2,
+          "impact_score": 68.0,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -347,17 +401,17 @@
       {
         "as_of": "2026-06-30T18:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 83,
+          "event_count": 89,
           "execution_count": 0,
-          "impact_score": 64.8,
+          "impact_score": 69.6,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -365,17 +419,17 @@
       {
         "as_of": "2026-06-30T19:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 97,
+          "event_count": 103,
           "execution_count": 0,
-          "impact_score": 76.0,
+          "impact_score": 80.8,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -383,17 +437,17 @@
       {
         "as_of": "2026-06-30T19:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 108,
+          "event_count": 114,
           "execution_count": 0,
-          "impact_score": 84.8,
+          "impact_score": 89.6,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -401,17 +455,17 @@
       {
         "as_of": "2026-06-30T20:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 110,
+          "event_count": 116,
           "execution_count": 0,
-          "impact_score": 86.4,
+          "impact_score": 91.2,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -419,17 +473,17 @@
       {
         "as_of": "2026-06-30T20:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 111,
+          "event_count": 117,
           "execution_count": 0,
-          "impact_score": 85.6,
+          "impact_score": 90.4,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -437,17 +491,17 @@
       {
         "as_of": "2026-06-30T20:30:00+00:00",
         "feature_snapshot": {
-          "event_count": 141,
+          "event_count": 146,
           "execution_count": 0,
-          "impact_score": 109.6,
+          "impact_score": 113.6,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -455,17 +509,17 @@
       {
         "as_of": "2026-06-30T20:45:00+00:00",
         "feature_snapshot": {
-          "event_count": 153,
+          "event_count": 157,
           "execution_count": 0,
-          "impact_score": 119.2,
+          "impact_score": 122.4,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -473,17 +527,17 @@
       {
         "as_of": "2026-06-30T21:00:00+00:00",
         "feature_snapshot": {
-          "event_count": 154,
+          "event_count": 158,
           "execution_count": 0,
-          "impact_score": 120.0,
+          "impact_score": 123.2,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -491,17 +545,17 @@
       {
         "as_of": "2026-06-30T21:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 158,
+          "event_count": 161,
           "execution_count": 0,
-          "impact_score": 123.2,
+          "impact_score": 125.6,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -509,17 +563,17 @@
       {
         "as_of": "2026-06-30T22:15:00+00:00",
         "feature_snapshot": {
-          "event_count": 86,
+          "event_count": 82,
           "execution_count": 0,
-          "impact_score": 67.2,
+          "impact_score": 64.0,
           "macro_count": 0,
           "quote_count": 0,
-          "signal_confidence": 0.38,
-          "signal_score": 0.0
+          "signal_confidence": 0.35,
+          "signal_score": -0.25
         },
         "label": 0,
         "predicted_action": "HOLD",
-        "predicted_score": 0.0,
+        "predicted_score": -0.25,
         "realized_pnl": 0.0,
         "realized_return": 0.0,
         "ticker": "NVDA"
@@ -532,6 +586,6 @@
   },
   "model_family": "realtime_supervised",
   "model_name": "realtime_supervised:trade_timing",
-  "saved_at": "2026-06-30T23:58:12.140433+00:00",
+  "saved_at": "2026-06-30T23:51:58.501131+00:00",
   "simulated": false
 }

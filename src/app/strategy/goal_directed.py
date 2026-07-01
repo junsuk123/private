@@ -30,6 +30,15 @@ class GoalExecutionPlan:
     notes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class EvidenceVote:
+    name: str
+    action: OrderAction
+    confidence: float
+    reliability: float
+    direction: float
+
+
 def build_goal_execution_plan(
     goal: NegotiatedGoal,
     account: AccountSnapshot,
@@ -46,7 +55,7 @@ def build_goal_execution_plan(
     notes = (
         f"Target return {goal.target_return_rate * 100:.2f}% over {goal.period_days} days.",
         f"Annualized required return is {annualized * 100:.2f}%.",
-        "Signals combine ontology support/risk with RSI, volume, valuation, liquidity, and volatility rules.",
+        "Signals are selected by reliability-ranked evidence instead of a flat additive score.",
         "Orders are generated as paper-trading intents and still pass deterministic risk checks.",
     )
     return GoalExecutionPlan(
@@ -77,84 +86,88 @@ def _score_market(
             reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
         )
 
-    score = 0.0
     support: list[str] = []
     contradiction: list[str] = []
+    votes: list[EvidenceVote] = []
 
     ontology_support = graph.matching(subject=market.ticker, predicate="supportsSignal")
     ontology_risk = graph.matching(subject=market.ticker, predicate="increasesRiskOf")
     ontology_contra = graph.matching(subject=market.ticker, predicate="contradictsSignal")
     if ontology_support:
-        score += min(1.6, len(ontology_support) * 0.35)
         support.append("OntologySupport")
+        votes.append(_vote("OntologySupport", OrderAction.BUY, min(0.90, 0.55 + len(ontology_support) * 0.08), 0.78, 1.0))
     if ontology_risk:
-        score -= min(1.4, len(ontology_risk) * 0.45)
         contradiction.append("OntologyRisk")
+        votes.append(_vote("OntologyRisk", OrderAction.REDUCE, min(0.92, 0.58 + len(ontology_risk) * 0.10), 0.82, -1.0))
     if ontology_contra:
-        score -= min(1.2, len(ontology_contra) * 0.40)
         contradiction.append("OntologyContradiction")
+        votes.append(_vote("OntologyContradiction", OrderAction.REDUCE, min(0.88, 0.56 + len(ontology_contra) * 0.10), 0.80, -1.0))
 
     if indicator.rsi_14d is not None:
         if 45 <= indicator.rsi_14d <= 68:
-            score += 0.9
             support.append("RSIHealthyTrend")
+            votes.append(_vote("RSIHealthyTrend", OrderAction.BUY, 0.72, 0.62, 1.0))
         elif indicator.rsi_14d < 32:
-            score += 0.4
             support.append("RSIOversoldRebound")
+            votes.append(_vote("RSIOversoldRebound", OrderAction.BUY, 0.58, 0.48, 0.7))
         elif indicator.rsi_14d > 74:
-            score -= 1.2
             contradiction.append("RSIOverbought")
+            votes.append(_vote("RSIOverbought", OrderAction.REDUCE, 0.76, 0.66, -1.0))
 
     if indicator.volume_ratio is not None:
         if indicator.volume_ratio >= 1.15:
-            score += 0.55
             support.append("VolumeConfirmation")
+            votes.append(_vote("VolumeConfirmation", OrderAction.BUY, min(0.82, 0.54 + indicator.volume_ratio * 0.10), 0.58, 0.8))
         elif indicator.volume_ratio < 0.70:
-            score -= 0.45
             contradiction.append("WeakVolume")
+            votes.append(_vote("WeakVolume", OrderAction.HOLD, 0.60, 0.50, -0.5))
 
     if (indicator.operating_income_growth or 0) > 0.15:
-        score += 0.75
         support.append("EarningsGrowth")
+        votes.append(_vote("EarningsGrowth", OrderAction.BUY, 0.68, 0.55, 0.8))
     if (indicator.operating_margin or 0) > 0.15:
-        score += 0.55
         support.append("ProfitabilityQuality")
+        votes.append(_vote("ProfitabilityQuality", OrderAction.BUY, 0.64, 0.52, 0.7))
     if indicator.per is not None and indicator.per > 25:
-        score -= 0.65
         contradiction.append("ValuationHigh")
+        votes.append(_vote("ValuationHigh", OrderAction.HOLD, 0.62, 0.46, -0.5))
     elif indicator.per is not None and indicator.per < 18:
-        score += 0.35
         support.append("ValuationReasonable")
+        votes.append(_vote("ValuationReasonable", OrderAction.BUY, 0.55, 0.40, 0.45))
 
     if market.volatility_20d > 0.06:
-        score -= 1.2
         contradiction.append("HighVolatility")
+        votes.append(_vote("HighVolatility", OrderAction.REDUCE, min(0.88, 0.58 + market.volatility_20d * 3.0), 0.72, -1.0))
     elif market.volatility_20d < 0.035:
-        score += 0.35
         support.append("ControlledVolatility")
+        votes.append(_vote("ControlledVolatility", OrderAction.BUY, 0.56, 0.45, 0.45))
 
     if indicator.macro_risk_score > 0.55:
-        score -= 0.9
         contradiction.append("MacroRiskHigh")
+        votes.append(_vote("MacroRiskHigh", OrderAction.REDUCE, min(0.88, 0.56 + indicator.macro_risk_score * 0.25), 0.74, -0.9))
 
     flow_score, flow_support, flow_contra = _ontology_flow_adjustment(graph, market.ticker)
-    score += flow_score
     support.extend(flow_support)
     contradiction.extend(flow_contra)
+    if flow_support:
+        votes.append(_vote("OrderFlowSupport", OrderAction.BUY, min(0.88, 0.58 + max(0.0, flow_score) * 0.25), 0.76, 1.0))
+    if flow_contra:
+        votes.append(_vote("OrderFlowContradiction", OrderAction.REDUCE, min(0.90, 0.58 + abs(min(0.0, flow_score)) * 0.25), 0.80, -1.0))
 
     compounding_mode = "Principal-preserving" in goal.label
+    goal_drag = min(0.95, max(0.0, annualized_required_return - 0.20) * (0.25 if compounding_mode else 0.90))
     if compounding_mode:
-        score += 0.85
-        score -= min(0.35, max(0.0, annualized_required_return - 0.20) * 0.25)
-    else:
-        score -= min(1.3, max(0.0, annualized_required_return - 0.20) * 1.2)
+        votes.append(_vote("PrincipalPreservingMode", OrderAction.BUY, 0.66, 0.50, 0.6))
+    if goal_drag > 0:
+        contradiction.append("GoalDifficultyDrag")
+        votes.append(_vote("GoalDifficultyDrag", OrderAction.HOLD, 0.50 + goal_drag * 0.35, 0.64, -goal_drag))
     if goal.feasibility_percent < 35:
-        score -= 0.9
         contradiction.append("LowGoalFeasibility")
-    score += min(0.5, max(0, goal.feasibility_percent - 50) / 100)
+        votes.append(_vote("LowGoalFeasibility", OrderAction.REDUCE, 0.74, 0.70, -0.9))
+    elif goal.feasibility_percent > 50:
+        votes.append(_vote("GoalFeasibilitySupport", OrderAction.BUY, min(0.72, 0.50 + (goal.feasibility_percent - 50) / 100), 0.44, 0.45))
 
-    action = OrderAction.REDUCE if goal.feasibility_percent < 35 and score < 0.5 else _action_from_score(score, compounding_mode)
-    confidence = max(0.05, min(0.92, 0.48 + score * 0.10))
+    action, confidence, score = _select_signal_from_votes(votes, compounding_mode=compounding_mode)
     return StrategySignal(
         ticker=market.ticker,
         action=action,
@@ -164,6 +177,59 @@ def _score_market(
         contradicting_factors=tuple(contradiction),
         reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
     )
+
+
+def _vote(name: str, action: OrderAction, confidence: float, reliability: float, direction: float) -> EvidenceVote:
+    return EvidenceVote(
+        name=name,
+        action=action,
+        confidence=max(0.0, min(1.0, confidence)),
+        reliability=max(0.0, min(1.0, reliability)),
+        direction=max(-1.0, min(1.0, direction)),
+    )
+
+
+def _select_signal_from_votes(votes: list[EvidenceVote], *, compounding_mode: bool) -> tuple[OrderAction, float, float]:
+    if not votes:
+        return OrderAction.HOLD, 0.05, -2.0
+
+    ranked = sorted(votes, key=lambda item: (item.reliability * item.confidence, item.reliability), reverse=True)
+    lead = ranked[0]
+    lead_quality = lead.reliability * lead.confidence
+    same_quality = sum(item.reliability * item.confidence for item in ranked if item.action == lead.action)
+    opposite_quality = sum(
+        item.reliability * item.confidence
+        for item in ranked
+        if _is_opposing_action(item.action, lead.action)
+    )
+    buy_quality = sum(item.reliability * item.confidence for item in ranked if item.action == OrderAction.BUY)
+    risk_quality = sum(item.reliability * item.confidence for item in ranked if item.action == OrderAction.REDUCE)
+    total_quality = max(lead_quality, same_quality + opposite_quality)
+    agreement = same_quality / max(0.01, total_quality)
+    contradiction = opposite_quality / max(0.01, total_quality)
+
+    score = round((buy_quality - risk_quality) + lead.direction * lead_quality - contradiction * 0.5, 4)
+    if risk_quality > buy_quality and risk_quality >= 0.75:
+        action = OrderAction.SELL if risk_quality >= buy_quality + 0.65 else OrderAction.REDUCE
+    elif lead.action == OrderAction.REDUCE and lead_quality >= 0.42:
+        action = OrderAction.SELL if risk_quality >= buy_quality + 0.65 else OrderAction.REDUCE
+    elif lead.action == OrderAction.BUY:
+        buy_threshold = 0.42 if compounding_mode else 0.52
+        veto_threshold = 0.56 if compounding_mode else 0.42
+        action = OrderAction.BUY if lead_quality >= buy_threshold and contradiction <= veto_threshold else OrderAction.HOLD
+    else:
+        action = OrderAction.HOLD
+
+    confidence = max(0.05, min(0.92, 0.36 + lead_quality * 0.42 + agreement * 0.18 - contradiction * 0.16))
+    return action, confidence, score
+
+
+def _is_opposing_action(action: OrderAction, lead_action: OrderAction) -> bool:
+    if lead_action == OrderAction.BUY:
+        return action in {OrderAction.REDUCE, OrderAction.SELL}
+    if lead_action in {OrderAction.REDUCE, OrderAction.SELL}:
+        return action == OrderAction.BUY
+    return False
 
 
 def _safe_annualized_return(return_rate: float, period_days: int) -> float:
@@ -177,18 +243,6 @@ def _safe_annualized_return(return_rate: float, period_days: int) -> float:
     if annualized_log_return >= cap_log_return:
         return MAX_ANNUALIZED_REQUIRED_RETURN
     return expm1(annualized_log_return)
-
-
-def _action_from_score(score: float, compounding_mode: bool = False) -> OrderAction:
-    buy_threshold = 1.25 if compounding_mode else 2.2
-    reduce_threshold = -0.8 if compounding_mode else -0.35
-    if score >= buy_threshold:
-        return OrderAction.BUY
-    if score <= -1.1:
-        return OrderAction.SELL
-    if score <= reduce_threshold:
-        return OrderAction.REDUCE
-    return OrderAction.HOLD
 
 
 def _build_goal_intents(

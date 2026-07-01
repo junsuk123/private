@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
+from app.cost import TradingCostEngine
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.live_feature_frame import LiveFeatureFrameBuilder
 from app.models.live_signal_predictor import LiveSignalPredictor, LiveSignalPrediction
@@ -53,6 +54,18 @@ def _market_for_symbol(symbol: str) -> str:
     if s.isdigit() and len(s) == 6:
         return "KR"
     return "NASD"
+
+
+def _cost_context_for_holding(symbol: str, market: str) -> tuple[str, str]:
+    s = str(symbol or "").strip().upper()
+    market_name = str(market or "").strip().upper()
+    if s.isdigit() and len(s) == 6 or market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+        return "KRX", "domestic_stock"
+    if "NYSE" in market_name:
+        return "NYSE", "overseas_stock"
+    if "AMEX" in market_name:
+        return "AMEX", "overseas_stock"
+    return "NASD", "overseas_stock"
 
 
 @dataclass(frozen=True)
@@ -280,23 +293,53 @@ class SharedLiveDecisionEngine:
         # 우호적이면 밴드를 넓혀 더 오래 보유한다.
         take_profit_eff, stop_loss_eff = take_profit, stop_loss
         if ontology_score <= onto_reduce_score:
-            take_profit_eff = max(0.001, take_profit * 0.5)
-            stop_loss_eff = max(0.001, stop_loss * 0.5)
+            take_profit_eff = max(0.001, take_profit * 0.75)
         elif ontology_score >= 0.10:
             take_profit_eff = take_profit * 1.5
 
+        target_net_return = max(0.0, float(os.getenv("REALTIME_EXIT_TARGET_NET_RETURN", "0.0015")))
+        cost_floor = self._exit_cost_floor(holding, price, target_net_return)
+        required_exit_price = max(cost_floor.required_exit_price, avg_cost * (1.0 + take_profit_eff))
+        required_exit_return = (required_exit_price - avg_cost) / avg_cost
+        profitable_after_cost = price >= required_exit_price and cost_floor.net_expected_return >= target_net_return
+        loss_exit_allowed = os.getenv("REALTIME_ALLOW_LOSS_EXIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+        emergency_loss = max(stop_loss_eff, float(os.getenv("REALTIME_EMERGENCY_STOP_LOSS", "0.05")))
+
         prediction: LiveSignalPrediction | None = None
         reason: str | None = None
-        if ontology_score <= onto_sell_score:
-            reason = f"ontology_sell:score={ontology_score:.2f}"
-        elif pnl_rate >= take_profit_eff:
-            reason = f"fast_take_profit:{pnl_rate * 100:.2f}%(tp={take_profit_eff * 100:.2f}%,onto={ontology_score:.2f})"
+        blocked_reason: str | None = None
+        if profitable_after_cost and ontology_score <= onto_sell_score:
+            reason = (
+                f"profit_protected_ontology_sell:{pnl_rate * 100:.2f}%"
+                f"(net={cost_floor.net_expected_return * 100:.2f}%,required={required_exit_return * 100:.2f}%,onto={ontology_score:.2f})"
+            )
+        elif profitable_after_cost and pnl_rate >= required_exit_return:
+            reason = (
+                f"profit_protected_take_profit:{pnl_rate * 100:.2f}%"
+                f"(net={cost_floor.net_expected_return * 100:.2f}%,required={required_exit_return * 100:.2f}%,onto={ontology_score:.2f})"
+            )
+        elif pnl_rate <= -emergency_loss and loss_exit_allowed:
+            reason = f"emergency_stop_loss:{pnl_rate * 100:.2f}%(sl={emergency_loss * 100:.2f}%,onto={ontology_score:.2f})"
         elif pnl_rate <= -stop_loss_eff:
-            reason = f"fast_stop_loss:{pnl_rate * 100:.2f}%(sl={stop_loss_eff * 100:.2f}%,onto={ontology_score:.2f})"
+            blocked_reason = (
+                f"HOLD_LOSS_EXIT_DISABLED:pnl={pnl_rate * 100:.2f}%,"
+                f"enable_REALTIME_ALLOW_LOSS_EXIT=true_for_stop_loss"
+            )
+        elif ontology_score <= onto_sell_score:
+            blocked_reason = (
+                f"HOLD_UNPROFITABLE_ONTOLOGY_SELL_BLOCKED:pnl={pnl_rate * 100:.2f}%,"
+                f"required={required_exit_return * 100:.2f}%,net={cost_floor.net_expected_return * 100:.2f}%"
+            )
         else:
             reason, prediction = self._model_exit_signal(symbol, decision_time)
+            if reason is not None and not profitable_after_cost:
+                blocked_reason = (
+                    f"HOLD_UNPROFITABLE_MODEL_EXIT_BLOCKED:pnl={pnl_rate * 100:.2f}%,"
+                    f"required={required_exit_return * 100:.2f}%,net={cost_floor.net_expected_return * 100:.2f}%"
+                )
+                reason = None
         if reason is None:
-            return SharedDecisionResult(symbol, False, None, prediction, ("HOLD_WITHIN_BANDS",))
+            return SharedDecisionResult(symbol, False, None, prediction, (blocked_reason or "HOLD_BELOW_PROFIT_TARGET",))
 
         market = self._exit_market_snapshot(holding, price, observed_at, received_at)
         intent = OrderIntent(
@@ -307,11 +350,15 @@ class SharedLiveDecisionEngine:
             confidence=0.9,
             valid_until=decision_time + timedelta(minutes=1),
             reasoning_summary=(f"realtime_exit:{reason}",),
-            supporting_factors=("realtime_exit",),
+            supporting_factors=("realtime_exit", "ProfitProtectedExit"),
             contradicting_factors=(),
             source_data_ids=(source_id,),
             strategy_family="live_short_horizon_exit",
             signal_name=reason.split(":", 1)[0],
+            expected_exit_price=required_exit_price,
+            gross_expected_return=max(0.0, required_exit_return),
+            target_net_return=target_net_return,
+            cost_breakdown=cost_floor.as_dict(),
         )
         risk = self._exit_risk_manager().validate(intent, account, market)
         return SharedDecisionResult(
@@ -320,6 +367,22 @@ class SharedLiveDecisionEngine:
             final_order=risk.final_order,
             prediction=prediction,
             reason_codes=risk.rejection_reasons,
+        )
+
+    def _exit_cost_floor(self, holding: Holding, expected_exit_price: float, target_net_return: float):
+        symbol = str(getattr(holding, "ticker", "") or "")
+        market = str(getattr(holding, "market", "") or "")
+        quantity = max(1, int(getattr(holding, "quantity", 0) or 0))
+        venue, instrument_type = _cost_context_for_holding(symbol, market)
+        return TradingCostEngine().estimate(
+            symbol=symbol,
+            market=market or ("KR" if instrument_type == "domestic_stock" else venue),
+            venue=venue,
+            instrument_type=instrument_type,
+            entry_price=float(getattr(holding, "average_price", 0.0) or 0.0),
+            expected_exit_price=float(expected_exit_price),
+            quantity=quantity,
+            target_net_return=target_net_return,
         )
 
     def _realtime_volume_surge_ratio(self, symbol: str, decision_time: datetime) -> float:

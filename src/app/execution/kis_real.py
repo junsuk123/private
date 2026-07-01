@@ -1099,13 +1099,19 @@ class KisDevelopersApiClient:
             or row.get("prdt_code")
             or ""
         ).upper().strip()
-        quantity = int(_to_float(row.get("ovrs_cblc_qty") or row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
+        quantity = int(_to_float(row.get("ovrs_cblc_qty") or row.get("hldg_qty") or row.get("ord_psbl_qty") or row.get("cblc_qty13") or row.get("ord_psbl_qty1") or 0))
         if not ticker or quantity <= 0:
             return None
-        average_price = _first_float(row, "pchs_avg_pric", "avg_unpr", "frcr_pchs_amt1")
-        last_price = _first_float(row, "now_pric2", "ovrs_now_pric1", "last", "prpr", "evlu_pfls_rt")
+        average_price = _first_float(row, "pchs_avg_pric", "avg_unpr", "avg_unpr3", "frcr_pchs_amt1")
+        market_value = _first_float(row, "ovrs_stck_evlu_amt", "frcr_evlu_amt", "frcr_evlu_amt2", "evlu_amt")
+        last_price = _first_float(row, "now_pric2", "ovrs_now_pric1", "ovrs_stck_prpr", "last", "prpr")
+        if market_value > 0:
+            implied_price = market_value / quantity
+            if last_price <= 0 or abs((last_price * quantity) - market_value) > max(market_value, 1.0) * 0.5:
+                last_price = implied_price
         if last_price <= 0:
-            market_value = _first_float(row, "ovrs_stck_evlu_amt", "frcr_evlu_amt", "evlu_amt", "pchs_amt")
+            purchase_amount = _first_float(row, "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1")
+            market_value = market_value if market_value > 0 else purchase_amount
             last_price = market_value / quantity if market_value > 0 else average_price
         return Holding(
             ticker=ticker,

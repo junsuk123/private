@@ -603,6 +603,81 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertTrue(data["runtime_gate"]["ok"])
         self.assertIn("RiskManager", data["live_trading_message"])
 
+    def test_live_trading_start_preserves_cached_analysis_context(self) -> None:
+        client = TestClient(app)
+        cached_context = SimpleNamespace(
+            markets=(),
+            reasoning_paths=(),
+            candidate_selection=None,
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            previous_mode = web_module._live_state.get("context_mode")
+            web_module._live_state["context"] = cached_context
+            web_module._live_state["context_mode"] = "learning"
+        try:
+            with (
+                patch("app.web._start_kis_realtime_collector"),
+                patch("app.web._start_realtime_trading_engine"),
+                patch("app.web._ensure_background_refresh") as ensure_refresh,
+                patch(
+                    "app.web._kis_connection_probe",
+                    return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
+                ),
+                patch("app.web.load_short_horizon_strategy_config", return_value={"execution": {"live_trading_enabled": True}}),
+                patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
+                patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"}),
+            ):
+                data = client.post("/api/operation-mode/start", json={"mode": "live_trading"}).json()
+
+            self.assertEqual(data["live_trading_status"], "armed")
+            with web_module._live_lock:
+                self.assertIs(web_module._live_state["context"], cached_context)
+                self.assertEqual(web_module._live_state["context_mode"], "learning")
+            ensure_refresh.assert_called_once()
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+                web_module._live_state["context_mode"] = previous_mode
+
+    def test_realtime_buy_candidates_include_cached_context_candidates_first(self) -> None:
+        cached_context = SimpleNamespace(
+            markets=(
+                MarketSnapshot(
+                    "005930",
+                    "KOSPI",
+                    "Samsung",
+                    "Technology",
+                    70000.0,
+                    10_000_000,
+                    0.02,
+                    SourceMetadata("unit", datetime.now(timezone.utc)),
+                ),
+            ),
+            reasoning_paths=(SimpleNamespace(ticker="005930", conclusion="BuyCandidate"),),
+            candidate_selection=SimpleNamespace(candidate_stocks=("000660",)),
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = cached_context
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._load_realtime_collection_symbols", return_value=("111111",)),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5"}),
+            ):
+                store_cls.return_value.active_symbols.return_value = ("222222",)
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates[:2], ("005930", "000660"))
+            self.assertIn("111111", candidates)
+            self.assertIn("222222", candidates)
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
     def test_live_order_journal_snapshot_reports_submitted_and_blocked_orders(self) -> None:
         events = [
             {
@@ -935,6 +1010,34 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertTrue(web_module._is_live_market_extended_open("KRX", after_hours))
         self.assertFalse(web_module._is_live_market_core_open("KRX", after_hours))
+
+    def test_live_market_extended_session_includes_krx_opening_auction(self) -> None:
+        opening_auction = datetime(2026, 6, 30, 23, 45, tzinfo=timezone.utc)
+
+        self.assertTrue(web_module._is_live_market_extended_open("KRX", opening_auction))
+        self.assertFalse(web_module._is_live_market_core_open("KRX", opening_auction))
+
+    def test_live_affordable_krx_discovery_default_limit_is_broader_for_small_cash(self) -> None:
+        stored = StoredResearch(
+            events=(),
+            raw_records=(),
+            market_snapshots=(),
+            macro_metrics=(),
+            realtime_quotes=(),
+            realtime_executions=(),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+        account = AccountSnapshot(cash=102413.0, holdings=(), cash_by_currency={"KRW": 102413.0})
+        universe = tuple(f"{index:06d}.KS" for index in range(1, 321))
+
+        with (
+            patch("app.web._is_live_market_extended_open", return_value=True),
+            patch("app.web.load_krx_listed_universe", return_value=universe),
+        ):
+            targets = web_module._live_affordable_krx_discovery_targets(stored, account)
+
+        self.assertEqual(len(targets), 300)
 
 
 if __name__ == "__main__":

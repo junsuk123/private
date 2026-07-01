@@ -1310,7 +1310,8 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       state = OperationModeManager().start(mode)
       with _live_lock:
         _operation_mode_state["active"] = state
-        _clear_live_analysis_cache_unlocked()
+        if mode != "live_trading":
+          _clear_live_analysis_cache_unlocked()
       audit.record("operation_mode_started", {"mode_state": state})
 
       result = _to_jsonable(state)
@@ -3071,7 +3072,7 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   스토어에 데이터가 흐르는 종목을 후보로 넓혀 매수·매도가 함께 판단되게 한다.
   """
   max_age = float(os.getenv("REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", "120"))
-  limit = max(1, int(float(os.getenv("REALTIME_BUY_CANDIDATE_LIMIT", "30"))))
+  limit = max(1, int(float(os.getenv("REALTIME_BUY_CANDIDATE_LIMIT", "120"))))
   config_symbols = _load_realtime_collection_symbols()
   fresh: tuple[str, ...] = ()
   try:
@@ -3079,8 +3080,42 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
     fresh = RealtimeMarketDataStore().active_symbols(since, limit=limit)
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     fresh = ()
+  cached_context = _cached_context_buy_candidates(limit=limit)
   surge = _cached_volume_surge_symbols()
-  return tuple(dict.fromkeys((*config_symbols, *fresh, *surge)))
+  return tuple(dict.fromkeys((*cached_context, *config_symbols, *fresh, *surge)))[:limit]
+
+
+def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
+  with _live_lock:
+    context = _live_state.get("context")
+  if context is None:
+    return ()
+
+  markets = tuple(getattr(context, "markets", ()) or ())
+  market_by_ticker = _market_name_by_ticker(markets)
+  open_groups = set(_active_live_market_groups())
+  selected: list[str] = []
+
+  for path in tuple(getattr(context, "reasoning_paths", ()) or ()):
+    if str(getattr(path, "conclusion", "") or "") != "BuyCandidate":
+      continue
+    ticker = str(getattr(path, "ticker", "") or "").upper().strip()
+    if not ticker:
+      continue
+    group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    if not open_groups or group in open_groups:
+      selected.append(ticker)
+
+  selection = getattr(context, "candidate_selection", None)
+  for ticker_value in tuple(getattr(selection, "candidate_stocks", ()) or ()):
+    ticker = str(ticker_value or "").upper().strip()
+    if not ticker:
+      continue
+    group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    if not open_groups or group in open_groups:
+      selected.append(ticker)
+
+  return tuple(dict.fromkeys(selected))[: max(1, int(limit))]
 
 
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
@@ -3671,11 +3706,7 @@ def _is_live_market_extended_open(group: str, now_utc: Any | None = None) -> boo
     if local.weekday() >= 5:
       return False
     current_time = local.time()
-    return (
-        _time(8, 30) <= current_time < _time(8, 40)
-        or _time(9, 0) <= current_time <= _time(15, 30)
-        or _time(15, 40) <= current_time <= _time(18, 0)
-    )
+    return _time(8, 30) <= current_time <= _time(18, 0)
 
   return False
 
@@ -3800,9 +3831,9 @@ def _live_affordable_krx_discovery_targets(
   if krw_cash <= 0:
     return ()
   try:
-    limit = max(0, int(os.getenv("LIVE_KRX_AFFORDABLE_DISCOVERY_LIMIT", "40")))
+    limit = max(0, int(os.getenv("LIVE_KRX_AFFORDABLE_DISCOVERY_LIMIT", "300")))
   except ValueError:
-    limit = 40
+    limit = 300
   if limit <= 0:
     return ()
 
@@ -3866,9 +3897,9 @@ def _live_affordable_us_discovery_targets(
   if usd_cash <= 0:
     return ()
   try:
-    limit = max(0, int(os.getenv("LIVE_US_AFFORDABLE_DISCOVERY_LIMIT", "40")))
+    limit = max(0, int(os.getenv("LIVE_US_AFFORDABLE_DISCOVERY_LIMIT", "120")))
   except ValueError:
-    limit = 40
+    limit = 120
   if limit <= 0:
     return ()
 
@@ -4033,9 +4064,9 @@ def _with_live_broker_market_snapshots(stored: StoredResearch) -> tuple[StoredRe
   if not markets:
     return stored, {"quotes": 0, "errors": [], "message": "no stored markets available for broker quote overlay"}
   try:
-    limit = max(1, int(os.getenv("LIVE_BROKER_QUOTE_LIMIT", "80")))
+    limit = max(1, int(os.getenv("LIVE_BROKER_QUOTE_LIMIT", "240")))
   except ValueError:
-    limit = 80
+    limit = 240
   client = KisDevelopersApiClient(paper=False, enabled=True)
   quoted: list[MarketSnapshot] = []
   errors: list[dict[str, str]] = []
@@ -5278,6 +5309,16 @@ HTML = """
     .choice.selected { border-color: var(--accent); outline: 2px solid #99d5cc; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; }
     .chip { background: var(--chip); color: var(--accent-strong); border-radius: 999px; padding: 6px 9px; font-size: 12px; }
+    .asset-table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+    .asset-table th, .asset-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: right; vertical-align: top; }
+    .asset-table th { color: var(--muted); font-weight: 700; text-align: left; width: 48%; }
+    .asset-table tr:last-child th, .asset-table tr:last-child td { border-bottom: 0; }
+    .holding-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+    .holding-list { border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-height: 116px; }
+    .holding-list strong { display: block; font-size: 12px; margin-bottom: 8px; color: var(--muted); }
+    .holding-list ul { list-style: none; padding: 0; margin: 0; display: grid; gap: 7px; }
+    .holding-list li { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+    .holding-list .empty { color: var(--muted); }
     .log { white-space: pre-wrap; background: #111827; color: #e5e7eb; border-radius: 8px; padding: 14px; min-height: 160px; overflow: auto; font-size: 12px; }
     .table-wrap { width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
     table.live-table { width: 100%; border-collapse: collapse; font-size: 12px; background: white; }
@@ -5394,6 +5435,7 @@ HTML = """
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
       .span-4, .span-8 { grid-column: span 12; }
       .cards { grid-template-columns: 1fr; }
+      .holding-lists { grid-template-columns: 1fr; }
       .stats, .ticker-grid { grid-template-columns: 1fr; }
       .data-volume-wrap { grid-template-columns: 1fr; }
       .ontology-scene { min-height: 560px; }
@@ -5477,18 +5519,22 @@ HTML = """
     </aside>
     <main>
       <div class="grid">
-        <section class="panel span-4"><h2>계좌 기준 운용현금</h2><div class="metric" id="equity">-</div><div class="muted">주문과 paper trading 기준은 총자산이 아니라 KIS 주문가능 원화입니다. 총자산, 외화/해외평가, 보유주식은 참고값으로 따로 표시합니다.</div><div class="chips" style="margin-top:12px;"><span class="chip" id="totalAssets">총자산 -</span><span class="chip" id="cash">주문가능 원화 -</span><span class="chip" id="investedValue">보유주식 -</span><span class="chip" id="krwCash">KRW 현금 -</span><span class="chip" id="foreignCash">외화/해외평가 -</span><span class="chip" id="cashWeight">현금 비중 -</span></div></section>
+        <section class="panel span-4"><h2>자산평가</h2><div class="metric" id="equity">-</div><table class="asset-table"><tbody><tr><th>총 자산</th><td id="totalAssets">-</td></tr><tr><th>주문 가능 원화</th><td id="cash">-</td></tr><tr><th>국내 보유 주식</th><td id="domesticInvestedValue">-</td></tr><tr><th>주문 가능 달러</th><td id="usdCash">-</td></tr><tr><th>해외 보유 주식</th><td id="foreignInvestedValue">-</td></tr></tbody></table><span id="investedValue" hidden></span><span id="krwCash" hidden></span><span id="foreignCash" hidden></span><span id="cashWeight" hidden></span></section>
         <section class="panel span-4"><h2 id="performancePanelTitle">Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
         <section class="panel span-4">
-          <h2>증권사 실계좌</h2>
+          <h2>보유 주식 현황</h2>
           <div class="metric" id="brokerDeposit">읽기 전</div>
           <div class="chips" style="margin-top:12px;">
-            <span class="chip" id="brokerHoldings">실보유 종목 -</span>
-            <span class="chip" id="brokerAccount">계좌 -</span>
-            <span class="chip" id="brokerEquity">총자산 -</span>
-            <span class="chip" id="brokerInvested">보유주식 -</span>
-            <span class="chip" id="brokerKrwCash">원화 -</span>
-            <span class="chip" id="brokerForeignCash">외화 -</span>
+            <span class="chip" id="brokerAccount">계좌번호 -</span>
+            <span class="chip" id="brokerHoldings">보유 종목 -</span>
+            <span class="chip" id="brokerEquity" hidden></span>
+            <span class="chip" id="brokerInvested" hidden></span>
+            <span class="chip" id="brokerKrwCash" hidden></span>
+            <span class="chip" id="brokerForeignCash" hidden></span>
+          </div>
+          <div class="holding-lists">
+            <div class="holding-list"><strong>국내 보유 주식 목록</strong><ul id="brokerDomesticHoldings"><li class="empty">-</li></ul></div>
+            <div class="holding-list"><strong>해외 보유 주식 목록</strong><ul id="brokerForeignHoldings"><li class="empty">-</li></ul></div>
           </div>
           <p class="muted" id="brokerStatus" style="margin-bottom:0;">실전 준비 점검에서 읽기 전용으로 실제 예수금과 보유 종목 수만 확인합니다. 주문은 제출하지 않습니다.</p>
         </section>
@@ -5667,6 +5713,51 @@ HTML = """
       const invested = Math.max(0, equity - cashEquivalentKrw);
       const cashWeight = Number(data.cash_weight ?? (equity > 0 ? cash / equity : 0));
       return { equity, cash, cashEquivalentKrw, invested, krwCash, foreignCashKrw, cashByCurrency: balances, foreignCashByCurrency: data.foreign_cash_by_currency || {}, cashWeight };
+    }
+
+    function positionCurrency(position = {}) {
+      const explicit = String(position.currency || '').toUpperCase();
+      if (explicit) return explicit;
+      const ticker = String(position.ticker || '');
+      return /^\d{6}$/.test(ticker) ? 'KRW' : 'USD';
+    }
+
+    function splitInvestmentSummary(data = {}, summary = accountSnapshotSummary(data)) {
+      const positions = Array.isArray(data.positions) ? data.positions : [];
+      let domestic = 0;
+      let foreign = 0;
+      let foreignUsd = 0;
+      positions.forEach((position) => {
+        const rawValue = Number(position.market_value || 0);
+        const krwValue = Number(position.market_value_krw || 0);
+        if (positionCurrency(position) === 'KRW') domestic += krwValue > 0 ? krwValue : rawValue;
+        else {
+          foreign += krwValue > 0 ? krwValue : 0;
+          foreignUsd += rawValue;
+        }
+      });
+      if (!positions.length) domestic = Number(summary.invested || 0);
+      return {
+        domesticInvested: Math.max(0, domestic),
+        foreignInvested: Math.max(0, foreign),
+        foreignInvestedUsd: Math.max(0, foreignUsd),
+        usdCash: Number((summary.cashByCurrency || {}).USD ?? (data.cash_by_currency || {}).USD ?? 0),
+      };
+    }
+
+    function renderHoldingList(targetId, positions = []) {
+      const target = document.getElementById(targetId);
+      if (!target) return;
+      const rows = positions.slice(0, 8).map((position) => {
+        const ticker = String(position.ticker || '-');
+        const qty = Number(position.quantity || 0);
+        const currency = positionCurrency(position);
+        const value = currency === 'KRW'
+          ? formatMoney(Number(position.market_value_krw ?? position.market_value ?? 0), 'KRW')
+          : formatMoney(Number(position.market_value ?? 0), 'USD');
+        return `<li><span>${ticker} x ${qty}</span><span>${value}</span></li>`;
+      }).join('');
+      target.innerHTML = rows || '<li class="empty">-</li>';
     }
 
     function applyCompactKoreanDashboard() {
@@ -6752,10 +6843,17 @@ HTML = """
         };
       }
       const summary = accountSnapshotSummary(data);
+      const split = splitInvestmentSummary(data, summary);
       document.getElementById('equity').textContent = fmtWon.format(summary.cash);
       const totalAssetsTarget = document.getElementById('totalAssets');
-      if (totalAssetsTarget) totalAssetsTarget.textContent = `총자산 ${fmtWon.format(summary.equity)}`;
-      document.getElementById('cash').textContent = `주문가능 원화 ${fmtWon.format(summary.cash)}`;
+      if (totalAssetsTarget) totalAssetsTarget.textContent = fmtWon.format(summary.equity);
+      document.getElementById('cash').textContent = fmtWon.format(summary.cash);
+      const domesticInvestedTarget = document.getElementById('domesticInvestedValue');
+      if (domesticInvestedTarget) domesticInvestedTarget.textContent = fmtWon.format(split.domesticInvested);
+      const usdCashTarget = document.getElementById('usdCash');
+      if (usdCashTarget) usdCashTarget.textContent = formatMoney(split.usdCash, 'USD');
+      const foreignInvestedTarget = document.getElementById('foreignInvestedValue');
+      if (foreignInvestedTarget) foreignInvestedTarget.textContent = formatMoney(split.foreignInvestedUsd, 'USD');
       const investedValueTarget = document.getElementById('investedValue');
       if (investedValueTarget) investedValueTarget.textContent = `보유주식 ${fmtWon.format(summary.invested)}`;
       const krwCashTarget = document.getElementById('krwCash');
@@ -8704,9 +8802,13 @@ HTML = """
         const node = document.getElementById(id);
         if (node) node.textContent = text;
       };
+      const split = splitInvestmentSummary(data, summary);
       setText('equity', fmtWon.format(summary.cash));
-      setText('totalAssets', `총자산 ${fmtWon.format(summary.equity)}`);
-      setText('cash', `주문가능 원화 ${fmtWon.format(summary.cash)}`);
+      setText('totalAssets', fmtWon.format(summary.equity));
+      setText('cash', fmtWon.format(summary.cash));
+      setText('domesticInvestedValue', fmtWon.format(split.domesticInvested));
+      setText('usdCash', formatMoney(split.usdCash, 'USD'));
+      setText('foreignInvestedValue', formatMoney(split.foreignInvestedUsd, 'USD'));
       setText('investedValue', `보유주식 ${fmtWon.format(summary.invested)}`);
       setText('krwCash', `KRW 현금 ${fmtWon.format(summary.krwCash)}`);
       setText('foreignCash', `외화/해외평가 ${fmtWon.format(summary.foreignCashKrw)}`);
@@ -8743,19 +8845,29 @@ HTML = """
         const holdings = connection.holdings_count ?? connection.holdings ?? 0;
         const submitted = Number((connection.live_order_journal || {}).submitted_count ?? connection.submitted_count ?? 0);
         const updatedAt = connection.updated_at ? new Date(connection.updated_at).toLocaleTimeString('ko-KR') : new Date().toLocaleTimeString('ko-KR');
-        depositTarget.textContent = fmtWon.format(summary.cash);
+        const accountLabel = `계좌번호 ${connection.account_suffix || '-'}`;
+        const positions = Array.isArray(connection.positions) ? connection.positions : [];
+        const domesticPositions = positions.filter((position) => positionCurrency(position) === 'KRW');
+        const foreignPositions = positions.filter((position) => positionCurrency(position) !== 'KRW');
+        depositTarget.textContent = accountLabel;
+        accountTarget.textContent = accountLabel;
         if (equityTarget) equityTarget.textContent = `총자산 ${fmtWon.format(summary.equity)}`;
         if (investedTarget) investedTarget.textContent = `보유주식 ${fmtWon.format(summary.invested)}`;
         if (krwCashTarget) krwCashTarget.textContent = `원화 ${fmtWon.format(summary.krwCash)}`;
         if (foreignCashTarget) foreignCashTarget.textContent = `외화 ${formatForeignCash(connection)}`;
-        holdingsTarget.textContent = `Holdings ${holdings}`;
+        holdingsTarget.textContent = `보유 종목 ${holdings}개`;
+        renderHoldingList('brokerDomesticHoldings', domesticPositions);
+        renderHoldingList('brokerForeignHoldings', foreignPositions);
         statusTarget.textContent = `KIS 실계좌 실시간 갱신 ${updatedAt} · 제출 ${submitted}건`;
         applyLiveAccountBasis(connection);
         return;
       }
       if (connection.ok === false) {
         depositTarget.textContent = '조회 실패';
-        holdingsTarget.textContent = 'Holdings -';
+        accountTarget.textContent = '계좌번호 -';
+        holdingsTarget.textContent = '보유 종목 -';
+        renderHoldingList('brokerDomesticHoldings', []);
+        renderHoldingList('brokerForeignHoldings', []);
         if (equityTarget) equityTarget.textContent = '총자산 -';
         if (investedTarget) investedTarget.textContent = '보유주식 -';
         if (krwCashTarget) krwCashTarget.textContent = '원화 -';
@@ -8764,7 +8876,10 @@ HTML = """
         return;
       }
       depositTarget.textContent = '조회 대기';
-      holdingsTarget.textContent = 'Holdings -';
+      accountTarget.textContent = '계좌번호 -';
+      holdingsTarget.textContent = '보유 종목 -';
+      renderHoldingList('brokerDomesticHoldings', []);
+      renderHoldingList('brokerForeignHoldings', []);
       if (equityTarget) equityTarget.textContent = '총자산 -';
       if (investedTarget) investedTarget.textContent = '보유주식 -';
       if (krwCashTarget) krwCashTarget.textContent = '원화 -';

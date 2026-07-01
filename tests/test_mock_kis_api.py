@@ -415,6 +415,56 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(psamount_call["params"]["OVRS_ORD_UNPR"], "1")
         self.assertEqual(psamount_call["params"]["ITEM_CD"], "AAPL")
 
+    def test_kis_overseas_balance_uses_foreign_stock_evaluation_amount(self) -> None:
+        class OverseasBalanceTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "2401"}]}
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "2401"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [
+                            {
+                                "ovrs_pdno": "TSLA",
+                                "ovrs_item_name": "Tesla",
+                                "ovrs_cblc_qty": "2",
+                                "pchs_avg_pric": "150.00",
+                                "now_pric2": "0",
+                                "ovrs_stck_evlu_amt": "512.34",
+                                "tr_crcy_cd": "USD",
+                                "ovrs_excg_cd": "NASD",
+                            }
+                        ],
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "0.49", "bass_exrt": "1500"}],
+                        "output3": {"tot_asst_amt": "771586"},
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_amt": "0.49"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=OverseasBalanceTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.holdings[0].ticker, "TSLA")
+        self.assertAlmostEqual(portfolio.account.holdings[0].last_price, 256.17)
+        self.assertAlmostEqual(portfolio.account.holdings[0].market_value, 512.34)
+
     def test_kis_balance_does_not_treat_total_evaluation_as_cash(self) -> None:
         class BalanceOnlyTransport(RecordingKisTransport):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):

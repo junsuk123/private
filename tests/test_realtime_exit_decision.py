@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -74,9 +75,18 @@ def _account(holding: Holding, cash: float = 0.0) -> AccountSnapshot:
 
 
 class RealtimeExitDecisionTest(unittest.TestCase):
-    def test_stop_loss_triggers_sell(self) -> None:
+    def test_stop_loss_is_blocked_by_default(self) -> None:
         engine = _engine(price=98.0)  # -2% vs avg 100, below 1% stop
         result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
+        self.assertFalse(result.approved)
+        self.assertIsNone(result.final_order)
+        self.assertTrue(any("HOLD_LOSS_EXIT_DISABLED" in code for code in result.reason_codes))
+
+    def test_emergency_stop_loss_requires_explicit_opt_in(self) -> None:
+        engine = _engine(price=94.0)
+        with patch.dict("os.environ", {"REALTIME_ALLOW_LOSS_EXIT": "true", "REALTIME_EMERGENCY_STOP_LOSS": "0.05"}):
+            result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
+
         self.assertTrue(result.approved, result.reason_codes)
         self.assertIsNotNone(result.final_order)
         self.assertEqual(result.final_order.side, OrderSide.SELL)
@@ -93,15 +103,15 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
         self.assertFalse(result.approved)
         self.assertIsNone(result.final_order)
-        self.assertIn("HOLD_WITHIN_BANDS", result.reason_codes)
+        self.assertIn("HOLD_BELOW_PROFIT_TARGET", result.reason_codes)
 
     def test_no_tick_falls_back_to_broker_balance_mark(self) -> None:
         # 실시간 틱이 없어도 브로커 잔고가(last_price)로 손절을 판단해야 한다.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         holding = _holding(100.0, last_price=98.0)  # -2% via broker mark, below 1% stop
         result = engine.evaluate_exit_for_holding(holding, _account(holding), take_profit=0.006, stop_loss=0.01)
-        self.assertTrue(result.approved, result.reason_codes)
-        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertFalse(result.approved)
+        self.assertTrue(any("HOLD_LOSS_EXIT_DISABLED" in code for code in result.reason_codes))
 
     def test_no_price_anywhere_returns_missing_market_data(self) -> None:
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
@@ -110,11 +120,22 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIn("MISSING_MARKET_DATA", result.reason_codes)
 
-    def test_ontology_risk_triggers_sell_within_bands(self) -> None:
+    def test_ontology_risk_does_not_sell_below_profit_floor(self) -> None:
         # 가격은 밴드 안(평단 근처)이지만 온톨로지가 매도 신호면 매도해야 한다.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         holding = _holding(100.0, last_price=100.0)  # flat -> within TP/SL bands
         # 현금을 충분히 둬 포지션 비중을 작게 만들어 온톨로지 효과만 분리한다.
+        account = _account(holding, cash=1_000_000.0)
+        graph = _FakeGraph(risk_objects=("SellCandidate",))
+        result = engine.evaluate_exit_for_holding(
+            holding, account, take_profit=0.006, stop_loss=0.01, ontology_graph=graph
+        )
+        self.assertFalse(result.approved)
+        self.assertTrue(any("HOLD_UNPROFITABLE_ONTOLOGY_SELL_BLOCKED" in code for code in result.reason_codes))
+
+    def test_ontology_risk_sells_once_profit_floor_is_met(self) -> None:
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        holding = _holding(100.0, last_price=101.0)
         account = _account(holding, cash=1_000_000.0)
         graph = _FakeGraph(risk_objects=("SellCandidate",))
         result = engine.evaluate_exit_for_holding(
@@ -132,7 +153,7 @@ class RealtimeExitDecisionTest(unittest.TestCase):
             holding, account, take_profit=0.006, stop_loss=0.01, ontology_graph=graph
         )
         self.assertFalse(result.approved)
-        self.assertIn("HOLD_WITHIN_BANDS", result.reason_codes)
+        self.assertIn("HOLD_BELOW_PROFIT_TARGET", result.reason_codes)
 
 
 class _BuyStore:
