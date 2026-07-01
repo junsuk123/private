@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
+from app.schemas.domain import OrderAction
 from app.strategy import (
     PairAssetProfile,
     StrategyCandidateFactory,
@@ -80,6 +81,7 @@ class StrategyCandidateFactoryTest(unittest.TestCase):
 
         intent = result.candidates[0].to_order_intent(
             market="KR",
+            action=OrderAction.BUY,
             suggested_weight=0.01,
             valid_until=datetime.now(timezone.utc) + timedelta(minutes=30),
             source_data_ids=("factory-test",),
@@ -89,6 +91,31 @@ class StrategyCandidateFactoryTest(unittest.TestCase):
         self.assertIsNotNone(intent.expected_exit_price)
         self.assertIn("ranking_score", intent.strategy_metadata)
         self.assertGreater(intent.strategy_metadata["ranking_score"], 0)
+
+    def test_order_intent_requires_explicit_action(self) -> None:
+        bars = _bars("005930", [10_000 + i * 10 for i in range(25)] + [10_500])
+        features = _momentum_features("005930", bars[-1].as_of)
+        result = StrategyCandidateFactory(
+            StrategyFactoryConfig(
+                enable_short_term_reversal=False,
+                enable_pair_relative_value=False,
+                target_net_return=0.0,
+            )
+        ).build(
+            StrategyCandidateFactoryInput(
+                features_by_ticker={"005930": features},
+                price_history_by_ticker={"005930": bars},
+                entry_prices={"005930": bars[-1].close},
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            result.candidates[0].to_order_intent(
+                market="KR",
+                suggested_weight=0.01,
+                valid_until=datetime.now(timezone.utc) + timedelta(minutes=30),
+                source_data_ids=("factory-test",),
+            )
 
     def test_factory_can_build_pair_relative_value_candidate(self) -> None:
         histories = _diverged_histories()

@@ -1,4 +1,9 @@
 short_term_reversal:
+  theory_id: "jegadeesh_1990_short_term_reversal"
+  theory_family: "short_term_reversal"
+  style: "contrarian"
+  horizon_bucket: "short_intraday"
+  default_action_bias: "BUY"
   enabled: true
   paper_only: false
   requires_reality_check_passed: false
@@ -12,6 +17,11 @@ short_term_reversal:
   expected_holding_minutes: 20
 
 intraday_momentum:
+  theory_id: "gao_2018_intraday_momentum"
+  theory_family: "intraday_momentum"
+  style: "continuation"
+  horizon_bucket: "late_intraday"
+  default_action_bias: "BUY"
   enabled: true
   paper_only: false
   requires_reality_check_passed: false
@@ -29,6 +39,11 @@ intraday_momentum:
   session_close: "15:30"
 
 technical_rule:
+  theory_id: "brock_1992_technical_breakout"
+  theory_family: "technical_breakout"
+  style: "breakout"
+  horizon_bucket: "short_intraday"
+  default_action_bias: "BUY"
   enabled: true
   paper_only: false
   requires_reality_check_passed: false
@@ -46,6 +61,11 @@ technical_rule:
   expected_holding_minutes: 45
 
 pair_relative_value:
+  theory_id: "gatev_2006_pairs_mean_reversion"
+  theory_family: "statistical_arbitrage"
+  style: "mean_reversion"
+  horizon_bucket: "swing"
+  default_action_bias: "BUY"
   enabled: true
   paper_only: false
   requires_reality_check_passed: false

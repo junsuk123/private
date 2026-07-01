@@ -77,7 +77,7 @@ def filter_markets_affordable_for_account(
 def is_overseas_market(market: MarketSnapshot) -> bool:
     market_name = str(market.market or "").upper()
     ticker = str(market.ticker or "").upper()
-    if market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+    if market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX", "SIM"}:
         return False
     if any(
         token in market_name

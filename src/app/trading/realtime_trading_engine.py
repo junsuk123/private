@@ -48,6 +48,7 @@ class RealtimeTradingConfig:
     # Keep fresh-account live trading conservative: after one accepted buy, wait for
     # the next broker account snapshot before sizing another buy.
     max_buy_orders_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_BUY_ORDERS_PER_CYCLE", 1)))
+    max_buy_evaluations_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 30)))
     # 같은 종목을 매 사이클(~1s) 재제출해 중복 주문/에러가 쌓이는 것을 막는 쿨다운.
     submit_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SUBMIT_COOLDOWN_SEC", 20.0))
     # 하드 거부(브로커 에러/게이트 차단) 종목은 더 길게 쉬어 에러 폭주를 막는다(ETP 미신청·자금부족 등).
@@ -110,6 +111,7 @@ class RealtimeTradingEngine:
                 "stop_loss": self.config.stop_loss,
                 "buy_weight": self.config.buy_weight,
                 "max_orders_per_cycle": self.config.max_orders_per_cycle,
+                "max_buy_evaluations_per_cycle": self.config.max_buy_evaluations_per_cycle,
             }
             return status
 
@@ -130,6 +132,9 @@ class RealtimeTradingEngine:
             "errors": 0,
             "sell_evaluated": 0,
             "buy_evaluated": 0,
+            "sell_rejected": 0,
+            "buy_rejected": 0,
+            "rejections": [],
             "skipped_market_closed": 0,
             "skipped_cooldown": 0,
             "reason": None,
@@ -190,9 +195,15 @@ class RealtimeTradingEngine:
                         sell_submitted += 1
                 elif self._submit(result.final_order, "SELL", result.reason_codes, decision_time, summary):
                     sell_submitted += 1
+            else:
+                summary["sell_rejected"] += 1
+                self._append_rejection(summary, holding.ticker, "SELL", result.reason_codes)
 
         # 2) 매수: 미보유 후보 진입(매도와 독립 예산).
         for symbol in self.candidate_symbols_provider():
+            if summary["buy_evaluated"] >= self.config.max_buy_evaluations_per_cycle:
+                summary["reason"] = summary["reason"] or "BUY_EVALUATION_LIMIT_REACHED"
+                break
             if buy_submitted >= min(self.config.max_orders_per_cycle, self.config.max_buy_orders_per_cycle):
                 break
             if symbol in held_tickers:
@@ -219,6 +230,9 @@ class RealtimeTradingEngine:
             if result.approved and result.final_order is not None:
                 if self._submit(result.final_order, "BUY", result.reason_codes, decision_time, summary):
                     buy_submitted += 1
+            else:
+                summary["buy_rejected"] += 1
+                self._append_rejection(summary, symbol, "BUY", result.reason_codes)
 
         summary["buy_submitted"] = buy_submitted
         summary["sell_submitted"] = sell_submitted
@@ -236,6 +250,24 @@ class RealtimeTradingEngine:
             return False
         last = self._last_submit_monotonic.get(symbol)
         return last is not None and (now - last) < cooldown
+
+    def _append_rejection(
+        self,
+        summary: dict[str, Any],
+        symbol: str,
+        side: str,
+        reason_codes: tuple[str, ...],
+    ) -> None:
+        rejections = summary.setdefault("rejections", [])
+        if len(rejections) >= 12:
+            return
+        rejections.append(
+            {
+                "symbol": symbol,
+                "side": side,
+                "reason_codes": tuple(reason_codes or ()),
+            }
+        )
 
     def _submit(
         self,

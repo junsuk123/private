@@ -100,6 +100,7 @@ class TestStrategyDataStructures(unittest.TestCase):
 
         intent = candidate.to_order_intent(
             market="KR",
+            action=OrderAction.BUY,
             suggested_weight=0.02,
             valid_until=now + timedelta(minutes=45),
             source_data_ids=("quote:005930",),

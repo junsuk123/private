@@ -84,6 +84,10 @@ class ShortTermReversalEngine:
                 "expected_rebound": expected_rebound,
                 "target_net_return": self.config.target_net_return,
                 "entry_price": entry_price,
+                "theory_id": 0.0,
+                "theory_family_short_term_reversal": 1.0,
+                "style_contrarian": 1.0,
+                "horizon_short_intraday": 1.0,
             }
         )
         return StrategyCandidate(
@@ -215,6 +219,10 @@ class IntradayMomentumEngine:
                 "entry_price": entry_price,
                 "session_open_hour": float(self.config.session_open.hour),
                 "session_close_hour": float(self.config.session_close.hour),
+                "theory_id": 1.0,
+                "theory_family_intraday_momentum": 1.0,
+                "style_continuation": 1.0,
+                "horizon_late_intraday": 1.0,
             }
         )
         return StrategyCandidate(
@@ -358,6 +366,10 @@ class TechnicalRuleEngine:
                 "expected_technical_return": expected_return,
                 "target_net_return": self.config.target_net_return,
                 "entry_price": entry_price,
+                "theory_id": 2.0,
+                "theory_family_technical_breakout": 1.0,
+                "style_breakout": 1.0,
+                "horizon_short_intraday": 1.0,
             }
         )
         return StrategyCandidate(

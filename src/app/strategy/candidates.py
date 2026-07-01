@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.schemas.domain import OrderAction, OrderIntent
+from app.graph.theory_vote import FinalActionDecision
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,8 @@ class StrategyCandidate:
         self,
         *,
         market: str,
-        action: OrderAction = OrderAction.BUY,
+        action: OrderAction | None = None,
+        final_decision: FinalActionDecision | None = None,
         suggested_weight: float,
         valid_until: datetime,
         source_data_ids: tuple[str, ...],
@@ -66,10 +68,11 @@ class StrategyCandidate:
         model_uncertainty: float | None = None,
     ) -> OrderIntent:
         """Convert a candidate into an OrderIntent for RiskManager review."""
+        resolved_action = _resolve_order_action(action, final_decision)
         return OrderIntent(
             ticker=self.ticker,
             market=market,
-            action=action,
+            action=resolved_action,
             suggested_weight=suggested_weight,
             confidence=self.confidence,
             valid_until=valid_until,
@@ -86,5 +89,24 @@ class StrategyCandidate:
             target_net_return=target_net_return,
             validation_id=self.validation_id,
             ontology_tags=tuple(self.ontology_tags),
-            strategy_metadata={"features": dict(self.features), "entry_price": self.entry_price},
+            strategy_metadata={
+                "features": dict(self.features),
+                "entry_price": self.entry_price,
+                "final_action_decision": final_decision.as_dict() if final_decision is not None else None,
+            },
         )
+
+
+def _resolve_order_action(action: OrderAction | None, final_decision: FinalActionDecision | None) -> OrderAction:
+    if final_decision is not None:
+        selected = final_decision.selected_action.upper()
+        if selected in {"HOLD", "WATCH"}:
+            raise ValueError(f"{selected} is a non-order decision")
+        if selected not in {"BUY", "SELL", "REDUCE"}:
+            raise ValueError(f"Unsupported final action: {selected}")
+        return OrderAction(selected)
+    if action is None:
+        raise ValueError("OrderIntent creation requires an explicit action or FinalActionDecision")
+    if action in {OrderAction.HOLD, OrderAction.WATCH}:
+        raise ValueError(f"{action.value} is a non-order decision")
+    return action

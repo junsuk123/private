@@ -170,6 +170,11 @@ class SemanticFeatureEngine:
             semantic_relation=relation,  # type: ignore[arg-type]
             target_signal=target_signal,
             ontology_node_id=f"semantic:{node_id}",
+            metadata={
+                "evidence_cluster_id": _cluster_for_feature(name, category, target_signal),
+                "action_bias": _action_bias_for_feature(relation, target_signal),
+                "theory_id": _theory_for_feature(name, category, target_signal),
+            },
         )
 
 
@@ -185,3 +190,41 @@ def _last_price_proxy(by_name: dict[str, RawIndicatorRecord]) -> float | None:
     if sma20 is None:
         return None
     return sma20 * (1 + (r1 or 0))
+
+
+def _cluster_for_feature(name: str, category: str, target_signal: str | None) -> str:
+    if target_signal in {"SellCandidate", "ReduceRiskCandidate", "RiskAdjustedSizing"} or "risk" in category:
+        return "risk_cluster"
+    if name in {"PriceAboveMA20", "MA20AboveMA60", "MACDBullishCross", "MACDBearishCross", "MomentumIncreasing"}:
+        return "trend_cluster"
+    if name in {"BullishCandle", "BearishCandle", "CloseNearHigh", "CloseNearLow"}:
+        return "candle_cluster"
+    if "Volume" in name or "MoneyFlow" in name:
+        return "volume_cluster"
+    if "Oversold" in name or "Overbought" in name:
+        return "reversal_cluster"
+    if "Breakout" in str(target_signal):
+        return "breakout_cluster"
+    return "momentum_cluster"
+
+
+def _action_bias_for_feature(relation: str, target_signal: str | None) -> str:
+    if target_signal == "SellCandidate":
+        return "SELL"
+    if target_signal in {"ReduceRiskCandidate", "RiskAdjustedSizing"}:
+        return "REDUCE"
+    if target_signal == "BuyCandidate" and relation == "supportsSignal":
+        return "BUY"
+    if target_signal in {"WaitOrTakeProfit", "HoldWithTrailingStop"}:
+        return "HOLD"
+    return "WATCH"
+
+
+def _theory_for_feature(name: str, category: str, target_signal: str | None) -> str:
+    if target_signal in {"SellCandidate", "ReduceRiskCandidate", "RiskAdjustedSizing"} or "risk" in category:
+        return "risk_reduction_exit"
+    if "Oversold" in name or "Overbought" in name:
+        return "jegadeesh_1990_short_term_reversal"
+    if "Breakout" in str(target_signal):
+        return "brock_1992_technical_breakout"
+    return "gao_2018_intraday_momentum"

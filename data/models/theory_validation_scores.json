@@ -1,0 +1,36 @@
+{
+  "version": "v1",
+  "updated_at": null,
+  "theories": {
+    "jegadeesh_1990_short_term_reversal": {
+      "validation_weight": 0.5,
+      "status": "partially_validated",
+      "oos_trade_count": 0
+    },
+    "gao_2018_intraday_momentum": {
+      "validation_weight": 0.5,
+      "status": "partially_validated",
+      "oos_trade_count": 0
+    },
+    "brock_1992_technical_breakout": {
+      "validation_weight": 0.1,
+      "status": "unvalidated",
+      "oos_trade_count": 0
+    },
+    "microstructure_liquidity_imbalance": {
+      "validation_weight": 0.1,
+      "status": "unvalidated",
+      "oos_trade_count": 0
+    },
+    "risk_reduction_exit": {
+      "validation_weight": 1.0,
+      "status": "validated",
+      "oos_trade_count": 0
+    },
+    "profit_taking_exit": {
+      "validation_weight": 1.0,
+      "status": "validated",
+      "oos_trade_count": 0
+    }
+  }
+}

@@ -57,6 +57,13 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertFalse(live_readiness.live_orders_allowed)
         self.assertEqual(live_readiness.execution_label, "KIS live readiness check")
 
+    def test_live_trading_allows_background_training_and_live_orders(self) -> None:
+        state = OperationModeManager().start(OperationMode.LIVE_TRADING)
+
+        self.assertTrue(state.live_orders_allowed)
+        self.assertTrue(state.training_allowed)
+        self.assertFalse(state.synthetic_data_allowed)
+
     def test_short_horizon_policy_reduces_before_large_loss(self) -> None:
         policy = ShortHorizonRiskPolicy()
 
@@ -94,6 +101,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["acceleration"]["latency_profile"], "low_latency")
         self.assertIn(5, data["acceleration"]["prediction_horizons_seconds"])
         self.assertIn("short_horizon_policy", data)
+        self.assertIn("live_training", data)
 
     def test_cash_fit_keeps_sell_orders_without_cash_requirement(self) -> None:
         account = AccountSnapshot(cash=0.0, holdings=(), cash_by_currency={"KRW": 0.0, "USD": 0.0})
@@ -664,6 +672,7 @@ class RealtimeModesTest(unittest.TestCase):
             with (
                 patch("app.web._active_live_market_groups", return_value=("KRX",)),
                 patch("app.web._load_realtime_collection_symbols", return_value=("111111",)),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5"}),
@@ -674,6 +683,38 @@ class RealtimeModesTest(unittest.TestCase):
             self.assertEqual(candidates[:2], ("005930", "000660"))
             self.assertIn("111111", candidates)
             self.assertIn("222222", candidates)
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
+    def test_realtime_buy_candidates_include_affordable_discovery_when_context_empty(self) -> None:
+        account = AccountSnapshot(
+            cash=100000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 100000.0, "USD": 20.0},
+            cash_equivalent_krw=130000.0,
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = None
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX", "US")),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._held_or_recent_buy_tickers", return_value=set()),
+                patch("app.web.load_krx_listed_universe", return_value=("005930.KS", "000660.KS")),
+                patch("app.web.load_us_listed_universe", return_value=("AAPL", "MSFT")),
+                patch("app.web._load_realtime_collection_symbols", return_value=()),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
+            ):
+                store_cls.return_value.active_symbols.return_value = ()
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertIn("005930", candidates)
+            self.assertIn("000660", candidates)
+            self.assertIn("AAPL", candidates)
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context

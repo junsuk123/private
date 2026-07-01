@@ -200,6 +200,13 @@ def _feature(
         metadata={
             "strategy_family": candidate.strategy_family,
             "signal_name": candidate.signal_name,
+            "theory_id": _theory_id_for_candidate(candidate, name, target_signal),
+            "theory_family": _theory_family_for_candidate(candidate),
+            "style": _style_for_candidate(candidate),
+            "horizon_bucket": _horizon_for_candidate(candidate),
+            "expected_holding_minutes": candidate.expected_holding_minutes,
+            "evidence_cluster_id": _evidence_cluster_for_feature(name, category, target_signal),
+            "action_bias": _action_bias_for_relation(relation, target_signal),
             "expected_exit_price": candidate.expected_exit_price,
             "gross_expected_return": candidate.gross_expected_return,
         },
@@ -214,3 +221,77 @@ def _deduplicate(features: list[SemanticFeatureRecord]) -> list[SemanticFeatureR
         if current is None or feature.confidence > current.confidence:
             by_key[key] = feature
     return list(by_key.values())
+
+
+def _theory_id_for_candidate(candidate: StrategyCandidate, feature_name: str, target_signal: str | None) -> str:
+    if candidate.signal_name in {
+        "jegadeesh_1990_short_term_reversal",
+        "brock_1992_technical_breakout",
+    }:
+        return candidate.signal_name
+    if candidate.signal_name == "gao_2018_opening_return_momentum":
+        return "gao_2018_intraday_momentum"
+    if target_signal in {"SellCandidate", "WaitOrTakeProfit"}:
+        return "profit_taking_exit"
+    if target_signal in {"RiskAdjustedSizing", "TradeForbidden", "ReduceRiskCandidate"} or "Risk" in feature_name:
+        return "risk_reduction_exit"
+    if candidate.strategy_family == "intraday_momentum":
+        return "gao_2018_intraday_momentum"
+    if candidate.strategy_family == "technical_rule":
+        return "brock_1992_technical_breakout"
+    if candidate.strategy_family == "short_term_reversal":
+        return "jegadeesh_1990_short_term_reversal"
+    return candidate.signal_name
+
+
+def _theory_family_for_candidate(candidate: StrategyCandidate) -> str:
+    if candidate.strategy_family == "technical_rule":
+        return "technical_breakout"
+    return candidate.strategy_family
+
+
+def _style_for_candidate(candidate: StrategyCandidate) -> str:
+    if candidate.strategy_family == "short_term_reversal":
+        return "contrarian"
+    if candidate.strategy_family == "intraday_momentum":
+        return "continuation"
+    if candidate.strategy_family == "technical_rule":
+        return "breakout"
+    if candidate.strategy_family == "pair_relative_value":
+        return "mean_reversion"
+    return "unknown"
+
+
+def _horizon_for_candidate(candidate: StrategyCandidate) -> str:
+    minutes = candidate.expected_holding_minutes
+    if minutes <= 10:
+        return "scalp"
+    if minutes <= 90:
+        return "short_intraday"
+    if minutes <= 390:
+        return "late_intraday"
+    return "swing"
+
+
+def _evidence_cluster_for_feature(feature_name: str, category: str, target_signal: str | None) -> str:
+    if target_signal in {"TradeForbidden", "RiskAdjustedSizing", "ReduceRiskCandidate"} or "risk" in category:
+        return "risk_cluster"
+    if "Reversal" in feature_name or "Overreaction" in feature_name:
+        return "reversal_cluster"
+    if "Momentum" in feature_name or "OpeningReturn" in feature_name:
+        return "momentum_cluster"
+    if "Breakout" in feature_name:
+        return "breakout_cluster"
+    if "Volume" in feature_name:
+        return "volume_cluster"
+    return "trend_cluster"
+
+
+def _action_bias_for_relation(relation: str, target_signal: str | None) -> str:
+    if target_signal in {"TradeForbidden", "RiskAdjustedSizing", "ReduceRiskCandidate"}:
+        return "REDUCE"
+    if target_signal in {"SellCandidate", "WaitOrTakeProfit"}:
+        return "SELL"
+    if relation == "supportsSignal" and target_signal in {"BuyCandidate", "TradeAllowed"}:
+        return "BUY"
+    return "WATCH"

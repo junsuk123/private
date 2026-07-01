@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 
 from app.graph.knowledge_graph import KnowledgeGraph, Triple
 from app.graph.runtime import OntologyRuntime, get_ontology_runtime
+from app.graph.action_aggregator import ActionAggregator
+from app.graph.theory_registry import TheoryRegistry, get_theory_registry
+from app.graph.theory_vote import FinalActionDecision, PositionContext, TheoryVote
+from app.evaluation.theory_validation import TheoryValidationStore, get_theory_validation_store
 from app.schemas.domain import ReasoningPath
 
 SUPPORT_WEIGHTS = {
@@ -21,6 +25,8 @@ SUPPORT_WEIGHTS = {
     "CashFitOneShare": 0.07,
     "AffordableByAccountCash": 0.08,
     "SectorMomentum": 0.08,
+    "BuyCandidate": 0.08,
+    "AccountCashFeasibleBuyCandidate": 0.06,
 }
 CONTRADICTION_WEIGHTS = {
     "ValuationDiscipline": 0.12,
@@ -31,6 +37,8 @@ CONTRADICTION_WEIGHTS = {
     "OrderFlowPriceDivergence": 0.10,
     "SuspectedSmartMoneyDistribution": 0.12,
     "CashBelowOneSharePrice": 0.18,
+    "BuyCandidate": 0.20,
+    "AggressiveBuy": 0.10,
 }
 RISK_WEIGHTS = {
     "MacroRateRisk": 0.14,
@@ -40,6 +48,9 @@ RISK_WEIGHTS = {
     "OrderFlowDistributionRisk": 0.16,
     "ThinLiquidityPriceImpactRisk": 0.14,
     "InsufficientAccountCashRisk": 0.20,
+    "SellCandidate": 0.22,
+    "ReduceRiskCandidate": 0.18,
+    "TradeForbidden": 0.30,
 }
 
 
@@ -63,10 +74,15 @@ class OntologyReasoner:
         graph: KnowledgeGraph,
         runtime: OntologyRuntime | None = None,
         policy: OntologyReasoningPolicy | None = None,
+        registry: TheoryRegistry | None = None,
+        validation_store: TheoryValidationStore | None = None,
     ) -> None:
         self.graph = graph
         self.runtime = runtime or get_ontology_runtime()
         self.policy = policy or OntologyReasoningPolicy()
+        self.registry = registry or get_theory_registry()
+        self.validation_store = validation_store or get_theory_validation_store()
+        self.action_aggregator = ActionAggregator(self.registry)
 
     def infer(self) -> KnowledgeGraph:
         self._infer_buy_candidates()
@@ -75,6 +91,7 @@ class OntologyReasoner:
 
     def build_reasoning_paths(self, tickers: tuple[str, ...]) -> tuple[ReasoningPath, ...]:
         paths = []
+        decisions = {decision.ticker: decision for decision in self.build_action_decisions(tickers)}
         for ticker in tickers:
             support = self.graph.matching(subject=ticker, predicate="supportsSignal")
             contradiction = self.graph.matching(subject=ticker, predicate="contradictsSignal")
@@ -97,7 +114,8 @@ class OntologyReasoner:
                 self.policy.min_confidence,
                 min(self.policy.max_confidence, self.policy.base_confidence + support_score - contradiction_score - risk_score),
             )
-            conclusion = "BuyCandidate" if confidence >= self.policy.buy_threshold else "HoldOrWatch"
+            decision = decisions.get(ticker)
+            conclusion = _legacy_conclusion(decision, confidence, self.policy.buy_threshold)
             path_id = hashlib.sha256(
                 f"{ticker}:{support}:{contradiction}:{risk}:{conclusion}".encode("utf-8")
             ).hexdigest()[:16]
@@ -110,10 +128,73 @@ class OntologyReasoner:
                     supporting_triples=_format_triples(support),
                     contradicting_triples=_format_triples(contradiction),
                     risk_triples=_format_triples(risk),
-                    explanation=_explain(ticker, conclusion, confidence, support, contradiction, risk, sizing),
+                    explanation=_explain(ticker, conclusion, confidence, support, contradiction, risk, sizing, decision),
                 )
             )
         return tuple(paths)
+
+    def build_action_decisions(
+        self,
+        tickers: tuple[str, ...],
+        *,
+        positions: dict[str, PositionContext] | None = None,
+    ) -> tuple[FinalActionDecision, ...]:
+        positions = positions or {}
+        decisions: list[FinalActionDecision] = []
+        for ticker in tickers:
+            votes = self._theory_votes_for_ticker(ticker)
+            decisions.append(
+                self.action_aggregator.decide(
+                    ticker,
+                    votes,
+                    position_context=positions.get(ticker, PositionContext()),
+                    npu_profile=self.runtime.as_dict(),
+                )
+            )
+        return tuple(decisions)
+
+    def _theory_votes_for_ticker(self, ticker: str) -> tuple[TheoryVote, ...]:
+        votes: list[TheoryVote] = []
+        for triple in self.graph.matching(subject=ticker, predicate="supportsSignal"):
+            vote = self._vote_from_triple(ticker, triple, "support")
+            if vote is not None:
+                votes.append(vote)
+        for triple in self.graph.matching(subject=ticker, predicate="contradictsSignal"):
+            vote = self._vote_from_triple(ticker, triple, "contradiction")
+            if vote is not None:
+                votes.append(vote)
+        for triple in self.graph.matching(subject=ticker, predicate="increasesRiskOf"):
+            vote = self._vote_from_triple(ticker, triple, "risk")
+            if vote is not None:
+                votes.append(vote)
+        return tuple(votes)
+
+    def _vote_from_triple(self, ticker: str, triple: Triple, kind: str) -> TheoryVote | None:
+        theory_id = _theory_id_for_object(triple.object, kind)
+        metadata = self.registry.get(theory_id)
+        if metadata is None:
+            return None
+        raw_signal = _weight_for_triple(triple, kind, self.policy)
+        action = _action_for_triple(triple.object, kind, metadata.default_action_bias)
+        return TheoryVote(
+            ticker=ticker,
+            theory_id=theory_id,
+            theory_family=metadata.family,
+            style=metadata.style,
+            action=action,
+            horizon_bucket=metadata.horizon_bucket,
+            expected_holding_minutes=metadata.expected_holding_minutes,
+            raw_signal=raw_signal,
+            confidence=min(0.95, max(0.05, 0.50 + raw_signal)),
+            expected_net_return=None,
+            evidence_cluster_id=metadata.evidence_cluster,
+            regime_gate=1.0,
+            data_quality_weight=1.0,
+            validation_weight=self.validation_store.weight_for(theory_id),
+            horizon_compatibility=1.0,
+            evidence_ids=(triple.evidence_id or "",),
+            explanation=f"{triple.predicate} {triple.object} mapped to {theory_id}/{action}.",
+        )
 
     def _infer_buy_candidates(self) -> None:
         subjects = {triple.subject for triple in self.graph.triples()}
@@ -154,8 +235,85 @@ def _explain(
     contradiction: tuple[Triple, ...],
     risk: tuple[Triple, ...],
     sizing: tuple[Triple, ...] = (),
+    decision: FinalActionDecision | None = None,
 ) -> str:
-    return (
+    base = (
         f"{ticker} conclusion={conclusion}, confidence={confidence:.2f}. "
         f"Support={len(support)}, contradiction={len(contradiction)}, risk={len(risk)}, sizing_adjustments={len(sizing)}."
     )
+    if decision is None:
+        return base
+    return f"{base} {decision.final_explanation}"
+
+
+def _legacy_conclusion(decision: FinalActionDecision | None, confidence: float, buy_threshold: float) -> str:
+    if decision is None:
+        return "BuyCandidate" if confidence >= buy_threshold else "HoldOrWatch"
+    if decision.selected_action == "BUY" and confidence >= buy_threshold:
+        return "BuyCandidate"
+    if decision.selected_action in {"HOLD", "WATCH"} and confidence >= buy_threshold:
+        return "BuyCandidate"
+    if decision.selected_action == "SELL":
+        return "SellCandidate"
+    if decision.selected_action == "REDUCE":
+        return "ReduceRiskCandidate"
+    if decision.selected_action == "WATCH":
+        return "HoldOrWatch"
+    return "HoldOrWatch"
+
+
+def _theory_id_for_object(object_name: str, kind: str) -> str:
+    direct = {
+        "ShortTermReversalBuy": "jegadeesh_1990_short_term_reversal",
+        "ShortTermReversalCandidate": "jegadeesh_1990_short_term_reversal",
+        "LiquiditySupportedReversal": "jegadeesh_1990_short_term_reversal",
+        "RSIOversold": "jegadeesh_1990_short_term_reversal",
+        "RangeOversold": "jegadeesh_1990_short_term_reversal",
+        "IntradayMomentumBuy": "gao_2018_intraday_momentum",
+        "IntradayMomentum": "gao_2018_intraday_momentum",
+        "OpeningReturnStrength": "gao_2018_intraday_momentum",
+        "VolumeConfirmedMomentum": "gao_2018_intraday_momentum",
+        "MarketDirectionAligned": "gao_2018_intraday_momentum",
+        "TechnicalBreakoutBuy": "brock_1992_technical_breakout",
+        "BreakoutWatch": "brock_1992_technical_breakout",
+        "VolumeConfirmedBreakout": "brock_1992_technical_breakout",
+        "MovingAverageBreakout": "brock_1992_technical_breakout",
+        "TradingRangeBreakout": "brock_1992_technical_breakout",
+        "InformedOrderFlowImbalance": "microstructure_liquidity_imbalance",
+        "OrderFlowPriceConfirmation": "microstructure_liquidity_imbalance",
+        "OrderFlowConfirmedBuyCandidate": "microstructure_liquidity_imbalance",
+        "InformedOrderFlowDistribution": "microstructure_liquidity_imbalance",
+        "OrderFlowDistributionRisk": "microstructure_liquidity_imbalance",
+        "SellCandidate": "profit_taking_exit",
+        "WaitOrTakeProfit": "profit_taking_exit",
+        "ReduceRiskCandidate": "risk_reduction_exit",
+        "RiskAdjustedSizing": "risk_reduction_exit",
+        "TradeForbidden": "risk_reduction_exit",
+    }
+    if object_name in direct:
+        return direct[object_name]
+    if kind == "risk":
+        return "risk_reduction_exit"
+    if kind == "contradiction":
+        return "profit_taking_exit"
+    return "gao_2018_intraday_momentum"
+
+
+def _action_for_triple(object_name: str, kind: str, default_action_bias: str) -> str:
+    if object_name in {"SellCandidate", "WaitOrTakeProfit", "InformedOrderFlowDistribution"}:
+        return "SELL"
+    if kind == "risk" or object_name in {"RiskAdjustedSizing", "ReduceRiskCandidate", "TradeForbidden"}:
+        return "REDUCE"
+    if kind == "contradiction":
+        return "SELL"
+    if default_action_bias == "BUY_OR_SELL":
+        return "BUY"
+    return default_action_bias if default_action_bias in {"BUY", "SELL", "HOLD", "REDUCE", "WATCH"} else "WATCH"
+
+
+def _weight_for_triple(triple: Triple, kind: str, policy: OntologyReasoningPolicy) -> float:
+    if kind == "support":
+        return policy.support_weights.get(triple.object, policy.default_support_weight)
+    if kind == "contradiction":
+        return policy.contradiction_weights.get(triple.object, policy.default_contradiction_weight)
+    return policy.risk_weights.get(triple.object, policy.default_risk_weight)

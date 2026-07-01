@@ -7,6 +7,7 @@ from typing import Mapping, Sequence
 from app.cost import CostBreakdown, TradingCostEngine
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
+from app.graph.theory_vote import FinalActionDecision
 from app.schemas.domain import OrderAction, OrderIntent
 from app.strategy.candidates import StrategyCandidate
 from app.strategy.pairs_relative_value import (
@@ -69,13 +70,15 @@ class RankedStrategyCandidate:
         suggested_weight: float,
         valid_until: datetime,
         source_data_ids: tuple[str, ...],
-        action: OrderAction = OrderAction.BUY,
+        action: OrderAction | None = None,
+        final_decision: FinalActionDecision | None = None,
         model_uncertainty: float | None = None,
     ) -> OrderIntent:
+        resolved_action = _resolve_order_action(action, final_decision)
         return OrderIntent(
             ticker=self.candidate.ticker,
             market=market,
-            action=action,
+            action=resolved_action,
             suggested_weight=suggested_weight,
             confidence=self.candidate.confidence,
             valid_until=valid_until,
@@ -100,6 +103,7 @@ class RankedStrategyCandidate:
                 "ontology_score": self.ontology_score,
                 "liquidity_score": self.liquidity_score,
                 "risk_adjustment": self.risk_adjustment,
+                "final_action_decision": final_decision.as_dict() if final_decision is not None else None,
             },
         )
 
@@ -317,3 +321,18 @@ def _risk_adjustment(candidate: StrategyCandidate, cost: CostBreakdown, spread_r
 
 def _safety_margin(cost_engine: TradingCostEngine) -> float:
     return float(cost_engine.config.get("safety_margin", {}).get("default_safety_margin_rate", 0.001))
+
+
+def _resolve_order_action(action: OrderAction | None, final_decision: FinalActionDecision | None) -> OrderAction:
+    if final_decision is not None:
+        selected = final_decision.selected_action.upper()
+        if selected in {"HOLD", "WATCH"}:
+            raise ValueError(f"{selected} is a non-order decision")
+        if selected not in {"BUY", "SELL", "REDUCE"}:
+            raise ValueError(f"Unsupported final action: {selected}")
+        return OrderAction(selected)
+    if action is None:
+        raise ValueError("OrderIntent creation requires an explicit action or FinalActionDecision")
+    if action in {OrderAction.HOLD, OrderAction.WATCH}:
+        raise ValueError(f"{action.value} is a non-order decision")
+    return action

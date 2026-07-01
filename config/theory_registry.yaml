@@ -1,0 +1,195 @@
+ontology_voting:
+  mode: theory_aware_multi_action
+  decision_margin: 0.10
+  enable_conflict_resolver: true
+  enable_evidence_clustering: true
+  enable_position_aware_action: true
+  default_unvalidated_theory_weight: 0.1
+  default_partially_validated_theory_weight: 0.5
+  default_validated_theory_weight: 1.0
+  max_same_cluster_contribution: 1.0
+  high_conflict_hold_threshold: 0.4
+
+npu:
+  enabled: true
+  device_preference: NPU
+  fallback_device: CPU
+  batch_buckets: [128, 256, 512, 1024, 2048, 4096]
+  compile_cache_enabled: true
+  profile_enabled: true
+  numerical_tolerance: 0.0001
+  min_batch_for_npu: 128
+  use_async_inference: true
+  modules:
+    ontology_candidate_scorer:
+      enabled: true
+    theory_vote_scorer:
+      enabled: true
+    evidence_cluster_compressor:
+      enabled: true
+    conflict_scorer:
+      enabled: true
+    short_horizon_predictor:
+      enabled: true
+    execution_edge_scorer:
+      enabled: true
+    final_decision:
+      enabled: false
+    broker_execution:
+      enabled: false
+    graph_trace_generation:
+      enabled: false
+
+theories:
+  jegadeesh_1990_short_term_reversal:
+    family: short_term_reversal
+    style: contrarian
+    default_action_bias: BUY
+    horizon_bucket: short_intraday
+    expected_holding_minutes: 30
+    required_evidence:
+      - recent_negative_return_shock
+      - oversold_condition
+      - liquidity_recovery
+    invalid_when:
+      - strong_downtrend_breakdown
+      - order_flow_still_negative
+      - high_toxicity_flow
+      - spread_too_wide
+    compatible_with:
+      - liquidity_supported_reversal
+      - oversold_rebound
+    conflicts_with:
+      - gao_2018_intraday_momentum
+      - brock_1992_technical_breakout
+    evidence_cluster: reversal_cluster
+    validation:
+      status: partially_validated
+      default_weight: 0.5
+      min_oos_trades_for_full_weight: 100
+
+  gao_2018_intraday_momentum:
+    family: intraday_momentum
+    style: continuation
+    default_action_bias: BUY
+    horizon_bucket: late_intraday
+    expected_holding_minutes: 180
+    required_evidence:
+      - opening_return_strength
+      - volume_confirmed_momentum
+      - market_direction_aligned
+    invalid_when:
+      - opening_move_reversed
+      - market_downtrend_strong
+      - liquidity_score_low
+      - spread_too_wide
+    compatible_with:
+      - market_direction_aligned
+      - volume_confirmed_momentum
+      - trend_continuation
+    conflicts_with:
+      - jegadeesh_1990_short_term_reversal
+      - overbought_reversal
+      - false_breakout_risk
+    evidence_cluster: momentum_cluster
+    validation:
+      status: partially_validated
+      default_weight: 0.5
+      min_oos_trades_for_full_weight: 100
+
+  brock_1992_technical_breakout:
+    family: technical_breakout
+    style: breakout
+    default_action_bias: BUY
+    horizon_bucket: short_intraday
+    expected_holding_minutes: 60
+    required_evidence:
+      - breakout_confirmed
+      - volume_confirmed_breakout
+    invalid_when:
+      - false_breakout_risk
+      - spread_too_wide
+      - overbought_reversal
+      - low_volume_breakout
+    compatible_with:
+      - trend_continuation
+      - volume_confirmed_momentum
+    conflicts_with:
+      - jegadeesh_1990_short_term_reversal
+      - mean_reversion_sell
+      - liquidity_trap
+      - high_false_breakout_probability
+    evidence_cluster: breakout_cluster
+    validation:
+      status: unvalidated
+      default_weight: 0.1
+      min_oos_trades_for_full_weight: 100
+
+  microstructure_liquidity_imbalance:
+    family: liquidity_microstructure
+    style: order_flow
+    default_action_bias: BUY_OR_SELL
+    horizon_bucket: scalp
+    expected_holding_minutes: 5
+    required_evidence:
+      - order_flow_imbalance
+      - queue_imbalance
+      - spread_acceptable
+      - depth_sufficient
+    invalid_when:
+      - high_toxicity_flow
+      - adverse_selection_risk_high
+      - stale_orderbook
+      - spread_too_wide
+    compatible_with:
+      - liquidity_supported_reversal
+      - short_term_execution_edge
+    conflicts_with:
+      - low_depth_regime
+      - toxic_order_flow
+    evidence_cluster: microstructure_cluster
+    validation:
+      status: unvalidated
+      default_weight: 0.1
+      min_oos_trades_for_full_weight: 200
+
+  risk_reduction_exit:
+    family: risk_management
+    style: risk_reduction
+    default_action_bias: REDUCE
+    horizon_bucket: position_dependent
+    expected_holding_minutes: 0
+    required_evidence:
+      - position_exists
+      - drawdown_or_stop_condition
+    invalid_when: []
+    compatible_with:
+      - sell_signal
+      - take_profit_signal
+      - stop_loss_signal
+    conflicts_with: []
+    evidence_cluster: risk_cluster
+    validation:
+      status: validated
+      default_weight: 1.0
+      min_oos_trades_for_full_weight: 0
+
+  profit_taking_exit:
+    family: risk_management
+    style: profit_taking
+    default_action_bias: SELL
+    horizon_bucket: position_dependent
+    expected_holding_minutes: 0
+    required_evidence:
+      - position_exists
+      - take_profit_signal
+    invalid_when: []
+    compatible_with:
+      - sell_signal
+      - cost_feasible_exit
+    conflicts_with: []
+    evidence_cluster: risk_cluster
+    validation:
+      status: validated
+      default_weight: 1.0
+      min_oos_trades_for_full_weight: 0

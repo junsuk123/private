@@ -11,6 +11,7 @@ class OrderAction(StrEnum):
     SELL = "SELL"
     HOLD = "HOLD"
     REDUCE = "REDUCE"
+    WATCH = "WATCH"
     REBALANCE = "REBALANCE"
 
 

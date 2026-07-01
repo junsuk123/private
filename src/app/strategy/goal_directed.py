@@ -213,10 +213,12 @@ def _select_signal_from_votes(votes: list[EvidenceVote], *, compounding_mode: bo
         action = OrderAction.SELL if risk_quality >= buy_quality + 0.65 else OrderAction.REDUCE
     elif lead.action == OrderAction.REDUCE and lead_quality >= 0.42:
         action = OrderAction.SELL if risk_quality >= buy_quality + 0.65 else OrderAction.REDUCE
-    elif lead.action == OrderAction.BUY:
+    elif buy_quality > risk_quality and score > 0.20:
+        action = OrderAction.BUY
+    elif lead.action == OrderAction.BUY or buy_quality >= (0.50 if compounding_mode else 0.45):
         buy_threshold = 0.42 if compounding_mode else 0.52
         veto_threshold = 0.56 if compounding_mode else 0.42
-        action = OrderAction.BUY if lead_quality >= buy_threshold and contradiction <= veto_threshold else OrderAction.HOLD
+        action = OrderAction.BUY if max(lead_quality, buy_quality) >= buy_threshold and contradiction <= veto_threshold else OrderAction.HOLD
     else:
         action = OrderAction.HOLD
 

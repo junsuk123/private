@@ -49,6 +49,7 @@ from app.realtime.learning import (
     update_realtime_model_artifacts,
 )
 from app.graph.npu_classifier import get_ontology_npu_classifier
+from app.npu.runtime_manager import get_npu_runtime_manager
 from app.risk import PrincipalProtectionEngine, RiskManager
 from app.schemas.domain import (
     AccountSnapshot,
@@ -1123,11 +1124,14 @@ def ontology_runtime() -> JSONResponse:
 def realtime_runtime() -> JSONResponse:
     acceleration = RealtimeAccelerationPolicy().status()
     risk_policy = ShortHorizonRiskPolicy()
+    ontology_status = get_ontology_npu_classifier().status()
+    training_status = _safe_live_training_status()
     return _json(
         {
             "acceleration": acceleration,
             "event_llm": event_llm_runtime_status(),
-            "ontology_npu": get_ontology_npu_classifier().status(),
+            "ontology_npu": ontology_status,
+            "live_training": training_status,
             "short_horizon_policy": risk_policy,
             "operation_mode": _operation_mode_state.get("active"),
             "resource_allocation": {
@@ -1140,6 +1144,65 @@ def realtime_runtime() -> JSONResponse:
             },
         }
     )
+
+
+@app.get("/api/live-training/status")
+def live_training_status_api() -> JSONResponse:
+    return _json(_safe_live_training_status())
+
+
+@app.get("/api/npu/runtime")
+def npu_runtime() -> JSONResponse:
+    manager = get_npu_runtime_manager()
+    modules = manager.status().get("modules", {})
+    ontology_status = get_ontology_npu_classifier().status()
+    payload_modules = {
+        "ontology_candidate_scorer": _to_jsonable(ontology_status),
+        "theory_vote_scorer": modules.get("theory_vote_scorer") or manager.status("theory_vote_scorer"),
+        "evidence_cluster_compressor": modules.get("evidence_cluster_compressor") or manager.status("evidence_cluster_compressor"),
+        "conflict_scorer": modules.get("conflict_scorer") or manager.status("conflict_scorer"),
+        "short_horizon_predictor": modules.get("short_horizon_predictor") or manager.status("short_horizon_predictor"),
+        "execution_edge_scorer": modules.get("execution_edge_scorer") or manager.status("execution_edge_scorer"),
+    }
+    return _json(
+        {
+            "available_devices": manager.available_devices,
+            "selected_device": manager.device_preference if "NPU" in manager.available_devices else "CPU",
+            "modules": payload_modules,
+            "cpu_kept_deterministic": (
+                "ontology_graph_traversal",
+                "explanation_trace",
+                "final_action_selection",
+                "risk_manager",
+                "broker_execution",
+            ),
+        }
+    )
+
+
+def _safe_live_training_status() -> dict[str, Any]:
+    try:
+        status = live_training_status()
+    except Exception as exc:  # noqa: BLE001 - runtime status must remain available.
+        return {
+            "ok": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "pipeline": "collect_features_train_save_predict",
+        }
+    latest = status.get("latest_ineligible_artifact")
+    latest_id = latest.get("artifact_id") if isinstance(latest, dict) else None
+    latest_live_eligible = bool(status.get("latest_live_eligible_exists"))
+    return {
+        **status,
+        "ok": True,
+        "pipeline": "collect_features_train_save_predict",
+        "auto_training_enabled": True,
+        "model_saved": bool(latest_id or latest_live_eligible),
+        "latest_model_artifact_id": latest_id,
+        "inference_uses_latest_live_eligible": latest_live_eligible,
+    }
+
+
 
 
 LIVE_FLAG_VALUES = {
@@ -1291,7 +1354,14 @@ def _live_model_readiness_failure_message(exc: Exception) -> str:
 
 @app.post("/api/operation-mode/start")
 async def operation_mode_start(request: Request) -> JSONResponse:
-    payload = await request.json()
+    try:
+      payload = await request.json()
+    except json.JSONDecodeError as exc:
+      raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+    if payload is None:
+      payload = {}
+    if not isinstance(payload, dict):
+      raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
     return _json(await run_in_threadpool(_operation_mode_start_response, payload))
 
 
@@ -2521,6 +2591,9 @@ def live_trading_progress() -> JSONResponse:
     positions = list(connection.get("positions") or [])
     snapshot = _live_snapshot()
     execution_summary = snapshot.get("live_execution_summary") or {}
+    realtime_summary = _realtime_engine_execution_summary()
+    if realtime_summary is not None:
+      execution_summary = realtime_summary
     runtime_gate = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
     journal = _live_order_journal_snapshot()
     active_mode = None
@@ -3081,8 +3154,66 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     fresh = ()
   cached_context = _cached_context_buy_candidates(limit=limit)
+  affordable = _live_affordable_buy_candidate_symbols(limit=limit)
   surge = _cached_volume_surge_symbols()
-  return tuple(dict.fromkeys((*cached_context, *config_symbols, *fresh, *surge)))[:limit]
+  return tuple(dict.fromkeys((*cached_context, *fresh, *surge, *config_symbols, *affordable)))[:limit]
+
+
+def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
+  """Return open-session symbols that this small live account can plausibly buy.
+
+  This feeds the low-latency realtime engine. The slower broker quote overlay still
+  verifies prices before order creation; this list only makes sure the engine has
+  a useful scan universe when cached ontology BuyCandidate paths are empty.
+  """
+  open_groups = set(_active_live_market_groups())
+  if not open_groups:
+    return ()
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:  # noqa: BLE001 - candidates are best-effort.
+    account = None
+  if account is None:
+    return ()
+  excluded = _held_or_recent_buy_tickers(account)
+  symbols: list[str] = []
+  max_count = max(1, int(limit))
+
+  if "KRX" in open_groups and float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0) > 0:
+    try:
+      krx_limit = max(0, int(os.getenv("REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT", "60")))
+    except ValueError:
+      krx_limit = 60
+    try:
+      krx_universe = tuple(load_krx_listed_universe(limit=None) or ())
+    except Exception as exc:  # noqa: BLE001 - discovery is optional.
+      audit.record("realtime_krx_discovery_candidate_load_failed", {"error": str(exc)})
+      krx_universe = ()
+    for symbol in krx_universe:
+      ticker = str(symbol or "").upper().strip().split(".", 1)[0]
+      if ticker and ticker not in excluded and ticker.isdigit() and len(ticker) == 6:
+        symbols.append(ticker)
+      if len(symbols) >= min(max_count, krx_limit):
+        break
+
+  if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0 and len(symbols) < max_count:
+    try:
+      us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "60")))
+    except ValueError:
+      us_limit = 60
+    try:
+      us_universe = tuple(load_us_listed_universe(limit=None) or ())
+    except Exception as exc:  # noqa: BLE001 - discovery is optional.
+      audit.record("realtime_us_discovery_candidate_load_failed", {"error": str(exc)})
+      us_universe = ()
+    for symbol in _rotated_symbols(us_universe):
+      ticker = str(symbol or "").upper().strip().split(".", 1)[0]
+      if ticker and ticker not in excluded:
+        symbols.append(ticker)
+      if len(symbols) >= min(max_count, us_limit):
+        break
+
+  return tuple(dict.fromkeys(symbols))[:max_count]
 
 
 def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
@@ -3185,7 +3316,11 @@ def _realtime_engine_execution_summary() -> dict[str, Any] | None:
       "errors": int(status.get("errors", 0) or 0),
       "skipped_market_closed": int(last.get("skipped_market_closed", 0) or 0),
       "skipped_cooldown": int(last.get("skipped_cooldown", 0) or 0),
+      "buy_rejected": int(last.get("buy_rejected", 0) or 0),
+      "sell_rejected": int(last.get("sell_rejected", 0) or 0),
+      "rejections": tuple(last.get("rejections", ()) or ())[:12],
       "cycles": int(status.get("cycles", 0) or 0),
+      "last_reason": last.get("reason"),
       "runtime_gate": {"ok": runtime.ok, "failures": tuple(runtime.failures)},
       "last_cycle_at": status.get("last_cycle_at"),
       "recent_events": list(status.get("recent_events") or ())[:10],
@@ -5899,13 +6034,19 @@ HTML = """
       const policy = data.short_horizon_policy || {};
       const eventLlm = data.event_llm || {};
       const ontologyNpu = data.ontology_npu || {};
+      const training = data.live_training || {};
       const npuLabel = accel.uses_npu ? 'NPU active' : `CPU fallback (${accel.active_backend || '-'})`;
       const llmLabel = eventLlm.available ? `LLM ${eventLlm.provider || '-'} ready` : `LLM waiting ${eventLlm.reason || 'not configured'}`;
       const ontologyNpuLabel = ontologyNpu.uses_npu
-        ? `Ontology NPU ${ontologyNpu.last_items || 0} rows ${ontologyNpu.last_latency_ms ? `${ontologyNpu.last_latency_ms}ms` : 'ready'}`
+        ? (Number(ontologyNpu.last_items || 0) > 0
+          ? `Ontology NPU ${ontologyNpu.last_items} rows ${ontologyNpu.last_latency_ms ? `${ontologyNpu.last_latency_ms}ms` : 'ready'}`
+          : 'Ontology NPU ready, no batch yet')
         : `Ontology fallback ${ontologyNpu.backend || '-'}`;
+      const trainingLabel = training.ok
+        ? `training rows ${training.training_rows || 0} | model ${training.inference_uses_latest_live_eligible ? 'live' : (training.model_saved ? 'saved' : 'waiting')}`
+        : 'training status waiting';
       document.getElementById('runtimeStatus').textContent =
-        `${npuLabel} | ${ontologyNpuLabel} | ${llmLabel} | ${accel.latency_profile || 'low_latency'} | horizons ${((accel.prediction_horizons_seconds || []).join('/'))}s | cap ${((policy.max_position_weight_intraday || 0) * 100).toFixed(1)}%`;
+        `${npuLabel} | ${ontologyNpuLabel} | ${trainingLabel} | ${llmLabel} | ${accel.latency_profile || 'low_latency'} | horizons ${((accel.prediction_horizons_seconds || []).join('/'))}s | cap ${((policy.max_position_weight_intraday || 0) * 100).toFixed(1)}%`;
       if (data.operation_mode) renderOperationMode(data.operation_mode);
     }
     function selectedOperationMode(action) {
@@ -7017,6 +7158,18 @@ HTML = """
       return `실행 ${reason} · 신호 ${Number(summary.signals || 0)} · BUY ${Number(summary.buy_signals || 0)} · SELL/REDUCE ${Number(summary.sell_signals || 0)} · 후보 ${Number(summary.intents || 0)} · 승인 매수 ${Number(summary.approved_buy_orders || 0)} · 승인 매도 ${Number(summary.approved_sell_orders || 0)} · 실행가능 매수 ${Number(summary.executable_buy_orders || 0)} · 실행가능 매도 ${Number(summary.executable_sell_orders || 0)} · 제출 ${Number(summary.submitted || 0)} · 현금부족 제외 ${skipped} · 차단 ${blocked} · 오류 ${errors} · ${gateText}`;
     }
 
+    function liveExecutionRejectionText(summary = {}) {
+      const rejections = Array.isArray(summary.rejections) ? summary.rejections.slice(0, 5) : [];
+      if (!rejections.length) return '';
+      return rejections.map((item) => {
+        const side = String(item.side || '').toUpperCase();
+        const symbol = item.symbol || item.ticker || '-';
+        const reasons = Array.isArray(item.reason_codes) ? item.reason_codes : [];
+        const reason = reasons.length ? reasons.join('/') : 'NO_DETAIL';
+        return `${side} ${symbol}: ${reason}`;
+      }).join(' | ');
+    }
+
     function renderLivePerformanceSummary(data = {}) {
       setPerformancePanelMode('live_trading');
       const percent = Number(data.return_rate || 0) * 100;
@@ -7027,8 +7180,10 @@ HTML = """
       document.getElementById('mockTarget').textContent = '실전 목표 -';
       const accountSummary = accountSnapshotSummary(data);
       const executionSummary = data.execution_summary || {};
+      const rejectionText = liveExecutionRejectionText(executionSummary);
       document.getElementById('mockStatus').textContent =
         `KIS 실계좌 기준 갱신 · 총자산 ${fmtWon.format(accountSummary.equity)} · 주문가능 원화 ${fmtWon.format(accountSummary.cash)} · 보유주식 ${fmtWon.format(accountSummary.invested)} · 외화 ${fmtWon.format(accountSummary.foreignCashKrw)} · ${liveExecutionSummaryText(executionSummary, data)}`;
+      if (rejectionText) document.getElementById('mockStatus').textContent += ` 쨌 사유 ${rejectionText}`;
     }
 
     async function loadMockPerformance() {

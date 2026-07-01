@@ -50,7 +50,7 @@ class OperationModeManager:
             model_root=str(env.model_dir),
             synthetic_data_allowed=False,
             live_orders_allowed=selected == OperationMode.LIVE_TRADING,
-            training_allowed=selected == OperationMode.LEARNING,
+            training_allowed=selected in {OperationMode.LEARNING, OperationMode.LIVE_TRADING},
             paper_trading_allowed=selected in {
                 OperationMode.TESTING,
                 OperationMode.PAPER_TRADING,

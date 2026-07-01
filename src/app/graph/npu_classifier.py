@@ -38,6 +38,9 @@ class OntologyNpuStatus:
     batch_size: int
     feature_dim: int
     score_dim: int
+    model_name: str = "ontology_candidate_scorer"
+    requested_device: str = "NPU"
+    selected_device: str = "uninitialized"
     model_kind: str = "heuristic_linear_scorer"
     last_latency_ms: float | None = None
     last_items: int = 0
@@ -182,6 +185,9 @@ class OntologyNpuLinearScorer:
             batch_size=self.batch_size,
             feature_dim=self.feature_dim,
             score_dim=self.score_dim,
+            model_name="ontology_candidate_scorer",
+            requested_device=os.getenv("OPENVINO_DEVICE", os.getenv("ONTOLOGY_CLASSIFIER_DEVICE", "NPU")),
+            selected_device=self._backend,
             model_kind="heuristic_linear_scorer",
             last_latency_ms=self._last_latency_ms,
             last_items=self._last_items,
