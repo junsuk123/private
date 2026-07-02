@@ -57,6 +57,9 @@ class AnalysisContext:
     affordability_filter: dict[str, Any] = field(default_factory=dict)
     parameter_tuning: tuple[dict[str, Any], ...] = ()
     temporal_frames: tuple[TimeSynchronizedTickerFrame, ...] = ()
+    # Additive RDF/RDFS/OWL + SHACL ontology layer output (None if disabled or
+    # unavailable). Advisory only; the RiskManager remains the final gate.
+    ontology_layer: Any = None
 
 
 def build_analysis_context(
@@ -108,7 +111,8 @@ def build_analysis_context(
         realtime_quotes=realtime_quotes,
         realtime_executions=realtime_executions,
     )
-    graph = build_market_graph(markets, indicators, events, account=account)
+    score_sink: dict[str, Any] = {}
+    graph = build_market_graph(markets, indicators, events, account=account, score_sink=score_sink)
     add_time_frames_to_graph(graph, temporal_frames)
     _add_account_position_state_to_graph(graph, account)
     parameter_tuning = _ontology_parameter_tuning(markets, indicators, events)
@@ -116,6 +120,7 @@ def build_analysis_context(
     reasoner = OntologyReasoner(graph)
     reasoner.infer()
     reasoning_paths = reasoner.build_reasoning_paths(tuple(market.ticker for market in markets))
+    ontology_layer = _build_ontology_layer(graph, markets, account, risk_rules, score_sink)
     report = build_portfolio_report(account)
     signals = generate_strategy_signals(markets, indicators, graph, account)
     signals = _augment_live_liquidity_recovery_signals(markets, signals, account, risk_rules)
@@ -142,7 +147,34 @@ def build_analysis_context(
         affordability_filter=_affordability_filter_payload(affordability_filter),
         parameter_tuning=parameter_tuning,
         temporal_frames=temporal_frames,
+        ontology_layer=ontology_layer,
     )
+
+
+def _build_ontology_layer(
+    graph: KnowledgeGraph,
+    markets: tuple[MarketSnapshot, ...],
+    account: AccountSnapshot,
+    risk_rules: RiskRules | None,
+    score_sink: dict[str, Any],
+) -> Any:
+    """Run the additive RDF/OWL/SHACL ontology layer (fail-safe, advisory only)."""
+    try:
+        from app.graph.ontology_layer import build_ontology_layer
+
+        live = bool(risk_rules is not None and getattr(risk_rules, "live_trading_enabled", False))
+        cycle_id = f"cycle:{account.captured_at.isoformat()}:{len(markets)}"
+        return build_ontology_layer(
+            graph,
+            markets={market.ticker: market for market in markets},
+            account=account,
+            live=live,
+            cycle_id=cycle_id,
+            score_sink=score_sink,
+        )
+    except Exception:
+        # Never let the ontology layer affect the trading path.
+        return None
 
 
 def _augment_live_cash_fit_signals(

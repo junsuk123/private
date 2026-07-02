@@ -4,7 +4,7 @@
 
 The system separates probabilistic reasoning from deterministic control. Classifiers, semantic layers, ontology screening, and strategy scoring can explain, classify, rank, tune, and propose. They cannot directly execute live trades.
 
-Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved orders are limit orders with manual approval required. The current app supports mock, local paper, KIS paper-readiness, live-readiness, hypothetical, and in-memory simulation paths. Live automated brokerage execution remains blocked unless future manual approval gates deliberately enable it.
+Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved live orders are limit orders submitted only through `LiveExecutionCoordinator`. The current app supports mock, local paper, KIS paper, live-readiness, hypothetical, in-memory simulation, and KIS live auto-trading paths. In the `run.ps1` runtime, live flags are enabled for the local process, but live submission is still constrained by runtime gates, KIS health checks, idempotency, cost/risk rules, source freshness, and kill-switch controls.
 
 ![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
 
@@ -13,18 +13,14 @@ The diagram is the high-level companion to this document. The sections below map
 ## Runtime Flow
 
 ```text
-Research sources
-  -> event/market/macro normalization
-  -> realtime SQLite store
-  -> analysis context
-  -> lightweight ontology candidate filter
-  -> indicators and time-synchronized frames
-  -> ontology graph
-  -> ontology reasoning paths
-  -> strategy signals
-  -> order intents
-  -> risk validation
-  -> mock KIS / KIS paper-readiness / hypothetical testing / paper-trading simulation / UI output
+KIS live account + KIS realtime ticks/orderbooks + KIS broker quotes
+  -> realtime SQLite stores and account dashboard
+  -> live feature frames + live short-horizon model artifacts
+  -> ontology/NPU evidence and realtime candidate discovery
+  -> SharedLiveDecisionEngine
+  -> RiskManager / FinalTradeGate
+  -> LiveExecutionCoordinator
+  -> KIS live limit orders, open-order keep/amend, audit/status surfaces
 ```
 
 Detailed flow:
@@ -39,8 +35,9 @@ Detailed flow:
 8. The ontology reasoner infers buy candidates, risk-adjusted sizing, contradictions, and reasoning paths.
 9. Strategy modules combine indicator, ontology, and domestic investor-flow evidence to produce `StrategySignal` and `OrderIntent` records.
 10. `RiskManager` validates each intent against hard rules.
-11. Approved intents can become mock KIS orders, local paper-trading orders, hypothetical test records, or paper-trading simulation trades only.
-12. Audit logging records inputs, mode changes, refreshes, decisions, rejections, and outputs, with recursive redaction for credentials, tokens, account numbers, and broker secrets.
+11. `FinalOrder` objects are submitted through mock/paper executors or through `LiveExecutionCoordinator` for live KIS limit orders when all live gates pass.
+12. The realtime engine evaluates SELL/REDUCE before BUY, keeps existing open SELL orders when the replacement price is effectively unchanged, and blocks BUY when `REALTIME_BUY_ENABLED=false`.
+13. Audit logging records inputs, mode changes, refreshes, decisions, rejections, submissions, and outputs, with recursive redaction for credentials, tokens, account numbers, and broker secrets.
 
 ## Public Data Layer
 
@@ -81,11 +78,13 @@ data/synthetic_disabled/
 
 `run.ps1` starts the app on strict port `8010` by default, opens a managed browser window when possible, and stops the server when that window closes.
 
-Startup services:
+Startup services in the current `run.ps1` runtime:
 
-- `AUTO_START_LIVE_WORKER=true` starts realtime collection/learning automatically.
+- `AUTO_START_KIS_REALTIME_COLLECTOR=true` starts KIS realtime tick/orderbook collection.
+- `AUTO_START_LIVE_TRAINING=true` starts periodic live short-horizon model retraining.
+- `AUTO_START_REALTIME_TRADING=true` starts the independent realtime trading loop.
 - `AUTO_START_LIVE_READINESS=true` starts a read-only KIS live-readiness account check automatically.
-- The web UI does not require manual learning, refresh, or live-readiness buttons; it keeps paper trading and the guarded live-trading gate as explicit user actions.
+- The web UI does not require manual learning, refresh, or live-readiness buttons; `/account` is the primary operations dashboard.
 
 Important UI/API paths:
 
@@ -115,6 +114,13 @@ Important UI/API paths:
 - `GET /api/mock-kis/portfolio`: mock portfolio state
 - `POST /api/mock-trading/run`: deterministic mock trading cycle
 - `GET /api/mock-trading/performance`: mock-trading performance summary
+- `GET /account`: KIS account dashboard, holdings, cash, asset history, realtime decision flow, rejection reasons, and termination button
+- `GET /api/account/dashboard`: live account dashboard payload
+- `GET /api/account/asset-history`: minute-bucketed total-asset history
+- `GET /api/realtime-trading/status`: independent realtime trading engine status, recent events, and decision diagnostics
+- `GET /api/ai/validation`: event LLM, live model, training, and ontology/NPU validation
+- `GET /api/live-training/status`: live short-horizon training status
+- `POST /api/live-trading/terminate`: disable BUY, submit profit-seeking liquidation SELL orders, and optionally schedule server shutdown
 
 ## Operation Modes
 
@@ -124,11 +130,11 @@ Implemented in `src/app/realtime/mode_manager.py`.
 - `testing`: backward-compatible legacy paper-trading replay.
 - `paper_trading` / `paper_trading_test`: KIS paper-trading API check plus local paper-trading flow.
 - `live_readiness` / `live_trading_test`: KIS live authentication/readiness check; no broker orders are submitted.
-- `live_trading`: realtime trading gate; live brokerage execution remains guarded/blocked.
+- `live_trading`: realtime KIS live auto-trading loop; live brokerage execution remains guarded by runtime, KIS, risk, source, cost, and idempotency gates.
 
 All modes use the unified realtime data store and model root. Synthetic data is not allowed as input to these modes.
 
-`learning` and read-only live-readiness are automatic startup services in the default web runtime. The operation-mode API still supports explicit starts for diagnostics, tests, and controlled manual rechecks.
+KIS realtime collection, live training, read-only live-readiness, and realtime trading are automatic startup services in the `run.ps1` runtime. The operation-mode API still supports explicit starts for diagnostics, tests, and controlled manual rechecks.
 
 ## Agent Boundaries
 
@@ -191,3 +197,67 @@ The model layer currently provides no-lookahead dataset rows, training-plan summ
 ## Current Implementation Choice
 
 The current workspace uses FastAPI/Uvicorn for the web runtime, SQLite for local persistence, JSON model artifacts for lightweight learning outputs, and an in-memory graph. PostgreSQL, TimescaleDB, Neo4j/RDF4J, pgvector, APScheduler, and Prometheus can still be added phase-by-phase once the core contracts are stable.
+
+## Standards-Based Ontology Framework (Hybrid RDF/RDFS/OWL + SHACL)
+
+### Before / after
+
+- **Before:** a custom in-memory triple store (`app.graph.KnowledgeGraph`) of `(subject, predicate, object,
+  evidence_id)` string tuples, with a rule-based scorer named `OntologyReasoner` and a flat list of class /
+  predicate name strings in `ontology.py`. No IRIs, no class/property hierarchy, no OWL reasoner, no SHACL,
+  no SPARQL, no named graphs, no formal provenance.
+- **After:** the custom graph remains the primary store, and an *additive* standards-based layer projects it
+  into RDF (`rdflib`), materializes semantic classes with OWL RL (`owlrl`), validates operational
+  constraints with SHACL (`pyshacl`), and represents provenance with explicit evidence individuals. The
+  scorer is renamed `SemanticPolicyScorer` (alias `OntologyReasoner` retained) to make explicit that it does
+  numerical policy scoring, not logical reasoning.
+
+### Layers
+
+1. **RDF assertion graph layer** (`rdf_graph.py`, `rdf_adapter.py`). Converts internal records / custom
+   triples / evidence into RDF with stable IRIs (`res:`, `ev:`) under a named graph per analysis cycle
+   (`rdflib.Dataset`). Emitted signal/risk object strings map to canonical `tr:` individuals so OWL rules fire.
+2. **RDFS/OWL schema layer** (`src/app/ontology/trading_core.ttl`). Classes, `rdfs:subClassOf` hierarchy,
+   object/data properties, `rdfs:domain`/`rdfs:range`, `rdfs:subPropertyOf`, and `owl:disjointWith`
+   (Approved vs Rejected, Buy vs Sell intent, Eligible vs Forbidden). OWL 2 RL compatible.
+3. **OWL RL materialization layer** (`owl_reasoner.py`, `semantic_materializer.py`). Merges the cached schema
+   with the scoped assertion graph and runs `owlrl` closure. Returns the enriched graph plus the separately
+   identified inferred triples. Classification axioms live in `trading_rules.ttl` (`owl:hasValue` restriction
+   subclasses; e.g. `increasesRiskOf Risk_TradeForbidden` ⇒ `TradeForbiddenAsset`).
+4. **SHACL validation layer** (`trading_shapes.ttl`, `shacl_validator.py`). Closed-world checks: required
+   fields, positive broker price, stale/synthetic blocking for live candidates, account/order structure,
+   approved-and-rejected conflict, final-order preconditions. `mode="live"` blocks; `mode="paper"` warns.
+5. **Python semantic policy scoring layer** (`reasoner.py::SemanticPolicyScorer`). Support/contradiction/risk
+   weights, confidence, ranking, thresholds, short-horizon policy. Consumes OWL-inferred classes as *extra*
+   features only.
+6. **Trading safety and execution gate layer** (unchanged). `TradingCostEngine`, `PrincipalProtectionEngine`,
+   `RiskManager`, live-readiness checks, broker adapter, `LiveExecutionCoordinator`.
+
+Orchestration is `ontology_layer.py`, wired into `app.pipeline.build_analysis_context` after the existing
+graph/scorer steps; its result is attached to `AnalysisContext.ontology_layer` (advisory only).
+
+### Data provenance and evidence representation
+
+Each source- or model-derived assertion links to an `ev:{evidence_id}` `tr:EvidenceItem` via
+`tr:hasEvidence` / `tr:derivedFromEvidence`, carrying source name, source type, timestamp, quality score,
+synthetic/stale flags, confidence, and analysis-cycle id. NPU/CPU/heuristic scorer output is preserved as
+evidence data properties (`hasSupportScore`, `hasRiskScore`, `hasConfidence`, …) tagged with the backend —
+never as a trade authorization. Per-cycle scoping uses named graphs; no reification / RDF-star.
+
+### Real-time performance considerations
+
+The schema graph is parsed once and cached by file mtime; SHACL shapes are lru-cached; materialization is
+scoped to the current candidate universe (not full history); the per-cycle result is computed once and
+stored on the frozen `AnalysisContext`; timings for RDF build, OWL materialization, and SHACL validation are
+exposed. In the live runtime the analysis context is built on a background refresh thread, so API requests
+read a cached payload and the GUI does not block. `ONTOLOGY_REASONING_PROFILE=rdfs` offers a cheaper closure
+and `ONTOLOGY_RDF_LAYER=0` disables the layer entirely.
+
+### Known limitations and future improvements
+
+- OWL is open-world: missing data is unknown, not false — so OWL never blocks or authorizes a trade;
+  closed-world constraints must remain in SHACL and Python.
+- OWL RL closure over the full ontology adds hundreds of milliseconds per cycle; it is intentionally kept off
+  the tightest real-time tick loop and scoped to candidates.
+- Future work: incremental/delta materialization, a persistent triple store (e.g. RDF4J/GraphDB) for
+  cross-session provenance, SPARQL-backed explainability queries, and richer SHACL-SPARQL rules.

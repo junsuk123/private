@@ -61,7 +61,14 @@ RISK_WEIGHTS = {
 
 
 @dataclass(frozen=True)
-class OntologyReasoningPolicy:
+class SemanticPolicyScorerConfig:
+    """Numerical scoring configuration for the Python policy scorer.
+
+    This is deliberately NOT OWL: all weights, thresholds, and confidence math
+    live here in Python. OWL handles semantic categorization; this handles
+    numbers (see docs/ontology_migration_audit.md).
+    """
+
     base_confidence: float = 0.40
     buy_threshold: float = 0.58
     support_weights: dict[str, float] = field(default_factory=lambda: dict(SUPPORT_WEIGHTS))
@@ -74,21 +81,35 @@ class OntologyReasoningPolicy:
     max_confidence: float = 0.95
 
 
-class OntologyReasoner:
+class SemanticPolicyScorer:
+    """Numerical policy scorer over the semantic graph (formerly ``OntologyReasoner``).
+
+    Despite the historical name, this component does NOT perform OWL logical
+    entailment. It aggregates support/contradiction/risk weights into a
+    confidence score and emits theory votes / candidate labels. OWL-inferred
+    classes (from ``semantic_materializer``) may be supplied as *additional*
+    features via ``inferred_classes``; they enrich explanations but never
+    replace the numerical scoring, ranking, or the RiskManager gate.
+    """
+
     def __init__(
         self,
         graph: KnowledgeGraph,
         runtime: OntologyRuntime | None = None,
-        policy: OntologyReasoningPolicy | None = None,
+        policy: SemanticPolicyScorerConfig | None = None,
         registry: TheoryRegistry | None = None,
         validation_store: TheoryValidationStore | None = None,
+        inferred_classes: dict[str, list[str]] | None = None,
     ) -> None:
         self.graph = graph
         self.runtime = runtime or get_ontology_runtime()
-        self.policy = policy or OntologyReasoningPolicy()
+        self.policy = policy or SemanticPolicyScorerConfig()
         self.registry = registry or get_theory_registry()
         self.validation_store = validation_store or get_theory_validation_store()
         self.action_aggregator = ActionAggregator(self.registry)
+        # OWL-inferred semantic class labels per ticker, used only as extra
+        # explanation features (never as the sole decision source).
+        self.inferred_classes = inferred_classes or {}
 
     def infer(self) -> KnowledgeGraph:
         self._infer_buy_candidates()
@@ -327,9 +348,22 @@ def _action_for_triple(object_name: str, kind: str, default_action_bias: str) ->
     return default_action_bias if default_action_bias in {"BUY", "SELL", "HOLD", "REDUCE", "WATCH"} else "WATCH"
 
 
-def _weight_for_triple(triple: Triple, kind: str, policy: OntologyReasoningPolicy) -> float:
+def _weight_for_triple(triple: Triple, kind: str, policy: SemanticPolicyScorerConfig) -> float:
     if kind == "support":
         return policy.support_weights.get(triple.object, policy.default_support_weight)
     if kind == "contradiction":
         return policy.contradiction_weights.get(triple.object, policy.default_contradiction_weight)
     return policy.risk_weights.get(triple.object, policy.default_risk_weight)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility aliases.
+#
+# The class was renamed from ``OntologyReasoner`` to ``SemanticPolicyScorer``
+# (and ``OntologyReasoningPolicy`` -> ``SemanticPolicyScorerConfig``) to make
+# explicit that it performs numerical policy scoring, not OWL logical
+# reasoning. The old names remain importable so existing callers, the GUI, and
+# tests continue to work. Prefer the new names in new code.
+# ---------------------------------------------------------------------------
+OntologyReasoner = SemanticPolicyScorer
+OntologyReasoningPolicy = SemanticPolicyScorerConfig

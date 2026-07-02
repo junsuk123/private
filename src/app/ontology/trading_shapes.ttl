@@ -1,0 +1,215 @@
+@prefix tr:   <https://junsuk123.github.io/private/ontology/trading#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Trading Shapes (SHACL) — closed-world operational validation
+#
+# SHACL handles constraints OWL should NOT (OWL is open-world). These are
+# data-quality and live-trading-readiness gates. The Python validator runs
+# these shapes and returns structured results:
+#   * mode="live"  -> a violation BLOCKS the candidate.
+#   * mode="paper" -> a violation is reported as a WARNING only.
+#
+# SHACL never grants permission to trade. The RiskManager remains the sole
+# final execution gate.
+#
+# Live-only shapes target tr:LiveTradingCandidate, a marker type the RDF
+# adapter assigns to candidates only when live trading is requested; in
+# paper/mock mode those shapes simply do not fire.
+#################################################################
+
+#################################################################
+# BrokerQuoteShape: a broker quote must have a positive last price.
+#################################################################
+tr:BrokerQuoteShape a sh:NodeShape ;
+    sh:targetClass tr:BrokerQuote ;
+    sh:property [
+        sh:path tr:hasLastPrice ;
+        sh:minCount 1 ;
+        sh:minExclusive 0 ;
+        sh:message "Broker quote must have a last price greater than zero." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
+# AccountSnapshotShape: cash + total asset fields required before sizing.
+#################################################################
+tr:AccountSnapshotShape a sh:NodeShape ;
+    sh:targetClass tr:AccountSnapshot ;
+    sh:property [
+        sh:path tr:hasTotalAssetValue ;
+        sh:minCount 1 ;
+        sh:message "Account snapshot must expose a total asset value before live sizing." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:sparql [
+        sh:message "Account snapshot must expose available KRW or USD cash before live sizing." ;
+        sh:severity sh:Violation ;
+        sh:select """
+            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            SELECT $this WHERE {
+                FILTER NOT EXISTS { $this tr:hasAvailableKRW ?krw }
+                FILTER NOT EXISTS { $this tr:hasAvailableUSD ?usd }
+            }
+        """ ;
+    ] .
+
+#################################################################
+# OrderIntentShape: an order intent must be well-formed.
+#################################################################
+tr:OrderIntentShape a sh:NodeShape ;
+    sh:targetClass tr:OrderIntent ;
+    sh:property [
+        sh:path tr:hasOrderSide ;
+        sh:minCount 1 ;
+        sh:message "Order intent must declare an order side." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasSymbol ;
+        sh:minCount 1 ;
+        sh:message "Order intent must reference a symbol." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasQuantity ;
+        sh:minCount 1 ;
+        sh:datatype xsd:integer ;
+        sh:message "Order intent must declare a quantity." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasConfidence ;
+        sh:minCount 1 ;
+        sh:message "Order intent must carry a confidence value." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasReason ;
+        sh:minCount 1 ;
+        sh:message "Order intent must carry a reason." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
+# LiveCandidateShape: a live candidate must carry the full required set of
+# fields and source metadata before it can be considered for a live order.
+#################################################################
+tr:LiveCandidateShape a sh:NodeShape ;
+    sh:targetClass tr:LiveTradingCandidate ;
+    sh:property [
+        sh:path tr:hasSymbol ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires a symbol." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasMarket ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires a market." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasBrokerQuote ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires a broker quote." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasAsOfTime ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires an as-of time." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasConfidence ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires a confidence value." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasSourceTrustLevel ;
+        sh:minCount 1 ;
+        sh:message "Live candidate requires source trust metadata." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
+# FreshQuoteShape: a live candidate must not be flagged stale.
+#################################################################
+tr:FreshQuoteShape a sh:NodeShape ;
+    sh:targetClass tr:LiveTradingCandidate ;
+    sh:property [
+        sh:path tr:hasIsStale ;
+        sh:not [ sh:hasValue "true"^^xsd:boolean ] ;
+        sh:message "Live candidate quote must not be stale." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
+# NoSyntheticLiveDataShape: synthetic data cannot back a live order.
+#################################################################
+tr:NoSyntheticLiveDataShape a sh:NodeShape ;
+    sh:targetClass tr:LiveTradingCandidate ;
+    sh:property [
+        sh:path tr:hasIsSynthetic ;
+        sh:not [ sh:hasValue "true"^^xsd:boolean ] ;
+        sh:message "Synthetic data cannot be used for live order approval." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
+# RiskDecisionShape: an order cannot be both approved and rejected.
+#################################################################
+tr:RiskDecisionShape a sh:NodeShape ;
+    sh:targetClass tr:OrderIntent ;
+    sh:sparql [
+        sh:message "An order intent cannot be both approved and rejected by the RiskManager." ;
+        sh:severity sh:Violation ;
+        sh:select """
+            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+            SELECT $this WHERE {
+                $this tr:hasRiskManagerDecision ?approved .
+                ?approved rdf:type tr:ApprovedByRiskManager .
+                $this tr:hasRiskManagerDecision ?rejected .
+                ?rejected rdf:type tr:RejectedByRiskManager .
+            }
+        """ ;
+    ] .
+
+#################################################################
+# FinalOrderShape: a final order must have a RiskManager approval and must
+# not be principal-protection blocked.
+#################################################################
+tr:FinalOrderShape a sh:NodeShape ;
+    sh:targetClass tr:FinalOrder ;
+    sh:sparql [
+        sh:message "A final order must be backed by a RiskManager approval." ;
+        sh:severity sh:Violation ;
+        sh:select """
+            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+            SELECT $this WHERE {
+                FILTER NOT EXISTS {
+                    $this tr:hasRiskManagerDecision ?d .
+                    ?d rdf:type tr:ApprovedByRiskManager .
+                }
+            }
+        """ ;
+    ] ;
+    sh:sparql [
+        sh:message "A final order must not be a principal-protection-blocked candidate." ;
+        sh:severity sh:Violation ;
+        sh:select """
+            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+            SELECT $this WHERE {
+                $this rdf:type tr:PrincipalProtectionBlockedCandidate .
+            }
+        """ ;
+    ] .

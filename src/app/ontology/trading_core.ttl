@@ -1,0 +1,463 @@
+@prefix tr:   <https://junsuk123.github.io/private/ontology/trading#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Trading Core Ontology
+#
+# Standards-based RDF/RDFS/OWL vocabulary for the Personal Multi-Agent
+# Ontology-Based Automated Stock Investment System.
+#
+# Design boundary (see src/app/ontology/README.md):
+#   * OWL / RDFS  -> class & property hierarchy, domain/range typing,
+#                    semantic categorization, consistency.
+#   * SHACL       -> closed-world operational validation (trading_shapes.ttl).
+#   * Python      -> numerical scoring, ranking, trading policy.
+#   * RiskManager -> the sole final execution gate (NOT modeled as OWL).
+#
+# Modeling is intentionally OWL 2 RL compatible: subClassOf / subPropertyOf,
+# domain / range, disjointness. No cardinality restrictions, no complex DL.
+#################################################################
+
+<https://junsuk123.github.io/private/ontology/trading>
+    a owl:Ontology ;
+    rdfs:label "Trading Core Ontology" ;
+    rdfs:comment "Core classes and properties for semantic representation of the trading pipeline. Semantic enrichment only; it does not grant permission to trade." .
+
+#################################################################
+# Top-level classes
+#################################################################
+
+tr:TradingEntity a owl:Class ;
+    rdfs:label "Trading Entity" ;
+    rdfs:comment "Root class for domain entities that participate in the trading ontology." .
+
+tr:MarketEntity a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Market Entity" ;
+    rdfs:comment "An entity that exists in the market domain (companies, stocks, sectors)." .
+
+tr:Company a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Company" .
+
+tr:Sector a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Sector" .
+
+#################################################################
+# Assets / stocks
+#################################################################
+
+tr:Stock a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Stock" .
+
+tr:DomesticStock a owl:Class ;
+    rdfs:subClassOf tr:Stock ;
+    rdfs:label "Domestic Stock" ;
+    rdfs:comment "A stock traded on a domestic (KRX/KOSPI/KOSDAQ/KONEX) exchange." .
+
+tr:ForeignStock a owl:Class ;
+    rdfs:subClassOf tr:Stock ;
+    rdfs:label "Foreign Stock" ;
+    rdfs:comment "A stock traded on a foreign exchange." .
+
+# Data-quality / tradability categorizations (populated by trading_rules.ttl).
+tr:TradeEligibleAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Trade Eligible Asset" .
+
+tr:TradeForbiddenAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Trade Forbidden Asset" .
+
+tr:HighLiquidityAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "High Liquidity Asset" .
+
+tr:LowLiquidityAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Low Liquidity Asset" .
+
+tr:HighVolatilityAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "High Volatility Asset" .
+
+tr:StaleDataAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Stale Data Asset" ;
+    rdfs:comment "An asset whose most recent quote is stale for live decision making." .
+
+tr:SyntheticDataAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Synthetic Data Asset" ;
+    rdfs:comment "An asset backed by synthetic/sample data; not eligible for live orders." .
+
+# TradeEligibleAsset and TradeForbiddenAsset cannot co-apply.
+tr:TradeEligibleAsset owl:disjointWith tr:TradeForbiddenAsset .
+
+#################################################################
+# Market data & account state
+#################################################################
+
+tr:MarketSnapshot a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Market Snapshot" .
+
+tr:BrokerQuote a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Broker Quote" .
+
+tr:AccountSnapshot a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Account Snapshot" .
+
+tr:PortfolioPosition a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Portfolio Position" .
+
+tr:OrderableCash a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Orderable Cash" .
+
+#################################################################
+# Indicators
+#################################################################
+
+tr:Indicator a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Indicator" .
+
+tr:TechnicalIndicator a owl:Class ;
+    rdfs:subClassOf tr:Indicator ;
+    rdfs:label "Technical Indicator" .
+
+tr:FundamentalIndicator a owl:Class ;
+    rdfs:subClassOf tr:Indicator ;
+    rdfs:label "Fundamental Indicator" .
+
+tr:MacroIndicator a owl:Class ;
+    rdfs:subClassOf tr:Indicator ;
+    rdfs:label "Macro Indicator" .
+
+#################################################################
+# Events
+#################################################################
+
+tr:MarketEvent a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Market Event" .
+
+tr:NewsEvent a owl:Class ;
+    rdfs:subClassOf tr:MarketEvent ;
+    rdfs:label "News Event" .
+
+tr:DisclosureEvent a owl:Class ;
+    rdfs:subClassOf tr:MarketEvent ;
+    rdfs:label "Disclosure Event" .
+
+#################################################################
+# Evidence, semantic features, signals, risk
+#################################################################
+
+tr:EvidenceItem a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Evidence Item" ;
+    rdfs:comment "A provenance-bearing unit of evidence derived from a source or model (e.g. NPU score)." .
+
+tr:SemanticFeature a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Semantic Feature" .
+
+tr:RiskFactor a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Risk Factor" .
+
+tr:StrategySignal a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Strategy Signal" .
+
+tr:PositiveSignal a owl:Class ;
+    rdfs:subClassOf tr:StrategySignal ;
+    rdfs:label "Positive Signal" .
+
+tr:NegativeSignal a owl:Class ;
+    rdfs:subClassOf tr:StrategySignal ;
+    rdfs:label "Negative Signal" .
+
+tr:ContradictorySignal a owl:Class ;
+    rdfs:subClassOf tr:StrategySignal ;
+    rdfs:label "Contradictory Signal" .
+
+#################################################################
+# Candidates
+#################################################################
+
+tr:CandidateAsset a owl:Class ;
+    rdfs:subClassOf tr:MarketEntity ;
+    rdfs:label "Candidate Asset" .
+
+tr:BuyCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Buy Candidate" .
+
+tr:SellCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Sell Candidate" .
+
+tr:HoldCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Hold Candidate" .
+
+tr:WatchCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Watch Candidate" .
+
+tr:RejectedCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Rejected Candidate" .
+
+tr:CostEfficientCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Cost Efficient Candidate" ;
+    rdfs:comment "A candidate whose net expected return clears its cost/break-even threshold (computed in Python)." .
+
+tr:PrincipalProtectionBlockedCandidate a owl:Class ;
+    rdfs:subClassOf tr:CandidateAsset ;
+    rdfs:label "Principal Protection Blocked Candidate" ;
+    rdfs:comment "A candidate blocked by the PrincipalProtectionEngine (decided in Python, represented here for explainability)." .
+
+#################################################################
+# Order intents, decisions, final orders
+#################################################################
+
+tr:OrderIntent a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Order Intent" .
+
+tr:BuyOrderIntent a owl:Class ;
+    rdfs:subClassOf tr:OrderIntent ;
+    rdfs:label "Buy Order Intent" .
+
+tr:SellOrderIntent a owl:Class ;
+    rdfs:subClassOf tr:OrderIntent ;
+    rdfs:label "Sell Order Intent" .
+
+# A single order intent cannot be both a buy and a sell.
+tr:BuyOrderIntent owl:disjointWith tr:SellOrderIntent .
+
+tr:RiskManagerDecision a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Risk Manager Decision" .
+
+tr:ApprovedByRiskManager a owl:Class ;
+    rdfs:subClassOf tr:RiskManagerDecision ;
+    rdfs:label "Approved By Risk Manager" .
+
+tr:RejectedByRiskManager a owl:Class ;
+    rdfs:subClassOf tr:RiskManagerDecision ;
+    rdfs:label "Rejected By Risk Manager" .
+
+# The RiskManager is the final gate; a decision cannot be both approved and rejected.
+tr:ApprovedByRiskManager owl:disjointWith tr:RejectedByRiskManager .
+
+tr:FinalOrder a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Final Order" ;
+    rdfs:comment "An order that has passed the RiskManager gate. Membership here is asserted only after RiskManager approval; OWL never confers it." .
+
+tr:ReasoningPath a owl:Class ;
+    rdfs:subClassOf tr:TradingEntity ;
+    rdfs:label "Reasoning Path (Policy)" ;
+    rdfs:comment "A numerical policy reasoning path produced by the Python SemanticPolicyScorer, not OWL entailment." .
+
+#################################################################
+# Object properties
+#
+# hasSemanticEvidence is the super-property of the four polarity relations
+# so that RDFS/OWL RL can infer semantic-evidence membership generically.
+#################################################################
+
+tr:hasSemanticEvidence a owl:ObjectProperty ;
+    rdfs:label "has semantic evidence" ;
+    rdfs:domain tr:MarketEntity .
+
+tr:supportsSignal a owl:ObjectProperty ;
+    rdfs:subPropertyOf tr:hasSemanticEvidence ;
+    rdfs:range tr:StrategySignal ;
+    rdfs:label "supports signal" .
+
+tr:contradictsSignal a owl:ObjectProperty ;
+    rdfs:subPropertyOf tr:hasSemanticEvidence ;
+    rdfs:range tr:StrategySignal ;
+    rdfs:label "contradicts signal" .
+
+tr:increasesRiskOf a owl:ObjectProperty ;
+    rdfs:subPropertyOf tr:hasSemanticEvidence ;
+    rdfs:range tr:RiskFactor ;
+    rdfs:label "increases risk of" .
+
+tr:decreasesRiskOf a owl:ObjectProperty ;
+    rdfs:subPropertyOf tr:hasSemanticEvidence ;
+    rdfs:range tr:RiskFactor ;
+    rdfs:label "decreases risk of" .
+
+tr:hasTicker a owl:ObjectProperty ;
+    rdfs:domain tr:Company ;
+    rdfs:range tr:Stock ;
+    rdfs:label "has ticker" .
+
+tr:belongsToSector a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:Sector ;
+    rdfs:label "belongs to sector" .
+
+tr:hasMarketSnapshot a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:MarketSnapshot ;
+    rdfs:label "has market snapshot" .
+
+tr:hasAccountSnapshot a owl:ObjectProperty ;
+    rdfs:range tr:AccountSnapshot ;
+    rdfs:label "has account snapshot" .
+
+tr:hasPortfolioPosition a owl:ObjectProperty ;
+    rdfs:domain tr:AccountSnapshot ;
+    rdfs:range tr:PortfolioPosition ;
+    rdfs:label "has portfolio position" .
+
+tr:hasOrderableCash a owl:ObjectProperty ;
+    rdfs:domain tr:AccountSnapshot ;
+    rdfs:range tr:OrderableCash ;
+    rdfs:label "has orderable cash" .
+
+tr:hasTechnicalIndicator a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:TechnicalIndicator ;
+    rdfs:label "has technical indicator" .
+
+tr:hasFundamentalIndicator a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:FundamentalIndicator ;
+    rdfs:label "has fundamental indicator" .
+
+tr:hasMacroIndicator a owl:ObjectProperty ;
+    rdfs:range tr:MacroIndicator ;
+    rdfs:label "has macro indicator" .
+
+tr:hasNewsEvent a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:NewsEvent ;
+    rdfs:label "has news event" .
+
+tr:hasDisclosureEvent a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:DisclosureEvent ;
+    rdfs:label "has disclosure event" .
+
+tr:hasBrokerQuote a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:BrokerQuote ;
+    rdfs:label "has broker quote" .
+
+tr:hasSemanticFeature a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:SemanticFeature ;
+    rdfs:label "has semantic feature" .
+
+tr:hasEvidence a owl:ObjectProperty ;
+    rdfs:range tr:EvidenceItem ;
+    rdfs:label "has evidence" .
+
+tr:derivedFromEvidence a owl:ObjectProperty ;
+    rdfs:range tr:EvidenceItem ;
+    rdfs:label "derived from evidence" .
+
+tr:requiresSizingAdjustment a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:label "requires sizing adjustment" .
+
+tr:generatesOrderIntent a owl:ObjectProperty ;
+    rdfs:domain tr:MarketEntity ;
+    rdfs:range tr:OrderIntent ;
+    rdfs:label "generates order intent" .
+
+tr:isRejectedByRiskRule a owl:ObjectProperty ;
+    rdfs:domain tr:OrderIntent ;
+    rdfs:label "is rejected by risk rule" .
+
+tr:isApprovedByRiskManager a owl:ObjectProperty ;
+    rdfs:domain tr:OrderIntent ;
+    rdfs:range tr:RiskManagerDecision ;
+    rdfs:label "is approved by risk manager" .
+
+tr:hasRiskManagerDecision a owl:ObjectProperty ;
+    rdfs:domain tr:OrderIntent ;
+    rdfs:range tr:RiskManagerDecision ;
+    rdfs:label "has risk manager decision" .
+
+tr:hasFinalOrder a owl:ObjectProperty ;
+    rdfs:range tr:FinalOrder ;
+    rdfs:label "has final order" .
+
+tr:hasReasoningPath a owl:ObjectProperty ;
+    rdfs:range tr:ReasoningPath ;
+    rdfs:label "has reasoning path" .
+
+tr:hasDataSource a owl:ObjectProperty ;
+    rdfs:label "has data source" .
+
+tr:hasProvenance a owl:ObjectProperty ;
+    rdfs:range tr:EvidenceItem ;
+    rdfs:label "has provenance" .
+
+tr:increasesRiskOf rdfs:comment "Semantic evidence relation; risk scoring itself stays in Python." .
+
+#################################################################
+# Data properties
+#################################################################
+
+tr:hasSymbol a owl:DatatypeProperty ; rdfs:domain tr:MarketEntity ; rdfs:range xsd:string ; rdfs:label "has symbol" .
+tr:hasMarket a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has market" .
+tr:hasExchange a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has exchange" .
+tr:hasCurrency a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has currency" .
+tr:hasAsOfTime a owl:DatatypeProperty ; rdfs:range xsd:dateTime ; rdfs:label "has as-of time" .
+tr:hasLastPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has last price" .
+tr:hasOpenPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has open price" .
+tr:hasHighPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has high price" .
+tr:hasLowPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has low price" .
+tr:hasClosePrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has close price" .
+tr:hasVolume a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has volume" .
+tr:hasVolumeRatio a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has volume ratio" .
+tr:hasSpread a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has spread" .
+tr:hasSlippageEstimate a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has slippage estimate" .
+tr:hasTradingFeeEstimate a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has trading fee estimate" .
+tr:hasTaxEstimate a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has tax estimate" .
+tr:hasBreakEvenReturn a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has break-even return" .
+tr:hasExpectedReturn a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has expected return" .
+tr:hasNetExpectedReturn a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has net expected return" .
+tr:hasConfidence a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has confidence" .
+tr:hasSupportScore a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has support score" .
+tr:hasContradictionScore a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has contradiction score" .
+tr:hasRiskScore a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has risk score" .
+tr:hasQualityScore a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has quality score" .
+tr:hasSourceTrustLevel a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has source trust level" .
+tr:hasIsSynthetic a owl:DatatypeProperty ; rdfs:range xsd:boolean ; rdfs:label "has is-synthetic flag" .
+tr:hasIsStale a owl:DatatypeProperty ; rdfs:range xsd:boolean ; rdfs:label "has is-stale flag" .
+tr:hasReason a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has reason" .
+tr:hasDecision a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has decision" .
+tr:hasQuantity a owl:DatatypeProperty ; rdfs:domain tr:OrderIntent ; rdfs:range xsd:integer ; rdfs:label "has quantity" .
+tr:hasOrderSide a owl:DatatypeProperty ; rdfs:domain tr:OrderIntent ; rdfs:range xsd:string ; rdfs:label "has order side" .
+tr:hasOrderType a owl:DatatypeProperty ; rdfs:domain tr:OrderIntent ; rdfs:range xsd:string ; rdfs:label "has order type" .
+tr:hasAvailableKRW a owl:DatatypeProperty ; rdfs:domain tr:AccountSnapshot ; rdfs:range xsd:decimal ; rdfs:label "has available KRW" .
+tr:hasAvailableUSD a owl:DatatypeProperty ; rdfs:domain tr:AccountSnapshot ; rdfs:range xsd:decimal ; rdfs:label "has available USD" .
+tr:hasTotalAssetValue a owl:DatatypeProperty ; rdfs:domain tr:AccountSnapshot ; rdfs:range xsd:decimal ; rdfs:label "has total asset value" .
+tr:hasPrincipalProtectedAmount a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has principal-protected amount" .
+
+# Provenance metadata carried on EvidenceItem individuals.
+tr:hasSourceName a owl:DatatypeProperty ; rdfs:domain tr:EvidenceItem ; rdfs:range xsd:string ; rdfs:label "has source name" .
+tr:hasSourceType a owl:DatatypeProperty ; rdfs:domain tr:EvidenceItem ; rdfs:range xsd:string ; rdfs:label "has source type" .
+tr:hasAnalysisCycleId a owl:DatatypeProperty ; rdfs:domain tr:EvidenceItem ; rdfs:range xsd:string ; rdfs:label "has analysis cycle id" .

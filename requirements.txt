@@ -1,0 +1,14 @@
+# Runtime dependencies for the Personal Multi-Agent Ontology-Based Automated
+# Stock Investment System. Mirrors [project].dependencies in pyproject.toml.
+# Install with: pip install -r requirements.txt
+fastapi
+httpx
+numpy
+owlrl
+pyshacl
+PyYAML
+rdflib
+starlette>=0.40.0,<0.47.0
+tzdata
+uvicorn
+websockets

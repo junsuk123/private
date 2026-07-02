@@ -16,11 +16,24 @@ def build_market_graph(
     events: tuple[ClassifiedEvent, ...] = (),
     npu_scores: dict[str, tuple[float, ...]] | None = None,
     account: AccountSnapshot | None = None,
+    score_sink: dict | None = None,
 ) -> KnowledgeGraph:
+    """Build the custom KnowledgeGraph for the scoped market universe.
+
+    ``score_sink`` (optional): when provided, it is populated with the NPU
+    scores (``"npu_scores"``) and classifier status (``"npu_status"``) used
+    here. This lets the additive RDF layer represent NPU output as RDF evidence
+    (with backend/source metadata) without recomputing inference. The
+    KnowledgeGraph output itself is unchanged whether or not a sink is passed.
+    """
     graph = KnowledgeGraph()
     markets = _scope_markets(markets)
     events = _scope_events(events, {market.ticker for market in markets})
-    npu_scores = npu_scores or get_ontology_npu_classifier().classify(markets, indicators)
+    classifier = get_ontology_npu_classifier()
+    npu_scores = npu_scores or classifier.classify(markets, indicators)
+    if score_sink is not None:
+        score_sink["npu_scores"] = dict(npu_scores)
+        score_sink["npu_status"] = classifier.status()
 
     for market in markets:
         company = market.company_name

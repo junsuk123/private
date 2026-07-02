@@ -1,0 +1,105 @@
+@prefix tr:   <https://junsuk123.github.io/private/ontology/trading#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Trading Rules Ontology (OWL 2 RL classification axioms)
+#
+# These axioms let the OWL RL materializer (owlrl) infer semantic class
+# memberships from asserted facts. They are intentionally lightweight and
+# RL-compatible: the only construct used is owl:hasValue restriction classes
+# declared as subclasses of a target category. Under OWL RL rule cls-hv2,
+# `x p v` entails `x a <restriction>`, and via rdfs:subClassOf (cax-sco)
+# `x a <target>`.
+#
+# These rules perform SEMANTIC CATEGORIZATION ONLY. They never compute
+# scores, never rank, and never grant permission to trade. Numerical policy
+# stays in Python; final approval stays with the RiskManager.
+#################################################################
+
+<https://junsuk123.github.io/private/ontology/trading/rules>
+    a owl:Ontology ;
+    owl:imports <https://junsuk123.github.io/private/ontology/trading> ;
+    rdfs:label "Trading Rules Ontology" ;
+    rdfs:comment "OWL RL classification axioms for semantic categorization of assets, signals, and risk." .
+
+#################################################################
+# Canonical signal / risk individuals referenced by classification rules.
+# The RDF adapter maps emitted object strings (e.g. "BuyCandidate",
+# "TradeForbidden") to these stable IRIs.
+#################################################################
+
+tr:Signal_BuyCandidate       a tr:PositiveSignal ; rdfs:label "Buy Candidate Signal" .
+tr:Signal_SellCandidate      a tr:PositiveSignal ; rdfs:label "Sell Candidate Signal" .
+tr:Signal_HoldWithTrailingStop a tr:PositiveSignal ; rdfs:label "Hold-With-Trailing-Stop Signal" .
+tr:Signal_WaitOrTakeProfit   a tr:PositiveSignal ; rdfs:label "Wait-Or-Take-Profit Signal" .
+tr:Signal_NetProfitability   a tr:PositiveSignal ; rdfs:label "Net Profitability Signal" .
+
+tr:Risk_TradeForbidden       a tr:RiskFactor ; rdfs:label "Trade Forbidden Risk" .
+tr:Risk_Volatility           a tr:RiskFactor ; rdfs:label "Volatility Risk" .
+tr:Risk_ThinLiquidity        a tr:RiskFactor ; rdfs:label "Thin Liquidity / Price Impact Risk" .
+tr:Risk_ConcentratedPosition a tr:RiskFactor ; rdfs:label "Concentrated Position Risk" .
+
+#################################################################
+# Asset tradability classification
+#################################################################
+
+# An asset whose evidence increases the "TradeForbidden" risk is a TradeForbiddenAsset.
+[ a owl:Restriction ;
+  owl:onProperty tr:increasesRiskOf ;
+  owl:hasValue tr:Risk_TradeForbidden
+] rdfs:subClassOf tr:TradeForbiddenAsset .
+
+# An asset flagged synthetic is a SyntheticDataAsset.
+[ a owl:Restriction ;
+  owl:onProperty tr:hasIsSynthetic ;
+  owl:hasValue "true"^^xsd:boolean
+] rdfs:subClassOf tr:SyntheticDataAsset .
+
+# An asset flagged stale is a StaleDataAsset.
+[ a owl:Restriction ;
+  owl:onProperty tr:hasIsStale ;
+  owl:hasValue "true"^^xsd:boolean
+] rdfs:subClassOf tr:StaleDataAsset .
+
+# An asset carrying thin-liquidity risk evidence is a LowLiquidityAsset.
+[ a owl:Restriction ;
+  owl:onProperty tr:increasesRiskOf ;
+  owl:hasValue tr:Risk_ThinLiquidity
+] rdfs:subClassOf tr:LowLiquidityAsset .
+
+# An asset carrying volatility risk evidence is a HighVolatilityAsset.
+[ a owl:Restriction ;
+  owl:onProperty tr:increasesRiskOf ;
+  owl:hasValue tr:Risk_Volatility
+] rdfs:subClassOf tr:HighVolatilityAsset .
+
+#################################################################
+# Candidate classification (semantic label only; scoring is in Python)
+#################################################################
+
+# An asset supporting the BuyCandidate signal is a BuyCandidate.
+[ a owl:Restriction ;
+  owl:onProperty tr:supportsSignal ;
+  owl:hasValue tr:Signal_BuyCandidate
+] rdfs:subClassOf tr:BuyCandidate .
+
+# An asset supporting the SellCandidate signal is a SellCandidate.
+[ a owl:Restriction ;
+  owl:onProperty tr:supportsSignal ;
+  owl:hasValue tr:Signal_SellCandidate
+] rdfs:subClassOf tr:SellCandidate .
+
+# An asset supporting a hold/trailing-stop signal is a HoldCandidate.
+[ a owl:Restriction ;
+  owl:onProperty tr:supportsSignal ;
+  owl:hasValue tr:Signal_HoldWithTrailingStop
+] rdfs:subClassOf tr:HoldCandidate .
+
+# An asset supporting a wait/take-profit signal is a WatchCandidate.
+[ a owl:Restriction ;
+  owl:onProperty tr:supportsSignal ;
+  owl:hasValue tr:Signal_WaitOrTakeProfit
+] rdfs:subClassOf tr:WatchCandidate .

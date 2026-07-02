@@ -1,24 +1,124 @@
 # Personal Multi-Agent Ontology-Based Automated Stock Investment System
 
-Personal-use research system for safe, auditable, explainable stock-investment analysis and realtime-only paper-trading and live-readiness workflows.
+Personal-use research system for safe, auditable, explainable stock-investment analysis, realtime account monitoring, paper trading, and KIS live auto-trading under deterministic execution gates.
 
-The current implementation is intentionally conservative: it collects public/current-market research, builds indicators and ontology evidence, negotiates target feasibility, creates strategy intents, and validates every possible order through deterministic risk rules. Live automated brokerage execution remains blocked.
+The current implementation is intentionally conservative but live-capable in the local runtime started by `run.ps1`: it collects KIS realtime/broker data, builds live feature frames and ontology evidence, trains a short-horizon model in the background, evaluates SELL before BUY every cycle, and submits only `FinalOrder` objects that pass live runtime, broker, cost, risk, freshness, and idempotency gates.
 
 ![End-to-end ontology trading system flow](docs/ontology%20base%20trading%20system%20diagram.png)
 
-The repository-level architecture is also documented in `docs/README.md` and `docs/architecture.md`.
+The repository-level architecture is also documented in `docs/README.md`, `docs/architecture.md`, `docs/live_trading_runbook.md`, and `docs/realtime_short_horizon_policy.md`.
+
+## Current Runtime Flow
+
+`run.ps1` is the canonical local launcher. It opens `http://127.0.0.1:8010/account`, starts the KIS realtime collector, starts periodic live model retraining, starts the realtime trading engine, and shuts down the server when the managed browser closes.
+
+```text
+KIS live account + KIS realtime ticks/orderbooks + KIS broker quotes
+  -> account dashboard and minute-bucketed asset history
+  -> live feature frames and live short-horizon model artifacts
+  -> ontology/NPU evidence and realtime candidate discovery
+  -> SharedLiveDecisionEngine
+       SELL path first: profit target, trailing/loss exit, domestic drawdown and concentration guards
+       BUY path second: cash, spread, liquidity, feature freshness, ontology/runtime support, model advisory score
+  -> RiskManager + FinalTradeGate + LiveExecutionCoordinator
+  -> KIS live limit orders, amend/keep existing open SELL orders, audit/status surfaces
+```
+
+Important current behavior:
+
+- Auto-trading starts automatically when `run.ps1` starts the server.
+- SELL/REDUCE decisions are evaluated before new BUY decisions.
+- Existing open SELL orders are amended only when the price meaningfully changes; otherwise they are kept and surfaced as `open_sell_kept`.
+- BUY can be globally disabled with `REALTIME_BUY_ENABLED=false`; the `/account` 종료 button does this before submitting profit-seeking liquidation SELL orders and scheduling server shutdown.
+- The live ML model is advisory. Model-only BUY is rejected when `REALTIME_MODEL_AUXILIARY_ONLY=true`; ontology or runtime broker evidence must confirm the trade.
+- A BUY rejection such as `WIDE_SPREAD`, `LOW_LIQUIDITY`, `FALLBACK_SCORE_BELOW_THRESHOLD`, or `INSUFFICIENT_CASH_FOR_ONE_SHARE` means the engine is intentionally avoiding low-quality execution.
 
 ## Safety Model
 
 - LLM or LLM-like components never execute trades.
-- AI/semantic/ontology layers may classify events, rank candidates, tune analysis parameters, and produce `OrderIntent` objects.
+- AI/semantic/ontology/model layers may classify events, rank candidates, tune analysis parameters, produce `OrderIntent` objects, or boost a candidate that already has deterministic evidence.
+- The live short-horizon model is an auxiliary signal, not a sole execution authority.
 - `RiskManager` is the deterministic final gate before an intent can become a `FinalOrder`.
 - Source trust, data quality, freshness, synthetic status, and model uncertainty are checked before live approval can proceed.
-- Approved orders are limit orders with `manual_approval_required=True`.
-- Live automated execution is disabled by default and remains blocked in the current app flow.
+- Approved live orders are limit orders submitted only through `LiveExecutionCoordinator`.
+- In the `run.ps1` runtime, live execution flags are explicitly enabled for the local process; safety comes from runtime gates, KIS checks, FinalTradeGate, idempotency, cost/risk rules, and kill-switch controls rather than from a disabled live flag.
 - Synthetic, sample, pseudo, or hash-derived features are allowed only in clearly labeled offline fixtures and must not be used as trusted paper-trading or live-trading evidence.
 - Margin, leverage, derivatives, short selling, credit loans, and leveraged ETFs are rejected.
-- Paper trading uses the KIS virtual domain or the local paper engine; live-readiness checks do not submit broker orders.
+- Paper trading uses the KIS virtual domain or the local paper engine.
+- Live termination disables BUY first, then submits profit-seeking limit SELL orders for current holdings when all live gates pass.
+
+## Standards-Based Ontology Framework (RDF/RDFS/OWL + SHACL)
+
+The system now includes a standards-based ontology layer built on `rdflib`, `owlrl`, and `pyshacl`, in
+addition to the existing custom in-memory graph. It adds formal semantic representation, class/property
+hierarchy, logical inference, consistency checking, closed-world validation, provenance, and
+explainability — **without changing any trading decision**. It is an *additive* layer: the custom
+`KnowledgeGraph` remains the primary store, and the RDF/OWL/SHACL results are exposed as extra
+diagnostics and semantic labels.
+
+### Hybrid reasoning boundary
+
+```text
+OWL / RDFS  -> class & property hierarchy, domain/range typing, semantic
+               categorization (BuyCandidate, TradeForbiddenAsset, SyntheticDataAsset...),
+               consistency (disjoint classes).  [open-world]
+SHACL       -> required fields, positive prices, stale/synthetic blocking (live),
+               account/order structure, approved-vs-rejected conflict.  [closed-world]
+Python       -> support/contradiction/risk/confidence scoring, ranking, thresholding,
+               short-horizon policy (SemanticPolicyScorer, formerly OntologyReasoner).
+Engines      -> TradingCostEngine, PrincipalProtectionEngine, position sizing.
+RiskManager  -> the SOLE final execution gate.
+```
+
+Why OWL does **not** approve trades: OWL is open-world (missing data is *unknown*, not *false*), so it
+can never conclude an asset is safe. It provides semantic standardization, interoperability, consistency,
+explainability, and research defensibility — not numerical trading logic and not permission to trade.
+Closed-world constraints (required fields, stale/synthetic rejection) are handled by SHACL; all numbers
+stay in Python; the RiskManager decides.
+
+### End-to-end flow
+
+```text
+Data Sources -> Typed Records -> RDF Assertion Graph -> RDFS/OWL Schema
+  -> OWL RL Materialization -> SHACL Validation -> Python Policy Scorer
+  -> TradingCostEngine -> PrincipalProtectionEngine -> RiskManager -> FinalOrder
+```
+
+Asserted facts (from market/account/news/disclosure/indicator data and the custom graph) are projected
+into an RDF assertion graph with stable IRIs; the schema is merged and OWL RL materialization infers
+semantic classes; SHACL validates operational constraints; inferred classes and validation results flow
+to the Python policy scorer as *extra features*; order intents then pass the unchanged cost/principal/
+risk chain. Evidence items (including NPU/CPU/heuristic scorer output) are represented as provenance-
+bearing `tr:EvidenceItem` individuals linked via `tr:hasEvidence` / `tr:derivedFromEvidence`.
+
+### Ontology files
+
+| File | Role |
+|---|---|
+| `src/app/ontology/trading_core.ttl` | Classes, hierarchy, object/data properties, domain/range, disjointness. |
+| `src/app/ontology/trading_rules.ttl` | OWL 2 RL classification axioms (semantic categorization). |
+| `src/app/ontology/trading_shapes.ttl` | SHACL shapes for closed-world operational validation. |
+| `src/app/ontology/README.md` | Namespaces, modeling decisions, inference boundary, how to extend. |
+
+Python modules: `src/app/graph/rdf_graph.py` (RDF store + IRIs), `rdf_adapter.py` (Triple↔RDF↔UI),
+`owl_reasoner.py` + `semantic_materializer.py` (OWL RL closure), `shacl_validator.py` (SHACL),
+`ontology_layer.py` (orchestration wired into `app/pipeline.py`).
+
+### Running / inspecting / extending
+
+- Run ontology tests: `python -m pytest tests/test_ontology_framework.py`
+- Parse-check the Turtle files:
+  `python -c "import rdflib;[rdflib.Graph().parse(f,format='turtle') for f in ('src/app/ontology/trading_core.ttl','src/app/ontology/trading_rules.ttl','src/app/ontology/trading_shapes.ttl')];print('ok')"`
+- Serialize the runtime graph: `RdfTradingGraph.serialize(format="turtle" | "json-ld")`.
+- Env controls: `ONTOLOGY_RDF_LAYER=0` disables the layer; `ONTOLOGY_REASONING_PROFILE=rdfs` uses the
+  cheaper RDFS-only closure.
+- Extend safely: see `src/app/ontology/README.md`. Add hierarchy/axioms in TTL, closed-world checks in
+  SHACL, and never encode scores or trade permissions in OWL.
+
+The GUI/API separates **asserted** vs **inferred** triples, keeps OWL results apart from Python policy
+scores, and reports SHACL validation in the diagnostics panel (`/api/ontology/graph` `semantic_layer`
+section and `/api/research/diagnostics`). See `docs/ontology_standardization_report.md` and
+`docs/ontology_migration_audit.md` for the full design and old→new mapping.
 
 ## Current Scope
 
@@ -39,6 +139,9 @@ Implemented capabilities include:
 - KIS paper-trading boundary and local paper-trading loop
 - Automatic server-start realtime collection/learning and read-only KIS live-readiness account check
 - KIS/BanKIS trading-cost model for fees, sell tax, slippage, spread, break-even return, and net profitability checks
+- KIS realtime WebSocket tick/orderbook collection and broker quote refresh for live decisions
+- Realtime trading status, decision-flow, rejection-reason, account, cash, holdings, asset-allocation, and minute asset-history dashboard at `/account`
+- Live BUY disable and program termination workflow from the `/account` dashboard
 - Realtime learning and paper-trading evaluation artifacts under `data/models`
 - Audit logging and diagnostics endpoints
 - Recursive audit redaction for credentials, tokens, account numbers, and broker secrets
@@ -65,20 +168,28 @@ One-command Windows launch:
 .\run.ps1
 ```
 
-`run.ps1` starts a managed local app server on `http://127.0.0.1:8010` by default, opens Chrome or Edge when available, and stops the server when the managed browser window closes. It sets safe defaults including:
+`run.ps1` starts a managed local app server on `http://127.0.0.1:8010` by default, opens Chrome or Edge at `/account` when available, and stops the server when the managed browser window closes. It sets current live-runtime defaults including:
 
 - `DATA_ENV=realtime`
 - `DATA_ROOT=data`
 - `REALTIME_STORE_ROOT=data/store`
-- `TRADING_MODE=learning`
-- `LIVE_TRADING_ENABLED=false`
+- `TRADING_MODE=live_trading`
+- `LIVE_TRADING_ENABLED=true`
+- `KIS_LIVE_ENABLED=true`
+- `KIS_PAPER_TRADING=false`
+- `LIVE_ORDER_SUBMIT_ENABLED=true`
+- `AUTO_START_REALTIME_TRADING=true`
+- `AUTO_START_LIVE_TRAINING=true`
+- `REALTIME_BUY_ENABLED=true`
+- `REALTIME_MODEL_AUXILIARY_ONLY=true`
+- `REALTIME_ALLOW_LOSS_EXIT=true`
 - `ONTOLOGY_ACCELERATOR=NPU`
 - OpenVINO/NPU low-latency hints with CPU fallback
 - small LLM event-classification limits for responsive refreshes
 
 If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded local model. Otherwise it checks for an Ollama-compatible local server at `127.0.0.1:11434`; if unavailable, event classification falls back to deterministic keyword rules.
 
-On server startup, realtime collection/learning starts automatically when `AUTO_START_LIVE_WORKER=true` (default). A read-only KIS live-readiness account check also runs automatically when `AUTO_START_LIVE_READINESS=true` (default). The UI therefore exposes only the user-facing trading controls: target return, target time, paper trading, and the guarded live-trading gate.
+On server startup, KIS realtime collection, periodic short-horizon model training, live account refresh, and the independent realtime trading loop start automatically. The account dashboard is the primary operating surface.
 
 ## KIS Developers Broker Adapter
 
@@ -145,11 +256,11 @@ This framework does not guarantee profit or principal preservation under all mar
 
 Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`, parsed with PyYAML. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.
 
-These modules produce `StrategyCandidate` records, not executable orders. Candidates must pass `TradingCostEngine`, ontology risk semantics, `RealityCheckValidator` where required, and the deterministic `RiskManager`/FinalTradeGate path before any order intent can be considered. The default execution mode is `paper_trading`; `live_trading_enabled` is `false`.
+These modules produce `StrategyCandidate` records, not direct broker calls. Candidates must pass `TradingCostEngine`, ontology risk semantics, `RealityCheckValidator` where required, and the deterministic `RiskManager`/FinalTradeGate path before any order intent can be considered. In the current `run.ps1` runtime, live flags are process-enabled, but strategy output still cannot bypass the realtime engine, FinalTradeGate, or `LiveExecutionCoordinator`.
 
 Reality-check reports can feed `StrategyParameterReestimator`, which proposes conservative parameter updates such as higher target net return, tighter spread limits, disabled failed strategies, and the latest validation id. This is parameter governance for an automatic trading program, not a profit guarantee.
 
-The GUI includes a live auto-trading gate beside the paper-trading controls. It stays blocked unless config and environment flags explicitly allow live trading, KIS live account probing succeeds, and the normal strategy, cost, ontology, RiskManager, and FinalTradeGate checks remain intact.
+The GUI includes a live auto-trading path and the `/account` operational dashboard. Live orders are submitted only when config and environment flags allow live trading, KIS live account probing succeeds, and the normal strategy, cost, ontology, `RiskManager`, and FinalTradeGate checks remain intact.
 
 The short-horizon strategies are research infrastructure for paper trading, dry runs, and gated automatic trading. They do not guarantee profits, and passing a backtest or reality check does not imply future performance.
 
@@ -220,10 +331,10 @@ paper_trading   KIS paper-trading API check + local paper buy/sell loop
 paper_trading_test alias for paper_trading
 live_readiness  KIS live-readiness check; no broker orders submitted
 live_trading_test alias for live_readiness
-live_trading    realtime trading gate; brokerage execution remains guarded/blocked
+live_trading    realtime KIS live auto-trading loop; brokerage execution remains guarded by runtime gates
 ```
 
-The UI no longer requires manual learning, refresh, or live-readiness buttons. `learning` and the read-only live-readiness account probe are automatic server-start services; manual mode starts are still available through the API for tests and diagnostics.
+The UI no longer requires manual learning, refresh, or live-readiness buttons. KIS realtime collection, periodic live training, account refresh, and live trading are automatic server-start services in the `run.ps1` runtime; manual mode starts are still available through the API for tests and diagnostics.
 
 The paper-trading loop starts through:
 
@@ -249,12 +360,35 @@ Public/current research sources
   -> goal feasibility and strategy scoring
   -> OrderIntent records
   -> deterministic RiskManager validation
-  -> KIS paper-trading / local paper-trading output
+  -> FinalOrder
+  -> LiveExecutionCoordinator or paper/mock executor
 ```
 
 The first ontology filter screens the full available universe with low-cost quote-like features such as liquidity, volume change, price momentum, foreign/institution flow, halt status, and management-stock status. In offline fixture mode these quote-like values can be synthetic or estimated and are labeled accordingly. Only selected candidates continue to heavier graph/strategy stages, with priority tickers retained for visibility.
 
 The current ontology NPU path is a heuristic fixed linear scorer accelerated by OpenVINO when available. It is not a trained AI model unless a separately trained/exported model is plugged into the inference backend. CPU fallback remains enabled.
+
+## Live Trading Decision Semantics
+
+The independent realtime engine in `src/app/trading/realtime_trading_engine.py` runs every `REALTIME_TRADING_INTERVAL_MS` milliseconds. Each cycle:
+
+1. Reads the latest KIS account snapshot.
+2. Evaluates exits for every holding before evaluating new entries.
+3. Keeps already-open SELL orders unless the replacement limit price changes enough to justify an amend.
+4. Skips BUY entirely when `REALTIME_BUY_ENABLED=false`.
+5. Builds BUY candidates from cached context, fresh realtime symbols, volume-surge discovery, configured symbols, and affordable broker-quote candidates.
+6. Rejects BUY candidates with stale KIS realtime feature inputs, excessive spread, low liquidity, insufficient one-share cash, weak fallback score, missing ontology/runtime confirmation, or model-only support.
+7. Submits only approved `FinalOrder` objects through `LiveExecutionCoordinator`.
+
+Common rejection meanings:
+
+- `HOLD_BELOW_PROFIT_TARGET`: SELL was considered, but expected exit is still below the configured net-profit target after costs.
+- `open_sell_kept`: a SELL order is already open at effectively the same price; no duplicate order is sent.
+- `MODEL_FEATURE_UNAVAILABLE:...QUOTE_STALE,ORDERBOOK_STALE`: the live model cannot score because KIS realtime tick/orderbook inputs are stale or missing.
+- `WIDE_SPREAD:x>ybps`: current spread is wider than the adaptive policy allows.
+- `LOW_LIQUIDITY`: candidate liquidity is too thin for reliable execution.
+- `FALLBACK_SCORE_BELOW_THRESHOLD`: rule/ontology fallback score is below the adaptive buy threshold.
+- `INSUFFICIENT_CASH_FOR_ONE_SHARE`: available currency cash is below one-share cost plus buffer.
 
 ## Resource Profile
 

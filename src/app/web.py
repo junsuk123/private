@@ -1123,6 +1123,7 @@ def research_diagnostics() -> JSONResponse:
             "graph_triples_count": _graph_triples_count(snapshot, context),
             "reasoning_paths": context.reasoning_paths[:25],
             "ontology_runtime": context.ontology_runtime.as_dict(),
+            "semantic_layer": _semantic_layer_diagnostics(context),
             "updated_at": _iso_or_none(snapshot["last_updated"]),
             "last_error": snapshot["last_error"],
             "is_refreshing": snapshot["is_refreshing"],
@@ -5486,6 +5487,81 @@ def _graph_payload(context: Any) -> dict[str, Any]:
         "candidate_selection": _candidate_selection_payload(getattr(context, "candidate_selection", None)),
         "parameter_tuning": tuple(getattr(context, "parameter_tuning", ()) or ()),
         "temporal_frame_count": len(tuple(getattr(context, "temporal_frames", ()) or ())),
+        # Additive standards-based RDF/OWL/SHACL view. Separates asserted from
+        # inferred triples and reports SHACL validation. Never replaces the
+        # fields above; the GUI renders it in its own diagnostic panel.
+        "semantic_layer": _semantic_layer_payload(context),
+    }
+
+
+def _semantic_layer_diagnostics(context: Any) -> dict[str, Any] | None:
+    """Compact (graph-free) semantic-layer summary for the diagnostics panel."""
+    layer = getattr(context, "ontology_layer", None)
+    if layer is None:
+        return None
+    try:
+        data = layer.as_dict()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    validation = data.get("validation", {}) or {}
+    return {
+        "ok": data.get("ok", True),
+        "errors": data.get("errors", []),
+        "reasoning_profile": data.get("reasoning_profile"),
+        "counts": data.get("counts", {}),
+        "timings_ms": data.get("timings_ms", {}),
+        "validation": {
+            "mode": validation.get("mode"),
+            "conforms": validation.get("conforms"),
+            "blocking": validation.get("blocking"),
+            "violation_count": len(validation.get("violations", []) or []),
+            "violations": (validation.get("violations", []) or [])[:25],
+            "error": validation.get("error"),
+        },
+    }
+
+
+def _semantic_layer_payload(context: Any, *, node_limit: int = 400, link_limit: int = 500) -> dict[str, Any] | None:
+    """Compact GUI payload for the RDF/OWL/SHACL ontology layer.
+
+    Returns None when the layer is disabled/unavailable. Asserted and inferred
+    triples are separated, SHACL results are kept apart from OWL results, and
+    the semantic graph is trimmed so the GUI never receives oversized payloads.
+    """
+    layer = getattr(context, "ontology_layer", None)
+    if layer is None:
+        return None
+    try:
+        data = layer.as_dict()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    graph = data.get("graph") or {}
+    nodes = list(graph.get("nodes", []))[:node_limit]
+    links = list(graph.get("links", []))[:link_limit]
+    inferred_types = data.get("inferred_types", {}) or {}
+    return {
+        "ok": data.get("ok", True),
+        "errors": data.get("errors", []),
+        "reasoning_profile": data.get("reasoning_profile"),
+        "counts": data.get("counts", {}),
+        "timings_ms": data.get("timings_ms", {}),
+        # OWL logical results (kept separate from Python policy scores).
+        "owl": {
+            "inferred_types": dict(list(inferred_types.items())[:node_limit]),
+            "inferred_type_count": len(inferred_types),
+        },
+        # SHACL validation (rendered in the diagnostic/log section, not the
+        # primary portfolio view).
+        "validation": data.get("validation", {}),
+        # Frames for grouped visualization: asset facts / evidence / signals /
+        # risk / inferred classes / validation.
+        "graph": {
+            "nodes": nodes,
+            "links": links,
+            "truncated": len(graph.get("nodes", [])) > node_limit or len(graph.get("links", [])) > link_limit,
+            "node_count": len(graph.get("nodes", [])),
+            "link_count": len(graph.get("links", [])),
+        },
     }
 
 
@@ -5502,6 +5578,7 @@ def _empty_graph_payload(snapshot: dict[str, Any] | None = None) -> dict[str, An
         "candidate_selection": None,
         "parameter_tuning": (),
         "temporal_frame_count": 0,
+        "semantic_layer": None,
         "warming": True,
         "is_refreshing": bool(snapshot.get("is_refreshing")),
         "last_error": snapshot.get("last_error"),
