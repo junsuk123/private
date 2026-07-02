@@ -741,12 +741,12 @@ class ProfitTurnoverExitTest(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIsNone(result.final_order)
 
-    def test_profit_time_exit_realizes_small_net_winner_after_window(self) -> None:
+    def test_profit_time_exit_realizes_meaningful_net_winner_after_window(self) -> None:
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         now = datetime.now(timezone.utc)
         holding = Holding(
             ticker="005930", market="KR", company_name="Samsung", sector="Tech",
-            quantity=10, average_price=100.0, last_price=100.5,  # +0.5% gross, small net winner
+            quantity=10, average_price=100.0, last_price=100.7,  # +0.7% gross -> ~0.4% net, clears the floor
             opened_at=now - timedelta(seconds=600),
         )
         with patch.dict("os.environ", {
@@ -754,11 +754,46 @@ class ProfitTurnoverExitTest(unittest.TestCase):
             "REALTIME_PROFIT_TIME_EXIT_SEC": "300",
         }):
             result = engine.evaluate_exit_for_holding(
-                holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01, decision_time=now
+                holding, _account(holding, cash=1_000_000.0), take_profit=0.02, stop_loss=0.01, decision_time=now
             )
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.final_order.side, OrderSide.SELL)
         self.assertTrue(any(code.startswith("profit_time_exit") for code in result.reason_codes), result.reason_codes)
+
+    def test_near_breakeven_position_is_not_churned(self) -> None:
+        # A position only marginally above cost (net < min floor) must NOT be sold:
+        # churning it at ~break-even bleeds fees and erodes total assets.
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        now = datetime.now(timezone.utc)
+        holding = Holding(
+            ticker="005930", market="KR", company_name="Samsung", sector="Tech",
+            quantity=10, average_price=100.0, last_price=100.4,  # +0.4% gross -> ~0.1% net (below 0.3% floor)
+            opened_at=now - timedelta(seconds=600),
+        )
+        result = engine.evaluate_exit_for_holding(
+            holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01, decision_time=now
+        )
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
+
+    def test_hard_stop_cuts_catastrophic_loser_even_when_loss_exit_disabled(self) -> None:
+        # Capital circuit-breaker: a catastrophic loser is cut to protect total assets,
+        # even though routine loss exits are disabled by default.
+        engine = _engine(price=94.0)  # -6% vs avg 100, past the -5% hard stop
+        holding = _holding(100.0)
+        result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertEqual(result.final_order.quantity, 10)
+        self.assertTrue(any(code.startswith("hard_stop_loss") for code in result.reason_codes), result.reason_codes)
+
+    def test_hard_stop_can_be_disabled(self) -> None:
+        engine = _engine(price=94.0)  # -6%
+        holding = _holding(100.0)
+        with patch.dict("os.environ", {"REALTIME_HARD_STOP_LOSS": "0"}):
+            result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
 
     def test_profit_lock_sells_on_giveback_from_peak(self) -> None:
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())

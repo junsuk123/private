@@ -727,6 +727,16 @@ class SharedLiveDecisionEngine:
         lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.006))
         lock_giveback = min(0.95, max(0.0, _env_float("REALTIME_PROFIT_LOCK_GIVEBACK", 0.35)))
         profit_time_exit_sec = max(0.0, _env_float("REALTIME_PROFIT_TIME_EXIT_SEC", 300.0))
+        # Every profit-motivated exit must lock a MEANINGFUL net gain (after the full
+        # round-trip cost), never churn a ~break-even position. This is the key guard
+        # against fee/slippage bleed: without it, the cost-aware target is ~break-even
+        # gross, so routine profit exits realize ~0 net and erode total assets.
+        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.003))
+        # Always-on capital circuit-breaker: cap how far a single position may bleed,
+        # INDEPENDENT of REALTIME_ALLOW_LOSS_EXIT. Routine small dips are still held
+        # (per the no-loss-exit design), but a catastrophic loser is cut so unbounded
+        # unrealized losses cannot ratchet total assets down. Set to 0 to disable.
+        hard_stop_loss = max(0.0, _env_float("REALTIME_HARD_STOP_LOSS", 0.05))
         held_age_seconds: float | None = None
         opened_at = getattr(holding, "opened_at", None)
         if opened_at is not None:
@@ -758,15 +768,25 @@ class SharedLiveDecisionEngine:
             profit_time_exit_sec > 0.0
             and held_age_seconds is not None
             and held_age_seconds >= profit_time_exit_sec
-            and net_pnl_rate > max(0.0, target_net_return)
+            and net_pnl_rate >= max(min_net_profit_exit, target_net_return)
         ):
-            # Turnover pressure: realize a net-profitable position held past the
-            # short profit-turnover window instead of waiting the full time-exit.
+            # Turnover pressure: realize a MEANINGFULLY net-profitable position held
+            # past the short window. Requires >= min_net_profit_exit so it never
+            # churns a break-even position (which would just bleed round-trip cost).
             exit_reason = f"profit_time_exit:{net_pnl_rate * 100:.2f}%"
         elif profitable_after_cost and ontology_score <= -0.55:
+            # Strong ontology sell signal on a net-profitable position — risk-driven,
+            # allowed at any positive net.
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
-        elif profitable_after_cost and pnl_rate >= required_exit_return:
+        elif profitable_after_cost and pnl_rate >= required_exit_return and net_pnl_rate >= min_net_profit_exit:
+            # Routine profit target reached AND it clears a meaningful net gain.
+            # The net floor prevents selling at ~break-even (fee/slippage churn).
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
+        elif hard_stop_loss > 0.0 and pnl_rate <= -hard_stop_loss:
+            # Capital circuit-breaker — fires regardless of REALTIME_ALLOW_LOSS_EXIT.
+            # Cutting a catastrophic loser protects total assets from unbounded
+            # drawdown; realizing a bounded loss is better than holding into a larger one.
+            exit_reason = f"hard_stop_loss:{pnl_rate * 100:.2f}%"
         elif pnl_rate <= -exit_policy.stop_loss and not loss_exit_allowed:
             diagnostics = {"exit_policy": exit_policy.as_dict(), "policy": policy.as_dict(), "policy_state": policy_diag, "quote_age_seconds": round(quote_age_seconds, 3), "ontology_score": round(ontology_score, 4)}
             reasons = ("LOSS_EXIT_DISABLED", "HOLD_LOSS_EXIT_DISABLED", "REALTIME_ALLOW_LOSS_EXIT=false")
