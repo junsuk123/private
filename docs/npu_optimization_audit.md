@@ -1,5 +1,9 @@
 # NPU and Realtime Hot Path Optimization Audit
 
+## Current Runtime Note
+
+This audit predates the current guarded live runtime. NPU/CPU ontology acceleration remains an evidence and screening layer only. In the current `run.ps1` flow, live order submission still requires the realtime trading engine, `SharedLiveDecisionEngine`, deterministic `RiskManager`, FinalTradeGate, and `LiveExecutionCoordinator`; NPU scoring cannot submit orders directly.
+
 This audit corresponds to the performance/engineering notes in `ontology base trading system diagram.png`: vectorized universe screening, optional Rust/PyO3 native screening, top-k-only materialization, rolling feature cache targets, typed storage, and CPU/NPU separated timing profiles.
 
 ## Applied
@@ -20,8 +24,8 @@ This audit corresponds to the performance/engineering notes in `ontology base tr
 
 - Screening and NPU outputs remain evidence only.
 - They do not submit orders.
-- Orders still require strategy construction, `RiskManager`, final gates, and manual approval.
-- Live trading remains disabled by default.
+- Orders still require strategy construction, `RiskManager`, final gates, and live execution coordinator approval.
+- Live trading is available only through the guarded realtime engine; NPU output is never an execution path.
 - Production/realtime indicator paths do not promote `reference:`, `sample-indicator:`, or `demo-indicator:` source ids as trusted evidence.
 - Demo/offline sample indicators are only enabled through explicit demo context wiring.
 

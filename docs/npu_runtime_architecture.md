@@ -10,11 +10,11 @@ The repository-level flow diagram is `ontology base trading system diagram.png`.
 | Hard filter | CPU | Trading halt, management stock, liquidity, invalid data, and deterministic rejects. |
 | Candidate scoring | NPU with CPU fallback | Vectorized float32 evidence scoring and top-k ranking. |
 | Event classification | NPU/CPU fallback | Lightweight labels and sentiment evidence; keyword fallback by default. |
-| Short-horizon prediction | NPU/CPU fallback | Optional evidence provider, disabled by default. |
+| Short-horizon prediction | NPU/CPU fallback | Optional evidence provider; in the current `run.ps1` runtime the live model may be active, but it remains auxiliary evidence. |
 | Ontology graph reasoning | CPU | Explanation and reasoning trace construction. |
 | Strategy decision | CPU | Converts evidence into candidate intents. |
 | RiskManager | CPU | Mandatory final validation for all trade intents. |
-| Execution | CPU | Only approved/manual orders reach broker adapters. |
+| Execution | CPU | Only approved `FinalOrder` objects submitted through `LiveExecutionCoordinator` reach broker adapters. |
 
 ## Environment Controls
 
@@ -24,7 +24,7 @@ The repository-level flow diagram is `ontology base trading system diagram.png`.
 - `ONTOLOGY_NPU_TOP_K`: max candidate count passed to graph reasoning, default `50`.
 - `EVENT_CLASSIFIER_PROVIDER`: `keyword`, `openvino`, or `llm`; default `keyword`.
 - `EVENT_CLASSIFIER_DEVICE`: `AUTO`, `NPU`, or `CPU`.
-- `SHORT_HORIZON_PREDICTOR_ENABLED`: default `false`.
+- `SHORT_HORIZON_PREDICTOR_ENABLED`: enables the optional short-horizon evidence provider. The current live runtime can also use the live-trained model path when the latest artifact is eligible.
 - `SHORT_HORIZON_PREDICTOR_DEVICE`: `AUTO`, `NPU`, or `CPU`.
 - `ONTOLOGY_GRAPH_SCOPE`: `candidate_only`, `candidate_and_holdings`, or `full_debug`.
 

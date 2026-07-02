@@ -2,36 +2,35 @@
 
 This document summarizes the current algorithmic design implemented under `src/app`.
 
-The system is a safe realtime-only investment research, learning, hypothetical-testing, paper-trading, and readiness-check framework. It combines public research collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, goal feasibility scoring, deterministic strategy generation, deterministic risk validation, mock KIS paper trading, KIS paper/live-readiness boundaries, realtime hypothetical testing, and in-memory paper-trading simulation. Live automated trading is intentionally disabled.
+The system is a safe realtime-only investment research, learning, paper-trading, account-monitoring, and guarded KIS live auto-trading framework. It combines public research collection, KIS realtime tick/orderbook collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, live feature/model scoring, deterministic strategy generation, deterministic risk validation, mock/KIS paper trading, and guarded KIS live limit-order execution.
 
 ![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
 
 ## 1. Top-Level Flow
 
 ```text
-Research sources
-  -> event/market/macro normalization
+Research + KIS account + KIS realtime ticks/orderbooks + KIS broker quotes
   -> data/store SQLite persistence
-  -> analysis context
-  -> ontology_filter_1 candidate screening
+  -> account dashboard and minute asset history
+  -> live feature frames and live short-horizon artifacts
+  -> ontology_filter_1 and realtime candidate discovery
   -> indicators + time-synchronized frames
-  -> ontology graph
-  -> reasoning paths
-  -> strategy signals
-  -> order intents
-  -> deterministic risk validation
-  -> mock KIS / KIS paper-readiness / realtime hypothetical test / paper-trading simulation / UI output
+  -> ontology graph and reasoning paths
+  -> SharedLiveDecisionEngine
+  -> deterministic RiskManager / FinalTradeGate
+  -> mock/paper executor or LiveExecutionCoordinator
+  -> KIS live limit orders, open-order keep/amend, UI/audit output
 ```
 
 Primary entry points:
 
 - `run.py`: inserts `src` into `sys.path` and calls `app.run.main`.
 - `src/app/run.py`: performs startup checks, resolves port behavior, and starts `uvicorn app.web:app`.
-- `run.ps1`: starts a strict local app server on port `8010`, applies safe realtime/NPU defaults, and opens a managed browser.
+- `run.ps1`: starts a strict local app server on port `8010`, applies current live realtime/NPU defaults, opens `/account`, and stops the server when the managed browser closes.
 - `src/app/web.py`: FastAPI web UI and API orchestration.
 - `src/app/cli.py`: demo, research, accelerated-demo, and synthetic-data commands.
 
-Default web startup also starts realtime collection/learning and a read-only KIS live-readiness account probe. The UI keeps manual choices focused on target return, target time, paper trading, and the guarded live-trading gate.
+Default `run.ps1` startup also starts KIS realtime collection, periodic live training, a read-only KIS account probe, and the independent realtime trading engine. `/account` is the primary operations dashboard.
 
 ## 2. Data Collection Algorithm
 
@@ -413,7 +412,7 @@ Implemented in `src/app/risk/manager.py`.
 Checks:
 
 - LLM direct order execution blocked
-- live trading disabled
+- live trading enabled only through guarded runtime gates
 - action is BUY, SELL, or REDUCE
 - only limit order mode
 - daily loss limit
@@ -454,7 +453,7 @@ sell_value = max(0, current_value - target_value) for REDUCE
 quantity = floor(sell_value / last_price)
 ```
 
-Quantity `<= 0` is rejected. Approved orders are `LIMIT` orders with `manual_approval_required=True`.
+Quantity `<= 0` is rejected. Approved live orders are `LIMIT` `FinalOrder` objects and must pass `LiveExecutionCoordinator`.
 
 ## 11. Mock KIS Trading Algorithm
 
@@ -503,7 +502,7 @@ The adapter implements the KIS Developers domestic cash-stock REST contract behi
 - order-status polling with `VTTC8001R` or `TTTC8001R`
 - balance lookup with `VTTC8434R` or `TTTC8434R`
 
-`KIS_PAPER_TRADING=true` selects the virtual domain. `KIS_LIVE_ENABLED=false` blocks order, status, and account calls by default. `scripts/check_kis_connection.py` can issue a token-only check or a read-only balance check with `--account`.
+`KIS_PAPER_TRADING=true` selects the virtual domain. `KIS_LIVE_ENABLED=false` blocks order, status, and account calls; the current `run.ps1` live runtime explicitly sets `KIS_LIVE_ENABLED=true` and relies on the realtime engine, source freshness checks, `RiskManager`, FinalTradeGate, and `LiveExecutionCoordinator` for the live order boundary. `scripts/check_kis_connection.py` can issue a token-only check or a read-only balance check with `--account`.
 
 ## 12. Realtime Learning and Testing Algorithms
 
@@ -681,8 +680,8 @@ The system is designed so that:
 - Event LLM output is strict JSON and falls back to keyword rules.
 - `OrderIntent` must pass `RiskManager`.
 - `FinalOrder` is always a limit order.
-- `manual_approval_required=True` is retained.
-- live trading is disabled by default.
+- live `FinalOrder` submission remains coordinator-gated.
+- live trading is enabled only in the guarded `run.ps1` runtime.
 - restricted products are blocked.
 - hypothetical testing reports zero broker orders.
 - paper-trading simulation changes only in-memory simulated state.

@@ -4,6 +4,10 @@ The semantic feature layer is present as an extensible analysis/modeling layer. 
 
 The repository-level diagram `ontology base trading system diagram.png` summarizes where this layer fits: feature engineering feeds candidate filtering, evidence scoring, ontology reasoning, strategy construction, and finally the deterministic risk gate.
 
+## Current Runtime Note
+
+The current `run.ps1` runtime also starts a separate guarded live auto-trading loop. That loop uses KIS realtime feature frames, the live short-horizon model, ontology/runtime evidence, `RiskManager`, and `LiveExecutionCoordinator`. Semantic feature outputs are advisory/enrichment inputs and cannot directly submit live broker orders.
+
 ## Existing Integration Points
 
 - `src/app/data/`: read-only public/sample collectors and raw archive helpers.
@@ -15,7 +19,7 @@ The repository-level diagram `ontology base trading system diagram.png` summariz
 - `src/app/goals/`: target feasibility scoring and compromise goal generation.
 - `src/app/strategy/`: rule-based and goal-directed signal generation from indicators and graph relations.
 - `src/app/risk/`: deterministic risk manager that gates every `OrderIntent` before any final order.
-- `src/app/execution/`: paper/mock broker boundary; live KIS client remains disabled by default.
+- `src/app/execution/`: paper/mock broker boundary plus guarded live KIS client and `LiveExecutionCoordinator`.
 - `src/app/trading/`: mock program cycle using LLM-style judgment, ontology evidence, risk validation, and mock execution.
 - `src/app/backtesting/streaming_demo.py`: in-memory stepwise simulation with target return and target minutes.
 - `src/app/realtime/learning.py`: realtime supervised example creation and hypothetical testing with zero submitted orders.
@@ -33,7 +37,7 @@ The repository-level diagram `ontology base trading system diagram.png` summariz
 
 ## Safety Notes
 
-Live trading remains disabled by default. The new modules generate analysis records, graph triples, reasoning paths, and model rows only. They do not call brokerage APIs or create executable orders.
+Semantic feature modules generate analysis records, graph triples, reasoning paths, and model rows only. They do not call brokerage APIs or create executable orders. Live execution, when enabled by `run.ps1`, happens only through the guarded realtime engine and `LiveExecutionCoordinator`.
 
 Realtime testing remains hypothetical and reports `orders_submitted = 0`. Streaming simulation remains bounded to in-memory mock state and updates simulated cash, holdings, trades, progress, and return rate only.
 

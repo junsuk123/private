@@ -2,6 +2,19 @@
 
 Generated for the backend-only KIS domestic cash-stock conversion task.
 
+## Current Status Note
+
+This audit is historical. The current `run.ps1` runtime has progressed beyond the original conversion blocker list:
+
+- KIS realtime tick/orderbook collection exists.
+- Live feature frames and live short-horizon artifacts exist.
+- `SharedLiveDecisionEngine` joins model, ontology, broker quote, spread/liquidity, cash, cost, and risk checks.
+- `RealtimeTradingEngine` runs automatically when `AUTO_START_REALTIME_TRADING=true`.
+- `LiveExecutionCoordinator` can submit guarded live KIS limit orders when runtime gates pass.
+- `/account` exposes live account state, decision flow, rejection reasons, BUY-disable termination, and asset history.
+
+Remaining operational risks still include broker/network reconciliation, stale feature inputs, thin liquidity, wide spreads, and order-status recovery after unknown outcomes.
+
 ## Current Backend Inventory
 
 Already present:

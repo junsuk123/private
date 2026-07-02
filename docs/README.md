@@ -2,11 +2,25 @@
 
 ![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
 
-The diagram above is the canonical repository-level overview: trusted market and broker data enter validation/storage, become quantitative and semantic features, pass candidate filtering and evidence scoring, then flow through ontology reasoning, strategy construction, deterministic risk validation, controlled paper/live-readiness execution, and post-trade feedback.
+The diagram above is the canonical repository-level overview: trusted market and broker data enter validation/storage, become quantitative and semantic features, pass candidate filtering and evidence scoring, then flow through ontology reasoning, strategy construction, deterministic risk validation, controlled paper/live execution, and post-trade feedback.
+
+## Current Runtime Summary
+
+The current `run.ps1` runtime is a KIS live-capable realtime trading system. It opens `/account`, starts KIS realtime collection, starts periodic short-horizon model retraining, starts the independent realtime trading loop, and keeps deterministic execution gates mandatory.
+
+The live loop is conservative:
+
+- SELL/REDUCE is evaluated before BUY.
+- Existing open SELL orders are kept unless an amend is materially useful.
+- BUY is skipped when `REALTIME_BUY_ENABLED=false`.
+- The live ML model is advisory only when `REALTIME_MODEL_AUXILIARY_ONLY=true`.
+- BUY requires cash, quote freshness, acceptable spread/liquidity, ontology/runtime support, and final risk approval.
+- The `/account` termination button disables BUY, submits profit-seeking liquidation SELL orders when live gates pass, then schedules server shutdown.
 
 ## Core Architecture
 
 - `architecture.md`: runtime modules, API surfaces, operation modes, and deterministic safety boundaries.
+- `live_trading_runbook.md`: current live operating procedure, status checks, termination behavior, and stall diagnosis.
 - `system_algorithm_analysis.md`: algorithm-by-algorithm implementation map under `src/app`.
 - `data_environment_separation.md`: realtime-only data layout and synthetic-data rejection rules.
 - `realtime_short_horizon_policy.md`: low-latency realtime learning, paper-trading, and readiness behavior.
@@ -27,4 +41,4 @@ The diagram above is the canonical repository-level overview: trusted market and
 
 ## Runtime Defaults
 
-The web server now starts realtime collection/learning automatically and launches a read-only KIS live-readiness account check on startup. The UI keeps only the user-facing goal and trading controls; account basis, simulation initial cash, and profit-gain scaling are computed automatically from the live account/readiness state and target settings.
+The web server now starts KIS realtime collection, account refresh, live training, and the realtime trading engine automatically. The account dashboard is the primary control surface for holdings, cash, asset history, decision flow, rejection reasons, and program termination.

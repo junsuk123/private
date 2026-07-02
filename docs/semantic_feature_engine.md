@@ -4,7 +4,12 @@ This guide covers the semantic feature subsystem under `src/app/features`. It is
 
 For the full repository flow, see `ontology base trading system diagram.png`. This guide mainly expands the diagram's feature-engineering and ontology/graph-reasoning stages.
 
-The current web dashboard still uses the lighter `IndicatorSnapshot` decision path as its primary production path. Before that path runs, the current pipeline also applies `ontology_filter_1` from `src/app/trading_pipeline.py` to screen the broad universe with low-cost liquidity, momentum, flow, halt-status, and management-status features. The semantic feature modules are the planned richer replacement/enrichment layer for later stages, not the only source of live dashboard decisions today.
+The current runtime has two feature paths:
+
+- The broader research/dashboard path still uses the lighter `IndicatorSnapshot` plus `ontology_filter_1` for broad universe screening.
+- The live auto-trading path uses `LiveFeatureFrameBuilder` and `LIVE_SHORT_HORIZON_SCHEMA` for short-horizon model inference, then combines that with ontology/runtime evidence in `SharedLiveDecisionEngine`.
+
+The semantic feature modules remain enrichment infrastructure; they do not bypass the realtime engine, `RiskManager`, or live execution gates.
 
 ## Add a New Raw Indicator
 
@@ -177,4 +182,4 @@ semantic feature
   -> mock/paper FinalOrder only
 ```
 
-Live automated execution remains disabled. Realtime learning and hypothetical testing write artifacts to `data/models`, but simulated artifacts are refused by the active realtime model store.
+Semantic feature code does not execute live orders. Realtime learning and hypothetical testing write artifacts to `data/models`, simulated artifacts are refused by the active realtime model store, and live execution is handled only by the guarded realtime trading engine.

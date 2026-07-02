@@ -1,7 +1,14 @@
 # Live Trading Setup
 
-This repository is fail-closed. Real KIS orders are blocked unless all live flags,
-manual arming, KIS health checks, and backend approval gates pass.
+This repository is fail-closed at the order boundary. The current `run.ps1` runtime enables live process flags and starts the realtime trading engine automatically, but real KIS orders are still blocked unless all live flags, KIS health checks, runtime guards, idempotency, source freshness, cost/risk checks, and backend approval gates pass.
+
+For day-to-day operation, prefer:
+
+```powershell
+.\run.ps1
+```
+
+Then use `http://127.0.0.1:8010/account` as the primary dashboard.
 
 ## Setup
 
@@ -87,10 +94,13 @@ $env:KILL_SWITCH_ENABLED="false"
 
 ## Current Status
 
-Dry-run and guarded execution primitives are available. The true live loop remains
-blocked until live KIS WebSocket network connection/reconnect handling, real
-historical/realtime outcome datasets, tradable-universe/session gates, and a recent
-full readiness report are available.
+Guarded live execution is available in the local `run.ps1` runtime. The realtime loop:
 
-No code in this repository guarantees profit or capital protection. The controls are
-engineering gates only.
+- reads KIS account state
+- evaluates exits before entries
+- uses KIS realtime ticks/orderbooks and broker quote refresh
+- trains and validates live short-horizon artifacts in the background
+- treats the live model as auxiliary
+- submits only approved limit `FinalOrder` objects through `LiveExecutionCoordinator`
+
+Execution should still be treated as experimental and conservative. No code in this repository guarantees profit or capital protection. The controls are engineering gates only.

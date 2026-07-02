@@ -1,6 +1,6 @@
 # Realtime Short-Horizon Policy
 
-The realtime layer is optimized for responsive UI actions, short-horizon diagnostics, hypothetical testing, and safe local learning. It uses one realtime data environment and never submits automatic live broker orders.
+The realtime layer is optimized for responsive UI actions, short-horizon diagnostics, safe local learning, and guarded KIS live auto-trading. It uses one realtime data environment and submits live broker orders only through deterministic gates.
 
 See `ontology base trading system diagram.png` for the repository-level flow from trusted data inputs through candidate scoring, ontology reasoning, risk validation, paper/live-readiness execution, and feedback.
 
@@ -38,7 +38,7 @@ The current `OperationModeManager` supports:
 - `testing`: backward-compatible legacy paper-trading replay.
 - `paper_trading` / `paper_trading_test`: KIS paper-trading API check plus local paper-trading flow.
 - `live_readiness` / `live_trading_test`: KIS live-readiness/authentication check without broker orders.
-- `live_trading`: realtime trading gate; automatic execution remains guarded/blocked.
+- `live_trading`: realtime KIS live auto-trading loop; execution remains guarded by runtime, KIS, source, cost, risk, idempotency, and kill-switch gates.
 
 All modes use:
 
@@ -49,11 +49,13 @@ data/models
 
 Synthetic and simulation rows are not valid inputs for learning, testing, or live trading.
 
-Default web startup behavior:
+Default `run.ps1` startup behavior:
 
-- Realtime collection/learning starts automatically when `AUTO_START_LIVE_WORKER=true`.
+- KIS realtime tick/orderbook collection starts automatically when `AUTO_START_KIS_REALTIME_COLLECTOR=true`.
+- Periodic live short-horizon model training starts automatically when `AUTO_START_LIVE_TRAINING=true`.
+- The independent realtime trading engine starts automatically when `AUTO_START_REALTIME_TRADING=true`.
 - A read-only KIS live-readiness account check starts automatically when `AUTO_START_LIVE_READINESS=true`.
-- The UI intentionally removes manual learning, refresh, and live-readiness buttons. Users set only target return/time and choose paper trading or the guarded live-trading gate.
+- The `/account` dashboard becomes the primary control surface for account state, asset history, realtime decision flow, rejection reasons, and termination.
 
 ## Learning Behavior
 
@@ -71,6 +73,31 @@ The learning loop can still be stopped through the API for diagnostics:
 ```text
 POST /api/operation-mode/stop-learning
 ```
+
+## Live Trading Behavior
+
+The independent realtime trading engine is implemented in `src/app/trading/realtime_trading_engine.py`.
+
+Each cycle:
+
+1. Reads a KIS account snapshot.
+2. Evaluates SELL/REDUCE for holdings first.
+3. Keeps existing open SELL orders when the replacement price is effectively unchanged.
+4. Evaluates BUY candidates only if `REALTIME_BUY_ENABLED=true`.
+5. Uses `SharedLiveDecisionEngine` for model/ontology/runtime evaluation.
+6. Submits approved `FinalOrder` objects through `LiveExecutionCoordinator`.
+
+BUY is intentionally rejected when:
+
+- the model feature frame is unavailable or stale
+- broker quote cash is insufficient for one share plus buffer
+- spread exceeds adaptive max spread
+- liquidity is thin
+- fallback score is below the adaptive threshold
+- ontology/runtime confirmation is missing
+- model-only support is present while `REALTIME_MODEL_AUXILIARY_ONLY=true`
+
+SELL/REDUCE can be triggered by profit target, trailing/loss exit, domestic drawdown, emergency exit, concentration reduction, and time/quote policies.
 
 ## Paper-Trading and Readiness Behavior
 
@@ -129,4 +156,4 @@ Current guardrails:
 - SELL/REDUCE intents are ranked before BUY intents in streaming simulation.
 - High volatility, insufficient liquidity, duplicate orders, cash reserve, and sector exposure can block orders.
 - Final streaming step liquidates remaining simulated holdings.
-- Live automatic execution remains disabled.
+- Live automatic execution is available only in the guarded `live_trading` runtime and remains subject to the same risk/freshness/cost controls.

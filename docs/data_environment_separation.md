@@ -65,7 +65,7 @@ The web UI exposes these operation modes through `OperationModeManager`:
 - `paper_trading_test`: alias for KIS paper-trading checks.
 - `live_readiness`: KIS live-readiness/authentication check; no orders are submitted.
 - `live_trading_test`: alias for live-readiness checks.
-- `live_trading`: realtime trading gate; live brokerage execution remains guarded and blocked by default app flow.
+- `live_trading`: realtime KIS live auto-trading loop; live brokerage execution remains guarded by runtime, KIS, source, cost, risk, idempotency, and kill-switch gates.
 
 All modes use the unified realtime store:
 
@@ -79,7 +79,7 @@ The runtime policy exposed in `/api/research/diagnostics` states:
 Learning, paper trading, live-readiness checks, and live trading all use the unified realtime data store only.
 ```
 
-In the default web runtime, realtime collection/learning and the read-only KIS live-readiness account probe start automatically with the server. The UI no longer exposes separate manual learning, refresh, or live-readiness buttons.
+In the default `run.ps1` runtime, KIS realtime collection, periodic live training, account refresh, and the independent realtime trading engine start automatically with the server. The UI no longer exposes separate manual learning, refresh, or live-readiness buttons; `/account` is the primary operations dashboard.
 
 ## Paper-Trading Simulation
 
@@ -107,4 +107,4 @@ status = expired
 - Do not copy synthetic rows into `data/store`.
 - Do not save simulated model artifacts into `data/models`.
 - Treat paper-trading simulation state as temporary in-memory state.
-- Treat `live_trading` as a guarded/manual approval boundary, not automatic execution.
+- Treat `live_trading` as guarded automatic live execution. Never bypass source freshness, risk, cost, idempotency, KIS health, or kill-switch gates.

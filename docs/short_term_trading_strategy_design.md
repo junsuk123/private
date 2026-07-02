@@ -1,48 +1,61 @@
-# 단기매매 전략 설계 및 통합 문서
+# Short-Term Trading Strategy Design
 
-## 개요
+This document connects the literature-based short-term strategy modules to the current guarded KIS live runtime.
 
-이 문서는 논문 기반 단기매매 전략을 현재 시스템에 연결한 구조를 설명한다. 구현된 전략은 직접 주문을 실행하지 않고 `StrategyCandidate`를 만든다. 후보는 `StrategyCandidateFactory`, `TradingCostEngine`, 온톨로지 추론, `RealityCheckValidator`, `RiskManager`를 통과해야 하며 기본 실행 모드는 paper trading 또는 dry run이다.
+The strategy engines do not call brokerage APIs directly. They produce `StrategyCandidate` records that must pass cost checks, ontology/runtime evidence, `RealityCheckValidator` where required, `RiskManager`, FinalTradeGate, and finally `LiveExecutionCoordinator` before a live order can be submitted.
 
-실거래 자동 실행은 기본 비활성화되어 있다. 이 시스템은 연구 및 검증용 인프라이며 수익을 보장하지 않는다.
+## Current Runtime Position
 
-## 반영한 5개 논문
+`run.ps1` starts the local app on `/account` and enables the guarded realtime loop:
 
-- Jegadeesh (1990): 단기 수익률 예측 가능성과 단기 반전
-- Gao, Han, Li, Zhou (2018): 장 초반 수익률 기반 장중 모멘텀
-- Brock, Lakonishok, LeBaron (1992): 이동평균 및 trading range breakout 규칙
-- Gatev, Goetzmann, Rouwenhorst (2006): 가격 경로 유사 페어의 평균회귀
-- Sullivan, Timmermann, White (1999): 데이터 스누핑과 과최적화 방지
+- KIS account, balance, holdings, quotes, and open orders are refreshed into the account dashboard.
+- Live training runs continuously when `AUTO_START_LIVE_TRAINING=true`.
+- The realtime engine runs when `AUTO_START_REALTIME_TRADING=true`.
+- SELL/REDUCE is evaluated before BUY.
+- BUY is skipped when `REALTIME_BUY_ENABLED=false`.
+- Approved live orders are limit `FinalOrder` objects submitted only through `LiveExecutionCoordinator`.
 
-## 전략별 시스템 적용 방식
+The short-term strategy modules are evidence and candidate-generation layers inside this flow. They are not an execution shortcut.
 
-`src/app/strategy/short_horizon.py`에는 세 가지 단기 전략이 있다.
+## Literature Signals
 
-- `ShortTermReversalEngine`: 최근 5분 하락폭이 실현 변동성 대비 충분히 큰 경우 보수적 반등 후보를 만든다.
-- `IntradayMomentumEngine`: `ret_open_30m` 기본값으로 장 초반 수익률, 거래량, 시장 정렬을 확인한다.
-- `TechnicalRuleEngine`: 기존 `sma`를 재사용해 MA crossover를 계산하고, 현재 이후 데이터를 쓰지 않는 rolling high breakout을 확인한다.
+The strategy layer is based on conservative interpretations of:
 
-`src/app/strategy/pairs_relative_value.py`에는 long-only 페어 상대가치 전략이 있다.
+- Jegadeesh (1990): short-horizon return predictability and short-term reversal.
+- Gao, Han, Li, Zhou (2018): first half-hour return and intraday momentum.
+- Brock, Lakonishok, LeBaron (1992): moving-average and trading-range breakout rules.
+- Gatev, Goetzmann, Rouwenhorst (2006): pairs and relative-value mean reversion.
+- Sullivan, Timmermann, White (1999): data-snooping controls and out-of-sample validation.
 
-- `PairUniverseBuilder`: sector/theme/market beta와 normalized price path distance로 유사 페어를 고른다.
-- `PairRelativeValueEngine`: underperformer만 매수 후보로 만들며 공매도, 레버리지, 파생상품은 구현하지 않는다.
+These papers provide hypotheses, not guaranteed alpha. The live system still requires current market data, cost feasibility, liquidity, and risk approval.
 
-## ShortHorizonFeatureBuilder
+## Implemented Engines
 
-`src/app/features/short_horizon_features.py`는 분봉/일봉 기반 피처를 만든다.
+`src/app/strategy/short_horizon.py` contains:
 
-- 시간대별 수익률: `ret_1m`, `ret_3m`, `ret_5m`, `ret_15m`, `ret_30m`, `ret_1d`
-- 장중 수익률: `ret_open_10m`, `ret_open_30m`, `ret_preclose_30m`
-- 리스크/유동성: `realized_volatility_5m`, `realized_volatility_30m`, `volume_zscore`, `spread_rate`, `orderbook_depth_score`, `liquidity_score`
-- 시장/시간: `market_alignment_score`, `time_of_day_weight`
+- `ShortTermReversalEngine`: looks for conservative rebound candidates after recent short-horizon declines.
+- `IntradayMomentumEngine`: uses early-session return features such as `ret_open_30m`.
+- `TechnicalRuleEngine`: evaluates moving-average and breakout-style signals from available rolling features.
 
-`as_of` 이후 데이터는 필터링해 look-ahead bias를 피한다. 데이터 부족은 `None`, `missing_fields`, `is_valid=False`로 드러낸다.
+`src/app/strategy/pairs_relative_value.py` contains:
 
-## StrategyCandidateFactory
+- `PairUniverseBuilder`: selects similar pairs by sector/theme/beta and normalized price path distance.
+- `PairRelativeValueEngine`: long-only relative-value candidate generation for underperformers. It does not implement short selling, leverage, or derivatives.
 
-`src/app/strategy/candidate_factory.py`는 구현된 전략 엔진을 통합 호출한다.
+## Feature Builder
 
-Factory는 각 후보 생성 직후 `TradingCostEngine`을 호출하고 다음 조건을 통과한 후보만 남긴다.
+`src/app/features/short_horizon_features.py` builds minute/day features such as:
+
+- returns: `ret_1m`, `ret_3m`, `ret_5m`, `ret_15m`, `ret_30m`, `ret_1d`
+- opening/pre-close returns: `ret_open_10m`, `ret_open_30m`, `ret_preclose_30m`
+- risk/liquidity: `realized_volatility_5m`, `realized_volatility_30m`, `volume_zscore`, `spread_rate`, `orderbook_depth_score`, `liquidity_score`
+- context: `market_alignment_score`, `time_of_day_weight`
+
+Data after `as_of` is filtered to avoid look-ahead bias. Missing data is represented with `None`, `missing_fields`, and `is_valid=false`.
+
+## Candidate Factory
+
+`src/app/strategy/candidate_factory.py` merges strategy outputs and keeps only candidates that pass cost and feasibility checks:
 
 - `expected_exit_price > 0`
 - `net_expected_return > target_net_return`
@@ -51,7 +64,7 @@ Factory는 각 후보 생성 직후 `TradingCostEngine`을 호출하고 다음 �
 - `spread_rate < max_spread_rate`
 - `liquidity_score > min_liquidity_score`
 
-랭킹은 gross 수익률만 쓰지 않는다.
+Ranking favors net edge after costs:
 
 ```text
 excess_return_after_cost = net_expected_return - target_net_return
@@ -62,17 +75,26 @@ ranking_score = excess_return_after_cost
                 * risk_adjustment
 ```
 
-## TradingCostEngine 연결
+## Cost And Risk Gates
 
-`TradingCostEngine`은 매수/매도 수수료, 매도세, 슬리피지, 스프레드, 시장충격, safety margin을 반영한다. 전략 후보와 RiskManager 모두 이 비용 모델을 사용한다.
+`TradingCostEngine` reflects buy/sell commission, sell tax, slippage, spread, market impact, and safety margin. Both the candidate stage and `RiskManager` use this cost model.
 
-후보 단계에서 비용을 통과해도 주문으로 바로 이어지지 않는다. 최종 주문 후보는 다시 `RiskManager`에서 같은 비용 구조와 계좌/포지션 제한, live 안전장치를 검증받는다.
+A candidate that passes local cost screening still does not become an order. Final executable intent must pass:
 
-## 온톨로지 추론 연결
+- account and position limits
+- positive expected net return after cost
+- break-even plus safety margin
+- spread and liquidity limits
+- ontology/runtime risk tags
+- source freshness and quote/orderbook quality
+- live mode verification and KIS readiness
+- idempotency/open-order checks
 
-`src/app/graph/trading_strategy_semantics.py`는 `StrategyCandidate`와 `RankedStrategyCandidate`의 `ontology_tags`를 `SemanticFeatureRecord`로 변환한다.
+## Ontology Connection
 
-긍정 신호:
+`src/app/graph/trading_strategy_semantics.py` converts ranked candidates and `ontology_tags` into semantic evidence records.
+
+Positive evidence can include:
 
 - `ShortTermReversalBuy`
 - `IntradayMomentumBuy`
@@ -81,7 +103,7 @@ ranking_score = excess_return_after_cost
 - `CostEfficientTrade`
 - `RealityCheckPassed`
 
-위험 신호:
+Risk evidence can include:
 
 - `BidAskBounceRisk`
 - `FalseBreakoutRisk`
@@ -91,27 +113,13 @@ ranking_score = excess_return_after_cost
 - `DataSnoopingRisk`
 - `NoOutOfSampleValidation`
 
-`TradeForbidden`은 `RiskManager`의 `ontology_tags` 차단 흐름으로 전달될 수 있다.
+`TradeForbidden` can be mapped into `RiskManager` rejection through ontology tags.
 
-## RiskManager 및 FinalTradeGate
+## Reality Check
 
-`RiskManager`는 deterministic final gate다. 다음 조건은 후보를 reject한다.
+`src/app/evaluation/reality_check.py` provides `RealityCheckValidator`.
 
-- `expected_exit_price` 누락
-- 비용 차감 후 목표 순수익률 미달
-- break-even 및 safety margin 미달
-- 비용 부담 과다
-- 스프레드/슬리피지 위험
-- live 모드에서 검증 ID 또는 reality check 부재
-- 온톨로지 `TradeForbidden`
-
-이 통합은 `RiskManager` 또는 FinalTradeGate를 우회하지 않는다.
-
-## RealityCheck 및 백테스트 검증
-
-`src/app/evaluation/reality_check.py`는 `RealityCheckValidator`를 제공한다.
-
-검증 지표:
+Validation reports include:
 
 - gross/net total return
 - gross/net win rate
@@ -125,15 +133,13 @@ ranking_score = excess_return_after_cost
 - max drawdown after cost
 - block bootstrap p-value
 
-검증을 통과한 report만 `RealityCheckPassed` 태그를 제공한다. 실패하면 `NoOutOfSampleValidation`, `DataSnoopingRisk`가 붙는다.
+Passing validation can attach `RealityCheckPassed`. Failing validation attaches risk evidence such as `NoOutOfSampleValidation` or `DataSnoopingRisk`.
 
-`StrategyParameterReestimator`는 검증 report를 받아 전략 파라미터 조정안을 만든다. 실패한 전략은 기본적으로 비활성화하고 목표 순수익률을 높이며 스프레드 한도를 더 엄격하게 제안한다. 통과한 전략도 최신 `validation_id`, `requires_reality_check_passed`, 비용 차감 후 성과를 기준으로 보수적인 목표 순수익률을 유지한다.
+## Configuration
 
-## 설정 파일 설명
+The main strategy config is `config/short_horizon_strategies.yaml`.
 
-설정 파일은 `config/short_horizon_strategies.yaml`이며 런타임에서는 PyYAML의 `safe_load`로 읽는다.
-
-주요 섹션:
+Important sections:
 
 - `short_term_reversal`
 - `intraday_momentum`
@@ -144,31 +150,17 @@ ranking_score = excess_return_after_cost
 - `parameter_reestimation`
 - `execution`
 
-기본값은 보수적이다. `execution.live_trading_enabled`는 `false`이고 `execution.default_mode`는 `paper_trading`이다.
+Historical strategy defaults may still describe paper or dry-run execution for isolated strategy tests. The current operational entry point is `run.ps1`, which starts the guarded live-capable realtime engine and keeps the actual broker boundary in `LiveExecutionCoordinator`.
 
-## paper trading 실행 방법
+## Operational Reading
 
-기본 앱 실행:
+Use `/account` as the primary view. When there are no trades, inspect rejection reasons first:
 
-```powershell
-.\run.ps1
-```
+- `MODEL_FEATURE_UNAVAILABLE`: required live model features such as fresh quote/orderbook data are missing.
+- `WIDE_SPREAD`: spread cost is too high for the expected edge.
+- `LOW_LIQUIDITY`: depth/liquidity is not enough for a safe fill.
+- `FALLBACK_SCORE_BELOW_THRESHOLD`: ontology/runtime fallback score is not strong enough.
+- `INSUFFICIENT_CASH_FOR_ONE_SHARE`: available cash cannot buy one share after sizing and price checks.
+- `MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION`: model evidence exists but deterministic confirmation is missing.
 
-paper trading API:
-
-```text
-POST /api/paper-trading/start
-POST /api/paper-trading/step
-```
-
-단기 전략 Factory는 `trading_pipeline.generate_short_horizon_strategy_candidates(...)`를 통해 paper/dry-run 모드로 호출할 수 있다. live trading 모드를 요청해도 설정에서 `live_trading_enabled: false`이면 후보를 반환하지 않는다.
-
-GUI에는 모의 투자와 별도로 `실전 투자` 버튼이 있다. 이 버튼은 자동매매 프로그램의 live gate를 점검하고 활성화 요청을 시작하지만, 주문 안전장치를 우회하지 않는다. 실전 자동매매는 `execution.live_trading_enabled: true`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, KIS 실계좌 연결 확인, RealityCheck, 온톨로지 위험 판단, RiskManager, FinalTradeGate가 모두 충족되어야만 진행 가능한 구조다.
-
-## 한계와 주의사항
-
-- 논문 결과는 한국 개별주에 그대로 확정 적용되는 값이 아니다.
-- beta, threshold, spread, liquidity, target net return은 백테스트와 paper trading으로 재검증해야 한다.
-- 과거 성과와 RealityCheck 통과는 미래 성과를 보장하지 않는다.
-- live trading에는 별도 검증, 계좌/주문 제한, 수동 승인 정책이 필요하며 기본값은 항상 차단이다.
-- 데이터 품질, 지연, 호가 공백, 체결 가능성, 세금/수수료 정책 변경은 실전 결과에 큰 영향을 줄 수 있다.
+These are expected fail-closed behaviors. The goal is not to maximize order count; it is to let through only candidates with current data, feasible execution, and positive expected net return after cost.
