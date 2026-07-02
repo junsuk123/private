@@ -158,6 +158,9 @@ class SharedLiveDecisionEngine:
         self.market_refresher = market_refresher
         self.decision_logger = decision_logger or DecisionLogger()
         self._last_diagnostics: dict[str, Any] = {}
+        # Per-symbol peak net (after-cost) PnL rate, used by the profit-giveback
+        # trailing lock so realized gains are not given back on a stall.
+        self._peak_net_pnl: dict[str, float] = {}
 
     def evaluate_buy(
         self,
@@ -699,9 +702,55 @@ class SharedLiveDecisionEngine:
         domestic_emergency_trigger = -abs(_env_float("REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER", 0.03))
         domestic_concentration_weight = _env_float("REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT", 0.20)
 
+        # --- Turnover-first profit realization ---------------------------------
+        # net_pnl_rate is the gain AFTER the full round-trip cost. All three rules
+        # below only fire when net-profitable, so they never realize a loss and
+        # therefore respect REALTIME_ALLOW_LOSS_EXIT=false. They give the engine a
+        # decisive, NON-chasing reason to lock in gains for fast buy/sell cycling
+        # instead of holding a winner until an ever-rising bar is met.
+        round_trip_cost_rate = float(getattr(cost_floor, "total_cost_rate", 0.0) or 0.0)
+        net_pnl_rate = pnl_rate - round_trip_cost_rate
+        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.004))
+        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.006))
+        lock_giveback = min(0.95, max(0.0, _env_float("REALTIME_PROFIT_LOCK_GIVEBACK", 0.35)))
+        profit_time_exit_sec = max(0.0, _env_float("REALTIME_PROFIT_TIME_EXIT_SEC", 300.0))
+        held_age_seconds: float | None = None
+        opened_at = getattr(holding, "opened_at", None)
+        if opened_at is not None:
+            try:
+                held_age_seconds = max(0.0, (decision_time - opened_at).total_seconds())
+            except Exception:  # noqa: BLE001 - opened_at is best-effort metadata.
+                held_age_seconds = None
+        if net_pnl_rate > 0.0:
+            peak_net_pnl = max(self._peak_net_pnl.get(symbol, 0.0), net_pnl_rate)
+        else:
+            peak_net_pnl = self._peak_net_pnl.get(symbol, 0.0)
+        self._peak_net_pnl[symbol] = peak_net_pnl
+
         prediction: LiveSignalPrediction | None = None
         exit_reason: str | None = None
-        if profitable_after_cost and ontology_score <= -0.55:
+        if quick_tp_net > 0.0 and net_pnl_rate >= quick_tp_net:
+            # Decisive absolute take-profit: a solid net winner is realized now.
+            exit_reason = f"quick_take_profit:{net_pnl_rate * 100:.2f}%"
+        elif (
+            lock_arm_net > 0.0
+            and peak_net_pnl >= lock_arm_net
+            and net_pnl_rate > max(0.0, target_net_return)
+            and net_pnl_rate <= peak_net_pnl * (1.0 - lock_giveback)
+        ):
+            # Profit-giveback trailing lock: after arming on a good gain, sell if the
+            # position gives back part of its peak while still net-positive.
+            exit_reason = f"profit_lock:{net_pnl_rate * 100:.2f}%<=peak{peak_net_pnl * 100:.2f}%"
+        elif (
+            profit_time_exit_sec > 0.0
+            and held_age_seconds is not None
+            and held_age_seconds >= profit_time_exit_sec
+            and net_pnl_rate > max(0.0, target_net_return)
+        ):
+            # Turnover pressure: realize a net-profitable position held past the
+            # short profit-turnover window instead of waiting the full time-exit.
+            exit_reason = f"profit_time_exit:{net_pnl_rate * 100:.2f}%"
+        elif profitable_after_cost and ontology_score <= -0.55:
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
         elif profitable_after_cost and pnl_rate >= required_exit_return:
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
@@ -782,6 +831,9 @@ class SharedLiveDecisionEngine:
                 "quote_age_seconds": round(quote_age_seconds, 3),
                 "ontology_score": round(ontology_score, 4),
                 "pnl_rate": round(pnl_rate, 6),
+                "net_pnl_rate": round(net_pnl_rate, 6),
+                "peak_net_pnl": round(peak_net_pnl, 6),
+                "round_trip_cost_rate": round(round_trip_cost_rate, 6),
                 "exit_reason": exit_reason,
                 "exit_action": str(exit_action),
                 "exit_suggested_weight": round(exit_suggested_weight, 6),

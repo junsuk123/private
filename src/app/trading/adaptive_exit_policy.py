@@ -69,10 +69,15 @@ def derive_exit_policy(
         exit_mode = "time_exit"
 
     base_average_price = max(0.01, float(getattr(holding, "average_price", 0.0) or 0.0))
+    # Sell target is a FIXED, cost-aware bar. It must NOT chase the current price:
+    # the previous `target_net_return + net_expected_return` term grew with the
+    # unrealized gain, so a winner's exit bar kept rising with the price and the
+    # position was rarely realized (HOLD_BELOW_PROFIT_TARGET). Net-profitability is
+    # already enforced separately by `profitable_after_cost`, so the bar here only
+    # needs to cover cost break-even plus a small take-profit / volatility cushion.
     dynamic_profit = max(
         take_profit,
         cost_floor.required_exit_price / base_average_price - 1.0,
-        max(0.0, target_net_return) + cost_floor.net_expected_return,
         0.0005 + volatility * 0.05,
     )
     dynamic_stop = max(0.0025, min(0.04, stop_loss + volatility * 0.1 + cost_floor.total_cost_rate * 0.5))

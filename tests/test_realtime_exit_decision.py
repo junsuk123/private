@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -707,6 +707,82 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(len(coordinator.amended), 1)
         self.assertEqual(coordinator.amended[0][0], "SELL0001")
         self.assertEqual(coordinator.amended[0][1].limit_price, 101.2)
+
+
+class ProfitTurnoverExitTest(unittest.TestCase):
+    """Turnover-first profit realization: net winners are sold decisively, and
+    gains are locked on giveback — without ever realizing a net loss."""
+
+    def test_quick_take_profit_realizes_net_winner(self) -> None:
+        # +1% gross clears the round-trip cost by well over the 0.4% net floor,
+        # so the position is realized immediately regardless of the dynamic bar.
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        holding = _holding(100.0, last_price=101.0)
+        result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0))
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertTrue(any(code.startswith("quick_take_profit") for code in result.reason_codes), result.reason_codes)
+
+    def test_quick_take_profit_does_not_fire_below_net_floor(self) -> None:
+        # +0.2% gross is below the round-trip cost + net floor: selling here would
+        # be churn at ~break-even, so the engine holds.
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        holding = _holding(100.0, last_price=100.2)
+        result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
+        self.assertFalse(result.approved)
+        self.assertIn("HOLD_BELOW_PROFIT_TARGET", result.reason_codes)
+
+    def test_net_loss_is_never_realized_by_turnover_rules(self) -> None:
+        # A losing position must never be sold by the turnover rules: no order is
+        # produced (loss exit disabled by default), so no net loss is realized.
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        holding = _holding(100.0, last_price=99.0)  # -1%
+        result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
+        self.assertFalse(result.approved)
+        self.assertIsNone(result.final_order)
+
+    def test_profit_time_exit_realizes_small_net_winner_after_window(self) -> None:
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        now = datetime.now(timezone.utc)
+        holding = Holding(
+            ticker="005930", market="KR", company_name="Samsung", sector="Tech",
+            quantity=10, average_price=100.0, last_price=100.5,  # +0.5% gross, small net winner
+            opened_at=now - timedelta(seconds=600),
+        )
+        with patch.dict("os.environ", {
+            "REALTIME_QUICK_TAKE_PROFIT_NET": "0.05",   # disable quick TP so time-exit is exercised
+            "REALTIME_PROFIT_TIME_EXIT_SEC": "300",
+        }):
+            result = engine.evaluate_exit_for_holding(
+                holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01, decision_time=now
+            )
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertTrue(any(code.startswith("profit_time_exit") for code in result.reason_codes), result.reason_codes)
+
+    def test_profit_lock_sells_on_giveback_from_peak(self) -> None:
+        engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
+        env = {
+            "REALTIME_QUICK_TAKE_PROFIT_NET": "0.05",   # disable quick TP
+            "REALTIME_PROFIT_LOCK_ARM_NET": "0.006",
+            "REALTIME_PROFIT_LOCK_GIVEBACK": "0.35",
+        }
+        # Call 1: arm the peak at ~+1.2% gross; take_profit high so profit_exit does not preempt.
+        peak_holding = _holding(100.0, last_price=101.2)
+        with patch.dict("os.environ", env):
+            first = engine.evaluate_exit_for_holding(
+                peak_holding, _account(peak_holding, cash=1_000_000.0), take_profit=0.02, stop_loss=0.01
+            )
+        self.assertFalse(first.approved, first.reason_codes)  # held, peak recorded
+        # Call 2: price gives back to ~+0.7% gross (still net-positive) -> lock the gain.
+        giveback_holding = _holding(100.0, last_price=100.7)
+        with patch.dict("os.environ", env):
+            second = engine.evaluate_exit_for_holding(
+                giveback_holding, _account(giveback_holding, cash=1_000_000.0), take_profit=0.02, stop_loss=0.01
+            )
+        self.assertTrue(second.approved, second.reason_codes)
+        self.assertEqual(second.final_order.side, OrderSide.SELL)
+        self.assertTrue(any(code.startswith("profit_lock") for code in second.reason_codes), second.reason_codes)
 
 
 if __name__ == "__main__":
