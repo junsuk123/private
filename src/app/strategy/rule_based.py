@@ -67,7 +67,11 @@ def generate_strategy_signals(
         if account is not None and not is_market_affordable_for_account(market, account):
             continue
 
-        available_cash = 0.0
+        # The one-share cash gate only applies when an account is supplied.
+        # With no account there is no cash constraint to enforce, so signals must
+        # not be forced to HOLD (that regression suppressed valid BUY signals in
+        # account-less analysis/backtest paths).
+        has_sufficient_cash = True
         if account is not None:
             market_upper = str(market.market or "").upper()
             if market_upper in ("KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"):
@@ -75,8 +79,18 @@ def generate_strategy_signals(
             else:
                 currency = "USD"
             cash_by_currency = getattr(account, "cash_by_currency", {}) or {}
-            available_cash = float(cash_by_currency.get(currency, 0.0))
-        has_sufficient_cash = available_cash >= float(market.last_price or 0.0) * 1.05
+            available_cash = float(cash_by_currency.get(currency, 0.0) or 0.0)
+            if available_cash <= 0.0:
+                # Fall back to the account's base cash when the per-currency bucket
+                # is absent, only for the base currency (mirrors RiskManager).
+                base_currency = str(getattr(account, "base_currency", "KRW") or "KRW").upper()
+                if currency == base_currency:
+                    available_cash = max(
+                        available_cash,
+                        float(getattr(account, "pure_cash", 0.0) or 0.0),
+                        float(getattr(account, "cash", 0.0) or 0.0),
+                    )
+            has_sufficient_cash = available_cash >= float(market.last_price or 0.0) * 1.05
 
         indicator = indicators.get(market.ticker)
         if indicator is None:

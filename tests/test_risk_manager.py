@@ -35,12 +35,16 @@ class RiskManagerTest(unittest.TestCase):
         self.assertTrue(result.final_order.manual_approval_required)
 
     def test_rejects_when_deposit_is_too_small_for_one_share(self) -> None:
-        account = collect_sample_account()
         markets = collect_sample_market()
         indicators = build_sample_indicators(markets)
         graph = build_market_graph(markets, indicators)
         signals = generate_strategy_signals(markets, indicators, graph)
         intent = generate_order_intents(markets, indicators, signals)[0]
+        # Deposit deliberately below one share of markets[0] so the one-share
+        # affordability gate must reject. (The shared sample account holds enough
+        # cash to buy a share, which would not exercise this gate.)
+        one_share_price = float(markets[0].last_price)
+        account = AccountSnapshot(cash=one_share_price - 1.0, holdings=())
 
         result = RiskManager().validate(intent, account, markets[0])
 

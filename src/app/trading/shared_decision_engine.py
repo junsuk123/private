@@ -203,7 +203,20 @@ class SharedLiveDecisionEngine:
 
         currency = "KRW" if market_name.upper() in ("KR", "KRX", "KOSPI", "KOSDAQ", "KONEX") else "USD"
         cash_by_currency = account.cash_by_currency if hasattr(account, "cash_by_currency") else {}
-        available_cash = float(cash_by_currency.get(currency, 0.0))
+        available_cash = float(cash_by_currency.get(currency, 0.0) or 0.0)
+        if available_cash <= 0.0:
+            # Fall back to the account's base cash when the per-currency bucket is
+            # absent (snapshots that only populate `cash`). Only for the base
+            # currency, so a USD order never borrows KRW cash. Mirrors
+            # RiskManager._cash_available_for_market so the buy pre-check and the
+            # final risk gate agree on available cash.
+            base_currency = str(getattr(account, "base_currency", "KRW") or "KRW").upper()
+            if currency == base_currency:
+                available_cash = max(
+                    available_cash,
+                    float(getattr(account, "pure_cash", 0.0) or 0.0),
+                    float(getattr(account, "cash", 0.0) or 0.0),
+                )
         domestic_drawdown_rate = (
             _account_domestic_unrealized_rate(account)
             if _is_domestic_symbol_or_market(symbol, market_name)

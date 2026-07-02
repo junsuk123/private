@@ -624,6 +624,62 @@ class KisDevelopersApiClient:
     def token_source(self) -> str | None:
         return self._token_source
 
+    def inquire_domestic_period_profit(self, start_date: Any, end_date: Any) -> dict[str, Any]:
+        """Raw KIS domestic period trade-profit inquiry (기간별매매손익현황조회).
+
+        TR TTTC8715R / VTTC8715R (paper). Returns realized (settled) trade
+        profit/loss over [start_date, end_date] for domestic stocks.
+        """
+        params = {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "SORT_DVSN": "00",
+            "PDNO": "",
+            "INQR_STRT_DT": _kis_yyyymmdd(start_date),
+            "INQR_END_DT": _kis_yyyymmdd(end_date),
+            "CBLC_DVSN": "00",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        return self._get(
+            "/uapi/domestic-stock/v1/trading/inquire-period-trade-profit",
+            tr_id="VTTC8715R" if self.paper else "TTTC8715R",
+            params=params,
+        )
+
+    def get_domestic_realized_pnl(self, start_date: Any, end_date: Any) -> float:
+        """Total realized (settled) domestic P&L in KRW over the given dates.
+
+        Reads the KIS period trade-profit summary. Field names are parsed
+        defensively (KIS returns the total realized P&L under one of a few
+        documented keys); if the summary is absent it falls back to summing the
+        per-trade rows. Raises KisApiError on an unsuccessful response.
+        """
+        response = self.inquire_domestic_period_profit(start_date, end_date)
+        self._ensure_success(response, "KIS period trade-profit lookup failed")
+        summary = response.get("output2")
+        summary_row: dict[str, Any] = {}
+        if isinstance(summary, list) and summary:
+            summary_row = summary[0] if isinstance(summary[0], dict) else {}
+        elif isinstance(summary, dict):
+            summary_row = summary
+        for key in ("tot_rlzt_pfls", "rlzt_pfls_smtl_amt", "rlzt_pfls", "rlzt_pfls_amt"):
+            value = summary_row.get(key)
+            if value is not None and str(value).strip() not in ("", "None"):
+                return _to_float(value)
+        # Fallback: sum per-trade realized P&L rows (output1).
+        total = 0.0
+        found = False
+        for row in response.get("output1") or ():
+            if not isinstance(row, dict):
+                continue
+            for key in ("rlzt_pfls", "trad_pfls", "pfls_amt", "evlu_pfls_amt"):
+                if key in row and str(row.get(key)).strip() not in ("", "None"):
+                    total += _to_float(row.get(key))
+                    found = True
+                    break
+        return total if found else 0.0
+
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
         return self.transport.request(
             "GET",
@@ -1167,6 +1223,13 @@ def _to_float(value: Any) -> float:
         return float(str(value).replace(",", ""))
     except ValueError:
         return 0.0
+
+
+def _kis_yyyymmdd(value: Any) -> str:
+    """Format a date/datetime/str as KIS 'YYYYMMDD'."""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y%m%d")
+    return str(value).replace("-", "").strip()
 
 
 def _first_float(data: dict[str, Any], *keys: str) -> float:

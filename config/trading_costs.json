@@ -19,7 +19,7 @@
     "sell_tax_rate": 0.0
   },
   "slippage": {
-    "default_slippage_rate": 0.00005,
+    "default_slippage_rate": 0.0005,
     "use_dynamic_slippage_if_orderbook_exists": true
   },
   "spread": {

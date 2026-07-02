@@ -143,8 +143,11 @@ class TradingCostEngine:
         reject_reason = None
         if quantity <= 0 or entry_price <= 0:
             reject_reason = "INVALID_ORDER_SIZE_OR_PRICE"
-        # All other cost validations disabled - signal-driven trades take priority
-        # Cost is logged but doesn't block execution
+        elif net_expected_return <= 0:
+            # A trade that does not clear its own round-trip cost is not tradable.
+            # Buying a net-negative expected return erodes total assets; the exit
+            # (SELL) path does not use this flag, so de-risking is never blocked.
+            reject_reason = "NET_RETURN_NOT_POSITIVE"
 
         return CostBreakdown(
             symbol=symbol,

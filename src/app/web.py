@@ -463,6 +463,13 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "source": "kis_live_account",
       "account_suffix": connection.get("account_suffix") or "",
       "positions": list(connection.get("positions") or ()),
+      # Broker-authoritative realized (settled) P&L for today, sourced from the
+      # KIS period trade-profit inquiry in the account probe. Passed through so
+      # the dashboard's realized-P&L field updates as sells settle.
+      "realized_pnl_today_krw": _number_or_zero(connection.get("realized_pnl_today_krw")),
+      "realized_pnl_period_krw": _number_or_zero(
+          connection.get("realized_pnl_period_krw") or connection.get("realized_pnl_today_krw")
+      ),
   }
 
 
@@ -1796,9 +1803,21 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         result["actual_equity"] = actual_equity
         result["cash_weight"] = krw_cash / actual_equity if actual_equity > 0 else 0.0
         result["actual_deposit_currency"] = "KRW"
+        # Today's realized (settled) P&L from the KIS period trade-profit inquiry.
+        # Fail-safe: a lookup failure must never break the account check, so it
+        # degrades to 0 with a diagnostic rather than raising.
+        try:
+          from datetime import date as _date
+
+          today = _date.today()
+          result["realized_pnl_today_krw"] = float(client.get_domestic_realized_pnl(today, today))
+        except Exception as exc:  # noqa: BLE001 - realized P&L is best-effort.
+          result["realized_pnl_today_krw"] = 0.0
+          result["realized_pnl_error"] = str(exc)
         result["account_api_sources"] = {
             "domestic_balance": "TTTC8434R /uapi/domestic-stock/v1/trading/inquire-balance",
             "domestic_orderable_cash": "TTTC8908R /uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            "domestic_realized_pnl": "TTTC8715R /uapi/domestic-stock/v1/trading/inquire-period-trade-profit",
             "overseas_balance": "TTTS3012R /uapi/overseas-stock/v1/trading/inquire-balance",
             "overseas_present_balance": "CTRP6504R /uapi/overseas-stock/v1/trading/inquire-present-balance",
             "overseas_orderable_cash": "TTTS3007R /uapi/overseas-stock/v1/trading/inquire-psamount",
