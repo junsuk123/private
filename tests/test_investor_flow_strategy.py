@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.graph import OntologyReasoner
 from app.graph.builders import build_market_graph
 from app.schemas.domain import (
+    AccountSnapshot,
     IndicatorSnapshot,
     InvestorFlowSnapshot,
     InvestorGroup,
@@ -114,6 +115,37 @@ class InvestorFlowStrategyTest(unittest.TestCase):
         self.assertIn("HighLiquidity", signals[0].supporting_factors)
         self.assertEqual(len(intents), 1)
         self.assertEqual(intents[0].source_data_ids, ("unit-market",))
+
+    def test_unaffordable_buy_candidates_are_excluded_when_account_is_provided(self) -> None:
+        cheap_market = _market(
+            foreign_net_buy=4_000_000_000,
+            institution_net_buy=3_000_000_000,
+            retail_net_buy=-5_000_000_000,
+            price_change_rate=0.025,
+        )
+        expensive_market = MarketSnapshot(
+            ticker="005930",
+            market="KOSPI",
+            company_name="Samsung Electronics",
+            sector="Semiconductor",
+            last_price=450_780,
+            average_daily_trading_value=100_000_000_000,
+            volatility_20d=0.028,
+            source=SourceMetadata("unit", datetime.now(timezone.utc), source_id="unit-market-expensive"),
+        )
+        account = AccountSnapshot(
+            cash=102_413.0,
+            holdings=(),
+            cash_by_currency={"KRW": 102_413.0},
+            cash_equivalent_krw=102_413.0,
+        )
+        indicators = {cheap_market.ticker: _indicator(cheap_market.ticker), expensive_market.ticker: _indicator(expensive_market.ticker)}
+        graph = build_market_graph((cheap_market, expensive_market), indicators)
+
+        signals = generate_strategy_signals((cheap_market, expensive_market), indicators, graph, account)
+
+        self.assertEqual([signal.ticker for signal in signals], [cheap_market.ticker])
+        self.assertEqual(signals[0].action, OrderAction.BUY)
 
 
 def _market(

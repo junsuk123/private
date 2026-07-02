@@ -113,6 +113,26 @@ function Wait-LocalAppReady {
   throw "Local app server did not become ready within $TimeoutSeconds seconds."
 }
 
+function Test-ManagedBrowserProfileRunning {
+  param([string]$BrowserProfilePath)
+
+  if (-not $BrowserProfilePath) { return $false }
+  $resolvedProfilePath = (Resolve-Path -LiteralPath $BrowserProfilePath -ErrorAction SilentlyContinue)
+  if ($resolvedProfilePath) {
+    $profileNeedle = $resolvedProfilePath.Path.ToLowerInvariant()
+  } else {
+    $profileNeedle = $BrowserProfilePath.ToLowerInvariant()
+  }
+
+  $browserProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.CommandLine -and
+      ($_.Name -ieq "chrome.exe" -or $_.Name -ieq "msedge.exe") -and
+      $_.CommandLine.ToLowerInvariant().Contains($profileNeedle)
+    }
+  return [bool]$browserProcesses
+}
+
 Stop-ExistingLocalAppServers
 Stop-WorkspaceRunPyProcesses
 
@@ -196,6 +216,8 @@ $port = [int]([Environment]::GetEnvironmentVariable("APP_PORT", "Process"))
 $url = "http://127.0.0.1:$port"
 $server = $null
 $browser = $null
+$browserProfile = $null
+$browserStartedAt = $null
 
 try {
   $server = Start-Process `
@@ -216,6 +238,7 @@ try {
   if ($browserExe) {
     $browserProfile = Join-Path $PSScriptRoot "data\runtime\managed-browser-profile"
     New-Item -ItemType Directory -Force -Path $browserProfile | Out-Null
+    $browserStartedAt = Get-Date
     $browser = Start-Process `
       -FilePath $browserExe `
       -ArgumentList @(
@@ -238,9 +261,15 @@ try {
       Write-Host "Server process exited."
       break
     }
-    if ($browser -and $browser.HasExited) {
-      Write-Host "Managed browser window closed. Stopping server..."
-      break
+    if ($browserProfile) {
+      $browserStartupGraceElapsed = $browserStartedAt -and ((Get-Date) -gt $browserStartedAt.AddSeconds(5))
+      if ($browserStartupGraceElapsed -and -not (Test-ManagedBrowserProfileRunning -BrowserProfilePath $browserProfile)) {
+        Write-Host "Managed browser window closed. Stopping server..."
+        break
+      }
+    } elseif ($browser -and $browser.HasExited) {
+        Write-Host "Managed browser window closed. Stopping server..."
+        break
     }
     Start-Sleep -Milliseconds 500
   }

@@ -25,7 +25,7 @@ from starlette import routing as starlette_routing
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
-from app.data.llm_classifier import event_llm_runtime_status
+from app.data.llm_classifier import build_event_llm_classifier_from_env, configure_default_event_llm_env, event_llm_runtime_status
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.execution import KisApiError, KisDevelopersApiClient, LiveExecutionCoordinator, MockKisDevelopersApi, PaperOrderExecutor
 from app.execution.kis_auth import build_kis_client, run_kis_health_check, validate_live_secret_file
@@ -418,6 +418,8 @@ def _holdings_from_live_positions(positions: Any) -> tuple[Holding, ...]:
   for position in tuple(positions or ()):
     if not isinstance(position, dict):
       continue
+    if str(position.get("position_state") or "").lower() == "pending_balance":
+      continue
     ticker = str(position.get("ticker") or "").upper().strip()
     quantity = int(_number_or_zero(position.get("quantity")))
     if not ticker or quantity <= 0:
@@ -486,6 +488,9 @@ def _connection_with_account_basis(connection: dict[str, Any], basis: dict[str, 
   merged["actual_equity"] = basis.get("equity", merged.get("actual_equity"))
   merged["invested_value"] = basis.get("invested_value", merged.get("invested_value"))
   merged["cash_weight"] = basis.get("cash_weight", merged.get("cash_weight"))
+  merged["positions"] = list(basis.get("positions") or merged.get("positions") or ())
+  merged["holdings"] = len(merged["positions"])
+  merged["holdings_count"] = len(merged["positions"])
   return merged
 
 
@@ -960,6 +965,10 @@ def status() -> JSONResponse:
         "cash_weight": live_basis["cash_weight"],
         "basis_source": live_basis["source"],
         "account_suffix": live_basis["account_suffix"],
+        "account_checked": True,
+        "holdings": len(tuple(live_basis.get("positions") or ())),
+        "holdings_count": len(tuple(live_basis.get("positions") or ())),
+        "positions": list(live_basis.get("positions") or ()),
         "daily_pnl_ratio": 0.0,
         "updated_at": datetime.now(timezone.utc),
         "last_error": None,
@@ -1122,6 +1131,7 @@ def ontology_runtime() -> JSONResponse:
 
 @app.get("/api/realtime/runtime")
 def realtime_runtime() -> JSONResponse:
+    configure_default_event_llm_env()
     acceleration = RealtimeAccelerationPolicy().status()
     risk_policy = ShortHorizonRiskPolicy()
     ontology_status = get_ontology_npu_classifier().status()
@@ -1144,6 +1154,87 @@ def realtime_runtime() -> JSONResponse:
             },
         }
     )
+
+
+@app.get("/api/ai/validation")
+def ai_validation() -> JSONResponse:
+    configure_default_event_llm_env()
+    llm_status = event_llm_runtime_status()
+    llm_validation: dict[str, Any] = {"ok": False, "status": llm_status}
+    if llm_status.get("available"):
+      try:
+        classifier = build_event_llm_classifier_from_env()
+        if classifier is None:
+          llm_validation["error"] = "LLM_CLASSIFIER_NOT_CONFIGURED"
+        else:
+          sample = classifier.classify(
+              "Samsung wins large AI memory supply contract",
+              "Samsung Electronics announced a multi-year HBM memory supply agreement for AI accelerators. Analysts expect higher revenue and margins.",
+              {"005930": "Samsung Electronics"},
+          )
+          labels = tuple(str(item) for item in sample.event_labels)
+          llm_validation.update(
+              {
+                  "ok": bool(sample.summary and sample.confidence >= 0.0),
+                  "model": sample.model,
+                  "sentiment": getattr(sample.sentiment, "value", str(sample.sentiment)),
+                  "tickers": sample.tickers,
+                  "event_labels": labels,
+                  "confidence": sample.confidence,
+                  "summary": sample.summary,
+                  "schema_ok": isinstance(sample.key_facts, tuple) and isinstance(sample.tickers, tuple),
+              }
+          )
+      except Exception as exc:  # noqa: BLE001 - validation must report, not fail the UI.
+        llm_validation["error"] = f"{exc.__class__.__name__}: {exc}"
+    training_status = _safe_live_training_status()
+    predictor_validation = _validate_live_signal_predictor()
+    ontology_status = get_ontology_npu_classifier().status()
+    return _json(
+        {
+            "ok": bool(llm_validation.get("ok")) and bool(training_status.get("ok")) and bool(predictor_validation.get("ok")),
+            "event_llm": llm_validation,
+            "live_training": training_status,
+            "live_signal_predictor": predictor_validation,
+            "ontology_npu": ontology_status,
+            "recommendation": _ai_validation_recommendation(llm_validation, training_status, predictor_validation),
+        }
+    )
+
+
+def _validate_live_signal_predictor() -> dict[str, Any]:
+    registry = ModelArtifactRegistry()
+    try:
+      artifact = registry.load_latest_live_eligible()
+    except Exception as exc:  # noqa: BLE001
+      return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}", "uses_live_eligible_model": False}
+    metrics = dict(getattr(artifact, "metrics", {}) or {})
+    finite_weights = all(math.isfinite(float(value)) for value in (*artifact.weights, *artifact.expected_return_weights))
+    finite_bias = math.isfinite(float(artifact.bias)) and math.isfinite(float(artifact.expected_return_bias))
+    return {
+        "ok": bool(artifact.live_eligible and finite_weights and finite_bias),
+        "artifact_id": artifact.artifact_id,
+        "path": str(artifact.path),
+        "uses_live_eligible_model": artifact.live_eligible,
+        "feature_schema_hash": artifact.feature_schema_hash,
+        "metrics": metrics,
+        "finite_parameters": finite_weights and finite_bias,
+    }
+
+
+def _ai_validation_recommendation(
+    llm_validation: dict[str, Any],
+    training_status: dict[str, Any],
+    predictor_validation: dict[str, Any],
+) -> str:
+    if not llm_validation.get("ok"):
+      return "LLM classifier is reachable check failed; keep keyword fallback active."
+    quality = training_status.get("quality") if isinstance(training_status.get("quality"), dict) else {}
+    if not predictor_validation.get("ok"):
+      return "Use ontology/rule fallback for live execution until a live-eligible predictor is available."
+    if not quality.get("meaningful_for_live"):
+      return "Model is useful for research diagnostics, but live edge is not proven because top-k forward return is not positive."
+    return "LLM and live predictor validation passed; keep FinalTradeGate/RiskManager as mandatory execution gates."
 
 
 @app.get("/api/live-training/status")
@@ -1189,17 +1280,64 @@ def _safe_live_training_status() -> dict[str, Any]:
             "error": f"{exc.__class__.__name__}: {exc}",
             "pipeline": "collect_features_train_save_predict",
         }
-    latest = status.get("latest_ineligible_artifact")
-    latest_id = latest.get("artifact_id") if isinstance(latest, dict) else None
+    latest_saved = status.get("latest_saved_artifact") or status.get("latest_ineligible_artifact")
+    latest_live = status.get("latest_live_eligible_artifact")
+    latest_saved_id = latest_saved.get("artifact_id") if isinstance(latest_saved, dict) else None
+    latest_live_id = latest_live.get("artifact_id") if isinstance(latest_live, dict) else None
     latest_live_eligible = bool(status.get("latest_live_eligible_exists"))
+    quality = _live_training_quality_summary(latest_saved, latest_live, status.get("training_rows"))
     return {
         **status,
         "ok": True,
         "pipeline": "collect_features_train_save_predict",
         "auto_training_enabled": True,
-        "model_saved": bool(latest_id or latest_live_eligible),
-        "latest_model_artifact_id": latest_id,
+        "model_saved": bool(latest_saved_id or latest_live_eligible),
+        "latest_model_artifact_id": latest_saved_id,
+        "latest_live_eligible_model_artifact_id": latest_live_id,
         "inference_uses_latest_live_eligible": latest_live_eligible,
+        "quality": quality,
+    }
+
+
+def _live_training_quality_summary(
+    latest_saved: Any,
+    latest_live: Any,
+    training_rows: Any,
+) -> dict[str, Any]:
+    saved_metrics = (latest_saved or {}).get("metrics") if isinstance(latest_saved, dict) else {}
+    live_metrics = (latest_live or {}).get("metrics") if isinstance(latest_live, dict) else {}
+    metrics = saved_metrics if isinstance(saved_metrics, dict) else {}
+    auc = _number_or_zero(metrics.get("auc"))
+    precision_at_k = _number_or_zero(metrics.get("precision_at_k"))
+    top_k_return = _number_or_zero(metrics.get("avg_forward_net_return_bps_top_k"))
+    rows = int(_number_or_zero(training_rows))
+    positive = _number_or_zero(metrics.get("positive_labels"))
+    negative = _number_or_zero(metrics.get("negative_labels"))
+    label_total = max(1.0, positive + negative)
+    label_balance = positive / label_total
+    latest_saved_live_eligible = bool((latest_saved or {}).get("live_eligible")) if isinstance(latest_saved, dict) else False
+    live_available = bool(latest_live)
+    meaningful_for_research = rows >= 500 and auc >= 0.55 and 0.005 <= label_balance <= 0.50
+    meaningful_for_live = bool(live_available and live_metrics)
+    if top_k_return <= 0:
+      meaningful_for_live = False
+    return {
+        "training_rows": rows,
+        "auc": auc,
+        "precision_at_k": precision_at_k,
+        "avg_forward_net_return_bps_top_k": top_k_return,
+        "positive_label_ratio": label_balance,
+        "latest_saved_live_eligible": latest_saved_live_eligible,
+        "live_eligible_available": live_available,
+        "meaningful_for_research": meaningful_for_research,
+        "meaningful_for_live": meaningful_for_live,
+        "assessment": (
+            "live_candidate"
+            if meaningful_for_live
+            else "research_only_until_top_k_positive"
+            if meaningful_for_research
+            else "needs_more_or_better_labels"
+        ),
     }
 
 
@@ -2175,15 +2313,19 @@ def _streaming_demo_terminate_response(demo_id: str) -> dict[str, Any]:
 
 @app.get("/api/realtime-trading/status")
 def realtime_trading_status() -> JSONResponse:
-    with _realtime_trading_lock:
-        engine = _realtime_trading_engine
-        running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
-    return _json({
-        "ok": True,
-        "running": running,
-        "auto_start": AUTO_START_REALTIME_TRADING,
-        "status": engine.get_status() if engine is not None else None,
-    })
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+    running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+  diagnostics = engine.decision_engine.get_diagnostics() if engine is not None and hasattr(engine, "decision_engine") else None
+  return _json(
+    {
+      "ok": True,
+      "running": running,
+      "auto_start": AUTO_START_REALTIME_TRADING,
+      "status": engine.get_status() if engine is not None else None,
+      "decision_diagnostics": diagnostics,
+    }
+  )
 
 
 @app.post("/api/live-trading/terminate")
@@ -2587,8 +2729,13 @@ def live_trading_progress() -> JSONResponse:
       connection = _cached_kis_connection_probe(paper=False, include_account=True)
     except Exception as exc:  # pragma: no cover - broker/network defensive boundary
       connection = {"ok": False, "mode": "live", "message": str(exc), "error": str(exc)}
-    basis = _last_live_account_basis()
-    positions = list(connection.get("positions") or [])
+    basis = _account_basis_from_kis_connection(connection) or _last_live_account_basis()
+    if basis is not None and connection.get("account_checked"):
+      connection = _connection_with_account_basis(connection, basis)
+      with _live_lock:
+        _operation_mode_state["last_kis_connection"] = connection
+        _operation_mode_state["last_kis_connection_checked_at"] = time.time()
+    positions = list(connection.get("positions") or (basis or {}).get("positions") or [])
     snapshot = _live_snapshot()
     execution_summary = snapshot.get("live_execution_summary") or {}
     realtime_summary = _realtime_engine_execution_summary()
@@ -2596,6 +2743,16 @@ def live_trading_progress() -> JSONResponse:
       execution_summary = realtime_summary
     runtime_gate = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
     journal = _live_order_journal_snapshot()
+    positions, pending_positions = _reconciled_live_positions(positions, journal)
+    if pending_positions and basis is not None:
+      basis = dict(basis)
+      basis["positions"] = positions
+      basis["invested_value"] = sum(_number_or_zero(position.get("market_value_krw") or position.get("market_value")) for position in positions)
+      connection = _connection_with_account_basis(connection, basis)
+      connection["pending_positions"] = pending_positions
+      with _live_lock:
+        _operation_mode_state["last_kis_connection"] = connection
+        _operation_mode_state["last_kis_connection_checked_at"] = time.time()
     active_mode = None
     baseline_equity = None
     with _live_lock:
@@ -2623,6 +2780,7 @@ def live_trading_progress() -> JSONResponse:
             "profit": equity - initial,
             "return_rate": return_rate,
             "positions": positions,
+            "pending_positions": pending_positions,
             "execution_summary": execution_summary,
             "runtime_gate": {"ok": runtime_gate.ok, "failures": tuple(runtime_gate.failures)},
             "live_order_journal": journal,
@@ -2670,6 +2828,11 @@ def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", li
     recent_orders = [item for item in recent_orders if item]
     all_orders = [_live_order_event_payload(event) for event in enriched_events]
     all_orders = [item for item in all_orders if item]
+    submitted_orders = [
+        item
+        for item in all_orders
+        if item.get("event_type") in {"live_order_submitted", "live_order_status", "live_trading_order_submitted"}
+    ]
     recent_executions = [
         item
         for item in recent_orders
@@ -2683,6 +2846,7 @@ def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", li
         "error_count": sum(1 for event in events if "error" in str(event.get("event_type") or "")),
         "recent_orders": recent_orders[-limit:],
         "recent_executions": recent_executions[-limit:],
+        "submitted_orders": submitted_orders[-50:],
     }
 
 
@@ -2735,6 +2899,142 @@ def _live_order_event_payload(event: dict[str, Any]) -> dict[str, Any] | None:
         "reason_codes": payload.get("reason_codes") or payload.get("blocked") or (),
         "error": payload.get("error") or payload.get("message") or "",
     }
+
+
+def _parse_event_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+      return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value or "").strip()
+    if not text:
+      return None
+    try:
+      parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+      return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _recent_live_buy_orders_for_reconciliation(
+    journal: dict[str, Any],
+    positions: list[dict[str, Any]],
+    *,
+    max_age_hours: float = 36.0,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    existing = {str(position.get("ticker") or "").upper() for position in positions if isinstance(position, dict)}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    candidates: list[dict[str, Any]] = []
+    seen_order_ids: set[str] = set()
+    for item in reversed(list(journal.get("submitted_orders") or ())):
+      if not isinstance(item, dict):
+        continue
+      order_id = str(item.get("broker_order_id") or "")
+      ticker = str(item.get("ticker") or "").upper().strip()
+      side = str(item.get("side") or "").upper()
+      if not order_id or order_id in seen_order_ids or not ticker or ticker in existing or side != "BUY":
+        continue
+      recorded_at = _parse_event_datetime(item.get("recorded_at"))
+      if recorded_at is not None and recorded_at < cutoff:
+        continue
+      seen_order_ids.add(order_id)
+      candidates.append(item)
+      if len(candidates) >= limit:
+        break
+    return list(reversed(candidates))
+
+
+def _pending_position_from_order_status(order: dict[str, Any], execution: Any | None = None) -> dict[str, Any] | None:
+    ticker = str(getattr(execution, "ticker", None) or order.get("ticker") or "").upper().strip()
+    if not ticker:
+      return None
+    side = getattr(execution, "side", None) or order.get("side")
+    side_value = getattr(side, "value", side)
+    if str(side_value or "").upper() != "BUY":
+      return None
+    status = str(getattr(execution, "status", None) or order.get("status") or "ACCEPTED").upper()
+    if status in {"CANCELED", "REJECTED", "EXPIRED"}:
+      return None
+    if status not in {"FILLED", "PARTIALLY_FILLED"}:
+      return None
+    quantity = int(_number_or_zero(getattr(execution, "quantity", None) or order.get("quantity") or 0))
+    if quantity <= 0:
+      return None
+    price = _number_or_zero(getattr(execution, "price", None) or order.get("limit_price") or 0)
+    if price <= 0:
+      return None
+    market = str(order.get("market") or "KR").upper()
+    currency = "USD" if _is_us_order_market(market, ticker) else "KRW"
+    value = quantity * price
+    return {
+        "ticker": ticker,
+        "market": market,
+        "quantity": quantity,
+        "average_price": price,
+        "last_price": price,
+        "market_value": value,
+        "unrealized_pnl": 0.0,
+        "return_rate": 0.0,
+        "currency": currency,
+        "market_value_krw": value if currency == "KRW" else 0.0,
+        "unrealized_pnl_krw": 0.0,
+        "source": "order_reconciliation",
+        "position_state": "pending_balance",
+        "order_status": status,
+        "broker_order_id": order.get("broker_order_id") or getattr(execution, "order_id", ""),
+        "recorded_at": order.get("recorded_at"),
+    }
+
+
+def _reconciled_live_positions(
+    positions: list[dict[str, Any]],
+    journal: dict[str, Any],
+    broker: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not journal.get("submitted_orders"):
+      return positions, []
+    reconciled = [dict(position) for position in positions if isinstance(position, dict)]
+    existing = {str(position.get("ticker") or "").upper() for position in reconciled}
+    pending: list[dict[str, Any]] = []
+    owned_broker = broker
+    for order in _recent_live_buy_orders_for_reconciliation(journal, reconciled):
+      execution = None
+      status_error = ""
+      if owned_broker is None:
+        try:
+          owned_broker = KisDevelopersApiClient(paper=False, enabled=True)
+        except Exception as exc:  # pragma: no cover - credential/runtime defensive boundary
+          status_error = str(exc)
+      if owned_broker is not None:
+        try:
+          order_id = str(order.get("broker_order_id") or "")
+          if hasattr(owned_broker, "_orders") and order_id:
+            side = OrderSide.BUY if str(order.get("side") or "").upper() == "BUY" else OrderSide.SELL
+            owned_broker._orders.setdefault(  # type: ignore[attr-defined]
+                order_id,
+                FinalOrder(
+                    ticker=str(order.get("ticker") or ""),
+                    market=str(order.get("market") or "KR"),
+                    order_type=OrderType.LIMIT,
+                    side=side,
+                    quantity=max(1, int(_number_or_zero(order.get("quantity") or 1))),
+                    limit_price=_number_or_zero(order.get("limit_price") or 0),
+                ),
+            )
+          execution = owned_broker.get_order_status(str(order.get("broker_order_id") or ""))
+        except Exception as exc:  # pragma: no cover - broker/network defensive boundary
+          status_error = str(exc)
+      pending_position = _pending_position_from_order_status(order, execution)
+      if pending_position is None:
+        continue
+      ticker = str(pending_position.get("ticker") or "").upper()
+      if ticker in existing:
+        continue
+      if status_error:
+        pending_position["order_status_error"] = status_error
+      existing.add(ticker)
+      pending.append(pending_position)
+      reconciled.append(pending_position)
+    return reconciled, pending
 
 
 def _is_us_order_market(market: str, ticker: str) -> bool:
@@ -3125,8 +3425,20 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   store = RealtimeMarketDataStore()
   account = _live_account_snapshot_for_analysis()
   rules = _live_risk_rules_for_account(account)
-  decision_engine = SharedLiveDecisionEngine(store, risk_manager=RiskManager(rules))
-  coordinator = LiveExecutionCoordinator(KisDevelopersApiClient(paper=False, enabled=True))
+  broker_client = KisDevelopersApiClient(paper=False, enabled=True)
+
+  def _refresh_market_snapshot(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot | None:
+    try:
+      return broker_client.get_market_snapshot(symbol, market, company_name=symbol, sector="Unknown")
+    except Exception:
+      return None
+
+  decision_engine = SharedLiveDecisionEngine(
+      store,
+      risk_manager=RiskManager(rules),
+      market_refresher=_refresh_market_snapshot,
+  )
+  coordinator = LiveExecutionCoordinator(broker_client)
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
       coordinator=coordinator,
@@ -3156,7 +3468,11 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   cached_context = _cached_context_buy_candidates(limit=limit)
   affordable = _live_affordable_buy_candidate_symbols(limit=limit)
   surge = _cached_volume_surge_symbols()
-  return tuple(dict.fromkeys((*cached_context, *fresh, *surge, *config_symbols, *affordable)))[:limit]
+  return _filter_realtime_buy_candidates_by_affordability(
+      tuple(dict.fromkeys((*cached_context, *fresh, *surge, *config_symbols, *affordable))),
+      limit=limit,
+      prevalidated_symbols=affordable,
+  )
 
 
 def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
@@ -3189,12 +3505,21 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("realtime_krx_discovery_candidate_load_failed", {"error": str(exc)})
       krx_universe = ()
+    krx_symbols: list[str] = []
     for symbol in krx_universe:
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
       if ticker and ticker not in excluded and ticker.isdigit() and len(ticker) == 6:
-        symbols.append(ticker)
-      if len(symbols) >= min(max_count, krx_limit):
+        krx_symbols.append(ticker)
+      if len(krx_symbols) >= min(max_count, krx_limit):
         break
+    symbols.extend(
+        _broker_affordable_candidate_symbols(
+            tuple(krx_symbols),
+            "KOSPI",
+            account,
+            max_symbols=max(0, min(max_count, krx_limit)),
+        )
+    )
 
   if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0 and len(symbols) < max_count:
     try:
@@ -3206,14 +3531,50 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("realtime_us_discovery_candidate_load_failed", {"error": str(exc)})
       us_universe = ()
+    us_symbols: list[str] = []
     for symbol in _rotated_symbols(us_universe):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
       if ticker and ticker not in excluded:
-        symbols.append(ticker)
-      if len(symbols) >= min(max_count, us_limit):
+        us_symbols.append(ticker)
+      if len(us_symbols) >= min(max_count - len(symbols), us_limit):
         break
+    symbols.extend(
+        _broker_affordable_candidate_symbols(
+            tuple(us_symbols),
+            "NASDAQ",
+            account,
+            max_symbols=max(0, min(max_count - len(symbols), us_limit)),
+        )
+    )
 
   return tuple(dict.fromkeys(symbols))[:max_count]
+
+
+def _broker_affordable_candidate_symbols(
+    symbols: tuple[str, ...],
+    market: str,
+    account: AccountSnapshot,
+    *,
+    max_symbols: int,
+) -> tuple[str, ...]:
+  if max_symbols <= 0 or not symbols:
+    return ()
+  client = KisDevelopersApiClient(paper=False, enabled=True)
+  selected: list[str] = []
+  errors: list[dict[str, str]] = []
+  for symbol in symbols:
+    if len(selected) >= max_symbols:
+      break
+    try:
+      snapshot = client.get_market_snapshot(symbol, market, company_name=symbol, sector="Unknown")
+    except Exception as exc:  # noqa: BLE001 - one failed quote should not stop discovery.
+      errors.append({"ticker": symbol, "market": market, "error": str(exc)})
+      continue
+    if snapshot.last_price > 0 and is_market_affordable_for_account(snapshot, account):
+      selected.append(snapshot.ticker)
+  if errors:
+    audit.record("realtime_affordable_candidate_quote_errors", {"market": market, "errors": errors[:10]})
+  return tuple(selected)
 
 
 def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
@@ -3223,8 +3584,12 @@ def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
     return ()
 
   markets = tuple(getattr(context, "markets", ()) or ())
-  market_by_ticker = _market_name_by_ticker(markets)
+  market_by_ticker = {str(getattr(market, "ticker", "") or "").upper().strip(): market for market in markets}
   open_groups = set(_active_live_market_groups())
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:  # noqa: BLE001 - fail closed for buy candidates.
+    account = None
   selected: list[str] = []
 
   for path in tuple(getattr(context, "reasoning_paths", ()) or ()):
@@ -3233,7 +3598,10 @@ def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
     ticker = str(getattr(path, "ticker", "") or "").upper().strip()
     if not ticker:
       continue
-    group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    market = market_by_ticker.get(ticker)
+    if account is not None and (market is None or not is_market_affordable_for_account(market, account)):
+      continue
+    group = _ticker_market_group_for_live_trading(ticker, getattr(market, "market", "") if market is not None else "")
     if not open_groups or group in open_groups:
       selected.append(ticker)
 
@@ -3242,11 +3610,61 @@ def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
     ticker = str(ticker_value or "").upper().strip()
     if not ticker:
       continue
-    group = _ticker_market_group_for_live_trading(ticker, market_by_ticker.get(ticker, ""))
+    market = market_by_ticker.get(ticker)
+    if account is not None and (market is None or not is_market_affordable_for_account(market, account)):
+      continue
+    group = _ticker_market_group_for_live_trading(ticker, getattr(market, "market", "") if market is not None else "")
     if not open_groups or group in open_groups:
       selected.append(ticker)
 
   return tuple(dict.fromkeys(selected))[: max(1, int(limit))]
+
+
+def _filter_realtime_buy_candidates_by_affordability(
+    symbols: tuple[str, ...],
+    *,
+    limit: int,
+    prevalidated_symbols: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:  # noqa: BLE001 - fail closed for live buy candidates.
+    return ()
+  if account is None:
+    return ()
+  with _live_lock:
+    context = _live_state.get("context")
+  context_markets = {
+      str(getattr(market, "ticker", "") or "").upper().strip(): market
+      for market in tuple(getattr(context, "markets", ()) or ())
+  }
+  store = RealtimeMarketDataStore()
+  selected: list[str] = []
+  seen: set[str] = set()
+  prevalidated = {str(symbol or "").upper().strip() for symbol in prevalidated_symbols}
+  for symbol in symbols:
+    ticker = str(symbol or "").upper().strip()
+    if not ticker or ticker in seen:
+      continue
+    if ticker not in prevalidated:
+      market = context_markets.get(ticker)
+      if market is not None:
+        if not is_market_affordable_for_account(market, account):
+          continue
+      else:
+        tick = store.latest_tick(ticker)
+        price = float(getattr(tick, "price", 0.0) or 0.0) if tick is not None else 0.0
+        if price <= 0:
+          continue
+        market = _placeholder_live_market(ticker, "KOSPI" if ticker.isdigit() and len(ticker) == 6 else "NASDAQ")
+        market = replace(market, last_price=price)
+        if not is_market_affordable_for_account(market, account):
+          continue
+    selected.append(ticker)
+    seen.add(ticker)
+    if len(selected) >= max(1, int(limit)):
+      break
+  return tuple(selected)
 
 
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
@@ -5797,6 +6215,16 @@ HTML = """
       return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(numeric) : fmtWon.format(numeric);
     }
 
+    function translateGoalLabel(label) {
+      const translations = {
+        'Requested target': '요청된 목표',
+        'Lower return': '낮은 수익',
+        'Longer period': '연장된 기간',
+        'Balanced compromise': '균형잡힌 절충',
+      };
+      return translations[label] || label;
+    }
+
     function formatCashByCurrency(account = {}) {
       const cashByCurrency = account && account.cash_by_currency && typeof account.cash_by_currency === 'object'
         ? account.cash_by_currency
@@ -5887,10 +6315,12 @@ HTML = """
         const ticker = String(position.ticker || '-');
         const qty = Number(position.quantity || 0);
         const currency = positionCurrency(position);
+        const pending = String(position.position_state || '') === 'pending_balance';
+        const label = pending ? `${ticker} · 잔고반영 대기` : ticker;
         const value = currency === 'KRW'
           ? formatMoney(Number(position.market_value_krw ?? position.market_value ?? 0), 'KRW')
           : formatMoney(Number(position.market_value ?? 0), 'USD');
-        return `<li><span>${ticker} x ${qty}</span><span>${value}</span></li>`;
+        return `<li><span>${label} x ${qty}</span><span>${value}</span></li>`;
       }).join('');
       target.innerHTML = rows || '<li class="empty">-</li>';
     }
@@ -5950,6 +6380,16 @@ HTML = """
       try {
         const data = await (await fetch('/api/status')).json();
         renderStatus(data);
+        if (data.basis_source === 'kis_live_account') {
+          renderBrokerAccountCard({
+            ...data,
+            ok: true,
+            mode: 'live',
+            account_checked: true,
+            holdings_count: data.holdings_count ?? (Array.isArray(data.positions) ? data.positions.length : 0),
+            holdings: data.holdings ?? data.holdings_count ?? (Array.isArray(data.positions) ? data.positions.length : 0),
+          });
+        }
       } finally {
         statusBusy = false;
       }
@@ -7183,7 +7623,7 @@ HTML = """
       const rejectionText = liveExecutionRejectionText(executionSummary);
       document.getElementById('mockStatus').textContent =
         `KIS 실계좌 기준 갱신 · 총자산 ${fmtWon.format(accountSummary.equity)} · 주문가능 원화 ${fmtWon.format(accountSummary.cash)} · 보유주식 ${fmtWon.format(accountSummary.invested)} · 외화 ${fmtWon.format(accountSummary.foreignCashKrw)} · ${liveExecutionSummaryText(executionSummary, data)}`;
-      if (rejectionText) document.getElementById('mockStatus').textContent += ` 쨌 사유 ${rejectionText}`;
+      if (rejectionText) document.getElementById('mockStatus').textContent += ` · 사유 ${rejectionText}`;
     }
 
     async function loadMockPerformance() {

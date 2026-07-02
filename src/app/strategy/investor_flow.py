@@ -62,25 +62,25 @@ def assess_domestic_investor_flow(market: MarketSnapshot) -> InvestorFlowAssessm
     risk: list[str] = []
     summary: list[str] = []
 
-    if metrics.informed_imbalance >= 0.018:
+    if metrics.informed_imbalance >= 0.012:
         support.append("InformedOrderFlowImbalance")
         summary.append("Foreign and institutional order-flow imbalance is positive after trading-value normalization.")
-    elif metrics.informed_imbalance <= -0.018:
+    elif metrics.informed_imbalance <= -0.015:
         contradiction.append("InformedOrderFlowDistribution")
         summary.append("Foreign and institutional order-flow imbalance is negative after trading-value normalization.")
 
-    if metrics.foreign_imbalance > 0 and metrics.institution_imbalance > 0 and flow.price_change_rate > 0:
+    if metrics.foreign_imbalance > 0.005 and metrics.institution_imbalance > 0.005 and flow.price_change_rate > 0:
         support.append("ForeignInstitutionJointBuying")
-    if metrics.foreign_imbalance < 0 and metrics.institution_imbalance < 0:
+    if metrics.foreign_imbalance < -0.005 and metrics.institution_imbalance < -0.005:
         contradiction.append("ForeignInstitutionJointSelling")
 
-    if metrics.retail_absorption >= 0.002 and metrics.informed_imbalance > 0:
+    if metrics.retail_absorption >= 0.0015 and metrics.informed_imbalance > 0:
         support.append("RetailSupplyAbsorbedByInformedFlow")
         summary.append("Retail selling is absorbed by foreign or institutional demand.")
-    elif metrics.retail_absorption >= 0.002 and metrics.informed_imbalance < 0:
+    elif metrics.retail_absorption >= 0.0015 and metrics.informed_imbalance < 0:
         contradiction.append("RetailDemandMeetsInformedSelling")
         summary.append("Retail buying is meeting foreign or institutional selling pressure.")
-    elif metrics.retail_absorption <= -0.002:
+    elif metrics.retail_absorption <= -0.0015:
         contradiction.append("CrowdedSameDirectionFlow")
         summary.append("Retail and informed-flow proxies move in the same direction, raising crowding risk.")
 

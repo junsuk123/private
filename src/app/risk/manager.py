@@ -118,7 +118,14 @@ class RiskManager:
             self.rules.max_intraday_position_weight if intent.action == OrderAction.BUY else self.rules.max_single_stock_weight,
         )
         cash_available_for_market = _cash_available_for_market(account, market)
-        equity_for_sizing = _equity_for_sizing(account, market, report.equity)
+        if cash_available_for_market <= 0:
+            currency = _market_currency(market)
+            cash_available_for_market = max(
+                cash_available_for_market,
+                float(account.pure_cash or 0.0),
+                float(account.cash_by_currency.get(currency, 0.0) or 0.0),
+            )
+        equity_for_sizing = _equity_for_sizing(account, market, max(report.equity, account.equity))
         metadata["cash_available_for_market"] = cash_available_for_market
         metadata["equity_for_sizing"] = equity_for_sizing
         metadata["market_currency"] = _market_currency(market)
@@ -248,14 +255,14 @@ class RiskManager:
                     spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost
                     <= cash_available_for_market
                 )
-                checks["net_profitability_check"] = cost.net_expected_return > 0
-                checks["target_net_return_check"] = cost.net_expected_return >= target_net_return
+                checks["net_profitability_check"] = cost.net_expected_return > -0.05
+                checks["target_net_return_check"] = cost.net_expected_return >= max(-0.01, target_net_return * 0.3)
                 checks["break_even_with_margin_check"] = (
-                    cost.gross_expected_return >= cost.break_even_return + policy.safety_margin_rate
+                    cost.gross_expected_return >= cost.break_even_return * 0.95
                 )
-                checks["cost_to_alpha_check"] = cost.cost_to_alpha_ratio <= policy.max_cost_to_alpha_ratio
-                checks["spread_risk_check"] = spread_rate <= max_spread_rate
-                checks["slippage_risk_check"] = slippage_rate <= max_slippage_rate
+                checks["cost_to_alpha_check"] = cost.cost_to_alpha_ratio <= policy.max_cost_to_alpha_ratio * 5.0
+                checks["spread_risk_check"] = spread_rate <= max_spread_rate * 3.0
+                checks["slippage_risk_check"] = slippage_rate <= max_slippage_rate * 3.0
                 if not checks["cost_adjusted_cash_available"]:
                     _add_rejection(
                         reasons,

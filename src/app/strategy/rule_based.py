@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
+from app.market_affordability import is_market_affordable_for_account
 from app.graph import KnowledgeGraph
 from app.schemas.domain import AccountSnapshot, Holding, IndicatorSnapshot, MarketSnapshot, OrderAction, OrderIntent, StrategySignal
 
@@ -63,6 +64,20 @@ def generate_strategy_signals(
             )
             continue
 
+        if account is not None and not is_market_affordable_for_account(market, account):
+            continue
+
+        available_cash = 0.0
+        if account is not None:
+            market_upper = str(market.market or "").upper()
+            if market_upper in ("KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"):
+                currency = "KRW"
+            else:
+                currency = "USD"
+            cash_by_currency = getattr(account, "cash_by_currency", {}) or {}
+            available_cash = float(cash_by_currency.get(currency, 0.0))
+        has_sufficient_cash = available_cash >= float(market.last_price or 0.0) * 1.05
+
         indicator = indicators.get(market.ticker)
         if indicator is None:
             score = 0.0
@@ -77,6 +92,10 @@ def generate_strategy_signals(
             contradicting.extend(flow_contra)
             action = OrderAction.BUY if score >= MARKET_CONTEXT_BUY_THRESHOLD else OrderAction.HOLD
             confidence = max(0.0, min(0.72, 0.38 + score * 0.12))
+            if not has_sufficient_cash:
+                action = OrderAction.HOLD
+                confidence = 0.0
+                contradicting = tuple(set(contradicting) | {"INSUFFICIENT_CASH_FOR_ONE_SHARE"})
             signals.append(
                 StrategySignal(
                     ticker=market.ticker,
@@ -84,7 +103,7 @@ def generate_strategy_signals(
                     confidence=confidence,
                     score=score,
                     supporting_factors=tuple(supporting),
-                    contradicting_factors=tuple(contradicting),
+                    contradicting_factors=contradicting,
                     reasoning_path_ids=graph.reasoning_path_ids(market.ticker),
                 )
             )
@@ -120,6 +139,10 @@ def generate_strategy_signals(
 
         action = OrderAction.BUY if score >= 1.8 else OrderAction.HOLD
         confidence = max(0.0, min(0.85, 0.45 + score * 0.1))
+        if not has_sufficient_cash:
+            action = OrderAction.HOLD
+            confidence = 0.0
+            contradicting.append("INSUFFICIENT_CASH_FOR_ONE_SHARE")
 
         signals.append(
             StrategySignal(

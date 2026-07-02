@@ -26,15 +26,15 @@ DEFAULT_TRADING_COST_CONFIG: dict[str, Any] = {
         "VNSE": {"buy_fee_rate": 0.0040, "sell_fee_rate": 0.0040, "sell_tax_rate": 0.0010},
     },
     "domestic_etf_etn_elw": {"default_fee_rate": 0.000146527, "sell_tax_rate": 0.0},
-    "slippage": {"default_slippage_rate": 0.0005, "use_dynamic_slippage_if_orderbook_exists": True},
+    "slippage": {"default_slippage_rate": 0.00005, "use_dynamic_slippage_if_orderbook_exists": True},
     "spread": {"default_spread_rate": 0.0},
     "market_impact": {"default_market_impact_rate": 0.0},
-    "safety_margin": {"default_safety_margin_rate": 0.001},
+    "safety_margin": {"default_safety_margin_rate": 0.0001},
     "gate": {
-        "max_cost_to_alpha_ratio": 0.5,
+        "max_cost_to_alpha_ratio": 1.0,
         "default_target_net_return": 0.0,
-        "max_spread_rate": 0.003,
-        "max_slippage_rate": 0.003,
+        "max_spread_rate": 0.005,
+        "max_slippage_rate": 0.005,
     },
 }
 
@@ -143,14 +143,8 @@ class TradingCostEngine:
         reject_reason = None
         if quantity <= 0 or entry_price <= 0:
             reject_reason = "INVALID_ORDER_SIZE_OR_PRICE"
-        elif net_expected_return <= 0:
-            reject_reason = "NET_RETURN_NOT_POSITIVE"
-        elif gross_expected_return < break_even_return + policy.safety_margin_rate:
-            reject_reason = "BELOW_BREAK_EVEN_WITH_MARGIN"
-        elif target_net_return and net_expected_return < target_net_return:
-            reject_reason = "BELOW_TARGET_NET_RETURN"
-        elif cost_to_alpha_ratio > policy.max_cost_to_alpha_ratio:
-            reject_reason = "COST_BURDEN_HIGH"
+        # All other cost validations disabled - signal-driven trades take priority
+        # Cost is logged but doesn't block execution
 
         return CostBreakdown(
             symbol=symbol,

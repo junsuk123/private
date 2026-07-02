@@ -382,6 +382,16 @@
       return String(currency || 'KRW').toUpperCase() === 'USD' ? fmtUsd.format(numeric) : fmtWon.format(numeric);
     }
 
+    function translateGoalLabel(label) {
+      const translations = {
+        'Requested target': '요청된 목표',
+        'Lower return': '낮은 수익',
+        'Longer period': '연장된 기간',
+        'Balanced compromise': '균형잡힌 절충',
+      };
+      return translations[label] || label;
+    }
+
     function formatCashByCurrency(account = {}) {
       const cashByCurrency = account && account.cash_by_currency && typeof account.cash_by_currency === 'object'
         ? account.cash_by_currency

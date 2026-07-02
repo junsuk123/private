@@ -17,6 +17,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def train_live_short_horizon_model(
     rows: list[dict[str, Any]],
     *,
@@ -43,14 +50,15 @@ def train_live_short_horizon_model(
         return artifact
     x = [[float(row["features"][name]) for name in feature_names] for row in rows]
     y = [int(row["label"]) for row in rows]
-    returns = [float(row.get("forward_net_return_bps", 0.0)) for row in rows]
+    returns = [_clip_return(float(row.get("forward_net_return_bps", 0.0))) for row in rows]
     means, scales, x_scaled = _standardize(x)
     weights, bias = _fit_logistic(x_scaled, y)
     ret_weights, ret_bias = _fit_linear(x_scaled, returns)
     probs = [_sigmoid(_dot(row, weights) + bias) for row in x_scaled]
     auc = auc_like_score(y, probs)
-    precision_at_k = _precision_at_k(y, probs, max(1, len(y) // 5))
-    avg_return_top = _avg_return_top(returns, probs, max(1, len(y) // 5))
+    top_k = _top_k_count(len(y))
+    precision_at_k = _precision_at_k(y, probs, top_k)
+    avg_return_top = _avg_return_top(returns, probs, top_k)
     min_auc = _env_float("LIVE_MODEL_MIN_AUC", 0.55)
     min_precision = _env_float("LIVE_MODEL_MIN_PRECISION_AT_K", 0.35)
     min_avg_return = _env_float("LIVE_MODEL_MIN_AVG_RETURN_BPS", 0.0)
@@ -63,6 +71,8 @@ def train_live_short_horizon_model(
         "auc": auc,
         "precision_at_k": precision_at_k,
         "avg_forward_net_return_bps_top_k": avg_return_top,
+        "top_k_count": float(top_k),
+        "top_k_fraction": top_k / max(1.0, float(len(rows))),
         "example_count": float(len(rows)),
         "positive_labels": float(sum(y)),
         "negative_labels": float(len(y) - sum(y)),
@@ -153,10 +163,24 @@ def _fit_linear(x: list[list[float]], y: list[float]) -> tuple[list[float], floa
     for _ in range(180):
         for row, target in zip(x, y, strict=True):
             pred = _dot(row, weights) + bias
-            err = pred - target
+            err = max(-250.0, min(250.0, pred - target))
             weights = [w - lr * (err * value + l2 * w) for w, value in zip(weights, row, strict=True)]
             bias -= lr * err
     return weights, bias
+
+
+def _clip_return(value: float) -> float:
+    limit = abs(_env_float("LIVE_MODEL_RETURN_CLIP_BPS", 500.0))
+    if not math.isfinite(value):
+        return 0.0
+    return max(-limit, min(limit, value))
+
+
+def _top_k_count(row_count: int) -> int:
+    fraction = max(0.001, min(0.2, _env_float("LIVE_MODEL_TOP_K_FRACTION", 0.01)))
+    minimum = max(1, _env_int("LIVE_MODEL_TOP_K_MIN", 25))
+    maximum = max(minimum, _env_int("LIVE_MODEL_TOP_K_MAX", 300))
+    return max(1, min(row_count, maximum, max(minimum, int(row_count * fraction))))
 
 
 def _standardize(x: list[list[float]]) -> tuple[list[float], list[float], list[list[float]]]:

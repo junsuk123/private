@@ -41,7 +41,7 @@ def _env_int(name: str, default: int) -> int:
 @dataclass
 class RealtimeTradingConfig:
     interval_ms: int = field(default_factory=lambda: max(100, _env_int("REALTIME_TRADING_INTERVAL_MS", 1000)))
-    take_profit: float = field(default_factory=lambda: _env_float("REALTIME_TAKE_PROFIT", 0.006))
+    take_profit: float = field(default_factory=lambda: _env_float("REALTIME_TAKE_PROFIT", 0.0025))
     stop_loss: float = field(default_factory=lambda: _env_float("REALTIME_STOP_LOSS", 0.010))
     buy_weight: float = field(default_factory=lambda: _env_float("REALTIME_BUY_WEIGHT", 0.01))
     max_orders_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_ORDERS_PER_CYCLE", 8)))
@@ -55,6 +55,7 @@ class RealtimeTradingConfig:
     error_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_ERROR_COOLDOWN_SEC", 300.0))
     # 매도 주문을 낸 종목은 그 주문이 처리될 때까지 재매도 금지(가능수량 초과 APBK0988 방지).
     sell_inflight_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SELL_INFLIGHT_COOLDOWN_SEC", 600.0))
+    sell_amend_min_price_delta: float = field(default_factory=lambda: _env_float("REALTIME_SELL_AMEND_MIN_PRICE_DELTA", 0.0005))
 
 
 class RealtimeTradingEngine:
@@ -348,6 +349,14 @@ class RealtimeTradingEngine:
             "broker_order_id": broker_order_id,
             "action": "amend_existing_sell",
         }
+        previous_order = (existing or {}).get("order")
+        previous_price = float(getattr(previous_order, "limit_price", 0.0) or 0.0)
+        price_delta = abs(float(order.limit_price or 0.0) - previous_price) / max(previous_price, 1e-9)
+        if previous_order is not None and price_delta < self.config.sell_amend_min_price_delta:
+            event["outcome"] = "open_sell_kept"
+            event["detail"] = "existing_sell_order_same_price"
+            self._record(event)
+            return False
         try:
             amended = self.coordinator.amend_final_order(broker_order_id, order)
         except LiveExecutionBlocked as exc:
@@ -357,6 +366,12 @@ class RealtimeTradingEngine:
             self._record(event)
             return False
         except Exception as exc:  # noqa: BLE001 - cancel and reorder if KIS refuses revision.
+            if "정정취소 가능수량" in str(exc) or "no quantity" in str(exc).lower():
+                self._open_sell_orders.pop(order.ticker, None)
+                event["outcome"] = "open_sell_dropped"
+                event["detail"] = f"amend_not_available={exc.__class__.__name__}: {exc}"
+                self._record(event)
+                return False
             try:
                 self.coordinator.cancel_final_order(broker_order_id, (existing or {}).get("order") or order)
                 self._open_sell_orders.pop(order.ticker, None)

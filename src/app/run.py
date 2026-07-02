@@ -19,6 +19,7 @@ import uvicorn
 
 from app.audit import AuditLogger
 from app.cli import run_demo
+from app.data.llm_classifier import configure_default_event_llm_env
 from app.research import ResearchService
 from app.storage import LocalResearchStore
 from app.trading.live_runtime_guard import env_bool as runtime_env_bool
@@ -27,6 +28,7 @@ from app.trading_pipeline import load_short_horizon_strategy_config
 
 def main() -> None:
     _configure_stdout()
+    configure_default_event_llm_env()
     parser = argparse.ArgumentParser(description="Run the complete local investment system")
     parser.add_argument("--host", default="127.0.0.1", help="Web server host")
     parser.add_argument("--port", default=8000, type=int, help="Web server port")

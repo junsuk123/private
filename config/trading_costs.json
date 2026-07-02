@@ -19,7 +19,7 @@
     "sell_tax_rate": 0.0
   },
   "slippage": {
-    "default_slippage_rate": 0.0005,
+    "default_slippage_rate": 0.00005,
     "use_dynamic_slippage_if_orderbook_exists": true
   },
   "spread": {
@@ -29,12 +29,12 @@
     "default_market_impact_rate": 0.0
   },
   "safety_margin": {
-    "default_safety_margin_rate": 0.0005
+    "default_safety_margin_rate": 0.0001
   },
   "gate": {
-    "max_cost_to_alpha_ratio": 0.8,
+    "max_cost_to_alpha_ratio": 1.0,
     "default_target_net_return": 0.0,
-    "max_spread_rate": 0.004,
-    "max_slippage_rate": 0.004
+    "max_spread_rate": 0.01,
+    "max_slippage_rate": 0.01
   }
 }

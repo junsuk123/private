@@ -362,6 +362,26 @@ class EmbeddedOpenVINOChatClient:
         return str(tokenizer.decode(generated, skip_special_tokens=True)).strip()
 
 
+def configure_default_event_llm_env() -> dict[str, Any]:
+    """Enable a local event LLM when no explicit LLM env was provided."""
+    if os.getenv("LLM_EVENT_CLASSIFIER_ENABLED"):
+        return event_llm_runtime_status()
+    if not os.getenv("LLM_EVENT_PROVIDER"):
+        os.environ["LLM_EVENT_PROVIDER"] = "local"
+    if not os.getenv("LLM_EVENT_MODEL"):
+        os.environ["LLM_EVENT_MODEL"] = "qwen2.5:1.5b-instruct"
+    if not os.getenv("LLM_EVENT_LOCAL_ENDPOINT"):
+        os.environ["LLM_EVENT_LOCAL_ENDPOINT"] = "http://127.0.0.1:11434/v1/chat/completions"
+    os.environ.setdefault("LLM_EVENT_MAX_ITEMS_PER_SOURCE", "1")
+    os.environ.setdefault("LLM_EVENT_MAX_ITEMS_PER_RUN", "1")
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
+            os.environ["LLM_EVENT_CLASSIFIER_ENABLED"] = "true" if response.status == 200 else "false"
+    except Exception:
+        os.environ["LLM_EVENT_CLASSIFIER_ENABLED"] = "false"
+    return event_llm_runtime_status()
+
+
 def build_event_llm_classifier_from_env() -> JsonEventLLMClassifier | None:
     enabled = os.getenv("LLM_EVENT_CLASSIFIER_ENABLED", "").lower() in {"1", "true", "yes"}
     provider = os.getenv("LLM_EVENT_PROVIDER", "remote").strip().lower()

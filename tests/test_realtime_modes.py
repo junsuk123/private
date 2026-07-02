@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -649,6 +650,7 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._live_state["context_mode"] = previous_mode
 
     def test_realtime_buy_candidates_include_cached_context_candidates_first(self) -> None:
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
         cached_context = SimpleNamespace(
             markets=(
                 MarketSnapshot(
@@ -657,6 +659,16 @@ class RealtimeModesTest(unittest.TestCase):
                     "Samsung",
                     "Technology",
                     70000.0,
+                    10_000_000,
+                    0.02,
+                    SourceMetadata("unit", datetime.now(timezone.utc)),
+                ),
+                MarketSnapshot(
+                    "000660",
+                    "KOSPI",
+                    "SK hynix",
+                    "Technology",
+                    90000.0,
                     10_000_000,
                     0.02,
                     SourceMetadata("unit", datetime.now(timezone.utc)),
@@ -672,12 +684,14 @@ class RealtimeModesTest(unittest.TestCase):
             with (
                 patch("app.web._active_live_market_groups", return_value=("KRX",)),
                 patch("app.web._load_realtime_collection_symbols", return_value=("111111",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
                 patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5"}),
             ):
                 store_cls.return_value.active_symbols.return_value = ("222222",)
+                store_cls.return_value.latest_tick.side_effect = lambda symbol: SimpleNamespace(price=5000.0) if symbol in {"111111", "222222"} else None
                 candidates = web_module._realtime_buy_candidates()
 
             self.assertEqual(candidates[:2], ("005930", "000660"))
@@ -687,7 +701,78 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
 
+    def test_cached_context_buy_candidates_exclude_symbols_above_orderable_cash(self) -> None:
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        cached_context = SimpleNamespace(
+            markets=(
+                MarketSnapshot(
+                    "005930",
+                    "KOSPI",
+                    "Samsung",
+                    "Technology",
+                    450780.0,
+                    10_000_000,
+                    0.02,
+                    SourceMetadata("unit", datetime.now(timezone.utc)),
+                ),
+                MarketSnapshot(
+                    "000001",
+                    "KOSPI",
+                    "Affordable KR",
+                    "Technology",
+                    4000.0,
+                    10_000_000,
+                    0.02,
+                    SourceMetadata("unit", datetime.now(timezone.utc)),
+                ),
+            ),
+            reasoning_paths=(
+                SimpleNamespace(ticker="005930", conclusion="BuyCandidate"),
+                SimpleNamespace(ticker="000001", conclusion="BuyCandidate"),
+            ),
+            candidate_selection=SimpleNamespace(candidate_stocks=()),
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = cached_context
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+            ):
+                candidates = web_module._cached_context_buy_candidates()
+
+            self.assertEqual(candidates, ("000001",))
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
     def test_realtime_buy_candidates_include_affordable_discovery_when_context_empty(self) -> None:
+        class FakeKisClient:
+            prices = {"005930": 70_000.0, "000660": 150_000.0, "AAPL": 300.0, "MSFT": 20.0}
+
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def get_market_snapshot(self, symbol, market, company_name=None, sector=None):
+                return MarketSnapshot(
+                    symbol,
+                    market,
+                    company_name or symbol,
+                    sector or "Unknown",
+                    self.prices[symbol],
+                    10_000_000,
+                    0.02,
+                    SourceMetadata(
+                        "KIS broker quote",
+                        datetime.now(timezone.utc),
+                        source_type="broker_api",
+                        trust_level=5,
+                        is_realtime=True,
+                        quality_score=1.0,
+                    ),
+                )
+
         account = AccountSnapshot(
             cash=100000.0,
             holdings=(),
@@ -702,6 +787,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._active_live_market_groups", return_value=("KRX", "US")),
                 patch("app.web._live_account_snapshot_for_analysis", return_value=account),
                 patch("app.web._held_or_recent_buy_tickers", return_value=set()),
+                patch("app.web.KisDevelopersApiClient", FakeKisClient),
                 patch("app.web.load_krx_listed_universe", return_value=("005930.KS", "000660.KS")),
                 patch("app.web.load_us_listed_universe", return_value=("AAPL", "MSFT")),
                 patch("app.web._load_realtime_collection_symbols", return_value=()),
@@ -710,11 +796,13 @@ class RealtimeModesTest(unittest.TestCase):
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
             ):
                 store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.return_value = None
                 candidates = web_module._realtime_buy_candidates()
 
             self.assertIn("005930", candidates)
-            self.assertIn("000660", candidates)
-            self.assertIn("AAPL", candidates)
+            self.assertNotIn("000660", candidates)
+            self.assertNotIn("AAPL", candidates)
+            self.assertIn("MSFT", candidates)
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
@@ -781,6 +869,20 @@ class RealtimeModesTest(unittest.TestCase):
             "cash": 800000,
             "invested_value": 200000,
             "actual_equity": 1000000,
+            "holdings": 1,
+            "holdings_count": 1,
+            "positions": [
+                {
+                    "ticker": "005930",
+                    "market": "KR",
+                    "quantity": 2,
+                    "average_price": 50000,
+                    "last_price": 100000,
+                    "market_value": 200000,
+                    "unrealized_pnl": 100000,
+                    "currency": "KRW",
+                }
+            ],
         }
         with (
             patch("app.web._kis_connection_probe", return_value=connection),
@@ -794,7 +896,147 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["orders_count"], 1)
         self.assertEqual(data["live_order_journal"]["blocked_count"], 1)
         self.assertEqual(data["recent_orders"][0]["ticker"], "005930")
+        self.assertEqual(data["positions"][0]["ticker"], "005930")
+        self.assertEqual(data["connection"]["positions"][0]["quantity"], 2)
         self.assertIn("MANUAL_ARMING_FILE_MISSING", data["message"])
+        with web_module._live_lock:
+            cached = web_module._operation_mode_state["last_kis_connection"]
+        self.assertEqual(cached["positions"][0]["ticker"], "005930")
+
+    def test_live_trading_progress_reconciles_filled_buy_before_balance_refresh(self) -> None:
+        client = TestClient(app)
+        journal = {
+            "path": "logs/live-orders.jsonl",
+            "orders_count": 1,
+            "submitted_count": 1,
+            "blocked_count": 0,
+            "error_count": 0,
+            "recent_orders": [],
+            "recent_executions": [],
+            "submitted_orders": [
+                {
+                    "event_type": "live_order_submitted",
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "ticker": "288180",
+                    "market": "KR",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "limit_price": 8700,
+                    "broker_order_id": "0032617900",
+                    "status": "ACCEPTED",
+                }
+            ],
+        }
+        connection = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 63303,
+            "krw_cash": 63303,
+            "cash": 63303,
+            "invested_value": 2600,
+            "actual_equity": 209555,
+            "holdings": 1,
+            "holdings_count": 1,
+            "positions": [
+                {
+                    "ticker": "012860",
+                    "market": "KR",
+                    "quantity": 1,
+                    "average_price": 2610,
+                    "last_price": 2600,
+                    "market_value": 2600,
+                    "market_value_krw": 2600,
+                    "unrealized_pnl": -10,
+                    "currency": "KRW",
+                }
+            ],
+        }
+
+        class FilledOrderBroker:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def get_order_status(self, order_id: str) -> SimpleNamespace:
+                return SimpleNamespace(
+                    order_id=order_id,
+                    ticker="288180",
+                    side=OrderSide.BUY,
+                    quantity=1,
+                    price=8700,
+                    executed_value=8700,
+                    status="FILLED",
+                    message="filled",
+                    executed_at=datetime.now(timezone.utc),
+                )
+
+        with (
+            patch("app.web._kis_connection_probe", return_value=connection),
+            patch("app.web.KisDevelopersApiClient", FilledOrderBroker),
+            patch("app.web._live_snapshot", return_value={"live_execution_summary": {"submitted": 1}}),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=False, failures=("LIVE_TRADING_ENABLED_NOT_TRUE",))),
+            patch("app.web._live_order_journal_snapshot", return_value=journal),
+        ):
+            data = client.get("/api/live-trading/progress").json()
+            status = client.get("/api/status").json()
+
+        self.assertEqual([item["ticker"] for item in data["positions"]], ["012860", "288180"])
+        self.assertEqual(data["pending_positions"][0]["ticker"], "288180")
+        self.assertEqual(data["pending_positions"][0]["position_state"], "pending_balance")
+        self.assertEqual(data["connection"]["holdings_count"], 2)
+        self.assertEqual([item["ticker"] for item in status["positions"]], ["012860", "288180"])
+
+    def test_status_exposes_live_positions_for_gui_refresh(self) -> None:
+        client = TestClient(app)
+        connection = {
+            "ok": True,
+            "mode": "live",
+            "account_checked": True,
+            "actual_deposit": 63303,
+            "krw_cash": 63303,
+            "cash": 63303,
+            "invested_value": 90000,
+            "actual_equity": 153303,
+            "account_suffix": "...28",
+            "positions": [
+                {
+                    "ticker": "012860",
+                    "market": "KR",
+                    "quantity": 1,
+                    "average_price": 2610,
+                    "last_price": 2600,
+                    "market_value": 2600,
+                    "unrealized_pnl": -10,
+                    "currency": "KRW",
+                },
+                {
+                    "ticker": "LAUR",
+                    "market": "NASD",
+                    "quantity": 1,
+                    "average_price": 36.295,
+                    "last_price": 36.32,
+                    "market_value": 36.32,
+                    "unrealized_pnl": 0.025,
+                    "currency": "USD",
+                },
+            ],
+        }
+        with web_module._live_lock:
+            previous = web_module._operation_mode_state.get("last_kis_connection")
+            previous_at = web_module._operation_mode_state.get("last_kis_connection_checked_at")
+            web_module._operation_mode_state["last_kis_connection"] = connection
+            web_module._operation_mode_state["last_kis_connection_checked_at"] = time.time()
+        try:
+            data = client.get("/api/status").json()
+        finally:
+            with web_module._live_lock:
+                web_module._operation_mode_state["last_kis_connection"] = previous
+                web_module._operation_mode_state["last_kis_connection_checked_at"] = previous_at
+
+        self.assertEqual(data["basis_source"], "kis_live_account")
+        self.assertTrue(data["account_checked"])
+        self.assertEqual(data["holdings_count"], 2)
+        self.assertEqual([item["ticker"] for item in data["positions"]], ["012860", "LAUR"])
 
     def test_stop_learning_endpoint_keeps_continuous_collection_alive(self) -> None:
         client = TestClient(app)

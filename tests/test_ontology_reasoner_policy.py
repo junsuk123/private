@@ -42,7 +42,15 @@ class OntologyReasonerPolicyTest(unittest.TestCase):
 
     def test_account_cash_affordability_is_graph_evidence(self) -> None:
         now = datetime.now(timezone.utc)
-        source = SourceMetadata(source_name="KIS broker quote", retrieved_at=now, source_id="quote:unit")
+        source = SourceMetadata(
+            source_name="KIS broker quote",
+            retrieved_at=now,
+            source_id="quote:unit",
+            source_type="broker_api",
+            trust_level=5,
+            is_realtime=True,
+            quality_score=1.0,
+        )
         markets = (
             MarketSnapshot("CHEAP", "NASDAQ", "Cheap", "Technology", 2.0, 10_000_000, 0.02, source),
             MarketSnapshot("EXP", "NASDAQ", "Expensive", "Technology", 200.0, 10_000_000, 0.02, source),
@@ -58,8 +66,28 @@ class OntologyReasonerPolicyTest(unittest.TestCase):
         paths = {path.ticker: path for path in OntologyReasoner(graph).build_reasoning_paths(("CHEAP", "EXP"))}
 
         self.assertTrue(graph.matching(subject="CHEAP", predicate="supportsSignal", object_="CashFitOneShare"))
+        self.assertTrue(graph.matching(subject="CHEAP", predicate="supportsSignal", object_="FreshBrokerQuote"))
+        self.assertTrue(graph.matching(subject="CHEAP", predicate="supportsSignal", object_="ExecutableBuyCandidate"))
         self.assertTrue(graph.matching(subject="EXP", predicate="contradictsSignal", object_="CashBelowOneSharePrice"))
         self.assertGreater(paths["CHEAP"].confidence, paths["EXP"].confidence)
+
+    def test_missing_market_data_blocks_executable_buy_candidate(self) -> None:
+        now = datetime.now(timezone.utc)
+        source = SourceMetadata(source_name="empty quote", retrieved_at=now, source_id="quote:missing")
+        markets = (
+            MarketSnapshot("MISS", "NASDAQ", "Missing", "Technology", 0.0, 10_000_000, 0.02, source),
+        )
+        indicators = {"MISS": IndicatorSnapshot("MISS", 0.2, 0.2, 0.2, None, None, 10, None, 60, 1.2, 0.0)}
+        account = AccountSnapshot(cash=0.0, holdings=(), cash_by_currency={"USD": 5.0}, base_currency="KRW")
+
+        graph = build_market_graph(markets, indicators, account=account)
+        OntologyReasoner(graph).infer()
+        path = OntologyReasoner(graph).build_reasoning_paths(("MISS",))[0]
+
+        self.assertTrue(graph.matching(subject="MISS", predicate="increasesRiskOf", object_="MissingMarketDataRisk"))
+        self.assertTrue(graph.matching(subject="MISS", predicate="increasesRiskOf", object_="TradeForbidden"))
+        self.assertFalse(graph.matching(subject="MISS", predicate="supportsSignal", object_="ExecutableBuyCandidate"))
+        self.assertNotEqual(path.conclusion, "BuyCandidate")
 
 
 if __name__ == "__main__":

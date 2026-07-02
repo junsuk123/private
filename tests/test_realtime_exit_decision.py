@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.schemas.domain import AccountSnapshot, Holding, OrderSide
+from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderSide, SourceMetadata
 from app.execution.kis_types import LiveOrderSubmission
 from app.schemas.domain import FinalOrder, OrderType
 from app.trading.realtime_trading_engine import RealtimeTradingEngine, RealtimeTradingConfig
@@ -170,6 +170,14 @@ class _BuyStore:
         return None
 
 
+class _NoTickBuyStore:
+    def latest_tick(self, symbol: str):
+        return None
+
+    def latest_orderbook(self, symbol: str):
+        return None
+
+
 class RealtimeBuyDecisionTest(unittest.TestCase):
     def test_ontology_drives_buy_when_model_unavailable(self) -> None:
         # 모델이 없어도(프레임 빌드 실패) 온톨로지 매수신호가 강하면 매수가 성립해야 한다.
@@ -187,20 +195,145 @@ class RealtimeBuyDecisionTest(unittest.TestCase):
         result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph)
         self.assertFalse(result.approved)
 
+    def test_buy_cash_check_refreshes_broker_quote_before_rejecting(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        def refresh(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot:
+            return MarketSnapshot(
+                symbol,
+                market,
+                symbol,
+                "Unknown",
+                70_000.0,
+                10_000_000_000,
+                0.02,
+                SourceMetadata(
+                    "KIS broker quote",
+                    decision_time,
+                    source_type="broker_api",
+                    trust_level=5,
+                    is_realtime=True,
+                    quality_score=1.0,
+                ),
+            )
+
+        engine = SharedLiveDecisionEngine(
+            _BuyStore(price=450_780.0),
+            predictor=_DummyPredictor(),
+            market_refresher=refresh,
+        )
+        account = AccountSnapshot(
+            cash=102_413.0,
+            holdings=(),
+            cash_by_currency={"KRW": 102_413.0},
+            cash_equivalent_krw=102_413.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+
+        result = engine.evaluate_buy("005930", account, suggested_weight=0.01, ontology_graph=graph, decision_time=now)
+
+        self.assertNotIn("INSUFFICIENT_CASH_FOR_ONE_SHARE", result.reason_codes)
+        self.assertEqual(engine.get_diagnostics()["quote_refresh_status"], "quote_refresh_ok")
+
+    def test_missing_tick_refreshes_broker_quote_before_rejecting(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        def refresh(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot:
+            return MarketSnapshot(
+                symbol,
+                market,
+                symbol,
+                "Unknown",
+                5.0,
+                10_000_000_000,
+                0.02,
+                SourceMetadata(
+                    "KIS broker quote",
+                    decision_time,
+                    source_type="broker_api",
+                    trust_level=5,
+                    is_realtime=True,
+                    quality_score=1.0,
+                ),
+            )
+
+        engine = SharedLiveDecisionEngine(
+            _NoTickBuyStore(),
+            predictor=_DummyPredictor(),
+            market_refresher=refresh,
+        )
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"USD": 100_000.0},
+            cash_equivalent_krw=130_000_000.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+
+        result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph, decision_time=now)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.BUY)
+        self.assertEqual(engine.get_diagnostics()["quote_refresh_status"], "quote_refresh_ok")
+
+    def test_realtime_adaptive_fallback_can_supply_runtime_ontology_support(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        def refresh(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot:
+            return MarketSnapshot(
+                symbol,
+                market,
+                symbol,
+                "Unknown",
+                5.0,
+                10_000_000_000,
+                0.02,
+                SourceMetadata(
+                    "KIS broker quote",
+                    decision_time,
+                    source_type="broker_api",
+                    trust_level=5,
+                    is_realtime=True,
+                    quality_score=1.0,
+                ),
+            )
+
+        engine = SharedLiveDecisionEngine(
+            _NoTickBuyStore(),
+            predictor=_DummyPredictor(),
+            market_refresher=refresh,
+        )
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"USD": 100_000.0},
+            cash_equivalent_krw=130_000_000.0,
+        )
+
+        result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=_FakeGraph(), decision_time=now)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertTrue(result.final_order.quantity > 0)
+        diagnostics = engine.get_diagnostics()
+        self.assertTrue(diagnostics["runtime_execution_ready"])
+        self.assertTrue(diagnostics["runtime_fallback_support"])
+
 
 class _FixedSellDecisionEngine:
-    def __init__(self) -> None:
+    def __init__(self, limit_price: float | None = None) -> None:
         self.calls = 0
+        self.limit_price = limit_price
 
     def evaluate_exit_for_holding(self, holding, account, **kwargs):
         self.calls += 1
+        limit_price = self.limit_price if self.limit_price is not None else 101.0
         order = FinalOrder(
             ticker=holding.ticker,
             market=holding.market,
             order_type=OrderType.LIMIT,
             side=OrderSide.SELL,
             quantity=holding.quantity,
-            limit_price=99.0 + self.calls,
+            limit_price=limit_price,
         )
         return SimpleNamespace(approved=True, final_order=order, reason_codes=("unit_exit",))
 
@@ -240,7 +373,7 @@ class _AmendAwareCoordinator:
 
 
 class RealtimeSellAmendTest(unittest.TestCase):
-    def test_second_sell_for_same_symbol_amends_existing_order(self) -> None:
+    def test_second_sell_for_same_symbol_keeps_existing_order_when_price_unchanged(self) -> None:
         holding = _holding(100.0, last_price=99.0)
         account = _account(holding, cash=1_000_000.0)
         coordinator = _AmendAwareCoordinator()
@@ -259,11 +392,38 @@ class RealtimeSellAmendTest(unittest.TestCase):
 
         self.assertEqual(first["submitted"], 1)
         self.assertEqual(second["submitted"], 0)
+        self.assertEqual(second["amended"], 0)
+        self.assertEqual(len(coordinator.submitted), 1)
+        self.assertEqual(len(coordinator.amended), 0)
+
+    def test_second_sell_for_same_symbol_amends_when_price_moves_enough(self) -> None:
+        holding = _holding(100.0, last_price=99.0)
+        account = _account(holding, cash=1_000_000.0)
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedSellDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(
+                submit_cooldown_sec=999,
+                sell_inflight_cooldown_sec=999,
+                sell_amend_min_price_delta=0.0001,
+            ),
+        )
+
+        first = engine.run_once()
+        engine.decision_engine = _FixedSellDecisionEngine(limit_price=101.2)
+        second = engine.run_once()
+
+        self.assertEqual(first["submitted"], 1)
         self.assertEqual(second["amended"], 1)
         self.assertEqual(len(coordinator.submitted), 1)
         self.assertEqual(len(coordinator.amended), 1)
         self.assertEqual(coordinator.amended[0][0], "SELL0001")
-        self.assertEqual(coordinator.amended[0][1].limit_price, 101.0)
+        self.assertEqual(coordinator.amended[0][1].limit_price, 101.2)
 
 
 if __name__ == "__main__":

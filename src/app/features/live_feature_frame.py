@@ -24,6 +24,8 @@ class LiveFeatureFrame:
     schema: FeatureSchema
     values: tuple[float, ...]
     provenance: FeatureProvenance
+    mark_price: float = 0.0
+    mark_source: str = "unknown"
 
     @property
     def feature_schema_hash(self) -> str:
@@ -132,7 +134,15 @@ class LiveFeatureFrameBuilder:
                 (decision_time - orderbook.received_at).total_seconds() * 1000,
             ),
         )
-        frame = LiveFeatureFrame(symbol, decision_time, self.schema, values, provenance)
+        frame = LiveFeatureFrame(
+            symbol,
+            decision_time,
+            self.schema,
+            values,
+            provenance,
+            float(prices[-1]),
+            "tick" if ticks else "orderbook_mid",
+        )
         frame.validate()
         self._journal(frame)
         return frame
@@ -142,6 +152,8 @@ class LiveFeatureFrameBuilder:
             "symbol": frame.symbol,
             "decision_time": frame.decision_time.isoformat(),
             "feature_schema_hash": frame.feature_schema_hash,
+            "mark_price": frame.mark_price,
+            "mark_source": frame.mark_source,
             "source_record_ids": frame.provenance.source_record_ids,
             "values": frame.as_feature_dict(),
         }

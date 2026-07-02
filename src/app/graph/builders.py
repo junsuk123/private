@@ -27,6 +27,7 @@ def build_market_graph(
         graph.add(company, "hasTicker", market.ticker, market.source.source_id)
         graph.add(company, "belongsToSector", market.sector, market.source.source_id)
         graph.add(market.ticker, "isListedOn", market.market, market.source.source_id)
+        _add_market_data_state_to_graph(graph, market)
         _add_account_affordability_to_graph(graph, market, account)
         _add_investor_flow_to_graph(graph, market)
 
@@ -150,3 +151,19 @@ def _add_account_affordability_to_graph(
     else:
         graph.add(market.ticker, "contradictsSignal", "CashBelowOneSharePrice", evidence_id)
         graph.add(market.ticker, "increasesRiskOf", "InsufficientAccountCashRisk", evidence_id)
+
+
+def _add_market_data_state_to_graph(graph: KnowledgeGraph, market: MarketSnapshot) -> None:
+    source = market.source
+    evidence_id = source.source_id or f"market-data:{market.ticker}:{source.retrieved_at.isoformat()}"
+    price = float(getattr(market, "last_price", 0.0) or 0.0)
+    graph.add(market.ticker, "hasMarketDataSource", source.source_name, evidence_id)
+    if price <= 0.0:
+        graph.add(market.ticker, "contradictsSignal", "MissingMarketData", evidence_id)
+        graph.add(market.ticker, "increasesRiskOf", "MissingMarketDataRisk", evidence_id)
+        return
+    if source.is_realtime and source.source_type == "broker_api" and source.quality_score >= 0.8:
+        graph.add(market.ticker, "supportsSignal", "LiveBrokerRealtimeQuote", evidence_id)
+        graph.add(market.ticker, "supportsSignal", "FreshBrokerQuote", evidence_id)
+    elif source.is_delayed or source.is_synthetic or source.quality_score < 0.3:
+        graph.add(market.ticker, "increasesRiskOf", "WeakMarketDataQualityRisk", evidence_id)

@@ -24,9 +24,12 @@ SUPPORT_WEIGHTS = {
     "OrderFlowConfirmedBuyCandidate": 0.10,
     "CashFitOneShare": 0.07,
     "AffordableByAccountCash": 0.08,
+    "FreshBrokerQuote": 0.08,
+    "LiveBrokerRealtimeQuote": 0.10,
     "SectorMomentum": 0.08,
     "BuyCandidate": 0.08,
     "AccountCashFeasibleBuyCandidate": 0.06,
+    "ExecutableBuyCandidate": 0.10,
 }
 CONTRADICTION_WEIGHTS = {
     "ValuationDiscipline": 0.12,
@@ -37,6 +40,7 @@ CONTRADICTION_WEIGHTS = {
     "OrderFlowPriceDivergence": 0.10,
     "SuspectedSmartMoneyDistribution": 0.12,
     "CashBelowOneSharePrice": 0.18,
+    "MissingMarketData": 0.22,
     "BuyCandidate": 0.20,
     "AggressiveBuy": 0.10,
 }
@@ -48,6 +52,8 @@ RISK_WEIGHTS = {
     "OrderFlowDistributionRisk": 0.16,
     "ThinLiquidityPriceImpactRisk": 0.14,
     "InsufficientAccountCashRisk": 0.20,
+    "MissingMarketDataRisk": 0.24,
+    "WeakMarketDataQualityRisk": 0.12,
     "SellCandidate": 0.22,
     "ReduceRiskCandidate": 0.18,
     "TradeForbidden": 0.30,
@@ -212,8 +218,18 @@ class OntologyReasoner:
                 self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:ofi-distribution")
             if {"CashFitOneShare", "AffordableByAccountCash"}.issubset(support_objects):
                 self.graph.add(subject, "supportsSignal", "AccountCashFeasibleBuyCandidate", "reasoner:account-cash")
+            if (
+                "AccountCashFeasibleBuyCandidate" in set(self.graph.objects(subject, "supportsSignal"))
+                and {"LiveBrokerRealtimeQuote", "FreshBrokerQuote"} & set(self.graph.objects(subject, "supportsSignal"))
+                and "MissingMarketDataRisk" not in risk_objects
+                and "InsufficientAccountCashRisk" not in risk_objects
+            ):
+                self.graph.add(subject, "supportsSignal", "ExecutableBuyCandidate", "reasoner:execution-readiness")
             if "CashBelowOneSharePrice" in contra_objects:
                 self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:account-cash")
+            if "MissingMarketData" in contra_objects or "MissingMarketDataRisk" in risk_objects:
+                self.graph.add(subject, "contradictsSignal", "BuyCandidate", "reasoner:market-data")
+                self.graph.add(subject, "increasesRiskOf", "TradeForbidden", "reasoner:market-data")
 
     def _infer_risk_adjustments(self) -> None:
         for triple in self.graph.matching(predicate="increasesRiskOf"):
