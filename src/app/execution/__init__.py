@@ -8,6 +8,7 @@ from app.execution.kis_real import (
     KisEndpointSet,
     load_kis_env_file,
 )
+from app.execution.kis_overseas import KisOverseasAccountClient
 from app.execution.live_execution_coordinator import LiveExecutionCoordinator
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "KisApiError",
     "KisCredentials",
     "KisEndpointSet",
+    "KisOverseasAccountClient",
     "load_kis_env_file",
     "LiveExecutionCoordinator",
     "MockKisExecution",

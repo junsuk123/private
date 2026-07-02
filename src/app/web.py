@@ -20,8 +20,10 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette import routing as starlette_routing
 
+from app.web_account_routes import create_account_router
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
@@ -157,6 +159,7 @@ def _ensure_starlette_router_event_compatibility() -> None:
 _ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
+app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 audit = AuditLogger(Path("logs/web-audit.jsonl"))
 sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
@@ -175,6 +178,52 @@ AUTO_START_KIS_REALTIME_COLLECTOR = os.getenv("AUTO_START_KIS_REALTIME_COLLECTOR
 # 안전 기본값: 실시간 거래 엔진은 서버 기동 시 자동 시작하지 않는다(live_trading 모드 진입 시 시작).
 AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").lower() in {"1", "true", "yes", "on"}
 _auto_live_readiness_started = False
+
+
+def _account_dashboard_status_provider() -> dict[str, Any]:
+  basis = _last_live_account_basis()
+  if basis is None:
+    snapshot = _live_snapshot()
+    context = snapshot.get("context")
+    account = getattr(context, "account", None)
+    report = getattr(context, "report", None)
+    return {
+        "cash": float(getattr(account, "cash", 0.0) or 0.0),
+        "krw_cash": float(getattr(account, "cash", 0.0) or 0.0),
+        "cash_equivalent_krw": float(getattr(account, "pure_cash", 0.0) or 0.0),
+        "equity": float(getattr(report, "equity", 0.0) or getattr(account, "equity", 0.0) or 0.0),
+        "cash_weight": float(getattr(report, "cash_weight", 0.0) or 0.0),
+        "base_currency": getattr(account, "base_currency", "KRW") if account is not None else "KRW",
+        "cash_by_currency": dict(getattr(account, "cash_by_currency", {}) or {}),
+        "positions": [],
+        "basis_source": "analysis_context_fallback",
+        "updated_at": _iso_or_none(snapshot.get("last_updated")),
+        "last_error": snapshot.get("last_error"),
+    }
+  return {
+      **basis,
+      "basis_source": basis.get("source", "kis_live_account"),
+      "account_checked": True,
+      "updated_at": datetime.now(timezone.utc).isoformat(),
+  }
+
+
+def _account_dashboard_logs_provider() -> dict[str, Any]:
+  snapshot = _live_snapshot()
+  return {
+      "collection_log": snapshot.get("collection_log") or [],
+      "last_error": snapshot.get("last_error"),
+      "live_execution_summary": snapshot.get("live_execution_summary"),
+      "learning": snapshot.get("learning"),
+  }
+
+
+app.include_router(
+    create_account_router(
+        status_provider=_account_dashboard_status_provider,
+        logs_provider=_account_dashboard_logs_provider,
+    )
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:

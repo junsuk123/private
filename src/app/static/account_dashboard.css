@@ -1,0 +1,161 @@
+:root {
+  color-scheme: light;
+  font-family: "Segoe UI", "Noto Sans KR", Arial, sans-serif;
+  background: #eef2f5;
+  color: #132238;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: #eef2f5; }
+
+.account-dashboard {
+  display: grid;
+  gap: 16px;
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.account-header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.account-header h1 { margin: 0; font-size: 28px; letter-spacing: 0; }
+.account-header p { margin: 6px 0 0; color: #667085; }
+.account-actions { display: flex; gap: 8px; align-items: center; }
+.account-actions a,
+.account-actions button {
+  border: 1px solid #cfd8e3;
+  background: #ffffff;
+  color: #132238;
+  border-radius: 8px;
+  padding: 9px 12px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.dashboard-frame {
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  padding: 16px;
+  background: #ffffff;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+}
+
+.frame-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.frame-title h2 { margin: 0; font-size: 18px; letter-spacing: 0; }
+.badge { border-radius: 999px; padding: 4px 9px; font-size: 12px; background: #e8f5ee; color: #027a48; }
+.badge.warn { background: #fff4e5; color: #b54708; }
+
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.kpi-card {
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.kpi-card span { display: block; color: #667085; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi-card strong { display: block; margin-top: 6px; font-size: 22px; line-height: 1.15; word-break: break-word; }
+.kpi-card small { display: block; margin-top: 4px; color: #667085; }
+.positive { color: #067647; }
+.negative { color: #b42318; }
+
+.main-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  gap: 16px;
+}
+
+.chart-frame {
+  display: block;
+  width: 100%;
+  min-height: 300px;
+  max-height: 380px;
+  border: 1px solid #edf1f6;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.segmented { display: flex; gap: 4px; flex-wrap: wrap; }
+.segmented button {
+  border: 1px solid #cfd8e3;
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px 9px;
+  cursor: pointer;
+}
+.segmented button.active { background: #176b87; color: #fff; border-color: #176b87; }
+
+.allocation-list { display: grid; gap: 8px; margin-top: 12px; }
+.allocation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; font-size: 13px; }
+.allocation-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.account-filters { display: flex; gap: 8px; flex-wrap: wrap; }
+.account-filters input,
+.account-filters select {
+  border: 1px solid #cfd8e3;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fff;
+}
+
+.table-frame {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid #edf1f6;
+  border-radius: 8px;
+}
+.table-frame.compact { max-height: 300px; }
+table { width: 100%; border-collapse: collapse; min-width: 860px; }
+th, td { padding: 10px 12px; border-bottom: 1px solid #edf1f6; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child,
+th:nth-child(2), td:nth-child(2),
+th:nth-child(3), td:nth-child(3) { text-align: left; }
+thead { position: sticky; top: 0; z-index: 1; background: #f8fafc; }
+tbody tr:hover { background: #f8fbff; }
+.empty-row td { text-align: center; color: #667085; padding: 24px; }
+
+.system-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+.system-pill { border: 1px solid #e1e7ef; border-radius: 8px; padding: 10px; background: #fbfcfe; }
+.system-pill span { display: block; color: #667085; font-size: 12px; }
+.system-pill strong { display: block; margin-top: 4px; }
+
+.log-details summary { cursor: pointer; font-weight: 700; }
+.log-panel {
+  max-height: 280px;
+  overflow: auto;
+  margin-top: 12px;
+  border-radius: 8px;
+  background: #111827;
+  color: #e5e7eb;
+  padding: 12px;
+  font: 12px/1.5 Consolas, "Courier New", monospace;
+}
+
+@media (max-width: 900px) {
+  .account-header { align-items: start; flex-direction: column; }
+  .main-grid { grid-template-columns: 1fr; }
+  .account-dashboard { padding: 10px; }
+  .dashboard-frame { padding: 12px; }
+}
