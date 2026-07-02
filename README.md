@@ -56,6 +56,8 @@ explainability — **without changing any trading decision**. It is an *additive
 `KnowledgeGraph` remains the primary store, and the RDF/OWL/SHACL results are exposed as extra
 diagnostics and semantic labels.
 
+![Hybrid RDF/RDFS/OWL + SHACL ontology framework](docs/diagrams/ontology_framework.svg)
+
 ### Hybrid reasoning boundary
 
 ```text

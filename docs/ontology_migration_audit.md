@@ -7,6 +7,8 @@ framework with hybrid reasoning, **without** breaking the existing trading pipel
 vocabulary to the target RDF/RDFS/OWL model, list the modules that must be updated, and record the
 compatibility risks. This is the reference for T02–T14.
 
+![Before/after: custom triple store migrated to a standards-based ontology](diagrams/ontology_migration_beforeafter.svg)
+
 ---
 
 ## 1. Current design summary

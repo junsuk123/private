@@ -4,6 +4,8 @@ Conversion of the custom in-memory triple ontology into a standards-based RDF/RD
 hybrid reasoning (`rdflib` + `owlrl` + `pyshacl`), delivered on branch
 `feature/standard-rdf-owl-ontology-framework`.
 
+![Ontology framework components and data flow](diagrams/ontology_standardization_components.svg)
+
 ## Summary of what changed
 
 An **additive** standards-based ontology layer was added alongside the existing custom

@@ -27,6 +27,8 @@ blank nodes, so the same entity gets the same IRI across analysis cycles.
 
 ## Reasoning boundary (why hybrid)
 
+![Reasoning boundary: OWL, SHACL, Python, RiskManager](../../../docs/diagrams/ontology_reasoning_boundary.svg)
+
 ```
 OWL / RDFS  -> class & property hierarchy, domain/range typing, semantic
                categorization (BuyCandidate, TradeForbiddenAsset, SyntheticDataAsset...),

@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a5" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <style>
+      .h{fill:#0f172a;font-size:19px;font-weight:700;}
+      .c{fill:#ffffff;font-size:15px;font-weight:700;text-anchor:middle;}
+      .b{fill:#0f172a;font-size:12px;text-anchor:middle;}
+      .s{fill:#334155;font-size:11.5px;text-anchor:middle;}
+    </style>
+  </defs>
+  <rect x="0" y="0" width="960" height="440" fill="#f8fafc"/>
+  <text x="40" y="40" class="h">Reasoning Boundary — Who Decides What</text>
+
+  <rect x="40" y="80" width="200" height="150" rx="12" fill="#7c3aed"/>
+  <text x="140" y="112" class="c">OWL / RDFS</text>
+  <text x="140" y="140" class="b" fill="#ede9fe">class &amp; property hierarchy</text>
+  <text x="140" y="162" class="b" fill="#ede9fe">domain/range typing</text>
+  <text x="140" y="184" class="b" fill="#ede9fe">semantic categorization</text>
+  <text x="140" y="206" class="b" fill="#ede9fe">consistency (open-world)</text>
+
+  <rect x="260" y="80" width="200" height="150" rx="12" fill="#0ea5e9"/>
+  <text x="360" y="112" class="c">SHACL</text>
+  <text x="360" y="140" class="b" fill="#e0f2fe">required fields</text>
+  <text x="360" y="162" class="b" fill="#e0f2fe">stale / synthetic block</text>
+  <text x="360" y="184" class="b" fill="#e0f2fe">invalid state</text>
+  <text x="360" y="206" class="b" fill="#e0f2fe">(closed-world)</text>
+
+  <rect x="480" y="80" width="200" height="150" rx="12" fill="#f59e0b"/>
+  <text x="580" y="112" class="c">Python</text>
+  <text x="580" y="140" class="b" fill="#fef3c7">support/contradiction/risk</text>
+  <text x="580" y="162" class="b" fill="#fef3c7">confidence · ranking</text>
+  <text x="580" y="184" class="b" fill="#fef3c7">thresholds</text>
+  <text x="580" y="206" class="b" fill="#fef3c7">short-horizon policy</text>
+
+  <rect x="700" y="80" width="220" height="150" rx="12" fill="#dc2626"/>
+  <text x="810" y="112" class="c">RiskManager</text>
+  <text x="810" y="140" class="b" fill="#fee2e2">cost · tax · slippage</text>
+  <text x="810" y="162" class="b" fill="#fee2e2">principal protection</text>
+  <text x="810" y="184" class="b" fill="#fee2e2">sizing · cash checks</text>
+  <text x="810" y="208" class="b" fill="#fee2e2" font-weight="700">SOLE FINAL GATE</text>
+
+  <path d="M240,155 L258,155" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a5)"/>
+  <path d="M460,155 L478,155" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a5)"/>
+  <path d="M680,155 L698,155" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#a5)"/>
+
+  <text x="140" y="255" class="s">labels + entailments</text>
+  <text x="360" y="255" class="s">block / warn</text>
+  <text x="580" y="255" class="s">scores + intents</text>
+  <text x="810" y="255" class="s">approve / reject</text>
+
+  <rect x="40" y="290" width="880" height="120" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="480" y="320" class="c" fill="#0f172a" font-size="15">OWL / RDFS / SHACL enrich semantics and explainability — they do NOT authorize trades.</text>
+  <text x="480" y="352" class="s">Open-world OWL cannot treat missing data as false; an inferred BuyCandidate / TradeEligibleAsset is only a label.</text>
+  <text x="480" y="378" class="s">Extend safely: hierarchy &amp; axioms in TTL · closed-world checks in SHACL · never encode scores or trade permission in OWL.</text>
+</svg>

@@ -200,7 +200,11 @@ The current workspace uses FastAPI/Uvicorn for the web runtime, SQLite for local
 
 ## Standards-Based Ontology Framework (Hybrid RDF/RDFS/OWL + SHACL)
 
+![Layered ontology architecture and end-to-end flow](diagrams/ontology_layered_architecture.svg)
+
 ### Before / after
+
+![Before/after: custom triple store to standards-based ontology](diagrams/ontology_migration_beforeafter.svg)
 
 - **Before:** a custom in-memory triple store (`app.graph.KnowledgeGraph`) of `(subject, predicate, object,
   evidence_id)` string tuples, with a rule-based scorer named `OntologyReasoner` and a flat list of class /
