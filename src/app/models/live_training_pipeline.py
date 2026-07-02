@@ -20,15 +20,44 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
+# Triple-barrier 라벨 기본값: 전략 청산 기준과 정렬(TP=take_profit 25bps, SL=stop_loss 100bps,
+# 지평=장중 보유창 10분). "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에 압도돼
+# 모델이 붕괴했다. 경로가 TP/SL 중 무엇을 먼저 터치하는지로 라벨링하면 신호가 살아난다.
+# 지평은 실데이터 시간기반 홀드아웃 스윕으로 선정: 600s에서 AUC 0.563/상위픽 +51bps로 적격,
+# 900s 이상에서는 노이즈가 커져 부적격이 됐다.
+DEFAULT_LABEL_HORIZON_SECONDS = 600.0
+DEFAULT_LABEL_TAKE_PROFIT_BPS = 25.0
+DEFAULT_LABEL_STOP_LOSS_BPS = 100.0
+MIN_TRIPLE_BARRIER_PATH_POINTS = 2
 
 
 def _label_min_net_return_bps() -> float:
-    # 단타용으로 라벨을 완화: 비용 차감 후 순수익이 이 값(bps) 초과면 positive.
-    # 기존 20bps는 너무 빡빡해 positive가 ~1%뿐이라 모델이 붕괴했다.
+    # 가격 경로가 없을 때(테스트/스토어 미비) 쓰는 폴백 단일-전방 라벨의 임계값(bps).
     try:
         return float(os.getenv("LIVE_LABEL_MIN_NET_RETURN_BPS", "5.0"))
     except (TypeError, ValueError):
         return 5.0
+
+
+def _label_horizon_seconds() -> float:
+    try:
+        return max(60.0, float(os.getenv("LIVE_LABEL_HORIZON_SECONDS", str(DEFAULT_LABEL_HORIZON_SECONDS))))
+    except (TypeError, ValueError):
+        return DEFAULT_LABEL_HORIZON_SECONDS
+
+
+def _label_take_profit_bps() -> float:
+    try:
+        return abs(float(os.getenv("LIVE_LABEL_TAKE_PROFIT_BPS", str(DEFAULT_LABEL_TAKE_PROFIT_BPS))))
+    except (TypeError, ValueError):
+        return DEFAULT_LABEL_TAKE_PROFIT_BPS
+
+
+def _label_stop_loss_bps() -> float:
+    try:
+        return abs(float(os.getenv("LIVE_LABEL_STOP_LOSS_BPS", str(DEFAULT_LABEL_STOP_LOSS_BPS))))
+    except (TypeError, ValueError):
+        return DEFAULT_LABEL_STOP_LOSS_BPS
 
 
 def collect_live_feature_frames_from_realtime_store(
@@ -78,7 +107,11 @@ def train_live_short_horizon_from_collected_features(
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
-            "label_rule": f"forward_mark_price_return_after_30s_after_costs_bps > {_label_min_net_return_bps()}",
+            "label_rule": (
+                f"triple_barrier tp={_label_take_profit_bps()}bps sl={_label_stop_loss_bps()}bps "
+                f"horizon={_label_horizon_seconds()}s net_of_costs "
+                f"(fallback: forward_return_after_30s > {_label_min_net_return_bps()}bps)"
+            ),
             "schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
             "row_quality": _row_quality_summary(rows),
         },
@@ -128,17 +161,16 @@ def build_live_training_rows_from_feature_journal(
             continue
         by_symbol[str(frame.get("symbol") or "")].append(frame)
 
+    horizon_seconds = _label_horizon_seconds()
+    take_profit_bps = _label_take_profit_bps()
+    stop_loss_bps = _label_stop_loss_bps()
+
     rows: list[dict[str, Any]] = []
     for symbol, symbol_frames in by_symbol.items():
         ordered = _dedupe_sorted_frames(symbol_frames)
+        times = [_parse_frame_time(frame) for frame in ordered]
+        prices = [_frame_mark_price(frame, price_lookup) for frame in ordered]
         for index, current in enumerate(ordered):
-            nxt = _next_frame_after_minimum_horizon(
-                ordered,
-                index,
-                minimum_forward_seconds=DEFAULT_LABEL_MIN_FORWARD_SECONDS,
-            )
-            if nxt is None:
-                continue
             if not _frame_passes_training_quality(current):
                 continue
             try:
@@ -150,20 +182,25 @@ def build_live_training_rows_from_feature_journal(
                 continue
             if any(not math.isfinite(value) for value in features.values()):
                 continue
-            current_price = _frame_mark_price(current, price_lookup)
-            future_price = _frame_mark_price(nxt, price_lookup)
-            if current_price is not None and future_price is not None and current_price > 0:
-                gross_forward_return_bps = (future_price / current_price - 1.0) * 10_000.0
-                label_source = "forward_mark_price"
-            else:
-                gross_forward_return_bps = float(nxt["values"].get("return_1m", 0.0)) * 10_000.0
-                label_source = "fallback_next_return_1m"
-            observed_cost_bps = max(0.0, float(current["values"].get("spread_bps", 0.0))) + 10.0
-            forward_net_return_bps = gross_forward_return_bps - observed_cost_bps
+            labelled = _triple_barrier_label(
+                ordered,
+                times,
+                prices,
+                index,
+                horizon_seconds=horizon_seconds,
+                take_profit_bps=take_profit_bps,
+                stop_loss_bps=stop_loss_bps,
+            )
+            if labelled is None:
+                # 가격 경로가 없으면(테스트/스토어 미비) 기존 단일-전방 라벨로 후퇴한다.
+                labelled = _legacy_forward_label(ordered, index, price_lookup)
+            if labelled is None:
+                continue
+            label, forward_net_return_bps, gross_forward_return_bps, label_source = labelled
             rows.append(
                 {
                     "features": features,
-                    "label": int(forward_net_return_bps > _label_min_net_return_bps()),
+                    "label": label,
                     "forward_net_return_bps": forward_net_return_bps,
                     "gross_forward_return_bps": gross_forward_return_bps,
                     "label_source": label_source,
@@ -173,6 +210,88 @@ def build_live_training_rows_from_feature_journal(
                 }
             )
     return rows
+
+
+def _observed_cost_bps(frame: dict[str, Any]) -> float:
+    try:
+        spread_bps = max(0.0, float(frame["values"].get("spread_bps", 0.0)))
+    except (TypeError, ValueError, KeyError):
+        spread_bps = 0.0
+    return spread_bps + 10.0
+
+
+def _triple_barrier_label(
+    ordered: list[dict[str, Any]],
+    times: list[datetime | None],
+    prices: list[float | None],
+    index: int,
+    *,
+    horizon_seconds: float,
+    take_profit_bps: float,
+    stop_loss_bps: float,
+) -> tuple[int, float, float, str] | None:
+    """전방 지평(horizon) 안에서 순수익 경로가 +TP를 먼저 터치하면 1, -SL을 먼저 터치하면 0.
+
+    어느 배리어도 터치하지 않으면 지평 종단 순수익의 부호로 라벨링한다. 라벨은 미래 가격을
+    사용하지만 피처는 as-of 시점 값만 쓰므로 룩어헤드가 아니다.
+    """
+    entry_time = times[index]
+    entry_price = prices[index]
+    if entry_time is None or entry_price is None or entry_price <= 0:
+        return None
+    cost_bps = _observed_cost_bps(ordered[index])
+    horizon_cutoff = entry_time + timedelta(seconds=horizon_seconds)
+    forward_prices: list[float] = []
+    for j in range(index + 1, len(ordered)):
+        candidate_time = times[j]
+        if candidate_time is None:
+            continue
+        if candidate_time > horizon_cutoff:
+            break
+        candidate_price = prices[j]
+        if candidate_price is not None and candidate_price > 0:
+            forward_prices.append(candidate_price)
+    if len(forward_prices) < MIN_TRIPLE_BARRIER_PATH_POINTS:
+        return None
+    for price in forward_prices:
+        gross_bps = (price / entry_price - 1.0) * 10_000.0
+        net_bps = gross_bps - cost_bps
+        if net_bps >= take_profit_bps:
+            return (1, net_bps, gross_bps, "triple_barrier_take_profit")
+        if net_bps <= -stop_loss_bps:
+            return (0, net_bps, gross_bps, "triple_barrier_stop_loss")
+    terminal_gross_bps = (forward_prices[-1] / entry_price - 1.0) * 10_000.0
+    terminal_net_bps = terminal_gross_bps - cost_bps
+    return (int(terminal_net_bps > 0.0), terminal_net_bps, terminal_gross_bps, "triple_barrier_terminal")
+
+
+def _legacy_forward_label(
+    ordered: list[dict[str, Any]],
+    index: int,
+    price_lookup: "_FramePriceLookup",
+) -> tuple[int, float, float, str] | None:
+    nxt = _next_frame_after_minimum_horizon(
+        ordered,
+        index,
+        minimum_forward_seconds=DEFAULT_LABEL_MIN_FORWARD_SECONDS,
+    )
+    if nxt is None:
+        return None
+    current_price = _frame_mark_price(ordered[index], price_lookup)
+    future_price = _frame_mark_price(nxt, price_lookup)
+    if current_price is not None and future_price is not None and current_price > 0:
+        gross_forward_return_bps = (future_price / current_price - 1.0) * 10_000.0
+        label_source = "forward_mark_price"
+    else:
+        gross_forward_return_bps = float(nxt["values"].get("return_1m", 0.0)) * 10_000.0
+        label_source = "fallback_next_return_1m"
+    forward_net_return_bps = gross_forward_return_bps - _observed_cost_bps(ordered[index])
+    return (
+        int(forward_net_return_bps > _label_min_net_return_bps()),
+        forward_net_return_bps,
+        gross_forward_return_bps,
+        label_source,
+    )
 
 
 def _load_feature_frames(journal_path: str | Path) -> list[dict[str, Any]]:

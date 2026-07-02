@@ -38,6 +38,19 @@ class _DummyPredictor:
         raise AssertionError("predictor should not be called for TP/SL exits")
 
 
+class _ApprovedPredictor:
+    def predict(self, frame):
+        return SimpleNamespace(
+            probability_success=0.74,
+            expected_net_return_bps=80.0,
+            uncertainty_score=0.2,
+            approved=True,
+            reason_codes=(),
+            model_artifact_id="unit-model",
+            feature_schema_hash=frame.feature_schema_hash,
+        )
+
+
 def _engine(price: float) -> SharedLiveDecisionEngine:
     return SharedLiveDecisionEngine(_FakeStore(price), predictor=_DummyPredictor())
 
@@ -155,6 +168,55 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIn("HOLD_BELOW_PROFIT_TARGET", result.reason_codes)
 
+    def test_domestic_drawdown_reduces_before_large_loss(self) -> None:
+        engine = _engine(price=98.0)
+        holding = _holding(100.0)
+        account = _account(holding, cash=1_000_000.0)
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_ALLOW_LOSS_EXIT": "true",
+                "REALTIME_DOMESTIC_DRAWDOWN_REDUCE_TRIGGER": "0.015",
+                "REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER": "0.03",
+            },
+        ):
+            result = engine.evaluate_exit_for_holding(
+                holding, account, take_profit=0.006, stop_loss=0.01, ontology_graph=_FakeGraph()
+            )
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertEqual(result.final_order.quantity, 5)
+        self.assertIn("domestic_drawdown_reduce", result.reason_codes[0])
+
+    def test_domestic_single_share_concentration_exits_instead_of_zero_reduce(self) -> None:
+        engine = _engine(price=99.5)
+        holding = Holding(
+            ticker="476830",
+            market="KR",
+            company_name="Concentrated",
+            sector="ETF",
+            quantity=1,
+            average_price=100.0,
+            last_price=99.5,
+        )
+        account = AccountSnapshot(cash=300.0, holdings=(holding,))
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_ALLOW_LOSS_EXIT": "true",
+                "REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT": "0.20",
+            },
+        ):
+            result = engine.evaluate_exit_for_holding(
+                holding, account, take_profit=0.006, stop_loss=0.01, ontology_graph=_FakeGraph()
+            )
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertEqual(result.final_order.quantity, 1)
+        self.assertIn("domestic_concentration_reduce", result.reason_codes[0])
+
 
 class _BuyStore:
     """Store exposing a fresh tick (and no orderbook) for the buy path."""
@@ -194,6 +256,71 @@ class RealtimeBuyDecisionTest(unittest.TestCase):
         graph = _FakeGraph()  # no buy-supportive evidence
         result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph)
         self.assertFalse(result.approved)
+
+    def test_domestic_buy_tightens_but_does_not_pause_when_domestic_book_is_in_drawdown(self) -> None:
+        engine = SharedLiveDecisionEngine(_BuyStore(price=5_000.0), predictor=_DummyPredictor())
+        losing_holding = Holding(
+            ticker="005930",
+            market="KR",
+            company_name="Samsung",
+            sector="Tech",
+            quantity=1,
+            average_price=100_000.0,
+            last_price=98_000.0,
+        )
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(losing_holding,),
+            cash_by_currency={"KRW": 1_000_000.0},
+            cash_equivalent_krw=1_000_000.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER": "0.005",
+                "REALTIME_DOMESTIC_DRAWDOWN_BUY_BONUS_MULTIPLIER": "6.0",
+            },
+        ):
+            result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=graph)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        diagnostics = engine.get_diagnostics()
+        self.assertGreater(diagnostics["effective_buy_threshold"], diagnostics["buy_threshold"])
+        self.assertLess(diagnostics["domestic_drawdown_rate"], 0)
+
+    def test_model_only_buy_is_rejected_when_ai_is_auxiliary(self) -> None:
+        engine = SharedLiveDecisionEngine(_BuyStore(price=5_000.0), predictor=_ApprovedPredictor())
+        engine.feature_builder = SimpleNamespace(
+            build=lambda symbol, decision_time=None: SimpleNamespace(
+                feature_schema_hash="unit-schema",
+                provenance=SimpleNamespace(source_record_ids=("unit-frame",)),
+            )
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+
+        with patch.dict("os.environ", {"REALTIME_MODEL_AUXILIARY_ONLY": "true"}):
+            result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=_FakeGraph())
+
+        self.assertFalse(result.approved)
+        self.assertIn("MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION", result.reason_codes)
+
+    def test_model_can_boost_buy_when_ontology_confirms(self) -> None:
+        engine = SharedLiveDecisionEngine(_BuyStore(price=5_000.0), predictor=_ApprovedPredictor())
+        engine.feature_builder = SimpleNamespace(
+            build=lambda symbol, decision_time=None: SimpleNamespace(
+                feature_schema_hash="unit-schema",
+                provenance=SimpleNamespace(source_record_ids=("unit-frame",)),
+            )
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+
+        with patch.dict("os.environ", {"REALTIME_MODEL_AUXILIARY_ONLY": "true"}):
+            result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=graph)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.BUY)
 
     def test_buy_cash_check_refreshes_broker_quote_before_rejecting(self) -> None:
         now = datetime.now(timezone.utc)
@@ -276,6 +403,67 @@ class RealtimeBuyDecisionTest(unittest.TestCase):
         self.assertEqual(result.final_order.side, OrderSide.BUY)
         self.assertEqual(engine.get_diagnostics()["quote_refresh_status"], "quote_refresh_ok")
 
+    def test_runtime_probe_allows_small_buy_without_ontology_when_broker_quote_is_fresh(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        def refresh(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot:
+            return MarketSnapshot(
+                symbol,
+                market,
+                symbol,
+                "Unknown",
+                5_000.0,
+                10_000_000_000,
+                0.02,
+                SourceMetadata(
+                    "KIS broker quote",
+                    decision_time,
+                    source_type="broker_api",
+                    trust_level=5,
+                    is_realtime=True,
+                    quality_score=1.0,
+                ),
+            )
+
+        engine = SharedLiveDecisionEngine(
+            _NoTickBuyStore(),
+            predictor=_DummyPredictor(),
+            market_refresher=refresh,
+        )
+        losing_holding = Holding(
+            ticker="005930",
+            market="KR",
+            company_name="Samsung",
+            sector="Tech",
+            quantity=1,
+            average_price=100_000.0,
+            last_price=98_000.0,
+        )
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(losing_holding,),
+            cash_by_currency={"KRW": 1_000_000.0},
+            cash_equivalent_krw=1_000_000.0,
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_RUNTIME_PROBE_BUY_ENABLED": "true",
+                "REALTIME_RUNTIME_PROBE_BUY_MARGIN": "1.0",
+                "REALTIME_RUNTIME_PROBE_BUY_WEIGHT": "0.003",
+                "REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER": "0.005",
+                "REALTIME_DOMESTIC_DRAWDOWN_BUY_BONUS_MULTIPLIER": "20.0",
+                "REALTIME_DOMESTIC_DRAWDOWN_BUY_MAX_BONUS": "0.8",
+            },
+        ):
+            result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=_FakeGraph(), decision_time=now)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.BUY)
+        diagnostics = engine.get_diagnostics()
+        self.assertTrue(diagnostics["runtime_execution_ready"])
+        self.assertTrue(diagnostics["runtime_probe_support"])
+
     def test_realtime_adaptive_fallback_can_supply_runtime_ontology_support(self) -> None:
         now = datetime.now(timezone.utc)
 
@@ -341,6 +529,22 @@ class _FixedSellDecisionEngine:
         raise AssertionError("buy path should not be reached")
 
 
+class _FixedBuyDecisionEngine:
+    def evaluate_exit_for_holding(self, *args, **kwargs):  # pragma: no cover - no holdings
+        raise AssertionError("sell path should not be reached")
+
+    def evaluate_buy(self, symbol, account, **kwargs):
+        order = FinalOrder(
+            ticker=symbol,
+            market="KR",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=1,
+            limit_price=5_000.0,
+        )
+        return SimpleNamespace(approved=True, final_order=order, reason_codes=("unit_buy",))
+
+
 class _AmendAwareCoordinator:
     def __init__(self) -> None:
         self.submitted = []
@@ -372,7 +576,86 @@ class _AmendAwareCoordinator:
         raise AssertionError("cancel should not be needed")
 
 
+class _FailingBuyCoordinator:
+    def __init__(self) -> None:
+        self.submitted = []
+
+    def submit_final_order(self, order):
+        self.submitted.append(order)
+        raise RuntimeError("broker rejected")
+
+    def amend_final_order(self, broker_order_id, replacement):  # pragma: no cover
+        raise AssertionError("amend should not be needed")
+
+    def cancel_final_order(self, broker_order_id, order):  # pragma: no cover
+        raise AssertionError("cancel should not be needed")
+
+
 class RealtimeSellAmendTest(unittest.TestCase):
+    def test_domestic_buy_is_skipped_outside_core_session(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660",),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_buy_orders_per_cycle=1),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "true"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 6, 32, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_evaluated"], 0)
+        self.assertEqual(summary["skipped_market_closed"], 1)
+        self.assertEqual(len(coordinator.submitted), 0)
+
+    def test_failed_buy_submission_counts_toward_cycle_attempt_limit(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _FailingBuyCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660", "005930", "035420"),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_orders_per_cycle=8, max_buy_orders_per_cycle=1, error_cooldown_sec=0),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "false"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_submit_attempted"], 1)
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(len(coordinator.submitted), 1)
+
+    def test_buy_disabled_flag_skips_buy_path(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660",),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_orders_per_cycle=8, max_buy_orders_per_cycle=1),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_BUY_ENABLED": "true"}):
+            engine.disable_buys("unit_shutdown")
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+            self.assertEqual(summary["buy_evaluated"], 0)
+            self.assertEqual(summary["buy_submitted"], 0)
+            self.assertTrue(summary["buy_disabled"])
+            self.assertEqual(summary["reason"], "unit_shutdown")
+            self.assertEqual(len(coordinator.submitted), 0)
+            self.assertFalse(engine.get_status()["buy_enabled"])
+
     def test_second_sell_for_same_symbol_keeps_existing_order_when_price_unchanged(self) -> None:
         holding = _holding(100.0, last_price=99.0)
         account = _account(holding, cash=1_000_000.0)

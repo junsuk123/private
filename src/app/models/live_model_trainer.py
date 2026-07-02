@@ -48,17 +48,42 @@ def train_live_short_horizon_model(
         artifact = _artifact_payload(feature_names, [0.0] * len(feature_names), 0.0, [0.0] * len(feature_names), 0.0, metrics, False, reasons)
         registry.save(artifact)
         return artifact
+    # 시간 순서로 정렬해 "미래" 구간을 홀드아웃으로 떼어 일반화 성능을 정직하게 평가한다.
+    # (이전 구현은 학습=평가(in-sample)라 지표가 낙관적으로 왜곡됐다.)
+    rows = sorted(rows, key=lambda row: str(row.get("as_of") or ""))
     x = [[float(row["features"][name]) for name in feature_names] for row in rows]
     y = [int(row["label"]) for row in rows]
     returns = [_clip_return(float(row.get("forward_net_return_bps", 0.0))) for row in rows]
     means, scales, x_scaled = _standardize(x)
+    # 배포 가중치는 데이터를 버리지 않도록 전체로 적합한다.
     weights, bias = _fit_logistic(x_scaled, y)
     ret_weights, ret_bias = _fit_linear(x_scaled, returns)
-    probs = [_sigmoid(_dot(row, weights) + bias) for row in x_scaled]
-    auc = auc_like_score(y, probs)
-    top_k = _top_k_count(len(y))
-    precision_at_k = _precision_at_k(y, probs, top_k)
-    avg_return_top = _avg_return_top(returns, probs, top_k)
+
+    holdout_fraction = min(0.5, max(0.1, _env_float("LIVE_MODEL_HOLDOUT_FRACTION", 0.3)))
+    split = int(len(rows) * (1.0 - holdout_fraction))
+    y_train, y_val = y[:split], y[split:]
+    holdout_evaluated = (
+        0 < split < len(rows)
+        and sum(y_train) >= 1
+        and (len(y_train) - sum(y_train)) >= 1
+        and sum(y_val) >= 1
+        and (len(y_val) - sum(y_val)) >= 1
+    )
+    if holdout_evaluated:
+        # 홀드아웃 평가용 모델은 과거(train) 구간만으로 적합하고 미래(val) 구간에서 채점한다.
+        weights_h, bias_h = _fit_logistic(x_scaled[:split], y_train)
+        eval_labels = y_val
+        eval_returns = returns[split:]
+        eval_probs = [_sigmoid(_dot(row, weights_h) + bias_h) for row in x_scaled[split:]]
+    else:
+        # 소규모/단일클래스 데이터는 홀드아웃이 불가능하므로 전체로 평가(합성 테스트 경로).
+        eval_labels = y
+        eval_returns = returns
+        eval_probs = [_sigmoid(_dot(row, weights) + bias) for row in x_scaled]
+    auc = auc_like_score(eval_labels, eval_probs)
+    top_k = _top_k_count(len(eval_labels))
+    precision_at_k = _precision_at_k(eval_labels, eval_probs, top_k)
+    avg_return_top = _avg_return_top(eval_returns, eval_probs, top_k)
     min_auc = _env_float("LIVE_MODEL_MIN_AUC", 0.55)
     min_precision = _env_float("LIVE_MODEL_MIN_PRECISION_AT_K", 0.35)
     min_avg_return = _env_float("LIVE_MODEL_MIN_AVG_RETURN_BPS", 0.0)
@@ -72,8 +97,10 @@ def train_live_short_horizon_model(
         "precision_at_k": precision_at_k,
         "avg_forward_net_return_bps_top_k": avg_return_top,
         "top_k_count": float(top_k),
-        "top_k_fraction": top_k / max(1.0, float(len(rows))),
+        "top_k_fraction": top_k / max(1.0, float(len(eval_labels))),
         "example_count": float(len(rows)),
+        "validation_example_count": float(len(y_val)) if holdout_evaluated else 0.0,
+        "holdout_evaluated": 1.0 if holdout_evaluated else 0.0,
         "positive_labels": float(sum(y)),
         "negative_labels": float(len(y) - sum(y)),
     }

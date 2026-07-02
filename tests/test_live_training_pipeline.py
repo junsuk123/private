@@ -38,10 +38,11 @@ class LiveTrainingPipelineTest(unittest.TestCase):
     def test_training_from_collected_frames_creates_latest_when_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal = Path(tmp) / "frames.jsonl"
-            _write_frames(journal, count=80)
+            _write_frames(journal, count=200)
             registry = ModelArtifactRegistry(Path(tmp) / "models")
 
             # 이 합성 데이터는 20bps 라벨 기준으로 깔끔히 분리되도록 설계됨(운영 기본값은 5bps).
+            # 시간기반 홀드아웃(30%)에서 top-k 선택이 동작할 만큼 충분한 표본을 준다.
             with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
                 artifact = train_live_short_horizon_from_collected_features(
                     journal_path=journal,
@@ -98,13 +99,15 @@ def _write_frames(path: Path, *, count: int) -> None:
     names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
     with path.open("w", encoding="utf-8") as file:
         for index in range(count):
-            positive_phase = index % 4 in {1, 2}
+            # 균형(50/50)·명확 분리 데이터: 시간기반 홀드아웃 top-k 평가에서도 적격이 되도록.
+            # 스프레드(=비용)는 양쪽 동일하게 낮게 두어 라벨이 순수히 전방수익 부호로 결정된다.
+            positive_phase = index % 2 == 0
             values = {name: 0.0 for name in names}
-            values["return_30s"] = 0.004 if positive_phase else -0.004
-            values["return_1m"] = 0.006 if positive_phase else -0.006
-            values["return_3m"] = 0.01 if positive_phase else -0.01
+            values["return_30s"] = 0.005 if positive_phase else -0.005
+            values["return_1m"] = 0.010 if positive_phase else -0.010
+            values["return_3m"] = 0.015 if positive_phase else -0.015
             values["distance_from_vwap"] = 0.003 if positive_phase else -0.003
-            values["spread_bps"] = 3.0 if positive_phase else 35.0
+            values["spread_bps"] = 3.0
             values["orderbook_imbalance"] = 0.4 if positive_phase else -0.4
             values["bid_depth"] = 300000.0 if positive_phase else 60000.0
             values["ask_depth"] = 100000.0 if positive_phase else 200000.0

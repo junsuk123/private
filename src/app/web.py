@@ -177,6 +177,10 @@ AUTO_START_LIVE_READINESS = os.getenv("AUTO_START_LIVE_READINESS", "true").lower
 AUTO_START_KIS_REALTIME_COLLECTOR = os.getenv("AUTO_START_KIS_REALTIME_COLLECTOR", "true").lower() not in {"0", "false", "no", "off"}
 # 안전 기본값: 실시간 거래 엔진은 서버 기동 시 자동 시작하지 않는다(live_trading 모드 진입 시 시작).
 AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").lower() in {"1", "true", "yes", "on"}
+# 주기적 백그라운드 학습: 실시간 수집 데이터로 라이브 단기 모델을 주기적으로 재학습·배포한다.
+# 데이터 수집은 실시간(KIS 수집기 + 트레이딩 평가 프레임 저널링), 학습은 이 워커가 주기적으로 수행.
+AUTO_START_LIVE_TRAINING = os.getenv("AUTO_START_LIVE_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
+LIVE_TRAINING_INTERVAL_SECONDS = max(60, int(os.getenv("LIVE_TRAINING_INTERVAL_SECONDS", "300")))
 _auto_live_readiness_started = False
 
 
@@ -923,6 +927,9 @@ _realtime_trading_worker: threading.Thread | None = None
 _realtime_trading_stop = threading.Event()
 _realtime_trading_engine: Any | None = None
 _realtime_trading_lock = threading.Lock()
+# 주기적 백그라운드 학습 워커: 수집·트레이딩과 독립된 스레드.
+_live_training_worker: threading.Thread | None = None
+_live_training_stop = threading.Event()
 _live_state: dict[str, Any] = {
     "context": None,
     "research_result": None,
@@ -983,12 +990,15 @@ def _startup_live_worker() -> None:
       _start_auto_live_readiness_check()
     if AUTO_START_REALTIME_TRADING:
       _start_realtime_trading_engine()
+    if AUTO_START_LIVE_TRAINING:
+      _start_live_training_worker()
 
 
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
     _stop_realtime_trading_engine()
     _stop_kis_realtime_collector()
+    _stop_live_training_worker()
     _stop_live_worker()
 
 
@@ -2377,12 +2387,51 @@ def realtime_trading_status() -> JSONResponse:
   )
 
 
+def _schedule_app_process_shutdown(delay_seconds: float = 1.5) -> None:
+    def _shutdown_later() -> None:
+        time.sleep(max(0.2, delay_seconds))
+        os._exit(0)
+
+    threading.Thread(target=_shutdown_later, name="ui-requested-shutdown", daemon=True).start()
+
+
+def _is_domestic_holding(holding: Holding) -> bool:
+    ticker = str(getattr(holding, "ticker", "") or "").strip().upper()
+    market = str(getattr(holding, "market", "") or "").strip().upper()
+    return (ticker.isdigit() and len(ticker) == 6) or market in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _profit_seeking_termination_price(holding: Holding) -> float:
+    last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
+    average_price = float(getattr(holding, "average_price", 0.0) or 0.0)
+    if last_price <= 0:
+        last_price = average_price
+    if average_price <= 0:
+        return round(max(0.0, last_price), 4)
+    try:
+        target_return = max(0.0, float(os.getenv("LIVE_TERMINATION_TARGET_PROFIT_RATE", "0.0025")))
+    except (TypeError, ValueError):
+        target_return = 0.0025
+    try:
+        hard_loss_exit = abs(float(os.getenv("LIVE_TERMINATION_HARD_LOSS_EXIT_RATE", "0.03")))
+    except (TypeError, ValueError):
+        hard_loss_exit = 0.03
+    pnl_rate = (last_price - average_price) / average_price
+    if pnl_rate <= -hard_loss_exit:
+        price = last_price
+    else:
+        price = max(last_price, average_price * (1.0 + target_return))
+    if _is_domestic_holding(holding):
+        return float(max(1, round(price)))
+    return round(max(0.0001, price), 4)
+
+
 @app.post("/api/live-trading/terminate")
-async def live_trading_terminate() -> JSONResponse:
-    return _json(await run_in_threadpool(_live_trading_terminate_response))
+async def live_trading_terminate(shutdown: bool = True) -> JSONResponse:
+    return _json(await run_in_threadpool(_live_trading_terminate_response, shutdown))
 
 
-def _live_trading_terminate_response() -> dict[str, Any]:
+def _live_trading_terminate_response(shutdown: bool = True) -> dict[str, Any]:
     with _live_lock:
         active = _operation_mode_state.get("active")
     active_mode = getattr(active, "mode", None)
@@ -2390,6 +2439,11 @@ def _live_trading_terminate_response() -> dict[str, Any]:
     if active_mode_value != "live_trading":
         return {"ok": False, "status": "not_live_trading", "message": "Live trading is not the active operation mode."}
     # 청산 전에 실시간 거래 엔진을 멈춰 신규 주문 유입을 차단한다.
+    os.environ["REALTIME_BUY_ENABLED"] = "false"
+    with _realtime_trading_lock:
+        engine = _realtime_trading_engine
+    if engine is not None and hasattr(engine, "disable_buys"):
+        engine.disable_buys("LIVE_TERMINATION_BUY_DISABLED")
     _stop_realtime_trading_engine()
     config = load_short_horizon_strategy_config()
     config_live_enabled = bool(config.get("execution", {}).get("live_trading_enabled", False))
@@ -2411,7 +2465,7 @@ def _live_trading_terminate_response() -> dict[str, Any]:
     skipped = []
     for holding in portfolio.account.holdings:
         quantity = int(getattr(holding, "quantity", 0) or 0)
-        limit_price = float(getattr(holding, "last_price", 0.0) or getattr(holding, "average_price", 0.0) or 0.0)
+        limit_price = _profit_seeking_termination_price(holding)
         if quantity <= 0 or limit_price <= 0:
             skipped.append({"ticker": holding.ticker, "quantity": quantity, "last_price": limit_price})
             continue
@@ -2435,16 +2489,26 @@ def _live_trading_terminate_response() -> dict[str, Any]:
         _operation_mode_state["live_trading_baseline_equity"] = None
     audit.record(
         "live_trading_terminated",
-        {"submitted_sell_orders": len(receipts), "skipped_holdings": skipped, "account_equity": portfolio.account.equity},
+        {
+            "submitted_sell_orders": len(receipts),
+            "skipped_holdings": skipped,
+            "account_equity": portfolio.account.equity,
+            "buy_enabled": False,
+            "shutdown_scheduled": shutdown,
+        },
     )
+    if shutdown:
+        _schedule_app_process_shutdown()
     return {
         "ok": True,
         "status": "terminated",
+        "buy_enabled": False,
         "submitted_sell_orders": len(receipts),
         "skipped_holdings": skipped,
         "receipts": receipts,
         "executions": executions,
-        "message": "Live trading termination submitted limit SELL orders for all current KIS holdings.",
+        "shutdown_scheduled": shutdown,
+        "message": "Live trading termination disabled BUY and submitted profit-seeking limit SELL orders for current KIS holdings.",
     }
 
 
@@ -3466,6 +3530,70 @@ def _stop_kis_realtime_collector() -> None:
   with _live_lock:
     worker = _kis_realtime_collector_worker
     _append_collection_log_unlocked("stopped", "KIS realtime collector stopped")
+  if worker is not None:
+    worker.join(timeout=2.0)
+
+
+def _live_training_loop() -> None:
+  """실시간 수집 데이터로 라이브 단기 모델을 주기적으로 재학습·배포한다.
+
+  - 데이터 수집: KIS 실시간 수집기 + 트레이딩 엔진 평가 프레임 저널링(실시간·상시).
+  - 학습: 이 루프가 주기(LIVE_TRAINING_INTERVAL_SECONDS)마다 수행 — 트레이딩과 독립 스레드.
+  registry.save는 적격 모델만 latest를 원자적으로 교체하므로, 부적격 재학습은 기존 모델을 보존하고
+  라이브 예측기(매 예측마다 latest 재로딩)는 재시작 없이 개선된 모델을 자동 반영한다.
+  """
+  while not _live_training_stop.is_set():
+    try:
+      collection = collect_live_feature_frames_from_realtime_store()
+      artifact = train_live_short_horizon_from_collected_features()
+      metrics = artifact.get("metrics") or {}
+      with _live_lock:
+        _append_collection_log_unlocked(
+            "complete" if artifact.get("live_eligible") else "running",
+            (
+                "Live short-horizon model retrained and deployed"
+                if artifact.get("live_eligible")
+                else "Live short-horizon model retrained (kept previous eligible model)"
+            ),
+            counts={
+                "feature_frames_built": int(collection.get("built", 0) or 0),
+                "auc": round(float(metrics.get("auc", 0.0) or 0.0), 4),
+                "precision_at_k": round(float(metrics.get("precision_at_k", 0.0) or 0.0), 4),
+                "live_eligible": bool(artifact.get("live_eligible")),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - 학습 실패가 서버/트레이딩을 죽여서는 안 된다.
+      with _live_lock:
+        _append_collection_log_unlocked(
+            "error",
+            f"Live training cycle failed: {str(exc) or exc.__class__.__name__}",
+        )
+    _live_training_stop.wait(LIVE_TRAINING_INTERVAL_SECONDS)
+
+
+def _start_live_training_worker() -> None:
+  global _live_training_worker
+  with _live_lock:
+    if _live_training_worker is not None and _live_training_worker.is_alive():
+      return
+    _live_training_stop.clear()
+    _append_collection_log_unlocked(
+        "scheduled",
+        f"Periodic live model training starting (every {LIVE_TRAINING_INTERVAL_SECONDS}s)",
+    )
+    _live_training_worker = threading.Thread(
+        target=_live_training_loop,
+        name="live-model-training",
+        daemon=True,
+    )
+    _live_training_worker.start()
+
+
+def _stop_live_training_worker() -> None:
+  worker: threading.Thread | None
+  _live_training_stop.set()
+  with _live_lock:
+    worker = _live_training_worker
   if worker is not None:
     worker.join(timeout=2.0)
 

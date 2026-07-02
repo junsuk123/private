@@ -77,6 +77,57 @@ def _cost_context_for_holding(symbol: str, market: str) -> tuple[str, str]:
     return "NASD", "overseas_stock"
 
 
+def _is_domestic_symbol_or_market(symbol: str, market: str) -> bool:
+    s = str(symbol or "").strip().upper()
+    market_name = str(market or "").strip().upper()
+    return (s.isdigit() and len(s) == 6) or market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _account_domestic_unrealized_rate(account: AccountSnapshot) -> float:
+    cost = 0.0
+    pnl = 0.0
+    for holding in getattr(account, "holdings", ()) or ():
+        if not _is_domestic_symbol_or_market(getattr(holding, "ticker", ""), getattr(holding, "market", "")):
+            continue
+        quantity = float(getattr(holding, "quantity", 0.0) or 0.0)
+        average_price = float(getattr(holding, "average_price", 0.0) or 0.0)
+        last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
+        cost += max(0.0, quantity * average_price)
+        pnl += quantity * (last_price - average_price)
+    return pnl / cost if cost > 0 else 0.0
+
+
+def _buy_blocker_reason_codes(
+    *,
+    prediction_error: Exception | None,
+    policy: Any,
+    policy_diag: dict[str, Any],
+    fallback_score: float,
+    effective_buy_threshold: float,
+    spread_bps: float,
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if prediction_error is not None:
+        raw = str(prediction_error) or prediction_error.__class__.__name__
+        reasons.append("MODEL_FEATURE_UNAVAILABLE:" + raw[:96])
+    max_spread = float(getattr(policy, "max_spread_bps", 0.0) or 0.0)
+    if max_spread > 0 and spread_bps > max_spread:
+        reasons.append(f"WIDE_SPREAD:{spread_bps:.1f}>{max_spread:.1f}bps")
+    regime_notes = tuple(((policy_diag.get("regime") or {}).get("notes") or ()))
+    if "LOW_LIQUIDITY" in regime_notes:
+        reasons.append("LOW_LIQUIDITY")
+    if fallback_score < effective_buy_threshold:
+        reasons.append(f"FALLBACK_SCORE_BELOW_THRESHOLD:{fallback_score:.3f}<{effective_buy_threshold:.3f}")
+    return tuple(dict.fromkeys(reasons))
+
+
 @dataclass(frozen=True)
 class SharedDecisionResult:
     symbol: str
@@ -150,6 +201,11 @@ class SharedLiveDecisionEngine:
         currency = "KRW" if market_name.upper() in ("KR", "KRX", "KOSPI", "KOSDAQ", "KONEX") else "USD"
         cash_by_currency = account.cash_by_currency if hasattr(account, "cash_by_currency") else {}
         available_cash = float(cash_by_currency.get(currency, 0.0))
+        domestic_drawdown_rate = (
+            _account_domestic_unrealized_rate(account)
+            if _is_domestic_symbol_or_market(symbol, market_name)
+            else 0.0
+        )
 
         orderbook = self.store.latest_orderbook(symbol) if hasattr(self.store, "latest_orderbook") else None
         tick_received_at = getattr(tick, "received_at", decision_time) if tick is not None else decision_time
@@ -276,6 +332,15 @@ class SharedLiveDecisionEngine:
             prediction_error=prediction_error,
             decision_time=decision_time,
         )
+        domestic_buy_threshold_bonus = 0.0
+        if domestic_drawdown_rate < 0:
+            drawdown_trigger = abs(_env_float("REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER", 0.005))
+            if abs(domestic_drawdown_rate) >= drawdown_trigger:
+                domestic_buy_threshold_bonus = min(
+                    _env_float("REALTIME_DOMESTIC_DRAWDOWN_BUY_MAX_BONUS", 0.18),
+                    abs(domestic_drawdown_rate) * _env_float("REALTIME_DOMESTIC_DRAWDOWN_BUY_BONUS_MULTIPLIER", 6.0),
+                )
+        effective_buy_threshold = policy.buy_threshold + domestic_buy_threshold_bonus
         runtime_execution_ready = (
             price > 0.0
             and available_cash >= min_cash_for_one_share
@@ -285,10 +350,12 @@ class SharedLiveDecisionEngine:
             and float(getattr(market.source, "quality_score", 0.0) or 0.0) >= 0.8
         )
         runtime_fallback_support = False
+        runtime_probe_support = False
+        runtime_probe_margin = _env_float("REALTIME_RUNTIME_PROBE_BUY_MARGIN", 0.18)
         if (
             not model_ok
             and runtime_execution_ready
-            and fallback_score >= policy.buy_threshold
+            and fallback_score >= effective_buy_threshold
             and policy.allowed_fallback_mode != "no_trade"
         ):
             runtime_fallback_support = True
@@ -305,10 +372,52 @@ class SharedLiveDecisionEngine:
                     )
                 )
             )
+        elif (
+            not model_ok
+            and runtime_execution_ready
+            and policy.allowed_fallback_mode != "no_trade"
+            and os.getenv("REALTIME_RUNTIME_PROBE_BUY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+            and fallback_score >= max(0.0, effective_buy_threshold - runtime_probe_margin)
+        ):
+            runtime_probe_support = True
+            ontology_ok = True
+            ontology_score = max(ontology_score, 0.35)
+            ontology_support = tuple(
+                dict.fromkeys(
+                    (
+                        *ontology_support,
+                        "FreshBrokerQuote",
+                        "CashFitOneShare",
+                        "RuntimeProbeBuyCandidate",
+                    )
+                )
+            )
         if not model_ok and require_ontology_fallback and not ontology_ok:
             reasons = tuple(getattr(prediction, "reason_codes", ()) or ("MODEL_UNAVAILABLE",))
-            reasons = (*reasons, "ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK", f"QUOTE_REFRESH:{quote_refresh_status}")
-            diagnostics = {"policy": policy.as_dict(), "policy_state": policy_diag, "quote_refresh_status": quote_refresh_status, "fallback_score": fallback_score, "ontology_score": ontology_score}
+            blocker_reasons = _buy_blocker_reason_codes(
+                prediction_error=prediction_error,
+                policy=policy,
+                policy_diag=policy_diag,
+                fallback_score=fallback_score,
+                effective_buy_threshold=effective_buy_threshold,
+                spread_bps=spread_bps,
+            )
+            reasons = (
+                *reasons,
+                *blocker_reasons,
+                "ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK",
+                f"QUOTE_REFRESH:{quote_refresh_status}",
+            )
+            diagnostics = {
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_refresh_status": quote_refresh_status,
+                "fallback_score": fallback_score,
+                "ontology_score": ontology_score,
+                "runtime_execution_ready": runtime_execution_ready,
+                "effective_buy_threshold": effective_buy_threshold,
+                "spread_bps": spread_bps,
+            }
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
         if not model_ok and policy.allowed_fallback_mode == "no_trade" and fallback_score < policy.buy_threshold:
@@ -317,15 +426,37 @@ class SharedLiveDecisionEngine:
             diagnostics = {"policy": policy.as_dict(), "policy_state": policy_diag, "quote_refresh_status": quote_refresh_status, "fallback_score": fallback_score}
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
+        model_auxiliary_only = os.getenv("REALTIME_MODEL_AUXILIARY_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+        if model_ok and model_auxiliary_only and not ontology_ok and not runtime_fallback_support and not runtime_probe_support:
+            diagnostics = {
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_refresh_status": quote_refresh_status,
+                "fallback_score": fallback_score,
+                "ontology_score": ontology_score,
+                "model_auxiliary_only": True,
+                "model_probability_success": float(getattr(prediction, "probability_success", 0.0) or 0.0),
+                "model_expected_net_return_bps": float(getattr(prediction, "expected_net_return_bps", 0.0) or 0.0),
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                ("MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION", f"QUOTE_REFRESH:{quote_refresh_status}"),
+                diagnostics,
+            )
 
         model_score = float(getattr(prediction, "probability_success", 0.0) or 0.0) if model_ok else fallback_score
         signal_score = max(model_score, ontology_score * 0.35 if not model_ok else ontology_score * 0.25)
         if not model_ok:
             signal_score = max(signal_score, fallback_score)
-        signal_gap = signal_score - policy.buy_threshold
+        signal_gap = signal_score - effective_buy_threshold
         size_multiplier = 1.0
         if signal_gap < 0:
-            if signal_gap >= -0.18 and policy.allowed_fallback_mode != "no_trade":
+            min_signal_gap = -runtime_probe_margin if runtime_probe_support else -0.18
+            if signal_gap >= min_signal_gap and policy.allowed_fallback_mode != "no_trade":
                 size_multiplier = max(0.20, 1.0 + signal_gap * 2.5)
             else:
                 reasons = tuple(getattr(prediction, "reason_codes", ()) or ())
@@ -335,6 +466,8 @@ class SharedLiveDecisionEngine:
                 return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
 
         suggested_weight = max(0.001, suggested_weight * size_multiplier)
+        if runtime_probe_support and not runtime_fallback_support:
+            suggested_weight = min(suggested_weight, _env_float("REALTIME_RUNTIME_PROBE_BUY_WEIGHT", 0.003))
         expected_return_bps = 100.0
         if model_ok and prediction is not None:
             expected_return_bps = max(expected_return_bps, float(prediction.expected_net_return_bps or 0.0))
@@ -362,7 +495,12 @@ class SharedLiveDecisionEngine:
             "fallback_score": round(fallback_score, 4),
             "runtime_execution_ready": runtime_execution_ready,
             "runtime_fallback_support": runtime_fallback_support,
+            "runtime_probe_support": runtime_probe_support,
+            "model_auxiliary_only": model_auxiliary_only,
             "buy_threshold": policy.buy_threshold,
+            "effective_buy_threshold": round(effective_buy_threshold, 6),
+            "domestic_drawdown_rate": round(domestic_drawdown_rate, 6),
+            "domestic_buy_threshold_bonus": round(domestic_buy_threshold_bonus, 6),
             "policy": policy.as_dict(),
             "policy_state": policy_diag,
             "quote_refresh_status": quote_refresh_status,
@@ -414,8 +552,14 @@ class SharedLiveDecisionEngine:
             "fallback_score": fallback_score,
             "model_ok": model_ok,
             "signal_score": signal_score,
+            "buy_threshold": policy.buy_threshold,
+            "effective_buy_threshold": effective_buy_threshold,
+            "domestic_drawdown_rate": domestic_drawdown_rate,
+            "domestic_buy_threshold_bonus": domestic_buy_threshold_bonus,
             "runtime_execution_ready": runtime_execution_ready,
             "runtime_fallback_support": runtime_fallback_support,
+            "runtime_probe_support": runtime_probe_support,
+            "model_auxiliary_only": model_auxiliary_only,
             "adaptive_risk_rules": adaptive_rules,
             "risk_metadata": risk.metadata,
         }
@@ -539,6 +683,21 @@ class SharedLiveDecisionEngine:
         profitable_after_cost = price >= required_exit_price and cost_floor.net_expected_return >= target_net_return
         loss_exit_allowed = exit_policy.allow_loss_exit
         emergency_loss = max(exit_policy.stop_loss, float(os.getenv("REALTIME_EMERGENCY_STOP_LOSS", "0.05")))
+        account_total = max(
+            float(
+                getattr(account, "equity", None)
+                or getattr(account, "total_equity", None)
+                or getattr(account, "cash_balance", None)
+                or getattr(account, "cash", None)
+                or 1.0
+            ),
+            1.0,
+        )
+        position_weight = max(0.0, (holding.quantity * price) / account_total)
+        is_domestic_holding = _is_domestic_symbol_or_market(symbol, holding.market or "")
+        domestic_reduce_trigger = -abs(_env_float("REALTIME_DOMESTIC_DRAWDOWN_REDUCE_TRIGGER", 0.015))
+        domestic_emergency_trigger = -abs(_env_float("REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER", 0.03))
+        domestic_concentration_weight = _env_float("REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT", 0.20)
 
         prediction: LiveSignalPrediction | None = None
         exit_reason: str | None = None
@@ -551,8 +710,14 @@ class SharedLiveDecisionEngine:
             reasons = ("LOSS_EXIT_DISABLED", "HOLD_LOSS_EXIT_DISABLED", "REALTIME_ALLOW_LOSS_EXIT=false")
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
+        elif is_domestic_holding and loss_exit_allowed and pnl_rate <= domestic_emergency_trigger:
+            exit_reason = f"domestic_emergency_exit:{pnl_rate * 100:.2f}%"
         elif pnl_rate <= -emergency_loss and loss_exit_allowed:
             exit_reason = f"loss_exit:{pnl_rate * 100:.2f}%"
+        elif is_domestic_holding and loss_exit_allowed and pnl_rate <= domestic_reduce_trigger:
+            exit_reason = f"domestic_drawdown_reduce:{pnl_rate * 100:.2f}%"
+        elif is_domestic_holding and loss_exit_allowed and pnl_rate < 0 and position_weight >= domestic_concentration_weight:
+            exit_reason = f"domestic_concentration_reduce:{position_weight * 100:.2f}%"
         elif pnl_rate <= -exit_policy.trailing_stop and loss_exit_allowed:
             exit_reason = f"trailing_exit:{pnl_rate * 100:.2f}%"
         elif quote_age_seconds >= exit_policy.time_exit_seconds:
@@ -585,23 +750,13 @@ class SharedLiveDecisionEngine:
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
 
-        account_total = max(
-            float(
-                getattr(account, "equity", None)
-                or getattr(account, "total_equity", None)
-                or getattr(account, "cash_balance", None)
-                or getattr(account, "cash", None)
-                or 1.0
-            ),
-            1.0,
-        )
-        position_weight = max(0.0, (holding.quantity * price) / account_total)
         exit_action = OrderAction.SELL
         exit_suggested_weight = 0.0
-        if exit_reason.startswith("trailing_exit"):
+        if exit_reason.startswith(("trailing_exit", "domestic_drawdown_reduce", "domestic_concentration_reduce")):
             reduce_fraction = max(0.1, min(1.0, float(os.getenv("REALTIME_LOSS_EXIT_REDUCE_FRACTION", "0.5"))))
-            exit_action = OrderAction.REDUCE
-            exit_suggested_weight = max(0.0, position_weight * (1.0 - reduce_fraction))
+            if float(getattr(holding, "quantity", 0.0) or 0.0) > 1.0:
+                exit_action = OrderAction.REDUCE
+                exit_suggested_weight = max(0.0, position_weight * (1.0 - reduce_fraction))
 
         intent = OrderIntent(
             ticker=symbol,
@@ -687,7 +842,7 @@ class SharedLiveDecisionEngine:
             approved=risk.approved and risk.final_order is not None,
             final_order=risk.final_order,
             prediction=prediction,
-            reason_codes=risk.rejection_reasons,
+            reason_codes=risk.rejection_reasons or (exit_reason,),
             diagnostics=diagnostics,
         )
 

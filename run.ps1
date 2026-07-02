@@ -6,6 +6,10 @@ function Set-DefaultEnv($Name, $Value) {
   }
 }
 
+function Set-RunEnv($Name, $Value) {
+  [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+}
+
 function Stop-ExistingLocalAppServers {
   $processIdsToStop = New-Object 'System.Collections.Generic.HashSet[int]'
   $connections = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
@@ -140,15 +144,27 @@ Set-DefaultEnv "PYTHONPATH" "src"
 Set-DefaultEnv "APP_ENV" "local"
 Set-DefaultEnv "APP_PORT" "8010"
 Set-DefaultEnv "DATA_ENV" "realtime"
-Set-DefaultEnv "TRADING_MODE" "live_trading"
-Set-DefaultEnv "LIVE_TRADING_ENABLED" "true"
-Set-DefaultEnv "KIS_LIVE_ENABLED" "true"
-Set-DefaultEnv "KIS_PAPER_TRADING" "false"
-Set-DefaultEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
+Set-RunEnv "TRADING_MODE" "live_trading"
+Set-RunEnv "LIVE_TRADING_ENABLED" "true"
+Set-RunEnv "KIS_LIVE_ENABLED" "true"
+Set-RunEnv "KIS_PAPER_TRADING" "false"
+Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
 Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
 Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.035"
+Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER" "0.005"
+Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_BONUS_MULTIPLIER" "6.0"
+Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_MAX_BONUS" "0.18"
+Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_ENABLED" "true"
+Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_MARGIN" "0.18"
+Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_WEIGHT" "0.003"
+Set-DefaultEnv "REALTIME_BUY_ENABLED" "true"
+Set-DefaultEnv "REALTIME_MODEL_AUXILIARY_ONLY" "true"
+Set-DefaultEnv "REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY" "false"
+Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_REDUCE_TRIGGER" "0.015"
+Set-DefaultEnv "REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER" "0.03"
+Set-DefaultEnv "REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT" "0.20"
 Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
 Set-DefaultEnv "REALTIME_LATENCY_PROFILE" "low_latency"
 Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
@@ -199,6 +215,9 @@ Set-DefaultEnv "LIVE_REFRESH_SECONDS" "15"
 Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "60"
 Set-DefaultEnv "AUTO_START_LIVE_WORKER" "false"
 Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
+# 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
+Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
+Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "300"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"

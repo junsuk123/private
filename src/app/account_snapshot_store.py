@@ -15,7 +15,7 @@ class AccountSnapshotStore:
         self.migrate()
 
     def migrate(self) -> None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             conn.executescript(
                 """
                 create table if not exists account_snapshots (
@@ -103,7 +103,44 @@ class AccountSnapshotStore:
     def save_dashboard(self, dashboard: dict[str, Any]) -> int:
         snapshot = dict(dashboard.get("snapshot") or {})
         created_at = str(snapshot.get("created_at") or datetime.now(timezone.utc).isoformat())
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
+            existing_snapshot_id = self._latest_snapshot_id_in_same_minute(conn, created_at)
+            if existing_snapshot_id is not None:
+                conn.execute(
+                    """
+                    update account_snapshots
+                    set created_at = ?, source = ?, total_asset_krw = ?, net_asset_krw = ?,
+                        cash_equivalent_krw = ?, krw_cash = ?, foreign_cash_krw = ?,
+                        domestic_stock_value_krw = ?, overseas_stock_value_krw = ?,
+                        realized_pnl_krw = ?, unrealized_pnl_krw = ?, total_pnl_krw = ?,
+                        total_pnl_rate = ?, raw_payload_json = ?
+                    where id = ?
+                    """,
+                    (
+                        created_at,
+                        str(snapshot.get("source") or "unknown"),
+                        _num(snapshot.get("total_asset_krw")),
+                        _num(snapshot.get("net_asset_krw")),
+                        _num(snapshot.get("cash_equivalent_krw")),
+                        _num(snapshot.get("krw_cash")),
+                        _num(snapshot.get("foreign_cash_krw")),
+                        _num(snapshot.get("domestic_stock_value_krw")),
+                        _num(snapshot.get("overseas_stock_value_krw")),
+                        _num(snapshot.get("realized_pnl_period_krw") or snapshot.get("realized_pnl_today_krw")),
+                        _num(snapshot.get("unrealized_pnl_krw")),
+                        _num(snapshot.get("total_pnl_krw")),
+                        _num(snapshot.get("total_pnl_rate")),
+                        json.dumps(dashboard, ensure_ascii=True, sort_keys=True),
+                        existing_snapshot_id,
+                    ),
+                )
+                conn.execute("delete from holding_snapshots where snapshot_id = ?", (existing_snapshot_id,))
+                conn.execute("delete from cash_currency_snapshots where snapshot_id = ?", (existing_snapshot_id,))
+                self._insert_holdings(conn, existing_snapshot_id, created_at, dashboard.get("holdings") or ())
+                self._insert_cash(conn, existing_snapshot_id, created_at, dashboard.get("cash") or ())
+                conn.commit()
+                return existing_snapshot_id
+
             cursor = conn.execute(
                 """
                 insert into account_snapshots
@@ -136,8 +173,29 @@ class AccountSnapshotStore:
             conn.commit()
         return snapshot_id
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
+        conn.execute("pragma busy_timeout = 15000")
+        conn.execute("pragma journal_mode = wal")
+        conn.execute("pragma synchronous = normal")
+        return conn
+
+    def _latest_snapshot_id_in_same_minute(self, conn: sqlite3.Connection, created_at: str) -> int | None:
+        current_bucket = _minute_bucket(created_at)
+        if current_bucket is None:
+            return None
+        row = conn.execute(
+            "select id, created_at from account_snapshots order by created_at desc, id desc limit 1"
+        ).fetchone()
+        if not row:
+            return None
+        latest_bucket = _minute_bucket(str(row[1] or ""))
+        if latest_bucket != current_bucket:
+            return None
+        return int(row[0])
+
     def latest_dashboard(self) -> dict[str, Any] | None:
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "select raw_payload_json from account_snapshots order by created_at desc, id desc limit 1"
             ).fetchone()
@@ -151,29 +209,35 @@ class AccountSnapshotStore:
 
     def asset_history(self, range_name: str = "1D") -> list[dict[str, Any]]:
         start = datetime.now(timezone.utc) - _range_delta(range_name)
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                select created_at, total_asset_krw, cash_equivalent_krw, domestic_stock_value_krw,
+                select id, created_at, total_asset_krw, cash_equivalent_krw, domestic_stock_value_krw,
                        overseas_stock_value_krw, unrealized_pnl_krw, realized_pnl_krw, total_pnl_krw
                 from account_snapshots
                 where created_at >= ?
-                order by created_at
+                order by created_at, id
                 """,
                 (start.isoformat(),),
             ).fetchall()
+        by_minute: dict[str, Any] = {}
+        for row in rows:
+            bucket = _minute_bucket(str(row[1] or ""))
+            if bucket is None:
+                bucket = str(row[1] or "")
+            by_minute[bucket] = row
         return [
             {
-                "created_at": row[0],
-                "total_asset_krw": float(row[1] or 0),
-                "cash_equivalent_krw": float(row[2] or 0),
-                "domestic_stock_value_krw": float(row[3] or 0),
-                "overseas_stock_value_krw": float(row[4] or 0),
-                "unrealized_pnl_krw": float(row[5] or 0),
-                "realized_pnl_krw": float(row[6] or 0),
-                "total_pnl_krw": float(row[7] or 0),
+                "created_at": row[1],
+                "total_asset_krw": float(row[2] or 0),
+                "cash_equivalent_krw": float(row[3] or 0),
+                "domestic_stock_value_krw": float(row[4] or 0),
+                "overseas_stock_value_krw": float(row[5] or 0),
+                "unrealized_pnl_krw": float(row[6] or 0),
+                "realized_pnl_krw": float(row[7] or 0),
+                "total_pnl_krw": float(row[8] or 0),
             }
-            for row in rows
+            for row in by_minute.values()
         ]
 
     def _insert_holdings(self, conn: sqlite3.Connection, snapshot_id: int, created_at: str, rows: Any) -> None:
@@ -273,6 +337,16 @@ def _num(value: Any) -> float:
         return float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _minute_bucket(value: str) -> str | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(second=0, microsecond=0).isoformat()
 
 
 def _range_delta(range_name: str) -> timedelta:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,9 +35,11 @@ class ModelArtifactRegistry:
     def save(self, artifact: dict[str, Any]) -> Path:
         artifact_id = str(artifact["artifact_id"])
         path = self.root / f"{artifact_id}.json"
-        path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
+        payload = json.dumps(artifact, indent=2, sort_keys=True)
+        _atomic_write_text(path, payload)
         if artifact.get("live_eligible") is True:
-            self.latest_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
+            # 적격 모델만 latest를 갱신 — 주기적 재학습이 부적격이면 기존 적격 모델을 보존한다.
+            _atomic_write_text(self.latest_path, payload)
         return path
 
     def load_latest_live_eligible(self) -> ModelArtifact:
@@ -46,6 +50,23 @@ class ModelArtifactRegistry:
         if not artifact.live_eligible:
             raise RuntimeError("LATEST_MODEL_NOT_LIVE_ELIGIBLE")
         return artifact
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    # 같은 디렉터리에 임시 파일로 쓴 뒤 원자적으로 교체한다. 라이브 예측기는 매 예측마다
+    # latest.json을 다시 읽으므로, 재학습 중 부분 기록된 파일을 읽어 파싱 오류가 나는 것을 막는다.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _artifact_from_payload(payload: dict[str, Any], path: Path) -> ModelArtifact:

@@ -61,6 +61,52 @@ class AccountDashboardTest(unittest.TestCase):
         self.assertEqual(len(dashboard["holdings"]), 2)
         self.assertEqual(len(history), 1)
 
+    def test_asset_history_rolls_up_to_one_point_per_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountSnapshotStore(Path(tmp) / "account.sqlite3")
+            first = {
+                "snapshot": {
+                    "created_at": "2026-07-01T00:00:05+00:00",
+                    "source": "kis_live_account",
+                    "total_asset_krw": 100_000,
+                    "net_asset_krw": 100_000,
+                },
+                "holdings": [],
+                "cash": [],
+                "trades": [],
+            }
+            second = {
+                "snapshot": {
+                    "created_at": "2026-07-01T00:00:55+00:00",
+                    "source": "kis_live_account",
+                    "total_asset_krw": 101_000,
+                    "net_asset_krw": 101_000,
+                },
+                "holdings": [],
+                "cash": [],
+                "trades": [],
+            }
+            third = {
+                "snapshot": {
+                    "created_at": "2026-07-01T00:01:01+00:00",
+                    "source": "kis_live_account",
+                    "total_asset_krw": 102_000,
+                    "net_asset_krw": 102_000,
+                },
+                "holdings": [],
+                "cash": [],
+                "trades": [],
+            }
+
+            first_id = store.save_dashboard(first)
+            second_id = store.save_dashboard(second)
+            third_id = store.save_dashboard(third)
+            history = store.asset_history("1W")
+
+        self.assertEqual(first_id, second_id)
+        self.assertNotEqual(second_id, third_id)
+        self.assertEqual([row["total_asset_krw"] for row in history], [101_000, 102_000])
+
     def test_overseas_account_client_maps_balance_request(self) -> None:
         transport = _RecordingTransport()
         with tempfile.TemporaryDirectory() as tmp:

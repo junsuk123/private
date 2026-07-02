@@ -44,6 +44,7 @@ function renderDashboard(data, trading) {
   renderTrades(data.trades || []);
   renderCash(data.cash || []);
   renderSystem(snapshot, data.logs || {}, trading);
+  renderDecisionFlow(trading);
   renderLogs(data.logs || {});
 }
 
@@ -148,6 +149,87 @@ function renderSystem(snapshot, logs, trading) {
   `).join('');
 }
 
+function renderDecisionFlow(trading) {
+  const flow = document.getElementById('decision-flow');
+  const events = document.getElementById('decision-events');
+  const rejections = document.getElementById('decision-rejections');
+  const badge = document.getElementById('decision-cycle-badge');
+  if (!flow || !events || !rejections || !badge) return;
+
+  const status = trading && trading.status ? trading.status : {};
+  const summary = status.last_summary || {};
+  const running = Boolean(trading && trading.running);
+  badge.textContent = running
+    ? `cycle ${Number(status.cycles || 0).toLocaleString('ko-KR')}`
+    : 'stopped';
+  badge.className = running ? 'badge' : 'badge warn';
+
+  const buyEvaluated = Number(summary.buy_evaluated || 0);
+  const sellEvaluated = Number(summary.sell_evaluated || 0);
+  const submitted = Number(summary.submitted || 0);
+  const amended = Number(summary.amended || 0);
+  const blocked = Number(summary.blocked || 0);
+  const errors = Number(summary.errors || 0);
+  const buyRejected = Number(summary.buy_rejected || 0);
+  const sellRejected = Number(summary.sell_rejected || 0);
+  const totalEvaluated = buyEvaluated + sellEvaluated;
+  const stages = [
+    ['계좌', running ? '자동 실행' : '대기', status.last_cycle_at ? formatTime(status.last_cycle_at) : '-'],
+    ['매도 평가', `${sellEvaluated}건`, `${Number(summary.sell_submitted || 0)} 제출 · ${sellRejected} 보류`],
+    ['매수 평가', `${buyEvaluated}건`, `${Number(summary.buy_submitted || 0)} 제출 · ${buyRejected} 보류`],
+    ['주문 처리', `${submitted} 제출`, `${amended} 정정 · ${blocked} 차단`],
+    ['오류', `${errors}건`, summary.reason || status.last_reason || '정상'],
+  ];
+  flow.innerHTML = stages.map(([label, value, note], index) => {
+    const ratio = index === 0 ? (running ? 1 : 0) : Math.min(1, Number.parseFloat(String(value)) / Math.max(1, totalEvaluated));
+    const cls = errors && label === '오류' ? 'danger' : submitted && label === '주문 처리' ? 'active' : '';
+    return `
+      <div class="decision-stage ${cls}">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+        <small>${escapeHtml(note)}</small>
+        <div class="decision-meter"><i style="width:${Math.max(8, Math.round(ratio * 100))}%"></i></div>
+      </div>
+    `;
+  }).join('');
+
+  const recentEvents = (status.recent_events || []).slice(0, 12);
+  events.innerHTML = recentEvents.length ? recentEvents.map((event) => {
+    const kind = String(event.kind || '');
+    const outcome = String(event.outcome || event.status || '');
+    const reason = String(event.reason || event.detail || '');
+    const cls = outcome.includes('error') || outcome.includes('blocked') ? 'danger' : outcome.includes('submitted') ? 'active' : '';
+    return `
+      <div class="decision-event ${cls}">
+        <div><strong>${escapeHtml(kind)} ${escapeHtml(event.symbol || '-')}</strong><span>${escapeHtml(outcome || '-')}</span></div>
+        <small>${escapeHtml(reason || formatTime(event.at))}</small>
+      </div>
+    `;
+  }).join('') : `<div class="decision-empty">최근 실행 판단 없음</div>`;
+
+  const rows = (summary.rejections || []).slice(0, 12);
+  rejections.innerHTML = rows.length ? rows.map((row) => {
+    const codes = (row.reason_codes || []).map((code) => String(code));
+    const primary = codes[0] || '보류';
+    return `
+      <div class="decision-rejection">
+        <strong>${escapeHtml(row.side || '-')} ${escapeHtml(row.symbol || '-')}</strong>
+        <span>${escapeHtml(primary)}</span>
+        <small>${escapeHtml(codes.slice(1, 3).join(' · '))}</small>
+      </div>
+    `;
+  }).join('') : `<div class="decision-empty">최근 보류 사유 없음</div>`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
 function renderLogs(logs) {
   document.getElementById('account-logs').textContent = JSON.stringify(logs, null, 2);
 }
@@ -234,7 +316,35 @@ function formatTime(value) {
   return d.toLocaleString('ko-KR', { hour12: false });
 }
 
+async function terminateProgram() {
+  const button = document.getElementById('account-terminate');
+  const source = document.getElementById('account-source');
+  if (button) button.disabled = true;
+  if (source) source.textContent = 'Termination requested: BUY disabled, submitting profit-seeking SELL orders...';
+  try {
+    const data = await fetchJson('/api/live-trading/terminate?shutdown=true');
+    if (source) {
+      source.textContent = data.ok
+        ? `Termination complete: SELL orders ${Number(data.submitted_sell_orders || 0)}, server shutdown scheduled`
+        : `Termination blocked: ${data.message || data.status || 'unknown'}`;
+    }
+    if (data.ok) {
+      setTimeout(() => {
+        window.open('', '_self');
+        window.close();
+      }, 800);
+    } else if (button) {
+      button.disabled = false;
+    }
+  } catch (error) {
+    if (source) source.textContent = `Termination failed: ${error.message}`;
+    if (button) button.disabled = false;
+  }
+}
+
 document.getElementById('account-refresh').addEventListener('click', refreshDashboard);
+const terminateButton = document.getElementById('account-terminate');
+if (terminateButton) terminateButton.addEventListener('click', terminateProgram);
 document.getElementById('holding-search').addEventListener('input', (event) => {
   state.query = event.target.value || '';
   renderHoldings((state.dashboard || {}).holdings || []);

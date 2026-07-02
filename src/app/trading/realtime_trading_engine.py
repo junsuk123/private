@@ -17,8 +17,9 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time as day_time, timezone
 from typing import Any, Callable, Deque
+from zoneinfo import ZoneInfo
 
 from app.execution.kis_errors import LiveExecutionBlocked
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding
@@ -36,6 +37,20 @@ def _env_int(name: str, default: int) -> int:
         return int(float(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
+
+
+def _is_domestic_symbol_or_market(symbol: str, market: str = "") -> bool:
+    ticker = str(symbol or "").strip().upper()
+    market_name = str(market or "").strip().upper()
+    return (ticker.isdigit() and len(ticker) == 6) or market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+
+
+def _is_krx_core_buy_session(now_utc: datetime | None = None) -> bool:
+    current = now_utc or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(ZoneInfo("Asia/Seoul"))
+    return local.weekday() < 5 and day_time(9, 0) <= local.time() <= day_time(15, 20)
 
 
 @dataclass
@@ -88,12 +103,15 @@ class RealtimeTradingEngine:
         self._error_backoff_until: dict[str, float] = {}
         self._open_sell_orders: dict[str, dict[str, Any]] = {}
         self._recent: Deque[dict[str, Any]] = deque(maxlen=recent_events_max)
+        self._buy_enabled = os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        self._buy_disabled_reason: str | None = None
         self._status: dict[str, Any] = {
             "cycles": 0,
             "last_cycle_at": None,
             "submitted": 0,
             "amended": 0,
             "buy_submitted": 0,
+            "buy_submit_attempted": 0,
             "sell_submitted": 0,
             "blocked": 0,
             "errors": 0,
@@ -102,6 +120,19 @@ class RealtimeTradingEngine:
         }
 
     # ---- status ---------------------------------------------------------
+    def disable_buys(self, reason: str = "BUY_DISABLED") -> None:
+        self._buy_enabled = False
+        self._buy_disabled_reason = reason
+        os.environ["REALTIME_BUY_ENABLED"] = "false"
+        self._record(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "kind": "CONTROL",
+                "outcome": "buy_disabled",
+                "detail": reason,
+            }
+        )
+
     def get_status(self) -> dict[str, Any]:
         with self._lock:
             status = dict(self._status)
@@ -114,6 +145,8 @@ class RealtimeTradingEngine:
                 "max_orders_per_cycle": self.config.max_orders_per_cycle,
                 "max_buy_evaluations_per_cycle": self.config.max_buy_evaluations_per_cycle,
             }
+            status["buy_enabled"] = self._buy_enabled
+            status["buy_disabled_reason"] = self._buy_disabled_reason
             return status
 
     def _record(self, event: dict[str, Any]) -> None:
@@ -156,6 +189,8 @@ class RealtimeTradingEngine:
         # 매도·매수는 독립 예산을 갖는다 — 매도가 사이클 한도를 다 써서 매수를 굶기면 안 된다.
         sell_submitted = 0
         buy_submitted = 0
+        buy_submit_attempted = 0
+        buy_enabled = self._buy_enabled and os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
         # 최신 온톨로지 추론 그래프(분석 컨텍스트)를 1회 조회해 매도 판단에 반영한다.
         ontology_graph = None
@@ -201,14 +236,33 @@ class RealtimeTradingEngine:
                 self._append_rejection(summary, holding.ticker, "SELL", result.reason_codes)
 
         # 2) 매수: 미보유 후보 진입(매도와 독립 예산).
+        if not buy_enabled:
+            summary["reason"] = summary["reason"] or (self._buy_disabled_reason or "BUY_DISABLED")
+            summary["buy_disabled"] = True
+            summary["buy_disabled_reason"] = self._buy_disabled_reason or "REALTIME_BUY_ENABLED=false"
+            summary["buy_submitted"] = buy_submitted
+            summary["buy_submit_attempted"] = buy_submit_attempted
+            summary["sell_submitted"] = sell_submitted
+            self._finish_cycle(summary)
+            return summary
+
         for symbol in self.candidate_symbols_provider():
             if summary["buy_evaluated"] >= self.config.max_buy_evaluations_per_cycle:
                 summary["reason"] = summary["reason"] or "BUY_EVALUATION_LIMIT_REACHED"
                 break
-            if buy_submitted >= min(self.config.max_orders_per_cycle, self.config.max_buy_orders_per_cycle):
+            if buy_submit_attempted >= min(self.config.max_orders_per_cycle, self.config.max_buy_orders_per_cycle):
                 break
             if symbol in held_tickers:
                 continue  # 보유 종목은 매도 감시 대상이므로 신규 매수에서 제외.
+            if (
+                _is_domestic_symbol_or_market(symbol)
+                and os.getenv("REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+                and not _is_krx_core_buy_session(decision_time)
+            ):
+                # 기본은 정규장 이외(장전/장후/시간외 단일가)에도 국내 매수를 허용한다.
+                # 실제 거래소 개장 여부는 아래 market_open_provider(확장시간 게이트)가 판단한다.
+                summary["skipped_market_closed"] += 1
+                continue
             if self.market_open_provider is not None and not self.market_open_provider(symbol, ""):
                 summary["skipped_market_closed"] += 1
                 continue  # 거래소 마감: 신규 매수 보류.
@@ -229,6 +283,8 @@ class RealtimeTradingEngine:
                 self._record({"at": decision_time.isoformat(), "symbol": symbol, "kind": "BUY", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
             if result.approved and result.final_order is not None:
+                buy_submit_attempted += 1
+                summary["buy_submit_attempted"] = buy_submit_attempted
                 if self._submit(result.final_order, "BUY", result.reason_codes, decision_time, summary):
                     buy_submitted += 1
             else:
@@ -236,6 +292,7 @@ class RealtimeTradingEngine:
                 self._append_rejection(summary, symbol, "BUY", result.reason_codes)
 
         summary["buy_submitted"] = buy_submitted
+        summary["buy_submit_attempted"] = buy_submit_attempted
         summary["sell_submitted"] = sell_submitted
         self._finish_cycle(summary)
         return summary

@@ -78,6 +78,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       </div>
       <div class="account-actions">
         <button type="button" id="account-refresh">새로고침</button>
+        <button type="button" id="account-terminate" class="danger">&#51333;&#47308;</button>
         <a href="/">매매 대시보드</a>
         <a href="/api/realtime-trading/status" target="_blank" rel="noreferrer">자동거래 상태</a>
       </div>
@@ -111,6 +112,24 @@ _ACCOUNT_PAGE = """<!doctype html>
         <canvas class="chart-frame" id="allocation-chart" width="420" height="320"></canvas>
         <div class="allocation-list" id="allocation-list"></div>
       </article>
+    </section>
+
+    <section class="dashboard-frame">
+      <div class="frame-title">
+        <h2>실시간 판단 흐름</h2>
+        <span class="badge" id="decision-cycle-badge">-</span>
+      </div>
+      <div class="decision-flow" id="decision-flow"></div>
+      <div class="decision-grid">
+        <article>
+          <h3>최근 실행 판단</h3>
+          <div class="decision-events" id="decision-events"></div>
+        </article>
+        <article>
+          <h3>최근 보류 사유</h3>
+          <div class="decision-rejections" id="decision-rejections"></div>
+        </article>
+      </div>
     </section>
 
     <section class="dashboard-frame">
