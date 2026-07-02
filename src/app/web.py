@@ -181,7 +181,7 @@ _auto_live_readiness_started = False
 
 
 def _account_dashboard_status_provider() -> dict[str, Any]:
-  basis = _last_live_account_basis()
+  basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
   if basis is None:
     snapshot = _live_snapshot()
     context = snapshot.get("context")
@@ -6049,6 +6049,7 @@ HTML = """
 <body>
   <div class="shell">
     <aside>
+      <a href="/account" style="display:block; margin:0 0 16px; padding:12px 14px; border-radius:8px; background:#176b87; color:#fff; text-decoration:none; font-weight:700; text-align:center;">계좌·자산 대시보드 열기</a>
       <h1>개인 투자 분석 시스템</h1>
       <div class="status" id="gate">목표가 확정될 때까지 프로그램은 시작되지 않습니다.</div>
       <h2>운영 모드</h2>

@@ -140,8 +140,15 @@ Set-DefaultEnv "PYTHONPATH" "src"
 Set-DefaultEnv "APP_ENV" "local"
 Set-DefaultEnv "APP_PORT" "8010"
 Set-DefaultEnv "DATA_ENV" "realtime"
-Set-DefaultEnv "TRADING_MODE" "learning"
-Set-DefaultEnv "LIVE_TRADING_ENABLED" "false"
+Set-DefaultEnv "TRADING_MODE" "live_trading"
+Set-DefaultEnv "LIVE_TRADING_ENABLED" "true"
+Set-DefaultEnv "KIS_LIVE_ENABLED" "true"
+Set-DefaultEnv "KIS_PAPER_TRADING" "false"
+Set-DefaultEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
+Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
+Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
+Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
+Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.035"
 Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
 Set-DefaultEnv "REALTIME_LATENCY_PROFILE" "low_latency"
 Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
@@ -191,6 +198,7 @@ if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_CLASSIFIER_ENABLED", "
 Set-DefaultEnv "LIVE_REFRESH_SECONDS" "15"
 Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "60"
 Set-DefaultEnv "AUTO_START_LIVE_WORKER" "false"
+Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"
@@ -214,6 +222,7 @@ $serverOutLog = Join-Path $logsDir "run-server.out.log"
 $serverErrLog = Join-Path $logsDir "run-server.err.log"
 $port = [int]([Environment]::GetEnvironmentVariable("APP_PORT", "Process"))
 $url = "http://127.0.0.1:$port"
+$launchUrl = "$url/account"
 $server = $null
 $browser = $null
 $browserProfile = $null
@@ -232,6 +241,7 @@ try {
   Write-Host "Starting local app server (PID $($server.Id))..."
   Wait-LocalAppReady -Url $url -ServerProcess $server
   Write-Host "Web UI: $url"
+  Write-Host "Account dashboard: $launchUrl"
   Write-Host "Server logs: $serverOutLog"
 
   $browserExe = Find-BrowserExecutable
@@ -242,7 +252,7 @@ try {
     $browser = Start-Process `
       -FilePath $browserExe `
       -ArgumentList @(
-        "--app=$url",
+        "--app=$launchUrl",
         "--user-data-dir=$browserProfile",
         "--no-first-run",
         "--disable-extensions"
@@ -251,7 +261,7 @@ try {
     Write-Host "Opened managed browser window (PID $($browser.Id))."
     Write-Host "Close that browser window to stop the server, or press Ctrl+C here to close both."
   } else {
-    Start-Process $url | Out-Null
+    Start-Process $launchUrl | Out-Null
     Write-Host "No Chrome or Edge executable was found for managed mode."
     Write-Host "Press Ctrl+C here to stop the server."
   }

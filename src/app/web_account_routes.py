@@ -79,6 +79,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="account-actions">
         <button type="button" id="account-refresh">새로고침</button>
         <a href="/">매매 대시보드</a>
+        <a href="/api/realtime-trading/status" target="_blank" rel="noreferrer">자동거래 상태</a>
       </div>
     </header>
 

@@ -15,8 +15,14 @@ async function fetchJson(url) {
 
 async function refreshDashboard() {
   const data = await fetchJson('/api/account/dashboard');
+  let trading = null;
+  try {
+    trading = await fetchJson('/api/realtime-trading/status');
+  } catch (_) {
+    trading = null;
+  }
   state.dashboard = data;
-  renderDashboard(data);
+  renderDashboard(data, trading);
   await refreshHistory();
 }
 
@@ -25,7 +31,7 @@ async function refreshHistory() {
   renderAssetChart(data.points || []);
 }
 
-function renderDashboard(data) {
+function renderDashboard(data, trading) {
   const snapshot = data.snapshot || {};
   document.getElementById('account-source').textContent = `${snapshot.source || 'unknown'} | updated ${formatTime(snapshot.updated_at)}`;
   const badge = document.getElementById('account-stale-badge');
@@ -37,7 +43,7 @@ function renderDashboard(data) {
   renderHoldings(data.holdings || []);
   renderTrades(data.trades || []);
   renderCash(data.cash || []);
-  renderSystem(snapshot, data.logs || {});
+  renderSystem(snapshot, data.logs || {}, trading);
   renderLogs(data.logs || {});
 }
 
@@ -123,10 +129,14 @@ function renderCash(rows) {
   `).join('') : `<tr class="empty-row"><td colspan="5">예수금 정보 수집 중</td></tr>`;
 }
 
-function renderSystem(snapshot, logs) {
+function renderSystem(snapshot, logs, trading) {
   const warnings = snapshot.data_quality_warnings || [];
+  const tradingStatus = trading && trading.status ? trading.status : {};
   const items = [
     ['KIS 상태', snapshot.is_live ? '연결됨' : 'fallback'],
+    ['자동거래', trading && trading.running ? '실행 중' : '대기'],
+    ['자동시작', trading && trading.auto_start ? '켜짐' : '꺼짐'],
+    ['주문 제출', String((tradingStatus.submitted || 0))],
     ['마지막 계좌 갱신', formatTime(snapshot.updated_at)],
     ['데이터 stale', snapshot.is_stale ? '주의' : '정상'],
     ['API 경고', String(warnings.length)],
@@ -245,4 +255,4 @@ document.querySelector('#history-range button[data-range="1D"]').classList.add('
 refreshDashboard().catch((error) => {
   document.getElementById('account-logs').textContent = `dashboard load failed: ${error.message}`;
 });
-setInterval(() => refreshDashboard().catch(() => {}), 15000);
+setInterval(() => refreshDashboard().catch(() => {}), 5000);

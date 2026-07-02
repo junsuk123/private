@@ -585,11 +585,29 @@ class SharedLiveDecisionEngine:
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
 
+        account_total = max(
+            float(
+                getattr(account, "equity", None)
+                or getattr(account, "total_equity", None)
+                or getattr(account, "cash_balance", None)
+                or getattr(account, "cash", None)
+                or 1.0
+            ),
+            1.0,
+        )
+        position_weight = max(0.0, (holding.quantity * price) / account_total)
+        exit_action = OrderAction.SELL
+        exit_suggested_weight = 0.0
+        if exit_reason.startswith("trailing_exit"):
+            reduce_fraction = max(0.1, min(1.0, float(os.getenv("REALTIME_LOSS_EXIT_REDUCE_FRACTION", "0.5"))))
+            exit_action = OrderAction.REDUCE
+            exit_suggested_weight = max(0.0, position_weight * (1.0 - reduce_fraction))
+
         intent = OrderIntent(
             ticker=symbol,
             market=holding.market or "KR",
-            action=OrderAction.SELL,
-            suggested_weight=0.0,
+            action=exit_action,
+            suggested_weight=exit_suggested_weight,
             confidence=max(exit_policy.confidence_floor, 0.85 if profitable_after_cost else 0.7),
             valid_until=decision_time + timedelta(seconds=max(30, exit_policy.time_exit_seconds // 4)),
             reasoning_summary=(f"realtime_exit:{exit_reason}",),
@@ -610,6 +628,8 @@ class SharedLiveDecisionEngine:
                 "ontology_score": round(ontology_score, 4),
                 "pnl_rate": round(pnl_rate, 6),
                 "exit_reason": exit_reason,
+                "exit_action": str(exit_action),
+                "exit_suggested_weight": round(exit_suggested_weight, 6),
             },
         )
         adaptive_rules = self.auto_tuner.derive_risk_rules(
@@ -621,7 +641,7 @@ class SharedLiveDecisionEngine:
         )
         risk_manager = RiskManager(adaptive_rules, audit_logger=self.risk_manager.audit_logger)
         risk = risk_manager.validate(intent, account, market)
-        if intent.action == OrderAction.SELL and not risk.approved and set(risk.rejection_reasons) == {"cash_available"}:
+        if intent.action in {OrderAction.SELL, OrderAction.REDUCE} and not risk.approved and set(risk.rejection_reasons) == {"cash_available"}:
             risk = risk.__class__(
                 ticker=risk.ticker,
                 action=risk.action,
