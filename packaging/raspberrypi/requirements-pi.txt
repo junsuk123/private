@@ -1,0 +1,24 @@
+# Raspberry Pi (CPU-only) runtime dependencies.
+#
+# This is the NPU-free profile of the system: it mirrors the core
+# [project].dependencies in pyproject.toml and intentionally EXCLUDES the
+# optional acceleration extras (`openvino`, `optimum-intel`, `torch`,
+# `transformers`). Every module that can request those backends already
+# degrades to a deterministic CPU/NumPy path, so the full trading, ontology,
+# risk, and realtime pipeline runs unchanged on ARM CPUs.
+#
+# All of these ship prebuilt aarch64 (manylinux) wheels or are pure Python, so
+# no C/Rust compilation is required for the core install.
+#
+# Install with: pip install -r packaging/raspberrypi/requirements-pi.txt
+fastapi
+httpx
+numpy
+owlrl
+pyshacl
+PyYAML
+rdflib
+starlette>=0.40.0,<0.47.0
+tzdata
+uvicorn
+websockets

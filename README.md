@@ -201,6 +201,24 @@ If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded lo
 
 On server startup, KIS realtime collection, periodic short-horizon model training, live account refresh, and the independent realtime trading loop start automatically. The account dashboard is the primary operating surface.
 
+## Raspberry Pi (CPU-only, NPU-free)
+
+The system also runs end-to-end on a Raspberry Pi with **no NPU and no OpenVINO**. The NPU was never a hard dependency: every acceleration path (ontology scoring, signal inference, native screening, event classification) already degrades to a deterministic CPU/NumPy implementation, and trading/graph/risk logic is pure Python that always runs on CPU. Dropping the NPU changes throughput, not behavior or safety.
+
+A self-contained package lives under [`packaging/raspberrypi/`](packaging/raspberrypi/) and *only adds files* — the Windows launchers and the accumulated `data/` are untouched. Copy the repository (including `data/`) to the Pi and run **one command** to install dependencies and build:
+
+```bash
+bash packaging/raspberrypi/bootstrap.sh
+```
+
+That installs OS packages, creates an isolated `.venv-pi/`, installs the CPU-only dependencies and the project (no `openvino`/`torch`/`transformers`), builds the optional Rust `screening_core` accelerator when a toolchain is present, and verifies the CPU runtime. Then launch headless (reusing the existing `data/` and `data/store/`):
+
+```bash
+bash packaging/raspberrypi/run.sh    # open http://<pi-ip>:8010/account
+```
+
+Full guide, systemd auto-start, live-trading flags, and verification details: [`docs/raspberry_pi_deployment.md`](docs/raspberry_pi_deployment.md).
+
 ## KIS Developers Broker Adapter
 
 `src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so the same paper-trading flow can be run with an injected fake KIS transport and later switched to the real transport.
@@ -529,6 +547,9 @@ docs/
   data_environment_separation.md
   semantic_feature_engine.md
   semantic_feature_codebase_analysis.md
+  raspberry_pi_deployment.md
+packaging/
+  raspberrypi/     One-command CPU-only (NPU-free) Raspberry Pi package
 research_notes/
   technical_indicator_formulas.md
 ```

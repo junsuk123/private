@@ -1,0 +1,29 @@
+# systemd unit for the CPU-only (NPU-free) investment system on Raspberry Pi.
+#
+# Install:
+#   1. Edit WorkingDirectory / User below to match your checkout and account.
+#   2. sudo cp packaging/raspberrypi/personal-investment.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now personal-investment.service
+#   5. journalctl -u personal-investment.service -f
+#
+[Unit]
+Description=Personal Ontology-Based Investment System (Raspberry Pi, CPU-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# Absolute path to the repository checkout on the Pi:
+WorkingDirectory=/home/pi/private
+ExecStart=/bin/bash packaging/raspberrypi/run.sh
+Restart=on-failure
+RestartSec=5
+# Keep the box responsive; the CPU pipeline is lightweight but bursty.
+Nice=5
+TimeoutStopSec=20
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

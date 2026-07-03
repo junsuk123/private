@@ -1,10 +1,14 @@
 fastapi
 httpx
 numpy
+owlrl
+pyshacl
 PyYAML
+rdflib
 starlette<0.47.0,>=0.40.0
 tzdata
 uvicorn
+websockets
 
 [local-llm]
 accelerate

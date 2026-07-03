@@ -1,4 +1,6 @@
 .venv/
+.venv-pi/
+packaging/raspberrypi/pi.env
 __pycache__/
 *.pyc
 .pytest_cache/
