@@ -1,5 +1,10 @@
 # NPU and Realtime Hot Path Optimization Audit
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 ## Current Runtime Note
 
 This audit predates the current guarded live runtime. NPU/CPU ontology acceleration remains an evidence and screening layer only. In the current `run.ps1` flow, live order submission still requires the realtime trading engine, `SharedLiveDecisionEngine`, deterministic `RiskManager`, FinalTradeGate, and `LiveExecutionCoordinator`; NPU scoring cannot submit orders directly.

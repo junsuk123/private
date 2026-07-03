@@ -1,5 +1,9 @@
 # Personal Multi-Agent Ontology-Based Automated Stock Investment System
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
 Personal-use research system for safe, auditable, explainable stock-investment analysis, realtime account monitoring, paper trading, and KIS live auto-trading under deterministic execution gates.
 
 The current implementation is intentionally conservative but live-capable in the local runtime started by `run.ps1`: it collects KIS realtime/broker data, builds live feature frames and ontology evidence, trains a short-horizon model in the background, evaluates SELL before BUY every cycle, and submits only `FinalOrder` objects that pass live runtime, broker, cost, risk, freshness, and idempotency gates.
@@ -470,12 +474,22 @@ The ontology pipeline can use OpenVINO/NPU for numeric evidence scoring while
 keeping hard filters, graph reasoning, strategy decisions, `RiskManager`, manual
 approval, and broker execution on CPU-controlled deterministic paths.
 
+Current verified behavior:
+
+- The local OpenVINO runtime reports `CPU`, `GPU`, and `NPU`.
+- `run.ps1` requests `OPENVINO_DEVICE=NPU` and `ONTOLOGY_ACCELERATOR=NPU`.
+- `OntologyNpuLinearScorer` compiles its candidate scoring graph to `NPU` and reports `uses_npu=true` when available.
+- `trading_pipeline._rank_accepted_with_npu` uses that scorer for accepted candidate ranking.
+- Event classification and short-horizon model paths may request OpenVINO/NPU, but their outputs remain advisory and may fall back to keyword, live-model, linear, or CPU implementations.
+
 Key controls:
 
 - `ONTOLOGY_NPU_ENABLED=true`: enable candidate evidence scoring.
 - `ONTOLOGY_NPU_TOP_K=50`: limit candidates passed into graph reasoning.
 - `ONTOLOGY_NPU_BATCH_SIZE=auto`: choose `512/1024/2048/4096` scoring buckets.
+- `ONTOLOGY_ACCELERATOR=NPU`: request NPU for ontology runtime status.
 - `OPENVINO_DEVICE=NPU`: request NPU; CPU fallback is automatic.
+- `NPU_MIN_BATCH_FOR_NPU=128`: shared NPU helper modules use CPU NumPy below this batch size.
 - `EVENT_CLASSIFIER_PROVIDER=keyword`: lightweight event classification default.
 - `SHORT_HORIZON_PREDICTOR_ENABLED=false`: opt-in short-horizon predictor.
 - `ONTOLOGY_GRAPH_SCOPE=candidate_only`: avoid full-universe graph materialization.

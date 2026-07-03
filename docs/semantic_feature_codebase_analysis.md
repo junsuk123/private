@@ -1,5 +1,10 @@
 # Codebase Analysis: Semantic Feature Integration
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 The semantic feature layer is present as an extensible analysis/modeling layer. The current main web decision path still uses `IndicatorSnapshot` from `src/app/indicators/engine.py` plus lightweight ontology candidate filtering, ontology reasoning, goal feasibility, deterministic strategies, and risk validation.
 
 The repository-level diagram `ontology base trading system diagram.png` summarizes where this layer fits: feature engineering feeds candidate filtering, evidence scoring, ontology reasoning, strategy construction, and finally the deterministic risk gate.

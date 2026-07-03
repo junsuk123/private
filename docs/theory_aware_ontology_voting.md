@@ -1,5 +1,10 @@
 # Theory-aware ontology voting
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 ## Current flow
 
 The legacy ontology path stores low-level triples such as `supportsSignal`,

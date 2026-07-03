@@ -1,5 +1,10 @@
 # Current Short-Term Trading Audit
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 Status: historical audit snapshot.
 
 This file previously contained a 2026-06-27 audit of an older branch that did not yet use the current guarded live runtime. That is no longer the current operating baseline.

@@ -1,5 +1,10 @@
 # Realtime Pipeline Benchmark Results
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 Requested device: `CPU`
 
 | scenario | input | hard_filter | topk | device | scoring_ms | total_pipeline_ms | peak_memory_mb |

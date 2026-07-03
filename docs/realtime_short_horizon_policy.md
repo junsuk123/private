@@ -1,5 +1,10 @@
 # Realtime Short-Horizon Policy
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 The realtime layer is optimized for responsive UI actions, short-horizon diagnostics, safe local learning, and guarded KIS live auto-trading. It uses one realtime data environment and submits live broker orders only through deterministic gates.
 
 See `ontology base trading system diagram.png` for the repository-level flow from trusted data inputs through candidate scoring, ontology reasoning, risk validation, paper/live-readiness execution, and feedback.

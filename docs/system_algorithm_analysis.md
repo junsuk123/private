@@ -1,8 +1,14 @@
 # System Algorithm Analysis
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
 This document summarizes the current algorithmic design implemented under `src/app`.
 
 The system is a safe realtime-only investment research, learning, paper-trading, account-monitoring, and guarded KIS live auto-trading framework. It combines public research collection, KIS realtime tick/orderbook collection, local SQLite storage, indicator snapshots, ontology screening, ontology reasoning, live feature/model scoring, deterministic strategy generation, deterministic risk validation, mock/KIS paper trading, and guarded KIS live limit-order execution.
+
+The current local runtime is NPU-capable for numeric ontology evidence. In the verified environment, OpenVINO reports `CPU`, `GPU`, and `NPU`, and the ontology runtime selects `NPU` when launched with the `run.ps1` defaults. This acceleration is limited to dense scoring/ranking; execution authority remains in deterministic CPU modules.
 
 ![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
 
@@ -171,6 +177,16 @@ Reject immediately when:
 - management-stock status is active
 - trading value is below `min_trading_value`
 - liquidity score is below `min_liquidity_score`
+
+When `ONTOLOGY_NPU_ENABLED=true`, the accepted set is ranked by `_rank_accepted_with_npu`:
+
+1. Build an 8-column float32 feature matrix from price change, volume change, market cap, missing trading value, volatility proxy, momentum, confidence, and liquidity.
+2. Instantiate `OntologyNpuLinearScorer` with `ONTOLOGY_NPU_BATCH_SIZE`, defaulting to the `run.ps1` value `4096`.
+3. Compile a small OpenVINO matmul graph to `OPENVINO_DEVICE`, normally `NPU`.
+4. Score rows, keep top-k according to `ONTOLOGY_NPU_TOP_K`, and record latency/profile metrics.
+5. If NPU compile fails, compile to CPU; if OpenVINO is unavailable, use the NumPy scorer. Output schema stays unchanged.
+
+This scorer is not a trained model by default. It is a fixed transparent linear evidence scorer used to rank and enrich candidates before graph reasoning and risk validation.
 
 Candidate score:
 

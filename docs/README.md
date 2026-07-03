@@ -1,5 +1,9 @@
 # Documentation Index
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
 ![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
 
 The diagram above is the canonical repository-level overview: trusted market and broker data enter validation/storage, become quantitative and semantic features, pass candidate filtering and evidence scoring, then flow through ontology reasoning, strategy construction, deterministic risk validation, controlled paper/live execution, and post-trade feedback.
@@ -7,6 +11,8 @@ The diagram above is the canonical repository-level overview: trusted market and
 ## Current Runtime Summary
 
 The current `run.ps1` runtime is a KIS live-capable realtime trading system. It opens `/account`, starts KIS realtime collection, starts periodic short-horizon model retraining, starts the independent realtime trading loop, and keeps deterministic execution gates mandatory.
+
+The current acceleration boundary is explicit: OpenVINO/NPU is used for compatible numeric ontology/candidate evidence scoring when available, and CPU fallback is automatic. On the verified local environment, OpenVINO exposes `CPU`, `GPU`, and `NPU`, and the ontology runtime selects `NPU` under `run.ps1`. Trading decisions, risk checks, final order creation, and broker submission remain CPU-controlled deterministic paths.
 
 The live loop is conservative:
 

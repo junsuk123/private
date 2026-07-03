@@ -1,5 +1,10 @@
 # Short-Term Trading Strategy Design
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 This document connects the literature-based short-term strategy modules to the current guarded KIS live runtime.
 
 The strategy engines do not call brokerage APIs directly. They produce `StrategyCandidate` records that must pass cost checks, ontology/runtime evidence, `RealityCheckValidator` where required, `RiskManager`, FinalTradeGate, and finally `LiveExecutionCoordinator` before a live order can be submitted.

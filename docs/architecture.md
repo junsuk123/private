@@ -1,5 +1,9 @@
 # Architecture
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
 ## Principle
 
 The system separates probabilistic reasoning from deterministic control. Classifiers, semantic layers, ontology screening, and strategy scoring can explain, classify, rank, tune, and propose. They cannot directly execute live trades.
@@ -38,6 +42,29 @@ Detailed flow:
 11. `FinalOrder` objects are submitted through mock/paper executors or through `LiveExecutionCoordinator` for live KIS limit orders when all live gates pass.
 12. The realtime engine evaluates SELL/REDUCE before BUY, keeps existing open SELL orders when the replacement price is effectively unchanged, and blocks BUY when `REALTIME_BUY_ENABLED=false`.
 13. Audit logging records inputs, mode changes, refreshes, decisions, rejections, submissions, and outputs, with recursive redaction for credentials, tokens, account numbers, and broker secrets.
+
+## Current Acceleration Boundary
+
+The current system uses NPU only for compatible dense numeric evidence work. It does not move the trading control plane to NPU.
+
+Current verified path:
+
+1. `run.ps1` sets `ONTOLOGY_ACCELERATOR=NPU`, `OPENVINO_DEVICE=NPU`, `OPENVINO_HINT_PERFORMANCE_MODE=LATENCY`, and `ONTOLOGY_NPU_BATCH_SIZE=4096`.
+2. `src/app/graph/runtime.py` checks OpenVINO devices and reports `active_backend=NPU` when `NPU` is available.
+3. `src/app/graph/npu_classifier.py` builds an OpenVINO linear scorer and compiles it to the requested device for ontology candidate evidence.
+4. `src/app/trading_pipeline.py` calls that scorer in `_rank_accepted_with_npu` to rank accepted lightweight candidates.
+5. `src/app/graph/builders.py` can also call the same classifier while building graph evidence.
+6. If OpenVINO import, device discovery, compile, or inference fails, the same schema falls back to CPU and reports the fallback reason.
+
+CPU-only authoritative paths:
+
+- source validation and synthetic/stale-data blocking
+- graph traversal and explanation construction
+- strategy action selection
+- `TradingCostEngine`, `PrincipalProtectionEngine`, `RiskManager`, and FinalTradeGate
+- idempotency, open-order keep/amend logic, and broker submission through `LiveExecutionCoordinator`
+
+Runtime status is exposed through `/api/ontology/runtime`, `/api/realtime/runtime`, and `/api/npu/runtime`.
 
 ## Public Data Layer
 

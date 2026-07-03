@@ -1,5 +1,10 @@
 # Semantic Feature Engine Developer Guide
 
+## Current Runtime Contract
+
+As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+
+
 This guide covers the semantic feature subsystem under `src/app/features`. It is an extensible layer for richer indicators, semantic states, graph triples, and model rows.
 
 For the full repository flow, see `ontology base trading system diagram.png`. This guide mainly expands the diagram's feature-engineering and ontology/graph-reasoning stages.
