@@ -1097,7 +1097,7 @@ DISPLAY_HTML = """<!doctype html>
   window.addEventListener("resize", resize);
 
   let state = null;   // {nodes, links, nodeMap, adj, maxDeg}
-  let alpha = 0, hover=null, dragNode=null, panning=false, lastX=0, lastY=0, moved=false;
+  let alpha = 0, hover=null, dragNode=null, panning=false, lastX=0, lastY=0, moved=false, autoFit=true;
   const reheat=(a)=>{ alpha=Math.max(alpha,a); };
   const worldToScreen=(x,y)=>({x:x*view.scale+view.tx, y:y*view.scale+view.ty});
   const screenToWorld=(sx,sy)=>({x:(sx-view.tx)/view.scale, y:(sy-view.ty)/view.scale});
@@ -1122,7 +1122,8 @@ DISPLAY_HTML = """<!doctype html>
     let a=Infinity,b=Infinity,c=-Infinity,d=-Infinity;
     state.nodes.forEach(n=>{ if(n.x<a)a=n.x; if(n.x>c)c=n.x; if(n.y<b)b=n.y; if(n.y>d)d=n.y; });
     const w=Math.max(1,c-a), h=Math.max(1,d-b);
-    view.scale=Math.max(0.25, Math.min(2.4, Math.min(W/(w+90), H/(h+90))));
+    const pad=22;
+    view.scale=Math.max(0.15, Math.min(6, Math.min((W-pad)/w, (H-pad)/h)));
     view.tx=W/2-((a+c)/2)*view.scale; view.ty=H/2-((b+d)/2)*view.scale;
   }
 
@@ -1138,12 +1139,14 @@ DISPLAY_HTML = """<!doctype html>
     }
     state.links.forEach(l=>{ let dx=l.t.x-l.s.x, dy=l.t.y-l.s.y; const dd=Math.sqrt(dx*dx+dy*dy)||0.01, f=(dd-84)*0.045, fx=dx/dd*f, fy=dy/dd*f;
       l.s.vx+=fx;l.s.vy+=fy;l.t.vx-=fx;l.t.vy-=fy; });
-    ns.forEach(n=>{ n.vx+=(-n.x)*0.003; n.vy+=(-n.y)*0.003; if(n.fixed){n.vx=0;n.vy=0;return;} n.vx*=0.86; n.vy*=0.86; n.x+=n.vx*alpha*1.4; n.y+=n.vy*alpha*1.4; });
+    var aspect=(H>0?W/H:1), gx=0.0032, gy=gx*aspect*aspect; // anisotropic: blob matches screen aspect
+    ns.forEach(n=>{ n.vx+=(-n.x)*gx; n.vy+=(-n.y)*gy; if(n.fixed){n.vx=0;n.vy=0;return;} n.vx*=0.86; n.vy*=0.86; n.x+=n.vx*alpha*1.4; n.y+=n.vy*alpha*1.4; });
     alpha*=0.992;
   }
 
   function draw(){
     stepSim();
+    if(autoFit && state && alpha>0.05) fit();   // keep the graph filling the screen while it settles
     const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0b0f16"); g.addColorStop(1,"#0a1622");
     ctx.setTransform(DPR,0,0,DPR,0,0); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
     if(!state){ requestAnimationFrame(draw); return; }
@@ -1178,14 +1181,14 @@ DISPLAY_HTML = """<!doctype html>
     for(const n of state.nodes){ const p=worldToScreen(n.x,n.y), r=screenRadius(n)+6, dx=p.x-sx, dy=p.y-sy, d=dx*dx+dy*dy; if(d<r*r&&d<bd){bd=d;best=n;} }
     return best; }
   canvas.addEventListener("pointerdown",e=>{ moved=false; lastX=e.clientX; lastY=e.clientY; const n=pick(e.clientX,e.clientY); if(n){dragNode=n;n.fixed=true;reheat(0.5);} else panning=true; canvas.setPointerCapture(e.pointerId); });
-  canvas.addEventListener("pointermove",e=>{ if(dragNode){const w=screenToWorld(e.clientX,e.clientY); dragNode.x=w.x; dragNode.y=w.y; dragNode.vx=0; dragNode.vy=0; moved=true; reheat(0.4); return;}
-    if(panning){ view.tx+=e.clientX-lastX; view.ty+=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY; moved=true; return; }
+  canvas.addEventListener("pointermove",e=>{ if(dragNode){autoFit=false; const w=screenToWorld(e.clientX,e.clientY); dragNode.x=w.x; dragNode.y=w.y; dragNode.vx=0; dragNode.vy=0; moved=true; reheat(0.4); return;}
+    if(panning){ autoFit=false; view.tx+=e.clientX-lastX; view.ty+=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY; moved=true; return; }
     hover=pick(e.clientX,e.clientY); });
   canvas.addEventListener("pointerup",()=>{ if(dragNode)dragNode.fixed=false; dragNode=null; panning=false; });
   canvas.addEventListener("pointerleave",()=>{ hover=null; });
-  canvas.addEventListener("wheel",e=>{ e.preventDefault(); const f=e.deltaY>0?0.9:1.1, ns=Math.max(0.2,Math.min(4,view.scale*f));
+  canvas.addEventListener("wheel",e=>{ e.preventDefault(); autoFit=false; const f=e.deltaY>0?0.9:1.1, ns=Math.max(0.2,Math.min(4,view.scale*f));
     view.tx=e.clientX-(e.clientX-view.tx)*(ns/view.scale); view.ty=e.clientY-(e.clientY-view.ty)*(ns/view.scale); view.scale=ns; },{passive:false});
-  window.addEventListener("dblclick",()=>{ fit(); reheat(0.5); });
+  window.addEventListener("dblclick",()=>{ autoFit=true; fit(); reheat(0.6); });
 
   let sig=null;
   async function poll(){
