@@ -17,7 +17,7 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as day_time, timezone
 from pathlib import Path
 from typing import Any, Callable, Deque
@@ -267,12 +267,22 @@ class RealtimeTradingEngine:
                 self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
             if result.approved and result.final_order is not None:
+                final_order = self._fit_sell_order_to_available_quantity(result.final_order, holding)
+                if final_order is None:
+                    summary["sell_rejected"] += 1
+                    self._append_rejection(
+                        summary,
+                        holding.ticker,
+                        "SELL",
+                        ("NO_SELLABLE_QUANTITY", "OPEN_ORDER_OR_SETTLEMENT_LOCK"),
+                    )
+                    continue
                 # Record the sell so we don't immediately re-buy the same name (churn).
                 self._recent_sell_monotonic[holding.ticker] = time.monotonic()
                 if has_open_sell:
-                    if self._amend_open_sell(result.final_order, result.reason_codes, decision_time, summary):
+                    if self._amend_open_sell(final_order, result.reason_codes, decision_time, summary):
                         sell_submitted += 1
-                elif self._submit(result.final_order, "SELL", result.reason_codes, decision_time, summary):
+                elif self._submit(final_order, "SELL", result.reason_codes, decision_time, summary):
                     sell_submitted += 1
             else:
                 summary["sell_rejected"] += 1
@@ -379,6 +389,20 @@ class RealtimeTradingEngine:
                 "reason_codes": tuple(reason_codes or ()),
             }
         )
+
+    def _fit_sell_order_to_available_quantity(self, order: FinalOrder, holding: Any) -> FinalOrder | None:
+        sellable = getattr(holding, "sellable_quantity", None)
+        if sellable is None:
+            return order
+        try:
+            available = int(sellable)
+        except (TypeError, ValueError):
+            return order
+        if available <= 0:
+            return None
+        if available >= int(order.quantity):
+            return order
+        return replace(order, quantity=available)
 
     def _submit(
         self,

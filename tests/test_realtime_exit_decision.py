@@ -88,6 +88,66 @@ def _account(holding: Holding, cash: float = 0.0) -> AccountSnapshot:
 
 
 class RealtimeExitDecisionTest(unittest.TestCase):
+    def test_small_account_one_share_loss_concentration_should_hold(self) -> None:
+        holding = Holding(
+            ticker="005930",
+            market="KR",
+            company_name="Samsung",
+            sector="Tech",
+            quantity=1,
+            average_price=50_000.0,
+            last_price=49_900.0,
+        )
+        account = AccountSnapshot(cash=150_000.0, holdings=(holding,))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_SMALL_ACCOUNT_MODE": "true",
+                "REALTIME_SMALL_ACCOUNT_EQUITY_KRW": "300000",
+                "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE": "true",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "true",
+                "REALTIME_HARD_STOP_LOSS": "0.03",
+                "REALTIME_STOP_LOSS_NET": "0.004",
+            },
+        ):
+            result = _engine(price=49_900.0).evaluate_exit_for_holding(
+                holding, account, take_profit=0.006, stop_loss=0.01
+            )
+
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIn("SMALL_ACCOUNT_ONE_SHARE_LOSS_BLOCK", result.reason_codes)
+
+    def test_small_account_hard_stop_exit_allowed(self) -> None:
+        holding = Holding(
+            ticker="005930",
+            market="KR",
+            company_name="Samsung",
+            sector="Tech",
+            quantity=1,
+            average_price=50_000.0,
+            last_price=48_000.0,
+        )
+        account = AccountSnapshot(cash=150_000.0, holdings=(holding,))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_SMALL_ACCOUNT_MODE": "true",
+                "REALTIME_SMALL_ACCOUNT_EQUITY_KRW": "300000",
+                "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE": "true",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "true",
+                "REALTIME_HARD_STOP_LOSS": "0.03",
+                "REALTIME_STOP_LOSS_NET": "0",
+            },
+        ):
+            result = _engine(price=48_000.0).evaluate_exit_for_holding(
+                holding, account, take_profit=0.006, stop_loss=0.01
+            )
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertTrue(any(code.startswith("hard_stop_loss") for code in result.reason_codes), result.reason_codes)
+
     def test_investment_mode_holds_normal_dip(self) -> None:
         # Default (investment) mode: a normal -2% dip is HELD, never dumped below entry.
         engine = _engine(price=98.0)
@@ -804,6 +864,64 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(len(coordinator.amended), 1)
         self.assertEqual(coordinator.amended[0][0], "SELL0001")
         self.assertEqual(coordinator.amended[0][1].limit_price, 101.2)
+
+    def test_sell_uses_sellable_quantity_instead_of_total_holding_quantity(self) -> None:
+        holding = Holding(
+            ticker="484590",
+            market="KR",
+            company_name="Sellable",
+            sector="ETF",
+            quantity=2,
+            average_price=7236.5,
+            last_price=7340.0,
+            sellable_quantity=1,
+        )
+        account = _account(holding, cash=1_000_000.0)
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedSellDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(submit_cooldown_sec=999, sell_inflight_cooldown_sec=999),
+        )
+
+        result = engine.run_once()
+
+        self.assertEqual(result["submitted"], 1)
+        self.assertEqual(coordinator.submitted[0].quantity, 1)
+
+    def test_sell_skips_when_no_sellable_quantity(self) -> None:
+        holding = Holding(
+            ticker="484590",
+            market="KR",
+            company_name="Locked",
+            sector="ETF",
+            quantity=2,
+            average_price=7236.5,
+            last_price=7340.0,
+            sellable_quantity=0,
+        )
+        account = _account(holding, cash=1_000_000.0)
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedSellDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(submit_cooldown_sec=999, sell_inflight_cooldown_sec=999),
+        )
+
+        result = engine.run_once()
+
+        self.assertEqual(result["submitted"], 0)
+        self.assertEqual(result["sell_rejected"], 1)
+        self.assertEqual(len(coordinator.submitted), 0)
+        self.assertIn("NO_SELLABLE_QUANTITY", result["rejections"][0]["reason_codes"])
 
     def test_sell_amend_no_available_quantity_drops_stale_open_sell(self) -> None:
         holding = _holding(100.0, last_price=99.0)

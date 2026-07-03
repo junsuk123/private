@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from math import floor
 from pathlib import Path
@@ -188,7 +189,31 @@ class RiskManager:
             quantity = floor(spend / market.last_price)
             metadata["estimated_order_quantity"] = quantity
             metadata["minimum_one_share_cash_required"] = float(market.last_price)
-            if quantity > 0:
+            small_account_enabled = _env_bool("REALTIME_SMALL_ACCOUNT_MODE", False)
+            small_account_equity = _env_float("REALTIME_SMALL_ACCOUNT_EQUITY_KRW", 300000.0)
+            max_position_weight = _env_float("REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT", 0.10)
+            account_equity = max(0.0, float(getattr(account, "equity", 0.0) or 0.0))
+            if (
+                small_account_enabled
+                and account_equity > 0.0
+                and account_equity <= small_account_equity
+                and max_position_weight > 0.0
+                and market.last_price > account_equity * max_position_weight
+            ):
+                _add_rejection(
+                    reasons,
+                    rejection_log,
+                    "SMALL_ACCOUNT_ONE_SHARE_TOO_EXPENSIVE",
+                    "small_account_position_sizing",
+                    {
+                        "equity": account_equity,
+                        "last_price": market.last_price,
+                        "max_position_weight": max_position_weight,
+                        "max_one_share_price": account_equity * max_position_weight,
+                    },
+                )
+                approved = False
+            if approved and quantity > 0:
                 orderbook_snapshot = intent.strategy_metadata.get("orderbook_snapshot")
                 cost = self.cost_engine.estimate(
                     symbol=intent.ticker,
@@ -349,7 +374,7 @@ class RiskManager:
                         {"slippage_rate": slippage_rate, "max_slippage_rate": max_slippage_rate},
                     )
                     approved = False
-            else:
+            elif quantity <= 0:
                 approved = False
                 _add_rejection(
                     reasons,
@@ -505,6 +530,20 @@ def _equity_for_sizing(account: AccountSnapshot, market: MarketSnapshot, fallbac
 
 def _market_currency(market: MarketSnapshot) -> str:
     return account_market_currency(market)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_overseas_market(market: MarketSnapshot) -> bool:

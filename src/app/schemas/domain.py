@@ -98,6 +98,7 @@ class Holding:
     average_price: float
     last_price: float
     opened_at: datetime | None = None
+    sellable_quantity: int | None = None
 
     @property
     def market_value(self) -> float:
@@ -116,9 +117,11 @@ class AccountSnapshot:
     unrealized_pnl_today: float = 0.0
     base_currency: str = "KRW"
     cash_by_currency: dict[str, float] = field(default_factory=dict)
+    orderable_cash_by_currency: dict[str, float] = field(default_factory=dict)
     fx_rate_by_currency: dict[str, float] = field(default_factory=dict)
     position_opened_at_by_ticker: dict[str, datetime] = field(default_factory=dict)
     cash_equivalent_krw: float | None = None
+    foreign_cash_krw: float | None = None
     total_equity_krw: float | None = None
     captured_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 

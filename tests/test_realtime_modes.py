@@ -36,6 +36,13 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertTrue(state.training_allowed)
         self.assertIn("Use one unified realtime data store only: data/store.", state.guardrails)
 
+    def test_us_market_holiday_closes_us_group_but_not_krx(self) -> None:
+        holiday_kst = datetime(2026, 7, 3, 5, 0, tzinfo=timezone.utc)  # 14:00 KST, Jul 3 ET holiday
+
+        self.assertFalse(web_module._is_open_live_market_ticker("LABT", "NASDAQ", holiday_kst))
+        self.assertTrue(web_module._is_open_live_market_ticker("005930", "KR", holiday_kst))
+        self.assertEqual(web_module._active_live_market_groups(holiday_kst), ("KRX",))
+
     def test_legacy_paper_trading_replay_uses_unified_realtime_data_without_live_orders(self) -> None:
         state = OperationModeManager().start(OperationMode.TESTING)
 

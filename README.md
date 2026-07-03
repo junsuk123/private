@@ -28,6 +28,8 @@ Important current behavior:
 
 - Auto-trading starts automatically when `run.ps1` starts the server.
 - SELL/REDUCE decisions are evaluated before new BUY decisions.
+- Small-account mode is enabled by default in `run.ps1`: 1-share loss exits are blocked unless the hard stop is reached, below-break-even non-emergency SELLs are blocked, and one-share BUYs that exceed the configured account-weight cap are rejected.
+- Foreign cash is displayed from actual foreign-currency cash and broker FX; broker cash-equivalent residuals are shown separately in the dashboard instead of being counted as foreign cash.
 - Existing open SELL orders are amended only when the price meaningfully changes; otherwise they are kept and surfaced as `open_sell_kept`.
 - BUY can be globally disabled with `REALTIME_BUY_ENABLED=false`; the `/account` 종료 button does this before submitting profit-seeking liquidation SELL orders and scheduling server shutdown.
 - The live ML model is advisory. Model-only BUY is rejected when `REALTIME_MODEL_AUXILIARY_ONLY=true`; ontology or runtime broker evidence must confirm the trade.
@@ -46,6 +48,8 @@ Important current behavior:
 - Margin, leverage, derivatives, short selling, credit loans, and leveraged ETFs are rejected.
 - Paper trading uses the KIS virtual domain or the local paper engine.
 - Live termination disables BUY first, then submits profit-seeking limit SELL orders for current holdings when all live gates pass.
+
+Small-account loss-sell behavior and dashboard cash decomposition are documented in `docs/small_account_loss_sell_fix_report.md`.
 
 ## Standards-Based Ontology Framework (RDF/RDFS/OWL + SHACL)
 

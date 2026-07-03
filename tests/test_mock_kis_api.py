@@ -327,7 +327,7 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(portfolio.account.cash_by_currency["KRW"], 1_000_000)
         self.assertEqual(portfolio.account.cash_by_currency["USD"], 12.34)
 
-    def test_kis_portfolio_uses_domestic_orderable_cash_before_deposit_total(self) -> None:
+    def test_kis_portfolio_keeps_domestic_deposit_and_orderable_cash_separate(self) -> None:
         class OrderableCashTransport(RecordingKisTransport):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):
                 self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
@@ -363,10 +363,64 @@ class MockKisApiTest(unittest.TestCase):
 
         portfolio = broker.get_portfolio()
 
-        self.assertEqual(portfolio.account.cash, 750_000)
-        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 750_000)
+        self.assertEqual(portfolio.account.cash, 1_000_000)
+        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 1_000_000)
+        self.assertEqual(portfolio.account.orderable_cash_by_currency["KRW"], 750_000)
         self.assertEqual(portfolio.account.securities_market_value, 142_000)
-        self.assertEqual(portfolio.account.equity, 892_000)
+        self.assertEqual(portfolio.account.equity, 1_142_000)
+
+    def test_kis_portfolio_reads_domestic_balance_continuation_pages(self) -> None:
+        class PagedDomesticBalanceTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    if headers.get("tr_cont") == "N":
+                        return {
+                            "rt_cd": "0",
+                            "ctx_area_fk100": "ctx",
+                            "ctx_area_nk100": "",
+                            "output1": [
+                                {"pdno": "484590", "prdt_name": "Second", "hldg_qty": "3", "pchs_avg_pric": "7000", "prpr": "7340"},
+                                {"pdno": "000000", "prdt_name": "Zero", "hldg_qty": "0", "pchs_avg_pric": "0", "prpr": "1"},
+                            ],
+                            "output2": [{"dnca_tot_amt": "20374", "scts_evlu_amt": "36020", "tot_evlu_amt": "56394"}],
+                        }
+                    return {
+                        "rt_cd": "0",
+                        "ctx_area_fk100": "ctx",
+                        "ctx_area_nk100": "next",
+                        "output1": [
+                            {"pdno": "481070", "prdt_name": "First", "hldg_qty": "1", "pchs_avg_pric": "14020", "prpr": "14000"},
+                            {"pdno": "006880", "prdt_name": "Zero", "hldg_qty": "0", "pchs_avg_pric": "0", "prpr": "4575"},
+                        ],
+                        "output2": [{"dnca_tot_amt": "20374", "scts_evlu_amt": "36020", "tot_evlu_amt": "56394"}],
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "13515"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {"rt_cd": "0", "output2": [], "output3": {"tot_asst_amt": "0"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": []}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "0"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=True,
+            enabled=True,
+            transport=PagedDomesticBalanceTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual([(h.ticker, h.quantity) for h in portfolio.account.holdings], [("481070", 1), ("484590", 3)])
+        self.assertEqual(portfolio.account.securities_market_value, 36_020)
+        self.assertEqual(portfolio.account.cash, 20_374)
+        self.assertEqual(portfolio.account.orderable_cash_by_currency["KRW"], 13_515)
 
     def test_kis_portfolio_uses_overseas_orderable_cash_not_total_usd_balance(self) -> None:
         class OverseasOrderableTransport(RecordingKisTransport):

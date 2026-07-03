@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -150,6 +151,49 @@ class RiskManagerTest(unittest.TestCase):
         self.assertTrue(result.checks["live_validation_id_present"])
         self.assertTrue(result.approved)
         self.assertIsNotNone(result.final_order)
+
+    def test_small_account_rejects_expensive_one_share_buy(self) -> None:
+        now = datetime.now(timezone.utc)
+        market = MarketSnapshot(
+            ticker="005930",
+            market="KOSPI",
+            company_name="Samsung Electronics",
+            sector="Technology",
+            last_price=50_000,
+            average_daily_trading_value=100_000_000_000,
+            volatility_20d=0.02,
+            source=SourceMetadata(source_name="KIS", retrieved_at=now, observed_at=now, is_realtime=True),
+        )
+        intent = OrderIntent(
+            ticker=market.ticker,
+            market=market.market,
+            action=OrderAction.BUY,
+            suggested_weight=0.50,
+            confidence=0.95,
+            valid_until=now + timedelta(minutes=5),
+            reasoning_summary=("unit",),
+            supporting_factors=("unit",),
+            contradicting_factors=(),
+            source_data_ids=("unit",),
+            strategy_family="unit_test",
+            expected_exit_price=52_000,
+            target_net_return=0.01,
+            validation_id="unit-validation",
+        )
+        account = AccountSnapshot(cash=200_000, holdings=(), cash_by_currency={"KRW": 200_000})
+
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_SMALL_ACCOUNT_MODE": "true",
+                "REALTIME_SMALL_ACCOUNT_EQUITY_KRW": "300000",
+                "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT": "0.10",
+            },
+        ):
+            result = RiskManager(RiskRules(live_trading_enabled=False)).validate(intent, account, market)
+
+        self.assertFalse(result.approved)
+        self.assertIn("SMALL_ACCOUNT_ONE_SHARE_TOO_EXPENSIVE", result.rejection_reasons)
 
 
 if __name__ == "__main__":

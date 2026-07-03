@@ -381,6 +381,10 @@ def _principal_protection_account_snapshot(config: PrincipalProtectionConfig) ->
         holdings=(),
         base_currency=str(live_basis.get("base_currency") or "KRW"),
         cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
+        orderable_cash_by_currency={
+            str(key): float(value)
+            for key, value in dict(live_basis.get("orderable_cash_by_currency") or {}).items()
+        },
         cash_equivalent_krw=max(0.0, float(live_basis.get("cash_equivalent_krw") or live_basis.get("cash") or 0.0)),
         captured_at=datetime.now(timezone.utc),
     )
@@ -434,7 +438,11 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   krw_cash = _number_or_zero(connection.get("krw_cash") or connection.get("actual_deposit") or 0)
   cash = krw_cash if krw_cash > 0 else _number_or_zero(connection.get("cash") or 0)
   cash_by_currency = _cash_by_currency_payload(connection.get("cash_by_currency"), krw_cash)
+  orderable_cash_by_currency = _cash_by_currency_payload(connection.get("orderable_cash_by_currency"), krw_cash)
   foreign_cash_krw = _number_or_zero(connection.get("foreign_cash_krw") or 0)
+  cash_equivalent_krw = _number_or_zero(connection.get("cash_equivalent_krw") or 0)
+  if cash_equivalent_krw <= 0:
+    cash_equivalent_krw = cash + foreign_cash_krw
   if cash <= 0:
     cash = krw_cash
   equity = _number_or_zero(
@@ -455,8 +463,9 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "cash": cash,
       "krw_cash": krw_cash_value,
       "foreign_cash_krw": foreign_cash_krw,
-      "cash_equivalent_krw": cash + foreign_cash_krw,
+      "cash_equivalent_krw": cash_equivalent_krw,
       "cash_by_currency": cash_by_currency,
+      "orderable_cash_by_currency": orderable_cash_by_currency,
       "foreign_cash_by_currency": _foreign_cash_by_currency(cash_by_currency),
       "base_currency": "KRW",
       "equity": equity,
@@ -497,6 +506,11 @@ def _holdings_from_live_positions(positions: Any) -> tuple[Holding, ...]:
             quantity=quantity,
             average_price=_number_or_zero(position.get("average_price")),
             last_price=_number_or_zero(position.get("last_price")),
+            sellable_quantity=(
+                int(_number_or_zero(position.get("sellable_quantity")))
+                if position.get("sellable_quantity") is not None
+                else None
+            ),
         )
     )
   return tuple(holdings)
@@ -528,6 +542,10 @@ def _merge_live_account_basis_with_previous(
   cash_by_currency = dict(merged.get("cash_by_currency") or {})
   cash_by_currency["KRW"] = previous_krw_cash
   merged["cash_by_currency"] = cash_by_currency
+  orderable_cash_by_currency = dict(merged.get("orderable_cash_by_currency") or {})
+  if "KRW" not in orderable_cash_by_currency:
+    orderable_cash_by_currency["KRW"] = previous_krw_cash
+  merged["orderable_cash_by_currency"] = orderable_cash_by_currency
   merged["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
   merged["krw_cash"] = previous_krw_cash
   merged["cash"] = max(_number_or_zero(merged.get("cash")), previous_krw_cash)
@@ -546,6 +564,7 @@ def _connection_with_account_basis(connection: dict[str, Any], basis: dict[str, 
   merged["krw_cash"] = basis.get("krw_cash", merged.get("krw_cash"))
   merged["foreign_cash_krw"] = basis.get("foreign_cash_krw", merged.get("foreign_cash_krw"))
   merged["cash_by_currency"] = basis.get("cash_by_currency", merged.get("cash_by_currency"))
+  merged["orderable_cash_by_currency"] = basis.get("orderable_cash_by_currency", merged.get("orderable_cash_by_currency"))
   merged["foreign_cash_by_currency"] = basis.get("foreign_cash_by_currency", merged.get("foreign_cash_by_currency"))
   merged["actual_equity"] = basis.get("equity", merged.get("actual_equity"))
   merged["invested_value"] = basis.get("invested_value", merged.get("invested_value"))
@@ -564,6 +583,7 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
       cash=max(0.0, float(basis.get("krw_cash") or 0.0)),
       holdings=_holdings_from_live_positions(basis.get("positions")),
       cash_by_currency=dict(basis.get("cash_by_currency") or {}),
+      orderable_cash_by_currency=dict(basis.get("orderable_cash_by_currency") or {}),
       cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis["cash"])),
       captured_at=datetime.now(timezone.utc),
   )
@@ -579,6 +599,10 @@ def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
       holdings=_holdings_from_live_positions(basis.get("positions")),
       base_currency=str(basis.get("base_currency") or "KRW"),
       cash_by_currency={str(key): float(value) for key, value in cash_by_currency.items()},
+      orderable_cash_by_currency={
+          str(key): float(value)
+          for key, value in dict(basis.get("orderable_cash_by_currency") or {}).items()
+      },
       cash_equivalent_krw=max(0.0, float(basis.get("cash_equivalent_krw") or basis.get("cash") or 0.0)),
       captured_at=datetime.now(timezone.utc),
   )
@@ -1027,6 +1051,7 @@ def status() -> JSONResponse:
         "krw_cash": live_basis["krw_cash"],
         "foreign_cash_krw": live_basis["foreign_cash_krw"],
         "cash_by_currency": live_basis["cash_by_currency"],
+        "orderable_cash_by_currency": live_basis.get("orderable_cash_by_currency", live_basis["cash_by_currency"]),
         "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
         "base_currency": live_basis["base_currency"],
         "equity": live_basis["equity"],
@@ -1761,6 +1786,7 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
                 "ticker": holding.ticker,
                 "market": holding.market,
                 "quantity": holding.quantity,
+                "sellable_quantity": getattr(holding, "sellable_quantity", None),
                 "average_price": holding.average_price,
                 "last_price": holding.last_price,
                 "market_value": holding.market_value,
@@ -1776,6 +1802,11 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         ]
         cash_by_currency = _cash_by_currency_payload(
             getattr(portfolio.account, "cash_by_currency", None),
+            portfolio.account.cash,
+            getattr(portfolio.account, "base_currency", "KRW"),
+        )
+        orderable_cash_by_currency = _cash_by_currency_payload(
+            getattr(portfolio.account, "orderable_cash_by_currency", None),
             portfolio.account.cash,
             getattr(portfolio.account, "base_currency", "KRW"),
         )
@@ -1803,10 +1834,13 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
           base = usd_cash + usd_position_value
           implied = (broker_equiv - krw_cash) / base if (broker_equiv > krw_cash and base > 0) else 0.0
           usd_krw_rate = implied if 900.0 <= implied <= 2000.0 else default_usd_krw
-        # Foreign cash in KRW = actual foreign cash * sane FX. Do NOT derive it as
-        # (cash_equivalent - krw_cash): that conflates foreign STOCK value into cash.
-        foreign_cash_krw = usd_cash * usd_krw_rate
-        cash_equivalent_krw = krw_cash + foreign_cash_krw
+        # Foreign cash in KRW = broker/orderable foreign-currency cash * sane FX.
+        # Do NOT derive it as (cash_equivalent - krw_cash): that turns settlement
+        # residuals and account-total adjustments into fake foreign cash.
+        account_foreign_cash_krw = _number_or_zero(getattr(portfolio.account, "foreign_cash_krw", None))
+        foreign_cash_krw = account_foreign_cash_krw if account_foreign_cash_krw > 0 else usd_cash * usd_krw_rate
+        broker_cash_equivalent_krw = _number_or_zero(getattr(portfolio.account, "cash_equivalent_krw", None))
+        cash_equivalent_krw = broker_cash_equivalent_krw if broker_cash_equivalent_krw > 0 else krw_cash + foreign_cash_krw
         invested_value_krw = 0.0
         for position in result["positions"]:
           currency = str(position.get("currency") or "KRW").upper()
@@ -1821,13 +1855,16 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         # Total equity from the CORRECTED parts (sane FX): KRW cash + foreign cash +
         # stock value. Do not trust a broker-provided total that can embed a bad FX
         # rate (which inflated both 외화 예수금 and the domestic-vs-total composition).
-        actual_equity = cash_equivalent_krw + invested_value_krw
+        broker_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
+        corrected_parts_equity = krw_cash + foreign_cash_krw + invested_value_krw
+        actual_equity = broker_equity if broker_equity > corrected_parts_equity else corrected_parts_equity
         result["cash"] = krw_cash
         result["cash_equivalent_krw"] = cash_equivalent_krw
         result["actual_deposit"] = krw_cash
         result["krw_cash"] = cash_by_currency.get("KRW", portfolio.account.cash)
         result["foreign_cash_krw"] = foreign_cash_krw
         result["cash_by_currency"] = cash_by_currency
+        result["orderable_cash_by_currency"] = orderable_cash_by_currency
         result["foreign_cash_by_currency"] = _foreign_cash_by_currency(cash_by_currency)
         result["base_currency"] = getattr(portfolio.account, "base_currency", "KRW")
         result["invested_value"] = invested_value_krw
@@ -4491,6 +4528,8 @@ def _is_live_market_extended_open(group: str, now_utc: Any | None = None) -> boo
   group = str(group or "").upper()
   if group == "US":
     eastern = current.astimezone(ZoneInfo("America/New_York"))
+    if _is_us_market_holiday(eastern.date()):
+      return False
     if eastern.weekday() < 5 and _time(4, 0) <= eastern.time() <= _time(20, 0):
       return True
     seoul = current.astimezone(ZoneInfo("Asia/Seoul"))
@@ -4504,6 +4543,46 @@ def _is_live_market_extended_open(group: str, now_utc: Any | None = None) -> boo
     return _time(8, 30) <= current_time <= _time(18, 0)
 
   return False
+
+
+def _is_us_market_holiday(day: Any) -> bool:
+  try:
+    key = day.isoformat()
+  except Exception:
+    key = str(day)
+  # NYSE/Nasdaq full market holidays relevant to the local live-trading calendar.
+  # Keep this explicit and conservative: a missing date may allow evaluation, but
+  # a listed date prevents stale holiday quotes from being treated as tradable.
+  return key in {
+      "2026-01-01",
+      "2026-01-19",
+      "2026-02-16",
+      "2026-04-03",
+      "2026-05-25",
+      "2026-06-19",
+      "2026-07-03",
+      "2026-09-07",
+      "2026-11-26",
+      "2026-12-25",
+      "2027-01-01",
+      "2027-01-18",
+      "2027-02-15",
+      "2027-03-26",
+      "2027-05-31",
+      "2027-06-18",
+      "2027-07-05",
+      "2027-09-06",
+      "2027-11-25",
+      "2027-12-24",
+      "2028-01-17",
+      "2028-02-21",
+      "2028-04-14",
+      "2028-05-29",
+      "2028-07-04",
+      "2028-09-04",
+      "2028-11-23",
+      "2028-12-25",
+  }
 
 
 def _active_live_market_groups(now_utc: Any | None = None) -> tuple[str, ...]:

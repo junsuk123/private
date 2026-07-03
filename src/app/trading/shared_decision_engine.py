@@ -90,6 +90,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _account_domestic_unrealized_rate(account: AccountSnapshot) -> float:
     cost = 0.0
     pnl = 0.0
@@ -803,6 +810,37 @@ class SharedLiveDecisionEngine:
         # Catastrophic capital circuit-breaker only (NOT a routine stop). Holds normal
         # dips; cuts a position solely to prevent ruin. Set 0 to hold with no stop at all.
         hard_stop_loss = max(0.0, _env_float("REALTIME_HARD_STOP_LOSS", 0.08))
+        small_account_mode = _env_bool("REALTIME_SMALL_ACCOUNT_MODE", False)
+        small_account_equity = max(0.0, _env_float("REALTIME_SMALL_ACCOUNT_EQUITY_KRW", 300000.0))
+        small_account_active = small_account_mode and account_total <= small_account_equity
+        quantity = int(getattr(holding, "quantity", 0) or 0)
+        hard_stop_triggered = hard_stop_loss > 0.0 and pnl_rate <= -hard_stop_loss
+        if (
+            small_account_active
+            and _env_bool("REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE", True)
+            and quantity <= 1
+            and pnl_rate < 0.0
+            and not hard_stop_triggered
+        ):
+            diagnostics = {
+                "exit_policy": exit_policy.as_dict(),
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_age_seconds": round(quote_age_seconds, 3),
+                "ontology_score": round(ontology_score, 4),
+                "pnl_rate": round(pnl_rate, 6),
+                "position_weight": round(position_weight, 6),
+                "quantity": quantity,
+                "small_account_equity_krw": small_account_equity,
+                "hard_stop_loss": hard_stop_loss,
+            }
+            reasons = (
+                "SMALL_ACCOUNT_ONE_SHARE_LOSS_BLOCK",
+                "SELL_BELOW_BREAK_EVEN_BLOCKED",
+                "HOLD_BELOW_PROFIT_TARGET",
+            )
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(symbol, False, None, None, reasons, diagnostics)
         held_age_seconds: float | None = None
         opened_at = getattr(holding, "opened_at", None)
         if opened_at is not None:
@@ -909,6 +947,29 @@ class SharedLiveDecisionEngine:
                 "HOLD_RECHECK",
                 "HOLD_BELOW_PROFIT_TARGET",
                 f"QUOTE_REFRESH:{'quote_refresh_ok' if quote_age_seconds <= exit_policy.time_exit_seconds else 'quote_refresh_not_needed'}",
+            )
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
+
+        hard_emergency_exit = exit_reason.startswith(("hard_stop_loss", "domestic_emergency_exit"))
+        if _env_bool("REALTIME_BLOCK_SELL_BELOW_BREAKEVEN", False) and not hard_emergency_exit and not profitable_after_cost:
+            diagnostics = {
+                "exit_policy": exit_policy.as_dict(),
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_age_seconds": round(quote_age_seconds, 3),
+                "ontology_score": round(ontology_score, 4),
+                "pnl_rate": round(pnl_rate, 6),
+                "net_pnl_rate": round(net_pnl_rate, 6),
+                "required_exit_price": round(required_exit_price, 6),
+                "current_price": round(price, 6),
+                "attempted_exit_reason": exit_reason,
+                "hard_emergency": False,
+            }
+            reasons = (
+                "SELL_BELOW_BREAK_EVEN_BLOCKED",
+                "HOLD_BELOW_PROFIT_TARGET",
+                f"ATTEMPTED_EXIT:{exit_reason.split(':', 1)[0]}",
             )
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)

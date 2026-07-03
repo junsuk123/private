@@ -448,14 +448,18 @@ class KisDevelopersApiClient:
         cash = 0.0
         domestic_total_assets_krw = 0.0
         cash_by_currency: dict[str, float] = {"KRW": 0.0}
+        orderable_cash_by_currency: dict[str, float] = {"KRW": 0.0}
         try:
-            response = self._get(
-                "/uapi/domestic-stock/v1/trading/inquire-balance",
-                tr_id=self.endpoints.balance_tr_id,
-                params=self._balance_params(),
+            responses = self._get_domestic_balance_pages()
+            response = responses[0] if responses else {}
+            rows: list[dict[str, Any]] = []
+            for page in responses:
+                rows.extend(row for row in (page.get("output1") or ()) if isinstance(row, dict))
+            holdings = tuple(
+                holding
+                for row in rows
+                if (holding := self._holding_from_balance(row)) is not None
             )
-            self._ensure_success(response, "KIS portfolio lookup failed")
-            holdings = tuple(self._holding_from_balance(row) for row in response.get("output1") or ())
             summary = response.get("output2") or response.get("output3") or []
             summary_row = summary[0] if isinstance(summary, list) and summary else summary
             cash = _domestic_cash_from_balance_summary(summary_row, holdings)
@@ -463,9 +467,9 @@ class KisDevelopersApiClient:
                 orderable_cash = self._get_domestic_orderable_cash()
             except KisApiError:
                 orderable_cash = 0.0
-            if orderable_cash > 0:
-                cash = orderable_cash
             cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
+            orderable_cash_by_currency = dict(cash_by_currency)
+            orderable_cash_by_currency["KRW"] = orderable_cash if orderable_cash > 0 else cash
             domestic_total_assets_krw = _domestic_total_assets_from_balance_summary(summary_row)
         except KisApiError as exc:
             domestic_error = exc
@@ -486,6 +490,13 @@ class KisDevelopersApiClient:
             foreign_orderable = {}
         foreign_cash_by_currency.update(
             {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
+        )
+        orderable_cash_by_currency.update(
+            {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
+        )
+        display_foreign_cash_krw = max(
+            foreign_cash_krw,
+            _foreign_cash_krw_from_currency_balances(foreign_cash_by_currency, foreign_fx_by_currency),
         )
         if domestic_error is not None and not foreign_cash_by_currency and foreign_cash_krw <= 0:
             raise domestic_error
@@ -520,8 +531,10 @@ class KisDevelopersApiClient:
             holdings=all_holdings,
             base_currency="KRW",
             cash_by_currency=cash_by_currency,
+            orderable_cash_by_currency=orderable_cash_by_currency,
             fx_rate_by_currency=foreign_fx_by_currency,
             cash_equivalent_krw=cash_equivalent_krw,
+            foreign_cash_krw=display_foreign_cash_krw,
             total_equity_krw=total_equity_krw,
         )
         return MockKisPortfolio(
@@ -529,6 +542,38 @@ class KisDevelopersApiClient:
             market_prices={holding.ticker: holding.last_price for holding in holdings},
             updated_at=datetime.now(timezone.utc),
         )
+
+    def _get_domestic_balance_pages(self) -> list[dict[str, Any]]:
+        pages: list[dict[str, Any]] = []
+        params = self._balance_params()
+        tr_cont: str | None = None
+        seen_contexts: set[tuple[str, str]] = set()
+        for _ in range(10):
+            headers = self._headers(self.endpoints.balance_tr_id)
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+            response = self.transport.request(
+                "GET",
+                self._url("/uapi/domestic-stock/v1/trading/inquire-balance"),
+                headers=headers,
+                params=params,
+                timeout=self.timeout,
+            )
+            self._ensure_success(response, "KIS portfolio lookup failed")
+            pages.append(response)
+            next_fk = str(response.get("ctx_area_fk100") or "").strip()
+            next_nk = str(response.get("ctx_area_nk100") or "").strip()
+            if not next_fk or not next_nk:
+                break
+            context = (next_fk, next_nk)
+            if context in seen_contexts:
+                break
+            seen_contexts.add(context)
+            params = self._balance_params()
+            params["CTX_AREA_FK100"] = next_fk
+            params["CTX_AREA_NK100"] = next_nk
+            tr_cont = "N"
+        return pages
 
     def get_market_snapshot(
         self,
@@ -1071,7 +1116,11 @@ class KisDevelopersApiClient:
             response_rates = _foreign_fx_by_currency_from_overseas_response(response, nation_code)
             balances.update(response_balances)
             fx_rates.update(response_rates)
-            foreign_cash_krw = max(foreign_cash_krw, _foreign_cash_krw_from_overseas_response(response))
+            foreign_cash_krw = max(
+                foreign_cash_krw,
+                _foreign_cash_krw_from_overseas_response(response),
+                _foreign_cash_summary_krw_from_overseas_response(response),
+            )
             has_foreign_balance_context = bool(response_balances or response_rates or response.get("output1") or response.get("output2"))
             if has_foreign_balance_context:
                 total_assets_krw = max(total_assets_krw, _total_assets_krw_from_overseas_response(response))
@@ -1159,13 +1208,17 @@ class KisDevelopersApiClient:
             executed_at=datetime.now(timezone.utc),
         )
 
-    def _holding_from_balance(self, row: dict[str, Any]) -> Holding:
+    def _holding_from_balance(self, row: dict[str, Any]) -> Holding | None:
+        ticker = str(row.get("pdno") or "").strip()
         quantity = int(_to_float(row.get("hldg_qty") or row.get("ord_psbl_qty") or 0))
+        if not ticker or quantity <= 0:
+            return None
+        sellable_quantity = int(_to_float(row.get("ord_psbl_qty") or quantity))
         average_price = _to_float(row.get("pchs_avg_pric") or 0)
         last_price = _to_float(row.get("prpr") or row.get("bfdy_cprs_icdc") or average_price)
         opened_at = self._holding_opened_at_from_balance(row)
         return Holding(
-            ticker=str(row.get("pdno") or ""),
+            ticker=ticker,
             market="KR",
             company_name=str(row.get("prdt_name") or row.get("pdno") or ""),
             sector="Unknown",
@@ -1173,6 +1226,7 @@ class KisDevelopersApiClient:
             average_price=average_price,
             last_price=last_price,
             opened_at=opened_at,
+            sellable_quantity=max(0, min(quantity, sellable_quantity)),
         )
 
     def _overseas_holding_from_balance(self, row: dict[str, Any]) -> Holding | None:
@@ -1506,6 +1560,30 @@ def _foreign_cash_krw_from_overseas_response(response: dict[str, Any]) -> float:
         if amount is not None and rate > 0:
             best = max(best, amount * rate)
     return best
+
+
+def _foreign_cash_summary_krw_from_overseas_response(response: dict[str, Any]) -> float:
+    best = 0.0
+    for row in _response_rows(response):
+        for key in ("tot_frcr_cblc_smtl", "frcr_use_psbl_amt", "frcr_evlu_tota", "frcr_evlu_amt2"):
+            if key in row:
+                best = max(best, _to_float(row.get(key)))
+    return best
+
+
+def _foreign_cash_krw_from_currency_balances(
+    cash_by_currency: dict[str, float],
+    fx_by_currency: dict[str, float],
+) -> float:
+    total = 0.0
+    for currency, amount in cash_by_currency.items():
+        code = str(currency or "").upper()
+        if code == "KRW":
+            continue
+        rate = _to_float(fx_by_currency.get(code))
+        if amount > 0 and rate > 0:
+            total += amount * rate
+    return total
 
 
 def _overseas_holdings_value_krw(

@@ -33,6 +33,9 @@ def market_currency(market: MarketSnapshot) -> str:
 
 def cash_available_for_market(account: AccountSnapshot, market: MarketSnapshot) -> float:
     currency = market_currency(market)
+    orderable_by_currency = getattr(account, "orderable_cash_by_currency", None) or {}
+    if currency in orderable_by_currency:
+        return float(orderable_by_currency.get(currency) or 0.0)
     cash_by_currency = account.cash_by_currency or {}
     if currency != "KRW":
         if currency in cash_by_currency:
