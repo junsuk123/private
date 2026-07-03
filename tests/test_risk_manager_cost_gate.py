@@ -177,6 +177,19 @@ class TestRiskManagerCostGate(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIn("SLIPPAGE_RISK_HIGH", result.rejection_reasons)
 
+    def test_empty_orderbook_is_treated_as_untradable_spread(self) -> None:
+        # An empty/invalid order book (no real bid/ask, e.g. an illiquid warrant)
+        # must NOT be treated as zero-spread — it should be rejected as too wide.
+        exit_price = self.market.last_price * 1.05
+        intent = _create_mock_intent(
+            expected_exit_price=exit_price,
+            target_net_return=0.01,
+            strategy_metadata={"orderbook_snapshot": {"best_bid": 0.0, "best_ask": 0.0}},
+        )
+        result = RiskManager(rules=RiskRules(live_trading_enabled=False)).validate(intent, self.account, self.market)
+        self.assertFalse(result.approved)
+        self.assertIn("SPREAD_TOO_WIDE", result.rejection_reasons)
+
     def test_ontology_trade_forbidden_rejected(self) -> None:
         exit_price = self.market.last_price * 1.05
         intent = _create_mock_intent(expected_exit_price=exit_price, ontology_tags=("TradeForbidden",))

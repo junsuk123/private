@@ -723,15 +723,21 @@ class SharedLiveDecisionEngine:
         # instead of holding a winner until an ever-rising bar is met.
         round_trip_cost_rate = float(getattr(cost_floor, "total_cost_rate", 0.0) or 0.0)
         net_pnl_rate = pnl_rate - round_trip_cost_rate
-        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.004))
-        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.006))
+        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.012))
+        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.012))
         lock_giveback = min(0.95, max(0.0, _env_float("REALTIME_PROFIT_LOCK_GIVEBACK", 0.35)))
         profit_time_exit_sec = max(0.0, _env_float("REALTIME_PROFIT_TIME_EXIT_SEC", 300.0))
+        # Primary tight stop (always on), paired with a larger take-profit target so
+        # losses are cut small and early instead of being held until the -5% backstop.
+        # The default cuts around net -0.4% while quick take-profit waits for about
+        # net +1.2%, correcting the previous small-win / larger-loss skew.
+        # Net-based: it bounds the total realized loss if sold now. Set 0 to disable.
+        stop_loss_net = max(0.0, _env_float("REALTIME_STOP_LOSS_NET", 0.004))
         # Every profit-motivated exit must lock a MEANINGFUL net gain (after the full
         # round-trip cost), never churn a ~break-even position. This is the key guard
         # against fee/slippage bleed: without it, the cost-aware target is ~break-even
         # gross, so routine profit exits realize ~0 net and erode total assets.
-        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.003))
+        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.008))
         # Always-on capital circuit-breaker: cap how far a single position may bleed,
         # INDEPENDENT of REALTIME_ALLOW_LOSS_EXIT. Routine small dips are still held
         # (per the no-loss-exit design), but a catastrophic loser is cut so unbounded
@@ -782,6 +788,11 @@ class SharedLiveDecisionEngine:
             # Routine profit target reached AND it clears a meaningful net gain.
             # The net floor prevents selling at ~break-even (fee/slippage churn).
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
+        elif stop_loss_net > 0.0 and net_pnl_rate <= -stop_loss_net:
+            # Primary tight stop — fires regardless of REALTIME_ALLOW_LOSS_EXIT.
+            # Keeps each loss small and symmetric with the small take-profit so the
+            # strategy is not structurally negative-expectancy (small wins, huge losses).
+            exit_reason = f"stop_loss:{net_pnl_rate * 100:.2f}%"
         elif hard_stop_loss > 0.0 and pnl_rate <= -hard_stop_loss:
             # Capital circuit-breaker — fires regardless of REALTIME_ALLOW_LOSS_EXIT.
             # Cutting a catastrophic loser protects total assets from unbounded

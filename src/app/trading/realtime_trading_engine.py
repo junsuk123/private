@@ -12,12 +12,14 @@ LiveExecutionCoordinator를 통해 주문을 제출한다.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time as day_time, timezone
+from pathlib import Path
 from typing import Any, Callable, Deque
 from zoneinfo import ZoneInfo
 
@@ -53,6 +55,18 @@ def _is_krx_core_buy_session(now_utc: datetime | None = None) -> bool:
     return local.weekday() < 5 and day_time(9, 0) <= local.time() <= day_time(15, 20)
 
 
+def _is_no_available_sell_quantity_error(exc: Exception) -> bool:
+    raw = str(exc)
+    message = raw.lower()
+    return (
+        "매매가능한 수량이 없습니다" in raw
+        or "매매가능 수량" in raw
+        or "no quantity" in message
+        or "available quantity" in message
+        or "apbk0988" in message
+    )
+
+
 @dataclass
 class RealtimeTradingConfig:
     interval_ms: int = field(default_factory=lambda: max(100, _env_int("REALTIME_TRADING_INTERVAL_MS", 1000)))
@@ -71,6 +85,15 @@ class RealtimeTradingConfig:
     # 매도 주문을 낸 종목은 그 주문이 처리될 때까지 재매도 금지(가능수량 초과 APBK0988 방지).
     sell_inflight_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SELL_INFLIGHT_COOLDOWN_SEC", 600.0))
     sell_amend_min_price_delta: float = field(default_factory=lambda: _env_float("REALTIME_SELL_AMEND_MIN_PRICE_DELTA", 0.0005))
+    # 방금 매도한 종목을 곧바로 되사는 회전(churn)을 막는다 — 왕복 수수료·스프레드만
+    # 반복 지출하며 엣지 없이 자산을 깎는 것을 방지. 이 시간 내 같은 종목 신규매수 보류.
+    rebuy_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_REBUY_COOLDOWN_SEC", 3600.0))
+    # Recent losing round trips get a longer symbol-level buy cooldown. This is
+    # seeded from logs/live-orders.jsonl on startup and updated from accepted
+    # live orders during the current process.
+    loss_rebuy_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_LOSS_REBUY_COOLDOWN_SEC", 86400.0))
+    loss_rebuy_return_threshold: float = field(default_factory=lambda: _env_float("REALTIME_LOSS_REBUY_RETURN_THRESHOLD", -0.004))
+    order_log_path: str = field(default_factory=lambda: os.getenv("REALTIME_ORDER_LOG_PATH", "logs/live-orders.jsonl"))
 
 
 class RealtimeTradingEngine:
@@ -102,6 +125,10 @@ class RealtimeTradingEngine:
         self._last_submit_monotonic: dict[str, float] = {}
         self._error_backoff_until: dict[str, float] = {}
         self._open_sell_orders: dict[str, dict[str, Any]] = {}
+        # 최근 매도 시각(monotonic) — 재매수 쿨다운(churn 억제)에 사용.
+        self._recent_sell_monotonic: dict[str, float] = {}
+        self._recent_buy_orders: dict[str, Deque[tuple[float, float]]] = {}
+        self._loss_cooldown_until: dict[str, float] = {}
         self._recent: Deque[dict[str, Any]] = deque(maxlen=recent_events_max)
         self._buy_enabled = os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         self._buy_disabled_reason: str | None = None
@@ -118,6 +145,7 @@ class RealtimeTradingEngine:
             "last_reason": None,
             "last_summary": None,
         }
+        self._seed_loss_cooldowns_from_order_log()
 
     # ---- status ---------------------------------------------------------
     def disable_buys(self, reason: str = "BUY_DISABLED") -> None:
@@ -147,6 +175,9 @@ class RealtimeTradingEngine:
             }
             status["buy_enabled"] = self._buy_enabled
             status["buy_disabled_reason"] = self._buy_disabled_reason
+            status["loss_cooldown_symbols"] = sorted(
+                symbol for symbol, until in self._loss_cooldown_until.items() if until > time.monotonic()
+            )
             return status
 
     def _record(self, event: dict[str, Any]) -> None:
@@ -191,6 +222,16 @@ class RealtimeTradingEngine:
         buy_submitted = 0
         buy_submit_attempted = 0
         buy_enabled = self._buy_enabled and os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
+        account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
+        daily_loss_stop_krw = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0))
+        daily_loss_stop_rate = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0))
+        daily_loss_threshold = max(daily_loss_stop_krw, account_equity * daily_loss_stop_rate)
+        if buy_enabled and daily_loss_threshold > 0.0 and realized_pnl_today <= -daily_loss_threshold:
+            buy_enabled = False
+            self._buy_disabled_reason = (
+                f"DAILY_REALIZED_LOSS_BUY_STOP:{realized_pnl_today:.0f}<={-daily_loss_threshold:.0f}"
+            )
 
         # 최신 온톨로지 추론 그래프(분석 컨텍스트)를 1회 조회해 매도 판단에 반영한다.
         ontology_graph = None
@@ -226,6 +267,8 @@ class RealtimeTradingEngine:
                 self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
             if result.approved and result.final_order is not None:
+                # Record the sell so we don't immediately re-buy the same name (churn).
+                self._recent_sell_monotonic[holding.ticker] = time.monotonic()
                 if has_open_sell:
                     if self._amend_open_sell(result.final_order, result.reason_codes, decision_time, summary):
                         sell_submitted += 1
@@ -254,6 +297,16 @@ class RealtimeTradingEngine:
                 break
             if symbol in held_tickers:
                 continue  # 보유 종목은 매도 감시 대상이므로 신규 매수에서 제외.
+            loss_until = self._loss_cooldown_until.get(symbol)
+            if loss_until is not None and time.monotonic() < loss_until:
+                summary["skipped_cooldown"] += 1
+                self._append_rejection(summary, symbol, "BUY", ("RECENT_LOSS_SYMBOL_COOLDOWN",))
+                continue
+            if self.config.rebuy_cooldown_sec > 0:
+                last_sell = self._recent_sell_monotonic.get(symbol)
+                if last_sell is not None and (time.monotonic() - last_sell) < self.config.rebuy_cooldown_sec:
+                    summary["skipped_cooldown"] += 1
+                    continue  # 방금 판 종목 재매수 보류(churn 억제).
             if (
                 _is_domestic_symbol_or_market(symbol)
                 and os.getenv("REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -380,8 +433,95 @@ class RealtimeTradingEngine:
                 "order": order,
                 "updated_at": decision_time.isoformat(),
             }
+        self._record_submitted_order_for_performance(order, side)
         self._record(event)
         return True
+
+    def _record_submitted_order_for_performance(self, order: FinalOrder, side: str) -> None:
+        price = float(getattr(order, "limit_price", 0.0) or 0.0)
+        quantity = float(getattr(order, "quantity", 0.0) or 0.0)
+        if price <= 0.0 or quantity <= 0.0:
+            return
+        now = time.monotonic()
+        if side == "BUY":
+            queue = self._recent_buy_orders.setdefault(order.ticker, deque(maxlen=20))
+            queue.append((price, quantity))
+            return
+        if side != "SELL":
+            return
+        queue = self._recent_buy_orders.get(order.ticker)
+        if not queue:
+            return
+        buy_price, _buy_quantity = queue.popleft()
+        if buy_price <= 0.0:
+            return
+        gross_return = price / buy_price - 1.0
+        if gross_return <= self.config.loss_rebuy_return_threshold and self.config.loss_rebuy_cooldown_sec > 0.0:
+            self._loss_cooldown_until[order.ticker] = now + self.config.loss_rebuy_cooldown_sec
+            self._record(
+                {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "symbol": order.ticker,
+                    "kind": "CONTROL",
+                    "outcome": "loss_symbol_cooldown",
+                    "detail": f"gross_return={gross_return:.4f}",
+                }
+            )
+
+    def _seed_loss_cooldowns_from_order_log(self) -> None:
+        if self.config.loss_rebuy_cooldown_sec <= 0.0:
+            return
+        path = Path(self.config.order_log_path)
+        if not path.exists():
+            return
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        buys: dict[str, list[tuple[datetime, float, float]]] = {}
+        latest_loss: dict[str, datetime] = {}
+        for line in lines[-5000:]:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("event_type") != "live_order_submitted":
+                continue
+            payload = record.get("payload") or {}
+            order = payload.get("order") or {}
+            symbol = str(order.get("ticker") or "")
+            side = str(order.get("side") or "").upper()
+            if not symbol or side not in {"BUY", "SELL"}:
+                continue
+            try:
+                recorded_at = datetime.fromisoformat(str(record.get("recorded_at")).replace("Z", "+00:00"))
+                price = float(order.get("limit_price") or 0.0)
+                quantity = float(order.get("quantity") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0.0 or quantity <= 0.0:
+                continue
+            if side == "BUY":
+                buys.setdefault(symbol, []).append((recorded_at, price, quantity))
+                continue
+            queue = buys.get(symbol)
+            if not queue:
+                continue
+            buy_time, buy_price, _buy_quantity = queue.pop(0)
+            del buy_time
+            if buy_price <= 0.0:
+                continue
+            if price / buy_price - 1.0 <= self.config.loss_rebuy_return_threshold:
+                latest_loss[symbol] = recorded_at
+        now_wall = datetime.now(timezone.utc)
+        now_mono = time.monotonic()
+        for symbol, loss_time in latest_loss.items():
+            if loss_time.tzinfo is None:
+                loss_time = loss_time.replace(tzinfo=timezone.utc)
+            elapsed = max(0.0, (now_wall - loss_time.astimezone(timezone.utc)).total_seconds())
+            remaining = self.config.loss_rebuy_cooldown_sec - elapsed
+            if remaining > 0.0:
+                self._loss_cooldown_until[symbol] = now_mono + remaining
 
     def _amend_open_sell(
         self,
@@ -423,6 +563,12 @@ class RealtimeTradingEngine:
             self._record(event)
             return False
         except Exception as exc:  # noqa: BLE001 - cancel and reorder if KIS refuses revision.
+            if _is_no_available_sell_quantity_error(exc):
+                self._open_sell_orders.pop(order.ticker, None)
+                event["outcome"] = "open_sell_dropped"
+                event["detail"] = f"amend_not_available={exc.__class__.__name__}: {exc}"
+                self._record(event)
+                return False
             if "정정취소 가능수량" in str(exc) or "no quantity" in str(exc).lower():
                 self._open_sell_orders.pop(order.ticker, None)
                 event["outcome"] = "open_sell_dropped"

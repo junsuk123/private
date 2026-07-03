@@ -236,12 +236,16 @@ class TradingCostEngine:
     @staticmethod
     def _spread_rate_from_orderbook(orderbook_snapshot: dict[str, Any] | None) -> float | None:
         if not orderbook_snapshot:
-            return None
+            return None  # no orderbook info at all -> unknown; caller keeps default
         bid = _to_float(orderbook_snapshot.get("bid_price") or orderbook_snapshot.get("best_bid"))
         ask = _to_float(orderbook_snapshot.get("ask_price") or orderbook_snapshot.get("best_ask"))
-        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
-        if mid <= 0 or ask < bid:
-            return None
+        if bid <= 0 or ask <= 0 or ask < bid:
+            # A snapshot was provided but the book is empty/invalid (no real bid/ask,
+            # e.g. an illiquid warrant). This is the WORST case for a buy, so report a
+            # very large spread instead of silently treating it as zero-spread — the
+            # previous behaviour let exactly these untradable names pass the spread gate.
+            return 1.0
+        mid = (bid + ask) / 2
         return (ask - bid) / mid
 
     @staticmethod

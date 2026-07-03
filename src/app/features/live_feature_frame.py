@@ -51,22 +51,41 @@ class LiveFeatureFrameBuilder:
         schema: FeatureSchema = LIVE_SHORT_HORIZON_SCHEMA,
         max_quote_age_ms: int = int(os.getenv("LIVE_FEATURE_MAX_QUOTE_AGE_MS", "15000")),
         max_orderbook_age_ms: int = int(os.getenv("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS", "15000")),
+        # US quotes/orderbooks are REST-polled once per live-trading refresh cycle
+        # (tens of seconds apart), not streamed sub-second like the KRX websocket.
+        # A single 15s gate marks a healthy US REST feed permanently stale and starves
+        # US buys. Give US a cadence-aligned freshness window; KR keeps the tight gate.
+        # This only aligns the freshness gate with the feed cadence — it does NOT relax
+        # any spread/cost/liquidity/instrument risk gate.
+        max_quote_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_QUOTE_AGE_MS_US", "90000")),
+        max_orderbook_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS_US", "90000")),
         journal_path: str | Path = "logs/live-feature-frames.jsonl",
     ) -> None:
         self.store = store
         self.schema = schema
         self.max_quote_age_ms = max_quote_age_ms
         self.max_orderbook_age_ms = max_orderbook_age_ms
+        self.max_quote_age_ms_us = max_quote_age_ms_us
+        self.max_orderbook_age_ms_us = max_orderbook_age_ms_us
         self.journal_path = Path(journal_path)
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _is_us_symbol(symbol: str) -> bool:
+        # KRX realtime uses 6-digit numeric codes; US symbols are alphabetic.
+        s = str(symbol or "").strip().upper()
+        return not (s.isdigit() and len(s) == 6)
+
     def build(self, symbol: str, *, decision_time: datetime | None = None) -> LiveFeatureFrame:
         decision_time = decision_time or datetime.now(timezone.utc)
+        is_us = self._is_us_symbol(symbol)
+        quote_age_ms = self.max_quote_age_ms_us if is_us else self.max_quote_age_ms
+        orderbook_age_ms = self.max_orderbook_age_ms_us if is_us else self.max_orderbook_age_ms
         health = evaluate_market_data_health(
             self.store,
             symbol,
-            max_quote_age_ms=self.max_quote_age_ms,
-            max_orderbook_age_ms=self.max_orderbook_age_ms,
+            max_quote_age_ms=quote_age_ms,
+            max_orderbook_age_ms=orderbook_age_ms,
             now=decision_time,
         )
         if not health.ok_for_live_buy:

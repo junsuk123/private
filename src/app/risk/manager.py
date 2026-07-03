@@ -82,6 +82,15 @@ class RiskManager:
             or bool(intent.validation_id)
         )
         checks["ontology_trade_not_forbidden"] = "TradeForbidden" not in set(intent.ontology_tags)
+        # Block BUYs of warrants / units / rights (non-common equity). These are
+        # typically illiquid SPAC/IPO instruments that cannot be reliably exited
+        # (e.g. a warrant whose order book is empty), so buying them traps capital.
+        # SELL/REDUCE of an already-held position is never blocked here.
+        checks["tradable_instrument_type"] = (
+            self.rules.warrant_unit_buys_allowed
+            or intent.action != OrderAction.BUY
+            or not _is_non_common_equity_ticker(intent.ticker)
+        )
         source = market.source
         source_type = source.source_type or infer_source_type(source.source_name, source.raw_url)
         if source_type == "unknown":
@@ -519,7 +528,34 @@ def _reason_for_failed_check(check: str) -> str:
         "strategy_family_present": "MISSING_STRATEGY_FAMILY",
         "live_validation_id_present": "MISSING_VALIDATION_ID",
         "ontology_trade_not_forbidden": "ONTOLOGY_TRADE_FORBIDDEN",
+        "tradable_instrument_type": "NON_COMMON_INSTRUMENT_BUY_BLOCKED",
     }.get(check, check)
+
+
+def _is_non_common_equity_ticker(ticker: str) -> bool:
+    """Heuristic: does the ticker denote a warrant / unit / right (non-common equity)?
+
+    Targets US/overseas SPAC-style securities that are typically illiquid and hard
+    to exit (e.g. Locafy warrant ``LCFYW``, a unit ``LAFAU``). Uses the NASDAQ
+    5th-letter convention (5 alphabetic chars ending in W=warrant, U=unit, R=right)
+    plus explicit suffix forms (``.WS``, ``-WT``, ``-UN``, ``.RT`` …). Korean numeric
+    codes and ordinary <=4-letter tickers are not affected.
+    """
+    symbol = str(ticker or "").upper().strip()
+    if not symbol:
+        return False
+    suffix_markers = (
+        ".WS", "-WT", ".WT", "/WS", "-WS", "+",       # warrants
+        ".U", "-UN", ".UN", "-U", "/U",               # units
+        ".RT", "-RT", ".RTS", "-RTS", "/R",           # rights
+    )
+    for marker in suffix_markers:
+        if symbol.endswith(marker):
+            return True
+    # NASDAQ 5th-letter suffix convention (only for clean 5-letter alpha symbols).
+    if symbol.isalpha() and len(symbol) == 5 and symbol[-1] in {"W", "U", "R"}:
+        return True
+    return False
 
 
 def _add_rejection(

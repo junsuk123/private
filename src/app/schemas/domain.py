@@ -425,6 +425,11 @@ class RiskRules:
     derivatives_allowed: bool = False
     leverage_etf_allowed: bool = False
     credit_loan_allowed: bool = False
+    # Block BUYs of warrants / units / rights (non-common-equity instruments).
+    # These are typically illiquid SPAC/IPO securities (e.g. NASDAQ 5th-letter
+    # "W"/"U"/"R", or ".WS"/"-UN"/".RT" suffixes) that cannot be reliably exited.
+    # SELL/REDUCE of already-held positions is never blocked by this flag.
+    warrant_unit_buys_allowed: bool = False
     llm_direct_order_execution_allowed: bool = False
     max_intraday_position_weight: float = 0.025
     max_short_horizon_downside_risk: float = 0.012

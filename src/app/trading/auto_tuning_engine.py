@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -144,7 +145,15 @@ class AutoTuningEngine:
         buy_threshold += 0.06 if not model_ok and not fallback_allowed else 0.0
         buy_threshold = max(0.22, min(0.75, buy_threshold))
 
-        expected_net_return = max(0.0005, float(market_state.fallback_score) * 0.008)
+        min_buy_net_return = float(
+            os.getenv(
+                "REALTIME_MIN_BUY_NET_RETURN_KR"
+                if market.market.upper().startswith("K")
+                else "REALTIME_MIN_BUY_NET_RETURN_US",
+                "0.008" if market.market.upper().startswith("K") else "0.012",
+            )
+        )
+        expected_net_return = max(min_buy_net_return, float(market_state.fallback_score) * 0.008)
         if model_ok and prediction is not None:
             expected_net_return = max(expected_net_return, float(getattr(prediction, "expected_net_return_bps", 0.0) or 0.0) / 10_000.0)
 
