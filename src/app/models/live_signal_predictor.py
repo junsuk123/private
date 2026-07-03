@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 from app.config import LiveConfigError, load_live_trading_safety_config
@@ -24,6 +25,8 @@ class LiveSignalPredictor:
         self.registry = registry or ModelArtifactRegistry()
 
     def predict(self, frame: LiveFeatureFrame) -> LiveSignalPrediction:
+        if not live_signal_model_inference_enabled():
+            raise RuntimeError("LIVE_SIGNAL_MODEL_INFERENCE_DISABLED")
         artifact = self.registry.load_latest_live_eligible()
         if artifact.feature_schema_hash != frame.feature_schema_hash:
             raise RuntimeError("MODEL_FEATURE_SCHEMA_MISMATCH")
@@ -79,3 +82,12 @@ def _prediction_thresholds(artifact_thresholds: dict[str, float]) -> dict[str, f
         1.0 - max(0.0, min(1.0, safety.minimum_model_confidence)),
     )
     return thresholds
+
+
+def live_signal_model_inference_enabled() -> bool:
+    return os.getenv("LIVE_SIGNAL_MODEL_INFERENCE_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }

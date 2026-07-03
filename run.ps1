@@ -235,6 +235,7 @@ Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
 Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "60"
+Set-DefaultEnv "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED" "false"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"

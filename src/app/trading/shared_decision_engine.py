@@ -773,6 +773,16 @@ class SharedLiveDecisionEngine:
         # instead of holding a winner until an ever-rising bar is met.
         round_trip_cost_rate = float(getattr(cost_floor, "total_cost_rate", 0.0) or 0.0)
         net_pnl_rate = pnl_rate - round_trip_cost_rate
+        # Absolute AFTER-FEE profit in the position's own currency. Small 1-share KR
+        # positions rarely clear a % target but do clear a few tens of won — so the
+        # PRIMARY take-profit is an amount threshold (won for KR, USD for overseas),
+        # not a percentage. Realize whenever net profit >= that small amount.
+        notional = max(0.0, float(getattr(holding, "quantity", 0) or 0) * avg_cost)
+        net_profit_amount = net_pnl_rate * notional
+        if _is_domestic_symbol_or_market(symbol, holding.market or ""):
+            take_profit_amount = max(0.0, _env_float("REALTIME_TAKE_PROFIT_AMOUNT_KRW", 20.0))
+        else:
+            take_profit_amount = max(0.0, _env_float("REALTIME_TAKE_PROFIT_AMOUNT_USD", 0.05))
         # --- INVESTMENT MODE (profit realization, not stop-loss scalping) ------
         # Goal: realize profit and NEVER sell below the entry on noise. The exit only
         # sells at a MEANINGFUL net gain (quick target / trailing lock / stalled-but-
@@ -806,10 +816,19 @@ class SharedLiveDecisionEngine:
             peak_net_pnl = self._peak_net_pnl.get(symbol, 0.0)
         self._peak_net_pnl[symbol] = peak_net_pnl
 
+        # When the won-amount take-profit is enabled it GOVERNS routine profit exits:
+        # the percentage paths may not sell below the configured won floor (so raising
+        # the amount threshold genuinely holds sub-threshold winners). When it is
+        # disabled (0), the percentage paths behave as before.
+        amount_gate = take_profit_amount <= 0.0 or net_profit_amount >= take_profit_amount
+
         prediction: LiveSignalPrediction | None = None
         exit_reason: str | None = None
-        if quick_tp_net > 0.0 and net_pnl_rate >= quick_tp_net:
-            # Decisive absolute take-profit: a solid net winner is realized now.
+        if take_profit_amount > 0.0 and net_pnl_rate > 0.0 and net_profit_amount >= take_profit_amount:
+            # PRIMARY: absolute after-fee profit amount cleared -> realize now.
+            exit_reason = f"take_profit_amount:{net_profit_amount:.0f}"
+        elif quick_tp_net > 0.0 and net_pnl_rate >= quick_tp_net and amount_gate:
+            # Secondary: percentage take-profit (used when the won-amount rule is off).
             exit_reason = f"quick_take_profit:{net_pnl_rate * 100:.2f}%"
         elif (
             lock_arm_net > 0.0
@@ -825,6 +844,7 @@ class SharedLiveDecisionEngine:
             and held_age_seconds is not None
             and held_age_seconds >= profit_time_exit_sec
             and net_pnl_rate >= max(min_net_profit_exit, target_net_return)
+            and amount_gate
         ):
             # Turnover pressure: realize a MEANINGFULLY net-profitable position held
             # past the short window. Requires >= min_net_profit_exit so it never
@@ -834,9 +854,9 @@ class SharedLiveDecisionEngine:
             # Strong ontology sell signal on a net-profitable position — risk-driven,
             # allowed at any positive net.
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
-        elif profitable_after_cost and pnl_rate >= required_exit_return and net_pnl_rate >= min_net_profit_exit:
-            # Routine profit target reached AND it clears a meaningful net gain.
-            # The net floor prevents selling at ~break-even (fee/slippage churn).
+        elif profitable_after_cost and pnl_rate >= required_exit_return and net_pnl_rate >= min_net_profit_exit and amount_gate:
+            # Routine profit target reached AND it clears a meaningful net gain AND the
+            # won-amount floor (when enabled). Prevents selling at ~break-even.
             exit_reason = f"profit_exit:{pnl_rate * 100:.2f}%"
         elif stop_loss_net > 0.0 and net_pnl_rate <= -stop_loss_net:
             # Primary tight stop — fires regardless of REALTIME_ALLOW_LOSS_EXIT.

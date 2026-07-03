@@ -42,6 +42,7 @@ from app.models.live_training_pipeline import (
     live_training_status,
     train_live_short_horizon_from_collected_features,
 )
+from app.models.live_signal_predictor import live_signal_model_inference_enabled
 from app.pipeline import build_analysis_context
 from app.research import ResearchRunResult, ResearchService
 from app.realtime import OperationModeManager, RealtimeAccelerationPolicy, ShortHorizonRiskPolicy
@@ -1017,7 +1018,7 @@ def index() -> str:
 
 @app.get("/api/status")
 def status() -> JSONResponse:
-  live_basis = _last_live_account_basis()
+  live_basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
   if live_basis is not None:
     return _json(
       {
@@ -1271,6 +1272,13 @@ def ai_validation() -> JSONResponse:
 
 
 def _validate_live_signal_predictor() -> dict[str, Any]:
+    if not live_signal_model_inference_enabled():
+      return {
+          "ok": False,
+          "disabled": True,
+          "error": "LIVE_SIGNAL_MODEL_INFERENCE_DISABLED",
+          "uses_live_eligible_model": False,
+      }
     registry = ModelArtifactRegistry()
     try:
       artifact = registry.load_latest_live_eligible()
@@ -1353,6 +1361,7 @@ def _safe_live_training_status() -> dict[str, Any]:
     latest_saved_id = latest_saved.get("artifact_id") if isinstance(latest_saved, dict) else None
     latest_live_id = latest_live.get("artifact_id") if isinstance(latest_live, dict) else None
     latest_live_eligible = bool(status.get("latest_live_eligible_exists"))
+    inference_enabled = live_signal_model_inference_enabled()
     quality = _live_training_quality_summary(latest_saved, latest_live, status.get("training_rows"))
     return {
         **status,
@@ -1362,7 +1371,8 @@ def _safe_live_training_status() -> dict[str, Any]:
         "model_saved": bool(latest_saved_id or latest_live_eligible),
         "latest_model_artifact_id": latest_saved_id,
         "latest_live_eligible_model_artifact_id": latest_live_id,
-        "inference_uses_latest_live_eligible": latest_live_eligible,
+        "inference_enabled": inference_enabled,
+        "inference_uses_latest_live_eligible": inference_enabled and latest_live_eligible,
         "quality": quality,
     }
 
@@ -1416,6 +1426,7 @@ LIVE_FLAG_VALUES = {
     "KIS_LIVE_ENABLED": "true",
     "KIS_PAPER_TRADING": "false",
     "LIVE_ORDER_SUBMIT_ENABLED": "true",
+    "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED": "false",
     "REQUIRE_MANUAL_ARMING": "false",
     "KILL_SWITCH_ENABLED": "false",
 }
@@ -1491,18 +1502,21 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
       record("order_execution_config", True)
     except LiveConfigError as exc:
       record("order_execution_config", False, str(exc))
-    try:
-      artifact = ModelArtifactRegistry().load_latest_live_eligible()
-      model_ok = artifact.feature_schema_hash == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
-      record(
-          "live_eligible_model",
-          model_ok,
-          None
-          if model_ok
-          else f"FEATURE_SCHEMA_MISMATCH expected={LIVE_SHORT_HORIZON_SCHEMA.schema_hash} actual={artifact.feature_schema_hash}",
-      )
-    except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
-      record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
+    if live_signal_model_inference_enabled():
+      try:
+        artifact = ModelArtifactRegistry().load_latest_live_eligible()
+        model_ok = artifact.feature_schema_hash == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
+        record(
+            "live_eligible_model",
+            model_ok,
+            None
+            if model_ok
+            else f"FEATURE_SCHEMA_MISMATCH expected={LIVE_SHORT_HORIZON_SCHEMA.schema_hash} actual={artifact.feature_schema_hash}",
+        )
+      except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
+        record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
+    else:
+      record("live_signal_model_inference_disabled", True)
     secrets = validate_live_secret_file()
     record("kis_secret_file", _kis_secret_file_gate_ok(secrets), "missing KIS secret file or required keys")
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
@@ -2897,9 +2911,10 @@ def live_trading_progress() -> JSONResponse:
     cash = float(basis["cash"]) if basis is not None else 0.0
     initial = float(baseline_equity or equity or 0.0)
     return_rate = (equity - initial) / initial if initial > 0 else 0.0
+    realtime_engine_running = bool((realtime_summary or {}).get("engine_running"))
     return _json(
         {
-            "active": active_mode == "live_trading",
+            "active": active_mode == "live_trading" or realtime_engine_running,
             "mode": "live_trading",
             "account_checked": bool(connection.get("account_checked")),
             "connection": connection,

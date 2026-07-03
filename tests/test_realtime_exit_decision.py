@@ -123,7 +123,9 @@ class RealtimeExitDecisionTest(unittest.TestCase):
 
     def test_take_profit_triggers_sell(self) -> None:
         engine = _engine(price=101.6)  # +1.6% vs avg 100, above the net quick-take-profit floor
-        result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
+        # Disable the won-amount rule to exercise the percentage take-profit path.
+        with patch.dict("os.environ", {"REALTIME_TAKE_PROFIT_AMOUNT_KRW": "0"}):
+            result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.final_order.side, OrderSide.SELL)
 
@@ -842,7 +844,9 @@ class ProfitTurnoverExitTest(unittest.TestCase):
         # so the position is realized immediately regardless of the dynamic bar.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         holding = _holding(100.0, last_price=101.6)
-        result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0))
+        # Disable the won-amount rule to exercise the percentage take-profit path.
+        with patch.dict("os.environ", {"REALTIME_TAKE_PROFIT_AMOUNT_KRW": "0"}):
+            result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0))
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.final_order.side, OrderSide.SELL)
         self.assertTrue(any(code.startswith("quick_take_profit") for code in result.reason_codes), result.reason_codes)
@@ -885,6 +889,7 @@ class ProfitTurnoverExitTest(unittest.TestCase):
         with patch.dict("os.environ", {
             "REALTIME_QUICK_TAKE_PROFIT_NET": "0.05",   # disable quick TP so time-exit is exercised
             "REALTIME_PROFIT_TIME_EXIT_SEC": "300",
+            "REALTIME_TAKE_PROFIT_AMOUNT_KRW": "0",      # disable won-amount rule to isolate time-exit
         }):
             result = engine.evaluate_exit_for_holding(
                 holding, _account(holding, cash=1_000_000.0), take_profit=0.02, stop_loss=0.01, decision_time=now
@@ -953,6 +958,59 @@ class ProfitTurnoverExitTest(unittest.TestCase):
         self.assertTrue(second.approved, second.reason_codes)
         self.assertEqual(second.final_order.side, OrderSide.SELL)
         self.assertTrue(any(code.startswith("profit_lock") for code in second.reason_codes), second.reason_codes)
+
+
+class InvestmentModeRealHoldingsTest(unittest.TestCase):
+    """Regression on real reported holdings: winners are realized, losers are held.
+
+    Reproduces the dashboard snapshot where profitable positions were wrongly held
+    while losers were sold. Investment mode must sell winners and hold losers.
+    """
+
+    def _engine_no_tick(self) -> SharedLiveDecisionEngine:
+        return SharedLiveDecisionEngine(
+            SimpleNamespace(latest_tick=lambda s: None, latest_orderbook=lambda s: None),
+            predictor=_DummyPredictor(),
+        )
+
+    def test_winners_sell_losers_hold_on_real_holdings(self) -> None:
+        rows = [
+            ("342870", 3900, 3860, False),  # -1.03% -> HOLD
+            ("364950", 3670, 3635, False),  # -0.95% -> HOLD
+            ("388610", 4970, 5072, True),   # +2.05% -> SELL
+            ("460870", 2155, 2260, True),   # +4.87% -> SELL
+            ("475230", 7440, 7440, False),  # flat -> HOLD
+        ]
+        holdings = tuple(
+            Holding(ticker=t, market="KR", company_name=t, sector="", quantity=1, average_price=a, last_price=c)
+            for t, a, c, _ in rows
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=holdings, cash_by_currency={"KRW": 1_000_000.0})
+        engine = self._engine_no_tick()
+        for (t, a, c, should_sell), holding in zip(rows, holdings):
+            result = engine.evaluate_exit_for_holding(holding, account, take_profit=0.006, stop_loss=0.01)
+            self.assertEqual(
+                result.approved, should_sell,
+                msg=f"{t} ret={(c/a-1)*100:.2f}% expected {'SELL' if should_sell else 'HOLD'}, got {result.reason_codes}",
+            )
+            if should_sell:
+                self.assertEqual(result.final_order.side, OrderSide.SELL)
+                self.assertTrue(
+                    any(code.startswith(("take_profit_amount", "quick_take_profit")) for code in result.reason_codes),
+                    result.reason_codes,
+                )
+
+    def test_amount_based_take_profit_threshold(self) -> None:
+        # Sell when AFTER-FEE profit clears the won threshold; hold small gains below it.
+        engine = self._engine_no_tick()
+        acct = lambda h: AccountSnapshot(cash=1_000_000.0, holdings=(h,), cash_by_currency={"KRW": 1_000_000.0})
+        big = Holding(ticker="388610", market="KR", company_name="x", sector="", quantity=1, average_price=4970, last_price=5072)   # net ~88원
+        small = Holding(ticker="100000", market="KR", company_name="x", sector="", quantity=1, average_price=4000, last_price=4020)  # gross 20원 -> net<0
+        self.assertTrue(engine.evaluate_exit_for_holding(big, acct(big)).approved)     # 88 >= 40 -> SELL
+        self.assertFalse(engine.evaluate_exit_for_holding(small, acct(small)).approved)  # tiny -> HOLD
+        # Raising the threshold to 200원 makes the 88원 winner hold.
+        with patch.dict("os.environ", {"REALTIME_TAKE_PROFIT_AMOUNT_KRW": "200", "REALTIME_QUICK_TAKE_PROFIT_NET": "1"}):
+            self.assertFalse(engine.evaluate_exit_for_holding(big, acct(big)).approved)
 
 
 class RebuyCooldownTest(unittest.TestCase):
