@@ -446,6 +446,7 @@ class KisDevelopersApiClient:
         domestic_error: KisApiError | None = None
         holdings: tuple[Holding, ...] = ()
         cash = 0.0
+        domestic_total_assets_krw = 0.0
         cash_by_currency: dict[str, float] = {"KRW": 0.0}
         try:
             response = self._get(
@@ -465,6 +466,7 @@ class KisDevelopersApiClient:
             if orderable_cash > 0:
                 cash = orderable_cash
             cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
+            domestic_total_assets_krw = _domestic_total_assets_from_balance_summary(summary_row)
         except KisApiError as exc:
             domestic_error = exc
         overseas_holdings: tuple[Holding, ...] = ()
@@ -473,7 +475,7 @@ class KisDevelopersApiClient:
         except Exception:
             overseas_holdings = ()
         try:
-            foreign_cash_by_currency, foreign_cash_krw, total_assets_krw = self._get_overseas_cash_balance()
+            foreign_cash_by_currency, foreign_cash_krw, total_assets_krw, foreign_fx_by_currency = self._get_overseas_cash_balance()
         except KisApiError:
             if domestic_error is not None:
                 raise domestic_error
@@ -490,17 +492,37 @@ class KisDevelopersApiClient:
         cash_by_currency.update(foreign_cash_by_currency)
         all_holdings = holdings + overseas_holdings
         domestic_position_value = sum(max(0.0, holding.market_value) for holding in holdings)
-        raw_position_value = sum(max(0.0, holding.market_value) for holding in all_holdings)
+        overseas_position_value_krw = _overseas_holdings_value_krw(
+            overseas_holdings,
+            foreign_cash_by_currency,
+            foreign_cash_krw,
+            foreign_fx_by_currency,
+        )
         cash_equivalent_krw = cash + foreign_cash_krw
-        has_overseas_assets = bool(overseas_holdings) or foreign_cash_krw > 0
-        if has_overseas_assets and total_assets_krw >= cash + domestic_position_value:
-            cash_equivalent_krw = max(0.0, total_assets_krw - raw_position_value)
+        total_equity_krw = 0.0
+        if domestic_total_assets_krw > 0 and total_assets_krw >= domestic_total_assets_krw:
+            # KIS domestic balance total and overseas present-balance total overlap
+            # on KRW deposit. Combine both account views, then remove the duplicated
+            # KRW cash bucket. This matches the app's all-assets view better than
+            # treating overseas present-balance `tot_asst_amt` as the whole account.
+            total_equity_krw = domestic_total_assets_krw + total_assets_krw - cash
+            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
+        elif total_assets_krw >= cash + domestic_position_value:
+            total_equity_krw = total_assets_krw
+            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
+        elif domestic_total_assets_krw > 0:
+            total_equity_krw = domestic_total_assets_krw + foreign_cash_krw + overseas_position_value_krw
+            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
+        else:
+            total_equity_krw = cash_equivalent_krw + domestic_position_value + overseas_position_value_krw
         account = AccountSnapshot(
             cash=cash,
             holdings=all_holdings,
             base_currency="KRW",
             cash_by_currency=cash_by_currency,
+            fx_rate_by_currency=foreign_fx_by_currency,
             cash_equivalent_krw=cash_equivalent_krw,
+            total_equity_krw=total_equity_krw,
         )
         return MockKisPortfolio(
             account=account,
@@ -1028,8 +1050,9 @@ class KisDevelopersApiClient:
         )
         return holdings
 
-    def _get_overseas_cash_balance(self) -> tuple[dict[str, float], float, float]:
+    def _get_overseas_cash_balance(self) -> tuple[dict[str, float], float, float, dict[str, float]]:
         balances: dict[str, float] = {}
+        fx_rates: dict[str, float] = {}
         foreign_cash_krw = 0.0
         total_assets_krw = 0.0
         for nation_code in ("000", "840"):
@@ -1042,14 +1065,19 @@ class KisDevelopersApiClient:
                 self._ensure_success(response, "KIS overseas present balance lookup failed")
             except KisApiError:
                 if nation_code == "840":
-                    return balances, foreign_cash_krw, total_assets_krw
+                    return balances, foreign_cash_krw, total_assets_krw, fx_rates
                 continue
-            balances.update(_foreign_orderable_cash_by_currency_from_overseas_response(response, nation_code))
+            response_balances = _foreign_orderable_cash_by_currency_from_overseas_response(response, nation_code)
+            response_rates = _foreign_fx_by_currency_from_overseas_response(response, nation_code)
+            balances.update(response_balances)
+            fx_rates.update(response_rates)
             foreign_cash_krw = max(foreign_cash_krw, _foreign_cash_krw_from_overseas_response(response))
-            total_assets_krw = max(total_assets_krw, _total_assets_krw_from_overseas_response(response))
+            has_foreign_balance_context = bool(response_balances or response_rates or response.get("output1") or response.get("output2"))
+            if has_foreign_balance_context:
+                total_assets_krw = max(total_assets_krw, _total_assets_krw_from_overseas_response(response))
             if balances or foreign_cash_krw > 0 or total_assets_krw > 0:
                 break
-        return balances, foreign_cash_krw, total_assets_krw
+        return balances, foreign_cash_krw, total_assets_krw, fx_rates
 
     def _overseas_orderable_cash_params(self, currency: str = "USD", exchange_code: str = "NASD") -> dict[str, str]:
         default_item = os.getenv("KIS_OVERSEAS_ORDERABLE_ITEM_CD", "AAPL").strip().upper() or "AAPL"
@@ -1265,6 +1293,14 @@ def _domestic_cash_from_balance_summary(summary_row: dict[str, Any], holdings: t
     return 0.0
 
 
+def _domestic_total_assets_from_balance_summary(summary_row: dict[str, Any]) -> float:
+    for key in ("tot_evlu_amt", "nass_amt", "bfdy_tot_asst_evlu_amt"):
+        value = _to_float(summary_row.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
 def _broker_quote_source(ticker: str, scope: str, observed_at: datetime) -> SourceMetadata:
     return SourceMetadata(
         source_name="KIS broker quote",
@@ -1447,6 +1483,21 @@ def _foreign_orderable_cash_by_currency_from_overseas_response(
     return balances
 
 
+def _foreign_fx_by_currency_from_overseas_response(
+    response: dict[str, Any],
+    nation_code: str = "000",
+) -> dict[str, float]:
+    rates: dict[str, float] = {}
+    for row in _response_rows(response):
+        currency = _currency_from_row(row, nation_code)
+        if not currency or currency == "KRW":
+            continue
+        rate = _exchange_rate_from_row(row)
+        if rate > 0:
+            rates[currency] = max(rates.get(currency, 0.0), rate)
+    return rates
+
+
 def _foreign_cash_krw_from_overseas_response(response: dict[str, Any]) -> float:
     best = 0.0
     for row in _response_rows(response):
@@ -1455,6 +1506,29 @@ def _foreign_cash_krw_from_overseas_response(response: dict[str, Any]) -> float:
         if amount is not None and rate > 0:
             best = max(best, amount * rate)
     return best
+
+
+def _overseas_holdings_value_krw(
+    holdings: tuple[Holding, ...],
+    cash_by_currency: dict[str, float],
+    foreign_cash_krw: float,
+    fx_by_currency: dict[str, float],
+) -> float:
+    if not holdings:
+        return 0.0
+    usd_rate = fx_by_currency.get("USD", 0.0)
+    usd_cash = cash_by_currency.get("USD", 0.0)
+    if usd_rate <= 0 and usd_cash > 0 and foreign_cash_krw > 0:
+        usd_rate = foreign_cash_krw / usd_cash
+    total = 0.0
+    for holding in holdings:
+        market = str(getattr(holding, "market", "") or "").upper()
+        value = max(0.0, float(getattr(holding, "market_value", 0.0) or 0.0))
+        if market and market != "KR":
+            total += value * usd_rate if usd_rate > 0 else value
+        else:
+            total += value
+    return total
 
 
 def _total_assets_krw_from_overseas_response(response: dict[str, Any]) -> float:

@@ -465,6 +465,40 @@ class MockKisApiTest(unittest.TestCase):
         self.assertAlmostEqual(portfolio.account.holdings[0].last_price, 256.17)
         self.assertAlmostEqual(portfolio.account.holdings[0].market_value, 512.34)
 
+    def test_kis_total_assets_combines_domestic_and_overseas_without_duplicate_krw_cash(self) -> None:
+        class SplitTotalTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "20374", "tot_evlu_amt": "99554"}]}
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "20374"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": []}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "38.8", "frcr_drwg_psbl_amt_1": "38.8", "bass_exrt": "1554.1"}],
+                        "output3": {"tot_asst_amt": "123518", "tot_dncl_amt": "20374"},
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_amt": "38.8"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=SplitTotalTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.equity, 202_698)
+
     def test_kis_balance_does_not_treat_total_evaluation_as_cash(self) -> None:
         class BalanceOnlyTransport(RecordingKisTransport):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):

@@ -1,26 +1,26 @@
 {
-  "artifact_id": "live_short_horizon.20260703T020026207104Z",
+  "artifact_id": "live_short_horizon.20260703T020228016750Z",
   "classification": {
-    "bias": -0.05334351409192728,
+    "bias": 0.37127464124442944,
     "family": "logistic_regression_sgd",
     "weights": [
-      -1211.3426691478614,
-      -562.5893196792991,
-      -285.1761898620417,
-      -605.7295137003641,
-      -0.041921884174371316,
-      -1.576009702514601,
-      -2.538085475644981e-06,
-      -1.1690896752140474e-05,
-      0.0012905610546999778,
-      0.425089542655589,
-      -648.5951652103901,
-      -586.5993379614084,
-      -1.0724862024151107e-05,
+      -1614.0914285930469,
+      -766.043021199705,
+      -179.24396591707116,
+      -592.7477508683415,
+      -0.05138475288750505,
+      -2.88559675911162,
+      -3.824962005793976e-06,
+      -1.0493039241330572e-05,
+      0.0012357562977388483,
+      -0.546077423717755,
+      -574.4953874411646,
+      -464.325586000467,
+      0.0007765166620373668,
       0.0
     ]
   },
-  "created_at": "2026-07-03T02:00:26.207104+00:00",
+  "created_at": "2026-07-03T02:02:28.016750+00:00",
   "feature_names": [
     "return_30s",
     "return_1m",
@@ -39,37 +39,39 @@
   ],
   "feature_schema_hash": "1e4901681fc317af588b8441",
   "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
-  "live_eligible": true,
+  "live_eligible": false,
   "metrics": {
-    "auc": 0.558132530864366,
-    "avg_forward_net_return_bps_top_k": 1.9593818079680674,
-    "example_count": 18592.0,
+    "auc": 0.5079225042741934,
+    "avg_forward_net_return_bps_top_k": 41.89912580060522,
+    "example_count": 18641.0,
     "holdout_evaluated": 1.0,
     "negative_labels": 11023.0,
-    "positive_labels": 7569.0,
-    "precision_at_k": 0.7272727272727273,
+    "positive_labels": 7618.0,
+    "precision_at_k": 1.0,
     "top_k_count": 55.0,
-    "top_k_fraction": 0.00986016493366798,
-    "validation_example_count": 5578.0
+    "top_k_fraction": 0.009833720722331485,
+    "validation_example_count": 5593.0
   },
-  "reason_codes": [],
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
   "regression": {
-    "bias": -35.61059851155912,
+    "bias": -28.85162099248769,
     "family": "linear_regression_sgd",
     "weights": [
-      -30526.53773110138,
-      -11322.579755826078,
-      -4888.6667818556425,
-      -11625.471663638578,
-      0.6193822264595182,
-      -55.41328331650315,
-      2.9452067245374422e-05,
-      -4.427123482689899e-05,
-      0.009085945689026648,
-      -0.05533360250330308,
-      -6523.5439653933845,
-      -12949.839161462405,
-      -0.005108044715248696,
+      -29309.139499852397,
+      -11013.07304028339,
+      -3672.6752832539346,
+      -9917.137774899638,
+      0.6310741641750811,
+      -67.24801712036226,
+      2.522761284978043e-05,
+      3.615154770094263e-05,
+      0.00802433508756157,
+      -13.702430242567155,
+      -5159.643705321155,
+      -11554.392228657223,
+      -0.002717863428681487,
       0.0
     ]
   },
@@ -80,15 +82,15 @@
   },
   "training_data": {
     "label_rule": "triple_barrier tp=25.0bps sl=100.0bps horizon=600.0s net_of_costs (fallback: forward_return_after_30s > 5.0bps)",
-    "row_count": 18592,
+    "row_count": 18641,
     "row_quality": {
-      "avg_forward_net_return_bps": -21.734496135484477,
+      "avg_forward_net_return_bps": -21.666708810896633,
       "label_sources": {
         "fallback_next_return_1m": 3,
         "forward_mark_price": 694,
         "triple_barrier_stop_loss": 3621,
         "triple_barrier_take_profit": 6500,
-        "triple_barrier_terminal": 7774
+        "triple_barrier_terminal": 7823
       },
       "max_forward_net_return_bps": 2230.618101545253,
       "min_forward_net_return_bps": -6464.6502726823965
@@ -97,10 +99,10 @@
     "source": "logs\\live-feature-frames.jsonl",
     "source_type": "collected_live_feature_frames",
     "trade_feedback": {
-      "events_total": 418,
-      "filled_events": 68,
-      "latest_event_at": "2026-07-03T01:58:47.798210+00:00",
-      "latest_filled_at": "2026-07-03T01:50:49.824336+00:00",
+      "events_total": 422,
+      "filled_events": 70,
+      "latest_event_at": "2026-07-03T02:01:26.702878+00:00",
+      "latest_filled_at": "2026-07-03T02:01:26.702878+00:00",
       "store_exists": true,
       "store_path": "data\\store\\account_dashboard.sqlite3"
     }

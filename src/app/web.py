@@ -1780,18 +1780,33 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
             getattr(portfolio.account, "base_currency", "KRW"),
         )
         krw_cash = cash_by_currency.get("KRW", portfolio.account.cash)
-        cash_equivalent_krw = _number_or_zero(getattr(portfolio.account, "cash_equivalent_krw", None))
-        if cash_equivalent_krw <= 0:
-          cash_equivalent_krw = portfolio.account.cash
-        foreign_cash_krw = max(0.0, cash_equivalent_krw - krw_cash)
         usd_cash = _number_or_zero(cash_by_currency.get("USD", 0.0))
-        usd_position_value = sum(
-            _number_or_zero(position.get("market_value"))
-            for position in result["positions"]
-            if str(position.get("currency") or "").upper() == "USD"
-        )
-        usd_rate_base = usd_cash + usd_position_value
-        usd_krw_rate = foreign_cash_krw / usd_rate_base if usd_rate_base > 0 and foreign_cash_krw > 0 else 0.0
+        fx_by_currency = dict(getattr(portfolio.account, "fx_rate_by_currency", {}) or {})
+        try:
+          default_usd_krw = float(os.getenv("KIS_USD_KRW_RATE", "1380"))
+        except ValueError:
+          default_usd_krw = 1380.0
+        if not (900.0 <= default_usd_krw <= 2000.0):
+          default_usd_krw = 1380.0
+        # FX rate priority: (1) broker-reported FX if sane, (2) rate implied by the
+        # broker cash-equivalent if sane, (3) configured default. Every candidate is
+        # bounded to a sane band so a garbage rate can never inflate foreign cash —
+        # the real account produced a 3,168 KRW/USD back-calc that blew 외화 예수금 up ~2.3x.
+        usd_krw_rate = _number_or_zero(fx_by_currency.get("USD", 0.0))
+        if not (900.0 <= usd_krw_rate <= 2000.0):
+          broker_equiv = _number_or_zero(getattr(portfolio.account, "cash_equivalent_krw", None))
+          usd_position_value = sum(
+              _number_or_zero(position.get("market_value"))
+              for position in result["positions"]
+              if str(position.get("currency") or "").upper() == "USD"
+          )
+          base = usd_cash + usd_position_value
+          implied = (broker_equiv - krw_cash) / base if (broker_equiv > krw_cash and base > 0) else 0.0
+          usd_krw_rate = implied if 900.0 <= implied <= 2000.0 else default_usd_krw
+        # Foreign cash in KRW = actual foreign cash * sane FX. Do NOT derive it as
+        # (cash_equivalent - krw_cash): that conflates foreign STOCK value into cash.
+        foreign_cash_krw = usd_cash * usd_krw_rate
+        cash_equivalent_krw = krw_cash + foreign_cash_krw
         invested_value_krw = 0.0
         for position in result["positions"]:
           currency = str(position.get("currency") or "KRW").upper()
@@ -1803,9 +1818,10 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
             position["market_value_krw"] = market_value
             position["unrealized_pnl_krw"] = _number_or_zero(position.get("unrealized_pnl"))
           invested_value_krw += _number_or_zero(position.get("market_value_krw"))
-        actual_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
-        if actual_equity <= 0:
-          actual_equity = cash_equivalent_krw + invested_value_krw
+        # Total equity from the CORRECTED parts (sane FX): KRW cash + foreign cash +
+        # stock value. Do not trust a broker-provided total that can embed a bad FX
+        # rate (which inflated both 외화 예수금 and the domestic-vs-total composition).
+        actual_equity = cash_equivalent_krw + invested_value_krw
         result["cash"] = krw_cash
         result["cash_equivalent_krw"] = cash_equivalent_krw
         result["actual_deposit"] = krw_cash
