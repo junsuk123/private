@@ -1049,10 +1049,12 @@ DISPLAY_HTML = """<!doctype html>
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{height:100%;width:100%;overflow:hidden;background:#0b0f16;font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;cursor:default}
   #c{position:fixed;inset:0;display:block;touch-action:none}
-  #bar{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:11px;color:#8b98a9;background:linear-gradient(#0b0f16cc,transparent);z-index:3;pointer-events:none}
+  #bar{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;padding:5px 52px 5px 9px;font-size:11px;color:#8b98a9;background:linear-gradient(#0b0f16cc,transparent);z-index:3;pointer-events:none}
   #bar .t{color:#dce6f2;font-weight:600}
   #bar .dot{width:7px;height:7px;border-radius:50%;background:#38bdf8;box-shadow:0 0 8px #38bdf8}
   #cnt{margin-left:auto;font-variant-numeric:tabular-nums}
+  #exit{position:fixed;top:6px;right:8px;z-index:5;width:36px;height:36px;border-radius:9px;border:1px solid #37424f;background:rgba(20,26,34,.78);color:#e6edf3;font-size:17px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;pointer-events:auto;-webkit-tap-highlight-color:transparent}
+  #exit:active{background:#ef4444;border-color:#ef4444}
   #lg{position:fixed;bottom:3px;left:0;right:0;display:flex;flex-wrap:wrap;justify-content:center;gap:3px 8px;padding:3px;font-size:9px;color:#aeb9c7;z-index:3;pointer-events:none}
   #lg span{display:inline-flex;align-items:center;gap:3px}
   #lg i{width:8px;height:8px;border-radius:2px;display:inline-block}
@@ -1060,6 +1062,7 @@ DISPLAY_HTML = """<!doctype html>
 </style></head>
 <body>
 <canvas id="c"></canvas>
+<button id="exit" title="종료" aria-label="종료">✕</button>
 <div id="bar"><span class="dot"></span><span class="t">온톨로지 지식 그래프</span><span id="cnt">연결 중…</span></div>
 <div id="empty">온톨로지 그래프 생성 대기…</div>
 <div id="lg">
@@ -1196,6 +1199,14 @@ DISPLAY_HTML = """<!doctype html>
       else { empty.style.display="flex"; }
     }catch(err){ /* keep last graph */ }
   }
+  var exitBtn=document.getElementById("exit");
+  if(exitBtn){
+    exitBtn.addEventListener("click", async function(){
+      exitBtn.textContent="…";
+      try{ await fetch("/api/kiosk/exit",{method:"POST"}); }catch(e){}
+      try{ window.close(); }catch(e){}
+    });
+  }
   resize(); requestAnimationFrame(draw); poll(); setInterval(poll,12000);
 })();
 
@@ -1206,6 +1217,24 @@ DISPLAY_HTML = """<!doctype html>
 @app.get("/display", response_class=HTMLResponse)
 def ontology_display() -> str:
     return DISPLAY_HTML
+
+
+@app.post("/api/kiosk/exit")
+def kiosk_exit() -> JSONResponse:
+    """Close the local fullscreen kiosk browser (does not affect the server)."""
+    import subprocess
+
+    closed = False
+    for pattern in ("127.0.0.1:8010/display", "--app=http://127.0.0.1:8010/display"):
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", pattern], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                closed = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _json({"ok": True, "closed": closed})
 
 
 @app.get("/api/status")
