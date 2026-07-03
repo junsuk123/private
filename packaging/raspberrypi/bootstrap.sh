@@ -63,9 +63,14 @@ if [ "${DO_APT}" -eq 1 ]; then
     [ "$(id -u)" -ne 0 ] && SUDO="sudo"
     log "Installing OS packages (python3, venv, build tools)"
     ${SUDO} apt-get update
+    # libopenblas0: required at runtime by the piwheels numpy build used on
+    # 32-bit (armhf) Raspberry Pi OS. Harmless on 64-bit (arm64) where the PyPI
+    # numpy wheel bundles its own BLAS. Without it, `import numpy` fails with
+    # "libopenblas.so.0: cannot open shared object file".
     ${SUDO} apt-get install -y --no-install-recommends \
       python3 python3-venv python3-dev python3-pip \
-      build-essential pkg-config ca-certificates curl tzdata
+      build-essential pkg-config ca-certificates curl tzdata \
+      libopenblas0
   else
     warn "apt-get not found; skipping OS package install. Ensure python3 + venv + a C compiler are present."
   fi

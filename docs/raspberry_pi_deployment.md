@@ -193,6 +193,7 @@ NumPy screening path.
 | Symptom | Fix |
 | --- | --- |
 | `python3 -m venv` fails | `sudo apt-get install python3-venv` (bootstrap does this) |
+| `import numpy` → `libopenblas.so.0: cannot open shared object file` | 32-bit (armhf) Pi OS: `sudo apt-get install libopenblas0` (bootstrap now does this). The piwheels numpy build links the system OpenBLAS; 64-bit Pi OS bundles it in the wheel. |
 | `numpy`/wheel builds from source | ensure Bookworm + pip ≥ 23; bootstrap upgrades pip first |
 | Dashboard not reachable from LAN | confirm `APP_HOST=0.0.0.0` and the Pi's firewall allows the port |
 | Native build errors | ignore — Python fallback is automatic; or re-run with `--with-rust` |
