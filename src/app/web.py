@@ -1084,12 +1084,12 @@ DISPLAY_HTML = """<!doctype html>
   const canvas = document.getElementById("c");
   const ctx = canvas.getContext("2d");
   const view = {scale:1, tx:0, ty:0};
-  let W=0,H=0;
+  let W=0,H=0,DPR=1;
   function resize(){
-    const dpr = Math.min(window.devicePixelRatio||1, 2);
+    DPR = Math.min(window.devicePixelRatio||1, 2);
     W = window.innerWidth; H = window.innerHeight;
-    canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr);
-    ctx.setTransform(dpr,0,0,dpr,0,0);
+    canvas.width = Math.round(W*DPR); canvas.height = Math.round(H*DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
   }
   window.addEventListener("resize", resize);
 
@@ -1142,10 +1142,10 @@ DISPLAY_HTML = """<!doctype html>
   function draw(){
     stepSim();
     const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0b0f16"); g.addColorStop(1,"#0a1622");
-    ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    ctx.setTransform(DPR,0,0,DPR,0,0); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
     if(!state){ requestAnimationFrame(draw); return; }
     const foc=hover, neigh=foc?state.adj.get(foc.id):null, DIM=0.13;
-    ctx.setTransform(1,0,0,1,0,0);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
     state.links.forEach(l=>{ const a=worldToScreen(l.s.x,l.s.y), b=worldToScreen(l.t.x,l.t.y);
       const near=!foc||foc===l.s||foc===l.t;
       ctx.strokeStyle= near&&foc? "#5aa9ff" : "rgba(150,162,178,.26)";
