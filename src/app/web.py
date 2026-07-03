@@ -1040,6 +1040,174 @@ def index() -> str:
     return HTML
 
 
+DISPLAY_HTML = """<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>온톨로지 디스플레이</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;width:100%;overflow:hidden;background:#0b0f16;font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;cursor:default}
+  #c{position:fixed;inset:0;display:block;touch-action:none}
+  #bar{position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;padding:5px 9px;font-size:11px;color:#8b98a9;background:linear-gradient(#0b0f16cc,transparent);z-index:3;pointer-events:none}
+  #bar .t{color:#dce6f2;font-weight:600}
+  #bar .dot{width:7px;height:7px;border-radius:50%;background:#38bdf8;box-shadow:0 0 8px #38bdf8}
+  #cnt{margin-left:auto;font-variant-numeric:tabular-nums}
+  #lg{position:fixed;bottom:3px;left:0;right:0;display:flex;flex-wrap:wrap;justify-content:center;gap:3px 8px;padding:3px;font-size:9px;color:#aeb9c7;z-index:3;pointer-events:none}
+  #lg span{display:inline-flex;align-items:center;gap:3px}
+  #lg i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  #empty{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#5b6675;font-size:13px;z-index:2}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div id="bar"><span class="dot"></span><span class="t">온톨로지 지식 그래프</span><span id="cnt">연결 중…</span></div>
+<div id="empty">온톨로지 그래프 생성 대기…</div>
+<div id="lg">
+  <span><i style="background:#38bdf8"></i>종목</span><span><i style="background:#f97316"></i>이벤트</span>
+  <span><i style="background:#22c55e"></i>긍정</span><span><i style="background:#ef4444"></i>리스크</span>
+  <span><i style="background:#d946ef"></i>상충</span><span><i style="background:#84cc16"></i>섹터</span>
+  <span><i style="background:#a9b6c6"></i>개체</span>
+</div>
+<script>
+(function(){
+  "use strict";
+  const KIND = {
+    ticker:{ko:"종목",c:"#38bdf8"}, event:{ko:"이벤트",c:"#f97316"},
+    temporal:{ko:"시간",c:"#22d3ee"}, support:{ko:"긍정",c:"#22c55e"},
+    risk:{ko:"리스크",c:"#ef4444"}, contradiction:{ko:"상충",c:"#d946ef"},
+    sector:{ko:"섹터",c:"#84cc16"}, pipeline:{ko:"파이프",c:"#3b82f6"},
+    tuning:{ko:"튜닝",c:"#eab308"}, parameter:{ko:"파라미터",c:"#ec4899"},
+    metric:{ko:"메트릭",c:"#94a3b8"}, entity:{ko:"개체",c:"#a9b6c6"}
+  };
+  const colorOf = (k)=> (KIND[k]||{c:"#94a3b8"}).c;
+
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const view = {scale:1, tx:0, ty:0};
+  let W=0,H=0;
+  function resize(){
+    const dpr = Math.min(window.devicePixelRatio||1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  window.addEventListener("resize", resize);
+
+  let state = null;   // {nodes, links, nodeMap, adj, maxDeg}
+  let alpha = 0, hover=null, dragNode=null, panning=false, lastX=0, lastY=0, moved=false;
+  const reheat=(a)=>{ alpha=Math.max(alpha,a); };
+  const worldToScreen=(x,y)=>({x:x*view.scale+view.tx, y:y*view.scale+view.ty});
+  const screenToWorld=(sx,sy)=>({x:(sx-view.tx)/view.scale, y:(sy-view.ty)/view.scale});
+
+  function build(data){
+    const raw = (data.nodes||[]).map(n=>({id:n.id,label:n.label||n.id,kind:n.kind||"entity",imp:Number(n.importance_score||0),deg:0,x:0,y:0,vx:0,vy:0,fixed:false}));
+    const map = new Map(raw.map(n=>[n.id,n]));
+    const links = (data.links||[]).filter(l=>map.has(l.source)&&map.has(l.target)).map(l=>({s:map.get(l.source),t:map.get(l.target),p:l.predicate}));
+    const adj = new Map(raw.map(n=>[n.id,new Set()]));
+    links.forEach(l=>{ l.s.deg++; l.t.deg++; adj.get(l.s.id).add(l.t.id); adj.get(l.t.id).add(l.s.id); });
+    let maxDeg=1; raw.forEach(n=>{ if(n.deg>maxDeg) maxDeg=n.deg; });
+    raw.forEach((n,i)=>{ const a=i*2.399, r=90+Math.sqrt(i)*26; n.x=Math.cos(a)*r; n.y=Math.sin(a)*r; });
+    state = {nodes:raw, links, nodeMap:map, adj, maxDeg};
+    alpha = raw.length>260 ? 0.5 : 1;
+    fit();
+  }
+  const radiusOf=(n)=> 3.2 + Math.sqrt(n.deg)*2.6;
+  const screenRadius=(n)=> Math.max(2, radiusOf(n)*Math.max(0.6, Math.min(view.scale,1.7)));
+
+  function fit(){
+    if(!state||!state.nodes.length){ view.scale=1; view.tx=W/2; view.ty=H/2; return; }
+    let a=Infinity,b=Infinity,c=-Infinity,d=-Infinity;
+    state.nodes.forEach(n=>{ if(n.x<a)a=n.x; if(n.x>c)c=n.x; if(n.y<b)b=n.y; if(n.y>d)d=n.y; });
+    const w=Math.max(1,c-a), h=Math.max(1,d-b);
+    view.scale=Math.max(0.25, Math.min(2.4, Math.min(W/(w+90), H/(h+90))));
+    view.tx=W/2-((a+c)/2)*view.scale; view.ty=H/2-((b+d)/2)*view.scale;
+  }
+
+  function stepSim(){
+    if(!state || alpha<0.02) return;
+    const ns=state.nodes;
+    for(let i=0;i<ns.length;i++){ const p=ns[i];
+      for(let j=i+1;j<ns.length;j++){ const q=ns[j];
+        let dx=p.x-q.x, dy=p.y-q.y, d2=dx*dx+dy*dy; if(d2<0.01){d2=0.01;dx=Math.random()-0.5;dy=Math.random()-0.5;}
+        const dd=Math.sqrt(d2), f=Math.min(6500/d2,42), fx=dx/dd*f, fy=dy/dd*f;
+        p.vx+=fx;p.vy+=fy;q.vx-=fx;q.vy-=fy;
+      }
+    }
+    state.links.forEach(l=>{ let dx=l.t.x-l.s.x, dy=l.t.y-l.s.y; const dd=Math.sqrt(dx*dx+dy*dy)||0.01, f=(dd-84)*0.045, fx=dx/dd*f, fy=dy/dd*f;
+      l.s.vx+=fx;l.s.vy+=fy;l.t.vx-=fx;l.t.vy-=fy; });
+    ns.forEach(n=>{ n.vx+=(-n.x)*0.003; n.vy+=(-n.y)*0.003; if(n.fixed){n.vx=0;n.vy=0;return;} n.vx*=0.86; n.vy*=0.86; n.x+=n.vx*alpha*1.4; n.y+=n.vy*alpha*1.4; });
+    alpha*=0.992;
+  }
+
+  function draw(){
+    stepSim();
+    const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,"#0b0f16"); g.addColorStop(1,"#0a1622");
+    ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    if(!state){ requestAnimationFrame(draw); return; }
+    const foc=hover, neigh=foc?state.adj.get(foc.id):null, DIM=0.13;
+    ctx.setTransform(1,0,0,1,0,0);
+    state.links.forEach(l=>{ const a=worldToScreen(l.s.x,l.s.y), b=worldToScreen(l.t.x,l.t.y);
+      const near=!foc||foc===l.s||foc===l.t;
+      ctx.strokeStyle= near&&foc? "#5aa9ff" : "rgba(150,162,178,.26)";
+      ctx.globalAlpha= foc? (near?0.8:DIM) : 0.5;
+      ctx.lineWidth= near&&foc?1.5:0.7;
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+    });
+    ctx.globalAlpha=1;
+    const showHubLabels = state.nodes.length<=140;
+    state.nodes.forEach(n=>{ const p=worldToScreen(n.x,n.y), r=screenRadius(n), near=!foc||n===foc||(neigh&&neigh.has(n.id));
+      ctx.globalAlpha= foc?(near?1:DIM):0.95;
+      if(n===foc){ ctx.beginPath(); ctx.arc(p.x,p.y,r+6,0,7); ctx.fillStyle=colorOf(n.kind); ctx.globalAlpha=0.2; ctx.fill(); ctx.globalAlpha=near?1:DIM; }
+      ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fillStyle=colorOf(n.kind); ctx.fill();
+      if(n===foc){ ctx.lineWidth=1.5; ctx.strokeStyle="rgba(255,255,255,.8)"; ctx.stroke(); }
+      const wantLabel = (foc&&near) || view.scale>1.5 || (showHubLabels && n.deg>=Math.max(3, state.maxDeg*0.5));
+      if(wantLabel){ const fs=Math.max(9,11/Math.max(1,view.scale*0.6)); ctx.font=fs+"px system-ui,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="top";
+        const t=n.label.length>18?n.label.slice(0,17)+"…":n.label; const w=ctx.measureText(t).width;
+        ctx.globalAlpha= foc?(near?1:DIM):0.9; ctx.fillStyle="rgba(8,12,18,.78)"; ctx.fillRect(p.x-w/2-2,p.y+r+2,w+4,fs+2);
+        ctx.fillStyle="#dce6f2"; ctx.fillText(t,p.x,p.y+r+3);
+      }
+    });
+    ctx.globalAlpha=1;
+    requestAnimationFrame(draw);
+  }
+
+  function pick(sx,sy){ if(!state) return null; let best=null,bd=Infinity;
+    for(const n of state.nodes){ const p=worldToScreen(n.x,n.y), r=screenRadius(n)+6, dx=p.x-sx, dy=p.y-sy, d=dx*dx+dy*dy; if(d<r*r&&d<bd){bd=d;best=n;} }
+    return best; }
+  canvas.addEventListener("pointerdown",e=>{ moved=false; lastX=e.clientX; lastY=e.clientY; const n=pick(e.clientX,e.clientY); if(n){dragNode=n;n.fixed=true;reheat(0.5);} else panning=true; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener("pointermove",e=>{ if(dragNode){const w=screenToWorld(e.clientX,e.clientY); dragNode.x=w.x; dragNode.y=w.y; dragNode.vx=0; dragNode.vy=0; moved=true; reheat(0.4); return;}
+    if(panning){ view.tx+=e.clientX-lastX; view.ty+=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY; moved=true; return; }
+    hover=pick(e.clientX,e.clientY); });
+  canvas.addEventListener("pointerup",()=>{ if(dragNode)dragNode.fixed=false; dragNode=null; panning=false; });
+  canvas.addEventListener("pointerleave",()=>{ hover=null; });
+  canvas.addEventListener("wheel",e=>{ e.preventDefault(); const f=e.deltaY>0?0.9:1.1, ns=Math.max(0.2,Math.min(4,view.scale*f));
+    view.tx=e.clientX-(e.clientX-view.tx)*(ns/view.scale); view.ty=e.clientY-(e.clientY-view.ty)*(ns/view.scale); view.scale=ns; },{passive:false});
+  window.addEventListener("dblclick",()=>{ fit(); reheat(0.5); });
+
+  let sig=null;
+  async function poll(){
+    try{
+      const d=await (await fetch("/api/ontology/graph",{cache:"no-store"})).json();
+      const total=(d.counts&&d.counts.nodes)||0, shown=(d.nodes||[]).length;
+      document.getElementById("cnt").textContent = total? (shown+" / "+total+" 노드 · "+(d.links||[]).length+" 링크") : "대기 중";
+      const s=total+":"+shown+":"+((d.reasoning_steps||[]).length);
+      const empty=document.getElementById("empty");
+      if(total>0 && shown>0){ if(s!==sig){ sig=s; build(d); } empty.style.display="none"; }
+      else { empty.style.display="flex"; }
+    }catch(err){ /* keep last graph */ }
+  }
+  resize(); requestAnimationFrame(draw); poll(); setInterval(poll,12000);
+})();
+
+</script>
+</body></html>"""
+
+
+@app.get("/display", response_class=HTMLResponse)
+def ontology_display() -> str:
+    return DISPLAY_HTML
+
+
 @app.get("/api/status")
 def status() -> JSONResponse:
   live_basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
@@ -8278,6 +8446,7 @@ HTML = """
       const canvas = document.getElementById('ontologyCanvas');
       const tooltip = document.getElementById('ontologyTooltip');
       renderOntologyGraph2d(data, canvas, tooltip);
+      return; // Obsidian-style 2D force graph is the canonical ontology view.
       tooltip.style.display = 'block';
       tooltip.style.left = '12px';
       tooltip.style.top = '52px';
@@ -8737,6 +8906,23 @@ HTML = """
       const graphMetrics = buildGraphMetrics(nodes, renderGraph.links);
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const activeKinds = new Set(['ticker', 'event', 'temporal', 'sector', 'support', 'risk', 'contradiction', 'pipeline', 'tuning', 'parameter', 'metric', 'entity']);
+
+      // adjacency for Obsidian-style hover neighbour highlighting
+      const adj = new Map(nodes.map((node) => [node.id, new Set()]));
+      for (const link of renderGraph.links) {
+        if (adj.has(link.source) && adj.has(link.target)) {
+          adj.get(link.source).add(link.target);
+          adj.get(link.target).add(link.source);
+        }
+      }
+      // seed live-simulation coordinates from the precomputed layout
+      nodes.forEach((node, i) => {
+        const p = node.position || [];
+        node.x = Number.isFinite(p[0]) ? p[0] : Math.cos(i * 1.7) * 170;
+        node.y = Number.isFinite(p[1]) ? p[1] : Math.sin(i * 1.7) * 170;
+        node.vx = 0; node.vy = 0; node.fixed = false;
+      });
+
       const reasoningState = {
         steps: (data.reasoning_steps || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
         playing: true,
@@ -8746,8 +8932,14 @@ HTML = """
         activeNodeIds: new Set(),
         activeLinkKeys: new Set(),
       };
-      const view = { scale: 1, offsetX: 0, offsetY: 0, dragging: false, lastX: 0, lastY: 0, labels: false, pointerX: -9999, pointerY: -9999 };
-      let hoveredNode = null;
+      const view = { scale: 1, tx: 0, ty: 0, labels: false, pointerX: -9999, pointerY: -9999 };
+      const sim = { repel: 6500, linkLen: 84 };
+      let hoveredNode = null, selectedId = null, frozen = false;
+      // Large graphs are seeded from the server layout, so relax gently (low alpha)
+      // to avoid an expensive O(n^2) churn on modest devices; small graphs settle fully.
+      let alpha = nodes.length > 260 ? 0.45 : 1;
+      const reheat = (a) => { alpha = Math.max(alpha, a); };
+      if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) alpha = 0.3;
 
       document.getElementById('ontologyCounts').textContent =
         `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${nodes.length}/${renderGraph.links.length}`;
@@ -8760,39 +8952,36 @@ HTML = """
         ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
       }
 
-      function project(node) {
-        const rect = canvas.getBoundingClientRect();
-        const [x, y] = node.position || [0, 0, 0];
-        return {
-          x: rect.width / 2 + (x + view.offsetX) * view.scale,
-          y: rect.height / 2 + (y + view.offsetY) * view.scale,
-        };
-      }
-
-      function visibleNode(node) {
-        return activeKinds.has(node.kind);
+      const worldToScreen = (x, y) => ({ x: x * view.scale + view.tx, y: y * view.scale + view.ty });
+      const screenToWorld = (sx, sy) => ({ x: (sx - view.tx) / view.scale, y: (sy - view.ty) / view.scale });
+      const visibleNode = (node) => activeKinds.has(node.kind);
+      function screenRadius(node) {
+        const base = nodeRadius(node, graphMetrics);
+        return Math.max(2.4, base * Math.max(0.6, Math.min(view.scale, 1.8)));
       }
 
       function fitVisibleGraph2d() {
-        const visibleNodes = nodes.filter(visibleNode);
-        if (!visibleNodes.length) {
-          view.scale = 1;
-          view.offsetX = 0;
-          view.offsetY = 0;
-          return;
-        }
-        const xs = visibleNodes.map((node) => (node.position || [0, 0, 0])[0]);
-        const ys = visibleNodes.map((node) => (node.position || [0, 0, 0])[1]);
-        const minX = Math.min(...xs);
-        const maxX = Math.max(...xs);
-        const minY = Math.min(...ys);
-        const maxY = Math.max(...ys);
-        const width = Math.max(1, maxX - minX);
-        const height = Math.max(1, maxY - minY);
         const rect = canvas.getBoundingClientRect();
-        view.offsetX = -((minX + maxX) / 2);
-        view.offsetY = -((minY + maxY) / 2);
-        view.scale = Math.max(0.45, Math.min(2.7, Math.min(rect.width / (width + 120), rect.height / (height + 120))));
+        const vis = nodes.filter(visibleNode);
+        if (!vis.length) { view.scale = 1; view.tx = rect.width / 2; view.ty = rect.height / 2; return; }
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        vis.forEach((n) => { if (n.x < minX) minX = n.x; if (n.x > maxX) maxX = n.x; if (n.y < minY) minY = n.y; if (n.y > maxY) maxY = n.y; });
+        const w = Math.max(1, maxX - minX), h = Math.max(1, maxY - minY);
+        view.scale = Math.max(0.3, Math.min(2.6, Math.min(rect.width / (w + 150), rect.height / (h + 150))));
+        view.tx = rect.width / 2 - ((minX + maxX) / 2) * view.scale;
+        view.ty = rect.height / 2 - ((minY + maxY) / 2) * view.scale;
+      }
+
+      function pickNode(sx, sy) {
+        let best = null, bd = Infinity;
+        for (const node of nodes) {
+          if (!visibleNode(node)) continue;
+          const p = worldToScreen(node.x, node.y);
+          const r = screenRadius(node) + 5;
+          const dx = p.x - sx, dy = p.y - sy, d = dx * dx + dy * dy;
+          if (d < r * r && d < bd) { bd = d; best = node; }
+        }
+        return best;
       }
 
       function setActiveReasoningStep(index) {
@@ -8818,75 +9007,95 @@ HTML = """
         if (index !== reasoningState.currentIndex) setActiveReasoningStep(index);
       }
 
+      function stepSim() {
+        if (frozen || alpha < 0.02) return;
+        const list = nodes.filter(visibleNode);
+        for (let i = 0; i < list.length; i++) {
+          const a = list[i];
+          for (let j = i + 1; j < list.length; j++) {
+            const b = list[j];
+            let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy;
+            if (d2 < 0.01) { d2 = 0.01; dx = Math.random() - 0.5; dy = Math.random() - 0.5; }
+            const d = Math.sqrt(d2), f = Math.min(sim.repel / d2, 42);
+            const fx = dx / d * f, fy = dy / d * f;
+            a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+          }
+        }
+        for (const link of renderGraph.links) {
+          const a = nodeMap.get(link.source), b = nodeMap.get(link.target);
+          if (!a || !b || !visibleNode(a) || !visibleNode(b)) continue;
+          let dx = b.x - a.x, dy = b.y - a.y;
+          const d = Math.sqrt(dx * dx + dy * dy) || 0.01, f = (d - sim.linkLen) * 0.045;
+          const fx = dx / d * f, fy = dy / d * f;
+          a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+        }
+        for (const n of list) {
+          n.vx += (-n.x) * 0.003; n.vy += (-n.y) * 0.003;
+          if (n.fixed) { n.vx = 0; n.vy = 0; continue; }
+          n.vx *= 0.86; n.vy *= 0.86;
+          n.x += n.vx * alpha * 1.4; n.y += n.vy * alpha * 1.4;
+        }
+        alpha *= 0.992;
+      }
+
       function draw(now) {
         if (!graphState || graphState.stop) return;
+        stepSim();
         const rect = canvas.getBoundingClientRect();
         ctx.clearRect(0, 0, rect.width, rect.height);
         ctx.fillStyle = '#0f172a';
         ctx.fillRect(0, 0, rect.width, rect.height);
         updateReasoning(now);
         const pulse = 0.55 + Math.sin(now / 150) * 0.45;
+        const focus = hoveredNode;
+        const neigh = focus ? adj.get(focus.id) : null;
+        const DIM = 0.12;
 
         for (const link of renderGraph.links) {
-          const source = nodeMap.get(link.source);
-          const target = nodeMap.get(link.target);
-          if (!source || !target || !visibleNode(source) || !visibleNode(target)) continue;
-          const a = project(source);
-          const b = project(target);
-          const active = reasoningState.activeLinkKeys.has(linkKey(link.source, link.target, link.predicate));
+          const s = nodeMap.get(link.source), t = nodeMap.get(link.target);
+          if (!s || !t || !visibleNode(s) || !visibleNode(t)) continue;
+          const a = worldToScreen(s.x, s.y), b = worldToScreen(t.x, t.y);
+          const reasonActive = reasoningState.activeLinkKeys.has(linkKey(link.source, link.target, link.predicate));
+          const near = focus ? (focus === s || focus === t) : true;
           ctx.save();
-          ctx.strokeStyle = intColorToCss(active ? neonEdgeColor(link.predicate) : edgeColor(link.predicate));
-          ctx.globalAlpha = active ? 0.78 : 0.22;
-          ctx.lineWidth = active ? 2.4 + pulse * 1.5 : 0.8;
-          ctx.shadowBlur = active ? 16 : 0;
+          ctx.strokeStyle = intColorToCss(reasonActive ? neonEdgeColor(link.predicate) : edgeColor(link.predicate));
+          ctx.globalAlpha = focus ? (near ? 0.85 : DIM) : (reasonActive ? 0.78 : 0.22);
+          ctx.lineWidth = reasonActive ? 2.4 + pulse * 1.5 : (focus && near ? 1.6 : 0.8);
+          ctx.shadowBlur = reasonActive ? 16 : 0;
           ctx.shadowColor = ctx.strokeStyle;
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-          ctx.stroke();
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
           ctx.restore();
         }
 
-        hoveredNode = null;
-        let nearestDistance = 18;
         for (const node of nodes) {
           if (!visibleNode(node)) continue;
-          const p = project(node);
-          const active = reasoningState.activeNodeIds.has(node.id);
-          const highlighted = Boolean(node.highlight);
-          const radius = nodeRadius(node, graphMetrics) * view.scale * (active ? 1.35 : 1);
-          const color = intColorToCss(active ? neonColor(node.kind) : nodeColor(node.kind));
+          const p = worldToScreen(node.x, node.y);
+          const reasonActive = reasoningState.activeNodeIds.has(node.id);
+          const near = !focus || node === focus || (neigh && neigh.has(node.id));
+          const radius = screenRadius(node) * (reasonActive ? 1.3 : 1);
           ctx.save();
-          ctx.fillStyle = color;
-          ctx.globalAlpha = 0.92;
-          ctx.shadowBlur = active ? 24 : highlighted ? 14 : 0;
+          ctx.globalAlpha = focus ? (near ? 1 : DIM) : 0.95;
+          ctx.fillStyle = intColorToCss(reasonActive ? neonColor(node.kind) : nodeColor(node.kind));
+          ctx.shadowBlur = reasonActive ? 24 : (node === focus ? 14 : 0);
           ctx.shadowColor = intColorToCss(neonColor(node.kind));
-          ctx.beginPath();
-          ctx.arc(p.x, p.y, Math.max(2.2, radius), 0, Math.PI * 2);
-          ctx.fill();
-          if (highlighted || active) {
-            ctx.globalAlpha = active ? 0.28 + pulse * 0.16 : 0.16;
-            ctx.beginPath();
-            ctx.arc(p.x, p.y, Math.max(6, radius * 2.5), 0, Math.PI * 2);
-            ctx.fill();
+          ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
+          if (node === focus || node.id === selectedId) {
+            ctx.shadowBlur = 0; ctx.lineWidth = 2; ctx.strokeStyle = '#e5e7eb'; ctx.stroke();
           }
-          if (view.labels || active) {
-            ctx.globalAlpha = 0.95;
+          const showLabel = view.labels || reasonActive || (focus && near) || view.scale > 1.4;
+          if (showLabel) {
             ctx.shadowBlur = 0;
+            ctx.globalAlpha = focus ? (near ? 1 : DIM) : 0.95;
             ctx.fillStyle = '#e5e7eb';
             ctx.font = '12px Arial';
+            ctx.textBaseline = 'top';
             ctx.fillText(shortLabel(node.label), p.x + radius + 4, p.y - radius - 3);
           }
           ctx.restore();
-          const d = Math.hypot(p.x - view.pointerX, p.y - view.pointerY);
-          if (d < nearestDistance) {
-            nearestDistance = d;
-            hoveredNode = node;
-          }
         }
 
         if (hoveredNode) {
-          const p = project(hoveredNode);
+          const p = worldToScreen(hoveredNode.x, hoveredNode.y);
           tooltip.style.display = 'block';
           tooltip.style.left = `${Math.min(rect.width - 280, Math.max(8, p.x + 12))}px`;
           tooltip.style.top = `${Math.min(rect.height - 80, Math.max(50, p.y + 12))}px`;
@@ -8898,34 +9107,48 @@ HTML = """
         requestAnimationFrame(draw);
       }
 
+      let dragNode = null, panning = false, lastX = 0, lastY = 0, moved = false;
       canvas.onpointerdown = (event) => {
-        view.dragging = true;
-        view.lastX = event.clientX;
-        view.lastY = event.clientY;
+        const rect = canvas.getBoundingClientRect();
+        const sx = event.clientX - rect.left, sy = event.clientY - rect.top;
+        moved = false; lastX = event.clientX; lastY = event.clientY;
+        const n = pickNode(sx, sy);
+        if (n) { dragNode = n; n.fixed = true; reheat(0.5); } else { panning = true; }
         canvas.setPointerCapture(event.pointerId);
       };
       canvas.onpointermove = (event) => {
         const rect = canvas.getBoundingClientRect();
-        view.pointerX = event.clientX - rect.left;
-        view.pointerY = event.clientY - rect.top;
-        if (!view.dragging) return;
-        view.offsetX += (event.clientX - view.lastX) / Math.max(0.1, view.scale);
-        view.offsetY += (event.clientY - view.lastY) / Math.max(0.1, view.scale);
-        view.lastX = event.clientX;
-        view.lastY = event.clientY;
+        const sx = event.clientX - rect.left, sy = event.clientY - rect.top;
+        view.pointerX = sx; view.pointerY = sy;
+        if (dragNode) {
+          const w = screenToWorld(sx, sy);
+          dragNode.x = w.x; dragNode.y = w.y; dragNode.vx = 0; dragNode.vy = 0;
+          moved = true; reheat(0.4); return;
+        }
+        if (panning) {
+          view.tx += event.clientX - lastX; view.ty += event.clientY - lastY;
+          lastX = event.clientX; lastY = event.clientY; moved = true; return;
+        }
+        hoveredNode = pickNode(sx, sy);
+        canvas.style.cursor = hoveredNode ? 'pointer' : 'grab';
       };
-      canvas.onpointerup = () => { view.dragging = false; };
-      canvas.onpointerleave = () => { view.pointerX = -9999; view.pointerY = -9999; };
+      canvas.onpointerup = () => {
+        if (dragNode) dragNode.fixed = false;
+        if (!moved && hoveredNode) { selectedId = hoveredNode.id; renderNodePanel(hoveredNode, data.links); }
+        dragNode = null; panning = false;
+      };
+      canvas.onpointerleave = () => { view.pointerX = -9999; view.pointerY = -9999; hoveredNode = null; };
       canvas.onwheel = (event) => {
         event.preventDefault();
-        view.scale = Math.max(0.45, Math.min(2.7, view.scale * (event.deltaY > 0 ? 0.9 : 1.1)));
+        const rect = canvas.getBoundingClientRect();
+        const sx = event.clientX - rect.left, sy = event.clientY - rect.top;
+        const f = event.deltaY > 0 ? 0.9 : 1.1;
+        const ns = Math.max(0.3, Math.min(4, view.scale * f));
+        view.tx = sx - (sx - view.tx) * (ns / view.scale);
+        view.ty = sy - (sy - view.ty) * (ns / view.scale);
+        view.scale = ns;
       };
-      canvas.onclick = () => {
-        if (hoveredNode) renderNodePanel(hoveredNode, data.links);
-      };
-      document.getElementById('resetGraph').onclick = () => {
-        fitVisibleGraph2d();
-      };
+      document.getElementById('resetGraph').onclick = () => { fitVisibleGraph2d(); reheat(0.6); };
       document.getElementById('toggleLabels').onclick = () => {
         view.labels = !view.labels;
         document.getElementById('toggleLabels').textContent = view.labels ? '라벨 끄기' : '라벨 켜기';
@@ -8939,7 +9162,7 @@ HTML = """
         input.onchange = () => {
           if (input.checked) activeKinds.add(input.value);
           else activeKinds.delete(input.value);
-          fitVisibleGraph2d();
+          reheat(0.5);
         };
       });
 
@@ -8950,7 +9173,6 @@ HTML = """
       if (reasoningState.steps.length) setActiveReasoningStep(0);
       requestAnimationFrame(draw);
     }
-
     function intColorToCss(value) {
       return `#${Number(value || 0).toString(16).padStart(6, '0')}`;
     }
