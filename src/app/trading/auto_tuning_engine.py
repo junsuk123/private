@@ -29,6 +29,8 @@ class MarketStateSnapshot:
     volume_ratio: float
     recent_performance: float = 0.0
     fallback_score: float = 0.0
+    symbol_volatility: float = 0.0
+    market_volatility: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -58,18 +60,25 @@ class AutoTuningEngine:
         volume_ratio: float = 1.0,
         recent_performance: float = 0.0,
         fallback_score: float = 0.0,
+        symbol_volatility: float | None = None,
+        market_volatility: float | None = None,
     ) -> MarketStateSnapshot:
+        base_volatility = max(0.0, float(market.volatility_20d))
+        symbol_vol = base_volatility if symbol_volatility is None else max(0.0, float(symbol_volatility))
+        market_vol = 0.0 if market_volatility is None else max(0.0, float(market_volatility))
         return MarketStateSnapshot(
             symbol=symbol,
             last_price=max(0.0, float(market.last_price)),
             spread_bps=max(0.0, float(spread_bps)),
             liquidity=max(0.0, float(market.average_daily_trading_value)),
-            volatility=max(0.0, float(market.volatility_20d)),
+            volatility=max(base_volatility, symbol_vol, market_vol),
             quote_age_seconds=max(0.0, float(quote_age_seconds)),
             orderbook_available=bool(orderbook_available),
             volume_ratio=max(0.0, float(volume_ratio)),
             recent_performance=float(recent_performance),
             fallback_score=float(fallback_score),
+            symbol_volatility=symbol_vol,
+            market_volatility=market_vol,
         )
 
     def build_buy_policy(
@@ -109,6 +118,13 @@ class AutoTuningEngine:
         )
         equity = max(1.0, float(account.equity or 0.0))
         price = max(0.01, float(market.last_price or market_state.last_price or 0.01))
+        symbol_volatility = max(0.0, float(getattr(market_state, "symbol_volatility", 0.0) or 0.0))
+        market_volatility = max(0.0, float(getattr(market_state, "market_volatility", 0.0) or 0.0))
+        volatility_pressure = max(
+            0.0,
+            symbol_volatility / max(float(os.getenv("REALTIME_SYMBOL_VOLATILITY_REFERENCE", "0.006")), 1e-9) - 1.0,
+            market_volatility / max(float(os.getenv("REALTIME_MARKET_VOLATILITY_REFERENCE", "0.004")), 1e-9) - 1.0,
+        )
         risk_budget_ratio = 0.010
         if regime.regime.value == "capital_protection":
             risk_budget_ratio = 0.008
@@ -122,6 +138,7 @@ class AutoTuningEngine:
             risk_budget_ratio *= min(1.3, 1.0 + ontology_score * 0.15)
         if not model_ok:
             risk_budget_ratio *= 0.8
+        risk_budget_ratio *= max(0.35, 1.0 - min(0.65, volatility_pressure * 0.18))
         available_cash = max(0.0, float(account.cash or 0.0))
         one_share_price = price
         min_cash_for_one_share = one_share_price * 1.05
@@ -138,6 +155,7 @@ class AutoTuningEngine:
         buy_threshold = 0.42
         buy_threshold += market_state.spread_bps / 120.0
         buy_threshold += market_state.volatility * 4.0
+        buy_threshold += min(0.20, volatility_pressure * 0.05)
         buy_threshold -= min(0.2, math.log1p(max(0.0, market_state.liquidity)) / 40.0)
         buy_threshold -= min(0.20, max(0.0, ontology_score) * 0.12)
         buy_threshold -= min(0.12, max(0.0, fallback_score) * 0.12)
@@ -153,7 +171,11 @@ class AutoTuningEngine:
                 "0.008" if market.market.upper().startswith("K") else "0.012",
             )
         )
-        expected_net_return = max(min_buy_net_return, float(market_state.fallback_score) * 0.008)
+        expected_net_return = max(
+            min_buy_net_return,
+            float(market_state.fallback_score) * 0.008,
+            min_buy_net_return + min(0.012, volatility_pressure * 0.0025),
+        )
         if model_ok and prediction is not None:
             expected_net_return = max(expected_net_return, float(getattr(prediction, "expected_net_return_bps", 0.0) or 0.0) / 10_000.0)
 
@@ -168,6 +190,11 @@ class AutoTuningEngine:
         if not model_ok and fallback_allowed:
             allowed_fallback_mode = "ontology_only" if ontology_score > 0 else "rule_based"
         if market_state.quote_age_seconds > quote_ttl_seconds * 2:
+            allowed_fallback_mode = "no_trade"
+        if (
+            symbol_volatility > float(os.getenv("REALTIME_MAX_SYMBOL_VOLATILITY_BUY", "0.015"))
+            or market_volatility > float(os.getenv("REALTIME_MAX_MARKET_VOLATILITY_BUY", "0.008"))
+        ):
             allowed_fallback_mode = "no_trade"
 
         risk_mode = str(regime.regime.value)
@@ -184,6 +211,9 @@ class AutoTuningEngine:
             "cash_budget": round(cash_budget, 4),
             "base_cost": asdict(base_cost),
             "recent_performance": round(float(recent_performance), 6),
+            "symbol_volatility": round(symbol_volatility, 6),
+            "market_volatility": round(market_volatility, 6),
+            "volatility_pressure": round(volatility_pressure, 6),
         }
         policy = ExecutionPolicy(
             buy_threshold=round(buy_threshold, 4),

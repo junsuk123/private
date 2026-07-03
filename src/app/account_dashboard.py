@@ -341,6 +341,11 @@ def _allocations(total: float, domestic: float, overseas: float, krw_cash: float
 
 
 def _trade_rows(logs: dict[str, Any]) -> list[dict[str, Any]]:
+    journal = logs.get("live_order_journal")
+    if isinstance(journal, dict):
+        rows = list(journal.get("submitted_orders") or ()) + list(journal.get("recent_executions") or ())
+        normalized = [_trade_from_dict(item) for item in rows if isinstance(item, dict)]
+        return [asdict(row) for row in _dedupe_trade_rows(normalized)][-50:]
     summary = logs.get("live_execution_summary")
     if not isinstance(summary, dict):
         return []
@@ -351,29 +356,70 @@ def _trade_rows(logs: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _trade_from_dict(item: dict[str, Any]) -> TradeHistoryRow:
-    amount = _num(item.get("amount_krw") or item.get("notional") or item.get("filled_amount"))
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    status = str(item.get("order_status") or item.get("status") or raw.get("status") or "").upper()
+    ordered_quantity = _num(item.get("ordered_quantity") or item.get("quantity"))
+    filled_quantity = _num(item.get("filled_quantity") or item.get("filled_qty"))
+    if filled_quantity <= 0 and status in {"FILLED", "PARTIALLY_FILLED"}:
+        filled_quantity = _num(raw.get("quantity") or item.get("quantity"))
+    price = _num(item.get("average_fill_price") or item.get("price") or raw.get("price") or item.get("limit_price"))
+    amount = _num(item.get("amount_krw") or item.get("notional") or item.get("filled_amount") or raw.get("executed_value"))
+    if amount <= 0 and filled_quantity > 0 and price > 0:
+        amount = filled_quantity * price
+    ticker = str(item.get("ticker") or raw.get("ticker") or "")
+    market = str(item.get("market") or raw.get("market") or "")
+    side = item.get("side") or raw.get("side") or ""
+    side_value = getattr(side, "value", side)
+    currency = str(item.get("currency") or ("USD" if _is_us_market(market, ticker) else "KRW")).upper()
     return TradeHistoryRow(
-        occurred_at=str(item.get("occurred_at") or item.get("submitted_at") or item.get("filled_at") or datetime.now(timezone.utc).isoformat()),
-        market_group=str(item.get("market_group") or ("domestic" if str(item.get("currency") or "KRW").upper() == "KRW" else "overseas")),
-        market=str(item.get("market") or ""),
-        exchange=str(item.get("exchange") or ""),
-        ticker=str(item.get("ticker") or ""),
-        name=str(item.get("name") or item.get("ticker") or ""),
-        side=str(item.get("side") or ""),
+        occurred_at=str(item.get("occurred_at") or item.get("submitted_at") or item.get("filled_at") or item.get("recorded_at") or raw.get("executed_at") or datetime.now(timezone.utc).isoformat()),
+        market_group=str(item.get("market_group") or ("domestic" if currency == "KRW" else "overseas")),
+        market=market,
+        exchange=str(item.get("exchange") or market),
+        ticker=ticker,
+        name=str(item.get("name") or ticker),
+        side=str(side_value or ""),
         order_type=str(item.get("order_type") or ""),
-        order_id=str(item.get("order_id") or item.get("broker_order_id") or ""),
-        order_status=str(item.get("order_status") or item.get("status") or ""),
-        ordered_quantity=_num(item.get("ordered_quantity") or item.get("quantity")),
-        filled_quantity=_num(item.get("filled_quantity") or item.get("filled_qty")),
-        average_fill_price=_num(item.get("average_fill_price") or item.get("price")),
+        order_id=str(item.get("order_id") or item.get("broker_order_id") or raw.get("order_id") or ""),
+        order_status=status,
+        ordered_quantity=ordered_quantity,
+        filled_quantity=filled_quantity,
+        average_fill_price=price,
         amount_original=_num(item.get("amount_original") or amount),
         amount_krw=amount,
         fee_krw=_num(item.get("fee_krw")),
         tax_krw=_num(item.get("tax_krw")),
         realized_pnl_krw=_num(item.get("realized_pnl_krw")),
-        currency=str(item.get("currency") or "KRW").upper(),
-        source=str(item.get("source") or "live_execution_summary"),
+        currency=currency,
+        source=str(item.get("source") or item.get("event_type") or "live_execution_summary"),
     )
+
+
+def _dedupe_trade_rows(rows: list[TradeHistoryRow]) -> list[TradeHistoryRow]:
+    seen: set[tuple[str, str, str, str, str, float, float]] = set()
+    deduped: list[TradeHistoryRow] = []
+    for row in rows:
+        key = (
+            row.source,
+            row.order_id,
+            row.order_status,
+            row.ticker,
+            row.side,
+            row.ordered_quantity,
+            row.filled_quantity,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _is_us_market(market: str, ticker: str) -> bool:
+    upper_market = str(market or "").upper()
+    if upper_market in {"US", "NASDAQ", "NASD", "NYSE", "AMEX", "OVERSEAS"}:
+        return True
+    return bool(str(ticker or "").strip()) and not str(ticker or "").isdigit()
 
 
 def _warnings(status: dict[str, Any], logs: dict[str, Any], is_stale: bool) -> list[str]:

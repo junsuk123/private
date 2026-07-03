@@ -19,6 +19,7 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 
 DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
+DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH = Path("data/store/account_dashboard.sqlite3")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
 # Triple-barrier 라벨 기본값: 전략 청산 기준과 정렬(TP=take_profit 25bps, SL=stop_loss 100bps,
 # 지평=장중 보유창 10분). "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에 압도돼
@@ -107,6 +108,7 @@ def train_live_short_horizon_from_collected_features(
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
+            "trade_feedback": _trade_event_stats(DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH),
             "label_rule": (
                 f"triple_barrier tp={_label_take_profit_bps()}bps sl={_label_stop_loss_bps()}bps "
                 f"horizon={_label_horizon_seconds()}s net_of_costs "
@@ -142,6 +144,7 @@ def live_training_status(
         "latest_live_eligible_artifact": latest_live_eligible,
         "latest_saved_artifact": latest_saved,
         "latest_ineligible_artifact": latest_saved if latest_saved and not latest_saved.get("live_eligible") else None,
+        "trade_feedback": _trade_event_stats(DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH),
     }
 
 
@@ -210,6 +213,50 @@ def build_live_training_rows_from_feature_journal(
                 }
             )
     return rows
+
+
+def _trade_event_stats(db_path: str | Path) -> dict[str, Any]:
+    path = Path(db_path)
+    if not path.exists():
+        return {
+            "store_exists": False,
+            "store_path": str(path),
+            "events_total": 0,
+            "filled_events": 0,
+            "latest_event_at": None,
+            "latest_filled_at": None,
+        }
+    try:
+        with closing(sqlite3.connect(path, timeout=5.0)) as conn:
+            conn.execute("pragma busy_timeout = 5000")
+            total_row = conn.execute("select count(*) from trade_events").fetchone()
+            filled_row = conn.execute(
+                """
+                select count(*), max(occurred_at)
+                from trade_events
+                where filled_quantity > 0
+                   or upper(coalesce(order_status, '')) in ('FILLED', 'PARTIALLY_FILLED')
+                """
+            ).fetchone()
+            latest_row = conn.execute("select max(occurred_at) from trade_events").fetchone()
+    except sqlite3.Error as exc:
+        return {
+            "store_exists": True,
+            "store_path": str(path),
+            "events_total": 0,
+            "filled_events": 0,
+            "latest_event_at": None,
+            "latest_filled_at": None,
+            "error": str(exc),
+        }
+    return {
+        "store_exists": True,
+        "store_path": str(path),
+        "events_total": int((total_row or (0,))[0] or 0),
+        "filled_events": int((filled_row or (0, None))[0] or 0),
+        "latest_event_at": (latest_row or (None,))[0],
+        "latest_filled_at": (filled_row or (0, None))[1],
+    }
 
 
 def _observed_cost_bps(frame: dict[str, Any]) -> float:

@@ -88,10 +88,18 @@ def _account(holding: Holding, cash: float = 0.0) -> AccountSnapshot:
 
 
 class RealtimeExitDecisionTest(unittest.TestCase):
-    def test_primary_net_stop_sells_at_configured_loss(self) -> None:
-        # The always-on primary net stop cuts a -2% loser (net beyond -0.8%).
+    def test_investment_mode_holds_normal_dip(self) -> None:
+        # Default (investment) mode: a normal -2% dip is HELD, never dumped below entry.
         engine = _engine(price=98.0)
         result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
+
+    def test_optin_tight_stop_sells_when_enabled(self) -> None:
+        # A tight stop is opt-in (scalping); enabling it cuts a -2% loser.
+        engine = _engine(price=98.0)
+        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0.004"}):
+            result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.final_order.side, OrderSide.SELL)
         self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
@@ -127,11 +135,12 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         self.assertIn("HOLD_BELOW_PROFIT_TARGET", result.reason_codes)
 
     def test_no_tick_falls_back_to_broker_balance_mark(self) -> None:
-        # 실시간 틱이 없어도 브로커 잔고가(last_price)로 손절을 판단해야 한다.
-        # -2% 잔고가로 1차 손절(stop_loss)이 발동하면 = 잔고가가 실제로 사용된 것.
+        # 실시간 틱이 없어도 브로커 잔고가(last_price)로 판단해야 한다. opt-in 손절을 켜고
+        # -2% 잔고가로 손절이 발동하면 = 잔고가가 실제로 사용된 것.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         holding = _holding(100.0, last_price=98.0)  # -2% via broker mark
-        result = engine.evaluate_exit_for_holding(holding, _account(holding), take_profit=0.006, stop_loss=0.01)
+        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0.004"}):
+            result = engine.evaluate_exit_for_holding(holding, _account(holding), take_profit=0.006, stop_loss=0.01)
         self.assertTrue(result.approved, result.reason_codes)
         self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
 
@@ -245,6 +254,27 @@ class _BuyStore:
         return None
 
 
+class _VolatileBuyStore(_BuyStore):
+    def __init__(self, prices: tuple[float, ...]) -> None:
+        super().__init__(price=prices[-1])
+        now = datetime.now(timezone.utc)
+        self._ticks = tuple(
+            SimpleNamespace(
+                price=price,
+                received_at=now - timedelta(seconds=(len(prices) - index) * 10),
+                exchange_timestamp=now - timedelta(seconds=(len(prices) - index) * 10),
+                sequence_key=f"vol:{index}",
+            )
+            for index, price in enumerate(prices)
+        )
+
+    def recent_ticks(self, symbol: str, since: datetime):
+        return tuple(tick for tick in self._ticks if tick.exchange_timestamp >= since)
+
+    def active_symbols(self, since: datetime, *, limit: int = 200):
+        return ("000660",)
+
+
 class _NoTickBuyStore:
     def latest_tick(self, symbol: str):
         return None
@@ -269,6 +299,21 @@ class RealtimeBuyDecisionTest(unittest.TestCase):
         graph = _FakeGraph()  # no buy-supportive evidence
         result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph)
         self.assertFalse(result.approved)
+
+    def test_symbol_realtime_volatility_blocks_buy(self) -> None:
+        engine = SharedLiveDecisionEngine(
+            _VolatileBuyStore(prices=(100.0, 103.0, 97.0, 104.0, 96.0, 105.0)),
+            predictor=_DummyPredictor(),
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+
+        with patch.dict("os.environ", {"REALTIME_MAX_SYMBOL_VOLATILITY_BUY": "0.01"}):
+            result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=graph)
+
+        self.assertFalse(result.approved)
+        self.assertTrue(any(code.startswith("SYMBOL_VOLATILITY_TOO_HIGH") for code in result.reason_codes), result.reason_codes)
+        self.assertGreater(engine.get_diagnostics()["policy_state"]["market_state"]["symbol_volatility"], 0.01)
 
     def test_domestic_buy_tightens_but_does_not_pause_when_domestic_book_is_in_drawdown(self) -> None:
         engine = SharedLiveDecisionEngine(_BuyStore(price=5_000.0), predictor=_DummyPredictor())
@@ -820,13 +865,14 @@ class ProfitTurnoverExitTest(unittest.TestCase):
         self.assertFalse(result.approved)
         self.assertIsNone(result.final_order)
 
-    def test_take_profit_and_stop_are_symmetric_scale(self) -> None:
-        # Loss cut small (~ -0.4% net) rather than held to the -5% backstop.
+    def test_moderate_loss_is_held_in_investment_mode(self) -> None:
+        # Investment mode: a moderate -1.3% loss is HELD (not sold below entry).
+        # Only the catastrophic backstop (default -8%) can cut a position.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
-        holding = _holding(100.0, last_price=98.7)  # ~ -1.3% gross -> net beyond -0.8%
+        holding = _holding(100.0, last_price=98.7)  # ~ -1.3% gross
         result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
-        self.assertTrue(result.approved, result.reason_codes)
-        self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
 
     def test_profit_time_exit_realizes_meaningful_net_winner_after_window(self) -> None:
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
@@ -866,10 +912,10 @@ class ProfitTurnoverExitTest(unittest.TestCase):
     def test_hard_stop_cuts_catastrophic_loser_even_when_loss_exit_disabled(self) -> None:
         # Capital circuit-breaker: a catastrophic loser is cut to protect total assets,
         # even though routine loss exits are disabled by default.
-        engine = _engine(price=94.0)  # -6% vs avg 100, past the -5% hard stop
+        engine = _engine(price=94.0)  # -6% vs avg 100, past a -5% hard stop
         holding = _holding(100.0)
-        # Disable the primary net stop so the catastrophic hard stop is exercised.
-        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0"}):
+        # Disable the routine stop; set the catastrophic backstop to -5% so -6% cuts.
+        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0", "REALTIME_HARD_STOP_LOSS": "0.05"}):
             result = engine.evaluate_exit_for_holding(holding, _account(holding, cash=1_000_000.0), take_profit=0.006, stop_loss=0.01)
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.final_order.side, OrderSide.SELL)

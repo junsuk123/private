@@ -435,7 +435,47 @@ class RealtimeTradingEngine:
             }
         self._record_submitted_order_for_performance(order, side)
         self._record(event)
+        broker_order_id = str(getattr(submission, "broker_order_id", None) or "")
+        if broker_order_id:
+            self._poll_submitted_order_status_async(broker_order_id, order.ticker)
         return True
+
+    def _poll_submitted_order_status_async(self, broker_order_id: str, symbol: str) -> None:
+        thread = threading.Thread(
+            target=self._poll_submitted_order_status,
+            args=(broker_order_id, symbol),
+            name=f"order-status-{symbol}-{broker_order_id}",
+            daemon=True,
+        )
+        thread.start()
+
+    def _poll_submitted_order_status(self, broker_order_id: str, symbol: str) -> None:
+        try:
+            snapshot = self.coordinator.poll_status(broker_order_id)
+        except Exception as exc:  # noqa: BLE001 - status polling must not stop trading.
+            self._record(
+                {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "kind": "STATUS",
+                    "outcome": "error",
+                    "broker_order_id": broker_order_id,
+                    "detail": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            return
+        raw = getattr(snapshot, "raw", None)
+        self._record(
+            {
+                "at": getattr(snapshot, "observed_at", datetime.now(timezone.utc)).isoformat(),
+                "symbol": symbol,
+                "kind": "STATUS",
+                "outcome": str(getattr(snapshot, "status", "UNKNOWN") or "UNKNOWN").lower(),
+                "broker_order_id": broker_order_id,
+                "filled_quantity": getattr(raw, "quantity", None),
+                "average_fill_price": getattr(raw, "price", None),
+            }
+        )
 
     def _record_submitted_order_for_performance(self, order: FinalOrder, side: str) -> None:
         price = float(getattr(order, "limit_price", 0.0) or 0.0)

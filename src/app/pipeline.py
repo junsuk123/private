@@ -280,7 +280,22 @@ def _augment_live_liquidity_recovery_signals(
     if krw_cash >= cheapest_price:
         return signals
 
-    target_ticker = max(domestic_candidates, key=lambda item: item[0])[1]
+    # Investment mode: raise KRW cash by REALIZING A PROFIT, never by dumping a
+    # loser. Only a holding that clears its round-trip cost buffer is eligible; if
+    # nothing is net-profitable, hold everything (never sell below entry for cash).
+    try:
+        cost_buffer = max(0.0, float(os.getenv("REALTIME_CASH_RECOVERY_MIN_PROFIT", "0.005")))
+    except ValueError:
+        cost_buffer = 0.005
+    profitable: list[tuple[float, float, str]] = []
+    for value, ticker, price in domestic_candidates:
+        holding = holdings_by_ticker.get(ticker)
+        avg = float(getattr(holding, "average_price", 0.0) or 0.0)
+        if avg > 0.0 and price >= avg * (1.0 + cost_buffer):
+            profitable.append(((price - avg) / avg, value, ticker))
+    if not profitable:
+        return signals  # nothing net-profitable to realize -> hold; do not sell a loser for cash
+    target_ticker = max(profitable, key=lambda item: (item[0], item[1]))[2]
     signal_by_ticker = {signal.ticker: signal for signal in signals}
     existing = signal_by_ticker.get(target_ticker)
     supporting_tail = (

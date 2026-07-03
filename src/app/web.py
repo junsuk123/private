@@ -218,6 +218,7 @@ def _account_dashboard_logs_provider() -> dict[str, Any]:
       "collection_log": snapshot.get("collection_log") or [],
       "last_error": snapshot.get("last_error"),
       "live_execution_summary": snapshot.get("live_execution_summary"),
+      "live_order_journal": _live_order_journal_snapshot(),
       "learning": snapshot.get("learning"),
   }
 
@@ -3012,23 +3013,36 @@ def _live_order_event_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     if not event_type.startswith("live_"):
       return None
     order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+    raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
     ticker = str(payload.get("ticker") or order.get("ticker") or "")
+    if not ticker:
+      ticker = str(raw.get("ticker") or "")
     market = str(payload.get("market") or order.get("market") or "")
+    if not market:
+      market = str(raw.get("market") or "")
     quantity = payload.get("quantity") or order.get("quantity") or ""
+    raw_quantity = raw.get("quantity") or ""
     limit_price = payload.get("limit_price") or order.get("limit_price") or ""
+    raw_price = raw.get("price") or ""
+    status = str(payload.get("status") or raw.get("status") or "").upper()
+    filled_quantity = raw_quantity if status in {"FILLED", "PARTIALLY_FILLED"} else payload.get("filled_quantity", "")
+    average_fill_price = raw_price if filled_quantity not in ("", None) else payload.get("average_fill_price", "")
     currency = "USD" if _is_us_order_market(market, ticker) else "KRW"
     return {
         "event_type": event_type,
         "recorded_at": event.get("recorded_at"),
         "ticker": ticker,
         "market": market,
-        "side": payload.get("side") or order.get("side") or "",
-        "quantity": quantity,
+        "side": payload.get("side") or order.get("side") or raw.get("side") or "",
+        "quantity": quantity or raw_quantity,
         "limit_price": limit_price,
-        "notional": _number_or_zero(quantity) * _number_or_zero(limit_price),
+        "notional": _number_or_zero(quantity or raw_quantity) * _number_or_zero(limit_price or raw_price),
         "currency": currency,
-        "broker_order_id": payload.get("broker_order_id") or "",
-        "status": payload.get("status") or "",
+        "broker_order_id": payload.get("broker_order_id") or payload.get("order_id") or raw.get("order_id") or "",
+        "status": status,
+        "filled_quantity": filled_quantity,
+        "average_fill_price": average_fill_price,
+        "raw": raw,
         "reason_codes": payload.get("reason_codes") or payload.get("blocked") or (),
         "error": payload.get("error") or payload.get("message") or "",
     }

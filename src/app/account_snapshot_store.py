@@ -58,6 +58,7 @@ class AccountSnapshotStore:
                 );
                 create table if not exists trade_events (
                     id integer primary key autoincrement,
+                    event_key text,
                     occurred_at text not null,
                     market_group text not null,
                     market text,
@@ -98,6 +99,10 @@ class AccountSnapshotStore:
                 create index if not exists idx_cash_currency_snapshot_id on cash_currency_snapshots(snapshot_id);
                 """
             )
+            columns = {str(row[1]) for row in conn.execute("pragma table_info(trade_events)").fetchall()}
+            if "event_key" not in columns:
+                conn.execute("alter table trade_events add column event_key text")
+            conn.execute("create unique index if not exists idx_trade_events_event_key on trade_events(event_key)")
             conn.commit()
 
     def save_dashboard(self, dashboard: dict[str, Any]) -> int:
@@ -138,6 +143,7 @@ class AccountSnapshotStore:
                 conn.execute("delete from cash_currency_snapshots where snapshot_id = ?", (existing_snapshot_id,))
                 self._insert_holdings(conn, existing_snapshot_id, created_at, dashboard.get("holdings") or ())
                 self._insert_cash(conn, existing_snapshot_id, created_at, dashboard.get("cash") or ())
+                self._insert_trades(conn, dashboard.get("trades") or ())
                 conn.commit()
                 return existing_snapshot_id
 
@@ -299,13 +305,14 @@ class AccountSnapshotStore:
         for item in rows if isinstance(rows, list) else []:
             conn.execute(
                 """
-                insert into trade_events
-                (occurred_at, market_group, market, exchange, ticker, name, side, order_type,
+                insert or ignore into trade_events
+                (event_key, occurred_at, market_group, market, exchange, ticker, name, side, order_type,
                  order_id, order_status, ordered_quantity, filled_quantity, average_fill_price,
                  amount_krw, fee_krw, tax_krw, realized_pnl_krw, currency, source, raw_payload_json)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    _trade_event_key(item),
                     str(item.get("occurred_at") or datetime.now(timezone.utc).isoformat()),
                     str(item.get("market_group") or ""),
                     str(item.get("market") or ""),
@@ -328,6 +335,20 @@ class AccountSnapshotStore:
                     json.dumps(item, ensure_ascii=True, sort_keys=True),
                 ),
             )
+
+
+def _trade_event_key(item: dict[str, Any]) -> str:
+    order_id = str(item.get("order_id") or "").strip()
+    source = str(item.get("source") or "").strip()
+    status = str(item.get("order_status") or "").strip().upper()
+    ticker = str(item.get("ticker") or "").strip().upper()
+    side = str(item.get("side") or "").strip().upper()
+    occurred_at = str(item.get("occurred_at") or "").strip()
+    filled = f"{_num(item.get('filled_quantity')):.8f}"
+    ordered = f"{_num(item.get('ordered_quantity')):.8f}"
+    price = f"{_num(item.get('average_fill_price')):.8f}"
+    natural_id = order_id or f"{source}:{ticker}:{side}:{occurred_at}"
+    return "|".join((source, natural_id, status, ticker, side, ordered, filled, price))
 
 
 def _num(value: Any) -> float:

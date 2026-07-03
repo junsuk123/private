@@ -104,6 +104,19 @@ def _account_domestic_unrealized_rate(account: AccountSnapshot) -> float:
     return pnl / cost if cost > 0 else 0.0
 
 
+def _realized_volatility_from_prices(prices: list[float]) -> float:
+    returns = [
+        prices[index] / prices[index - 1] - 1.0
+        for index in range(1, len(prices))
+        if prices[index - 1] > 0.0
+    ]
+    if len(returns) < 2:
+        return 0.0
+    mean_return = sum(returns) / len(returns)
+    variance = sum((value - mean_return) ** 2 for value in returns) / len(returns)
+    return max(0.0, variance**0.5)
+
+
 def _buy_blocker_reason_codes(
     *,
     prediction_error: Exception | None,
@@ -126,6 +139,20 @@ def _buy_blocker_reason_codes(
     if fallback_score < effective_buy_threshold:
         reasons.append(f"FALLBACK_SCORE_BELOW_THRESHOLD:{fallback_score:.3f}<{effective_buy_threshold:.3f}")
     return tuple(dict.fromkeys(reasons))
+
+
+def _volatility_no_trade_reasons(policy_diag: dict[str, Any]) -> tuple[str, ...]:
+    market_state = policy_diag.get("market_state") or {}
+    symbol_volatility = float(market_state.get("symbol_volatility", 0.0) or 0.0)
+    market_volatility = float(market_state.get("market_volatility", 0.0) or 0.0)
+    max_symbol = _env_float("REALTIME_MAX_SYMBOL_VOLATILITY_BUY", 0.015)
+    max_market = _env_float("REALTIME_MAX_MARKET_VOLATILITY_BUY", 0.008)
+    reasons: list[str] = []
+    if symbol_volatility > max_symbol:
+        reasons.append(f"SYMBOL_VOLATILITY_TOO_HIGH:{symbol_volatility:.4f}>{max_symbol:.4f}")
+    if market_volatility > max_market:
+        reasons.append(f"MARKET_VOLATILITY_TOO_HIGH:{market_volatility:.4f}>{max_market:.4f}")
+    return tuple(reasons)
 
 
 @dataclass(frozen=True)
@@ -334,6 +361,8 @@ class SharedLiveDecisionEngine:
             volume_ratio=volume_ratio,
             recent_performance=0.0,
             fallback_score=fallback_score,
+            symbol_volatility=self._symbol_realtime_volatility(symbol, decision_time),
+            market_volatility=self._market_realtime_volatility(decision_time),
         )
         policy, policy_diag = self.auto_tuner.build_buy_policy(
             symbol=symbol,
@@ -348,6 +377,25 @@ class SharedLiveDecisionEngine:
             prediction_error=prediction_error,
             decision_time=decision_time,
         )
+        volatility_reasons = _volatility_no_trade_reasons(policy_diag)
+        if volatility_reasons:
+            diagnostics = {
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_refresh_status": quote_refresh_status,
+                "fallback_score": fallback_score,
+                "ontology_score": ontology_score,
+                "spread_bps": spread_bps,
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                (*volatility_reasons, f"QUOTE_REFRESH:{quote_refresh_status}"),
+                diagnostics,
+            )
         domestic_buy_threshold_bonus = 0.0
         if domestic_drawdown_rate < 0:
             drawdown_trigger = abs(_env_float("REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER", 0.005))
@@ -680,6 +728,8 @@ class SharedLiveDecisionEngine:
             volume_ratio=volume_ratio,
             recent_performance=0.0,
             fallback_score=max(0.0, ontology_score + max(-0.5, min(0.5, pnl_rate))),
+            symbol_volatility=self._symbol_realtime_volatility(symbol, decision_time),
+            market_volatility=self._market_realtime_volatility(decision_time),
         )
         policy, exit_policy, policy_diag = self.auto_tuner.build_exit_policy(
             symbol=symbol,
@@ -723,26 +773,26 @@ class SharedLiveDecisionEngine:
         # instead of holding a winner until an ever-rising bar is met.
         round_trip_cost_rate = float(getattr(cost_floor, "total_cost_rate", 0.0) or 0.0)
         net_pnl_rate = pnl_rate - round_trip_cost_rate
-        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.012))
-        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.012))
+        # --- INVESTMENT MODE (profit realization, not stop-loss scalping) ------
+        # Goal: realize profit and NEVER sell below the entry on noise. The exit only
+        # sells at a MEANINGFUL net gain (quick target / trailing lock / stalled-but-
+        # profitable time exit). Losers are HELD to recover; only a wide catastrophic
+        # backstop cuts a position, so a normal dip is never dumped at a small loss.
+        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.008))
+        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.010))
         lock_giveback = min(0.95, max(0.0, _env_float("REALTIME_PROFIT_LOCK_GIVEBACK", 0.35)))
         profit_time_exit_sec = max(0.0, _env_float("REALTIME_PROFIT_TIME_EXIT_SEC", 300.0))
-        # Primary tight stop (always on), paired with a larger take-profit target so
-        # losses are cut small and early instead of being held until the -5% backstop.
-        # The default cuts around net -0.4% while quick take-profit waits for about
-        # net +1.2%, correcting the previous small-win / larger-loss skew.
-        # Net-based: it bounds the total realized loss if sold now. Set 0 to disable.
-        stop_loss_net = max(0.0, _env_float("REALTIME_STOP_LOSS_NET", 0.004))
+        # Routine tight stop is OFF by default (investment mode): selling at net -0.4%
+        # meant cutting on a ~-0.12% gross downtick — inside the noise band — which
+        # dumped nearly every buy at a small loss (the "sell below buy" churn). Set
+        # REALTIME_STOP_LOSS_NET > 0 to re-enable a tight stop for scalping.
+        stop_loss_net = max(0.0, _env_float("REALTIME_STOP_LOSS_NET", 0.0))
         # Every profit-motivated exit must lock a MEANINGFUL net gain (after the full
-        # round-trip cost), never churn a ~break-even position. This is the key guard
-        # against fee/slippage bleed: without it, the cost-aware target is ~break-even
-        # gross, so routine profit exits realize ~0 net and erode total assets.
-        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.008))
-        # Always-on capital circuit-breaker: cap how far a single position may bleed,
-        # INDEPENDENT of REALTIME_ALLOW_LOSS_EXIT. Routine small dips are still held
-        # (per the no-loss-exit design), but a catastrophic loser is cut so unbounded
-        # unrealized losses cannot ratchet total assets down. Set to 0 to disable.
-        hard_stop_loss = max(0.0, _env_float("REALTIME_HARD_STOP_LOSS", 0.05))
+        # round-trip cost), never churn a ~break-even position.
+        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.004))
+        # Catastrophic capital circuit-breaker only (NOT a routine stop). Holds normal
+        # dips; cuts a position solely to prevent ruin. Set 0 to hold with no stop at all.
+        hard_stop_loss = max(0.0, _env_float("REALTIME_HARD_STOP_LOSS", 0.08))
         held_age_seconds: float | None = None
         opened_at = getattr(holding, "opened_at", None)
         if opened_at is not None:
@@ -957,6 +1007,39 @@ class SharedLiveDecisionEngine:
             quantity=quantity,
             target_net_return=target_net_return,
         )
+
+    def _symbol_realtime_volatility(self, symbol: str, decision_time: datetime) -> float:
+        try:
+            window_seconds = max(60.0, float(os.getenv("REALTIME_SYMBOL_VOLATILITY_WINDOW_SEC", "300")))
+            since = decision_time - timedelta(seconds=window_seconds)
+            ticks = self.store.recent_ticks(symbol, since) if hasattr(self.store, "recent_ticks") else ()
+            prices = [float(getattr(tick, "price", 0.0) or 0.0) for tick in ticks]
+            prices = [price for price in prices if price > 0.0]
+            return _realized_volatility_from_prices(prices)
+        except Exception:  # noqa: BLE001 - volatility is a risk input, not a hard dependency.
+            return 0.0
+
+    def _market_realtime_volatility(self, decision_time: datetime) -> float:
+        try:
+            window_seconds = max(60.0, float(os.getenv("REALTIME_MARKET_VOLATILITY_WINDOW_SEC", "300")))
+            since = decision_time - timedelta(seconds=window_seconds)
+            if hasattr(self.store, "active_symbols"):
+                symbols = self.store.active_symbols(since, limit=max(1, int(float(os.getenv("REALTIME_MARKET_VOLATILITY_SYMBOL_LIMIT", "40")))))
+            else:
+                symbols = ()
+            values: list[float] = []
+            for symbol in symbols:
+                vol = self._symbol_realtime_volatility(symbol, decision_time)
+                if vol > 0.0:
+                    values.append(vol)
+            if not values:
+                return 0.0
+            values.sort()
+            trim = max(0, int(len(values) * 0.1))
+            sample = values[trim : len(values) - trim] if len(values) > trim * 2 else values
+            return sum(sample) / len(sample)
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _realtime_volume_surge_ratio(self, symbol: str, decision_time: datetime) -> float:
         """장중 거래 활성도 급증 비율 = 최근 짧은 구간 체결빈도 / 기준 구간 체결빈도.
