@@ -1103,16 +1103,21 @@ DISPLAY_HTML = """<!doctype html>
   const screenToWorld=(sx,sy)=>({x:(sx-view.tx)/view.scale, y:(sy-view.ty)/view.scale});
 
   function build(data){
-    const raw = (data.nodes||[]).map(n=>({id:n.id,label:n.label||n.id,kind:n.kind||"entity",imp:Number(n.importance_score||0),deg:0,x:0,y:0,vx:0,vy:0,fixed:false}));
+    const prev = state ? state.nodeMap : null;   // reuse positions across polls -> stable/tappable
+    const raw = (data.nodes||[]).map((n,i)=>{
+      const p = prev ? prev.get(n.id) : null;
+      const a=i*2.399, r=90+Math.sqrt(i)*26;
+      return {id:n.id,label:n.label||n.id,kind:n.kind||"entity",imp:Number(n.importance_score||0),deg:0,
+        x: p?p.x:Math.cos(a)*r, y: p?p.y:Math.sin(a)*r, vx:0, vy:0, fixed:false};
+    });
     const map = new Map(raw.map(n=>[n.id,n]));
     const links = (data.links||[]).filter(l=>map.has(l.source)&&map.has(l.target)).map(l=>({s:map.get(l.source),t:map.get(l.target),p:l.predicate}));
     const adj = new Map(raw.map(n=>[n.id,new Set()]));
     links.forEach(l=>{ l.s.deg++; l.t.deg++; adj.get(l.s.id).add(l.t.id); adj.get(l.t.id).add(l.s.id); });
     let maxDeg=1; raw.forEach(n=>{ if(n.deg>maxDeg) maxDeg=n.deg; });
-    raw.forEach((n,i)=>{ const a=i*2.399, r=90+Math.sqrt(i)*26; n.x=Math.cos(a)*r; n.y=Math.sin(a)*r; });
     state = {nodes:raw, links, nodeMap:map, adj, maxDeg};
-    alpha = raw.length>260 ? 0.5 : 1;
-    fit();
+    if(prev){ alpha = 0.045; }                              // poll update: barely move, keep view -> accurate touch
+    else { alpha = raw.length>260 ? 0.5 : 1; autoFit=true; fit(); }  // first load: bloom + fit
   }
   const radiusOf=(n)=> 3.2 + Math.sqrt(n.deg)*2.6;
   const screenRadius=(n)=> Math.max(2, radiusOf(n)*Math.max(0.6, Math.min(view.scale,1.7)));
@@ -1178,7 +1183,7 @@ DISPLAY_HTML = """<!doctype html>
   }
 
   function pick(sx,sy){ if(!state) return null; let best=null,bd=Infinity;
-    for(const n of state.nodes){ const p=worldToScreen(n.x,n.y), r=screenRadius(n)+6, dx=p.x-sx, dy=p.y-sy, d=dx*dx+dy*dy; if(d<r*r&&d<bd){bd=d;best=n;} }
+    for(const n of state.nodes){ const p=worldToScreen(n.x,n.y), r=Math.max(screenRadius(n)+8,13), dx=p.x-sx, dy=p.y-sy, d=dx*dx+dy*dy; if(d<r*r&&d<bd){bd=d;best=n;} }
     return best; }
   canvas.addEventListener("pointerdown",e=>{ moved=false; lastX=e.clientX; lastY=e.clientY; const n=pick(e.clientX,e.clientY); if(n){dragNode=n;n.fixed=true;reheat(0.5);} else panning=true; canvas.setPointerCapture(e.pointerId); });
   canvas.addEventListener("pointermove",e=>{ if(dragNode){autoFit=false; const w=screenToWorld(e.clientX,e.clientY); dragNode.x=w.x; dragNode.y=w.y; dragNode.vx=0; dragNode.vy=0; moved=true; reheat(0.4); return;}
