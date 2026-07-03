@@ -5972,6 +5972,16 @@ def _trim_graph_payload_for_ui(
     return display_nodes, display_links, display_steps
 
 
+def _resolve_instrument_label(node_id: str) -> str:
+    """Map a bare ticker code (e.g. 005930) to a display name (삼성전자) when known."""
+    from app.graph.rdf_adapter import _instrument_name_map
+
+    text = str(node_id)
+    base = text.split(".", 1)[0]
+    names = _instrument_name_map()
+    return names.get(base) or names.get(text) or text
+
+
 def _node_payload(
     node_id: str,
     importance_score: float,
@@ -5981,7 +5991,7 @@ def _node_payload(
     kind = kind_override or _node_kind(node_id)
     payload = {
         "id": node_id,
-        "label": event_meta.get("title", node_id) if event_meta else node_id,
+        "label": event_meta.get("title", node_id) if event_meta else _resolve_instrument_label(node_id),
         "kind": kind,
         "importance_score": round(importance_score + float(event_meta.get("boost", 0.0) if event_meta else 0.0), 4),
         "size": _node_size(kind, importance_score + float(event_meta.get("boost", 0.0) if event_meta else 0.0)),

@@ -20,6 +20,9 @@ Design notes
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Iterable, Mapping
 
 from rdflib import Literal, URIRef
@@ -175,6 +178,9 @@ def _assert_market_entity(rdf: RdfTradingGraph, ticker: str, market: object, *, 
     else:
         rdf.add(subject, RDF.type, TR.Stock)
     rdf.add(subject, TR.hasSymbol, Literal(str(ticker)))
+    company_name = str(getattr(market, "company_name", "") or "").strip()
+    if company_name and company_name != str(ticker):
+        rdf.add(subject, TR.hasName, Literal(company_name))
     if market_code:
         rdf.add(subject, TR.hasMarket, Literal(market_code))
 
@@ -267,6 +273,40 @@ def attach_account_snapshot(rdf: RdfTradingGraph, account: object, *, node_name:
 _UI_SKIP_PREDICATES = {RDF.type}
 
 
+@lru_cache(maxsize=1)
+def _instrument_name_map() -> dict[str, str]:
+    """Load code -> display-name overrides (e.g. KRX Korean stock names)."""
+    mapping: dict[str, str] = {}
+    try:
+        path = Path("config/instrument_names.json")
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    key = str(key).strip()
+                    value = str(value).strip()
+                    if key and not key.startswith("_") and value:
+                        mapping[key] = value
+    except Exception:
+        pass
+    return mapping
+
+
+def _display_label(nid: str, attrs: Mapping[str, str]) -> str:
+    """Prefer a human-readable name (e.g. 삼성전자) over the bare 6-digit code."""
+    symbol = str(attrs.get("hasSymbol") or _local(nid))
+    base = symbol.split(".", 1)[0]
+    names = _instrument_name_map()
+    if base in names:
+        return names[base]
+    if symbol in names:
+        return names[symbol]
+    name_attr = attrs.get("hasName")
+    if name_attr and str(name_attr) != symbol:
+        return str(name_attr)
+    return symbol
+
+
 def _local(term: object) -> str:
     text = str(term)
     for sep in ("#", "/"):
@@ -322,7 +362,7 @@ def rdf_to_ui_payload(
         nodes.append(
             {
                 "id": nid,
-                "label": attrs.get("hasSymbol") or _local(nid),
+                "label": _display_label(nid, attrs),
                 "kind": _kind_from_types(types),
                 "rdf_types": types,
                 "inferred": bool(types) and nid not in _asserted_ids(merged, inferred_set),
