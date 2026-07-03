@@ -134,6 +134,15 @@ _ACCOUNT_PAGE = """<!doctype html>
 
     <section class="dashboard-frame">
       <div class="frame-title">
+        <h2>온톨로지 지식 그래프</h2>
+        <a href="/display" target="_blank" rel="noreferrer">전체화면으로 보기</a>
+      </div>
+      <iframe src="/display?embed=1" title="온톨로지 지식 그래프" loading="lazy"
+        style="width:100%;height:min(68vh,440px);border:0;border-radius:10px;background:#0b0f16;display:block"></iframe>
+    </section>
+
+    <section class="dashboard-frame">
+      <div class="frame-title">
         <h2>보유 주식 현황</h2>
         <div class="account-filters">
           <input id="holding-search" placeholder="종목 검색" />

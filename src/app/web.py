@@ -1203,7 +1203,9 @@ DISPLAY_HTML = """<!doctype html>
     }catch(err){ /* keep last graph */ }
   }
   var exitBtn=document.getElementById("exit");
-  if(exitBtn){
+  var embedded = location.search.indexOf("embed")>=0;
+  if(embedded){ if(exitBtn) exitBtn.style.display="none"; canvas.style.pointerEvents="none"; }
+  if(exitBtn && !embedded){
     exitBtn.addEventListener("click", async function(){
       exitBtn.textContent="…";
       try{ await fetch("/api/kiosk/exit",{method:"POST"}); }catch(e){}
