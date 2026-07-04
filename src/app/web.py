@@ -1224,7 +1224,103 @@ DISPLAY_HTML = """<!doctype html>
 </body></html>"""
 
 
+TRADE_DISPLAY_HTML = """<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>자동매매 — 왜 사고 팔았나</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{--bg:#0b0f16;--card:#141b26;--line:#263243;--muted:#8b98a9;--txt:#e6edf3}
+  html,body{height:100%;width:100%;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;overflow:hidden}
+  #app{display:flex;flex-direction:column;height:100vh}
+  header{display:flex;align-items:center;gap:8px;padding:8px 48px 8px 12px;border-bottom:1px solid var(--line);flex:0 0 auto}
+  header .dot{width:9px;height:9px;border-radius:50%;background:#22c55e;box-shadow:0 0 8px #22c55e;flex:0 0 auto}
+  header .dot.off{background:#64748b;box-shadow:none}
+  header h1{font-size:15px;font-weight:800;letter-spacing:-.2px;white-space:nowrap}
+  header .clock{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+  #exit{position:fixed;top:6px;right:8px;z-index:5;width:34px;height:34px;border-radius:9px;border:1px solid var(--line);background:rgba(20,26,34,.8);color:var(--txt);font-size:16px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent}
+  #exit:active{background:#ef4444;border-color:#ef4444}
+  main{flex:1 1 auto;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
+  .card{position:relative;flex:0 0 auto;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px 10px 18px;overflow:hidden}
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:6px;background:var(--accent,#64748b)}
+  .row1{display:flex;align-items:flex-start;gap:8px;margin-bottom:3px}
+  .badge{font-size:12px;font-weight:800;padding:2px 9px;border-radius:999px;background:var(--accent,#64748b);color:#06121e;white-space:nowrap;flex:0 0 auto}
+  .name{font-size:15px;font-weight:700}
+  .tk{font-size:11px;color:var(--muted);align-self:center}
+  .when{margin-left:auto;font-size:11px;color:var(--muted);text-align:right;line-height:1.35;white-space:nowrap}
+  .headline{font-size:17px;font-weight:800;letter-spacing:-.3px;margin:3px 0 7px}
+  .why{font-size:11px;color:var(--muted);margin-bottom:4px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px}
+  .chip{font-size:12px;padding:3px 9px;border-radius:8px;background:#0f1622;border:1px solid var(--line);color:#cdd8e6}
+  .tone-buy{--accent:#22c55e}.tone-profit{--accent:#22c55e}.tone-sell{--accent:#38bdf8}
+  .tone-loss{--accent:#ef4444}.tone-warn{--accent:#f59e0b}.tone-hold{--accent:#64748b}
+  #empty{margin:auto;text-align:center;color:#5b6675;font-size:14px;line-height:1.8;padding:16px}
+  #status{padding:6px 12px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style></head>
+<body>
+<div id="app">
+  <header><span class="dot" id="dot"></span><h1>왜 사고 팔았나 · 자동매매</h1><span class="clock" id="clock"></span></header>
+  <main id="list"></main>
+  <div id="status">연결 중…</div>
+</div>
+<button id="exit" title="종료" aria-label="종료">✕</button>
+<script>
+(function(){
+  "use strict";
+  var TONE_LABEL={buy:"매수",profit:"매도·이익",sell:"매도",loss:"매도·손실",warn:"차단",hold:"보류"};
+  function h(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+  function clockTick(){document.getElementById("clock").textContent=new Date().toLocaleTimeString("ko-KR",{hour12:false});}
+  setInterval(clockTick,1000);clockTick();
+  var exitBtn=document.getElementById("exit");
+  exitBtn.addEventListener("click",async function(){exitBtn.textContent="…";try{await fetch("/api/kiosk/exit",{method:"POST"});}catch(e){}try{window.close();}catch(e){}});
+  function render(d){
+    var list=document.getElementById("list");
+    document.getElementById("dot").className="dot"+(d.running?"":" off");
+    document.getElementById("status").textContent=(d.running?"자동매매 실행 중":"자동매매 정지")+(d.buy_enabled===false?" · 매수 비활성":"")+" · 갱신 "+new Date().toLocaleTimeString("ko-KR",{hour12:false});
+    var cards=(d&&d.cards)||[];
+    list.innerHTML="";
+    if(!cards.length){
+      var emp=h("div");emp.id="empty";
+      emp.innerHTML="아직 체결된 매매가 없습니다.<br>조건이 충족되면 여기에 <b>왜 샀는지 / 왜 이 가격·시점에 팔았는지</b>가 표시됩니다.";
+      list.appendChild(emp);return;
+    }
+    cards.forEach(function(c){
+      var card=h("div","card tone-"+(c.tone||"hold"));
+      var r1=h("div","row1");
+      r1.appendChild(h("span","badge",TONE_LABEL[c.tone]||c.verb||""));
+      r1.appendChild(h("span","name",c.name||c.symbol||""));
+      if(c.symbol&&c.symbol!==c.name)r1.appendChild(h("span","tk",c.symbol));
+      var when=h("div","when");when.innerHTML=(c.time_ago||"")+(c.time_hm?"<br>"+c.time_hm:"");
+      r1.appendChild(when);
+      card.appendChild(r1);
+      card.appendChild(h("div","headline",c.headline||""));
+      var rs=(c.reasons||[]).filter(function(x){return x;});
+      if(rs.length){
+        card.appendChild(h("div","why","왜:"));
+        var chips=h("div","chips");
+        rs.forEach(function(x){chips.appendChild(h("span","chip",x));});
+        card.appendChild(chips);
+      }
+      list.appendChild(card);
+    });
+  }
+  async function poll(){
+    try{var r=await fetch("/api/trade-explanations",{cache:"no-store"});render(await r.json());}
+    catch(e){document.getElementById("status").textContent="연결 오류 — 재시도 중…";}
+  }
+  poll();setInterval(poll,4000);
+})();
+</script>
+</body></html>"""
+
+
 @app.get("/display", response_class=HTMLResponse)
+def trade_display() -> str:
+    return TRADE_DISPLAY_HTML
+
+
+@app.get("/display/ontology", response_class=HTMLResponse)
 def ontology_display() -> str:
     return DISPLAY_HTML
 
@@ -2663,6 +2759,223 @@ def _streaming_demo_terminate_response(demo_id: str) -> dict[str, Any]:
         }
     finally:
         step_lock.release()
+
+
+# ---- Human-readable trade explanations (Pi kiosk display) -------------------
+# Maps the engine's terse reason codes into plain-Korean "why" phrases so the
+# local monitor can explain, intuitively, why each stock was bought or sold at
+# this price and time. Purely presentational — no decision logic here.
+_BUY_REASON_TEXT = {
+    "PositiveNewsConfirm": "긍정 뉴스가 매수를 뒷받침",
+    "InformedOrderFlowImbalance": "외국인·기관 매수 우위(정보성 수급)",
+    "ForeignInstitutionJointBuying": "외국인·기관 동반 매수",
+    "RetailSupplyAbsorbedByInformedFlow": "개인 매물을 정보성 매수세가 흡수",
+    "OrderFlowPriceConfirmation": "수급과 가격이 같은 방향",
+    "SuspectedSmartMoneyAccumulation": "스마트머니 매집 의심",
+    "NpuCompositeMomentum": "상승 모멘텀 포착",
+    "LiquiditySupport": "충분한 유동성 확보",
+    "RevenueGrowth": "매출 성장",
+    "EarningsGrowth": "이익 성장",
+    "ProfitabilityQuality": "수익성 양호",
+    "FreshBrokerQuote": "실시간 시세 신선",
+    "CashFitOneShare": "매수 가능 현금 확보",
+    "ExecutableBuyCandidate": "실시간 실행 조건 충족",
+    "RealtimeAdaptiveFallbackBuyCandidate": "실시간 적응형 매수 조건 충족",
+    "RuntimeProbeBuyCandidate": "소량 탐색 매수 조건 충족",
+}
+_SELL_PROFIT_BASES = {
+    "take_profit_amount": "목표 이익금액 달성",
+    "quick_take_profit": "빠른 목표수익 도달",
+    "profit_lock": "고점 대비 이익 반납 방지(이익 잠금)",
+    "profit_time_exit": "보유시간 경과 후 순이익 실현",
+    "profit_exit": "목표 수익 도달",
+}
+_SELL_LOSS_BASES = {
+    "stop_loss": "손절 — 손실 최소화",
+    "hard_stop_loss": "하드 손절 — 자본 보호",
+    "domestic_emergency_exit": "긴급 청산",
+    "loss_exit": "손실 청산",
+    "domestic_drawdown_reduce": "낙폭 확대로 비중 축소",
+    "domestic_concentration_reduce": "집중도 과다로 비중 축소",
+    "trailing_exit": "추적 손절",
+    "invalid_signal_exit": "매수 근거 약화(신호 무효)",
+}
+_SELL_NEUTRAL_BASES = {
+    "time_exit": "보유시간 만료 청산",
+    "profit_exit_ontology": "리스크 신호로 청산",
+}
+_HOLD_REASON_TEXT = {
+    "HOLD_BELOW_PROFIT_TARGET": "아직 목표 수익 미달 → 보유",
+    "WIDE_SPREAD": "호가 스프레드가 넓어 매수 보류",
+    "LOW_LIQUIDITY": "유동성 부족으로 보류",
+    "INSUFFICIENT_CASH_FOR_ONE_SHARE": "1주 매수 현금 부족",
+    "FALLBACK_SCORE_BELOW_THRESHOLD": "매수 점수 기준 미달",
+    "ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK": "근거 확인 부족으로 보류",
+    "MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION": "모델 단독 매수 불가(근거 필요)",
+    "MODEL_FEATURE_UNAVAILABLE": "실시간 데이터 부족으로 판단 보류",
+    "SELL_BELOW_BREAK_EVEN_BLOCKED": "손실 매도 방지(본전 미만)",
+    "SMALL_ACCOUNT_ONE_SHARE_LOSS_BLOCK": "소액계좌 보호(1주 손실매도 차단)",
+    "HOLD_UNPROFITABLE_ONTOLOGY_SELL_BLOCKED": "손실권 매도 보류",
+    "LOSS_EXIT_DISABLED": "손실 청산 비활성",
+    "MARKET_SESSION_CLOSED": "장 마감",
+    "MISSING_MARKET_DATA": "시세 없음",
+    "open_sell_kept": "기존 매도 주문 유지(중복 방지)",
+}
+
+
+def _humanize_reason(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    base, _sep, detail = text.partition(":")
+    base = base.strip()
+    detail = detail.strip()
+    if base == "VolumeSurge":
+        return f"거래량 급증 {detail}".strip()
+    if base in _BUY_REASON_TEXT:
+        return _BUY_REASON_TEXT[base]
+    for table in (_SELL_PROFIT_BASES, _SELL_LOSS_BASES, _SELL_NEUTRAL_BASES):
+        if base in table:
+            return f"{table[base]} ({detail})" if detail else table[base]
+    if base in _HOLD_REASON_TEXT:
+        return _HOLD_REASON_TEXT[base]
+    return text.replace("_", " ")
+
+
+def _reason_tone(kind: str, outcome: str, bases: list[str]) -> str:
+    if outcome in ("blocked", "error"):
+        return "warn"
+    if kind == "BUY":
+        return "buy"
+    if kind == "SELL":
+        for base in bases:
+            if base in _SELL_PROFIT_BASES:
+                return "profit"
+        for base in bases:
+            if base in _SELL_LOSS_BASES:
+                return "loss"
+        return "sell"
+    return "hold"
+
+
+def _time_ago_ko(at_iso: str, now: datetime) -> str:
+    try:
+        moment = datetime.fromisoformat(str(at_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    seconds = max(0.0, (now - moment).total_seconds())
+    if seconds < 60:
+        return f"{int(seconds)}초 전"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}분 전"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}시간 전"
+    return f"{int(seconds // 86400)}일 전"
+
+
+def _kst_hm(at_iso: str) -> str:
+    try:
+        moment = datetime.fromisoformat(str(at_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment + timedelta(hours=9)).strftime("%H:%M")
+
+
+def _is_us_symbol_market(symbol: str, market: str) -> bool:
+    s = str(symbol or "").strip()
+    if s.isdigit() and len(s) == 6:
+        return False
+    return bool(str(market or "").strip()) or not s.isdigit()
+
+
+def _format_price_display(price: Any, is_us: bool) -> str:
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    return f"${value:,.2f}" if is_us else f"{value:,.0f}원"
+
+
+def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    with _realtime_trading_lock:
+        engine = _realtime_trading_engine
+        running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+    if engine is None:
+        return {"generated_at": now.isoformat(), "running": running, "buy_enabled": None, "cards": []}
+    status = engine.get_status()
+    events = status.get("recent_events") or []
+    keep_outcomes = {"submitted", "amended", "filled", "partially_filled", "blocked", "error", "open_sell_kept"}
+    action_label = {
+        "submitted": "주문", "amended": "정정", "filled": "체결", "partially_filled": "일부 체결",
+        "blocked": "차단됨", "error": "오류", "open_sell_kept": "주문 유지",
+    }
+    cards: list[dict[str, Any]] = []
+    for event in events:
+        kind = str(event.get("kind") or "").upper()
+        outcome = str(event.get("outcome") or "")
+        if kind not in ("BUY", "SELL") or outcome not in keep_outcomes:
+            continue
+        symbol = str(event.get("symbol") or "")
+        market = str(event.get("market") or "")
+        is_us = _is_us_symbol_market(symbol, market)
+        raw_reason = str(event.get("reason") or event.get("detail") or "")
+        parts = [p for p in raw_reason.split(";") if p.strip()]
+        bases = [p.partition(":")[0].strip() for p in parts]
+        reasons = []
+        for part in parts:
+            phrase = _humanize_reason(part)
+            if phrase and phrase not in reasons:
+                reasons.append(phrase)
+        reasons = reasons[:4]
+        price = event.get("limit_price") if event.get("limit_price") else event.get("average_fill_price")
+        price_txt = _format_price_display(price, is_us)
+        try:
+            quantity = int(event.get("quantity") or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        name = _resolve_instrument_label(symbol) if symbol else symbol
+        verb = "매수" if kind == "BUY" else "매도"
+        act = action_label.get(outcome, outcome)
+        bits = [b for b in [f"{quantity}주" if quantity else "", price_txt] if b]
+        headline = f"{name} · {' · '.join(bits)} {verb} {act}".strip() if bits else f"{name} {verb} {act}"
+        cards.append(
+            {
+                "kind": kind,
+                "outcome": outcome,
+                "tone": _reason_tone(kind, outcome, bases),
+                "symbol": symbol,
+                "name": name,
+                "quantity": quantity,
+                "price_text": price_txt,
+                "verb": verb,
+                "action": act,
+                "headline": headline,
+                "reasons": reasons or [_humanize_reason(raw_reason)] if raw_reason else reasons,
+                "time_ago": _time_ago_ko(event.get("at"), now),
+                "time_hm": _kst_hm(event.get("at")),
+            }
+        )
+        if len(cards) >= limit:
+            break
+    return {
+        "generated_at": now.isoformat(),
+        "running": running,
+        "buy_enabled": bool(status.get("buy_enabled")),
+        "last_reason": status.get("last_reason"),
+        "cards": cards,
+    }
+
+
+@app.get("/api/trade-explanations")
+def trade_explanations() -> JSONResponse:
+    return _json(_trade_explanation_cards())
 
 
 @app.get("/api/realtime-trading/status")
