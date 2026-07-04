@@ -7,7 +7,7 @@ As of the current `run.ps1` entry point, the system is a guarded KIS live-capabl
 
 The realtime layer is optimized for responsive UI actions, short-horizon diagnostics, safe local learning, and guarded KIS live auto-trading. It uses one realtime data environment and submits live broker orders only through deterministic gates.
 
-See `ontology base trading system diagram.png` for the repository-level flow from trusted data inputs through candidate scoring, ontology reasoning, risk validation, paper/live-readiness execution, and feedback.
+See `docs/diagrams/system_overview.svg` for the repository-level flow from trusted data inputs through candidate scoring, ontology reasoning, risk validation, paper/live execution, and feedback.
 
 Typical analysis horizons:
 

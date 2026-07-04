@@ -13,7 +13,7 @@ from app.trading_pipeline import build_lightweight_market_snapshots, ontology_fi
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="CPU")
-    parser.add_argument("--output", default="docs/npu_realtime_benchmark_results.md")
+    parser.add_argument("--output", default="data/reports/npu_realtime_benchmark.md")
     args = parser.parse_args()
     os.environ["OPENVINO_DEVICE"] = args.device
 

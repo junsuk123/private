@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 820" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <marker id="ahf" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .t{fill:#0f172a;font-size:24px;font-weight:800;}
+      .st{fill:#475569;font-size:13px;}
+      .h{fill:#0f172a;font-size:15px;font-weight:700;}
+      .b{fill:#334155;font-size:11.5px;}
+      .badge{fill:#ffffff;font-size:13px;font-weight:800;}
+      .flow{stroke:#475569;stroke-width:2.2;fill:none;marker-end:url(#ah);}
+      .fb{stroke:#94a3b8;stroke-width:2;fill:none;stroke-dasharray:6 5;marker-end:url(#ahf);}
+      .panelh{fill:#0f172a;font-size:14px;font-weight:700;}
+      .note{fill:#7f1d1d;font-size:11.5px;font-weight:600;}
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1500" height="820" fill="#f8fafc"/>
+  <text x="40" y="42" class="t">Ontology-Based Automated Stock Investment — End-to-End Runtime</text>
+  <text x="40" y="66" class="st">Trusted data → quantitative + semantic features → NPU/CPU evidence → ontology reasoning → risk-gated strategy → guarded KIS live/paper execution → continuous feedback</text>
+
+  <!-- ============ ROW 1 : stages 1-5 ============ -->
+  <!-- 1 Data -->
+  <rect x="40" y="96" width="208" height="150" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="1.6"/>
+  <circle cx="64" cy="120" r="12" fill="#10b981"/><text x="60" y="125" class="badge">1</text>
+  <text x="84" y="125" class="h">Data Inputs</text>
+  <text x="56" y="150" class="b">KIS account · realtime ticks /</text>
+  <text x="56" y="167" class="b">orderbooks · broker quotes</text>
+  <text x="56" y="184" class="b">Market · macro · news · disclosure</text>
+  <text x="56" y="201" class="b">Listed universe (KRX / overseas)</text>
+  <text x="56" y="218" class="b">Execution costs: fees · tax ·</text>
+  <text x="56" y="235" class="b">slippage · spread</text>
+
+  <!-- 2 Validation & Storage -->
+  <rect x="264" y="96" width="208" height="150" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.6"/>
+  <circle cx="288" cy="120" r="12" fill="#3b82f6"/><text x="284" y="125" class="badge">2</text>
+  <text x="308" y="125" class="h">Validation &amp; Storage</text>
+  <text x="280" y="150" class="b">Source trust + quality scoring</text>
+  <text x="280" y="167" class="b">Reject synthetic / stale / unknown</text>
+  <text x="280" y="184" class="b">Typed records + audit (redacted)</text>
+  <text x="280" y="201" class="b">data/store SQLite · data/models</text>
+  <text x="280" y="218" class="b">Retention pruning + stable keys</text>
+
+  <!-- 3 Feature Engineering -->
+  <rect x="488" y="96" width="208" height="150" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.6"/>
+  <circle cx="512" cy="120" r="12" fill="#6366f1"/><text x="508" y="125" class="badge">3</text>
+  <text x="532" y="125" class="h">Feature Engineering</text>
+  <text x="504" y="150" class="b">Live feature frames (provenance)</text>
+  <text x="504" y="167" class="b">Short-horizon returns / volatility</text>
+  <text x="504" y="184" class="b">Microstructure: spread · depth ·</text>
+  <text x="504" y="201" class="b">liquidity · foreign / inst. flow</text>
+  <text x="504" y="218" class="b">Trusted indicator snapshots</text>
+
+  <!-- 4 Candidate Filtering -->
+  <rect x="712" y="96" width="208" height="150" rx="10" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.6"/>
+  <circle cx="736" cy="120" r="12" fill="#f59e0b"/><text x="732" y="125" class="badge">4</text>
+  <text x="756" y="125" class="h">Candidate Filtering</text>
+  <text x="728" y="150" class="b">ontology_filter_1 hard reject:</text>
+  <text x="728" y="167" class="b">halt · management · illiquid</text>
+  <text x="728" y="184" class="b">Rank by liquidity + momentum</text>
+  <text x="728" y="201" class="b">+ flow + volume change</text>
+  <text x="728" y="218" class="b">Top-K candidates only</text>
+
+  <!-- 5 Evidence Scoring -->
+  <rect x="936" y="96" width="208" height="150" rx="10" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.6"/>
+  <circle cx="960" cy="120" r="12" fill="#7c3aed"/><text x="956" y="125" class="badge">5</text>
+  <text x="980" y="125" class="h">Evidence Scoring</text>
+  <text x="952" y="150" class="b">OpenVINO NPU linear scorer</text>
+  <text x="952" y="167" class="b">→ automatic CPU/NumPy fallback</text>
+  <text x="952" y="184" class="b">Support / risk / confidence per</text>
+  <text x="952" y="201" class="b">candidate (Top-K batch only)</text>
+  <text x="952" y="222" class="note">evidence, not trade authorization</text>
+
+  <!-- ============ ROW 2 : stages 6-8 (snake right→left) ============ -->
+  <!-- 6 Ontology & Graph Reasoning (under stage 5) -->
+  <rect x="936" y="300" width="208" height="160" rx="10" fill="#ecfeff" stroke="#06b6d4" stroke-width="1.6"/>
+  <circle cx="960" cy="324" r="12" fill="#06b6d4"/><text x="956" y="329" class="badge">6</text>
+  <text x="980" y="329" class="h">Ontology Reasoning</text>
+  <text x="952" y="354" class="b">RDF / RDFS / OWL classes +</text>
+  <text x="952" y="371" class="b">SHACL closed-world validation</text>
+  <text x="952" y="388" class="b">SemanticPolicyScorer (Python):</text>
+  <text x="952" y="405" class="b">support vs contradiction vs risk</text>
+  <text x="952" y="422" class="b">Explanations + provenance</text>
+  <text x="952" y="445" class="b">(KnowledgeGraph = primary store)</text>
+
+  <!-- 7 Strategy Construction (middle) -->
+  <rect x="488" y="300" width="356" height="160" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.6"/>
+  <circle cx="512" cy="324" r="12" fill="#a855f7"/><text x="508" y="329" class="badge">7</text>
+  <text x="532" y="329" class="h">Strategy Construction — SharedLiveDecisionEngine</text>
+  <text x="504" y="356" class="b">• SELL / REDUCE evaluated BEFORE new BUY every cycle</text>
+  <text x="504" y="375" class="b">• Exits: profit target after costs · trailing / stop · drawdown ·</text>
+  <text x="504" y="392" class="b">  concentration · emergency</text>
+  <text x="504" y="411" class="b">• BUY needs cash · fresh quote · spread / liquidity · ontology or</text>
+  <text x="504" y="428" class="b">  runtime support (model advisory only)</text>
+  <text x="504" y="447" class="b">• Produces OrderIntent → risk gate</text>
+
+  <!-- 8 Risk Validation Gate (left, emphasized) -->
+  <rect x="40" y="300" width="424" height="160" rx="10" fill="#fef2f2" stroke="#dc2626" stroke-width="2.4"/>
+  <circle cx="64" cy="324" r="12" fill="#dc2626"/><text x="60" y="329" class="badge">8</text>
+  <text x="84" y="329" class="h">Risk Validation Gate — deterministic, CPU only</text>
+  <text x="56" y="356" class="b">TradingCostEngine → PrincipalProtectionEngine →</text>
+  <text x="56" y="373" class="b">RiskManager → FinalTradeGate</text>
+  <text x="56" y="393" class="b">Net-profit-after-cost · restricted products · exposure /</text>
+  <text x="56" y="410" class="b">daily-loss · liquidity · duplicate-order · data integrity</text>
+  <rect x="56" y="424" width="392" height="26" rx="6" fill="#dc2626"/>
+  <text x="66" y="442" fill="#ffffff" font-size="12" font-weight="700">AI / NPU / LLM / ontology never place orders directly</text>
+
+  <!-- ============ ROW 3 : stages 9-10 ============ -->
+  <!-- 9 Execution -->
+  <rect x="40" y="512" width="424" height="150" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+  <circle cx="64" cy="536" r="12" fill="#16a34a"/><text x="60" y="541" class="badge">9</text>
+  <text x="84" y="541" class="h">Execution — only FinalOrder objects</text>
+  <text x="56" y="567" class="b">LiveExecutionCoordinator → KIS live LIMIT orders</text>
+  <text x="56" y="585" class="b">Idempotency keys prevent duplicate submits</text>
+  <text x="56" y="603" class="b">Keep / amend existing open SELL (open_sell_kept)</text>
+  <text x="56" y="621" class="b">Paper / mock executor shares the same interface</text>
+  <text x="56" y="645" class="b">Gates: LIVE flags · KIS health · kill-switch · freshness</text>
+
+  <!-- 10 Feedback -->
+  <rect x="488" y="512" width="424" height="150" rx="10" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+  <circle cx="512" cy="536" r="12" fill="#64748b"/><text x="508" y="541" class="badge">10</text>
+  <text x="532" y="541" class="h">Post-Trade Monitoring &amp; Feedback</text>
+  <text x="504" y="567" class="b">/account dashboard: holdings · cash · asset history</text>
+  <text x="504" y="585" class="b">Realized / unrealized PnL · decision flow · rejections</text>
+  <text x="504" y="603" class="b">Periodic live short-horizon retraining (background)</text>
+  <text x="504" y="621" class="b">Feeds threshold tuning &amp; candidate re-ranking</text>
+  <text x="504" y="645" class="b">종료 button: disable BUY → liquidation SELL → shutdown</text>
+
+  <!-- ============ RIGHT PANEL ============ -->
+  <rect x="936" y="512" width="529" height="150" rx="10" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.4"/>
+  <text x="956" y="537" class="panelh">Core principle</text>
+  <text x="956" y="560" class="b">Probabilistic layers explain, classify, rank, tune, and</text>
+  <text x="956" y="577" class="b">propose. They cannot execute live trades.</text>
+  <text x="956" y="600" class="b">Margin · leverage · short selling · derivatives · credit</text>
+  <text x="956" y="617" class="b">loans · leveraged ETFs are rejected.</text>
+  <text x="956" y="640" class="b">Not financial advice — engineering gates only, no profit</text>
+  <text x="956" y="654" class="b">or capital-protection guarantee.</text>
+
+  <rect x="1175" y="96" width="290" height="364" rx="12" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.4"/>
+  <text x="1195" y="124" class="panelh">Safety &amp; runtime model</text>
+
+  <text x="1195" y="150" class="h" font-size="13" fill="#dc2626">Deterministic control plane</text>
+  <text x="1195" y="170" class="b">• RiskManager = sole final execution gate</text>
+  <text x="1195" y="187" class="b">• Kill-switch + REALTIME_BUY_ENABLED</text>
+  <text x="1195" y="204" class="b">• Small-account guards (loss-sell,</text>
+  <text x="1195" y="219" class="b">  weight cap) on by default in run.ps1</text>
+
+  <text x="1195" y="248" class="h" font-size="13" fill="#7c3aed">Acceleration boundary</text>
+  <text x="1195" y="268" class="b">• NPU = numeric evidence scoring only</text>
+  <text x="1195" y="285" class="b">• CPU controls decisions, risk, and</text>
+  <text x="1195" y="300" class="b">  broker submission</text>
+  <text x="1195" y="317" class="b">• Automatic CPU fallback (Pi = CPU-only)</text>
+
+  <text x="1195" y="346" class="h" font-size="13" fill="#16a34a">run.ps1 auto-start services</text>
+  <text x="1195" y="366" class="b">• KIS realtime collection</text>
+  <text x="1195" y="383" class="b">• Periodic live short-horizon training</text>
+  <text x="1195" y="400" class="b">• Independent realtime trading loop</text>
+  <text x="1195" y="417" class="b">• /account is the primary control surface</text>
+  <text x="1195" y="444" class="b" font-style="italic" fill="#64748b">Live gates stay mandatory even when flags on.</text>
+
+  <!-- ============ FLOW ARROWS ============ -->
+  <!-- row1 left→right -->
+  <path class="flow" d="M248,171 L262,171"/>
+  <path class="flow" d="M472,171 L486,171"/>
+  <path class="flow" d="M696,171 L710,171"/>
+  <path class="flow" d="M920,171 L934,171"/>
+  <!-- stage5 down to stage6 -->
+  <path class="flow" d="M1040,246 L1040,298"/>
+  <!-- row2 right→left: 6→7→8 -->
+  <path class="flow" d="M936,380 L846,380"/>
+  <path class="flow" d="M488,380 L466,380"/>
+  <!-- stage8 down to stage9 -->
+  <path class="flow" d="M252,460 L252,510"/>
+  <!-- stage9 → stage10 -->
+  <path class="flow" d="M464,587 L486,587"/>
+
+  <!-- feedback loop: stage10 back up to data inputs -->
+  <path class="fb" d="M700,662 L700,690 L24,690 L24,171 L38,171"/>
+  <text x="120" y="683" fill="#64748b" font-size="12" font-weight="600">continuous feedback — retrain · re-rank · re-tune</text>
+</svg>

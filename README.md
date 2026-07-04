@@ -8,7 +8,7 @@ Personal-use research system for safe, auditable, explainable stock-investment a
 
 The current implementation is intentionally conservative but live-capable in the local runtime started by `run.ps1`: it collects KIS realtime/broker data, builds live feature frames and ontology evidence, trains a short-horizon model in the background, evaluates SELL before BUY every cycle, and submits only `FinalOrder` objects that pass live runtime, broker, cost, risk, freshness, and idempotency gates.
 
-![End-to-end ontology trading system flow](docs/ontology%20base%20trading%20system%20diagram.png)
+![End-to-end ontology trading system flow](docs/diagrams/system_overview.svg)
 
 The repository-level architecture is also documented in `docs/README.md`, `docs/architecture.md`, `docs/live_trading_runbook.md`, and `docs/realtime_short_horizon_policy.md`.
 
@@ -192,7 +192,8 @@ One-command Windows launch:
 - `AUTO_START_LIVE_TRAINING=true`
 - `REALTIME_BUY_ENABLED=true`
 - `REALTIME_MODEL_AUXILIARY_ONLY=true`
-- `REALTIME_ALLOW_LOSS_EXIT=true`
+- `REALTIME_ALLOW_LOSS_EXIT=false`
+- `REALTIME_SMALL_ACCOUNT_MODE=true` (with `REALTIME_BLOCK_SELL_BELOW_BREAKEVEN=true`, `REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE=true`, and a `REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT` cap)
 - `ONTOLOGY_ACCELERATOR=NPU`
 - OpenVINO/NPU low-latency hints with CPU fallback
 - small LLM event-classification limits for responsive refreshes

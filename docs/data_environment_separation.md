@@ -7,7 +7,7 @@ As of the current `run.ps1` entry point, the system is a guarded KIS live-capabl
 
 The current system uses a realtime-only local data environment. Older live/simulation split directories may still exist in the repository history or under `data/legacy`, but they are not the active web runtime layout.
 
-The end-to-end data, inference, risk, and execution boundary is summarized in `ontology base trading system diagram.png`.
+The end-to-end data, inference, risk, and execution boundary is summarized in `docs/diagrams/system_overview.svg`.
 
 ## Active Layout
 

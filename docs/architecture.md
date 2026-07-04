@@ -10,7 +10,7 @@ The system separates probabilistic reasoning from deterministic control. Classif
 
 Every proposed order must pass `RiskManager` before it can become a `FinalOrder`. Approved live orders are limit orders submitted only through `LiveExecutionCoordinator`. The current app supports mock, local paper, KIS paper, live-readiness, hypothetical, in-memory simulation, and KIS live auto-trading paths. In the `run.ps1` runtime, live flags are enabled for the local process, but live submission is still constrained by runtime gates, KIS health checks, idempotency, cost/risk rules, source freshness, and kill-switch controls.
 
-![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
+![End-to-end ontology trading system flow](diagrams/system_overview.svg)
 
 The diagram is the high-level companion to this document. The sections below map each box in that flow to the concrete modules and API boundaries in the repository.
 

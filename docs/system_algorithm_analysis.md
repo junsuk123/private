@@ -10,7 +10,7 @@ The system is a safe realtime-only investment research, learning, paper-trading,
 
 The current local runtime is NPU-capable for numeric ontology evidence. In the verified environment, OpenVINO reports `CPU`, `GPU`, and `NPU`, and the ontology runtime selects `NPU` when launched with the `run.ps1` defaults. This acceleration is limited to dense scoring/ranking; execution authority remains in deterministic CPU modules.
 
-![End-to-end ontology trading system flow](ontology%20base%20trading%20system%20diagram.png)
+![End-to-end ontology trading system flow](diagrams/system_overview.svg)
 
 ## 1. Top-Level Flow
 

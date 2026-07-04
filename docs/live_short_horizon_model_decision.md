@@ -60,7 +60,7 @@ The default `run.ps1` runtime starts periodic training:
 
 ```text
 AUTO_START_LIVE_TRAINING=true
-LIVE_TRAINING_INTERVAL_SECONDS=300
+LIVE_TRAINING_INTERVAL_SECONDS=60
 ```
 
 The loop:

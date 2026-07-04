@@ -15,7 +15,7 @@ from app.graph.npu_classifier import OntologyNpuLinearScorer
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="CPU")
-    parser.add_argument("--output", default="docs/npu_benchmark_results.md")
+    parser.add_argument("--output", default="data/reports/npu_scoring_benchmark.md")
     args = parser.parse_args()
     os.environ["OPENVINO_DEVICE"] = args.device
 
