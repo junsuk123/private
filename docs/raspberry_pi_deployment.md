@@ -228,28 +228,43 @@ Then point `config/local_llm.env` at it:
 
 ```text
 LLM_EVENT_PROVIDER=local
-LLM_EVENT_MODEL=qwen2.5-1.5b-instruct
+LLM_EVENT_MODEL=qwen2.5-0.5b-instruct
 LLM_EVENT_LOCAL_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
-LLM_EVENT_TIMEOUT_SECONDS=180
+LLM_EVENT_CLASSIFIER_ENABLED=true
+LLM_EVENT_TIMEOUT_SECONDS=60
 LLM_EVENT_RESPONSE_MAX_TOKENS=200
 LLM_EVENT_MAX_ITEMS_PER_RUN=3
 ```
 
-### Behavior and limits (verified)
+Note: if the Pi `pi.env` still carries an old `LLM_EVENT_CLASSIFIER_ENABLED=false`, it is
+sourced with `set -a` and wins over `config/local_llm.env`, silently forcing keyword-only.
+Set it to `true` (or remove it) in `packaging/raspberrypi/pi.env`.
 
-- **`LLM_EVENT_TIMEOUT_SECONDS` must be raised on a Pi.** A 1.5B model on the Pi 4 CPU takes
-  **~2 minutes** to generate the full classification JSON. The desktop default (12s) times out
-  and the system silently falls back to keyword sentiment. With `=180` a real classification
-  succeeded: `sentiment=POSITIVE, model=qwen2.5-1.5b-instruct, labels=(AnalystUpgrade, DividendRaise)`.
-- This latency suits the throttled, background news feed (`LLM_EVENT_MAX_ITEMS_PER_RUN` small).
-  For faster turnaround use `Qwen2.5-0.5B-Instruct` — **~10-25s/item** (verified) — but it is
-  weaker: it reads clear positives well yet can miss a negative (classifying it NEUTRAL). Weak
-  models also tend to ignore the JSON instruction and emit prose; the parser salvages the
-  sentiment keyword from that prose so the signal is not lost (labels/summary are dropped).
-  Choose 0.5B for speed, 1.5B for accuracy, or a 64-bit OS + Ollama.
-- Run `llama-server` at boot via systemd (verified): a unit at
-  `/etc/systemd/system/llama-server.service` running `llama-server` bound to `127.0.0.1:8080`,
-  `enable --now`. Point `ExecStart -m` at the 0.5B or 1.5B GGUF to switch models.
+### Behavior and limits (verified on Pi 4, 8GB, 32-bit, live app running)
+
+- **LLM sentiment is opportunistic under CPU contention.** The 4 cores are shared by the trading
+  app (realtime loop + periodic retrain) and the CPU LLM server, so classification competes for
+  CPU. When cores are free, **0.5B completes in ~10-25s**; when the app is busy it exceeds the
+  timeout and **falls back to keyword** sentiment. Either way the `news_sentiment` store stays
+  populated (keyword fills broadly, the LLM refines opportunistically) — this is the intended,
+  safe degradation, not a failure.
+- **1.5B is not viable while the app runs on this Pi.** Under load a 1.5B call did not finish even
+  at `max_tokens=128, timeout=280s` (< 0.5 tok/s, starved) and degraded to keyword — worse than
+  0.5B, which reliably produces real LLM output. **Use 0.5B here.** For real 1.5B accuracy, reduce
+  app CPU load (larger `REALTIME_TRADING_INTERVAL_MS` / `LIVE_TRAINING_INTERVAL_SECONDS`), dedicate
+  cores to `llama-server`, or move to a 64-bit OS + Ollama / offload to the laptop.
+- Weak models often ignore the JSON instruction and emit prose; the parser salvages the sentiment
+  keyword from that prose so the signal is not lost (labels/summary are dropped).
+- **`LLM_EVENT_TIMEOUT_SECONDS`** trades completion vs. thread-blocking: `60` lets 0.5B finish when
+  CPU is free and falls back quickly to keyword when busy. The desktop default (12s) is too low for
+  a Pi CPU and always falls back.
+- Run `llama-server` at boot via systemd (verified): unit at
+  `/etc/systemd/system/llama-server.service`, `llama-server` bound to `127.0.0.1:8080`, `enable --now`.
+  Point `ExecStart -m` at the 0.5B or 1.5B GGUF to switch models (`daemon-reload` + `restart`).
+- **News sentiment store is auto-pruned.** The periodic training loop calls
+  `NewsSentimentStore.prune()` (retention `NEWS_SENTIMENT_RETENTION_DAYS`, default 2 days) so the
+  table stays bounded; live scoring only needs recent news (TTL ~6h) and training reads the value
+  journaled at frame-build time.
 - **8GB RAM recommended.** A 32-bit process is capped near ~3GB; a Q4 1.5B model (~1.1GB) fits.
 - If the server is unreachable, sentiment falls back to keyword rules — no crash.
 - Positive news is only a *soft confirmation* in the live buy path (never a solo trigger);
