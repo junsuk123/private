@@ -33,6 +33,7 @@ Headless; open `http://<pi-ip>:8010/account` from any LAN device.
 | `verify_pi.py` | End-to-end CPU-only runtime check |
 | `requirements-pi.txt` | Core dependencies only (no openvino/torch/transformers) |
 | `pi.env.example` | Copy to `pi.env` for persistent overrides (auto-sourced by `run.sh`) |
+| `pi-dashboard-launch.sh` | Attached-LCD kiosk launcher for `/display` trade-reason board |
 | `personal-investment.service` | systemd unit for auto-start on boot |
 | `Makefile` | `make install` / `make run` / `make verify` / `make service-install` |
 
