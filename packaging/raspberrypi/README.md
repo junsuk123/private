@@ -34,6 +34,8 @@ Headless; open `http://<pi-ip>:8010/account` from any LAN device.
 | `requirements-pi.txt` | Core dependencies only (no openvino/torch/transformers) |
 | `pi.env.example` | Copy to `pi.env` for persistent overrides (auto-sourced by `run.sh`) |
 | `pi-dashboard-launch.sh` | Attached-LCD kiosk launcher for `/display` trade-reason board |
+| `manage_llm_opportunistic.py` | Starts/stops the local news LLM only outside market hours and when CPU/UI are idle |
+| `llm-opportunistic.service` / `.timer` | systemd units for periodic opportunistic LLM management |
 | `personal-investment.service` | systemd unit for auto-start on boot |
 | `Makefile` | `make install` / `make run` / `make verify` / `make service-install` |
 

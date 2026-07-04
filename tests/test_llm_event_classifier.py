@@ -18,6 +18,7 @@ from app.data.llm_classifier import (
     JsonEventLLMClassifier,
     LocalOpenAICompatibleChatClient,
     build_event_llm_classifier_from_env,
+    event_llm_runtime_status,
 )
 from app.graph import KnowledgeGraph
 from app.graph.event_mapper import add_events_to_graph
@@ -148,6 +149,48 @@ class LLMEventClassifierTest(unittest.TestCase):
         self.assertIsNotNone(classifier)
         self.assertIsInstance(classifier.client, LocalOpenAICompatibleChatClient)
         self.assertEqual(classifier.client.model, "qwen2.5:1.5b-instruct")
+
+    def test_opportunistic_local_llm_skips_during_market_session(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_EVENT_CLASSIFIER_ENABLED": "true",
+                "LLM_EVENT_PROVIDER": "local",
+                "LLM_EVENT_MODEL": "qwen2.5-0.5b-instruct",
+                "LLM_EVENT_LOCAL_ENDPOINT": "http://127.0.0.1:8080/v1/chat/completions",
+                "LLM_EVENT_OPPORTUNISTIC_ENABLED": "true",
+                "LLM_EVENT_OPPORTUNISTIC_DISABLE_DURING_MARKET": "true",
+            },
+            clear=False,
+        ):
+            with patch("app.data.llm_classifier._market_session_open", return_value=True):
+                classifier = build_event_llm_classifier_from_env()
+                status = event_llm_runtime_status()
+
+        self.assertIsNone(classifier)
+        self.assertFalse(status["opportunistic"]["allowed"])
+        self.assertEqual(status["opportunistic"]["reason"], "market session open")
+
+    def test_opportunistic_local_llm_skips_when_endpoint_is_down(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_EVENT_CLASSIFIER_ENABLED": "true",
+                "LLM_EVENT_PROVIDER": "local",
+                "LLM_EVENT_MODEL": "qwen2.5-0.5b-instruct",
+                "LLM_EVENT_LOCAL_ENDPOINT": "http://127.0.0.1:8080/v1/chat/completions",
+                "LLM_EVENT_OPPORTUNISTIC_ENABLED": "true",
+                "LLM_EVENT_OPPORTUNISTIC_DISABLE_DURING_MARKET": "true",
+                "LLM_EVENT_OPPORTUNISTIC_MAX_LOAD_PER_CORE": "0.60",
+            },
+            clear=False,
+        ):
+            with patch("app.data.llm_classifier._market_session_open", return_value=False):
+                with patch("app.data.llm_classifier._cpu_load_per_core", return_value=0.10):
+                    with patch("app.data.llm_classifier._local_llm_reachable", return_value=(False, "down")):
+                        classifier = build_event_llm_classifier_from_env()
+
+        self.assertIsNone(classifier)
 
     def test_embedded_local_model_classifier_can_be_configured_without_api_key(self) -> None:
         with patch.dict(

@@ -1,0 +1,7 @@
+[Unit]
+Description=Opportunistically manage the local news LLM on Raspberry Pi
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/doingobject/private
+ExecStart=/home/doingobject/private/.venv-pi/bin/python /home/doingobject/private/packaging/raspberrypi/manage_llm_opportunistic.py

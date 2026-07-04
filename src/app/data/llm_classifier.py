@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
+from datetime import datetime, time
 from pathlib import Path
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from app.schemas.domain import SentimentDirection
 
@@ -416,6 +418,77 @@ def _local_llm_reachable(endpoint: str | None = None) -> tuple[bool, str]:
     return False, detail
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _market_session_open(now_utc: datetime | None = None) -> bool:
+    now_utc = now_utc or datetime.now(ZoneInfo("UTC"))
+    kr_now = now_utc.astimezone(ZoneInfo("Asia/Seoul"))
+    if kr_now.weekday() < 5 and time(9, 0) <= kr_now.time() <= time(15, 30):
+        return True
+    us_now = now_utc.astimezone(ZoneInfo("America/New_York"))
+    if us_now.weekday() < 5 and time(9, 30) <= us_now.time() <= time(16, 0):
+        return True
+    return False
+
+
+def _cpu_load_per_core() -> float | None:
+    if not hasattr(os, "getloadavg"):
+        return None
+    try:
+        one_min_load = os.getloadavg()[0]
+    except OSError:
+        return None
+    cores = os.cpu_count() or 1
+    return max(0.0, float(one_min_load) / float(cores))
+
+
+def event_llm_opportunistic_gate_status() -> dict[str, Any]:
+    """Return whether opportunistic local LLM use is allowed right now."""
+
+    enabled = _env_flag("LLM_EVENT_OPPORTUNISTIC_ENABLED", False)
+    status: dict[str, Any] = {
+        "enabled": enabled,
+        "allowed": True,
+        "reason": "opportunistic gate disabled",
+        "market_open": False,
+        "load_per_core": None,
+        "max_load_per_core": _env_float("LLM_EVENT_OPPORTUNISTIC_MAX_LOAD_PER_CORE", 0.60),
+    }
+    if not enabled:
+        return status
+
+    if _env_flag("LLM_EVENT_OPPORTUNISTIC_DISABLE_DURING_MARKET", True):
+        market_open = _market_session_open()
+        status["market_open"] = market_open
+        if market_open:
+            status["allowed"] = False
+            status["reason"] = "market session open"
+            return status
+
+    load_per_core = _cpu_load_per_core()
+    status["load_per_core"] = load_per_core
+    max_load = float(status["max_load_per_core"])
+    if load_per_core is not None and load_per_core > max_load:
+        status["allowed"] = False
+        status["reason"] = f"cpu load too high ({load_per_core:.2f}>{max_load:.2f})"
+        return status
+
+    status["reason"] = "allowed"
+    return status
+
+
 def configure_default_event_llm_env() -> dict[str, Any]:
     """Enable a local event LLM when no explicit LLM env was provided."""
     load_shared_local_llm_env()
@@ -445,6 +518,13 @@ def build_event_llm_classifier_from_env() -> JsonEventLLMClassifier | None:
             "LLM_EVENT_ENDPOINT",
             "http://127.0.0.1:11434/v1/chat/completions",
         )
+        if _env_flag("LLM_EVENT_OPPORTUNISTIC_ENABLED", False):
+            gate = event_llm_opportunistic_gate_status()
+            if not gate["allowed"]:
+                return None
+            reachable, _detail = _local_llm_reachable(endpoint)
+            if not reachable:
+                return None
         return JsonEventLLMClassifier(LocalOpenAICompatibleChatClient(model=model, endpoint=endpoint))
     if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
         device = os.getenv("LLM_EVENT_DEVICE", "auto").strip()
@@ -503,6 +583,8 @@ def event_llm_runtime_status() -> dict[str, Any]:
         "available": False,
         "reason": None,
     }
+    if _env_flag("LLM_EVENT_OPPORTUNISTIC_ENABLED", False):
+        status["opportunistic"] = event_llm_opportunistic_gate_status()
     if not enabled:
         if provider in {"local", "ollama", "llamacpp", "llama.cpp"}:
             status["backend"] = "openai-compatible"
