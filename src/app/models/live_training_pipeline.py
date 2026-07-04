@@ -93,6 +93,7 @@ def train_live_short_horizon_from_collected_features(
     minimum_positive_labels: int = 5,
     minimum_negative_labels: int = 5,
 ) -> dict[str, Any]:
+    _prune_news_sentiment_store()
     rows = build_live_training_rows_from_feature_journal(journal_path, db_path=DEFAULT_REALTIME_STORE_PATH)
     update_news_trust_from_rows(rows)
     artifact = train_live_short_horizon_model(
@@ -266,6 +267,21 @@ def _parse_iso_time(value: str) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _prune_news_sentiment_store() -> None:
+    """Keep the news-sentiment store bounded (memory-safe). Best-effort.
+
+    Live scoring only needs recent news (TTL ~6h) and training reads the value
+    journaled at frame-build time, so the store can be pruned aggressively. Runs
+    on the periodic training loop, so no extra scheduler is needed.
+    """
+    try:
+        from app.features.news_sentiment_store import NewsSentimentStore
+
+        NewsSentimentStore().prune(older_than_days=_env_float("NEWS_SENTIMENT_RETENTION_DAYS", 2.0))
+    except Exception:  # noqa: BLE001 - housekeeping must never break training.
+        pass
 
 
 def update_news_trust_from_rows(
