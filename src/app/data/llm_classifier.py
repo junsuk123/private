@@ -508,6 +508,7 @@ def configure_default_event_llm_env() -> dict[str, Any]:
 
 
 def build_event_llm_classifier_from_env() -> JsonEventLLMClassifier | None:
+    load_shared_local_llm_env()
     enabled = os.getenv("LLM_EVENT_CLASSIFIER_ENABLED", "").lower() in {"1", "true", "yes"}
     provider = os.getenv("LLM_EVENT_PROVIDER", "remote").strip().lower()
     model = os.getenv("LLM_EVENT_MODEL")
@@ -569,6 +570,7 @@ def build_event_llm_classifier_from_env() -> JsonEventLLMClassifier | None:
 
 
 def event_llm_runtime_status() -> dict[str, Any]:
+    load_shared_local_llm_env()
     enabled = os.getenv("LLM_EVENT_CLASSIFIER_ENABLED", "").lower() in {"1", "true", "yes"}
     provider = os.getenv("LLM_EVENT_PROVIDER", "remote").strip().lower()
     model = os.getenv("LLM_EVENT_MODEL", "")

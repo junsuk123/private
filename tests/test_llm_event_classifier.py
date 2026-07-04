@@ -192,6 +192,34 @@ class LLMEventClassifierTest(unittest.TestCase):
 
         self.assertIsNone(classifier)
 
+    def test_builder_loads_shared_local_llm_env_when_enabled_is_preconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "local_llm.env"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "LLM_EVENT_PROVIDER=local",
+                        "LLM_EVENT_MODEL=qwen2.5-0.5b-instruct",
+                        "LLM_EVENT_LOCAL_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "LOCAL_LLM_CONFIG": str(config_path),
+                    "LLM_EVENT_CLASSIFIER_ENABLED": "true",
+                    "LLM_EVENT_OPPORTUNISTIC_ENABLED": "false",
+                },
+                clear=True,
+            ):
+                classifier = build_event_llm_classifier_from_env()
+
+        self.assertIsNotNone(classifier)
+        self.assertIsInstance(classifier.client, LocalOpenAICompatibleChatClient)
+        self.assertEqual(classifier.client.model, "qwen2.5-0.5b-instruct")
+
     def test_embedded_local_model_classifier_can_be_configured_without_api_key(self) -> None:
         with patch.dict(
             "os.environ",
