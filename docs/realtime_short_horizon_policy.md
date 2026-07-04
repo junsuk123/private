@@ -104,6 +104,14 @@ BUY is intentionally rejected when:
 
 SELL/REDUCE can be triggered by profit target, trailing/loss exit, domestic drawdown, emergency exit, concentration reduction, and time/quote policies.
 
+### News/event sentiment (soft confirmation)
+
+When a local LLM is configured (shared `config/local_llm.env`; see the main `README.md`), RSS/disclosure text is classified into `POSITIVE`/`NEGATIVE`/`NEUTRAL` and mapped into the ontology graph. Its effect on the live BUY path is intentionally limited:
+
+- **Negative** news (`increasesRiskOf NegativeEventRisk`) already subtracts from buy evidence in `_ontology_buy_evidence`.
+- **Positive** news is a **soft confirmation only**: it adds `REALTIME_NEWS_CONFIRM_BONUS` (default `0.15`) to the ontology score of a candidate that already has other support, appends a `PositiveNewsConfirm` tag, and never sets `ontology_ok` on its own. News alone cannot create a BUY, and if negative news is also present the bonus is withheld.
+- Set `REALTIME_NEWS_SENTIMENT_ENABLED=false` to turn the buy-side reflection off. All spread/liquidity/cash/`RiskManager` gates still apply regardless.
+
 ## Paper-Trading and Readiness Behavior
 
 When `POST /api/operation-mode/start` receives `mode = testing`, `paper_trading`, or `paper_trading_test`, the app:

@@ -54,6 +54,20 @@ def _ontology_buy_evidence(graph: Any, symbol: str) -> tuple[float, tuple[str, .
     return net, tuple(sorted(edge))
 
 
+def _news_sentiment_flags(graph: Any, symbol: str) -> tuple[bool, bool]:
+    """Fresh news/disclosure sentiment already projected into the graph.
+
+    `event_mapper` maps a positive classified event to
+    (symbol supportsSignal PositiveEventImpact) and a negative one to
+    (symbol increasesRiskOf NegativeEventRisk). Returns (has_positive, has_negative).
+    The graph is rebuilt each analysis cycle from recency-filtered events, so a
+    present triple already implies the news is recent.
+    """
+    supports = {str(t.object) for t in graph.matching(subject=symbol, predicate="supportsSignal")}
+    risks = {str(t.object) for t in graph.matching(subject=symbol, predicate="increasesRiskOf")}
+    return "PositiveEventImpact" in supports, "NegativeEventRisk" in risks
+
+
 def _market_for_symbol(symbol: str) -> str:
     """Classify a symbol into the market label used for order routing/gates.
 
@@ -331,9 +345,27 @@ class SharedLiveDecisionEngine:
         if volume_ratio >= float(os.getenv("REALTIME_VOLUME_SURGE_RATIO", "1.5")):
             edge_score += 1.0
             ontology_support = (*ontology_support, f"VolumeSurge:{volume_ratio:.1f}x")
+        # 뉴스 감성: 소프트 확인용. 이미 다른 매수근거(수급/모멘텀/유동성/거래량)가 있는
+        # 후보에 한해 긍정 뉴스가 온톨로지 점수를 소폭 부스팅한다. 뉴스 단독으로는 근거가
+        # 되지 않으며(ontology_ok를 직접 켜지 않음), 부정 뉴스가 함께 있으면 부스팅하지 않는다.
+        # 부정 뉴스는 _ontology_buy_evidence의 increasesRiskOf 차감으로 이미 반영된다.
+        news_confirm_bonus = 0.0
+        if (
+            os.getenv("REALTIME_NEWS_SENTIMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+            and ontology_graph is not None
+            and (flow_score > 0.0 or edge_score > 0.0)
+        ):
+            try:
+                has_positive_news, has_negative_news = _news_sentiment_flags(ontology_graph, symbol)
+            except Exception:  # noqa: BLE001 - news is an enhancer, never fatal.
+                has_positive_news = has_negative_news = False
+            if has_positive_news and not has_negative_news:
+                news_confirm_bonus = max(0.0, _env_float("REALTIME_NEWS_CONFIRM_BONUS", 0.15))
+                if news_confirm_bonus > 0.0:
+                    ontology_support = (*ontology_support, "PositiveNewsConfirm")
         flow_threshold = float(os.getenv("REALTIME_ONTOLOGY_BUY_SCORE", "0.12"))
         edge_threshold = float(os.getenv("REALTIME_ONTOLOGY_BUY_MIN_SUPPORTS", "0.5"))
-        ontology_score = max(flow_score, edge_score)
+        ontology_score = max(flow_score, edge_score) + news_confirm_bonus
         ontology_ok = flow_score >= flow_threshold or edge_score >= edge_threshold
         require_ontology_fallback = str(os.getenv("REALTIME_REQUIRE_ONTOLOGY_FOR_MODEL_FALLBACK", "true")).lower() in {
             "1",

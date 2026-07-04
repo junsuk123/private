@@ -26,3 +26,4 @@ config/tradable_universe.json
 config/model_training.json
 config/realtime_market_data.json
 config/order_execution.json
+config/local_llm.env

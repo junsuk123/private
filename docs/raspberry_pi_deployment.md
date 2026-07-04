@@ -22,7 +22,7 @@ optional and already degrades to a deterministic CPU/NumPy implementation:
 | NPU runtime manager ([`app/npu/runtime_manager.py`](../src/app/npu/runtime_manager.py)) | OpenVINO compiled linear graphs | `_NumpyLinearModel` |
 | Realtime acceleration policy ([`app/realtime/acceleration.py`](../src/app/realtime/acceleration.py)) | requests NPU hints | reports CPU, trading logic unaffected |
 | Candidate screening ([`app/native/screening.py`](../src/app/native/screening.py)) | Rust `screening_core` (pyo3) | pure-Python vectorized NumPy |
-| Event classification | OpenVINO / torch / transformers LLM | deterministic keyword rules |
+| Event classification | OpenVINO / torch / transformers LLM | local LLM via Ollama (HTTP, no torch) **or** deterministic keyword rules |
 
 Trading logic, graph rules, and risk checks are pure Python and **always** run
 on CPU — acceleration only ever touched numeric scoring. So dropping the NPU
@@ -187,6 +187,31 @@ NumPy screening path.
   `low_latency`.
 - The Rust native screening core gives the biggest single CPU speedup for wide
   candidate sets; build it if you screen large universes.
+
+## Optional: local LLM news sentiment (Ollama)
+
+News/event sentiment can be judged by a **local LLM** instead of keyword rules, using the
+same shared `config/local_llm.env` as the Windows machine — no `torch`/`transformers` on the
+Pi, because the `local` provider only makes HTTP calls to Ollama.
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh   # 64-bit Raspberry Pi OS (arm64) only
+ollama pull qwen2.5:1.5b-instruct                # small + fast enough for Pi CPU
+cp config/local_llm.env.example config/local_llm.env
+bash packaging/raspberrypi/run.sh
+```
+
+Requirements and behavior:
+
+- **64-bit Pi OS (arm64)** — Ollama does not support 32-bit armhf.
+- **8GB RAM recommended** when the LLM and the trading app run together.
+- The app **auto-detects** Ollama at startup. If it is not reachable, sentiment silently
+  falls back to the deterministic keyword classifier (`pi.env`/`run.sh` keep this safe).
+- Positive news is only a *soft confirmation* in the live buy path (never a solo trigger);
+  negative news reduces buy evidence. Tune with `REALTIME_NEWS_CONFIRM_BONUS` or disable with
+  `REALTIME_NEWS_SENTIMENT_ENABLED=false`. See the main `README.md`.
+- Keep `LLM_EVENT_MAX_ITEMS_PER_RUN` small on a Pi so slow CPU inference does not back up the
+  refresh loop.
 
 ## Troubleshooting
 

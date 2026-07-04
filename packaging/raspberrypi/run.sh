@@ -46,10 +46,14 @@ setdefault ONTOLOGY_NPU_ENABLED "false"
 setdefault ONTOLOGY_FILTER1_NATIVE "auto"
 unset OPENVINO_DEVICE OPENVINO_HINT_PERFORMANCE_MODE OPENVINO_ENABLE_CPU_PINNING 2>/dev/null || true
 
-# Event classification: deterministic keyword rules (no torch/LLM download).
-# LLM_EVENT_CLASSIFIER_ENABLED=false disables the LLM path entirely; the active
-# classifier is selected by EVENT_CLASSIFIER_PROVIDER (default already "keyword").
-setdefault LLM_EVENT_CLASSIFIER_ENABLED "false"
+# News/event sentiment: local LLM (Ollama) with automatic keyword fallback.
+# The app loads the shared config/local_llm.env and probes Ollama at startup:
+# if it is reachable the LLM sentiment path turns on, otherwise it falls back to
+# deterministic keyword rules — no torch/transformers needed (HTTP only).
+# EVENT_CLASSIFIER_PROVIDER stays "keyword" (a separate CPU-only scorer; the LLM
+# news path is layered on top via the LLM_EVENT_* variables).
+# To force pure keyword (no LLM), set LLM_EVENT_CLASSIFIER_ENABLED=false in pi.env.
+setdefault LLM_EVENT_PROVIDER "local"
 setdefault EVENT_CLASSIFIER_PROVIDER "keyword"
 
 # Safe trading defaults (read-only). Override in pi.env to go live.

@@ -362,8 +362,37 @@ class EmbeddedOpenVINOChatClient:
         return str(tokenizer.decode(generated, skip_special_tokens=True)).strip()
 
 
+def load_shared_local_llm_env(path: str | None = None) -> dict[str, str]:
+    """Load the shared local-LLM config file as environment defaults.
+
+    A single `config/local_llm.env` (KEY=VALUE lines) is the one place both the
+    Windows launcher and the Raspberry Pi launcher configure the news/event LLM,
+    so the model is set once for every machine. Applied with setdefault
+    semantics: values already present in the environment (shell / launcher) win
+    and are never overwritten. Missing file is a no-op.
+    """
+    config_path = path or os.getenv("LOCAL_LLM_CONFIG", "config/local_llm.env")
+    applied: dict[str, str] = {}
+    try:
+        text = Path(config_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return applied
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            applied[key] = value
+    return applied
+
+
 def configure_default_event_llm_env() -> dict[str, Any]:
     """Enable a local event LLM when no explicit LLM env was provided."""
+    load_shared_local_llm_env()
     if os.getenv("LLM_EVENT_CLASSIFIER_ENABLED"):
         return event_llm_runtime_status()
     if not os.getenv("LLM_EVENT_PROVIDER"):

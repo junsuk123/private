@@ -315,6 +315,34 @@ $env:LLM_EVENT_DEVICE="NPU"
 .\run.ps1
 ```
 
+### Shared Local-LLM News Sentiment (Raspberry Pi + Windows)
+
+A single shared file, `config/local_llm.env` (copy from `config/local_llm.env.example`),
+configures a **local LLM** for news/event sentiment on **both** the Windows laptop and the
+Raspberry Pi. Both launchers and the app itself load it, so the model is set in one place:
+
+```text
+LLM_EVENT_PROVIDER=local
+LLM_EVENT_MODEL=qwen2.5:1.5b-instruct
+LLM_EVENT_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1/chat/completions
+```
+
+The `local` provider talks to an OpenAI-compatible endpoint (Ollama) over plain HTTP, so it
+needs no `torch`/`transformers` and runs the same way on a Pi. Install Ollama and run
+`ollama pull qwen2.5:1.5b-instruct` on each machine. At startup the app **auto-detects**
+whether Ollama is reachable: if it is, RSS/disclosure text is classified into
+`POSITIVE`/`NEGATIVE`/`NEUTRAL` JSON and mapped into the ontology graph; if it is not, the
+system falls back to the deterministic keyword classifier with no crash.
+
+Sentiment reflection in live decisions is deliberately conservative:
+
+- **Negative** news maps to `increasesRiskOf NegativeEventRisk` and already reduces buy evidence.
+- **Positive** news is a **soft confirmation only**: it adds a small `REALTIME_NEWS_CONFIRM_BONUS`
+  (default `0.15`) to the ontology score of a candidate that *already* has other support
+  (flow/momentum/liquidity/volume). News alone never creates buy support and never sets
+  `ontology_ok`; all spread/liquidity/cash/`RiskManager` gates still apply. Disable with
+  `REALTIME_NEWS_SENTIMENT_ENABLED=false`.
+
 For dynamic web pages that require browser rendering:
 
 ```powershell

@@ -202,6 +202,22 @@ Set-DefaultEnv "OPENVINO_CACHE_DIR" (Join-Path $PSScriptRoot "data\runtime\openv
 Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "openvino"
 Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
 
+# Shared local-LLM config (config/local_llm.env): the single place to set the
+# news/event sentiment model for both Windows and Raspberry Pi. Applied as
+# defaults (only if not already set), so it runs before the provider logic below
+# and lets one file pick the model for every machine.
+$localLlmConfig = Join-Path $PSScriptRoot "config\local_llm.env"
+if (Test-Path $localLlmConfig) {
+  foreach ($line in Get-Content -LiteralPath $localLlmConfig) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed -or $trimmed.StartsWith("#") -or ($trimmed -notmatch "=")) { continue }
+    $pair = $trimmed.Split("=", 2)
+    $key = $pair[0].Trim()
+    $value = $pair[1].Trim().Trim('"').Trim("'")
+    if ($key) { Set-DefaultEnv $key $value }
+  }
+}
+
 $embeddedModelPath = Join-Path $PSScriptRoot "models\local-llm\event-classifier"
 if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_PROVIDER", "Process")) {
   if (Test-Path $embeddedModelPath) {
