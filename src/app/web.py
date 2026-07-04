@@ -1241,6 +1241,14 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   header .clock{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
   #exit{position:fixed;top:6px;right:8px;z-index:5;width:34px;height:34px;border-radius:9px;border:1px solid var(--line);background:rgba(20,26,34,.8);color:var(--txt);font-size:16px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent}
   #exit:active{background:#ef4444;border-color:#ef4444}
+  #overview{flex:0 0 auto;padding:8px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:7px;background:#0d131d}
+  .ov{min-width:0;border:1px solid var(--line);border-radius:8px;background:#121a26;padding:7px 8px;position:relative;overflow:hidden}
+  .ov::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,#64748b)}
+  .ov b{display:block;font-size:14px;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ov span{display:block;margin-top:3px;font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ov small{display:block;margin-top:3px;font-size:10px;color:#9fb0c4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ov-primary b{font-size:18px}
+  .ov-open{--accent:#22c55e}.ov-pre{--accent:#f59e0b}.ov-after{--accent:#38bdf8}.ov-day{--accent:#a78bfa}.ov-busy{--accent:#f97316}.ov-idle{--accent:#64748b}.ov-closed{--accent:#475569}
   main{flex:1 1 auto;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
   .card{position:relative;flex:0 0 auto;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px 10px 18px;overflow:hidden}
   .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:6px;background:var(--accent,#64748b)}
@@ -1261,6 +1269,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
 <body>
 <div id="app">
   <header><span class="dot" id="dot"></span><h1>왜 사고 팔았나 · 자동매매</h1><span class="clock" id="clock"></span></header>
+  <section id="overview" aria-label="현재 상태"></section>
   <main id="list"></main>
   <div id="status">연결 중…</div>
 </div>
@@ -1274,8 +1283,28 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   setInterval(clockTick,1000);clockTick();
   var exitBtn=document.getElementById("exit");
   exitBtn.addEventListener("click",async function(){exitBtn.textContent="…";try{await fetch("/api/kiosk/exit",{method:"POST"});}catch(e){}try{window.close();}catch(e){}});
+  function toneClass(t){return "ov-"+(t||"idle");}
+  function overviewCard(label,detail,tone,sub,primary){
+    var box=h("div","ov "+toneClass(tone)+(primary?" ov-primary":""));
+    box.appendChild(h("b","",label||"-"));
+    box.appendChild(h("span","",detail||""));
+    if(sub)box.appendChild(h("small","",sub));
+    return box;
+  }
+  function renderOverview(o){
+    var root=document.getElementById("overview");
+    root.innerHTML="";
+    o=o||{};
+    var p=o.primary||{};
+    var times=o.times||{};
+    root.appendChild(overviewCard(p.label||"상태 확인 중",p.detail||"",p.tone||"idle","KST "+(times.kst||"--:--")+" · ET "+(times.et||"--:--"),true));
+    (o.markets||[]).slice(0,2).forEach(function(m){root.appendChild(overviewCard(m.label,m.detail,m.tone,m.key));});
+    var w=o.work||{};
+    root.appendChild(overviewCard(w.label||"뉴스 분석 대기",w.detail||"",w.tone||"idle","뉴스/데이터"));
+  }
   function render(d){
     var list=document.getElementById("list");
+    renderOverview(d.overview);
     document.getElementById("dot").className="dot"+(d.running?"":" off");
     document.getElementById("status").textContent=(d.running?"자동매매 실행 중":"자동매매 정지")+(d.buy_enabled===false?" · 매수 비활성":"")+" · 갱신 "+new Date().toLocaleTimeString("ko-KR",{hour12:false});
     var cards=(d&&d.cards)||[];
@@ -2902,13 +2931,115 @@ def _format_price_display(price: Any, is_us: bool) -> str:
     return f"${value:,.2f}" if is_us else f"{value:,.0f}원"
 
 
+def _kiosk_market_overview(now: datetime | None = None) -> dict[str, Any]:
+    from datetime import time as _time
+    from zoneinfo import ZoneInfo
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    seoul = current.astimezone(ZoneInfo("Asia/Seoul"))
+    eastern = current.astimezone(ZoneInfo("America/New_York"))
+
+    krx_core = _is_live_market_core_open("KRX", current)
+    krx_ext = _is_live_market_extended_open("KRX", current)
+    us_core = _is_live_market_core_open("US", current)
+    us_ext = _is_live_market_extended_open("US", current)
+    us_day = (
+        seoul.weekday() < 5
+        and _time(9, 0) <= seoul.time() <= _time(16, 50)
+        and not us_core
+        and not (_time(4, 0) <= eastern.time() < _time(9, 30))
+        and not (_time(16, 0) < eastern.time() <= _time(20, 0))
+    )
+
+    if krx_core:
+        primary = ("국내 정규장", "KRX 매매 가능", "open")
+    elif us_core:
+        primary = ("미국 정규장", "해외 매매 가능", "open")
+    elif eastern.weekday() < 5 and not _is_us_market_holiday(eastern.date()) and _time(4, 0) <= eastern.time() < _time(9, 30):
+        primary = ("미국 프리마켓", "프장 감시 중", "pre")
+    elif eastern.weekday() < 5 and not _is_us_market_holiday(eastern.date()) and _time(16, 0) < eastern.time() <= _time(20, 0):
+        primary = ("미국 애프터마켓", "시간외 감시 중", "after")
+    elif us_day:
+        primary = ("해외 데이마켓", "KIS 주간주문 시간", "day")
+    elif krx_ext:
+        primary = ("국내 시간외/장전", "국내 예약·시간외 구간", "pre")
+    else:
+        primary = ("양쪽 휴장", "거래보다 분석 대기", "closed")
+
+    if krx_core:
+        krx_label, krx_detail, krx_tone = "국내 장 오픈", "09:00-15:30", "open"
+    elif krx_ext and seoul.weekday() < 5 and _time(8, 30) <= seoul.time() < _time(9, 0):
+        krx_label, krx_detail, krx_tone = "국내 장전", "08:30-09:00", "pre"
+    elif krx_ext:
+        krx_label, krx_detail, krx_tone = "국내 시간외", "15:30 이후", "after"
+    elif seoul.weekday() < 5 and seoul.time() < _time(8, 30):
+        krx_label, krx_detail, krx_tone = "국내 장전 대기", "08:30부터 감시", "idle"
+    else:
+        krx_label, krx_detail, krx_tone = "국내 휴장", "KRX 대기", "closed"
+
+    if us_core:
+        us_label, us_detail, us_tone = "미국 장 오픈", "09:30-16:00 ET", "open"
+    elif eastern.weekday() < 5 and not _is_us_market_holiday(eastern.date()) and _time(4, 0) <= eastern.time() < _time(9, 30):
+        us_label, us_detail, us_tone = "미국 프리마켓", "04:00-09:30 ET", "pre"
+    elif eastern.weekday() < 5 and not _is_us_market_holiday(eastern.date()) and _time(16, 0) < eastern.time() <= _time(20, 0):
+        us_label, us_detail, us_tone = "미국 애프터", "16:00-20:00 ET", "after"
+    elif us_day:
+        us_label, us_detail, us_tone = "해외 데이마켓", "09:00-16:50 KST", "day"
+    else:
+        us_label, us_detail, us_tone = "미국 휴장", "해외 대기", "closed"
+
+    snap = _live_snapshot()
+    progress = snap.get("progress") or {}
+    learning = snap.get("learning") or {}
+    collection_log = snap.get("collection_log") or []
+    latest_log = collection_log[-1] if collection_log else {}
+    progress_active = bool(progress.get("active") or snap.get("is_refreshing"))
+    if progress_active:
+        work_label = "뉴스·데이터 분석 중"
+        work_detail = str(progress.get("message") or "실시간 수집/분석 진행 중")
+        work_tone = "busy"
+    elif learning.get("active"):
+        work_label = "뉴스 분석 예약"
+        work_detail = "다음 수집 대기" if learning.get("next_collection_at") else "백그라운드 학습 대기"
+        work_tone = "idle"
+    elif latest_log:
+        work_label = "최근 분석 완료"
+        work_detail = str(latest_log.get("message") or latest_log.get("status") or "대기")
+        work_tone = "idle"
+    else:
+        work_label = "뉴스 분석 대기"
+        work_detail = "새 수집 사이클 대기"
+        work_tone = "idle"
+
+    return {
+        "primary": {"label": primary[0], "detail": primary[1], "tone": primary[2]},
+        "markets": [
+            {"key": "KRX", "label": krx_label, "detail": krx_detail, "tone": krx_tone},
+            {"key": "US", "label": us_label, "detail": us_detail, "tone": us_tone},
+        ],
+        "work": {"label": work_label, "detail": work_detail[:90], "tone": work_tone},
+        "times": {
+            "kst": seoul.strftime("%H:%M"),
+            "et": eastern.strftime("%H:%M"),
+        },
+    }
+
+
 def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     with _realtime_trading_lock:
         engine = _realtime_trading_engine
         running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
     if engine is None:
-        return {"generated_at": now.isoformat(), "running": running, "buy_enabled": None, "cards": []}
+        return {
+            "generated_at": now.isoformat(),
+            "running": running,
+            "buy_enabled": None,
+            "overview": _kiosk_market_overview(now),
+            "cards": [],
+        }
     status = engine.get_status()
     events = status.get("recent_events") or []
     keep_outcomes = {"submitted", "amended", "filled", "partially_filled", "blocked", "error", "open_sell_kept"}
@@ -2969,6 +3100,7 @@ def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
         "running": running,
         "buy_enabled": bool(status.get("buy_enabled")),
         "last_reason": status.get("last_reason"),
+        "overview": _kiosk_market_overview(now),
         "cards": cards,
     }
 
