@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
@@ -22,6 +22,16 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _row_time(row: dict[str, Any]) -> datetime | None:
+    value = str(row.get("as_of") or "")
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def train_live_short_horizon_model(
@@ -61,17 +71,35 @@ def train_live_short_horizon_model(
 
     holdout_fraction = min(0.5, max(0.1, _env_float("LIVE_MODEL_HOLDOUT_FRACTION", 0.3)))
     split = int(len(rows) * (1.0 - holdout_fraction))
-    y_train, y_val = y[:split], y[split:]
+    y_val = y[split:]
+    # R3: purged + embargoed holdout. Triple-barrier labels look up to `horizon`
+    # seconds forward, so a train row near the split leaks validation-period prices
+    # into its own label. Drop train rows whose label window (as_of + horizon + embargo)
+    # reaches the validation start, so the eligibility AUC is not contaminated.
+    horizon_s = _env_float("LIVE_LABEL_HORIZON_SECONDS", 600.0)
+    embargo_s = _env_float("LIVE_MODEL_EMBARGO_SECONDS", 60.0)
+    val_start = _row_time(rows[split]) if 0 < split < len(rows) else None
+    train_idx = list(range(split))
+    if val_start is not None:
+        purged = [
+            index
+            for index in range(split)
+            if (t := _row_time(rows[index])) is not None
+            and t + timedelta(seconds=horizon_s + embargo_s) <= val_start
+        ]
+        if purged:
+            train_idx = purged
+    y_train_purged = [y[index] for index in train_idx]
     holdout_evaluated = (
         0 < split < len(rows)
-        and sum(y_train) >= 1
-        and (len(y_train) - sum(y_train)) >= 1
+        and sum(y_train_purged) >= 1
+        and (len(y_train_purged) - sum(y_train_purged)) >= 1
         and sum(y_val) >= 1
         and (len(y_val) - sum(y_val)) >= 1
     )
     if holdout_evaluated:
-        # 홀드아웃 평가용 모델은 과거(train) 구간만으로 적합하고 미래(val) 구간에서 채점한다.
-        weights_h, bias_h = _fit_logistic(x_scaled[:split], y_train)
+        # 홀드아웃 평가용 모델은 (purge/embargo된) 과거 구간만으로 적합하고 미래(val)에서 채점한다.
+        weights_h, bias_h = _fit_logistic([x_scaled[index] for index in train_idx], y_train_purged)
         eval_labels = y_val
         eval_returns = returns[split:]
         eval_probs = [_sigmoid(_dot(row, weights_h) + bias_h) for row in x_scaled[split:]]
@@ -100,6 +128,7 @@ def train_live_short_horizon_model(
         "top_k_fraction": top_k / max(1.0, float(len(eval_labels))),
         "example_count": float(len(rows)),
         "validation_example_count": float(len(y_val)) if holdout_evaluated else 0.0,
+        "holdout_train_count": float(len(train_idx)) if holdout_evaluated else 0.0,
         "holdout_evaluated": 1.0 if holdout_evaluated else 0.0,
         "positive_labels": float(sum(y)),
         "negative_labels": float(len(y) - sum(y)),

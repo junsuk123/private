@@ -188,30 +188,73 @@ NumPy screening path.
 - The Rust native screening core gives the biggest single CPU speedup for wide
   candidate sets; build it if you screen large universes.
 
-## Optional: local LLM news sentiment (Ollama)
+## Optional: local LLM news sentiment (open-source, no Ollama)
 
-News/event sentiment can be judged by a **local LLM** instead of keyword rules, using the
-same shared `config/local_llm.env` as the Windows machine — no `torch`/`transformers` on the
-Pi, because the `local` provider only makes HTTP calls to Ollama.
+News/event sentiment can be judged by a **local open-source LLM** instead of keyword rules,
+using the same shared `config/local_llm.env` as the Windows machine. The app's `local`
+provider only makes HTTP calls to an OpenAI-compatible server, so **no `torch`/`transformers`
+is needed on the Pi**. Startup auto-detect probes `/health`, `/v1/models`, and `/api/tags` on
+the configured endpoint, so any such server works.
+
+### 64-bit Pi OS (arm64): Ollama
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh   # 64-bit Raspberry Pi OS (arm64) only
-ollama pull qwen2.5:1.5b-instruct                # small + fast enough for Pi CPU
-cp config/local_llm.env.example config/local_llm.env
-bash packaging/raspberrypi/run.sh
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5:1.5b-instruct
+cp config/local_llm.env.example config/local_llm.env    # default endpoint = :11434
 ```
 
-Requirements and behavior:
+### 32-bit Pi OS (armhf): build llama.cpp (verified on Pi 4, 8GB)
 
-- **64-bit Pi OS (arm64)** — Ollama does not support 32-bit armhf.
-- **8GB RAM recommended** when the LLM and the trading app run together.
-- The app **auto-detects** Ollama at startup. If it is not reachable, sentiment silently
-  falls back to the deterministic keyword classifier (`pi.env`/`run.sh` keep this safe).
+Ollama ships arm64 only, so on a 32-bit userland build llama.cpp from source and run its
+OpenAI-compatible `llama-server`. The one armhf gotcha is 64-bit atomics — link `-latomic`:
+
+```bash
+git clone --depth 1 https://github.com/ggerganov/llama.cpp && cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+      -DCMAKE_C_STANDARD_LIBRARIES=-latomic -DCMAKE_CXX_STANDARD_LIBRARIES=-latomic
+cmake --build build --target llama-server -j4
+# download a small GGUF (Apache-2.0):
+mkdir -p ~/models && cd ~/models
+wget -O qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf
+# run the server (127.0.0.1 only):
+cd ~/llama.cpp/build/bin
+LD_LIBRARY_PATH=$PWD ./llama-server -m ~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  --host 127.0.0.1 --port 8080 -c 2048 -t 4
+```
+
+Then point `config/local_llm.env` at it:
+
+```text
+LLM_EVENT_PROVIDER=local
+LLM_EVENT_MODEL=qwen2.5-1.5b-instruct
+LLM_EVENT_LOCAL_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
+LLM_EVENT_TIMEOUT_SECONDS=180
+LLM_EVENT_RESPONSE_MAX_TOKENS=200
+LLM_EVENT_MAX_ITEMS_PER_RUN=3
+```
+
+### Behavior and limits (verified)
+
+- **`LLM_EVENT_TIMEOUT_SECONDS` must be raised on a Pi.** A 1.5B model on the Pi 4 CPU takes
+  **~2 minutes** to generate the full classification JSON. The desktop default (12s) times out
+  and the system silently falls back to keyword sentiment. With `=180` a real classification
+  succeeded: `sentiment=POSITIVE, model=qwen2.5-1.5b-instruct, labels=(AnalystUpgrade, DividendRaise)`.
+- This latency suits the throttled, background news feed (`LLM_EVENT_MAX_ITEMS_PER_RUN` small).
+  For faster turnaround use `Qwen2.5-0.5B-Instruct` — **~10-25s/item** (verified) — but it is
+  weaker: it reads clear positives well yet can miss a negative (classifying it NEUTRAL). Weak
+  models also tend to ignore the JSON instruction and emit prose; the parser salvages the
+  sentiment keyword from that prose so the signal is not lost (labels/summary are dropped).
+  Choose 0.5B for speed, 1.5B for accuracy, or a 64-bit OS + Ollama.
+- Run `llama-server` at boot via systemd (verified): a unit at
+  `/etc/systemd/system/llama-server.service` running `llama-server` bound to `127.0.0.1:8080`,
+  `enable --now`. Point `ExecStart -m` at the 0.5B or 1.5B GGUF to switch models.
+- **8GB RAM recommended.** A 32-bit process is capped near ~3GB; a Q4 1.5B model (~1.1GB) fits.
+- If the server is unreachable, sentiment falls back to keyword rules — no crash.
 - Positive news is only a *soft confirmation* in the live buy path (never a solo trigger);
-  negative news reduces buy evidence. Tune with `REALTIME_NEWS_CONFIRM_BONUS` or disable with
+  negative news reduces buy evidence. Tune `REALTIME_NEWS_CONFIRM_BONUS` or disable with
   `REALTIME_NEWS_SENTIMENT_ENABLED=false`. See the main `README.md`.
-- Keep `LLM_EVENT_MAX_ITEMS_PER_RUN` small on a Pi so slow CPU inference does not back up the
-  refresh loop.
 
 ## Troubleshooting
 

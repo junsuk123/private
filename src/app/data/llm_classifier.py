@@ -390,6 +390,32 @@ def load_shared_local_llm_env(path: str | None = None) -> dict[str, str]:
     return applied
 
 
+def _local_llm_reachable(endpoint: str | None = None) -> tuple[bool, str]:
+    """Probe an OpenAI-compatible local LLM server (Ollama, llama.cpp, ...).
+
+    Derives host:port from the configured endpoint and tries a few common
+    liveness paths, so auto-detect works for any local server — not just
+    Ollama's `/api/tags`. Returns (reachable, detail).
+    """
+    from urllib.parse import urlparse
+
+    endpoint = endpoint or os.getenv("LLM_EVENT_LOCAL_ENDPOINT") or os.getenv(
+        "LLM_EVENT_ENDPOINT", "http://127.0.0.1:11434/v1/chat/completions"
+    )
+    parsed = urlparse(endpoint)
+    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "http://127.0.0.1:11434"
+    detail = "no endpoint probed"
+    for path in ("/health", "/v1/models", "/api/tags"):
+        try:
+            with urllib.request.urlopen(base + path, timeout=1.5) as response:
+                if 200 <= response.status < 500:
+                    return True, f"reachable via {path} ({response.status})"
+                detail = f"{path} -> {response.status}"
+        except Exception as exc:  # noqa: BLE001 - keep probing the next path.
+            detail = f"{path} -> {exc}"
+    return False, detail
+
+
 def configure_default_event_llm_env() -> dict[str, Any]:
     """Enable a local event LLM when no explicit LLM env was provided."""
     load_shared_local_llm_env()
@@ -403,11 +429,8 @@ def configure_default_event_llm_env() -> dict[str, Any]:
         os.environ["LLM_EVENT_LOCAL_ENDPOINT"] = "http://127.0.0.1:11434/v1/chat/completions"
     os.environ.setdefault("LLM_EVENT_MAX_ITEMS_PER_SOURCE", "1")
     os.environ.setdefault("LLM_EVENT_MAX_ITEMS_PER_RUN", "1")
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
-            os.environ["LLM_EVENT_CLASSIFIER_ENABLED"] = "true" if response.status == 200 else "false"
-    except Exception:
-        os.environ["LLM_EVENT_CLASSIFIER_ENABLED"] = "false"
+    reachable, _detail = _local_llm_reachable()
+    os.environ["LLM_EVENT_CLASSIFIER_ENABLED"] = "true" if reachable else "false"
     return event_llm_runtime_status()
 
 
@@ -482,22 +505,19 @@ def event_llm_runtime_status() -> dict[str, Any]:
     }
     if not enabled:
         if provider in {"local", "ollama", "llamacpp", "llama.cpp"}:
-            status["backend"] = "ollama"
-            status["device"] = "ollama-managed"
+            status["backend"] = "openai-compatible"
+            status["device"] = "local-server"
             status["endpoint"] = os.getenv("LLM_EVENT_LOCAL_ENDPOINT") or os.getenv(
                 "LLM_EVENT_ENDPOINT",
                 "http://127.0.0.1:11434/v1/chat/completions",
             )
-            try:
-                with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
-                    status["available"] = response.status == 200
-                    status["reason"] = (
-                        "LLM_EVENT_CLASSIFIER_ENABLED is false, but local LLM endpoint is reachable."
-                        if status["available"]
-                        else f"local LLM status {response.status}"
-                    )
-            except Exception as exc:
-                status["reason"] = f"LLM disabled because local LLM endpoint is unavailable: {exc}"
+            reachable, detail = _local_llm_reachable(status["endpoint"])
+            status["available"] = reachable
+            status["reason"] = (
+                "LLM_EVENT_CLASSIFIER_ENABLED is false, but local LLM endpoint is reachable."
+                if reachable
+                else f"LLM disabled because local LLM endpoint is unavailable: {detail}"
+            )
             return status
         status["reason"] = "LLM_EVENT_CLASSIFIER_ENABLED is false."
         return status
@@ -505,19 +525,16 @@ def event_llm_runtime_status() -> dict[str, Any]:
         status["reason"] = "LLM_EVENT_MODEL is not configured."
         return status
     if provider in {"local", "ollama", "llamacpp", "llama.cpp"}:
-        status["backend"] = "ollama"
-        status["device"] = "ollama-managed"
+        status["backend"] = "openai-compatible"
+        status["device"] = "local-server"
         endpoint = os.getenv("LLM_EVENT_LOCAL_ENDPOINT") or os.getenv(
             "LLM_EVENT_ENDPOINT",
             "http://127.0.0.1:11434/v1/chat/completions",
         )
         status["endpoint"] = endpoint
-        try:
-            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
-                status["available"] = response.status == 200
-                status["reason"] = None if status["available"] else f"local LLM status {response.status}"
-        except Exception as exc:
-            status["reason"] = f"local LLM unavailable: {exc}"
+        reachable, detail = _local_llm_reachable(endpoint)
+        status["available"] = reachable
+        status["reason"] = None if reachable else f"local LLM unavailable: {detail}"
         return status
     if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
         model_path = Path(model)
@@ -603,9 +620,21 @@ def _parse_json_object(value: str) -> dict[str, Any]:
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end >= start:
-        text = text[start : end + 1]
-    data = json.loads(text)
-    return data if isinstance(data, dict) else {}
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    # Weak local models (e.g. small quantized GGUF) often ignore the JSON
+    # instruction and emit prose. Rather than discard the LLM signal entirely,
+    # salvage the sentiment — the field that actually drives the ontology graph —
+    # by taking the earliest sentiment keyword mentioned in the output.
+    upper = text.upper()
+    hits = sorted((upper.find(word), word) for word in ("POSITIVE", "NEGATIVE", "NEUTRAL") if word in upper)
+    if hits:
+        return {"sentiment": hits[0][1]}
+    raise ValueError("LLM output contained neither a JSON object nor a sentiment keyword")
 
 
 def _sentiment(value: str) -> SentimentDirection:

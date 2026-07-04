@@ -4,10 +4,31 @@ import os
 
 from app.graph import KnowledgeGraph
 from app.market_affordability import affordability_for_market
-from app.schemas.domain import AccountSnapshot, ClassifiedEvent, IndicatorSnapshot, MarketSnapshot
+from app.schemas.domain import AccountSnapshot, ClassifiedEvent, IndicatorSnapshot, MarketSnapshot, SentimentDirection
 from app.graph.event_mapper import add_events_to_graph
 from app.graph.npu_classifier import get_ontology_npu_classifier
+from app.features.news_sentiment_store import NewsSentimentStore
 from app.strategy.investor_flow import assess_domestic_investor_flow
+
+
+def _record_news_sentiment(events: tuple[ClassifiedEvent, ...]) -> None:
+    """Persist per-ticker news sentiment (best-effort) so the real-time numeric
+    learner can weigh news by realized outcomes. Never raises."""
+    if os.getenv("NEWS_SENTIMENT_RECORD_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    scored = [event for event in events if event.sentiment in (SentimentDirection.POSITIVE, SentimentDirection.NEGATIVE)]
+    if not scored:
+        return
+    try:
+        store = NewsSentimentStore()
+    except Exception:  # noqa: BLE001 - optional side channel.
+        return
+    for event in scored:
+        score = 1.0 if event.sentiment == SentimentDirection.POSITIVE else -1.0
+        source = getattr(event, "source", None)
+        observed_at = getattr(source, "observed_at", None) or getattr(source, "retrieved_at", None)
+        for ticker in getattr(event, "tickers", ()):  # only tickers the classifier resolved
+            store.record(ticker, score, observed_at)
 
 
 def build_market_graph(
@@ -88,6 +109,7 @@ def build_market_graph(
         if momentum_score > 0.18 or confidence_score > 0.18:
             graph.add(market.ticker, "supportsSignal", "NpuCompositeMomentum", "npu-indicator-composite")
 
+    _record_news_sentiment(events)
     return add_events_to_graph(graph, events)
 
 

@@ -20,6 +20,7 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
 DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH = Path("data/store/account_dashboard.sqlite3")
+DEFAULT_NEWS_TRUST_PATH = Path("data/store/news_trust.json")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
 # Triple-barrier 라벨 기본값: 전략 청산 기준과 정렬(TP=take_profit 25bps, SL=stop_loss 100bps,
 # 지평=장중 보유창 10분). "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에 압도돼
@@ -93,6 +94,7 @@ def train_live_short_horizon_from_collected_features(
     minimum_negative_labels: int = 5,
 ) -> dict[str, Any]:
     rows = build_live_training_rows_from_feature_journal(journal_path, db_path=DEFAULT_REALTIME_STORE_PATH)
+    update_news_trust_from_rows(rows)
     artifact = train_live_short_horizon_model(
         rows,
         registry=registry,
@@ -212,7 +214,106 @@ def build_live_training_rows_from_feature_journal(
                     "source": str(journal_path),
                 }
             )
+    return _market_adjust_rows(rows)
+
+
+def _market_adjust_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """R1 — cross-sectional market/sector adjustment of the label (confounding fix).
+
+    Raw forward return mixes the common market move with the stock-specific effect,
+    so a naive label credits (or blames) news for market beta. Here each frame's
+    forward net return is demeaned against other symbols that entered in the same
+    short time bucket, yielding an ABNORMAL return; the binary label is the sign of
+    that abnormal return. When a bucket has <2 distinct symbols the market factor is
+    unidentifiable, so it degrades gracefully to the raw (absolute) label.
+    """
+    if os.getenv("LIVE_LABEL_MARKET_ADJUST", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+        return rows
+    bucket_seconds = max(30.0, _env_float("LIVE_LABEL_MARKET_BUCKET_SECONDS", 300.0))
+    buckets: dict[int, list[float]] = defaultdict(list)
+    bucket_symbols: dict[int, set[str]] = defaultdict(set)
+    parsed: list[tuple[int, float] | None] = []
+    for row in rows:
+        entry_time = _parse_iso_time(str(row.get("as_of") or ""))
+        raw = float(row.get("forward_net_return_bps", 0.0))
+        if entry_time is None:
+            parsed.append(None)
+            continue
+        key = int(entry_time.timestamp() // bucket_seconds)
+        buckets[key].append(raw)
+        bucket_symbols[key].add(str(row.get("ticker") or ""))
+        parsed.append((key, raw))
+    for row, item in zip(rows, parsed, strict=True):
+        raw = float(row.get("forward_net_return_bps", 0.0))
+        row["raw_forward_net_return_bps"] = raw
+        if item is None or len(bucket_symbols[item[0]]) < 2:
+            row["market_bps"] = 0.0
+            continue  # cannot identify a market factor from a single name; keep absolute.
+        key, _ = item
+        market_bps = sum(buckets[key]) / len(buckets[key])
+        abnormal_bps = raw - market_bps
+        row["market_bps"] = market_bps
+        row["forward_net_return_bps"] = abnormal_bps
+        row["label"] = int(abnormal_bps > 0.0)
+        row["label_source"] = f"{row.get('label_source', 'unknown')}+market_adjusted"
     return rows
+
+
+def _parse_iso_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def update_news_trust_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    path: str | Path = DEFAULT_NEWS_TRUST_PATH,
+) -> dict[str, Any]:
+    """Outcome-calibrated news trust (approach A, redefined on ABNORMAL returns).
+
+    Runs on the market-adjusted rows from `_market_adjust_rows`, so `forward_net_return_bps`
+    here is already demeaned against contemporaneous names — the edge measures how much
+    positive-news candidates OUT-PERFORMED the market, not raw beta. Still only a mild,
+    well-gated multiplier on the advisory confirm bonus (never a trade trigger). Pure
+    arithmetic over floats already in the rows — KB-scale output.
+    """
+    threshold = _env_float("NEWS_TRUST_MIN_SENTIMENT", 0.1)
+    min_samples = int(_env_float("NEWS_TRUST_MIN_SAMPLES", 30))
+    all_returns = [float(row.get("forward_net_return_bps", 0.0)) for row in rows]
+    positive_returns = [
+        float(row.get("forward_net_return_bps", 0.0))
+        for row in rows
+        if float((row.get("features") or {}).get("news_sentiment", 0.0)) > threshold
+    ]
+    if len(positive_returns) >= min_samples and all_returns:
+        baseline = sum(all_returns) / len(all_returns)
+        positive_mean = sum(positive_returns) / len(positive_returns)
+        edge_bps = positive_mean - baseline
+        # Conservative: +50bps of abnormal edge → 1.5x; -50bps → 0.5x (clamped tight).
+        scale = max(0.5, min(1.5, 1.0 + edge_bps / 100.0))
+        calibrated = True
+    else:
+        edge_bps = 0.0
+        scale = 1.0
+        calibrated = False
+    payload = {
+        "news_confirm_scale": round(scale, 4),
+        "edge_bps": round(edge_bps, 3),
+        "positive_samples": len(positive_returns),
+        "total_samples": len(all_returns),
+        "calibrated": calibrated,
+    }
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError:
+        pass
+    return payload
 
 
 def _trade_event_stats(db_path: str | Path) -> dict[str, Any]:

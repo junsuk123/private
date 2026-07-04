@@ -72,6 +72,16 @@ The loop:
 5. Saves versioned artifacts under `data/models/live_short_horizon/`.
 6. Promotes only live-eligible artifacts to `latest.json`.
 
+## Label Methodology & Confounding Controls
+
+Realized PnL is a confounded target: a stock's forward return is mostly the common market/sector move plus noise, so a naive "did it go up" label credits whatever features happen to be present (including news sentiment) for beta they did not cause. The pipeline mitigates this at three levels:
+
+- **Market-adjusted (abnormal) label (R1).** `_market_adjust_rows` demeans each frame's forward net return against other symbols that entered in the same short time bucket (`LIVE_LABEL_MARKET_BUCKET_SECONDS`, default 300s). The binary label is the sign of the resulting *abnormal* return, so a name that merely rode a market rally is not labeled positive. When a bucket has fewer than 2 distinct symbols the market factor is unidentifiable and it degrades gracefully to the raw label. Disable with `LIVE_LABEL_MARKET_ADJUST=false`.
+- **Multivariate conditioning (B).** `news_sentiment` is one feature in the logistic/linear fit alongside spread, momentum, volatility, flow, etc., so its coefficient reflects marginal predictive value *given* the co-features — not a univariate correlation.
+- **Purged + embargoed holdout (R3).** Triple-barrier labels look up to `LIVE_LABEL_HORIZON_SECONDS` forward, so train rows near the split leak validation prices into their own labels. The holdout fit drops train rows whose label window (`horizon + LIVE_MODEL_EMBARGO_SECONDS`) reaches the validation start, so the eligibility AUC is leakage-free.
+
+The outcome-calibrated news trust (`news_confirm_scale`) is computed on these *abnormal* returns and kept a mild, well-gated multiplier (clamped 0.5–1.5, `NEWS_TRUST_MIN_SAMPLES` default 30). Even with these controls this remains controlled correlation, not proven causation — the model stays advisory and `RiskManager` is the final gate.
+
 ## Live Decision Integration
 
 The model participates in `SharedLiveDecisionEngine.evaluate_buy`.

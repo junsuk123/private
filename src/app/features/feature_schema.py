@@ -20,6 +20,11 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     "max_drop_3m",
     "cost_to_volatility_ratio",
     "principal_cushion_ratio",
+    # Recency-decayed local-LLM news sentiment in [-1, 1] as of the decision time
+    # (0.0 = no fresh news). Lets the real-time numeric learner weigh news by
+    # realized outcomes. Adding this bumps schema_hash, so existing artifacts are
+    # retired and a fresh one retrains — expected and safe (model is advisory).
+    "news_sentiment",
 )
 
 

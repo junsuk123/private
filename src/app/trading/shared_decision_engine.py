@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import math
 from dataclasses import dataclass, field, replace
@@ -15,6 +16,30 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnaps
 from app.trading.auto_tuning_engine import AutoTuningEngine, MarketStateSnapshot
 from app.trading.decision_logger import DecisionLogger
 from app.strategy.rule_based import _holding_exit_adjustment, _ontology_flow_adjustment
+
+
+_NEWS_TRUST_CACHE: dict[str, Any] = {"mtime": None, "scale": 1.0}
+
+
+def _news_confirm_scale(path: str = "data/store/news_trust.json") -> float:
+    """Outcome-calibrated multiplier for the positive-news confirm bonus (approach A).
+
+    Written by the training pipeline from realized PnL; read here cached by mtime so
+    the tick loop does not touch disk every cycle. Defaults to 1.0 (neutral)."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return 1.0
+    if _NEWS_TRUST_CACHE["mtime"] != mtime:
+        scale = 1.0
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                scale = float(json.load(handle).get("news_confirm_scale", 1.0))
+        except (OSError, ValueError, TypeError):
+            scale = 1.0
+        _NEWS_TRUST_CACHE["scale"] = max(0.3, min(2.0, scale))
+        _NEWS_TRUST_CACHE["mtime"] = mtime
+    return float(_NEWS_TRUST_CACHE["scale"])
 
 
 # 매수 근거로 인정하는 supportsSignal(현금/affordability 류는 제외 — 그건 매수 "엣지"가 아님).
@@ -360,7 +385,8 @@ class SharedLiveDecisionEngine:
             except Exception:  # noqa: BLE001 - news is an enhancer, never fatal.
                 has_positive_news = has_negative_news = False
             if has_positive_news and not has_negative_news:
-                news_confirm_bonus = max(0.0, _env_float("REALTIME_NEWS_CONFIRM_BONUS", 0.15))
+                # Base bonus scaled by the outcome-calibrated trust learned from realized PnL.
+                news_confirm_bonus = max(0.0, _env_float("REALTIME_NEWS_CONFIRM_BONUS", 0.15)) * _news_confirm_scale()
                 if news_confirm_bonus > 0.0:
                     ontology_support = (*ontology_support, "PositiveNewsConfirm")
         flow_threshold = float(os.getenv("REALTIME_ONTOLOGY_BUY_SCORE", "0.12"))

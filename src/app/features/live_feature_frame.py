@@ -11,6 +11,7 @@ from app.data.market_data_health import evaluate_market_data_health
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.feature_provenance import FeatureProvenance
 from app.features.feature_schema import FeatureSchema, LIVE_SHORT_HORIZON_SCHEMA
+from app.features.news_sentiment_store import NewsSentimentStore
 
 
 class FeatureFrameError(RuntimeError):
@@ -60,9 +61,14 @@ class LiveFeatureFrameBuilder:
         max_quote_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_QUOTE_AGE_MS_US", "90000")),
         max_orderbook_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS_US", "90000")),
         journal_path: str | Path = "logs/live-feature-frames.jsonl",
+        sentiment_store: NewsSentimentStore | None = None,
     ) -> None:
         self.store = store
         self.schema = schema
+        try:
+            self.sentiment_store = sentiment_store or NewsSentimentStore()
+        except Exception:  # noqa: BLE001 - sentiment is optional; never block frame building.
+            self.sentiment_store = None
         self.max_quote_age_ms = max_quote_age_ms
         self.max_orderbook_age_ms = max_orderbook_age_ms
         self.max_quote_age_ms_us = max_quote_age_ms_us
@@ -140,6 +146,7 @@ class LiveFeatureFrameBuilder:
             "max_drop_3m": min((_safe_return(price, prices[0]) for price in prices), default=0.0),
             "cost_to_volatility_ratio": (orderbook.spread_bps / 10_000.0) / max(vol, 1e-6),
             "principal_cushion_ratio": 1.0,
+            "news_sentiment": self._news_sentiment(symbol, decision_time),
         }
         values = tuple(float(feature_dict[name]) for name in self.schema.feature_names)
         provenance = FeatureProvenance(
@@ -165,6 +172,20 @@ class LiveFeatureFrameBuilder:
         frame.validate()
         self._journal(frame)
         return frame
+
+    def _news_sentiment(self, symbol: str, decision_time: datetime) -> float:
+        """Recency-decayed news sentiment as of decision_time (0.0 = no fresh news).
+
+        No lookahead (only news observed on/before decision_time) and best-effort:
+        any failure yields neutral 0.0 so the market-data frame is never blocked.
+        """
+        if self.sentiment_store is None:
+            return 0.0
+        try:
+            value = self.sentiment_store.score_as_of(symbol, decision_time)
+        except Exception:  # noqa: BLE001 - never let optional sentiment break a frame.
+            return 0.0
+        return value if math.isfinite(value) else 0.0
 
     def _journal(self, frame: LiveFeatureFrame) -> None:
         payload = {
