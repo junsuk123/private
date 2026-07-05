@@ -1,3 +1,10 @@
+from app.graph.fact_adapters import (
+    fact_table_from_graph,
+    graph_from_fact_table,
+    rows_to_triples,
+)
+from app.graph.fact_dictionary import FactDictionary
+from app.graph.fact_table import FactRow, FactTable, dequantize_unit, quantize_unit
 from app.graph.knowledge_graph import KnowledgeGraph, Triple
 from app.graph.reasoner import (
     OntologyReasoner,
@@ -20,4 +27,12 @@ __all__ = [
     "FinalActionDecision",
     "get_ontology_runtime",
     "reset_ontology_runtime_cache",
+    "FactDictionary",
+    "FactTable",
+    "FactRow",
+    "quantize_unit",
+    "dequantize_unit",
+    "fact_table_from_graph",
+    "graph_from_fact_table",
+    "rows_to_triples",
 ]
