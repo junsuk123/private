@@ -24,8 +24,29 @@ RISK_STRATEGY_SIGNALS = {
     "CostBurdenHigh",
     "DataSnoopingRisk",
     "NoOutOfSampleValidation",
+    # Phase 6 no-trade / risk-context reasoners.
+    "QuoteStale",
+    "DataQualityLow",
+    "SyntheticData",
+    "EstimatedData",
+    "RecentLossReentry",
+    "StrategyConflict",
+    "ExecutionRisk",
 }
-RISK_MANAGER_BLOCKING_TAGS = {"TradeForbidden", "SpreadTooWide", "SlippageRiskHigh", "CostBurdenHigh"}
+# Feature names that the RiskManager should surface as hard no-trade context. Every
+# entry here also resolves to a TradeForbidden target below, so the RiskManager blocks
+# the BUY via its existing "TradeForbidden" check without needing a code change.
+RISK_MANAGER_BLOCKING_TAGS = {
+    "TradeForbidden",
+    "SpreadTooWide",
+    "SlippageRiskHigh",
+    "CostBurdenHigh",
+    "NoOutOfSampleValidation",
+    "QuoteStale",
+    "SyntheticData",
+    "EstimatedData",
+    "StrategyConflict",
+}
 
 _TAG_FEATURE_RULES: dict[str, tuple[str, str, str, str]] = {
     "BidAskBounceRisk": ("BidAskBounceRisk", "microstructure_risk", "increasesRiskOf", "RiskAdjustedSizing"),
@@ -35,6 +56,19 @@ _TAG_FEATURE_RULES: dict[str, tuple[str, str, str, str]] = {
     "CostBurdenHigh": ("CostBurdenHigh", "execution_cost_risk", "increasesRiskOf", "TradeForbidden"),
     "DataSnoopingRisk": ("DataSnoopingRisk", "strategy_validation_risk", "increasesRiskOf", "RiskAdjustedSizing"),
     "NoOutOfSampleValidation": ("NoOutOfSampleValidation", "strategy_validation_risk", "increasesRiskOf", "TradeForbidden"),
+    # --- Phase 6: data-freshness / data-quality / re-entry / conflict / execution ---
+    # Hard blocks (resolve to TradeForbidden): a stale quote or synthetic/estimated data
+    # in the live path, or a strategy conflict with no dominant action, makes a BUY unsafe.
+    "QuoteStale": ("QuoteStale", "data_freshness_risk", "increasesRiskOf", "TradeForbidden"),
+    "QuoteFreshness": ("QuoteStale", "data_freshness_risk", "increasesRiskOf", "TradeForbidden"),
+    "SyntheticData": ("SyntheticData", "data_quality_risk", "increasesRiskOf", "TradeForbidden"),
+    "EstimatedData": ("EstimatedData", "data_quality_risk", "increasesRiskOf", "TradeForbidden"),
+    "StrategyConflict": ("StrategyConflict", "strategy_conflict_risk", "increasesRiskOf", "TradeForbidden"),
+    # Soft risk context (resolve to RiskAdjustedSizing): reduce size / tighten rather than
+    # hard-block, matching the BidAskBounceRisk pattern.
+    "DataQualityLow": ("DataQualityLow", "data_quality_risk", "increasesRiskOf", "RiskAdjustedSizing"),
+    "RecentLossReentry": ("RecentLossReentry", "reentry_risk", "increasesRiskOf", "RiskAdjustedSizing"),
+    "ExecutionRisk": ("ExecutionRisk", "execution_risk", "increasesRiskOf", "RiskAdjustedSizing"),
     "RealityCheckPassed": ("RealityCheckPassed", "strategy_validation", "supportsSignal", "TradeAllowed"),
     "CostEfficientTrade": ("CostEfficientTrade", "net_profitability", "supportsSignal", "TradeAllowed"),
 }

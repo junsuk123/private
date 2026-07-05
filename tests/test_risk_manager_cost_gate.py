@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 
 from app.risk.manager import RiskManager
@@ -146,7 +147,9 @@ class TestRiskManagerCostGate(unittest.TestCase):
         exit_price = self.market.last_price * 1.05
         intent = _create_mock_intent(expected_exit_price=exit_price, target_net_return=0.01)
         risk_manager = RiskManager(rules=RiskRules(live_trading_enabled=False))
-        risk_manager.cost_engine.config["gate"]["max_cost_to_alpha_ratio"] = 0.01
+        risk_manager._profitability_gate.policy = replace(
+            risk_manager._profitability_gate.policy, max_cost_to_alpha_ratio=0.01
+        )
 
         result = risk_manager.validate(intent, self.account, self.market)
 
@@ -170,7 +173,9 @@ class TestRiskManagerCostGate(unittest.TestCase):
         exit_price = self.market.last_price * 1.05
         intent = _create_mock_intent(expected_exit_price=exit_price, target_net_return=0.01)
         risk_manager = RiskManager(rules=RiskRules(live_trading_enabled=False))
-        risk_manager.cost_engine.config["gate"]["max_slippage_rate"] = 0.0001
+        risk_manager._profitability_gate.policy = replace(
+            risk_manager._profitability_gate.policy, max_slippage_rate=0.0001
+        )
 
         result = risk_manager.validate(intent, self.account, self.market)
 

@@ -7,14 +7,16 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from app.cost import TradingCostEngine
+from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.live_feature_frame import LiveFeatureFrameBuilder
 from app.models.live_signal_predictor import LiveSignalPredictor, LiveSignalPrediction
 from app.risk import RiskManager
+from app.risk.position_sizing import PositionSizer, SizingInputs
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnapshot, OrderAction, OrderIntent, RiskRules, SourceMetadata, OrderSide, OrderType
 from app.trading.auto_tuning_engine import AutoTuningEngine, MarketStateSnapshot
 from app.trading.decision_logger import DecisionLogger
+from app.trading.dynamic_exit_policy import DynamicExitPolicy
 from app.strategy.rule_based import _holding_exit_adjustment, _ontology_flow_adjustment
 
 
@@ -187,6 +189,27 @@ def _buy_blocker_reason_codes(
     return tuple(dict.fromkeys(reasons))
 
 
+def _resolve_model_provider(
+    prediction: LiveSignalPrediction | None, model_ok: bool
+) -> tuple[str, bool]:
+    """Provider/fallback state for the buy decision (Phase 5 visibility).
+
+    - ``trained_model``: the fitted live-eligible artifact drove the decision.
+    - ``heuristic_fallback``: the model ran but was not approved, so the ontology /
+      adaptive fallback score drove the decision.
+    - ``unavailable``: the model produced no prediction at all (missing artifact,
+      schema mismatch, or inference disabled) and the heuristic fallback is used.
+
+    ``is_fallback`` is True whenever the trained model did not drive the decision, so
+    the GUI can surface fallback mode and sizing/confidence stay conservative.
+    """
+    if prediction is not None and model_ok:
+        return str(getattr(prediction, "provider", "trained_model") or "trained_model"), False
+    if prediction is not None:
+        return "heuristic_fallback", True
+    return "unavailable", True
+
+
 def _volatility_no_trade_reasons(policy_diag: dict[str, Any]) -> tuple[str, ...]:
     market_state = policy_diag.get("market_state") or {}
     symbol_volatility = float(market_state.get("symbol_volatility", 0.0) or 0.0)
@@ -228,6 +251,9 @@ class SharedLiveDecisionEngine:
             RiskRules(live_trading_enabled=False, min_average_daily_trading_value=1, max_volatility=1.0)
         )
         self.auto_tuner = AutoTuningEngine(decision_logger=decision_logger, refresh_quote=market_refresher)
+        self.profitability_gate = ProfitabilityGate()
+        self.dynamic_exit_policy = DynamicExitPolicy()
+        self.position_sizer = PositionSizer()
         self.market_refresher = market_refresher
         self.decision_logger = decision_logger or DecisionLogger()
         self._last_diagnostics: dict[str, Any] = {}
@@ -416,6 +442,7 @@ class SharedLiveDecisionEngine:
             recent_performance=0.0,
         )
         model_ok = bool(prediction is not None and prediction.approved)
+        model_provider, model_is_fallback = _resolve_model_provider(prediction, model_ok)
         fallback_allowed = True
         policy_state = self.auto_tuner.snapshot_market_state(
             symbol=symbol,
@@ -546,6 +573,8 @@ class SharedLiveDecisionEngine:
                 "runtime_execution_ready": runtime_execution_ready,
                 "effective_buy_threshold": effective_buy_threshold,
                 "spread_bps": spread_bps,
+                "model_provider": model_provider,
+                "model_is_fallback": model_is_fallback,
             }
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
@@ -597,14 +626,86 @@ class SharedLiveDecisionEngine:
         suggested_weight = max(0.001, suggested_weight * size_multiplier)
         if runtime_probe_support and not runtime_fallback_support:
             suggested_weight = min(suggested_weight, _env_float("REALTIME_RUNTIME_PROBE_BUY_WEIGHT", 0.003))
-        expected_return_bps = 100.0
-        if model_ok and prediction is not None:
-            expected_return_bps = max(expected_return_bps, float(prediction.expected_net_return_bps or 0.0))
-        expected_return_bps = max(expected_return_bps, fallback_score * 300.0, policy.min_expected_net_return * 10_000.0)
-        gross_expected_return = max(policy.min_expected_net_return * 0.5, expected_return_bps / 10_000.0)
+        # --- Honest expected return (no fabricated positive floor) --------------
+        # The expected exit price handed to the ProfitabilityGate must reflect a REAL
+        # predicted edge, not the old synthetic 100bps / fallback*300bps floor that
+        # forced every candidate to look profitable. When the trained model is
+        # available we use its cost-adjusted net-return estimate; otherwise we use a
+        # conservative estimate derived from the adaptive fallback score. Either way
+        # the gate below judges it honestly against the real round-trip cost and a
+        # dynamic minimum net edge, and REJECTS negative-expectancy buys.
+        if model_ok and prediction is not None and float(prediction.expected_net_return_bps or 0.0) > 0.0:
+            expected_return_bps = float(prediction.expected_net_return_bps)
+        else:
+            fallback_edge_bps_per_score = _env_float("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", 120.0)
+            expected_return_bps = max(0.0, fallback_score) * fallback_edge_bps_per_score
+        gross_expected_return = max(0.0, expected_return_bps / 10_000.0)
+        expected_exit_price = price * (1.0 + gross_expected_return)
+
+        # --- Unified profitability gate (authoritative, mandatory) --------------
+        gate_venue, gate_instrument = _cost_context_for_holding(symbol, market_name)
+        gate_orderbook = None
+        if orderbook is not None:
+            gate_orderbook = {
+                "best_bid": float(getattr(orderbook, "best_bid", 0.0) or 0.0),
+                "best_ask": float(getattr(orderbook, "best_ask", 0.0) or 0.0),
+            }
+        profitability_decision = self.profitability_gate.evaluate(
+            ProfitabilityInput(
+                symbol=symbol,
+                action="BUY",
+                market=market_name,
+                venue=gate_venue,
+                instrument_type=gate_instrument,
+                entry_price=price,
+                expected_exit_price=expected_exit_price,
+                quantity=1,
+                spread_rate=(spread_bps / 10_000.0) if spread_bps > 0 else None,
+                liquidity_score=liquidity_score,
+                realized_volatility=self._symbol_realtime_volatility(symbol, decision_time),
+                orderbook_snapshot=gate_orderbook,
+                average_daily_trading_value=float(getattr(market, "average_daily_trading_value", 0.0) or 0.0),
+                account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
+            )
+        )
+        if not profitability_decision.allowed:
+            reasons = (
+                *profitability_decision.rejection_reasons,
+                "PROFITABILITY_GATE_REJECTED",
+                f"QUOTE_REFRESH:{quote_refresh_status}",
+            )
+            diagnostics = {
+                "policy": policy.as_dict(),
+                "policy_state": policy_diag,
+                "quote_refresh_status": quote_refresh_status,
+                "fallback_score": fallback_score,
+                "ontology_score": ontology_score,
+                "spread_bps": spread_bps,
+                "profitability_decision": profitability_decision.as_dict(),
+                "model_provider": model_provider,
+                "model_is_fallback": model_is_fallback,
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
         confidence = max(policy.confidence_floor, float(getattr(prediction, "probability_success", 0.5) or 0.5) if model_ok else 0.5 + fallback_score * 0.2)
         if not model_ok:
             confidence = max(0.35, confidence - 0.1)
+        # Edge/confidence-aware position sizing (Phase 4). Caps the weight by a
+        # fractional-Kelly, edge-, liquidity-, and drawdown-scaled size. Never sizes a
+        # negative-expectancy trade (the ProfitabilityGate already blocked those). The
+        # RiskManager one-share bump still guarantees a whole share when affordable.
+        sizing = self.position_sizer.size(
+            SizingInputs(
+                net_expected_return=profitability_decision.net_expected_return,
+                target_net_return=profitability_decision.required_min_net_return,
+                confidence_score=confidence,
+                liquidity_score=liquidity_score,
+                account_drawdown_rate=domestic_drawdown_rate,
+                recent_same_strategy_loss=False,
+            )
+        )
+        if sizing.position_weight > 0.0:
+            suggested_weight = min(suggested_weight, sizing.position_weight)
         signal_name = "trained_expected_net_return" if model_ok else "ontology_fallback_buy"
         supporting = ("trained_live_model",) if model_ok else ("ontology_fallback",)
         if ontology_support:
@@ -619,6 +720,8 @@ class SharedLiveDecisionEngine:
         )
         strategy_metadata: dict[str, Any] = {
             "model_artifact_id": artifact_id,
+            "model_provider": model_provider,
+            "model_is_fallback": model_is_fallback,
             "feature_schema_hash": prediction.feature_schema_hash if prediction is not None else "",
             "ontology_buy_score": round(ontology_score, 4),
             "fallback_score": round(fallback_score, 4),
@@ -635,6 +738,8 @@ class SharedLiveDecisionEngine:
             "quote_refresh_status": quote_refresh_status,
             "quote_age_seconds": round(quote_age_seconds, 3),
             "stop_loss_price": price * (1.0 - policy.stop_loss),
+            "profitability_decision": profitability_decision.as_dict(),
+            "position_sizing": sizing.as_dict(),
         }
         if orderbook is not None:
             strategy_metadata["orderbook_snapshot"] = {
@@ -657,10 +762,10 @@ class SharedLiveDecisionEngine:
             model_uncertainty=prediction.uncertainty_score if prediction is not None else (0.85 if not model_ok else None),
             strategy_family="live_short_horizon",
             signal_name=signal_name,
-            expected_exit_price=price * (1.0 + gross_expected_return),
+            expected_exit_price=expected_exit_price,
             expected_holding_minutes=max(1, min(30, int(policy.time_exit_seconds / 60))),
             gross_expected_return=gross_expected_return,
-            target_net_return=policy.min_expected_net_return,
+            target_net_return=profitability_decision.required_min_net_return,
             validation_id=validation_id,
             strategy_metadata=strategy_metadata,
         )
@@ -680,6 +785,8 @@ class SharedLiveDecisionEngine:
             "quote_refresh_status": quote_refresh_status,
             "fallback_score": fallback_score,
             "model_ok": model_ok,
+            "model_provider": model_provider,
+            "model_is_fallback": model_is_fallback,
             "signal_score": signal_score,
             "buy_threshold": policy.buy_threshold,
             "effective_buy_threshold": effective_buy_threshold,
@@ -691,6 +798,7 @@ class SharedLiveDecisionEngine:
             "model_auxiliary_only": model_auxiliary_only,
             "adaptive_risk_rules": adaptive_rules,
             "risk_metadata": risk.metadata,
+            "profitability_decision": profitability_decision.as_dict(),
         }
         self.auto_tuner.record_feedback(
             {
@@ -812,8 +920,25 @@ class SharedLiveDecisionEngine:
         required_exit_price = max(cost_floor.required_exit_price, avg_cost * (1.0 + exit_policy.sell_target))
         required_exit_return = (required_exit_price - avg_cost) / avg_cost
         profitable_after_cost = price >= required_exit_price and cost_floor.net_expected_return >= target_net_return
+        # Single authoritative exit-policy resolution (Phase 2): all exit thresholds
+        # below are sourced from this one object and logged once, replacing the ~15
+        # inline REALTIME_* reads. Env vars still override for backward compatibility.
+        _exit_is_domestic = _is_domestic_symbol_or_market(symbol, holding.market or "")
+        _exit_spread_rate = (
+            max(0.0, float(getattr(orderbook, "spread_bps", 0.0) or 0.0)) / 10_000.0
+            if orderbook is not None
+            else 0.0
+        )
+        resolved_exit = self.dynamic_exit_policy.resolve(
+            all_in_cost_rate=float(getattr(cost_floor, "total_cost_rate", 0.0) or 0.0),
+            realized_volatility=self._symbol_realtime_volatility(symbol, decision_time),
+            spread_rate=_exit_spread_rate,
+            liquidity_score=1.0,
+            predicted_downside_risk=0.0,
+            account_drawdown_rate=(_account_domestic_unrealized_rate(account) if _exit_is_domestic else 0.0),
+        )
         loss_exit_allowed = exit_policy.allow_loss_exit
-        emergency_loss = max(exit_policy.stop_loss, float(os.getenv("REALTIME_EMERGENCY_STOP_LOSS", "0.05")))
+        emergency_loss = max(exit_policy.stop_loss, resolved_exit.emergency_stop_rate)
         account_total = max(
             float(
                 getattr(account, "equity", None)
@@ -853,21 +978,22 @@ class SharedLiveDecisionEngine:
         # sells at a MEANINGFUL net gain (quick target / trailing lock / stalled-but-
         # profitable time exit). Losers are HELD to recover; only a wide catastrophic
         # backstop cuts a position, so a normal dip is never dumped at a small loss.
-        quick_tp_net = max(0.0, _env_float("REALTIME_QUICK_TAKE_PROFIT_NET", 0.008))
-        lock_arm_net = max(0.0, _env_float("REALTIME_PROFIT_LOCK_ARM_NET", 0.010))
-        lock_giveback = min(0.95, max(0.0, _env_float("REALTIME_PROFIT_LOCK_GIVEBACK", 0.35)))
-        profit_time_exit_sec = max(0.0, _env_float("REALTIME_PROFIT_TIME_EXIT_SEC", 300.0))
-        # Routine tight stop is OFF by default (investment mode): selling at net -0.4%
-        # meant cutting on a ~-0.12% gross downtick — inside the noise band — which
-        # dumped nearly every buy at a small loss (the "sell below buy" churn). Set
-        # REALTIME_STOP_LOSS_NET > 0 to re-enable a tight stop for scalping.
-        stop_loss_net = max(0.0, _env_float("REALTIME_STOP_LOSS_NET", 0.0))
+        # All exit thresholds now come from the single resolved exit policy (Phase 2).
+        # quick_take_profit_net / profit_lock_arm / giveback / profit_time_exit honor
+        # REALTIME_* env overrides via the resolver; unset defaults are dynamic.
+        quick_tp_net = max(0.0, resolved_exit.quick_take_profit_net)
+        lock_arm_net = max(0.0, resolved_exit.profit_lock_arm_net)
+        lock_giveback = min(0.95, max(0.0, resolved_exit.trailing_giveback_rate))
+        profit_time_exit_sec = max(0.0, resolved_exit.profit_time_exit_sec)
+        # Routine tight net stop (opt-in via REALTIME_STOP_LOSS_NET > 0). Keeps each
+        # loss small and symmetric with the small take-profit.
+        stop_loss_net = max(0.0, resolved_exit.stop_loss_net)
         # Every profit-motivated exit must lock a MEANINGFUL net gain (after the full
         # round-trip cost), never churn a ~break-even position.
-        min_net_profit_exit = max(0.0, _env_float("REALTIME_MIN_NET_PROFIT_EXIT", 0.004))
+        min_net_profit_exit = max(0.0, resolved_exit.min_net_profit_exit)
         # Catastrophic capital circuit-breaker only (NOT a routine stop). Holds normal
         # dips; cuts a position solely to prevent ruin. Set 0 to hold with no stop at all.
-        hard_stop_loss = max(0.0, _env_float("REALTIME_HARD_STOP_LOSS", 0.08))
+        hard_stop_loss = max(0.0, resolved_exit.hard_stop_rate)
         small_account_mode = _env_bool("REALTIME_SMALL_ACCOUNT_MODE", False)
         small_account_equity = max(0.0, _env_float("REALTIME_SMALL_ACCOUNT_EQUITY_KRW", 300000.0))
         small_account_active = small_account_mode and account_total <= small_account_equity
@@ -1010,7 +1136,7 @@ class SharedLiveDecisionEngine:
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
 
         hard_emergency_exit = exit_reason.startswith(("hard_stop_loss", "domestic_emergency_exit"))
-        if _env_bool("REALTIME_BLOCK_SELL_BELOW_BREAKEVEN", False) and not hard_emergency_exit and not profitable_after_cost:
+        if resolved_exit.block_sell_below_breakeven and not hard_emergency_exit and not profitable_after_cost:
             diagnostics = {
                 "exit_policy": exit_policy.as_dict(),
                 "policy": policy.as_dict(),
@@ -1067,6 +1193,7 @@ class SharedLiveDecisionEngine:
                 "net_pnl_rate": round(net_pnl_rate, 6),
                 "peak_net_pnl": round(peak_net_pnl, 6),
                 "round_trip_cost_rate": round(round_trip_cost_rate, 6),
+                "resolved_exit_policy": resolved_exit.as_dict(),
                 "exit_reason": exit_reason,
                 "exit_action": str(exit_action),
                 "exit_suggested_weight": round(exit_suggested_weight, 6),

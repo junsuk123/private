@@ -1,0 +1,44 @@
+# Unified dynamic exit-policy (Phase 2 refactor).
+#
+# The SINGLE authoritative source for exit thresholds. Replaces thresholds previously
+# scattered across RealtimeTradingConfig, adaptive_exit_policy, and ~15 inline
+# REALTIME_* env reads. The resolver logs the effective values once at startup.
+#
+# Precedence (highest wins): explicit REALTIME_* env var > this file > built-in default.
+# Defaults below match the previous inline defaults for exact backward compatibility;
+# run.ps1 pins the production values. Tune from realized exit-quality logs.
+#
+# See docs/dynamic_exit_policy.md.
+
+# --- Take-profit (dynamic) ---------------------------------------------------------
+# take_profit_rate = max(min_take_profit_rate,
+#     all_in_cost_rate + min_net_profit_buffer + k_vol_take_profit * realized_volatility
+#     + liquidity_take_profit_buffer * (1 - liquidity_score)
+#     + spread_take_profit_buffer_k * spread_rate)
+min_take_profit_rate: 0.008            # env: REALTIME_QUICK_TAKE_PROFIT_NET
+min_net_profit_buffer: 0.004           # env: REALTIME_MIN_NET_PROFIT_EXIT
+k_vol_take_profit: 1.0
+liquidity_take_profit_buffer: 0.002
+spread_take_profit_buffer_k: 1.0
+
+# --- Profit lock / trailing --------------------------------------------------------
+profit_lock_arm_net: 0.010             # env: REALTIME_PROFIT_LOCK_ARM_NET
+min_trailing_giveback: 0.35            # env: REALTIME_PROFIT_LOCK_GIVEBACK
+k_trail_volatility: 5.0                # trailing_giveback += k_trail * realized_volatility
+profit_time_exit_sec: 300.0            # env: REALTIME_PROFIT_TIME_EXIT_SEC
+
+# --- Stops -------------------------------------------------------------------------
+stop_loss_net: 0.0                     # env: REALTIME_STOP_LOSS_NET (0 = off)
+min_soft_stop_rate: 0.006
+k_downside_soft_stop: 1.0              # soft_stop += k_downside * predicted_downside_risk
+hard_stop_loss_rate: 0.08             # env: REALTIME_HARD_STOP_LOSS (run.ps1 pins 0.03)
+emergency_stop_loss_rate: 0.05        # env: REALTIME_EMERGENCY_STOP_LOSS (run.ps1 pins 0.035)
+
+# --- Loss-exit governance ----------------------------------------------------------
+# Loss exits are neither always-blocked nor always-allowed: permitted only on strong
+# deterioration evidence, blocked for noise-level losses.
+allow_loss_exit: false                 # env: REALTIME_ALLOW_LOSS_EXIT
+block_sell_below_breakeven: false      # env: REALTIME_BLOCK_SELL_BELOW_BREAKEVEN
+ontology_sell_dominance: -0.55         # ontology_score <= this permits a loss exit
+strong_negative_forecast_bps: 8.0      # model net-return <= -this (bps) permits a loss exit
+noise_band_loss_rate: 0.004            # |loss| within this band is noise -> hold

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Mapping, Sequence
 
-from app.cost import CostBreakdown, TradingCostEngine
+from app.cost import CostBreakdown, ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
 from app.graph.theory_vote import FinalActionDecision
@@ -127,6 +127,7 @@ class StrategyCandidateFactory:
         config: StrategyFactoryConfig | None = None,
         *,
         cost_engine: TradingCostEngine | None = None,
+        profitability_gate: ProfitabilityGate | None = None,
         short_term_reversal: ShortTermReversalEngine | None = None,
         intraday_momentum: IntradayMomentumEngine | None = None,
         technical_rule: TechnicalRuleEngine | None = None,
@@ -135,6 +136,7 @@ class StrategyCandidateFactory:
     ) -> None:
         self.config = config or StrategyFactoryConfig()
         self.cost_engine = cost_engine or TradingCostEngine()
+        self.profitability_gate = profitability_gate or ProfitabilityGate(cost_engine=self.cost_engine)
         self.short_term_reversal = short_term_reversal or ShortTermReversalEngine(ShortTermReversalConfig())
         self.intraday_momentum = intraday_momentum or IntradayMomentumEngine(IntradayMomentumConfig())
         self.technical_rule = technical_rule or TechnicalRuleEngine(TechnicalRuleConfig())
@@ -232,16 +234,29 @@ class StrategyCandidateFactory:
         feature_snapshot = inputs.features_by_ticker.get(candidate.ticker)
         liquidity_score = _liquidity_score(candidate, feature_snapshot)
         spread_rate = _spread_rate(candidate, feature_snapshot)
-        if cost.net_expected_return <= target_net_return:
-            return None, FilteredStrategyCandidate(candidate, "BELOW_TARGET_NET_RETURN_AFTER_COST", cost)
-        if cost.gross_expected_return <= cost.break_even_return + _safety_margin(self.cost_engine):
-            return None, FilteredStrategyCandidate(candidate, "BELOW_BREAK_EVEN_WITH_MARGIN", cost)
-        if cost.cost_to_alpha_ratio >= self.config.max_cost_to_alpha_ratio:
-            return None, FilteredStrategyCandidate(candidate, "COST_BURDEN_HIGH", cost)
-        if spread_rate is None or spread_rate >= self.config.max_spread_rate:
+        # Missing spread is a data-quality reject (we cannot judge execution cost).
+        if spread_rate is None:
             return None, FilteredStrategyCandidate(candidate, "SPREAD_TOO_WIDE", cost)
-        if liquidity_score <= self.config.min_liquidity_score:
-            return None, FilteredStrategyCandidate(candidate, "LIQUIDITY_TOO_LOW", cost)
+        # Single authoritative net-profitability decision (same gate as RiskManager,
+        # realtime engine, and GUI). Replaces the previously bespoke per-field checks.
+        decision = self.profitability_gate.evaluate(
+            ProfitabilityInput(
+                symbol=candidate.ticker,
+                action="BUY",
+                market=self.config.market,
+                venue=self.config.venue,
+                instrument_type=self.config.instrument_type,
+                entry_price=candidate.entry_price,
+                expected_exit_price=candidate.expected_exit_price,
+                quantity=1,
+                spread_rate=spread_rate,
+                liquidity_score=liquidity_score,
+                target_net_return=target_net_return,
+            )
+        )
+        if not decision.allowed:
+            reason = decision.rejection_reasons[0] if decision.rejection_reasons else "PROFITABILITY_REJECTED"
+            return None, FilteredStrategyCandidate(candidate, reason, cost)
 
         ontology_score = _ontology_score(candidate.ontology_tags)
         risk_adjustment = _risk_adjustment(candidate, cost, spread_rate)

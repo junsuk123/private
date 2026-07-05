@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from math import floor
 from pathlib import Path
 
+import math
+
 from app.audit import AuditLogger
-from app.cost import TradingCostEngine
+from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report
 from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
@@ -33,6 +35,7 @@ class RiskManager:
     def __init__(self, rules: RiskRules | None = None, audit_logger: AuditLogger | None = None) -> None:
         self.rules = rules or RiskRules()
         self.cost_engine = TradingCostEngine()
+        self._profitability_gate = ProfitabilityGate(cost_engine=self.cost_engine)
         self.principal_protection = PrincipalProtectionEngine()
         self.audit_logger = audit_logger or AuditLogger(Path("logs/principal-protection.jsonl"))
 
@@ -278,35 +281,10 @@ class RiskManager:
                 self._record_principal_protection_decision(intent, market, quantity, protection)
                 metadata["cost_breakdown"] = cost.as_dict()
                 metadata["validation_required"] = not bool(intent.validation_id)
-                target_net_return = intent.target_net_return or 0.0
-                policy = self.cost_engine.policy_for(venue=venue, instrument_type=instrument_type)
-                notional = max(1e-9, cost.entry_price * cost.quantity)
-                spread_rate = cost.spread_cost / notional
-                slippage_rate = cost.slippage_cost / notional
-                max_spread_rate = _cost_gate_float(self.cost_engine, "max_spread_rate", 0.003)
-                max_slippage_rate = _cost_gate_float(self.cost_engine, "max_slippage_rate", 0.003)
                 checks["cost_adjusted_cash_available"] = (
                     spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost
                     <= cash_available_for_market
                 )
-                # BUY cost gates bind at their configured thresholds (no relaxation
-                # multipliers): a buy must clear its round-trip cost, meet its target
-                # net return, and not be dominated by cost/spread/slippage. These gates
-                # apply to BUY only; SELL/REDUCE exits are handled separately and are
-                # never blocked here, preserving turnover.
-                checks["net_profitability_check"] = cost.net_expected_return > 0.0
-                # The trade must be EXPECTED to reach its target return. Compared on
-                # gross because net-positivity and cost coverage are enforced by the
-                # net_profitability and break-even checks; comparing a net target to
-                # net would be self-defeating when the buy policy sets its target to
-                # the gross expectation (net = gross - cost is always just under it).
-                checks["target_net_return_check"] = cost.gross_expected_return >= target_net_return
-                checks["break_even_with_margin_check"] = (
-                    cost.gross_expected_return >= cost.break_even_return * 0.95
-                )
-                checks["cost_to_alpha_check"] = cost.cost_to_alpha_ratio <= policy.max_cost_to_alpha_ratio
-                checks["spread_risk_check"] = spread_rate <= max_spread_rate
-                checks["slippage_risk_check"] = slippage_rate <= max_slippage_rate
                 if not checks["cost_adjusted_cash_available"]:
                     _add_rejection(
                         reasons,
@@ -316,63 +294,50 @@ class RiskManager:
                         {"required_cash": spend + cost.buy_fee + cost.slippage_cost + cost.spread_cost + cost.market_impact_cost},
                     )
                     approved = False
-                if not checks["net_profitability_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        cost.reject_reason or "NET_RETURN_NOT_POSITIVE",
-                        "net_profitability_check",
-                        {"net_expected_return": cost.net_expected_return},
+                # Unified net-profitability authority. One ProfitabilityGate replaces the
+                # previously fragmented net/target/break-even/cost-to-alpha/spread/slippage
+                # checks so candidate generation, the RiskManager, the realtime engine, and
+                # the GUI all judge a BUY by exactly the same cost-aware net-edge rule.
+                # Realized volatility is left at 0.0 here (the realtime engine supplies the
+                # short-horizon volatility buffer); this backstop therefore never rejects a
+                # trade the engine's own stricter gate already approved.
+                decision = self._profitability_gate.evaluate(
+                    ProfitabilityInput(
+                        symbol=intent.ticker,
+                        action="BUY",
+                        market=intent.market,
+                        venue=venue,
+                        instrument_type=instrument_type,
+                        entry_price=market.last_price,
+                        expected_exit_price=float(intent.expected_exit_price),
+                        quantity=quantity,
+                        spread_rate=None,
+                        liquidity_score=_liquidity_score_from_market(market),
+                        realized_volatility=0.0,
+                        orderbook_snapshot=orderbook_snapshot if isinstance(orderbook_snapshot, dict) else None,
+                        average_daily_trading_value=market.average_daily_trading_value,
+                        account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
+                        target_net_return=intent.target_net_return,
                     )
-                    approved = False
-                if not checks["target_net_return_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        "BELOW_TARGET_NET_RETURN_AFTER_COST",
-                        "target_net_return_check",
-                        {"net_expected_return": cost.net_expected_return, "target_net_return": target_net_return},
-                    )
-                    approved = False
-                if not checks["break_even_with_margin_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        "BELOW_BREAK_EVEN_WITH_MARGIN",
-                        "break_even_with_margin_check",
-                        {
-                            "gross_expected_return": cost.gross_expected_return,
-                            "break_even_return": cost.break_even_return,
-                            "safety_margin_rate": policy.safety_margin_rate,
-                        },
-                    )
-                    approved = False
-                if not checks["cost_to_alpha_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        "COST_BURDEN_HIGH",
-                        "cost_to_alpha_check",
-                        {"cost_to_alpha_ratio": cost.cost_to_alpha_ratio, "max_cost_to_alpha_ratio": policy.max_cost_to_alpha_ratio},
-                    )
-                    approved = False
-                if not checks["spread_risk_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        "SPREAD_TOO_WIDE",
-                        "spread_risk_check",
-                        {"spread_rate": spread_rate, "max_spread_rate": max_spread_rate},
-                    )
-                    approved = False
-                if not checks["slippage_risk_check"]:
-                    _add_rejection(
-                        reasons,
-                        rejection_log,
-                        "SLIPPAGE_RISK_HIGH",
-                        "slippage_risk_check",
-                        {"slippage_rate": slippage_rate, "max_slippage_rate": max_slippage_rate},
-                    )
+                )
+                metadata["profitability_decision"] = decision.as_dict()
+                checks["profitability_gate"] = decision.allowed
+                if not decision.allowed:
+                    for reason in decision.rejection_reasons:
+                        _add_rejection(
+                            reasons,
+                            rejection_log,
+                            reason,
+                            "profitability_gate",
+                            {
+                                "net_expected_return": decision.net_expected_return,
+                                "required_min_net_return": decision.required_min_net_return,
+                                "gross_expected_return": decision.gross_expected_return,
+                                "break_even_exit_price": decision.break_even_exit_price,
+                                "spread_rate": decision.spread_rate,
+                                "cost_to_alpha_ratio": decision.cost_to_alpha_ratio,
+                            },
+                        )
                     approved = False
             elif quantity <= 0:
                 approved = False
@@ -513,6 +478,16 @@ def _venue_for_market(market: MarketSnapshot) -> str:
 
 def _cash_available_for_market(account: AccountSnapshot, market: MarketSnapshot) -> float:
     return account_cash_available_for_market(account, market)
+
+
+def _liquidity_score_from_market(market: MarketSnapshot) -> float:
+    """Normalize average-daily-trading-value into a 0..1 liquidity score.
+
+    Same log-scaled mapping the realtime engine uses so the ProfitabilityGate sees
+    a consistent liquidity input regardless of which caller invokes it.
+    """
+    adtv = max(0.0, float(getattr(market, "average_daily_trading_value", 0.0) or 0.0))
+    return min(1.0, math.log1p(adtv) / math.log1p(10_000_000_000))
 
 
 def _equity_for_sizing(account: AccountSnapshot, market: MarketSnapshot, fallback_equity: float) -> float:

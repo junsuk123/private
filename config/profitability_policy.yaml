@@ -1,0 +1,55 @@
+# Unified profitability-gate policy (Phase 1 refactor).
+#
+# This is the SINGLE authoritative source for the net-profitability BUY rule used by
+# the strategy candidate factory, the RiskManager BUY path, the realtime trading
+# engine, and the GUI. A BUY is allowed only when its expected NET return after ALL
+# costs clears a dynamic minimum edge.
+#
+# Precedence (highest wins), resolved values are logged once at startup:
+#   1. Environment variables (backward compatible with existing REALTIME_* vars)
+#   2. this file
+#   3. built-in defaults in src/app/cost/profitability_gate.py
+#
+# These are INITIAL defaults to be tuned from realized PnL/execution logs — they are
+# not assumed universally optimal. See docs/profitability_gate.md.
+
+# Minimum acceptable net expected return (after all costs) by market.
+# Overridable by REALTIME_MIN_BUY_NET_RETURN_KR / REALTIME_MIN_BUY_NET_RETURN_US.
+min_required_net_return:
+  default: 0.008
+  KR: 0.008
+  US: 0.012
+
+# Extra net headroom demanded above pure break-even before a buy is worth taking.
+# Overridable by REALTIME_MIN_NET_PROFIT_BUFFER_RATE.
+min_net_profit_buffer_rate: 0.001
+
+# Absolute spread ceiling as a fraction of mid ((ask-bid)/mid).
+max_spread_rate: 0.003
+
+# Expected entry-slippage ceiling as a fraction of notional (hard reject).
+max_slippage_rate: 0.003
+
+# Execution quality: spread may not consume more than this fraction of gross alpha.
+max_spread_alpha_ratio: 0.35
+
+# Cost may not dominate alpha beyond this ratio (all_in_cost_rate / |gross_return|).
+max_cost_to_alpha_ratio: 0.5
+
+# Liquidity floor (0..1 normalized score).
+min_liquidity_score: 0.3
+
+# --- Dynamic required-net-return buffers -------------------------------------------
+# required_min_net_return = max(
+#     min_required_net_return[market],
+#     min_net_profit_buffer_rate
+#       + volatility_buffer_k * realized_volatility
+#       + liquidity_buffer_max * (1 - liquidity_score)
+#       + account_buffer(if small account),
+# )
+volatility_buffer_k: 0.5
+liquidity_buffer_max: 0.003
+
+account_buffer:
+  small_account_equity_krw: 200000.0
+  small_account_extra_net: 0.002

@@ -2849,6 +2849,17 @@ _HOLD_REASON_TEXT = {
     "MARKET_SESSION_CLOSED": "장 마감",
     "MISSING_MARKET_DATA": "시세 없음",
     "open_sell_kept": "기존 매도 주문 유지(중복 방지)",
+    "BELOW_TARGET_NET_RETURN_AFTER_COST": "비용 차감 후 목표 순수익 미달",
+    "BELOW_BREAK_EVEN_WITH_MARGIN": "본전(마진 포함) 미만 예상 → 매수 보류",
+    "COST_BURDEN_HIGH": "거래비용 부담 과다",
+    "SPREAD_TOO_WIDE": "호가 스프레드가 넓어 매수 보류",
+    "SPREAD_CONSUMES_ALPHA": "스프레드가 기대수익을 잠식",
+    "LIQUIDITY_TOO_LOW": "유동성 부족으로 보류",
+    "SLIPPAGE_RISK_HIGH": "슬리피지 위험 과다",
+    "PROFITABILITY_GATE_REJECTED": "수익성 게이트 거부(순기대수익 부족)",
+    "RECENT_LOSS_SYMBOL_COOLDOWN": "최근 손실 종목 재매수 대기",
+    "NO_SELLABLE_QUANTITY": "매도 가능 수량 없음",
+    "OPEN_ORDER_OR_SETTLEMENT_LOCK": "미체결 주문/결제 잠금",
 }
 
 
@@ -8658,6 +8669,41 @@ HTML = """
       return `실행 ${reason} · 신호 ${Number(summary.signals || 0)} · BUY ${Number(summary.buy_signals || 0)} · SELL/REDUCE ${Number(summary.sell_signals || 0)} · 후보 ${Number(summary.intents || 0)} · 승인 매수 ${Number(summary.approved_buy_orders || 0)} · 승인 매도 ${Number(summary.approved_sell_orders || 0)} · 실행가능 매수 ${Number(summary.executable_buy_orders || 0)} · 실행가능 매도 ${Number(summary.executable_sell_orders || 0)} · 제출 ${Number(summary.submitted || 0)} · 현금부족 제외 ${skipped} · 차단 ${blocked} · 오류 ${errors} · ${gateText}`;
     }
 
+    const HOLD_REASON_TEXT = {
+      HOLD_BELOW_PROFIT_TARGET: '아직 목표 수익 미달 → 보유',
+      WIDE_SPREAD: '호가 스프레드가 넓어 매수 보류',
+      LOW_LIQUIDITY: '유동성 부족으로 보류',
+      INSUFFICIENT_CASH_FOR_ONE_SHARE: '1주 매수 현금 부족',
+      FALLBACK_SCORE_BELOW_THRESHOLD: '매수 점수 기준 미달',
+      ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK: '근거 확인 부족으로 보류',
+      MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION: '모델 단독 매수 불가(근거 필요)',
+      MODEL_FEATURE_UNAVAILABLE: '실시간 데이터 부족으로 판단 보류',
+      SELL_BELOW_BREAK_EVEN_BLOCKED: '손실 매도 방지(본전 미만)',
+      SMALL_ACCOUNT_ONE_SHARE_LOSS_BLOCK: '소액계좌 보호(1주 손실매도 차단)',
+      HOLD_UNPROFITABLE_ONTOLOGY_SELL_BLOCKED: '손실권 매도 보류',
+      LOSS_EXIT_DISABLED: '손실 청산 비활성',
+      MARKET_SESSION_CLOSED: '장 마감',
+      MISSING_MARKET_DATA: '시세 없음',
+      open_sell_kept: '기존 매도 주문 유지(중복 방지)',
+      BELOW_TARGET_NET_RETURN_AFTER_COST: '비용 차감 후 목표 순수익 미달',
+      BELOW_BREAK_EVEN_WITH_MARGIN: '본전(마진 포함) 미만 예상 → 매수 보류',
+      COST_BURDEN_HIGH: '거래비용 부담 과다',
+      SPREAD_TOO_WIDE: '호가 스프레드가 넓어 매수 보류',
+      SPREAD_CONSUMES_ALPHA: '스프레드가 기대수익을 잠식',
+      LIQUIDITY_TOO_LOW: '유동성 부족으로 보류',
+      SLIPPAGE_RISK_HIGH: '슬리피지 위험 과다',
+      PROFITABILITY_GATE_REJECTED: '수익성 게이트 거부(순기대수익 부족)',
+      RECENT_LOSS_SYMBOL_COOLDOWN: '최근 손실 종목 재매수 대기',
+      NO_SELLABLE_QUANTITY: '매도 가능 수량 없음',
+      OPEN_ORDER_OR_SETTLEMENT_LOCK: '미체결 주문/결제 잠금',
+    };
+    function humanizeReasonCode(code) {
+      const raw = String(code || '').trim();
+      if (!raw) return '';
+      const base = raw.split(':')[0].trim();
+      return HOLD_REASON_TEXT[base] || base.replaceAll('_', ' ');
+    }
+
     function liveExecutionRejectionText(summary = {}) {
       const rejections = Array.isArray(summary.rejections) ? summary.rejections.slice(0, 5) : [];
       if (!rejections.length) return '';
@@ -8665,7 +8711,7 @@ HTML = """
         const side = String(item.side || '').toUpperCase();
         const symbol = item.symbol || item.ticker || '-';
         const reasons = Array.isArray(item.reason_codes) ? item.reason_codes : [];
-        const reason = reasons.length ? reasons.join('/') : 'NO_DETAIL';
+        const reason = reasons.length ? reasons.map(humanizeReasonCode).join(' / ') : '사유 없음';
         return `${side} ${symbol}: ${reason}`;
       }).join(' | ');
     }
@@ -8830,7 +8876,8 @@ HTML = """
         const ticker = item.ticker || item.market || item.event_type || '-';
         const currency = orderCurrency(item);
         const amount = Number(item.notional ?? (price * quantityValue) ?? 0);
-        const detail = item.broker_order_id ? `주문 ${item.broker_order_id}` : (item.error || (Array.isArray(item.reason_codes) ? item.reason_codes.join(', ') : item.reason_codes) || '');
+        const reasonText = Array.isArray(item.reason_codes) ? item.reason_codes.map(humanizeReasonCode).join(', ') : (item.reason_codes ? humanizeReasonCode(item.reason_codes) : '');
+        const detail = item.broker_order_id ? `주문 ${item.broker_order_id}` : (item.error || reasonText || '');
         const priceAmount = price > 0
           ? `${formatMoney(price, currency)} / ${formatMoney(amount, currency)}${detail ? ` · ${detail}` : ''}`
           : detail || '-';

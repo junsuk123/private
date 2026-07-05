@@ -1,0 +1,30 @@
+# Position-sizing policy (Phase 4 refactor).
+#
+# Edge- and confidence-aware sizing with fractional Kelly and hard caps. Size is never
+# increased on confidence alone; a positive net expectancy is required (enforced by the
+# ProfitabilityGate). Tune from realized win-rate / payoff logs.
+#
+# Env backward compatibility: REALTIME_BUY_WEIGHT -> base_position_weight,
+# REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT -> max_position_weight,
+# REALTIME_SMALL_ACCOUNT_EQUITY_KRW -> small_account_equity_krw.
+
+base_position_weight: 0.003
+min_position_weight: 0.0
+max_position_weight: 0.10
+
+# Fractional Kelly (never full Kelly).
+kelly_fraction: 0.25
+max_kelly_cap: 0.10
+
+# Conservative priors used when no realized performance history is available.
+default_p_win: 0.5
+default_avg_win_net: 0.012
+default_avg_loss_net: 0.012
+
+# Drawdown / recent-loss dampening.
+drawdown_dampen_k: 4.0
+min_drawdown_multiplier: 0.25
+recent_loss_multiplier: 0.5
+
+# Small-account reference equity (KRW).
+small_account_equity_krw: 200000.0

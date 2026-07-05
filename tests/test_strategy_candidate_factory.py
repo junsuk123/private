@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+from app.cost import ProfitabilityGate, load_policy
 from app.features.schemas import OHLCVBar
 from app.features.short_horizon_features import ShortHorizonFeatures
 from app.schemas.domain import OrderAction
@@ -14,6 +16,18 @@ from app.strategy import (
 )
 
 
+def _permissive_gate() -> ProfitabilityGate:
+    """A gate with no minimum-net-return floor, for plumbing tests that assert a
+    candidate is produced regardless of the production policy floor."""
+    policy = replace(
+        load_policy(),
+        min_required_net_return={"default": 0.0, "KR": 0.0, "US": 0.0},
+        min_net_profit_buffer_rate=0.0,
+        min_liquidity_score=0.0,
+    )
+    return ProfitabilityGate(policy=policy)
+
+
 class StrategyCandidateFactoryTest(unittest.TestCase):
     def test_factory_integrates_enabled_engines_and_attaches_costs(self) -> None:
         bars = _bars("005930", [10_000 + i * 10 for i in range(25)] + [10_500])
@@ -23,7 +37,8 @@ class StrategyCandidateFactoryTest(unittest.TestCase):
                 enable_short_term_reversal=False,
                 enable_pair_relative_value=False,
                 target_net_return=0.0,
-            )
+            ),
+            profitability_gate=_permissive_gate(),
         )
 
         result = factory.build(
@@ -70,7 +85,8 @@ class StrategyCandidateFactoryTest(unittest.TestCase):
                 enable_short_term_reversal=False,
                 enable_pair_relative_value=False,
                 target_net_return=0.0,
-            )
+            ),
+            profitability_gate=_permissive_gate(),
         ).build(
             StrategyCandidateFactoryInput(
                 features_by_ticker={"005930": features},
@@ -100,7 +116,8 @@ class StrategyCandidateFactoryTest(unittest.TestCase):
                 enable_short_term_reversal=False,
                 enable_pair_relative_value=False,
                 target_net_return=0.0,
-            )
+            ),
+            profitability_gate=_permissive_gate(),
         ).build(
             StrategyCandidateFactoryInput(
                 features_by_ticker={"005930": features},

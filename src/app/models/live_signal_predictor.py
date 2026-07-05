@@ -18,6 +18,13 @@ class LiveSignalPrediction:
     reason_codes: tuple[str, ...]
     model_artifact_id: str
     feature_schema_hash: str
+    # Provider/backend visibility (Phase 5). `provider` names what produced this
+    # prediction ("trained_model" for the fitted live-eligible artifact; other
+    # values are reserved for callers that synthesize a placeholder). `is_fallback`
+    # is True whenever the prediction did NOT come from the trained model.
+    # Both default so existing constructors/tests stay backward compatible.
+    provider: str = "trained_model"
+    is_fallback: bool = False
 
 
 class LiveSignalPredictor:
@@ -52,6 +59,8 @@ class LiveSignalPredictor:
             reason_codes=tuple(reasons),
             model_artifact_id=artifact.artifact_id,
             feature_schema_hash=frame.feature_schema_hash,
+            provider="trained_model",
+            is_fallback=False,
         )
 
 

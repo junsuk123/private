@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -129,7 +130,11 @@ class AutoTuningEngineTest(unittest.TestCase):
             market_refresher=lambda symbol, market, decision_time: refreshed_market,
         )
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"USD": 1_000_000.0}, cash_equivalent_krw=130_000_000.0)
-        result = decision_engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=_Graph(("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying")))
+        # A strong flow signal (see the profitability refactor) maps to a genuinely
+        # clearing expected move so the buy passes the unified ProfitabilityGate; the
+        # point of this test is that the stale quote is refreshed BEFORE the decision.
+        with patch.dict("os.environ", {"REALTIME_FALLBACK_EDGE_BPS_PER_SCORE": "700"}):
+            result = decision_engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=_Graph(("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying")))
 
         self.assertTrue(result.approved, result.reason_codes)
         self.assertEqual(result.diagnostics.get("quote_refresh_status"), "quote_refresh_ok")

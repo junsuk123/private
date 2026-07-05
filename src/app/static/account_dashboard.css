@@ -195,6 +195,27 @@ body { margin: 0; background: #eef2f5; }
 .decision-event small,
 .decision-rejection small { color: #667085; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .decision-empty { color: #667085; padding: 16px; text-align: center; border: 1px dashed #d7dee8; border-radius: 8px; }
+.decision-rejection span { white-space: normal; }
+.rejection-metrics { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 2px; }
+.rejection-metrics span {
+  font-size: 11px;
+  color: #344054;
+  background: #eef2f7;
+  border-radius: 6px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.profitability-note { margin-top: 10px; color: #667085; font-size: 12px; }
+.system-warnings { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; width: 100%; }
+.warn-chip {
+  font-size: 12px;
+  color: #b54708;
+  background: #fff4e5;
+  border: 1px solid #fdb022;
+  border-radius: 999px;
+  padding: 3px 10px;
+}
 
 .account-filters { display: flex; gap: 8px; flex-wrap: wrap; }
 .account-filters input,

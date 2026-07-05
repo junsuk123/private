@@ -149,6 +149,22 @@ KIS account + realtime ticks/orderbooks + broker quotes
 - [docs/npu_runtime_architecture.md](docs/npu_runtime_architecture.md): NPU/CPU 경계와 fallback
 - [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md): Pi CPU-only 배포와 키오스크
 
+### 수익성 리팩터 (profitability-first refactor)
+
+모든 BUY은 단일 순수익 게이트로, 모든 청산은 단일 동적 청산 정책으로 판단합니다.
+
+![Profitability architecture](docs/diagrams/profitability_architecture.svg)
+
+![Before/after net-profitability gate](docs/diagrams/profitability_before_after.svg)
+
+- [docs/profitability_refactor_audit.md](docs/profitability_refactor_audit.md): 리팩터 전 시스템 감사(Phase 0)
+- [docs/profitability_gate.md](docs/profitability_gate.md): 단일 순수익 게이트(모든 BUY 판단의 유일한 기준)
+- [docs/dynamic_exit_policy.md](docs/dynamic_exit_policy.md): 통합 동적 청산 정책과 손실청산 허용 규칙
+- [docs/npu_model_validation.md](docs/npu_model_validation.md): 라이브 예측기 provider/fallback와 검증 지표
+- [docs/runtime_profiles.md](docs/runtime_profiles.md): 런타임 프로파일과 arming(≠ARM/라즈베리파이) 구분
+- [docs/gui_profitability_dashboard.md](docs/gui_profitability_dashboard.md): GUI 순수익/근거 패널
+- [docs/profitability_replay_report.md](docs/profitability_replay_report.md): before/after 리플레이 지표 리포트
+
 ## 테스트
 
 전체 테스트:

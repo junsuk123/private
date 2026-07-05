@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,11 @@ class _ApprovedPredictor:
     def predict(self, frame):
         return SimpleNamespace(
             probability_success=0.74,
-            expected_net_return_bps=80.0,
+            # A genuinely profitable model signal: ~2% predicted short-horizon move,
+            # which clears the unified ProfitabilityGate's KR net-return floor after
+            # round-trip cost. (The old 80bps signal is a marginal trade the gate now
+            # correctly rejects — see the profitability refactor.)
+            expected_net_return_bps=200.0,
             uncertainty_score=0.2,
             approved=True,
             reason_codes=(),
@@ -346,6 +351,22 @@ class _NoTickBuyStore:
 
 
 class RealtimeBuyDecisionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise SIGNAL WIRING (ontology/flow/probe drives a buy), not
+        # profitability calibration. Under the unified ProfitabilityGate a buy must
+        # clear a real net-edge floor (0.8% KR / 1.2% US after cost), so a strong
+        # flow signal must map to a genuinely clearing expected move. We raise the
+        # fallback-edge coefficient (default 120 bps/score) to represent that strong
+        # conviction; the gate still enforces break-even, spread, and cost burden.
+        self._prev_fallback_edge = os.environ.get("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE")
+        os.environ["REALTIME_FALLBACK_EDGE_BPS_PER_SCORE"] = "700"
+
+    def tearDown(self) -> None:
+        if self._prev_fallback_edge is None:
+            os.environ.pop("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", None)
+        else:
+            os.environ["REALTIME_FALLBACK_EDGE_BPS_PER_SCORE"] = self._prev_fallback_edge
+
     def test_ontology_drives_buy_when_model_unavailable(self) -> None:
         # 모델이 없어도(프레임 빌드 실패) 온톨로지 매수신호가 강하면 매수가 성립해야 한다.
         engine = SharedLiveDecisionEngine(_BuyStore(price=5.0), predictor=_DummyPredictor())

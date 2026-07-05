@@ -24,6 +24,8 @@ from typing import Any, Callable, Deque
 from zoneinfo import ZoneInfo
 
 from app.execution.kis_errors import LiveExecutionBlocked
+from app.execution.execution_quality import ExecutionQualityEngine, ExecutionQualityInput
+from app.storage.execution_quality_store import ExecutionQualityStore
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding
 
 
@@ -121,6 +123,11 @@ class RealtimeTradingEngine:
         # 종목별 시장 세션 게이트: 해당 종목의 거래소가 지금 열려 있는지(닫혀 있으면 주문 보류).
         self.market_open_provider = market_open_provider
         self.config = config or RealtimeTradingConfig()
+        # Execution-quality layer (Phase 3): rejects buys whose alpha would be consumed
+        # by spread/slippage and records realized slippage per symbol/strategy.
+        self.execution_quality = ExecutionQualityEngine(store=ExecutionQualityStore())
+        # No-chase guard: last price at which a buy failed to fill, per symbol.
+        self._last_failed_entry_price: dict[str, float] = {}
         self._lock = threading.Lock()
         self._last_submit_monotonic: dict[str, float] = {}
         self._error_backoff_until: dict[str, float] = {}
@@ -232,6 +239,14 @@ class RealtimeTradingEngine:
             self._buy_disabled_reason = (
                 f"DAILY_REALIZED_LOSS_BUY_STOP:{realized_pnl_today:.0f}<={-daily_loss_threshold:.0f}"
             )
+        # Display-only telemetry for the account dashboard profitability panel.
+        # These are read-model fields; they do not influence any trading decision.
+        summary["realized_pnl_today_krw"] = realized_pnl_today
+        summary["daily_loss_budget_krw"] = daily_loss_threshold if daily_loss_threshold > 0.0 else None
+        summary["daily_loss_budget_remaining_krw"] = (
+            max(0.0, daily_loss_threshold + realized_pnl_today) if daily_loss_threshold > 0.0 else None
+        )
+        summary["live_armed"] = buy_enabled
 
         # 최신 온톨로지 추론 그래프(분석 컨텍스트)를 1회 조회해 매도 판단에 반영한다.
         ontology_graph = None
@@ -286,7 +301,7 @@ class RealtimeTradingEngine:
                     sell_submitted += 1
             else:
                 summary["sell_rejected"] += 1
-                self._append_rejection(summary, holding.ticker, "SELL", result.reason_codes)
+                self._append_rejection(summary, holding.ticker, "SELL", result.reason_codes, getattr(result, "diagnostics", None))
 
         # 2) 매수: 미보유 후보 진입(매도와 독립 예산).
         if not buy_enabled:
@@ -348,11 +363,16 @@ class RealtimeTradingEngine:
             if result.approved and result.final_order is not None:
                 buy_submit_attempted += 1
                 summary["buy_submit_attempted"] = buy_submit_attempted
+                exec_ok, exec_reason = self._execution_quality_gate(symbol, result, decision_time)
+                if not exec_ok:
+                    summary["buy_rejected"] += 1
+                    self._append_rejection(summary, symbol, "BUY", (exec_reason,))
+                    continue
                 if self._submit(result.final_order, "BUY", result.reason_codes, decision_time, summary):
                     buy_submitted += 1
             else:
                 summary["buy_rejected"] += 1
-                self._append_rejection(summary, symbol, "BUY", result.reason_codes)
+                self._append_rejection(summary, symbol, "BUY", result.reason_codes, getattr(result, "diagnostics", None))
 
         summary["buy_submitted"] = buy_submitted
         summary["buy_submit_attempted"] = buy_submit_attempted
@@ -378,17 +398,40 @@ class RealtimeTradingEngine:
         symbol: str,
         side: str,
         reason_codes: tuple[str, ...],
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         rejections = summary.setdefault("rejections", [])
         if len(rejections) >= 12:
             return
-        rejections.append(
-            {
-                "symbol": symbol,
-                "side": side,
-                "reason_codes": tuple(reason_codes or ()),
+        entry: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "reason_codes": tuple(reason_codes or ()),
+        }
+        # Surface the already-computed profitability decision for the dashboard
+        # decision cards. Read-only projection; no decision logic here.
+        prof = (diagnostics or {}).get("profitability_decision") if isinstance(diagnostics, dict) else None
+        if isinstance(prof, dict):
+            entry["profitability"] = {
+                key: prof.get(key)
+                for key in (
+                    "entry_price",
+                    "expected_exit_price",
+                    "break_even_exit_price",
+                    "all_in_cost_rate",
+                    "gross_expected_return",
+                    "net_expected_return",
+                    "required_min_net_return",
+                    "spread_rate",
+                    "expected_slippage_rate",
+                    "liquidity_score",
+                    "cost_to_alpha_ratio",
+                )
             }
-        )
+            warnings = prof.get("warnings") or prof.get("data_quality_flags")
+            if warnings:
+                entry["warnings"] = list(warnings)
+        rejections.append(entry)
 
     def _fit_sell_order_to_available_quantity(self, order: FinalOrder, holding: Any) -> FinalOrder | None:
         sellable = getattr(holding, "sellable_quantity", None)
@@ -403,6 +446,67 @@ class RealtimeTradingEngine:
         if available >= int(order.quantity):
             return order
         return replace(order, quantity=available)
+
+    def _execution_quality_gate(
+        self, symbol: str, result: Any, decision_time: datetime
+    ) -> tuple[bool, str]:
+        """Execution-quality pre-submission gate (Phase 3). Best-effort; never raises.
+
+        Rejects a buy whose alpha would be consumed by spread/expected slippage, blocks
+        chasing a symbol upward after a failed/blocked entry, and records the reference
+        price for realized-slippage tracking. Returns (ok, reason_code).
+        """
+        try:
+            final_order = result.final_order
+            reference_price = float(getattr(final_order, "limit_price", 0.0) or 0.0)
+            if reference_price <= 0:
+                return True, "EXEC_OK"  # nothing to assess; defer to downstream gates
+            # No-chase guard: do not re-enter above the last blocked/failed entry price.
+            last_failed = self._last_failed_entry_price.get(symbol)
+            if last_failed is not None and reference_price > last_failed * 1.001:
+                return False, "EXEC_NO_CHASE_AFTER_FAILED_ENTRY"
+            pd = (result.diagnostics or {}).get("profitability_decision") or {}
+            orderbook = None
+            store = getattr(self.decision_engine, "store", None)
+            if store is not None and hasattr(store, "latest_orderbook"):
+                try:
+                    orderbook = store.latest_orderbook(symbol)
+                except Exception:  # noqa: BLE001
+                    orderbook = None
+            assessment = self.execution_quality.assess(
+                ExecutionQualityInput(
+                    symbol=symbol,
+                    strategy_family=str(getattr(final_order, "strategy_family", "") or "live_short_horizon"),
+                    decision_reference_price=reference_price,
+                    gross_expected_return=float(pd.get("gross_expected_return", 0.0) or 0.0),
+                    net_expected_return=float(pd.get("net_expected_return", 0.0) or 0.0),
+                    required_min_net_return=float(pd.get("required_min_net_return", 0.0) or 0.0),
+                    best_bid=float(getattr(orderbook, "best_bid", 0.0) or 0.0) if orderbook is not None else 0.0,
+                    best_ask=float(getattr(orderbook, "best_ask", 0.0) or 0.0) if orderbook is not None else 0.0,
+                    bid_depth=float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) if orderbook is not None else 0.0,
+                    ask_depth=float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0) if orderbook is not None else 0.0,
+                    order_quantity=int(getattr(final_order, "quantity", 1) or 1),
+                    side="BUY",
+                )
+            )
+            if not assessment.allowed:
+                # Record the rejected price so we do not chase this symbol upward.
+                self._last_failed_entry_price[symbol] = reference_price
+                return False, assessment.reject_reason or "EXEC_QUALITY_REJECTED"
+            # Clear any prior no-chase marker once a clean entry passes.
+            self._last_failed_entry_price.pop(symbol, None)
+            return True, "EXEC_OK"
+        except Exception as exc:  # noqa: BLE001 - execution-quality is best-effort.
+            self._record(
+                {
+                    "at": decision_time.isoformat(),
+                    "symbol": symbol,
+                    "kind": "BUY",
+                    "outcome": "exec_quality_error",
+                    "detail": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+            return True, "EXEC_QUALITY_SKIPPED"
 
     def _submit(
         self,

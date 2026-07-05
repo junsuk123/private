@@ -26,6 +26,12 @@ HARD_RISK_FEATURES = {
     "SpreadTooWide",
     "SlippageRiskHigh",
     "NoOutOfSampleValidation",
+    # Phase 6 no-trade reasoners: a stale quote, synthetic/estimated live data, or a
+    # strategy conflict with no dominant action forces the reasoning path to TradeForbidden.
+    "QuoteStale",
+    "SyntheticData",
+    "EstimatedData",
+    "StrategyConflict",
 }
 
 
@@ -107,7 +113,12 @@ def _explain(
     risk: tuple[str, ...],
     confidence: float,
 ) -> str:
-    return (
+    base = (
         f"{ticker} as of {as_of.isoformat()} -> {signal} with confidence {confidence:.2f}. "
         f"Positive={len(positive)}, negative={len(negative)}, risk={len(risk)}."
     )
+    if signal in {"TradeForbidden", "SellCandidate", "ReduceRiskCandidate"} and risk:
+        blockers = sorted(feature for feature in risk if feature in HARD_RISK_FEATURES)
+        drivers = blockers or sorted(set(risk))
+        base += f" No-trade/risk drivers: {', '.join(drivers)}."
+    return base

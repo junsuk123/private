@@ -121,3 +121,38 @@ Before restarting after unknown network or broker errors:
 ## Current Risk Posture
 
 The engine is intentionally conservative. Wide spreads, thin liquidity, stale realtime inputs, insufficient cash, missing ontology/runtime support, and model-only approvals should lead to no trade.
+
+## Profitability-first decision flow (refactor)
+
+Every BUY is now judged by ONE authoritative net-profitability rule and every exit by ONE
+resolved exit policy:
+
+1. **ProfitabilityGate** (`src/app/cost/profitability_gate.py`, `config/profitability_policy.yaml`):
+   a BUY is allowed only if expected NET return after all costs clears a dynamic minimum
+   edge (KR 0.8% / US 1.2% by default), the exit price clears break-even+buffer, and
+   spread/liquidity/cost-to-alpha are within bounds. The live buy path derives a **real**
+   predicted exit price (no fabricated 100 bps floor). See `docs/profitability_gate.md`.
+2. **DynamicExitPolicy** (`src/app/trading/dynamic_exit_policy.py`,
+   `config/dynamic_exit_policy.yaml`): unifies all exit thresholds (logged once). Loss exits
+   are permitted only on strong deterioration evidence and blocked for noise-level losses.
+   See `docs/dynamic_exit_policy.md`.
+3. **PositionSizer** (`src/app/risk/position_sizing.py`): edge/confidence/liquidity/drawdown
+   fractional-Kelly sizing; never sizes a negative-expectancy trade.
+4. **ExecutionQuality** (`src/app/execution/execution_quality.py`): rejects buys whose alpha
+   is consumed by spread/slippage; no-chase guard; realized-slippage store.
+
+### Arming is NOT ARM/Raspberry Pi
+
+`scripts/arm_live_trading.py` / `disarm_live_trading.py` are the **live-order-submission
+safety switch** (they write/clear `config/secrets/live_trading_armed.json`). "Arm" means
+*arm live submission* — it is unrelated to the ARM CPU architecture or Raspberry Pi. Before
+arming, `submit` raises `LiveExecutionBlocked` and the engine records `blocked` (no real
+order). Runtime profiles and the optional Raspberry Pi monitor node are documented in
+`docs/runtime_profiles.md`.
+
+### Measuring profitability
+
+`PYTHONPATH=src python scripts/profitability_replay_report.py` reports order-flow outcomes,
+rejection-reason distribution, and cost-aware realized metrics (net PnL, win rate, payoff,
+expectancy) from `logs/live-orders.jsonl`. Run it before and after to compare — the success
+criterion is improved NET expectancy and fewer net-negative trades, not more trades.

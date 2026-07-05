@@ -92,6 +92,15 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="kpi-grid" id="account-kpis"></div>
     </section>
 
+    <section class="dashboard-frame">
+      <div class="frame-title">
+        <h2>수익성 요약 (비용 차감 기준)</h2>
+        <span id="profitability-armed" class="badge">-</span>
+      </div>
+      <div class="kpi-grid" id="profitability-kpis"></div>
+      <div class="profitability-note" id="profitability-note"></div>
+    </section>
+
     <section class="main-grid">
       <article class="dashboard-frame">
         <div class="frame-title">
@@ -155,7 +164,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       </div>
       <div class="table-frame">
         <table>
-          <thead><tr><th>종목</th><th>시장</th><th>수량</th><th>평단</th><th>현재가</th><th>평가금액</th><th>평가손익</th><th>수익률</th><th>비중</th><th>통화</th></tr></thead>
+          <thead><tr><th>종목</th><th>시장</th><th>수량</th><th>평단</th><th>손익분기</th><th>현재가</th><th>평가금액</th><th>평가손익(총)</th><th>예상순손익</th><th>수익률</th><th>비중</th><th>통화</th></tr></thead>
           <tbody id="holdings-body"></tbody>
         </table>
       </div>

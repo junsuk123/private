@@ -1,0 +1,32 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='900' height='340' viewBox='0 0 900 340'>
+<rect width='900' height='340' fill='#ffffff'/>
+<text x='450' y='34' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='20' font-weight='700' fill='#1b1f24' text-anchor='middle'>BUY decision flow (profitability-first)</text>
+<defs><marker id='arrow' markerWidth='10' markerHeight='10' refX='8' refY='3' orient='auto' markerUnits='strokeWidth'><path d='M0,0 L8,3 L0,6 z' fill='#8b949e'/></marker></defs>
+<rect x='20' y='120' width='150' height='66' rx='10' fill='#1f6feb'/>
+<text x='95' y='149' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>Signal + Model</text>
+<text x='95' y='167' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>predicted edge</text>
+<line x1='170' y1='153' x2='190' y2='153' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='190' y='120' width='150' height='66' rx='10' fill='#1a7f37'/>
+<text x='265' y='149' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>ProfitabilityGate</text>
+<text x='265' y='167' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>net &#8805; dynamic floor</text>
+<line x1='340' y1='153' x2='360' y2='153' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='360' y='120' width='150' height='66' rx='10' fill='#1f6feb'/>
+<text x='435' y='149' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>PositionSizer</text>
+<text x='435' y='167' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>fractional Kelly</text>
+<line x1='510' y1='153' x2='530' y2='153' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='530' y='120' width='150' height='66' rx='10' fill='#1f6feb'/>
+<text x='605' y='149' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>RiskManager</text>
+<text x='605' y='167' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>same gate (backstop)</text>
+<line x1='680' y1='153' x2='700' y2='153' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='700' y='120' width='150' height='66' rx='10' fill='#1f6feb'/>
+<text x='775' y='149' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>ExecutionQuality</text>
+<text x='775' y='167' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>spread / slippage / fill</text>
+<rect x='360' y='250' width='150' height='54' rx='10' fill='#1b1f24'/>
+<text x='435' y='273' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>KIS order</text>
+<text x='435' y='291' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>(guarded / armed)</text>
+<line x1='775' y1='186' x2='460' y2='250' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<text x='20' y='230' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='13' font-weight='700' fill='#cf222e' text-anchor='start'>Any stage may REJECT → no order (reasons surfaced to GUI):</text>
+<text x='20' y='252' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' font-weight='400' fill='#57606a' text-anchor='start'>MISSING_EXPECTED_EXIT_PRICE, BELOW_TARGET_NET_RETURN_AFTER_COST, BELOW_BREAK_EVEN_WITH_MARGIN,</text>
+<text x='20' y='270' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' font-weight='400' fill='#57606a' text-anchor='start'>COST_BURDEN_HIGH, SPREAD_TOO_WIDE, SPREAD_CONSUMES_ALPHA, LIQUIDITY_TOO_LOW, SLIPPAGE_RISK_HIGH</text>
+<text x='20' y='310' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='12' font-weight='700' fill='#9a6700' text-anchor='start'>Expected exit price is a REAL predicted edge (no fabricated 100bps floor).</text>
+</svg>

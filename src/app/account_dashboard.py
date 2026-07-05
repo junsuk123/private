@@ -32,6 +32,9 @@ class HoldingDashboardRow:
     last_price_source: str = "account"
     updated_at: str = ""
     is_stale: bool = False
+    round_trip_cost_rate: float = 0.0
+    break_even_price: float = 0.0
+    estimated_net_pnl_krw: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -180,11 +183,13 @@ class AccountDashboardService:
             principal_protection=dict(status.get("principal_protection") or {}),
             data_quality_warnings=_warnings(status, logs, is_stale),
         )
+        trade_rows = _trade_rows(logs)
         dashboard = {
             "snapshot": asdict(snapshot),
             "holdings": [asdict(row) for row in holdings],
             "cash": [asdict(row) for row in cash_rows],
-            "trades": _trade_rows(logs),
+            "trades": trade_rows,
+            "profitability": _profitability_summary(trade_rows, snapshot),
             "logs": {
                 "collection_log": list(logs.get("collection_log") or []),
                 "last_error": logs.get("last_error"),
@@ -269,6 +274,14 @@ def _holding_from_position(position: dict[str, Any], updated_at: str) -> Holding
         purchase_krw = quantity * average_price if market_group == "domestic" else evaluation_krw
     if pnl_krw == 0:
         pnl_krw = evaluation_krw - purchase_krw
+    # Exit-cost aware fields. round_trip_cost_rate is attached by the realtime exit
+    # decision engine to exit intents; account snapshots rarely carry it, so these
+    # stay 0 and the front-end shows "n/a" rather than fabricating a break-even.
+    round_trip_cost_rate = _num(
+        position.get("round_trip_cost_rate") or position.get("all_in_cost_rate")
+    )
+    break_even_price = average_price * (1.0 + round_trip_cost_rate) if (average_price > 0 and round_trip_cost_rate > 0) else 0.0
+    estimated_net_pnl_krw = pnl_krw - round_trip_cost_rate * evaluation_krw if round_trip_cost_rate > 0 else 0.0
     return HoldingDashboardRow(
         market_group=market_group,
         market=market,
@@ -292,6 +305,9 @@ def _holding_from_position(position: dict[str, Any], updated_at: str) -> Holding
         last_price_source=str(position.get("last_price_source") or "account"),
         updated_at=updated_at,
         is_stale=False,
+        round_trip_cost_rate=round_trip_cost_rate,
+        break_even_price=break_even_price,
+        estimated_net_pnl_krw=estimated_net_pnl_krw,
     )
 
 
@@ -420,6 +436,47 @@ def _is_us_market(market: str, ticker: str) -> bool:
     if upper_market in {"US", "NASDAQ", "NASD", "NYSE", "AMEX", "OVERSEAS"}:
         return True
     return bool(str(ticker or "").strip()) and not str(ticker or "").isdigit()
+
+
+def _profitability_summary(trades: list[dict[str, Any]], snapshot: AccountDashboardSnapshot) -> dict[str, Any]:
+    """Derive win-rate / payoff / expectancy from realized-trade rows.
+
+    Uses the same trade rows that feed the trade table. Values that cannot be
+    computed from available data are returned as ``None`` so the front-end can
+    show ``n/a`` instead of a fabricated number. No trading logic here — this is
+    a pure read-model over already-realized fills.
+    """
+    realized = [_num(t.get("realized_pnl_krw")) for t in trades if _num(t.get("realized_pnl_krw")) != 0.0]
+    wins = [v for v in realized if v > 0]
+    losses = [v for v in realized if v < 0]
+    closed = len(realized)
+    fees = sum(_num(t.get("fee_krw")) for t in trades)
+    tax = sum(_num(t.get("tax_krw")) for t in trades)
+    win_rate = (len(wins) / closed) if closed else None
+    avg_win = (sum(wins) / len(wins)) if wins else None
+    avg_loss = (sum(losses) / len(losses)) if losses else None  # negative
+    payoff = (avg_win / abs(avg_loss)) if (avg_win is not None and avg_loss not in (None, 0.0)) else None
+    if win_rate is not None and avg_win is not None and avg_loss is not None:
+        expectancy = win_rate * avg_win + (1.0 - win_rate) * avg_loss
+    else:
+        expectancy = None
+    return {
+        "closed_trade_count": closed,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "gross_realized_pnl_krw": sum(realized),
+        "realized_pnl_today_krw": snapshot.realized_pnl_today_krw,
+        "unrealized_pnl_krw": snapshot.unrealized_pnl_krw,
+        "trade_cost_krw": fees + tax,
+        "fees_krw": fees,
+        "tax_krw": tax,
+        "net_after_cost_krw": snapshot.realized_pnl_today_krw - (fees + tax),
+        "win_rate": win_rate,
+        "avg_win_krw": avg_win,
+        "avg_loss_krw": avg_loss,
+        "payoff_ratio": payoff,
+        "expectancy_krw": expectancy,
+    }
 
 
 def _warnings(status: dict[str, Any], logs: dict[str, Any], is_stale: bool) -> list[str]:

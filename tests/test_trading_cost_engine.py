@@ -125,7 +125,17 @@ def test_risk_manager_records_cost_breakdown_and_blocks_unprofitable_buy() -> No
 
     assert not result.approved
     assert "cost_breakdown" in result.metadata
-    assert "NET_RETURN_NOT_POSITIVE" in result.rejection_reasons
+    # A +0.1% gross exit cannot clear KR round-trip cost; the unified profitability
+    # gate rejects it (reason code is one of the cost-related codes).
+    assert any(
+        reason in result.rejection_reasons
+        for reason in (
+            "NET_RETURN_NOT_POSITIVE",
+            "BELOW_TARGET_NET_RETURN_AFTER_COST",
+            "BELOW_BREAK_EVEN_WITH_MARGIN",
+            "COST_BURDEN_HIGH",
+        )
+    )
 
 
 def test_streaming_demo_records_domestic_trade_costs() -> None:

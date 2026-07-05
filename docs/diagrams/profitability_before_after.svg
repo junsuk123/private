@@ -1,0 +1,30 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='900' height='340' viewBox='0 0 900 340'>
+<rect width='900' height='340' fill='#ffffff'/>
+<text x='450' y='34' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='20' font-weight='700' fill='#1b1f24' text-anchor='middle'>Before → After: net-profitability gate</text>
+<defs><marker id='arrow' markerWidth='10' markerHeight='10' refX='8' refY='3' orient='auto' markerUnits='strokeWidth'><path d='M0,0 L8,3 L0,6 z' fill='#8b949e'/></marker></defs>
+<text x='30' y='70' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='700' fill='#cf222e' text-anchor='start'>BEFORE</text>
+<rect x='30' y='84' width='180' height='56' rx='10' fill='#cf222e'/>
+<text x='120' y='108' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>Signal</text>
+<text x='120' y='126' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>fabricated 100bps</text>
+<line x1='210' y1='112' x2='260' y2='112' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='260' y='84' width='180' height='56' rx='10' fill='#57606a'/>
+<text x='350' y='108' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>RiskManager</text>
+<text x='350' y='126' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>garbage-in exit price</text>
+<text x='30' y='172' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='13' font-weight='700' fill='#1b1f24' text-anchor='start'>Replay of live journal:</text>
+<text x='30' y='194' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='13' font-weight='700' fill='#cf222e' text-anchor='start'>gross PnL +1,342  /  NET PnL -1,701</text>
+<text x='30' y='214' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='12' font-weight='400' fill='#57606a' text-anchor='start'>net expectancy -0.00117  /  101 of 181 net-negative</text>
+<text x='470' y='70' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='15' font-weight='700' fill='#1a7f37' text-anchor='start'>AFTER</text>
+<rect x='470' y='84' width='170' height='56' rx='10' fill='#1f6feb'/>
+<text x='555' y='108' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>Real edge</text>
+<text x='555' y='126' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>model / fallback est.</text>
+<line x1='640' y1='112' x2='690' y2='112' stroke='#8b949e' stroke-width='2' marker-end='url(#arrow)'/>
+<rect x='690' y='84' width='180' height='56' rx='10' fill='#1a7f37'/>
+<text x='780' y='108' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='14' font-weight='700' fill='#ffffff' text-anchor='middle'>ProfitabilityGate</text>
+<text x='780' y='126' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' fill='#ffffff' text-anchor='middle'>net &#8805; required min</text>
+<text x='470' y='172' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='13' font-weight='700' fill='#1b1f24' text-anchor='start'>A BUY is allowed only when</text>
+<text x='470' y='194' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='12' font-weight='700' fill='#1a7f37' text-anchor='start'>net_expected_return ≥ required_min_net_return</text>
+<text x='470' y='214' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='11' font-weight='400' fill='#57606a' text-anchor='start'>AND exit ≥ break-even+buffer AND spread/liquidity/cost OK</text>
+<text x='470' y='234' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='12' font-weight='400' fill='#57606a' text-anchor='start'>gross-positive / net-negative trades are rejected</text>
+<line x1='450' y1='60' x2='450' y2='250' stroke='#8b949e' stroke-dasharray='4 4'/>
+<text x='450' y='300' font-family='Segoe UI, Helvetica, Arial, sans-serif' font-size='12' font-weight='400' fill='#57606a' text-anchor='middle'>One authoritative decision object across candidate, risk, engine, and GUI.</text>
+</svg>
