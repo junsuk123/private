@@ -7,7 +7,7 @@ As of the current `run.ps1` entry point, the system is a guarded KIS live-capabl
 
 This guide covers the semantic feature subsystem under `src/app/features`. It is an extensible layer for richer indicators, semantic states, graph triples, and model rows.
 
-For the full repository flow, see `docs/diagrams/system_overview.svg`. This guide mainly expands the diagram's feature-engineering and ontology/graph-reasoning stages.
+For the full repository flow, see `docs/diagrams/system_overview.png`. This guide mainly expands the diagram's feature-engineering and ontology/graph-reasoning stages.
 
 The current runtime has two feature paths:
 

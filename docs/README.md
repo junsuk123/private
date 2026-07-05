@@ -2,7 +2,7 @@
 
 이 디렉터리는 현재 코드 기준의 운영 문서입니다. 최상위 개요는 [../README.md](../README.md)를 먼저 보고, 세부 운영/설계는 아래 문서를 따라가면 됩니다.
 
-![Current runtime architecture](diagrams/system_overview.svg)
+![Current runtime architecture](diagrams/system_overview.png)
 
 ## 현재 런타임 계약
 
@@ -67,11 +67,11 @@
 - [ontology_standardization_report.md](ontology_standardization_report.md): RDF/RDFS/OWL + SHACL additive layer
 - [ontology_migration_audit.md](ontology_migration_audit.md): custom graph에서 표준 온톨로지로의 mapping
 - Diagrams:
-  - [diagrams/ontology_framework.svg](diagrams/ontology_framework.svg)
-  - [diagrams/ontology_layered_architecture.svg](diagrams/ontology_layered_architecture.svg)
-  - [diagrams/ontology_reasoning_boundary.svg](diagrams/ontology_reasoning_boundary.svg)
-  - [diagrams/ontology_standardization_components.svg](diagrams/ontology_standardization_components.svg)
-  - [diagrams/ontology_migration_beforeafter.svg](diagrams/ontology_migration_beforeafter.svg)
+  - [diagrams/ontology_framework.png](diagrams/ontology_framework.png)
+  - [diagrams/ontology_layered_architecture.png](diagrams/ontology_layered_architecture.png)
+  - [diagrams/ontology_reasoning_boundary.png](diagrams/ontology_reasoning_boundary.png)
+  - [diagrams/ontology_standardization_components.png](diagrams/ontology_standardization_components.png)
+  - [diagrams/ontology_migration_beforeafter.png](diagrams/ontology_migration_beforeafter.png)
 
 ## Acceleration
 

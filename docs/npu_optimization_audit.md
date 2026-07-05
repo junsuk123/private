@@ -9,7 +9,7 @@ As of the current `run.ps1` entry point, the system is a guarded KIS live-capabl
 
 This audit predates the current guarded live runtime. NPU/CPU ontology acceleration remains an evidence and screening layer only. In the current `run.ps1` flow, live order submission still requires the realtime trading engine, `SharedLiveDecisionEngine`, deterministic `RiskManager`, FinalTradeGate, and `LiveExecutionCoordinator`; NPU scoring cannot submit orders directly.
 
-This audit corresponds to the acceleration notes in `docs/diagrams/system_overview.svg`: vectorized universe screening, optional Rust/PyO3 native screening, top-k-only materialization, rolling feature cache targets, typed storage, and CPU/NPU separated timing profiles.
+This audit corresponds to the acceleration notes in `docs/diagrams/system_overview.png`: vectorized universe screening, optional Rust/PyO3 native screening, top-k-only materialization, rolling feature cache targets, typed storage, and CPU/NPU separated timing profiles.
 
 ## Applied
 

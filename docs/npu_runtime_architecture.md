@@ -4,7 +4,7 @@
 
 As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
 
-The repository-level flow diagram is `docs/diagrams/system_overview.svg`. In that diagram, this document mainly covers stages 4 and 5: candidate universe filtering and evidence scoring. Risk validation and execution remain CPU/deterministic even when scoring is accelerated.
+The repository-level flow diagram is `docs/diagrams/system_overview.png`. In that diagram, this document mainly covers stages 4 and 5: candidate universe filtering and evidence scoring. Risk validation and execution remain CPU/deterministic even when scoring is accelerated.
 
 Current local verification shows the active Python/OpenVINO environment can see `CPU`, `GPU`, and `NPU`, and the ontology runtime reports `active_backend=NPU` with `uses_npu=true` when `OPENVINO_DEVICE=NPU` and `ONTOLOGY_ACCELERATOR=NPU` are set by `run.ps1`.
 

@@ -4,7 +4,7 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 
 > 핵심 원칙: LLM, NPU, ML, 온톨로지는 분류, 랭킹, 설명, 보조 점수만 제공합니다. 실제 주문은 `RiskManager`, 비용/원금보호/신선도/중복주문/KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
 
-![Current runtime architecture](docs/diagrams/system_overview.svg)
+![Current runtime architecture](docs/diagrams/system_overview.png)
 
 ## 현재 런타임 요약
 
