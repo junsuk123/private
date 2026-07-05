@@ -1318,7 +1318,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   #asset .val{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
   #asset .delta{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
   #asset .delta.up{color:#22c55e}#asset .delta.down{color:#ef4444}
-  #asset canvas{flex:1 1 auto;height:40px;min-width:0;display:block}
+  #asset canvas{flex:1 1 auto;height:54px;min-width:0;display:block}
 </style></head>
 <body>
 <div id="app">
@@ -1326,7 +1326,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   <section id="asset" aria-label="총자산 추이">
     <div class="col"><div class="lab">총자산</div><div class="val" id="asset-val">—</div></div>
     <div class="col delta" id="asset-delta"></div>
-    <canvas id="asset-spark" height="40"></canvas>
+    <canvas id="asset-spark" height="54"></canvas>
   </section>
   <section id="overview" aria-label="현재 상태"></section>
   <main id="list"></main>
@@ -1403,6 +1403,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   // 브라우저를 켜두지 않아도 흐름이 이어진다. /api/account/asset-history 는 SQLite 읽기라 가볍다.
   var assetPoints=[];
   function fmtWon(v){return "₩"+Math.round(Number(v||0)).toLocaleString("ko-KR");}
+  function hhmm(iso){var d=new Date(iso);if(isNaN(d.getTime()))return "";return d.toLocaleTimeString("ko-KR",{hour12:false,hour:"2-digit",minute:"2-digit"});}
   function drawSpark(){
     var c=document.getElementById("asset-spark");if(!c)return;
     var ctx=c.getContext("2d");
@@ -1412,15 +1413,25 @@ TRADE_DISPLAY_HTML = """<!doctype html>
     if(assetPoints.length<2)return;
     var vals=assetPoints.map(function(p){return Number(p.total_asset_krw||0);});
     var min=Math.min.apply(null,vals),max=Math.max.apply(null,vals);
-    var pad=4,span=Math.max(1,max-min),up=vals[vals.length-1]>=vals[0];
+    var pad=4,labelH=13,top=pad,bottom=hh-pad-labelH,span=Math.max(1,max-min),up=vals[vals.length-1]>=vals[0];
     var col=up?"#22c55e":"#ef4444";
+    var pts=vals.map(function(v,i){return [pad+(i/(vals.length-1))*(w-pad*2),bottom-((v-min)/span)*(bottom-top)];});
     ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();
-    var pts=vals.map(function(v,i){return [pad+(i/(vals.length-1))*(w-pad*2),hh-pad-((v-min)/span)*(hh-pad*2)];});
     pts.forEach(function(p,i){if(i===0)ctx.moveTo(p[0],p[1]);else ctx.lineTo(p[0],p[1]);});
     ctx.stroke();
-    var g=ctx.createLinearGradient(0,0,0,hh);
+    var g=ctx.createLinearGradient(0,0,0,bottom);
     g.addColorStop(0,up?"rgba(34,197,94,.22)":"rgba(239,68,68,.22)");g.addColorStop(1,"rgba(0,0,0,0)");
-    ctx.lineTo(pts[pts.length-1][0],hh-pad);ctx.lineTo(pts[0][0],hh-pad);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+    ctx.lineTo(pts[pts.length-1][0],bottom);ctx.lineTo(pts[0][0],bottom);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+    // 시간 축 라벨(HH:MM): 시작·중간·끝. 데이터가 적으면 시작·끝만.
+    ctx.fillStyle="#8b98a9";ctx.font="10px system-ui,-apple-system,sans-serif";ctx.textBaseline="alphabetic";
+    var ly=hh-3,n=assetPoints.length;
+    var ticks=n>=5?[[0,"left",pad],[Math.floor((n-1)/2),"center",w/2],[n-1,"right",w-pad]]:[[0,"left",pad],[n-1,"right",w-pad]];
+    ctx.strokeStyle="rgba(139,152,169,.18)";ctx.lineWidth=1;
+    ticks.forEach(function(t){
+      var label=hhmm(assetPoints[t[0]].created_at);if(!label)return;
+      ctx.beginPath();ctx.moveTo(pts[t[0]][0],top);ctx.lineTo(pts[t[0]][0],bottom);ctx.stroke();
+      ctx.textAlign=t[1];ctx.fillText(label,t[2],ly);
+    });
   }
   async function pollAsset(){
     try{
