@@ -27,9 +27,9 @@ from rdflib.namespace import OWL, RDF, RDFS, XSD
 # ---------------------------------------------------------------------------
 # Namespaces (kept in sync with src/app/ontology/*.ttl)
 # ---------------------------------------------------------------------------
-TRADING_NS = "https://junsuk123.github.io/private/ontology/trading#"
-RESOURCE_NS = "https://junsuk123.github.io/private/resource/"
-EVIDENCE_NS = "https://junsuk123.github.io/private/evidence/"
+TRADING_NS = "https://example.com/ontology/trading#"
+RESOURCE_NS = "https://example.com/resource/"
+EVIDENCE_NS = "https://example.com/evidence/"
 
 TR = Namespace(TRADING_NS)
 RES = Namespace(RESOURCE_NS)

@@ -509,8 +509,8 @@ Implemented in `src/app/execution/kis_real.py`.
 The adapter implements the KIS Developers domestic cash-stock REST contract behind the same broker boundary as mock execution:
 
 - environment/secrets loading from `config/secrets/kis_api_keys.env`
-- paper base URL `https://openapivts.koreainvestment.com:29443`
-- live base URL `https://openapi.koreainvestment.com:9443`
+- paper base URL (KIS paper REST endpoint — configured in secrets, not shown)
+- live base URL (KIS live REST endpoint — configured in secrets, not shown)
 - `/oauth2/tokenP` access-token issuance
 - `/uapi/hashkey` for cash-order POST bodies
 - domestic cash-order TR IDs `VTTC0012U` / `VTTC0011U` for paper buy/sell

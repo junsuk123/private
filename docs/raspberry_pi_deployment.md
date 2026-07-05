@@ -194,7 +194,7 @@ Pi에서는 `torch`/`transformers`를 설치하지 않습니다. news/event sent
 64-bit Pi OS에서 Ollama 예시:
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
+# install Ollama via its official installer (see the Ollama project docs)
 ollama pull qwen2.5:1.5b-instruct
 cp config/local_llm.env.example config/local_llm.env
 ```

@@ -1,4 +1,4 @@
-@prefix tr:   <https://junsuk123.github.io/private/ontology/trading#> .
+@prefix tr:   <https://example.com/ontology/trading#> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -21,7 +21,7 @@
 # domain / range, disjointness. No cardinality restrictions, no complex DL.
 #################################################################
 
-<https://junsuk123.github.io/private/ontology/trading>
+<https://example.com/ontology/trading>
     a owl:Ontology ;
     rdfs:label "Trading Core Ontology" ;
     rdfs:comment "Core classes and properties for semantic representation of the trading pipeline. Semantic enrichment only; it does not grant permission to trade." .

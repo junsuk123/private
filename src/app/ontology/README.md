@@ -18,9 +18,9 @@ existing trading pipeline. It does **not** replace numerical scoring or trading 
 
 | Prefix | IRI | Use |
 |---|---|---|
-| `tr:` | `https://junsuk123.github.io/private/ontology/trading#` | Schema terms (classes, properties). |
-| `res:` | `https://junsuk123.github.io/private/resource/` | Runtime instances (stocks, snapshots, candidates, decisions). |
-| `ev:` | `https://junsuk123.github.io/private/evidence/` | Provenance-bearing `tr:EvidenceItem` individuals. |
+| `tr:` | `https://example.com/ontology/trading#` | Schema terms (classes, properties). |
+| `res:` | `https://example.com/resource/` | Runtime instances (stocks, snapshots, candidates, decisions). |
+| `ev:` | `https://example.com/evidence/` | Provenance-bearing `tr:EvidenceItem` individuals. |
 
 Instance IRIs are **stable and deterministic** (derived by slugging tickers/ids), not random
 blank nodes, so the same entity gets the same IRI across analysis cycles.

@@ -69,9 +69,9 @@ consumer or GUI field is removed.
 
 ## 3. Vocabulary mapping (Python strings → RDF/RDFS/OWL)
 
-Base namespace `tr:` = `https://junsuk123.github.io/private/ontology/trading#`;
-instances `res:` = `https://junsuk123.github.io/private/resource/`;
-evidence `ev:` = `https://junsuk123.github.io/private/evidence/`.
+Base namespace `tr:` = `https://example.com/ontology/trading#`;
+instances `res:` = `https://example.com/resource/`;
+evidence `ev:` = `https://example.com/evidence/`.
 
 ### 3.1 Classes (from `ontology.CLASSES` + target minimum set)
 

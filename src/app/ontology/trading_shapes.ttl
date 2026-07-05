@@ -1,4 +1,4 @@
-@prefix tr:   <https://junsuk123.github.io/private/ontology/trading#> .
+@prefix tr:   <https://example.com/ontology/trading#> .
 @prefix sh:   <http://www.w3.org/ns/shacl#> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -50,7 +50,7 @@ tr:AccountSnapshotShape a sh:NodeShape ;
         sh:message "Account snapshot must expose available KRW or USD cash before live sizing." ;
         sh:severity sh:Violation ;
         sh:select """
-            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX tr: <https://example.com/ontology/trading#>
             SELECT $this WHERE {
                 FILTER NOT EXISTS { $this tr:hasAvailableKRW ?krw }
                 FILTER NOT EXISTS { $this tr:hasAvailableUSD ?usd }
@@ -171,7 +171,7 @@ tr:RiskDecisionShape a sh:NodeShape ;
         sh:message "An order intent cannot be both approved and rejected by the RiskManager." ;
         sh:severity sh:Violation ;
         sh:select """
-            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX tr: <https://example.com/ontology/trading#>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             SELECT $this WHERE {
                 $this tr:hasRiskManagerDecision ?approved .
@@ -192,7 +192,7 @@ tr:FinalOrderShape a sh:NodeShape ;
         sh:message "A final order must be backed by a RiskManager approval." ;
         sh:severity sh:Violation ;
         sh:select """
-            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX tr: <https://example.com/ontology/trading#>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             SELECT $this WHERE {
                 FILTER NOT EXISTS {
@@ -206,7 +206,7 @@ tr:FinalOrderShape a sh:NodeShape ;
         sh:message "A final order must not be a principal-protection-blocked candidate." ;
         sh:severity sh:Violation ;
         sh:select """
-            PREFIX tr: <https://junsuk123.github.io/private/ontology/trading#>
+            PREFIX tr: <https://example.com/ontology/trading#>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             SELECT $this WHERE {
                 $this rdf:type tr:PrincipalProtectionBlockedCandidate .
