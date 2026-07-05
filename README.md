@@ -1,601 +1,166 @@
-# Personal Multi-Agent Ontology-Based Automated Stock Investment System
+# Personal Investment Agent
 
-## Current Runtime Contract
+KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델, 결정론적 리스크 게이트를 묶은 개인용 자동 투자 분석/운영 시스템입니다. 현재 기준의 대표 실행 경로는 Windows의 `run.ps1`이고, Raspberry Pi에서는 CPU-only 런타임과 LCD 키오스크 GUI를 별도로 제공합니다.
 
-As of the current `run.ps1` entry point, the system is a guarded KIS live-capable realtime runtime. KIS realtime collection, read-only account probing, periodic live short-horizon training, and the independent realtime trading loop can start automatically. Numeric ontology/candidate evidence scoring requests OpenVINO `NPU` and falls back to CPU when unavailable; final action selection, graph explanations, risk checks, order gating, idempotency, and broker submission remain deterministic CPU-controlled paths. NPU output is evidence, not trade authorization.
+> 핵심 원칙: LLM, NPU, ML, 온톨로지는 분류, 랭킹, 설명, 보조 점수만 제공합니다. 실제 주문은 `RiskManager`, 비용/원금보호/신선도/중복주문/KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
 
-Personal-use research system for safe, auditable, explainable stock-investment analysis, realtime account monitoring, paper trading, and KIS live auto-trading under deterministic execution gates.
+![Current runtime architecture](docs/diagrams/system_overview.svg)
 
-The current implementation is intentionally conservative but live-capable in the local runtime started by `run.ps1`: it collects KIS realtime/broker data, builds live feature frames and ontology evidence, trains a short-horizon model in the background, evaluates SELL before BUY every cycle, and submits only `FinalOrder` objects that pass live runtime, broker, cost, risk, freshness, and idempotency gates.
+## 현재 런타임 요약
 
-![End-to-end ontology trading system flow](docs/diagrams/system_overview.svg)
+`run.ps1`은 로컬 Windows 운영용 표준 런처입니다. 기본 포트는 `8010`이고, 서버 준비 후 `http://127.0.0.1:8010/account`를 관리 브라우저 창으로 엽니다. 이 창을 닫으면 서버도 같이 종료됩니다.
 
-The repository-level architecture is also documented in `docs/README.md`, `docs/architecture.md`, `docs/live_trading_runbook.md`, and `docs/realtime_short_horizon_policy.md`.
+시작 시 기본적으로 수행되는 일:
 
-## Current Runtime Flow
+- KIS 실계좌 읽기, 잔고/현금/보유종목 스냅샷 갱신
+- KIS 실시간 체결가/호가 수집과 브로커 quote 갱신
+- 실시간 feature frame 생성과 live short-horizon 모델 주기 학습
+- 독립 실시간 자동거래 루프 시작
+- SELL/REDUCE 평가를 BUY보다 먼저 실행
+- 기존 미체결 SELL 주문은 의미 있는 가격 변화가 있을 때만 정정, 아니면 유지
+- BUY는 현금, spread, 유동성, quote freshness, 온톨로지/런타임 근거, 리스크 게이트를 통과해야 제출
 
-`run.ps1` is the canonical local launcher. It opens `http://127.0.0.1:8010/account`, starts the KIS realtime collector, starts periodic live model retraining, starts the realtime trading engine, and shuts down the server when the managed browser closes.
+Windows 기본값은 live-capable입니다. `run.ps1`은 `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `AUTO_START_REALTIME_TRADING=true`를 프로세스 환경에 설정합니다. 안전성은 live flag를 끄는 방식이 아니라, 계좌/시장 데이터 신뢰도와 최종 게이트에서 보장합니다.
 
-```text
-KIS live account + KIS realtime ticks/orderbooks + KIS broker quotes
-  -> account dashboard and minute-bucketed asset history
-  -> live feature frames and live short-horizon model artifacts
-  -> ontology/NPU evidence and realtime candidate discovery
-  -> SharedLiveDecisionEngine
-       SELL path first: profit target, trailing/loss exit, domestic drawdown and concentration guards
-       BUY path second: cash, spread, liquidity, feature freshness, ontology/runtime support, model advisory score
-  -> RiskManager + FinalTradeGate + LiveExecutionCoordinator
-  -> KIS live limit orders, amend/keep existing open SELL orders, audit/status surfaces
-```
-
-Important current behavior:
-
-- Auto-trading starts automatically when `run.ps1` starts the server.
-- SELL/REDUCE decisions are evaluated before new BUY decisions.
-- Small-account mode is enabled by default in `run.ps1`: 1-share loss exits are blocked unless the hard stop is reached, below-break-even non-emergency SELLs are blocked, and one-share BUYs that exceed the configured account-weight cap are rejected.
-- Foreign cash is displayed from actual foreign-currency cash and broker FX; broker cash-equivalent residuals are shown separately in the dashboard instead of being counted as foreign cash.
-- Existing open SELL orders are amended only when the price meaningfully changes; otherwise they are kept and surfaced as `open_sell_kept`.
-- BUY can be globally disabled with `REALTIME_BUY_ENABLED=false`; the `/account` 종료 button does this before submitting profit-seeking liquidation SELL orders and scheduling server shutdown.
-- The live ML model is advisory. Model-only BUY is rejected when `REALTIME_MODEL_AUXILIARY_ONLY=true`; ontology or runtime broker evidence must confirm the trade.
-- A BUY rejection such as `WIDE_SPREAD`, `LOW_LIQUIDITY`, `FALLBACK_SCORE_BELOW_THRESHOLD`, or `INSUFFICIENT_CASH_FOR_ONE_SHARE` means the engine is intentionally avoiding low-quality execution.
-
-## Safety Model
-
-- LLM or LLM-like components never execute trades.
-- AI/semantic/ontology/model layers may classify events, rank candidates, tune analysis parameters, produce `OrderIntent` objects, or boost a candidate that already has deterministic evidence.
-- The live short-horizon model is an auxiliary signal, not a sole execution authority.
-- `RiskManager` is the deterministic final gate before an intent can become a `FinalOrder`.
-- Source trust, data quality, freshness, synthetic status, and model uncertainty are checked before live approval can proceed.
-- Approved live orders are limit orders submitted only through `LiveExecutionCoordinator`.
-- In the `run.ps1` runtime, live execution flags are explicitly enabled for the local process; safety comes from runtime gates, KIS checks, FinalTradeGate, idempotency, cost/risk rules, and kill-switch controls rather than from a disabled live flag.
-- Synthetic, sample, pseudo, or hash-derived features are allowed only in clearly labeled offline fixtures and must not be used as trusted paper-trading or live-trading evidence.
-- Margin, leverage, derivatives, short selling, credit loans, and leveraged ETFs are rejected.
-- Paper trading uses the KIS virtual domain or the local paper engine.
-- Live termination disables BUY first, then submits profit-seeking limit SELL orders for current holdings when all live gates pass.
-
-Small-account loss-sell behavior and dashboard cash decomposition are documented in `docs/small_account_loss_sell_fix_report.md`.
-
-## Standards-Based Ontology Framework (RDF/RDFS/OWL + SHACL)
-
-The system now includes a standards-based ontology layer built on `rdflib`, `owlrl`, and `pyshacl`, in
-addition to the existing custom in-memory graph. It adds formal semantic representation, class/property
-hierarchy, logical inference, consistency checking, closed-world validation, provenance, and
-explainability — **without changing any trading decision**. It is an *additive* layer: the custom
-`KnowledgeGraph` remains the primary store, and the RDF/OWL/SHACL results are exposed as extra
-diagnostics and semantic labels.
-
-![Hybrid RDF/RDFS/OWL + SHACL ontology framework](docs/diagrams/ontology_framework.svg)
-
-### Hybrid reasoning boundary
-
-```text
-OWL / RDFS  -> class & property hierarchy, domain/range typing, semantic
-               categorization (BuyCandidate, TradeForbiddenAsset, SyntheticDataAsset...),
-               consistency (disjoint classes).  [open-world]
-SHACL       -> required fields, positive prices, stale/synthetic blocking (live),
-               account/order structure, approved-vs-rejected conflict.  [closed-world]
-Python       -> support/contradiction/risk/confidence scoring, ranking, thresholding,
-               short-horizon policy (SemanticPolicyScorer, formerly OntologyReasoner).
-Engines      -> TradingCostEngine, PrincipalProtectionEngine, position sizing.
-RiskManager  -> the SOLE final execution gate.
-```
-
-Why OWL does **not** approve trades: OWL is open-world (missing data is *unknown*, not *false*), so it
-can never conclude an asset is safe. It provides semantic standardization, interoperability, consistency,
-explainability, and research defensibility — not numerical trading logic and not permission to trade.
-Closed-world constraints (required fields, stale/synthetic rejection) are handled by SHACL; all numbers
-stay in Python; the RiskManager decides.
-
-### End-to-end flow
-
-```text
-Data Sources -> Typed Records -> RDF Assertion Graph -> RDFS/OWL Schema
-  -> OWL RL Materialization -> SHACL Validation -> Python Policy Scorer
-  -> TradingCostEngine -> PrincipalProtectionEngine -> RiskManager -> FinalOrder
-```
-
-Asserted facts (from market/account/news/disclosure/indicator data and the custom graph) are projected
-into an RDF assertion graph with stable IRIs; the schema is merged and OWL RL materialization infers
-semantic classes; SHACL validates operational constraints; inferred classes and validation results flow
-to the Python policy scorer as *extra features*; order intents then pass the unchanged cost/principal/
-risk chain. Evidence items (including NPU/CPU/heuristic scorer output) are represented as provenance-
-bearing `tr:EvidenceItem` individuals linked via `tr:hasEvidence` / `tr:derivedFromEvidence`.
-
-### Ontology files
-
-| File | Role |
-|---|---|
-| `src/app/ontology/trading_core.ttl` | Classes, hierarchy, object/data properties, domain/range, disjointness. |
-| `src/app/ontology/trading_rules.ttl` | OWL 2 RL classification axioms (semantic categorization). |
-| `src/app/ontology/trading_shapes.ttl` | SHACL shapes for closed-world operational validation. |
-| `src/app/ontology/README.md` | Namespaces, modeling decisions, inference boundary, how to extend. |
-
-Python modules: `src/app/graph/rdf_graph.py` (RDF store + IRIs), `rdf_adapter.py` (Triple↔RDF↔UI),
-`owl_reasoner.py` + `semantic_materializer.py` (OWL RL closure), `shacl_validator.py` (SHACL),
-`ontology_layer.py` (orchestration wired into `app/pipeline.py`).
-
-### Running / inspecting / extending
-
-- Run ontology tests: `python -m pytest tests/test_ontology_framework.py`
-- Parse-check the Turtle files:
-  `python -c "import rdflib;[rdflib.Graph().parse(f,format='turtle') for f in ('src/app/ontology/trading_core.ttl','src/app/ontology/trading_rules.ttl','src/app/ontology/trading_shapes.ttl')];print('ok')"`
-- Serialize the runtime graph: `RdfTradingGraph.serialize(format="turtle" | "json-ld")`.
-- Env controls: `ONTOLOGY_RDF_LAYER=0` disables the layer; `ONTOLOGY_REASONING_PROFILE=rdfs` uses the
-  cheaper RDFS-only closure.
-- Extend safely: see `src/app/ontology/README.md`. Add hierarchy/axioms in TTL, closed-world checks in
-  SHACL, and never encode scores or trade permissions in OWL.
-
-The GUI/API separates **asserted** vs **inferred** triples, keeps OWL results apart from Python policy
-scores, and reports SHACL validation in the diagnostics panel (`/api/ontology/graph` `semantic_layer`
-section and `/api/research/diagnostics`). See `docs/ontology_standardization_report.md` and
-`docs/ontology_migration_audit.md` for the full design and old→new mapping.
-
-## Current Scope
-
-Implemented capabilities include:
-
-- FastAPI web UI and API runtime
-- Public research collectors for RSS, HTML, dynamic pages, Stooq, Yahoo chart, Alpha Vantage, OpenDART, ECOS, and FRED
-- Listed-universe ingestion for US/overseas and KRX symbols
-- Rotating universe batches so large universes do not block UI refreshes
-- Local/OpenAI-compatible/embedded/OpenVINO event LLM classification with keyword fallback
-- SQLite-backed local research store with stable record keys and retention pruning
-- Lightweight indicator snapshots for the main decision path
-- Ontology graph, event mapping, NPU/CPU ontology candidate screening, and rule-based reasoning paths
-- Source trust policy and lightweight feature provenance labels for measured, estimated, and synthetic fields
-- Goal feasibility negotiation and compromise target generation
-- Rule-based and goal-directed strategy signal generation
-- Deterministic risk validation
-- KIS paper-trading boundary and local paper-trading loop
-- Automatic server-start realtime collection/learning and read-only KIS live-readiness account check
-- KIS/BanKIS trading-cost model for fees, sell tax, slippage, spread, break-even return, and net profitability checks
-- KIS realtime WebSocket tick/orderbook collection and broker quote refresh for live decisions
-- Realtime trading status, decision-flow, rejection-reason, account, cash, holdings, asset-allocation, and minute asset-history dashboard at `/account`
-- Live BUY disable and program termination workflow from the `/account` dashboard
-- Realtime learning and paper-trading evaluation artifacts under `data/models`
-- Audit logging and diagnostics endpoints
-- Recursive audit redaction for credentials, tokens, account numbers, and broker secrets
-- No-lookahead dataset scaffolding, ranked-signal evaluation summaries, and CPU/OpenVINO inference backend hooks
-
-## Data Trust And Provenance
-
-`SourceMetadata` records source type, trust level, observed/retrieved time, latency, realtime/delayed flags, synthetic/backfilled flags, license policy, and quality score. Legacy metadata defaults to low trust. `app.data.source_policy` centralizes source-type inference, default trust levels, quality scoring, and live-decision validation.
-
-Hash-derived or pseudo quote-like fields in the lightweight ontology filter are marked as synthetic or estimated. Offline fixture paths may use these labeled fields; paper-trading and live/realtime decision paths should reject `is_synthetic=true`, synthetic fields, unknown sources, stale quotes, or low quality scores. `RiskManager` remains the final deterministic authority.
-
-## Quick Start
+## 빠른 실행
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .
-python .\run.py
-```
-
-One-command Windows launch:
-
-```powershell
 .\run.ps1
 ```
 
-`run.ps1` starts a managed local app server on `http://127.0.0.1:8010` by default, opens Chrome or Edge at `/account` when available, and stops the server when the managed browser window closes. It sets current live-runtime defaults including:
+수동 서버 실행:
 
-- `DATA_ENV=realtime`
-- `DATA_ROOT=data`
-- `REALTIME_STORE_ROOT=data/store`
-- `TRADING_MODE=live_trading`
-- `LIVE_TRADING_ENABLED=true`
-- `KIS_LIVE_ENABLED=true`
-- `KIS_PAPER_TRADING=false`
-- `LIVE_ORDER_SUBMIT_ENABLED=true`
-- `AUTO_START_REALTIME_TRADING=true`
-- `AUTO_START_LIVE_TRAINING=true`
-- `REALTIME_BUY_ENABLED=true`
-- `REALTIME_MODEL_AUXILIARY_ONLY=true`
-- `REALTIME_ALLOW_LOSS_EXIT=false`
-- `REALTIME_SMALL_ACCOUNT_MODE=true` (with `REALTIME_BLOCK_SELL_BELOW_BREAKEVEN=true`, `REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE=true`, and a `REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT` cap)
-- `ONTOLOGY_ACCELERATOR=NPU`
-- OpenVINO/NPU low-latency hints with CPU fallback
-- small LLM event-classification limits for responsive refreshes
+```powershell
+python .\run.py --host 127.0.0.1 --port 8010
+```
 
-If `models/local-llm/event-classifier` exists, `run.ps1` enables the embedded local model. Otherwise it checks for an Ollama-compatible local server at `127.0.0.1:11434`; if unavailable, event classification falls back to deterministic keyword rules.
+KIS 실계좌 연동 전에는 `config/secrets/kis_api_keys.env.example`을 `config/secrets/kis_api_keys.env`로 복사한 뒤 값을 채웁니다. 토큰/계좌 확인은 아래처럼 따로 검증할 수 있습니다.
 
-On server startup, KIS realtime collection, periodic short-horizon model training, live account refresh, and the independent realtime trading loop start automatically. The account dashboard is the primary operating surface.
+```powershell
+python scripts/check_kis_connection.py --account
+python scripts/live_readiness_check.py
+```
 
-## Raspberry Pi (CPU-only, NPU-free)
+## 웹 GUI
 
-The system also runs end-to-end on a Raspberry Pi with **no NPU and no OpenVINO**. The NPU was never a hard dependency: every acceleration path (ontology scoring, signal inference, native screening, event classification) already degrades to a deterministic CPU/NumPy implementation, and trading/graph/risk logic is pure Python that always runs on CPU. Dropping the NPU changes throughput, not behavior or safety.
+현재 운영 중심 화면은 `/account`입니다. 기존 루트 화면(`/`)은 연구/진단/수동 실행용 기능이 남아 있고, 실제 계좌 기반 운용에서는 `/account`를 먼저 봅니다.
 
-A self-contained package lives under [`packaging/raspberrypi/`](packaging/raspberrypi/) and *only adds files* — the Windows launchers and the accumulated `data/` are untouched. Copy the repository (including `data/`) to the Pi and run **one command** to install dependencies and build:
+주요 화면:
+
+- `/account`: 계좌/자산 대시보드. 총자산, 현금, 외화 현금, 보유종목, 실현/평가손익, 자산 배분, 최근 거래, 진단 로그를 보여줍니다.
+- `/account`의 실시간 판단 흐름: 자동거래 루프의 cycle, SELL/BUY 평가 수, 제출/정정/차단 건수, 최근 실행 판단, 최근 보류 사유를 표시합니다.
+- `/account`의 종료 버튼: 먼저 `REALTIME_BUY_ENABLED=false`로 신규 BUY를 막고, 라이브 게이트를 통과하는 profit-seeking SELL 청산 주문을 제출한 뒤 서버 종료를 예약합니다.
+- `/display/ontology`: 온톨로지 지식 그래프와 추론 상태를 전체 화면으로 보여주는 시각화 화면입니다.
+- `/display`: Raspberry Pi LCD에 맞춘 trade-reason board입니다. 최근 자동거래 판단과 사람이 읽을 수 있는 이유 카드를 표시합니다.
+
+주요 API:
+
+- `GET /api/account/dashboard`
+- `GET /api/account/asset-history?range=1D|1W|1M|3M`
+- `GET /api/realtime-trading/status`
+- `POST /api/live-trading/terminate?shutdown=true`
+- `GET /api/trade-explanations`
+- `GET /api/ontology/graph`
+- `GET /api/realtime/runtime`
+- `GET /api/npu/runtime`
+
+## Raspberry Pi GUI와 배포
+
+Pi 패키지는 `packaging/raspberrypi/`에 있습니다. Pi에서는 OpenVINO/NPU 없이 CPU-only로 실행되며, 기본값은 read-only입니다.
 
 ```bash
 bash packaging/raspberrypi/bootstrap.sh
+bash packaging/raspberrypi/run.sh
 ```
 
-That installs OS packages, creates an isolated `.venv-pi/`, installs the CPU-only dependencies and the project (no `openvino`/`torch`/`transformers`), builds the optional Rust `screening_core` accelerator when a toolchain is present, and verifies the CPU runtime. Then launch headless (reusing the existing `data/` and `data/store/`):
+Pi 런처 특징:
+
+- `APP_HOST=0.0.0.0`, `APP_PORT=8010`으로 LAN에서 `http://<pi-ip>:8010/account` 접속
+- `ONTOLOGY_ACCELERATOR=CPU`, `ONTOLOGY_NPU_ENABLED=false`
+- `TRADING_MODE=read_only`, `LIVE_ORDER_SUBMIT_ENABLED=false`
+- 기존 `data/`, `data/store/`, `data/models/`를 그대로 재사용
+- `pi.env`로 포트, live flag, workload 크기, LLM 설정을 지속적으로 오버라이드
+
+LCD/키오스크 GUI:
 
 ```bash
-bash packaging/raspberrypi/run.sh    # open http://<pi-ip>:8010/account
+bash packaging/raspberrypi/pi-dashboard-launch.sh
 ```
 
-Full guide, systemd auto-start, live-trading flags, and verification details: [`docs/raspberry_pi_deployment.md`](docs/raspberry_pi_deployment.md).
+이 스크립트는 `personal-investment.service`를 시작한 뒤 `/api/trade-explanations`가 준비될 때까지 기다리고, Chromium을 `--kiosk --app=http://127.0.0.1:8010/display`로 실행합니다. 온톨로지 전체 화면은 `PI_DASHBOARD_URL=http://127.0.0.1:8010/display/ontology`로 바꿔 띄울 수 있습니다.
 
-## KIS Developers Broker Adapter
+자세한 내용은 [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md)와 [packaging/raspberrypi/README.md](packaging/raspberrypi/README.md)를 참고하세요.
 
-`src/app/execution/kis_real.py` implements the Korea Investment & Securities Open API REST contract for domestic cash-stock limit orders, order-status polling, and balance lookup. It uses the same broker interface as the in-memory mock broker, so the same paper-trading flow can be run with an injected fake KIS transport and later switched to the real transport.
-
-Safe defaults:
-
-- `KIS_PAPER_TRADING=true` uses `https://openapivts.koreainvestment.com:29443`.
-- `KIS_PAPER_TRADING=false` uses `https://openapi.koreainvestment.com:9443`.
-- `KIS_LIVE_ENABLED=false` blocks all KIS order and account calls.
-- `KIS_ACCOUNT_NO` may be `12345678-01` or paired with `KIS_ACCOUNT_PRODUCT_CODE=01`.
-
-The adapter follows the current KIS guide pattern: `/oauth2/tokenP` for access tokens, `/uapi/hashkey` before cash-order POSTs, and the new domestic cash-order TR IDs `TTTC0011U`/`TTTC0012U` for live and `VTTC0011U`/`VTTC0012U` for paper. Keep token issuance and order calls on the same base URL; mixing paper and live domains will fail at the KIS gateway.
-
-Secrets are loaded automatically from the ignored local file `config/secrets/kis_api_keys.env` when the KIS client starts. Copy `config/secrets/kis_api_keys.env.example` and keep real values out of Git. Use `python scripts/check_kis_connection.py` for a token-only check, or add `--account` for the read-only balance endpoint.
-
-KIS access tokens are cached under `config/secrets` and reused until expiry, so live-readiness and account-basis checks do not repeatedly request a token during the same 24-hour validity window. If KIS issued today's token outside this app, put it in `KIS_LIVE_ACCESS_TOKEN` or `KIS_ACCESS_TOKEN` so the app can reuse it without issuing another token.
-
-## Trading Costs And Net Profitability
-
-Trading-cost defaults live in `config/trading_costs.json`. The default domestic-stock profile models KRX/NXT brokerage fees, Korean sell-side transaction tax, slippage, bid-ask spread, market-impact reserve, and a safety margin. ETF/ETN/ELW defaults use the separate fee/tax profile in the same file.
-
-`TradingCostEngine` estimates gross return, total cost, break-even return, required exit price, net expected profit, net expected return, and cost-to-alpha ratio. `RiskManager` records the cost breakdown on BUY validations and blocks trades whose expected net return is not positive after costs. Backtesting and streaming paper-trading cash flows also deduct domestic trade costs and record `trading_cost` plus `net_value` on each simulated trade.
-
-The ontology graph exposes this path as `TradingCost -> BreakEvenReturn/NetExpectedReturn -> NetProfitability -> FinalTradeGate`, so the visualization can show how fees, tax, slippage, spread, and market impact affect final approval.
-
-## Principal Protection Framework
-
-The system now has a deterministic principal-protection layer between strategy signal generation and executable orders. AI, ontology, indicators, and strategy code may still produce `OrderIntent` candidates, but `PrincipalProtectionEngine` and `RiskManager` can block or resize BUY orders before a `FinalOrder` is created.
-
-Core formulas:
+## 시스템 흐름
 
 ```text
-P0 = initial principal
-E_t = current equity
-H_t = high-water mark
-F_t = P0 * principal_floor_ratio + profit_lockin_ratio * max(0, H_t - P0)
-C_t = max(0, E_t - F_t - cost_buffer - gap_risk_buffer)
-risk_budget = min(CPPI_multiplier * C_t, daily_budget, weekly_budget, per-trade constraints)
-estimated_trade_loss = stop-loss price loss + buy/sell fees + tax + slippage + spread + market impact
+KIS account + realtime ticks/orderbooks + broker quotes
+  + public market/macro/news/disclosure data
+  -> source trust, freshness, provenance, local SQLite/model storage
+  -> live feature frames, indicators, short-horizon artifacts
+  -> candidate filtering and NPU/CPU evidence scoring
+  -> RDF/RDFS/OWL semantic labels + SHACL validation + Python policy scoring
+  -> SharedLiveDecisionEngine
+       SELL/REDUCE first
+       BUY second only with cash, freshness, spread/liquidity, and supporting evidence
+  -> TradingCostEngine + PrincipalProtectionEngine + RiskManager + FinalTradeGate
+  -> LiveExecutionCoordinator
+  -> KIS limit orders, order journal, audit logs, dashboards, feedback artifacts
 ```
 
-Protection modes:
+## 안전 모델
 
-- `NORMAL_GROWTH`: normal risk limits apply while equity is safely above the protected floor.
-- `PROFIT_ONLY`: new risky trades are limited to calculated growth capital above the protected floor.
-- `DE_RISK`: drawdown control is active; new buys are restricted and exposure reduction is prioritized.
-- `PRINCIPAL_LOCKDOWN`: BUY orders are blocked. SELL/REDUCE actions remain available.
-- `NOT_CONFIGURED`: initial principal has not been set, so the legacy deterministic risk rules remain active.
+- LLM 또는 LLM-like 컴포넌트는 주문을 실행하지 않습니다.
+- NPU/OpenVINO 출력은 숫자 근거 점수일 뿐 주문 승인 권한이 아닙니다.
+- live short-horizon 모델은 기본적으로 advisory-only입니다. `REALTIME_MODEL_AUXILIARY_ONLY=true`이면 모델 단독 BUY는 거부됩니다.
+- synthetic/sample/hash-derived 데이터는 오프라인 fixture에서만 허용하고, paper/live 판단 근거로 쓰지 않습니다.
+- margin, leverage, derivatives, short selling, credit loan, leveraged ETF는 거부 대상입니다.
+- live 주문은 `LiveExecutionCoordinator`를 통해 limit order로만 제출합니다.
+- audit log는 credential, token, account number, broker secret을 재귀적으로 마스킹합니다.
 
-Configuration is stored in `config/principal_protection.json`; start from `config/principal_protection.example.json` or use the API:
+## 주요 디렉터리
 
-```text
-GET  /api/risk/principal-protection/state
-PUT  /api/risk/principal-protection/config
-POST /api/risk/principal-protection/preview-order
-```
+| 경로 | 역할 |
+| --- | --- |
+| `src/app/web.py` | FastAPI 앱, 루트 GUI, API, realtime/live runtime orchestration |
+| `src/app/web_account_routes.py` | `/account` 대시보드 라우트 |
+| `src/app/account_dashboard.py` | 계좌/현금/보유종목/거래/자산 히스토리 payload 구성 |
+| `src/app/static/account_dashboard.*` | `/account` 전용 프론트엔드 |
+| `src/app/trading/` | realtime engine, shared decision engine, execution policy, runtime guard |
+| `src/app/execution/` | KIS broker adapter, live coordinator, order journal/status tracking |
+| `src/app/graph/` | custom graph, RDF/OWL/SHACL layer, NPU/CPU evidence scorers |
+| `src/app/features/` | indicator, semantic feature, live feature frame, short-horizon features |
+| `src/app/models/` | live training, artifact registry, CPU/OpenVINO inference backend |
+| `config/` | strategy, cost, risk, source, live safety example configs |
+| `packaging/raspberrypi/` | CPU-only Pi install/run/service/kiosk scripts |
+| `docs/` | architecture, live trading, safety gates, Pi deployment, ontology docs |
 
-The dashboard shows the current protection mode, protected floor, growth capital, cushion, and risk budget. Every configured principal-protection order decision is written to `logs/principal-protection.jsonl` with the input state, estimated loss, decision, and reason codes.
+## 문서 지도
 
-This framework does not guarantee profit or principal preservation under all market conditions. It explicitly assumes losses, gaps, execution failure, fees, tax, slippage, spread, and market impact can occur.
+- [docs/README.md](docs/README.md): 문서 인덱스
+- [docs/architecture.md](docs/architecture.md): 모듈/엔드포인트/운영 모드 상세
+- [docs/live_trading_runbook.md](docs/live_trading_runbook.md): 실거래 운영 절차
+- [docs/live_trading_safety_gates.md](docs/live_trading_safety_gates.md): 제출/BUY/SELL 게이트와 rejection code
+- [docs/realtime_short_horizon_policy.md](docs/realtime_short_horizon_policy.md): 실시간 단기 모델 정책
+- [docs/ontology_standardization_report.md](docs/ontology_standardization_report.md): RDF/OWL/SHACL 온톨로지 설계
+- [docs/npu_runtime_architecture.md](docs/npu_runtime_architecture.md): NPU/CPU 경계와 fallback
+- [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md): Pi CPU-only 배포와 키오스크
 
-## Short-Horizon Strategy Research Mode
+## 테스트
 
-Paper-first short-horizon strategy modules live behind `config/short_horizon_strategies.yaml`, parsed with PyYAML. The current research set includes short-term reversal, intraday momentum, technical breakout, long-only pair relative value, cost-based candidate filtering, ontology strategy semantics, and reality-check validation.
-
-These modules produce `StrategyCandidate` records, not direct broker calls. Candidates must pass `TradingCostEngine`, ontology risk semantics, `RealityCheckValidator` where required, and the deterministic `RiskManager`/FinalTradeGate path before any order intent can be considered. In the current `run.ps1` runtime, live flags are process-enabled, but strategy output still cannot bypass the realtime engine, FinalTradeGate, or `LiveExecutionCoordinator`.
-
-Reality-check reports can feed `StrategyParameterReestimator`, which proposes conservative parameter updates such as higher target net return, tighter spread limits, disabled failed strategies, and the latest validation id. This is parameter governance for an automatic trading program, not a profit guarantee.
-
-The GUI includes a live auto-trading path and the `/account` operational dashboard. Live orders are submitted only when config and environment flags allow live trading, KIS live account probing succeeds, and the normal strategy, cost, ontology, `RiskManager`, and FinalTradeGate checks remain intact.
-
-The short-horizon strategies are research infrastructure for paper trading, dry runs, and gated automatic trading. They do not guarantee profits, and passing a backtest or reality check does not imply future performance.
-
-See `docs/short_term_trading_strategy_design.md` for the full design.
-
-Optional in-process local LLM setup:
+전체 테스트:
 
 ```powershell
-pip install ".[local-llm]"
-mkdir models\local-llm
-# Put a local Hugging Face causal/chat model in:
-# models\local-llm\event-classifier
-.\run.ps1
+python -m pytest
 ```
 
-Optional Intel OpenVINO/NPU event classification:
+문서 변경 후 빠르게 확인하기 좋은 테스트:
 
 ```powershell
-pip install ".[openvino-llm]"
-$env:LLM_EVENT_PROVIDER="openvino-llm"
-$env:LLM_EVENT_MODEL="models\local-llm\event-classifier"
-$env:LLM_EVENT_DEVICE="NPU"
-.\run.ps1
+python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
 ```
 
-### Shared Local-LLM News Sentiment (Raspberry Pi + Windows)
-
-A single shared file, `config/local_llm.env` (copy from `config/local_llm.env.example`),
-configures a **local LLM** for news/event sentiment on **both** the Windows laptop and the
-Raspberry Pi. Both launchers and the app itself load it, so the model is set in one place:
-
-```text
-LLM_EVENT_PROVIDER=local
-LLM_EVENT_MODEL=qwen2.5:1.5b-instruct
-LLM_EVENT_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1/chat/completions
-```
-
-The `local` provider talks to an OpenAI-compatible endpoint (Ollama) over plain HTTP, so it
-needs no `torch`/`transformers` and runs the same way on a Pi. Install Ollama and run
-`ollama pull qwen2.5:1.5b-instruct` on each machine. At startup the app **auto-detects**
-whether Ollama is reachable: if it is, RSS/disclosure text is classified into
-`POSITIVE`/`NEGATIVE`/`NEUTRAL` JSON and mapped into the ontology graph; if it is not, the
-system falls back to the deterministic keyword classifier with no crash.
-
-Sentiment reflection in live decisions is deliberately conservative:
-
-- **Negative** news maps to `increasesRiskOf NegativeEventRisk` and already reduces buy evidence.
-- **Positive** news is a **soft confirmation only**: it adds a small `REALTIME_NEWS_CONFIRM_BONUS`
-  (default `0.15`) to the ontology score of a candidate that *already* has other support
-  (flow/momentum/liquidity/volume). News alone never creates buy support and never sets
-  `ontology_ok`; all spread/liquidity/cash/`RiskManager` gates still apply. Disable with
-  `REALTIME_NEWS_SENTIMENT_ENABLED=false`.
-
-For dynamic web pages that require browser rendering:
-
-```powershell
-pip install playwright
-playwright install
-```
-
-Useful individual commands:
-
-```powershell
-$env:PYTHONPATH="src"
-python -m app.cli demo  # legacy local sample pipeline
-python -m app.cli research --config config/research_sources.live.json
-python -m app.cli research --config config/research_sources.demo.json
-python -m unittest discover -s tests
-uvicorn app.web:app --app-dir src --reload
-```
-
-## Data Layout
-
-The current runtime uses one realtime-only layout:
-
-```text
-data/store/research.sqlite3
-data/raw/
-data/models/<model_family>/
-data/reports/
-data/synthetic_disabled/
-```
-
-Synthetic/offline fixture rows are rejected from the realtime research/model stores. Historical `data/live`, `data/sim`, and `data/legacy` files may exist from older phases, but the active web runtime uses `data/store` and `data/models`.
-
-Model artifacts are versioned and also written to `<model>.latest.json` inside each model-family folder.
-
-## Runtime Modes
-
-The web operation-mode manager exposes:
-
-```text
-learning        realtime collection and supervised PnL-label artifact updates
-testing         legacy paper-trading replay alias; no live broker orders
-paper_trading   KIS paper-trading API check + local paper buy/sell loop
-paper_trading_test alias for paper_trading
-live_readiness  KIS live-readiness check; no broker orders submitted
-live_trading_test alias for live_readiness
-live_trading    realtime KIS live auto-trading loop; brokerage execution remains guarded by runtime gates
-```
-
-The UI no longer requires manual learning, refresh, or live-readiness buttons. KIS realtime collection, periodic live training, account refresh, and live trading are automatic server-start services in the `run.ps1` runtime; manual mode starts are still available through the API for tests and diagnostics.
-
-The paper-trading loop starts through:
-
-```text
-POST /api/paper-trading/start
-POST /api/paper-trading/step
-```
-
-It creates labeled local one-minute paper-trading bars in memory, uses the listed universe plus ontology CPU/NPU heuristic candidate screening, runs goal-directed strategy and `RiskManager`, then applies approved orders only to virtual cash and holdings.
-
-`initial_cash` is normally resolved automatically from the most recent read-only KIS live account basis. If no basis is cached, an `initial_cash_source = auto` request attempts a read-only live account refresh before falling back to the configured default. The simulation profit-gain multiplier is derived from the target return, target horizon, account size, and live cash weight rather than exposed as a user setting.
-
-## Core Algorithm
-
-```text
-Public/current research sources
-  -> normalization and optional LLM event classification
-  -> data/store SQLite persistence
-  -> analysis context
-  -> lightweight ontology candidate filter
-  -> indicator snapshots and time-synchronized frames
-  -> ontology graph + reasoning paths
-  -> goal feasibility and strategy scoring
-  -> OrderIntent records
-  -> deterministic RiskManager validation
-  -> FinalOrder
-  -> LiveExecutionCoordinator or paper/mock executor
-```
-
-The first ontology filter screens the full available universe with low-cost quote-like features such as liquidity, volume change, price momentum, foreign/institution flow, halt status, and management-stock status. In offline fixture mode these quote-like values can be synthetic or estimated and are labeled accordingly. Only selected candidates continue to heavier graph/strategy stages, with priority tickers retained for visibility.
-
-The current ontology NPU path is a heuristic fixed linear scorer accelerated by OpenVINO when available. It is not a trained AI model unless a separately trained/exported model is plugged into the inference backend. CPU fallback remains enabled.
-
-## Live Trading Decision Semantics
-
-The independent realtime engine in `src/app/trading/realtime_trading_engine.py` runs every `REALTIME_TRADING_INTERVAL_MS` milliseconds. Each cycle:
-
-1. Reads the latest KIS account snapshot.
-2. Evaluates exits for every holding before evaluating new entries.
-3. Keeps already-open SELL orders unless the replacement limit price changes enough to justify an amend.
-4. Skips BUY entirely when `REALTIME_BUY_ENABLED=false`.
-5. Builds BUY candidates from cached context, fresh realtime symbols, volume-surge discovery, configured symbols, and affordable broker-quote candidates.
-6. Rejects BUY candidates with stale KIS realtime feature inputs, excessive spread, low liquidity, insufficient one-share cash, weak fallback score, missing ontology/runtime confirmation, or model-only support.
-7. Submits only approved `FinalOrder` objects through `LiveExecutionCoordinator`.
-
-Common rejection meanings:
-
-- `HOLD_BELOW_PROFIT_TARGET`: SELL was considered, but expected exit is still below the configured net-profit target after costs.
-- `open_sell_kept`: a SELL order is already open at effectively the same price; no duplicate order is sent.
-- `MODEL_FEATURE_UNAVAILABLE:...QUOTE_STALE,ORDERBOOK_STALE`: the live model cannot score because KIS realtime tick/orderbook inputs are stale or missing.
-- `WIDE_SPREAD:x>ybps`: current spread is wider than the adaptive policy allows.
-- `LOW_LIQUIDITY`: candidate liquidity is too thin for reliable execution.
-- `FALLBACK_SCORE_BELOW_THRESHOLD`: rule/ontology fallback score is below the adaptive buy threshold.
-- `INSUFFICIENT_CASH_FOR_ONE_SHARE`: available currency cash is below one-share cost plus buffer.
-
-## Resource Profile
-
-Local resource probe measured on 2026-06-25 23:53 KST with `C:\Python311\python.exe`.
-
-Workload:
-
-```text
-30 iterations
-4096 synthetic market snapshots
-30 OpenVINO ontology classifier calls per iteration
-3,686,400 total NPU score rows
-600 time-synchronized frames per iteration
-300 realtime supervised learning examples per iteration
-200 paper-trading evaluation trades per iteration
-model artifacts written on the first and last iteration
-```
-
-Observed result:
-
-```text
-total elapsed time:              11.871 s
-average iteration time:          377.81 ms
-iteration time range:            339.20-470.60 ms
-OpenVINO backend:                NPU
-NPU active according to runtime: true
-NPU batch size:                  4096
-NPU batches per 4096-row call:   1
-NPU latency per 4096-row call:   avg 9.996 ms, min 7.911 ms, max 13.202 ms
-last measured NPU throughput:    425,258 rows/s
-process CPU usage:               avg 3.98%, max 4.40% of total logical CPU
-process working set memory:      avg 130.5 MB, max 135.3 MB
-process private memory:          avg 757.49 MB, max 760.7 MB
-system memory used:              avg 82.40%, max 82.69%
-GPU/NPU compute counter:         avg 0.00%, max 0.00%
-GPU 3D counter for process:      avg 6.61%, max 13.22%
-adapter shared memory:           avg 1606.25 MB, max 1617.2 MB
-```
-
-Measurement notes:
-
-- The application runtime reported `backend=NPU`, `uses_npu=True`, and no fallback reason.
-- The ontology NPU classifier uses a reusable input buffer and defaults to `ONTOLOGY_NPU_BATCH_SIZE=4096` to reduce per-call allocation churn and increase work per NPU dispatch.
-- Windows `GPU Engine(*)\Utilization Percentage` did not expose a separate measurable NPU compute engine for this OpenVINO workload on this machine, so the OS counter stayed at `0.00%` even while OpenVINO reported NPU execution.
-- CPU and process memory are sampled from the Python process; adapter memory is the aggregate Windows GPU adapter memory counter, not a per-model allocation.
-
-## Important API Paths
-
-```text
-GET  /api/status
-GET  /api/research
-POST /api/research/refresh
-GET  /api/research/diagnostics
-GET  /api/research/volume
-GET  /api/ontology/graph
-GET  /api/ontology/runtime
-GET  /api/realtime/runtime
-POST /api/live-snapshot
-POST /api/assess-goal
-POST /api/start
-POST /api/operation-mode/start
-GET  /api/operation-mode/status
-POST /api/operation-mode/stop-learning
-POST /api/paper-trading/start
-POST /api/paper-trading/step
-POST /api/mock-kis/orders
-GET  /api/mock-kis/portfolio
-```
-
-## NPU Evidence Acceleration
-
-The ontology pipeline can use OpenVINO/NPU for numeric evidence scoring while
-keeping hard filters, graph reasoning, strategy decisions, `RiskManager`, manual
-approval, and broker execution on CPU-controlled deterministic paths.
-
-Current verified behavior:
-
-- The local OpenVINO runtime reports `CPU`, `GPU`, and `NPU`.
-- `run.ps1` requests `OPENVINO_DEVICE=NPU` and `ONTOLOGY_ACCELERATOR=NPU`.
-- `OntologyNpuLinearScorer` compiles its candidate scoring graph to `NPU` and reports `uses_npu=true` when available.
-- `trading_pipeline._rank_accepted_with_npu` uses that scorer for accepted candidate ranking.
-- Event classification and short-horizon model paths may request OpenVINO/NPU, but their outputs remain advisory and may fall back to keyword, live-model, linear, or CPU implementations.
-
-Key controls:
-
-- `ONTOLOGY_NPU_ENABLED=true`: enable candidate evidence scoring.
-- `ONTOLOGY_NPU_TOP_K=50`: limit candidates passed into graph reasoning.
-- `ONTOLOGY_NPU_BATCH_SIZE=auto`: choose `512/1024/2048/4096` scoring buckets.
-- `ONTOLOGY_ACCELERATOR=NPU`: request NPU for ontology runtime status.
-- `OPENVINO_DEVICE=NPU`: request NPU; CPU fallback is automatic.
-- `NPU_MIN_BATCH_FOR_NPU=128`: shared NPU helper modules use CPU NumPy below this batch size.
-- `EVENT_CLASSIFIER_PROVIDER=keyword`: lightweight event classification default.
-- `SHORT_HORIZON_PREDICTOR_ENABLED=false`: opt-in short-horizon predictor.
-- `ONTOLOGY_GRAPH_SCOPE=candidate_only`: avoid full-universe graph materialization.
-
-Benchmark locally:
-
-```powershell
-python scripts/benchmark_npu_scoring.py --device CPU
-python scripts/benchmark_realtime_pipeline.py --device CPU
-```
-
-See `docs/npu_optimization_audit.md` and `docs/npu_runtime_architecture.md`.
-
-## Repository Layout
-
-```text
-src/app/
-  agents/          LLM-facing interfaces and contracts
-  audit/           Append-only audit logger
-  backtesting/     Local paper-trading and accelerated replay tools
-  data/            Public collectors, classifiers, HTTP helpers
-  execution/       Mock broker plus KIS Developers REST adapter
-  features/        Formula indicators, semantic features, model-row scaffolding
-  goals/           Target feasibility and compromise goal negotiation
-  graph/           Ontology graph, event mapper, NPU classifier, reasoner
-  indicators/      Main lightweight IndicatorSnapshot engine
-  models/          Dataset and no-lookahead labeling helpers
-  realtime/        Operation modes, acceleration policy, learning/paper-trading helpers
-  research/        Source orchestration, retries, diagnostics
-  risk/            Deterministic hard-rule risk manager
-  storage/         SQLite research store and model artifact store
-  strategy/        Rule-based and goal-directed strategy generation
-docs/
-  architecture.md
-  system_algorithm_analysis.md
-  realtime_short_horizon_policy.md
-  data_environment_separation.md
-  semantic_feature_engine.md
-  semantic_feature_codebase_analysis.md
-  raspberry_pi_deployment.md
-packaging/
-  raspberrypi/     One-command CPU-only (NPU-free) Raspberry Pi package
-research_notes/
-  technical_indicator_formulas.md
-```
-
-## Development Phases
-
-1. Realtime-only public data collection and normalized local storage
-2. Indicator and semantic feature expansion
-3. Ontology graph, candidate filtering, and reasoning
-4. Local/remote LLM classification with strict JSON output
-5. Goal-directed strategy and deterministic risk manager
-6. Paper-trading evaluation and local accelerated replay
-7. KIS paper/mock brokerage workflows
-8. Brokerage read-only integration
-9. Manual-approval trading gate
-10. Limited automation only after proven stability and explicit controls
-
-## Disclaimer
-
-This is engineering infrastructure for personal research. It is not financial advice, an investment advisory service, or third-party fund management software.
+환경에 따라 OpenVINO/NPU, KIS 실계좌, local LLM 관련 테스트는 optional dependency나 secrets 상태에 영향을 받을 수 있습니다.

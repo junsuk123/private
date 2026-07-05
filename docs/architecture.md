@@ -116,6 +116,9 @@ Startup services in the current `run.ps1` runtime:
 Important UI/API paths:
 
 - `GET /`: single-page web UI
+- `GET /account`: account/asset dashboard for current operations; shows holdings, cash by currency, PnL, asset history, realtime decision flow, rejection reasons, logs, and live termination controls
+- `GET /display`: compact trade-reason board for Raspberry Pi LCD/kiosk use
+- `GET /display/ontology`: fullscreen ontology graph view for browser or kiosk display
 - `GET /api/status`: account, report, risk, and refresh status
 - `GET /api/research`: configured research result, events, graph triples, and reasoning paths
 - `POST /api/research/refresh`: background refresh trigger
@@ -141,10 +144,10 @@ Important UI/API paths:
 - `GET /api/mock-kis/portfolio`: mock portfolio state
 - `POST /api/mock-trading/run`: deterministic mock trading cycle
 - `GET /api/mock-trading/performance`: mock-trading performance summary
-- `GET /account`: KIS account dashboard, holdings, cash, asset history, realtime decision flow, rejection reasons, and termination button
 - `GET /api/account/dashboard`: live account dashboard payload
 - `GET /api/account/asset-history`: minute-bucketed total-asset history
 - `GET /api/realtime-trading/status`: independent realtime trading engine status, recent events, and decision diagnostics
+- `GET /api/trade-explanations`: human-readable cards for `/display`
 - `GET /api/ai/validation`: event LLM, live model, training, and ontology/NPU validation
 - `GET /api/live-training/status`: live short-horizon training status
 - `POST /api/live-trading/terminate`: disable BUY, submit profit-seeking liquidation SELL orders, and optionally schedule server shutdown
