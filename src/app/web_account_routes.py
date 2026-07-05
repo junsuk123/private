@@ -12,9 +12,12 @@ def create_account_router(
     *,
     status_provider: Callable[[], dict[str, Any] | None] | None = None,
     logs_provider: Callable[[], dict[str, Any] | None] | None = None,
+    service: AccountDashboardService | None = None,
 ) -> APIRouter:
     router = APIRouter()
-    service = AccountDashboardService(status_provider=status_provider, logs_provider=logs_provider)
+    # A shared service can be injected so a background sampler and the HTTP routes
+    # write to the same snapshot store; otherwise build one from the providers.
+    service = service or AccountDashboardService(status_provider=status_provider, logs_provider=logs_provider)
 
     @router.get("/account", response_class=HTMLResponse)
     def account_dashboard_page() -> HTMLResponse:

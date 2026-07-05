@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette import routing as starlette_routing
 
 from app.web_account_routes import create_account_router
+from app.account_dashboard import AccountDashboardService
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
@@ -183,6 +184,11 @@ AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").
 AUTO_START_LIVE_TRAINING = os.getenv("AUTO_START_LIVE_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
 LIVE_TRAINING_INTERVAL_SECONDS = max(60, int(os.getenv("LIVE_TRAINING_INTERVAL_SECONDS", "300")))
 _auto_live_readiness_started = False
+# Background total-asset sampler: periodically persist a dashboard snapshot so the
+# asset-history curve accumulates continuously even when no browser is open (the Pi
+# kiosk shows the trade display, not /account). Read-only w.r.t. trading.
+AUTO_START_ASSET_HISTORY_SAMPLER = os.getenv("AUTO_START_ASSET_HISTORY_SAMPLER", "true").lower() not in {"0", "false", "no", "off"}
+ASSET_HISTORY_SAMPLE_SECONDS = max(15, int(os.getenv("ASSET_HISTORY_SAMPLE_SECONDS", "60")))
 
 
 def _account_dashboard_status_provider() -> dict[str, Any]:
@@ -224,12 +230,13 @@ def _account_dashboard_logs_provider() -> dict[str, Any]:
   }
 
 
-app.include_router(
-    create_account_router(
-        status_provider=_account_dashboard_status_provider,
-        logs_provider=_account_dashboard_logs_provider,
-    )
+# Single shared service so the HTTP routes and the background asset-history
+# sampler (see _asset_history_sampler_loop) persist to the same snapshot store.
+_account_service = AccountDashboardService(
+    status_provider=_account_dashboard_status_provider,
+    logs_provider=_account_dashboard_logs_provider,
 )
+app.include_router(create_account_router(service=_account_service))
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -955,6 +962,9 @@ def _start_streaming_demo(
 _live_worker: threading.Thread | None = None
 _refresh_worker: threading.Thread | None = None
 _kis_realtime_collector_worker: threading.Thread | None = None
+# 총자산 이력 샘플러: 수집·학습·거래와 독립된 읽기 전용 스레드.
+_asset_history_sampler_worker: threading.Thread | None = None
+_asset_history_sampler_stop = threading.Event()
 # 실시간 거래 엔진: 학습 워커(_live_worker)와 완전히 독립된 스레드/상태.
 _realtime_trading_worker: threading.Thread | None = None
 _realtime_trading_stop = threading.Event()
@@ -1012,9 +1022,45 @@ def _clear_live_analysis_cache_unlocked() -> None:
   _live_state["live_trading_baseline_equity"] = None
 
 
+def _asset_history_sampler_loop() -> None:
+    """Persist a total-asset snapshot every ASSET_HISTORY_SAMPLE_SECONDS.
+
+    Runs independently of any open browser so the dashboard asset-history curve
+    accumulates continuously (the Pi kiosk shows the trade display, not /account).
+    Zero/empty snapshots are skipped so the chart is not polluted before the first
+    live account read. Never raises — sampling must not affect trading.
+    """
+    while not _asset_history_sampler_stop.is_set():
+        try:
+            dashboard = _account_service.build_dashboard(persist=False)
+            snapshot = dashboard.get("snapshot") or {}
+            if float(snapshot.get("total_asset_krw") or 0.0) > 0.0:
+                _account_service.store.save_dashboard(dashboard)
+        except Exception:  # noqa: BLE001 - a sampling error must never break the server.
+            pass
+        _asset_history_sampler_stop.wait(ASSET_HISTORY_SAMPLE_SECONDS)
+
+
+def _start_asset_history_sampler() -> None:
+    global _asset_history_sampler_worker
+    if _asset_history_sampler_worker is not None and _asset_history_sampler_worker.is_alive():
+        return
+    _asset_history_sampler_stop.clear()
+    _asset_history_sampler_worker = threading.Thread(
+        target=_asset_history_sampler_loop, name="asset-history-sampler", daemon=True
+    )
+    _asset_history_sampler_worker.start()
+
+
+def _stop_asset_history_sampler() -> None:
+    _asset_history_sampler_stop.set()
+
+
 @app.on_event("startup")
 def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
+    if AUTO_START_ASSET_HISTORY_SAMPLER:
+      _start_asset_history_sampler()
     if AUTO_START_KIS_REALTIME_COLLECTOR:
       _start_kis_realtime_collector()
     if AUTO_START_LIVE_WORKER:
@@ -1029,6 +1075,7 @@ def _startup_live_worker() -> None:
 
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
+    _stop_asset_history_sampler()
     _stop_realtime_trading_engine()
     _stop_kis_realtime_collector()
     _stop_live_training_worker()
@@ -1265,10 +1312,22 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   .tone-loss{--accent:#ef4444}.tone-warn{--accent:#f59e0b}.tone-hold{--accent:#64748b}
   #empty{margin:auto;text-align:center;color:#5b6675;font-size:14px;line-height:1.8;padding:16px}
   #status{padding:6px 12px;border-top:1px solid var(--line);font-size:11px;color:var(--muted);flex:0 0 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #asset{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--line);background:#0d131d}
+  #asset .col{flex:0 0 auto;min-width:0}
+  #asset .lab{font-size:10px;color:var(--muted);line-height:1.2}
+  #asset .val{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15}
+  #asset .delta{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+  #asset .delta.up{color:#22c55e}#asset .delta.down{color:#ef4444}
+  #asset canvas{flex:1 1 auto;height:40px;min-width:0;display:block}
 </style></head>
 <body>
 <div id="app">
   <header><span class="dot" id="dot"></span><h1>왜 사고 팔았나 · 자동매매</h1><span class="clock" id="clock"></span></header>
+  <section id="asset" aria-label="총자산 추이">
+    <div class="col"><div class="lab">총자산</div><div class="val" id="asset-val">—</div></div>
+    <div class="col delta" id="asset-delta"></div>
+    <canvas id="asset-spark" height="40"></canvas>
+  </section>
   <section id="overview" aria-label="현재 상태"></section>
   <main id="list"></main>
   <div id="status">연결 중…</div>
@@ -1339,6 +1398,46 @@ TRADE_DISPLAY_HTML = """<!doctype html>
     catch(e){document.getElementById("status").textContent="연결 오류 — 재시도 중…";}
   }
   poll();setInterval(poll,4000);
+
+  // 총자산 실시간 추이(스파크라인). 서버 백그라운드 샘플러가 이력을 계속 적재하므로
+  // 브라우저를 켜두지 않아도 흐름이 이어진다. /api/account/asset-history 는 SQLite 읽기라 가볍다.
+  var assetPoints=[];
+  function fmtWon(v){return "₩"+Math.round(Number(v||0)).toLocaleString("ko-KR");}
+  function drawSpark(){
+    var c=document.getElementById("asset-spark");if(!c)return;
+    var ctx=c.getContext("2d");
+    var w=Math.max(1,c.clientWidth||c.width),hh=c.height;
+    if(c.width!==w)c.width=w;
+    ctx.clearRect(0,0,w,hh);
+    if(assetPoints.length<2)return;
+    var vals=assetPoints.map(function(p){return Number(p.total_asset_krw||0);});
+    var min=Math.min.apply(null,vals),max=Math.max.apply(null,vals);
+    var pad=4,span=Math.max(1,max-min),up=vals[vals.length-1]>=vals[0];
+    var col=up?"#22c55e":"#ef4444";
+    ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();
+    var pts=vals.map(function(v,i){return [pad+(i/(vals.length-1))*(w-pad*2),hh-pad-((v-min)/span)*(hh-pad*2)];});
+    pts.forEach(function(p,i){if(i===0)ctx.moveTo(p[0],p[1]);else ctx.lineTo(p[0],p[1]);});
+    ctx.stroke();
+    var g=ctx.createLinearGradient(0,0,0,hh);
+    g.addColorStop(0,up?"rgba(34,197,94,.22)":"rgba(239,68,68,.22)");g.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.lineTo(pts[pts.length-1][0],hh-pad);ctx.lineTo(pts[0][0],hh-pad);ctx.closePath();ctx.fillStyle=g;ctx.fill();
+  }
+  async function pollAsset(){
+    try{
+      var r=await fetch("/api/account/asset-history?range=1D",{cache:"no-store"});
+      var d=await r.json();assetPoints=(d&&d.points)||[];
+      var valEl=document.getElementById("asset-val"),dEl=document.getElementById("asset-delta");
+      if(!assetPoints.length){valEl.textContent="—";dEl.textContent="이력 수집 중";dEl.className="col delta";drawSpark();return;}
+      var first=Number(assetPoints[0].total_asset_krw||0),last=Number(assetPoints[assetPoints.length-1].total_asset_krw||0);
+      valEl.textContent=fmtWon(last);
+      var diff=last-first,pct=first>0?(diff/first*100):0;
+      dEl.textContent=(diff>=0?"▲ ":"▼ ")+fmtWon(Math.abs(diff))+" ("+(pct>=0?"+":"")+pct.toFixed(2)+"%)";
+      dEl.className="col delta "+(diff>=0?"up":"down");
+      drawSpark();
+    }catch(e){}
+  }
+  window.addEventListener("resize",drawSpark);
+  pollAsset();setInterval(pollAsset,15000);
 })();
 </script>
 </body></html>"""
