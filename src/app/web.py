@@ -1275,7 +1275,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
 <html lang="ko"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>자동매매 — 왜 사고 팔았나</title>
+<title>온톨로지 기반 투자 프로그램</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   :root{--bg:#0b0f16;--card:#141b26;--line:#263243;--muted:#8b98a9;--txt:#e6edf3}
@@ -1322,7 +1322,7 @@ TRADE_DISPLAY_HTML = """<!doctype html>
 </style></head>
 <body>
 <div id="app">
-  <header><span class="dot" id="dot"></span><h1>왜 사고 팔았나 · 자동매매</h1><span class="clock" id="clock"></span></header>
+  <header><span class="dot" id="dot"></span><h1>온톨로지 기반 투자 프로그램</h1><span class="clock" id="clock"></span></header>
   <section id="asset" aria-label="총자산 추이">
     <div class="col"><div class="lab">총자산</div><div class="val" id="asset-val">—</div></div>
     <div class="col delta" id="asset-delta"></div>
