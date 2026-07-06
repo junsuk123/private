@@ -1319,6 +1319,14 @@ TRADE_DISPLAY_HTML = """<!doctype html>
   #asset .delta{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
   #asset .delta.up{color:#22c55e}#asset .delta.down{color:#ef4444}
   #asset canvas{flex:1 1 auto;height:54px;min-width:0;display:block}
+  #cash{flex:0 0 auto;display:flex;align-items:stretch;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line);background:#0d131d}
+  #cash .col{flex:1 1 0;min-width:0;border:1px solid var(--line);border-radius:8px;background:#121a26;padding:6px 9px;position:relative;overflow:hidden}
+  #cash .col::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--accent,#64748b)}
+  #cash .col.krw{--accent:#a78bfa}#cash .col.fx{--accent:#38bdf8}
+  #cash .lab{font-size:10px;color:var(--muted);line-height:1.2}
+  #cash .val{margin-top:2px;font-size:17px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #cash .sub{margin-top:1px;font-size:10px;color:#9fb0c4;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #cash.off{opacity:.55}
 </style></head>
 <body>
 <div id="app">
@@ -1327,6 +1335,10 @@ TRADE_DISPLAY_HTML = """<!doctype html>
     <div class="col"><div class="lab">총자산</div><div class="val" id="asset-val">—</div></div>
     <div class="col delta" id="asset-delta"></div>
     <canvas id="asset-spark" height="54"></canvas>
+  </section>
+  <section id="cash" aria-label="주문 가능 잔액">
+    <div class="col krw"><div class="lab">주문가능 원화</div><div class="val" id="cash-krw">—</div><div class="sub" id="cash-krw-sub">KRW</div></div>
+    <div class="col fx"><div class="lab">주문가능 외화</div><div class="val" id="cash-fx">—</div><div class="sub" id="cash-fx-sub">원화환산</div></div>
   </section>
   <section id="overview" aria-label="현재 상태"></section>
   <main id="list"></main>
@@ -1361,9 +1373,22 @@ TRADE_DISPLAY_HTML = """<!doctype html>
     var w=o.work||{};
     root.appendChild(overviewCard(w.label||"뉴스 분석 대기",w.detail||"",w.tone||"idle","뉴스/데이터"));
   }
+  function wonShort(v){return "₩"+Math.round(Number(v||0)).toLocaleString("ko-KR");}
+  function renderOrderableCash(oc){
+    var sec=document.getElementById("cash");
+    var krwEl=document.getElementById("cash-krw"),fxEl=document.getElementById("cash-fx"),fxSub=document.getElementById("cash-fx-sub");
+    if(!oc||!oc.available){sec.className="off";krwEl.textContent="—";fxEl.textContent="—";fxSub.textContent="계좌 연결 대기";return;}
+    sec.className="";
+    krwEl.textContent=wonShort(oc.krw);
+    var ccy=oc.foreign_currency||"USD";
+    var amt=Number(oc.foreign_native||0);
+    fxEl.textContent=(ccy==="USD"?"$"+amt.toLocaleString("en-US",{maximumFractionDigits:2}):amt.toLocaleString("en-US",{maximumFractionDigits:2})+" "+ccy);
+    fxSub.textContent="≈ "+wonShort(oc.foreign_krw)+" 원화환산";
+  }
   function render(d){
     var list=document.getElementById("list");
     renderOverview(d.overview);
+    renderOrderableCash(d.orderable_cash);
     document.getElementById("dot").className="dot"+(d.running?"":" off");
     var a=d.activity||{};
     var activityText="cycle "+(a.cycle||0)+" | buy "+(a.buy_evaluated||0)+"/"+(a.buy_rejected||0)+" | sell "+(a.sell_evaluated||0)+"/"+(a.sell_rejected||0)+" | orders "+(a.submitted||0)+" | ignored "+(a.skipped_ignored||0);
@@ -3054,6 +3079,37 @@ def _format_price_display(price: Any, is_us: bool) -> str:
     return f"${value:,.2f}" if is_us else f"{value:,.0f}원"
 
 
+def _kiosk_orderable_cash() -> dict[str, Any]:
+    """Orderable cash by currency for the Pi kiosk / mobile overview.
+
+    Reuses the same cached KIS live-account basis the account dashboard reads, so
+    the figures match broker orderable cash (domestic inquire-psbl-order TTTC8908R
+    + overseas inquire-psamount TTTS3007R) without an extra API round trip. The
+    cache in _refresh_live_account_basis_for_auto keeps the 4s kiosk poll cheap.
+    """
+    basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
+    if basis is None:
+        return {"available": False}
+    orderable = {
+        str(code).upper(): _number_or_zero(amount)
+        for code, amount in dict(basis.get("orderable_cash_by_currency") or {}).items()
+    }
+    krw = _number_or_zero(orderable.get("KRW", basis.get("krw_cash")))
+    foreign_native = {
+        code: amount for code, amount in orderable.items() if code != "KRW" and amount > 0
+    }
+    # Primary foreign currency = the largest non-KRW orderable balance (USD for KR+US).
+    primary_ccy = max(foreign_native, key=foreign_native.get) if foreign_native else "USD"
+    return {
+        "available": True,
+        "krw": krw,
+        "foreign_currency": primary_ccy,
+        "foreign_native": foreign_native.get(primary_ccy, 0.0),
+        "foreign_krw": _number_or_zero(basis.get("foreign_cash_krw")),
+        "by_currency": orderable,
+    }
+
+
 def _kiosk_market_overview(now: datetime | None = None) -> dict[str, Any]:
     from datetime import time as _time
     from zoneinfo import ZoneInfo
@@ -3161,6 +3217,7 @@ def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
             "running": running,
             "buy_enabled": None,
             "overview": _kiosk_market_overview(now),
+            "orderable_cash": _kiosk_orderable_cash(),
             "cards": [],
         }
     status = engine.get_status()
@@ -3236,6 +3293,7 @@ def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
         "last_reason": status.get("last_reason"),
         "activity": activity,
         "overview": _kiosk_market_overview(now),
+        "orderable_cash": _kiosk_orderable_cash(),
         "cards": cards,
     }
 

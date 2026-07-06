@@ -106,6 +106,56 @@ def _market_for_symbol(symbol: str) -> str:
     return "NASD"
 
 
+def _load_us_exchange_map() -> dict[str, str]:
+    """Operator-maintained ticker→exchange overrides (JSON in KIS_US_EXCHANGE_MAP).
+
+    Example: KIS_US_EXCHANGE_MAP='{"PLTR":"NYSE","F":"NYSE","SPCE":"NYSE"}'
+    """
+    raw = os.getenv("KIS_US_EXCHANGE_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k).upper().strip(): str(v).upper().strip()
+        for k, v in data.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+
+def _resolve_order_market(symbol: str, account: AccountSnapshot | None = None) -> str:
+    """Resolve the KIS routing exchange for a *buy* order.
+
+    6-digit numeric → KR. For US names the OVRS_EXCG_CD must match the listing
+    exchange (KIS rejects a wrong one), yet a bare ticker only tells us "US". We
+    resolve it authoritatively when possible: (1) the broker-reported exchange of a
+    position we already hold with the same ticker, (2) an operator-maintained
+    KIS_US_EXCHANGE_MAP override, else (3) the configured default. Unknown names
+    keep the previous NASD behavior, so this never regresses working NASDAQ orders.
+    Sells are unaffected — they already route on the holding's broker exchange.
+    """
+    base = _market_for_symbol(symbol)
+    if base == "KR":
+        return base
+    s = str(symbol or "").strip().upper()
+    if account is not None:
+        for holding in getattr(account, "holdings", ()) or ():
+            if str(getattr(holding, "ticker", "") or "").strip().upper() != s:
+                continue
+            held = str(getattr(holding, "market", "") or "").strip().upper()
+            for code in ("NYSE", "AMEX", "NASD"):
+                if code in held:
+                    return code
+    mapped = _load_us_exchange_map().get(s)
+    if mapped:
+        return mapped
+    return os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper() or "NASD"
+
+
 def _cost_context_for_holding(symbol: str, market: str) -> tuple[str, str]:
     s = str(symbol or "").strip().upper()
     market_name = str(market or "").strip().upper()
@@ -281,7 +331,7 @@ class SharedLiveDecisionEngine:
             prediction_error = exc
 
         tick = self.store.latest_tick(symbol)
-        market_name = _market_for_symbol(symbol)
+        market_name = _resolve_order_market(symbol, account)
         quote_refresh_status = "quote_refresh_skipped"
         refreshed_market: MarketSnapshot | None = None
         if tick is None or float(getattr(tick, "price", 0.0) or 0.0) <= 0:
