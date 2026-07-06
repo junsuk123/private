@@ -16,8 +16,8 @@
 # Minimum acceptable net expected return (after all costs) by market.
 # Overridable by REALTIME_MIN_BUY_NET_RETURN_KR / REALTIME_MIN_BUY_NET_RETURN_US.
 min_required_net_return:
-  default: 0.008
-  KR: 0.008
+  default: 0.004
+  KR: 0.004
   US: 0.012
 
 # Extra net headroom demanded above pure break-even before a buy is worth taking.
@@ -34,7 +34,10 @@ max_slippage_rate: 0.003
 max_spread_alpha_ratio: 0.35
 
 # Cost may not dominate alpha beyond this ratio (all_in_cost_rate / |gross_return|).
-max_cost_to_alpha_ratio: 0.5
+# Relaxed 0.5 -> 0.7 (moderate) so realistic ~0.7-0.9% expected moves on a small
+# account are not blocked by COST_BURDEN_HIGH while clearly cost-dominated trades
+# (cost > 70% of alpha) are still rejected.
+max_cost_to_alpha_ratio: 0.7
 
 # Liquidity floor (0..1 normalized score).
 min_liquidity_score: 0.3
@@ -47,9 +50,14 @@ min_liquidity_score: 0.3
 #       + liquidity_buffer_max * (1 - liquidity_score)
 #       + account_buffer(if small account),
 # )
-volatility_buffer_k: 0.5
+# Relaxed 0.5 -> 0.2 (moderate): the volatility buffer was the dominant term forcing
+# required net to ~0.86% and rejecting every buy. At 0.2 a 1% realized-vol name adds
+# only +0.2%, so the KR market floor (0.004) becomes the binding minimum (~0.45%).
+volatility_buffer_k: 0.2
 liquidity_buffer_max: 0.003
 
 account_buffer:
   small_account_equity_krw: 200000.0
-  small_account_extra_net: 0.002
+  # 0.002 -> 0.0 (moderate): stop demanding an extra 0.2% net purely for being a
+  # small account; the market floor + cost/alpha rule already protect against bleed.
+  small_account_extra_net: 0.0

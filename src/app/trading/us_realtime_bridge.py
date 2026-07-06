@@ -222,15 +222,30 @@ def _ontology_us_buy_candidates(context: Any, *, min_confidence: float = 0.0, ma
 
 
 def _exchange_code(symbol: str, market_hint: str = "") -> str:
-    del symbol
     market = str(market_hint or "").upper().strip()
 
-    if market in {"NASDAQ", "NAS"}:
+    if market in {"NASDAQ", "NAS", "NASD"}:
         return "NAS"
     if market in {"NYSE", "NYS"}:
         return "NYS"
     if market in {"AMEX", "AMS"}:
         return "AMS"
+
+    # No usable hint: consult the built ticker→exchange listing map so NYSE/AMEX names
+    # are quoted on their real exchange. A wrong-exchange overseas quote returns price 0,
+    # which is exactly why affordable NYSE names never yielded a usable tick before.
+    try:
+        from app.trading.shared_decision_engine import _load_us_listed_exchange_map
+
+        mapped = _load_us_listed_exchange_map().get(str(symbol or "").upper().strip())
+        if mapped == "NYSE":
+            return "NYS"
+        if mapped == "AMEX":
+            return "AMS"
+        if mapped == "NASD":
+            return "NAS"
+    except Exception:  # noqa: BLE001 - map is best-effort; fall back to the default.
+        pass
 
     return _env_any("KIS_DEFAULT_US_QUOTE_EXCHANGE", default="NAS").upper()
 

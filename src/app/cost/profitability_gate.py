@@ -488,7 +488,9 @@ def load_policy(config_path: Path | str = "config/profitability_policy.yaml") ->
         volatility_buffer_k=float(merged.get("volatility_buffer_k", 0.5)),
         liquidity_buffer_max=float(merged.get("liquidity_buffer_max", 0.003)),
         small_account_equity_krw=float(account.get("small_account_equity_krw", 200000.0)),
-        small_account_extra_net=float(account.get("small_account_extra_net", 0.002)),
+        small_account_extra_net=_env_float(
+            "REALTIME_SMALL_ACCOUNT_EXTRA_NET", float(account.get("small_account_extra_net", 0.002))
+        ),
     )
     if not _POLICY_LOGGED:
         logger.info("ProfitabilityGate resolved policy: %s", policy.as_dict())

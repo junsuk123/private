@@ -163,6 +163,10 @@ NASDAQ_TRADER_LISTING_URLS = (
 SIM_UNIVERSE_CACHE = Path("data/universe/us_listed_symbols.csv")
 KRX_KIND_LISTED_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
 KRX_UNIVERSE_CACHE = Path("data/universe/krx_listed_symbols.csv")
+US_EXCHANGE_MAP_CACHE = Path("data/universe/us_exchange_map.csv")
+# otherlisted.txt Exchange column -> KIS US venue. KIS only routes NASD/NYSE/AMEX, so
+# Arca(P)/BATS(Z)/IEX(V) are intentionally omitted to avoid wrong-exchange orders.
+_KIS_OTHER_EXCHANGE = {"N": "NYSE", "A": "AMEX"}
 
 
 def load_us_listed_universe(
@@ -361,6 +365,58 @@ def _parse_nasdaq_trader_symbols(text: str) -> list[str]:
         if symbol:
             rows.append(symbol)
     return rows
+
+
+def _iter_nasdaq_trader_rows(text: str):
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return
+    headers = lines[0].split("|")
+    for line in lines[1:]:
+        if line.startswith("File Creation Time"):
+            continue
+        values = line.split("|")
+        if len(values) != len(headers):
+            continue
+        yield dict(zip(headers, values))
+
+
+def build_us_exchange_map(cache_path: Path = US_EXCHANGE_MAP_CACHE) -> dict[str, str]:
+    """Download NASDAQ Trader listings and build a ticker → KIS US exchange map.
+
+    nasdaqlisted.txt → NASD; otherlisted.txt Exchange column N → NYSE, A → AMEX
+    (Arca/BATS/IEX omitted; KIS routes only NASD/NYSE/AMEX). Writes a symbol,exchange
+    CSV and returns the mapping. On total network failure returns {} and leaves any
+    existing cache untouched, so a bad refresh never wipes a working map.
+    """
+    mapping: dict[str, str] = {}
+    try:
+        with urllib.request.urlopen(NASDAQ_TRADER_LISTING_URLS[0], timeout=20) as response:
+            text = response.read().decode("utf-8", errors="replace")
+        for row in _iter_nasdaq_trader_rows(text):
+            symbol = _normalize_symbol(row.get("Symbol") or "")
+            if symbol and row.get("Test Issue", "N") != "Y":
+                mapping[symbol] = "NASD"
+    except Exception:  # noqa: BLE001 - refresh is best-effort; keep the other source.
+        pass
+    try:
+        with urllib.request.urlopen(NASDAQ_TRADER_LISTING_URLS[1], timeout=20) as response:
+            text = response.read().decode("utf-8", errors="replace")
+        for row in _iter_nasdaq_trader_rows(text):
+            symbol = _normalize_symbol(row.get("ACT Symbol") or "")
+            kis = _KIS_OTHER_EXCHANGE.get((row.get("Exchange") or "").strip().upper())
+            if symbol and kis and row.get("Test Issue", "N") != "Y" and symbol not in mapping:
+                mapping[symbol] = kis
+    except Exception:  # noqa: BLE001 - refresh is best-effort; keep the other source.
+        pass
+    if mapping:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("w", encoding="utf-8", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=("symbol", "exchange"))
+            writer.writeheader()
+            for symbol in sorted(mapping):
+                writer.writerow({"symbol": symbol, "exchange": mapping[symbol]})
+    return mapping
 
 
 def _normalize_symbol(symbol: str) -> str:

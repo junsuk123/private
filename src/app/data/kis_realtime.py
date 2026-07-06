@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,7 @@ async def run_kis_realtime_websocket_collector(
     url: str | None = None,
     stop_event: Any | None = None,
     max_messages: int | None = None,
+    max_runtime_seconds: float | None = None,
 ) -> dict[str, int]:
     websockets = _load_websockets()
     client = client or build_kis_client(enabled=True)
@@ -116,14 +118,33 @@ async def run_kis_realtime_websocket_collector(
             for tr_id in DEFAULT_SUBSCRIPTION_TR_IDS:
                 await websocket.send(kis_realtime_subscription_message(approval_key, tr_id, symbol))
                 counts["subscriptions"] += 1
+        # Optional soft deadline so the caller can periodically reconnect with a
+        # refreshed symbol set (e.g. today's affordable candidates), not just the
+        # static config list.
+        deadline = time.monotonic() + max_runtime_seconds if max_runtime_seconds else None
         while stop_event is None or not stop_event.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
             except TimeoutError:
                 continue
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="replace")
-            parsed = parse_kis_realtime_message(str(raw))
+            raw = str(raw)
+            # KIS uses application-level PINGPONG keepalive frames (the websockets
+            # library ping is disabled via KIS_REALTIME_WS_PING_INTERVAL_SECONDS=0
+            # because KIS never answers standard WS pings). KIS drops the socket
+            # ("no close frame received or sent") unless every PINGPONG is echoed
+            # back verbatim, so answer it before doing anything else.
+            if raw.startswith("{") and "PINGPONG" in raw:
+                try:
+                    await websocket.send(raw)
+                except Exception:  # noqa: BLE001 - a failed echo just forces a reconnect.
+                    pass
+                counts["pingpongs"] = counts.get("pingpongs", 0) + 1
+                continue
+            parsed = parse_kis_realtime_message(raw)
             ticks = tuple(tick for tick in parsed.ticks if tick.symbol in normalized_symbols)
             orderbooks = tuple(book for book in parsed.orderbooks if book.symbol in normalized_symbols)
             counts["ticks"] += store.save_ticks(ticks)

@@ -127,6 +127,42 @@ def _load_us_exchange_map() -> dict[str, str]:
     }
 
 
+_US_LISTED_EXCHANGE_MAP_CACHE: dict[str, Any] = {"mtime": None, "map": {}}
+
+
+def _load_us_listed_exchange_map(path: str = "data/universe/us_exchange_map.csv") -> dict[str, str]:
+    """Ticker → KIS US exchange (NASD/NYSE/AMEX) from the built listing map.
+
+    Built from nasdaqtrader.com nasdaqlisted.txt + otherlisted.txt so a US buy quotes
+    (EXCD) and routes its order (OVRS_EXCG_CD) on the ticker's REAL exchange. Without
+    it, US names defaulted to NASD, so NYSE/AMEX tickers quoted at price 0 in discovery
+    and would be rejected at order time. Cached by mtime; empty dict when the file is
+    absent (falls back to the previous NASD default). Only the three KIS-supported US
+    venues are kept — Arca/BATS/IEX rows are omitted upstream to avoid wrong-exchange
+    orders.
+    """
+    import csv as _csv
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _US_LISTED_EXCHANGE_MAP_CACHE.get("mtime") != mtime:
+        mapping: dict[str, str] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for row in _csv.DictReader(handle):
+                    sym = str(row.get("symbol") or "").strip().upper()
+                    exch = str(row.get("exchange") or "").strip().upper()
+                    if sym and exch in {"NASD", "NYSE", "AMEX"}:
+                        mapping[sym] = exch
+        except OSError:
+            return dict(_US_LISTED_EXCHANGE_MAP_CACHE.get("map") or {})
+        _US_LISTED_EXCHANGE_MAP_CACHE["map"] = mapping
+        _US_LISTED_EXCHANGE_MAP_CACHE["mtime"] = mtime
+    return _US_LISTED_EXCHANGE_MAP_CACHE.get("map") or {}
+
+
 def _resolve_order_market(symbol: str, account: AccountSnapshot | None = None) -> str:
     """Resolve the KIS routing exchange for a *buy* order.
 
@@ -134,9 +170,10 @@ def _resolve_order_market(symbol: str, account: AccountSnapshot | None = None) -
     exchange (KIS rejects a wrong one), yet a bare ticker only tells us "US". We
     resolve it authoritatively when possible: (1) the broker-reported exchange of a
     position we already hold with the same ticker, (2) an operator-maintained
-    KIS_US_EXCHANGE_MAP override, else (3) the configured default. Unknown names
-    keep the previous NASD behavior, so this never regresses working NASDAQ orders.
-    Sells are unaffected — they already route on the holding's broker exchange.
+    KIS_US_EXCHANGE_MAP override, (3) the built ticker→exchange listing map
+    (NASD/NYSE/AMEX), else (4) the configured default. Unknown names keep the previous
+    NASD behavior, so this never regresses working NASDAQ orders. Sells are unaffected
+    — they already route on the holding's broker exchange.
     """
     base = _market_for_symbol(symbol)
     if base == "KR":
@@ -153,6 +190,9 @@ def _resolve_order_market(symbol: str, account: AccountSnapshot | None = None) -
     mapped = _load_us_exchange_map().get(s)
     if mapped:
         return mapped
+    listed = _load_us_listed_exchange_map().get(s)
+    if listed:
+        return listed
     return os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper() or "NASD"
 
 
@@ -376,7 +416,11 @@ class SharedLiveDecisionEngine:
         tick_received_at = getattr(tick, "received_at", decision_time) if tick is not None else decision_time
         quote_age_seconds = 0.0 if refreshed_market is not None else max(0.0, (decision_time - tick_received_at).total_seconds())
         price = float(getattr(refreshed_market, "last_price", 0.0) or getattr(tick, "price", 0.0) or 0.0)
-        min_cash_for_one_share = price * 1.05
+        # Cash headroom required to afford one share (covers small tick moves between the
+        # decision and the fill). Tunable so a very small account is not locked out by a
+        # buffer it cannot spare: REALTIME_ONE_SHARE_CASH_BUFFER (default 1.05 = +5%).
+        one_share_buffer = max(1.0, _env_float("REALTIME_ONE_SHARE_CASH_BUFFER", 1.05))
+        min_cash_for_one_share = price * one_share_buffer
         needs_cash_check_refresh = available_cash < min_cash_for_one_share
         if (
             self.market_refresher is not None
@@ -394,7 +438,7 @@ class SharedLiveDecisionEngine:
             if refreshed_market is not None:
                 quote_refresh_status = "quote_refresh_ok"
                 price = float(getattr(refreshed_market, "last_price", 0.0) or price)
-                min_cash_for_one_share = price * 1.05
+                min_cash_for_one_share = price * one_share_buffer
 
         if available_cash < min_cash_for_one_share:
             result = SharedDecisionResult(
@@ -1185,8 +1229,26 @@ class SharedLiveDecisionEngine:
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
 
-        hard_emergency_exit = exit_reason.startswith(("hard_stop_loss", "domestic_emergency_exit"))
-        if resolved_exit.block_sell_below_breakeven and not hard_emergency_exit and not profitable_after_cost:
+        # A DELIBERATE risk-stop must still execute below break-even — that is the whole
+        # point of a stop. This covers the opt-in net tight stop (REALTIME_STOP_LOSS_NET,
+        # documented to "fire regardless of allow_loss_exit"), the hard/emergency capital
+        # circuit-breakers, and — when the operator enabled loss exits — the discretionary
+        # loss/trailing/domestic reduce exits. block_sell_below_breakeven only exists to
+        # stop *profit/time/model*-motivated exits from churning a slightly-underwater
+        # position on noise; it must NOT silently veto a configured stop-loss (which was
+        # the prior behaviour: a pinned REALTIME_STOP_LOSS_NET never actually sold).
+        deliberate_loss_stop = exit_reason.startswith(
+            (
+                "stop_loss",
+                "hard_stop_loss",
+                "domestic_emergency_exit",
+                "loss_exit",
+                "trailing_exit",
+                "domestic_drawdown_reduce",
+                "domestic_concentration_reduce",
+            )
+        )
+        if resolved_exit.block_sell_below_breakeven and not deliberate_loss_stop and not profitable_after_cost:
             diagnostics = {
                 "exit_policy": exit_policy.as_dict(),
                 "policy": policy.as_dict(),

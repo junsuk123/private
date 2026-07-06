@@ -169,6 +169,51 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         self.assertEqual(result.final_order.side, OrderSide.SELL)
         self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
 
+    def test_optin_tight_stop_sells_even_when_block_below_breakeven_is_on(self) -> None:
+        # REGRESSION: run.ps1 pins REALTIME_STOP_LOSS_NET=0.004 AND
+        # REALTIME_BLOCK_SELL_BELOW_BREAKEVEN=true together. The net tight stop is
+        # documented to "fire regardless of allow_loss_exit", but the break-even
+        # block used to silently veto it (only hard/emergency stops were exempt),
+        # so the configured stop-loss never actually sold — losers between the net
+        # stop and the -3% hard stop were held indefinitely and showed as blocked
+        # sells. A deliberate stop-loss must still execute below break-even.
+        engine = _engine(price=98.0)  # -2% -> below the 0.4% net stop
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0.004",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "true",
+                "REALTIME_ALLOW_LOSS_EXIT": "false",
+                "REALTIME_HARD_STOP_LOSS": "0.03",
+            },
+        ):
+            result = engine.evaluate_exit_for_holding(
+                _holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01
+            )
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertEqual(result.final_order.side, OrderSide.SELL)
+        self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
+
+    def test_block_below_breakeven_still_holds_noise_dip_without_a_stop(self) -> None:
+        # Guard the other side: with NO deliberate stop configured, a slightly
+        # underwater position must still be HELD by block_sell_below_breakeven
+        # (the churn guard is only bypassed for real stops, not for noise dips).
+        engine = _engine(price=98.7)  # ~ -1.3%, no stop configured
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0",
+                "REALTIME_HARD_STOP_LOSS": "0",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "true",
+                "REALTIME_ALLOW_LOSS_EXIT": "false",
+            },
+        ):
+            result = engine.evaluate_exit_for_holding(
+                _holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01
+            )
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
+
     def test_all_stops_disabled_holds_loss(self) -> None:
         engine = _engine(price=98.0)  # -2%
         with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0", "REALTIME_HARD_STOP_LOSS": "0"}):

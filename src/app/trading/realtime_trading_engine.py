@@ -120,6 +120,7 @@ class RealtimeTradingEngine:
         session_open_provider: Callable[[], bool],
         ontology_graph_provider: Callable[[], Any] | None = None,
         market_open_provider: Callable[[str, str], bool] | None = None,
+        cycle_observer: Callable[[dict[str, Any]], None] | None = None,
         config: RealtimeTradingConfig | None = None,
         recent_events_max: int = 50,
     ) -> None:
@@ -131,6 +132,7 @@ class RealtimeTradingEngine:
         self.ontology_graph_provider = ontology_graph_provider
         # 종목별 시장 세션 게이트: 해당 종목의 거래소가 지금 열려 있는지(닫혀 있으면 주문 보류).
         self.market_open_provider = market_open_provider
+        self.cycle_observer = cycle_observer
         self.config = config or RealtimeTradingConfig()
         # Execution-quality layer (Phase 3): rejects buys whose alpha would be consumed
         # by spread/slippage and records realized slippage per symbol/strategy.
@@ -148,6 +150,8 @@ class RealtimeTradingEngine:
         self._recent: Deque[dict[str, Any]] = deque(maxlen=recent_events_max)
         self._buy_enabled = os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         self._buy_disabled_reason: str | None = None
+        self._last_observed_cycle_monotonic = 0.0
+        self._last_observed_cycle_reason: str | None = None
         self._status: dict[str, Any] = {
             "cycles": 0,
             "last_cycle_at": None,
@@ -800,6 +804,7 @@ class RealtimeTradingEngine:
         return True
 
     def _finish_cycle(self, summary: dict[str, Any]) -> None:
+        should_observe = self._should_observe_cycle(summary)
         with self._lock:
             self._status["cycles"] += 1
             self._status["last_cycle_at"] = summary["at"]
@@ -811,6 +816,33 @@ class RealtimeTradingEngine:
             self._status["errors"] += summary["errors"]
             self._status["last_reason"] = summary["reason"]
             self._status["last_summary"] = summary
+        if should_observe and self.cycle_observer is not None:
+            try:
+                self.cycle_observer(dict(summary))
+            except Exception:  # noqa: BLE001 - telemetry must never stop trading.
+                pass
+
+    def _should_observe_cycle(self, summary: dict[str, Any]) -> bool:
+        reason = str(summary.get("reason") or "")
+        submitted = int(summary.get("submitted") or 0)
+        amended = int(summary.get("amended") or 0)
+        blocked = int(summary.get("blocked") or 0)
+        errors = int(summary.get("errors") or 0)
+        attempted = int(summary.get("buy_submit_attempted") or 0)
+        if submitted > 0 or amended > 0 or blocked > 0 or errors > 0 or attempted > 0:
+            self._last_observed_cycle_monotonic = time.monotonic()
+            self._last_observed_cycle_reason = reason
+            return True
+        if reason != self._last_observed_cycle_reason:
+            self._last_observed_cycle_monotonic = time.monotonic()
+            self._last_observed_cycle_reason = reason
+            return True
+        interval = max(5.0, _env_float("REALTIME_CYCLE_AUDIT_INTERVAL_SEC", 30.0))
+        if time.monotonic() - self._last_observed_cycle_monotonic >= interval:
+            self._last_observed_cycle_monotonic = time.monotonic()
+            self._last_observed_cycle_reason = reason
+            return True
+        return False
 
     # ---- thread loop ----------------------------------------------------
     def run_forever(self, stop_event: threading.Event) -> None:

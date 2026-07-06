@@ -9,6 +9,12 @@ dynamic minimum edge. Directional signal strength alone is never sufficient.
 - Config: `config/profitability_policy.yaml`
 - Cost math: delegated to `src/app/cost/trading_cost_engine.py` (one cost model).
 
+> **2026-07 small-account tuning:** the dynamic buffers were relaxed
+> (`volatility_buffer_k` 0.5→0.2, `max_cost_to_alpha_ratio` 0.5→0.7,
+> `small_account_extra_net` 0.002→0.0, KR/default floor →0.004) so a ~0.7% expected move
+> clears instead of ~1.4%. Full trading-activation write-up:
+> [`trading_activation_2026-07.md`](trading_activation_2026-07.md).
+
 ![BUY decision flow](diagrams/profitability_decision_flow.svg)
 
 ## Decision rule

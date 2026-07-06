@@ -167,8 +167,14 @@ Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
 Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.004"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
-Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.008"
+# Small-account "moderate" buy tuning: lower the KR net-edge floor (0.8% -> 0.4%),
+# drop the extra net-return penalty that only applied to small accounts, and shrink
+# the one-share cash headroom (5% -> 2%) so a tiny balance can still afford a share.
+# US floor is left at its already-permissive 0.35% (raising it would cut US buys).
+Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.004"
 Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_US" "0.0035"
+Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EXTRA_NET" "0.0"
+Set-DefaultEnv "REALTIME_ONE_SHARE_CASH_BUFFER" "1.02"
 Set-DefaultEnv "REALTIME_FALLBACK_EDGE_BPS_PER_SCORE" "220"
 Set-DefaultEnv "REALTIME_US_EXCLUDE_SYMBOL_SUFFIXES" "U,WS,WT,W,R,P"
 Set-DefaultEnv "REALTIME_LOSS_REENTRY_COOLDOWN_SEC" "7200"

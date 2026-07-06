@@ -14,7 +14,7 @@ from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -74,7 +74,7 @@ from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
-from app.trading.shared_decision_engine import SharedLiveDecisionEngine
+from app.trading.shared_decision_engine import SharedLiveDecisionEngine, _load_us_listed_exchange_map
 from app.trading.realtime_trading_engine import RealtimeTradingEngine
 from app.backtesting.accelerated_demo import load_krx_listed_universe, load_us_listed_universe
 from app.market_affordability import (
@@ -183,6 +183,10 @@ AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").
 # 데이터 수집은 실시간(KIS 수집기 + 트레이딩 평가 프레임 저널링), 학습은 이 워커가 주기적으로 수행.
 AUTO_START_LIVE_TRAINING = os.getenv("AUTO_START_LIVE_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
 LIVE_TRAINING_INTERVAL_SECONDS = max(60, int(os.getenv("LIVE_TRAINING_INTERVAL_SECONDS", "300")))
+# US ticker→exchange map (NASD/NYSE/AMEX) auto-refresh: the NASDAQ Trader listings
+# change over time, so a background worker rebuilds data/universe/us_exchange_map.csv
+# whenever it is missing or older than US_EXCHANGE_MAP_MAX_AGE_DAYS.
+AUTO_START_US_EXCHANGE_MAP_REFRESH = os.getenv("AUTO_START_US_EXCHANGE_MAP_REFRESH", "true").lower() not in {"0", "false", "no", "off"}
 _auto_live_readiness_started = False
 # Background total-asset sampler: periodically persist a dashboard snapshot so the
 # asset-history curve accumulates continuously even when no browser is open (the Pi
@@ -716,13 +720,28 @@ def _start_auto_live_readiness_check() -> None:
   def worker() -> None:
     _set_operation_request(True, "starting", "Auto live readiness check", None)
     try:
-      basis = _refresh_live_account_basis_for_auto()
+      basis = None
+      try:
+        attempts = max(1, int(float(os.getenv("AUTO_LIVE_READINESS_RETRIES", "3"))))
+      except (TypeError, ValueError):
+        attempts = 3
+      try:
+        delay_seconds = max(0.5, float(os.getenv("AUTO_LIVE_READINESS_RETRY_DELAY_SECONDS", "5")))
+      except (TypeError, ValueError):
+        delay_seconds = 5.0
+      for attempt in range(1, attempts + 1):
+        basis = _refresh_live_account_basis_for_auto()
+        if basis is not None:
+          break
+        audit.record("auto_live_readiness_retry", {"attempt": attempt, "attempts": attempts})
+        if attempt < attempts:
+          time.sleep(delay_seconds)
       if basis is not None:
         _set_operation_request(False, "checked", "Auto live readiness checked", None)
         audit.record("auto_live_readiness_checked", {"basis": basis})
       else:
         _set_operation_request(False, "error", "Auto live readiness did not return account basis", None)
-        audit.record("auto_live_readiness_missing_basis", {})
+        audit.record("auto_live_readiness_missing_basis", {"attempts": attempts})
     except Exception as exc:  # pragma: no cover - thread-level safety guard
       _set_operation_request(False, "error", f"Auto live readiness failed: {exc}", str(exc))
       audit.record("auto_live_readiness_failed", {"error": str(exc)})
@@ -1063,6 +1082,8 @@ def _startup_live_worker() -> None:
       _start_asset_history_sampler()
     if AUTO_START_KIS_REALTIME_COLLECTOR:
       _start_kis_realtime_collector()
+    if AUTO_START_US_EXCHANGE_MAP_REFRESH:
+      _start_us_exchange_map_refresher()
     if AUTO_START_LIVE_WORKER:
       _start_live_worker("learning")
     if AUTO_START_LIVE_READINESS:
@@ -4633,6 +4654,37 @@ def _start_kis_realtime_collector() -> None:
     _kis_realtime_collector_worker.start()
 
 
+def _refresh_us_exchange_map_if_stale() -> None:
+  """Rebuild the US ticker→exchange map when missing or older than the max age.
+
+  Best-effort: a network failure leaves the existing CSV in place (build returns {}).
+  """
+  from app.backtesting.accelerated_demo import US_EXCHANGE_MAP_CACHE, build_us_exchange_map
+
+  max_age_days = max(0.0, float(os.getenv("US_EXCHANGE_MAP_MAX_AGE_DAYS", "7")))
+  try:
+    age_days = (time.time() - os.path.getmtime(US_EXCHANGE_MAP_CACHE)) / 86400.0
+    if age_days < max_age_days:
+      return
+  except OSError:
+    pass  # missing → rebuild
+  mapping = build_us_exchange_map()
+  audit.record("us_exchange_map_refreshed", {"rows": len(mapping)})
+
+
+def _start_us_exchange_map_refresher() -> None:
+  def worker() -> None:
+    interval = max(3600.0, float(os.getenv("US_EXCHANGE_MAP_REFRESH_SECONDS", "86400")))
+    while True:
+      try:
+        _refresh_us_exchange_map_if_stale()
+      except Exception as exc:  # noqa: BLE001 - refresher must never kill the process.
+        audit.record("us_exchange_map_refresh_failed", {"error": str(exc) or exc.__class__.__name__})
+      time.sleep(interval)
+
+  threading.Thread(target=worker, name="us-exchange-map-refresher", daemon=True).start()
+
+
 def _stop_kis_realtime_collector() -> None:
   worker: threading.Thread | None
   _kis_realtime_collector_stop.set()
@@ -4733,7 +4785,33 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       session_open_provider=lambda: bool(_active_live_market_groups()),
       ontology_graph_provider=_latest_ontology_graph,
       market_open_provider=_is_open_live_market_ticker,
+      cycle_observer=_record_realtime_trading_cycle,
   )
+
+
+def _record_realtime_trading_cycle(summary: dict[str, Any]) -> None:
+  compact = {
+      "at": summary.get("at"),
+      "reason": summary.get("reason"),
+      "submitted": summary.get("submitted", 0),
+      "buy_submitted": summary.get("buy_submitted", 0),
+      "sell_submitted": summary.get("sell_submitted", 0),
+      "buy_submit_attempted": summary.get("buy_submit_attempted", 0),
+      "buy_evaluated": summary.get("buy_evaluated", 0),
+      "buy_rejected": summary.get("buy_rejected", 0),
+      "sell_evaluated": summary.get("sell_evaluated", 0),
+      "sell_rejected": summary.get("sell_rejected", 0),
+      "skipped_market_closed": summary.get("skipped_market_closed", 0),
+      "skipped_cooldown": summary.get("skipped_cooldown", 0),
+      "skipped_ignored": summary.get("skipped_ignored", 0),
+      "errors": summary.get("errors", 0),
+      "blocked": summary.get("blocked", 0),
+      "live_armed": summary.get("live_armed"),
+      "buy_disabled": summary.get("buy_disabled", False),
+      "buy_disabled_reason": summary.get("buy_disabled_reason"),
+      "rejections": list(summary.get("rejections") or ())[:5],
+  }
+  audit.record("realtime_trading_cycle", compact)
 
 
 def _realtime_buy_candidates() -> tuple[str, ...]:
@@ -4803,6 +4881,46 @@ def _is_excluded_us_live_candidate(symbol: str) -> bool:
   return any(text.endswith(suffix) and len(text) > len(suffix) for suffix in suffixes)
 
 
+_affordable_candidate_cache: dict[str, Any] = {"key": None, "at": 0.0, "symbols": ()}
+_broker_quote_backoff_until: dict[str, float] = {}
+_us_nasdaq_universe_cache: dict[str, Any] = {"mtime": None, "symbols": ()}
+
+
+def _load_us_nasdaq_universe() -> tuple[str, ...]:
+  """NASDAQ-listed-only US universe for live discovery.
+
+  Live US buys quote with EXCD=NAS and route orders with OVRS_EXCG_CD=NASD, so the
+  discovery universe MUST be NASDAQ-listed: a NYSE/AMEX/Arca name quoted as NASDAQ
+  returns price 0 (silently dropped), and if one slipped through, its order would be
+  rejected for a wrong exchange. The merged nasdaqtraded universe is ~66% non-NASDAQ,
+  which starved US discovery to ~0 affordable candidates. This reads a NASDAQ-only
+  cache (data/universe/us_nasdaq_listed.csv, built from nasdaqlisted.txt) and falls
+  back to the merged universe only when that cache is missing.
+  """
+  import csv
+  from pathlib import Path as _Path
+
+  path = _Path("data/universe/us_nasdaq_listed.csv")
+  try:
+    mtime = path.stat().st_mtime
+  except OSError:
+    return tuple(load_us_listed_universe(limit=None) or ())
+  if _us_nasdaq_universe_cache.get("mtime") != mtime:
+    symbols: list[str] = []
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+          symbol = str(row.get("symbol") or "").upper().strip()
+          if symbol:
+            symbols.append(symbol)
+    except OSError:
+      return tuple(load_us_listed_universe(limit=None) or ())
+    _us_nasdaq_universe_cache["symbols"] = tuple(symbols)
+    _us_nasdaq_universe_cache["mtime"] = mtime
+  symbols = tuple(_us_nasdaq_universe_cache.get("symbols") or ())
+  return symbols or tuple(load_us_listed_universe(limit=None) or ())
+
+
 def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
   """Return open-session symbols that this small live account can plausibly buy.
 
@@ -4822,17 +4940,32 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
   excluded = _held_or_recent_buy_tickers(account)
   symbols: list[str] = []
   max_count = max(1, int(limit))
+  cache_ttl = max(5.0, float(os.getenv("REALTIME_AFFORDABLE_CANDIDATE_TTL_SEC", "45")))
+  cache_key = (
+      tuple(sorted(open_groups)),
+      max_count,
+      round(float((account.cash_by_currency or {}).get("USD") or 0.0), 2),
+      round(float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0), 0),
+      tuple(sorted(excluded))[:20],
+  )
+  now = time.monotonic()
+  if (
+      _affordable_candidate_cache.get("key") == cache_key
+      and now - float(_affordable_candidate_cache.get("at") or 0.0) < cache_ttl
+  ):
+    return tuple(_affordable_candidate_cache.get("symbols") or ())[:max_count]
 
   if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0:
     try:
-      us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "60")))
+      us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "8")))
     except ValueError:
-      us_limit = 60
+      us_limit = 8
     try:
-      us_universe = tuple(load_us_listed_universe(limit=None) or ())
+      us_exchange_map = _load_us_listed_exchange_map()
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("realtime_us_discovery_candidate_load_failed", {"error": str(exc)})
-      us_universe = ()
+      us_exchange_map = {}
+    us_universe = tuple(us_exchange_map.keys()) or tuple(_load_us_nasdaq_universe() or ())
     us_symbols: list[str] = []
     for symbol in _rotated_symbols(us_universe):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
@@ -4843,17 +4976,18 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
     symbols.extend(
         _broker_affordable_candidate_symbols(
             tuple(us_symbols),
-            "NASDAQ",
+            "US",
             account,
             max_symbols=max(0, min(max_count - len(symbols), us_limit)),
+            exchange_resolver=lambda s: us_exchange_map.get(s, "NASDAQ"),
         )
     )
 
   if "KRX" in open_groups and float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0) > 0 and len(symbols) < max_count:
     try:
-      krx_limit = max(0, int(os.getenv("REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT", "60")))
+      krx_limit = max(0, int(os.getenv("REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT", "6")))
     except ValueError:
-      krx_limit = 60
+      krx_limit = 6
     try:
       krx_universe = tuple(load_krx_listed_universe(limit=None) or ())
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
@@ -4875,7 +5009,9 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
         )
     )
 
-  return tuple(dict.fromkeys(symbols))[:max_count]
+  result = tuple(dict.fromkeys(symbols))[:max_count]
+  _affordable_candidate_cache.update({"key": cache_key, "at": now, "symbols": result})
+  return result
 
 
 def _broker_affordable_candidate_symbols(
@@ -4884,25 +5020,77 @@ def _broker_affordable_candidate_symbols(
     account: AccountSnapshot,
     *,
     max_symbols: int,
+    exchange_resolver: Callable[[str], str] | None = None,
 ) -> tuple[str, ...]:
   if max_symbols <= 0 or not symbols:
+    return ()
+  now = time.monotonic()
+  market_key = market.upper().strip() or "UNKNOWN"
+  if now < float(_broker_quote_backoff_until.get(market_key, 0.0) or 0.0):
     return ()
   client = KisDevelopersApiClient(paper=False, enabled=True)
   selected: list[str] = []
   errors: list[dict[str, str]] = []
+  quote_delay = max(0.0, float(os.getenv("REALTIME_BROKER_QUOTE_DELAY_SEC", "0.25")))
   for symbol in symbols:
     if len(selected) >= max_symbols:
       break
+    if now < float(_broker_quote_backoff_until.get(symbol, 0.0) or 0.0):
+      continue
+    # US discovery must quote each ticker on its REAL exchange (NASD/NYSE/AMEX): a
+    # NYSE name quoted as NASDAQ returns price 0. exchange_resolver supplies the
+    # per-ticker exchange; without it, the fixed market is used (e.g. KRX).
+    quote_market = exchange_resolver(symbol) if exchange_resolver is not None else market
     try:
-      snapshot = client.get_market_snapshot(symbol, market, company_name=symbol, sector="Unknown")
+      snapshot = client.get_market_snapshot(symbol, quote_market, company_name=symbol, sector="Unknown")
     except Exception as exc:  # noqa: BLE001 - one failed quote should not stop discovery.
-      errors.append({"ticker": symbol, "market": market, "error": str(exc)})
+      error_text = str(exc) or exc.__class__.__name__
+      errors.append({"ticker": symbol, "market": quote_market, "error": error_text})
+      cooldown = _broker_quote_error_cooldown_seconds(error_text)
+      if cooldown > 0.0:
+        until = time.monotonic() + cooldown
+        _broker_quote_backoff_until[symbol] = until
+        if _is_market_wide_broker_quote_error(error_text):
+          _broker_quote_backoff_until[market_key] = until
+          break
       continue
     if snapshot.last_price > 0 and is_market_affordable_for_account(snapshot, account):
       selected.append(snapshot.ticker)
+    if quote_delay > 0.0 and len(selected) < max_symbols:
+      time.sleep(quote_delay)
   if errors:
-    audit.record("realtime_affordable_candidate_quote_errors", {"market": market, "errors": errors[:10]})
+    audit.record(
+        "realtime_affordable_candidate_quote_errors",
+        {
+            "market": market,
+            "errors": errors[:10],
+            "selected": selected[:10],
+            "backoff_seconds": round(max(0.0, float(_broker_quote_backoff_until.get(market_key, 0.0) or 0.0) - time.monotonic()), 2),
+        },
+    )
   return tuple(selected)
+
+
+def _broker_quote_error_cooldown_seconds(error_text: str) -> float:
+  lowered = error_text.lower()
+  if "초당 거래건수" in error_text or "rate" in lowered or "too many" in lowered:
+    return max(5.0, float(os.getenv("REALTIME_BROKER_RATE_LIMIT_BACKOFF_SEC", "20")))
+  if "temporary failure in name resolution" in lowered:
+    return max(5.0, float(os.getenv("REALTIME_BROKER_DNS_BACKOFF_SEC", "30")))
+  if "timed out" in lowered or "closed connection" in lowered or "remote end closed" in lowered:
+    return max(3.0, float(os.getenv("REALTIME_BROKER_TRANSIENT_BACKOFF_SEC", "10")))
+  return 0.0
+
+
+def _is_market_wide_broker_quote_error(error_text: str) -> bool:
+  lowered = error_text.lower()
+  return (
+      "초당 거래건수" in error_text
+      or "temporary failure in name resolution" in lowered
+      or "timed out" in lowered
+      or "closed connection" in lowered
+      or "remote end closed" in lowered
+  )
 
 
 def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
@@ -5088,6 +5276,7 @@ def _realtime_trading_loop() -> None:
   try:
     engine = _build_realtime_trading_engine()
   except Exception as exc:  # noqa: BLE001 - surface build failure, keep server alive.
+    audit.record("realtime_trading_engine_start_failed", {"error": str(exc) or exc.__class__.__name__})
     with _live_lock:
       _append_collection_log_unlocked(
           "error",
@@ -5096,6 +5285,7 @@ def _realtime_trading_loop() -> None:
     return
   with _realtime_trading_lock:
     _realtime_trading_engine = engine
+  audit.record("realtime_trading_engine_started", {"auto_start": AUTO_START_REALTIME_TRADING})
   engine.run_forever(_realtime_trading_stop)
 
 
@@ -5105,6 +5295,7 @@ def _start_realtime_trading_engine() -> None:
     if _realtime_trading_worker is not None and _realtime_trading_worker.is_alive():
       return
     _realtime_trading_stop.clear()
+    audit.record("realtime_trading_engine_starting", {"auto_start": AUTO_START_REALTIME_TRADING})
     _realtime_trading_worker = threading.Thread(
         target=_realtime_trading_loop,
         name="realtime-trading-engine",
@@ -5121,19 +5312,48 @@ def _stop_realtime_trading_engine() -> None:
     worker.join(timeout=3.0)
 
 
+def _kis_realtime_collector_symbols() -> tuple[str, ...]:
+  """Symbols the realtime collector subscribes to = static config + today's affordable
+  KR buy candidates.
+
+  The KIS realtime WebSocket used here speaks DOMESTIC TR_IDs only (H0STCNT0/H0STASP0),
+  so only Korean 6-digit tickers produce data — US affordable names are excluded (they
+  would need a separate overseas-realtime subscription). Feeding the affordable KR
+  candidates gives THOSE names live ticks/orderbook, so volume-surge/momentum signals
+  and model feature frames can form on names the account can actually buy — instead of
+  only the two unaffordable config blue-chips.
+  """
+  base = list(_load_realtime_collection_symbols())
+  try:
+    max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "18")))
+  except (TypeError, ValueError):
+    max_syms = 18
+  try:
+    extra = _live_affordable_buy_candidate_symbols(limit=max_syms)
+  except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
+    extra = ()
+  kr_extra = [s for s in extra if str(s).isdigit() and len(str(s)) == 6]
+  merged = list(dict.fromkeys([*base, *kr_extra]))
+  return tuple(merged[:max_syms])
+
+
 def _kis_realtime_collector_loop() -> None:
-  symbols = _load_realtime_collection_symbols()
-  if not symbols:
-    with _live_lock:
-      _append_collection_log_unlocked("error", "KIS realtime collector has no symbols configured")
-    return
+  resubscribe_seconds = max(30.0, float(os.getenv("REALTIME_COLLECTOR_RESUBSCRIBE_SECONDS", "300")))
   while not _kis_realtime_collector_stop.is_set():
+    symbols = _kis_realtime_collector_symbols()
+    if not symbols:
+      with _live_lock:
+        _append_collection_log_unlocked("error", "KIS realtime collector has no symbols configured")
+      if _kis_realtime_collector_stop.wait(30.0):
+        return
+      continue
     try:
       counts = asyncio.run(
           run_kis_realtime_websocket_collector(
               symbols=symbols,
               store=RealtimeMarketDataStore(),
               stop_event=_kis_realtime_collector_stop,
+              max_runtime_seconds=resubscribe_seconds,
           )
       )
       with _live_lock:
@@ -5366,6 +5586,25 @@ def _refresh_live_cache() -> None:
         model_paths = update_realtime_model_artifacts(ModelArtifactStore(), realtime_examples, test_result)
       _set_live_progress(80, "learning", "Collecting live feature frames and training live short-horizon model")
       live_feature_symbols = _live_realtime_feature_symbols_for_active_session(context) if active_mode == "live_trading" else None
+      if active_mode == "live_trading" and "US" in set(_active_live_market_groups()):
+        # Warm US realtime data for AFFORDABLE discovery candidates too, not just the
+        # ontology BuyCandidates (which skew to unaffordable big-caps). This feeds the
+        # REST bridge + feature collection below so cheap US names the account can
+        # actually buy accumulate ticks/orderbook → momentum/model signals. Capped to
+        # protect the KIS REST rate limit.
+        try:
+          warm_cap = max(0, int(os.getenv("REALTIME_US_FEATURE_WARM_LIMIT", "6")))
+        except (TypeError, ValueError):
+          warm_cap = 6
+        if warm_cap > 0:
+          try:
+            affordable_us = tuple(
+                s for s in _live_affordable_buy_candidate_symbols(limit=warm_cap)
+                if _ticker_market_group_for_live_trading(s, "") == "US"
+            )[:warm_cap]
+            live_feature_symbols = tuple(dict.fromkeys((*(live_feature_symbols or ()), *affordable_us)))
+          except Exception:  # noqa: BLE001 - warming is best-effort.
+            pass
       live_us_realtime_bridge_summary = {}
       if active_mode == "live_trading":
         try:
@@ -5851,15 +6090,16 @@ def _live_affordable_us_discovery_targets(
 
   if len(candidates) < limit:
     try:
-      universe = load_us_listed_universe(limit=None)
+      us_exchange_map = _load_us_listed_exchange_map()
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("live_affordable_us_universe_load_failed", {"error": str(exc)})
-      universe = ()
+      us_exchange_map = {}
+    universe = tuple(us_exchange_map.keys()) or tuple(_load_us_nasdaq_universe() or ())
     for symbol in _rotated_symbols(tuple(universe)):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
       if ticker in seen or ticker in excluded or not ticker or _is_excluded_us_live_candidate(ticker):
         continue
-      candidates.append(_placeholder_live_market(ticker, "NASDAQ"))
+      candidates.append(_placeholder_live_market(ticker, us_exchange_map.get(ticker, "NASDAQ")))
       seen.add(ticker)
       if len(candidates) >= limit:
         break
