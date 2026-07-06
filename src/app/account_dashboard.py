@@ -88,6 +88,7 @@ class AccountDashboardSnapshot:
     cash_equivalent_krw: float
     krw_cash: float
     foreign_cash_krw: float
+    settlement_cash_krw: float
     cash_by_currency: dict[str, float]
     orderable_cash_by_currency: dict[str, float]
     domestic_stock_value_krw: float
@@ -132,15 +133,16 @@ class AccountDashboardService:
         ]
         cash_rows = _cash_rows(status, updated_at.isoformat())
 
-        krw_cash = _num(status.get("krw_cash") or status.get("cash"))
+        krw_cash = _num(status.get("krw_cash") or status.get("actual_deposit") or status.get("cash"))
         foreign_cash_krw = _num(status.get("foreign_cash_krw"))
         cash_equivalent_krw = _num(status.get("cash_equivalent_krw") or (krw_cash + foreign_cash_krw))
+        settlement_cash_krw = max(0.0, cash_equivalent_krw - krw_cash - foreign_cash_krw)
         domestic_value = sum(row.evaluation_amount_krw for row in holdings if row.market_group == "domestic")
         overseas_value = sum(row.evaluation_amount_krw for row in holdings if row.market_group == "overseas")
         if domestic_value <= 0 and overseas_value <= 0:
             invested = _num(status.get("invested") or status.get("invested_value"))
             domestic_value = invested
-        total_asset_krw = _num(status.get("equity") or status.get("account_value"))
+        total_asset_krw = _num(status.get("equity") or status.get("actual_equity") or status.get("account_value"))
         if total_asset_krw <= 0:
             total_asset_krw = cash_equivalent_krw + domestic_value + overseas_value
         holdings = [
@@ -168,6 +170,7 @@ class AccountDashboardService:
             cash_equivalent_krw=cash_equivalent_krw,
             krw_cash=krw_cash,
             foreign_cash_krw=foreign_cash_krw,
+            settlement_cash_krw=settlement_cash_krw,
             cash_by_currency={str(k).upper(): _num(v) for k, v in dict(status.get("cash_by_currency") or {"KRW": krw_cash}).items()},
             orderable_cash_by_currency=_orderable_by_currency(status),
             domestic_stock_value_krw=domestic_value,
@@ -179,7 +182,14 @@ class AccountDashboardService:
             unrealized_pnl_krw=unrealized,
             total_pnl_krw=total_pnl,
             total_pnl_rate=_ratio(total_pnl, purchase_total),
-            asset_allocations=_allocations(total_asset_krw, domestic_value, overseas_value, krw_cash, foreign_cash_krw),
+            asset_allocations=_allocations(
+                total_asset_krw,
+                domestic_value,
+                overseas_value,
+                krw_cash,
+                foreign_cash_krw,
+                settlement_cash_krw,
+            ),
             principal_protection=dict(status.get("principal_protection") or {}),
             data_quality_warnings=_warnings(status, logs, is_stale),
         )
@@ -333,6 +343,25 @@ def _cash_rows(status: dict[str, Any], updated_at: str) -> list[CashCurrencyRow]
                 source=str(status.get("basis_source") or "account"),
             )
         )
+    settlement_cash = max(
+        0.0,
+        _num(status.get("cash_equivalent_krw"))
+        - _num(status.get("krw_cash") or status.get("actual_deposit") or status.get("cash"))
+        - _num(status.get("foreign_cash_krw")),
+    )
+    if settlement_cash > 0.5:
+        rows.append(
+            CashCurrencyRow(
+                currency="KRW_SETTLEMENT",
+                cash_balance=settlement_cash,
+                orderable_amount=0.0,
+                withdrawable_amount=0.0,
+                fx_rate_to_krw=1.0,
+                krw_equivalent=settlement_cash,
+                updated_at=updated_at,
+                source=str(status.get("basis_source") or "account"),
+            )
+        )
     return rows
 
 
@@ -349,6 +378,27 @@ def _allocations(total: float, domestic: float, overseas: float, krw_cash: float
         ("overseas_stock", "해외주식", overseas),
         ("krw_cash", "원화 예수금", krw_cash),
         ("foreign_cash", "외화 예수금", foreign_cash),
+    ]
+    used = sum(max(0.0, value) for _, _, value in rows)
+    if total > used:
+        rows.append(("other", "기타/미분류", total - used))
+    return [{"key": key, "label": label, "value_krw": value, "weight": _ratio(value, total)} for key, label, value in rows]
+
+
+def _allocations(
+    total: float,
+    domestic: float,
+    overseas: float,
+    krw_cash: float,
+    foreign_cash: float,
+    settlement_cash: float = 0.0,
+) -> list[dict[str, Any]]:
+    rows = [
+        ("domestic_stock", "국내주식", domestic),
+        ("overseas_stock", "해외주식", overseas),
+        ("krw_cash", "원화 예수금", krw_cash),
+        ("foreign_cash", "외화 예수금", foreign_cash),
+        ("settlement_cash", "결제예정/미분류 현금", settlement_cash),
     ]
     used = sum(max(0.0, value) for _, _, value in rows)
     if total > used:

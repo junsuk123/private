@@ -131,6 +131,7 @@ _ACCOUNT_PAGE = """<!doctype html>
         <h2>실시간 판단 흐름</h2>
         <span class="badge" id="decision-cycle-badge">-</span>
       </div>
+      <div class="decision-live-strip" id="decision-live-strip"></div>
       <div class="decision-flow" id="decision-flow"></div>
       <div class="decision-grid">
         <article>

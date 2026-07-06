@@ -117,6 +117,38 @@ body { margin: 0; background: #eef2f5; }
 .allocation-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; font-size: 13px; }
 .allocation-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.decision-live-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.decision-live-chip {
+  min-width: 0;
+  border: 1px solid #e1e7ef;
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: #f8fafc;
+}
+
+.decision-live-chip span {
+  display: block;
+  color: #667085;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.decision-live-chip strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 14px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 .decision-flow {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

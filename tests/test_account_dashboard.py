@@ -63,6 +63,42 @@ class AccountDashboardTest(unittest.TestCase):
         self.assertEqual(len(dashboard["holdings"]), 2)
         self.assertEqual(len(history), 1)
 
+    def test_dashboard_uses_actual_equity_when_equity_key_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = AccountDashboardService(
+                status_provider=lambda: {
+                    "basis_source": "kis_live_account",
+                    "account_checked": True,
+                    "updated_at": "2026-07-01T00:00:00+00:00",
+                    "actual_deposit": 22_440,
+                    "foreign_cash_krw": 85_468.747,
+                    "cash_equivalent_krw": 108_384.165,
+                    "actual_equity": 124_628,
+                    "cash_by_currency": {"KRW": 22_440, "USD": 55.51},
+                    "positions": [
+                        {
+                            "ticker": "LCFYW",
+                            "market": "NASD",
+                            "currency": "USD",
+                            "quantity": 1,
+                            "average_price": 10.0,
+                            "last_price": 10.55,
+                            "market_value_krw": 16_243.835,
+                        }
+                    ],
+                },
+                logs_provider=lambda: {"collection_log": [], "last_error": None},
+                store=AccountSnapshotStore(Path(tmp) / "account.sqlite3"),
+            )
+
+            dashboard = service.build_dashboard()
+
+        snapshot = dashboard["snapshot"]
+        self.assertEqual(snapshot["total_asset_krw"], 124_628)
+        self.assertEqual(snapshot["krw_cash"], 22_440)
+        self.assertEqual(snapshot["cash_equivalent_krw"], 108_384.165)
+        self.assertEqual(len(dashboard["holdings"]), 1)
+
     def test_asset_history_rolls_up_to_one_point_per_minute(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = AccountSnapshotStore(Path(tmp) / "account.sqlite3")

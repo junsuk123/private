@@ -79,6 +79,19 @@ class KisRealtimeSubscriptionManager:
         self.running = False
 
 
+def _websocket_ping_setting(name: str, default: float) -> float | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"", "0", "false", "no", "off", "none", "null"}:
+        return None
+    try:
+        return max(1.0, float(value))
+    except ValueError:
+        return default
+
+
 async def run_kis_realtime_websocket_collector(
     *,
     symbols: Iterable[str],
@@ -96,7 +109,9 @@ async def run_kis_realtime_websocket_collector(
     store = store or RealtimeMarketDataStore()
     counts = {"messages": 0, "ticks": 0, "orderbooks": 0, "subscriptions": 0}
     feature_builder = LiveFeatureFrameBuilder(store)
-    async with websockets.connect(target_url, ping_interval=20, ping_timeout=20) as websocket:
+    ping_interval = _websocket_ping_setting("KIS_REALTIME_WS_PING_INTERVAL_SECONDS", 20.0)
+    ping_timeout = _websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", 20.0)
+    async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
         for symbol in normalized_symbols:
             for tr_id in DEFAULT_SUBSCRIPTION_TR_IDS:
                 await websocket.send(kis_realtime_subscription_message(approval_key, tr_id, symbol))

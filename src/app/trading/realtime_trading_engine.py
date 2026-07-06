@@ -69,6 +69,15 @@ def _is_no_available_sell_quantity_error(exc: Exception) -> bool:
     )
 
 
+def _ignored_realtime_symbols() -> set[str]:
+    raw = os.getenv("REALTIME_IGNORE_SYMBOLS", "")
+    return {
+        symbol.strip().upper()
+        for symbol in raw.replace(";", ",").split(",")
+        if symbol.strip()
+    }
+
+
 @dataclass
 class RealtimeTradingConfig:
     interval_ms: int = field(default_factory=lambda: max(100, _env_int("REALTIME_TRADING_INTERVAL_MS", 1000)))
@@ -256,8 +265,16 @@ class RealtimeTradingEngine:
             except Exception:  # noqa: BLE001 - ontology is best-effort.
                 ontology_graph = None
 
+        ignored_symbols = _ignored_realtime_symbols()
+        summary["ignored_symbols"] = sorted(ignored_symbols)
+        summary["skipped_ignored"] = 0
+
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
+            holding_symbol = str(getattr(holding, "ticker", "") or "").upper()
+            if holding_symbol in ignored_symbols:
+                summary["skipped_ignored"] += 1
+                continue
             if sell_submitted >= self.config.max_orders_per_cycle:
                 break
             if self.market_open_provider is not None and not self.market_open_provider(holding.ticker, holding.market or ""):
@@ -315,6 +332,10 @@ class RealtimeTradingEngine:
             return summary
 
         for symbol in self.candidate_symbols_provider():
+            symbol = str(symbol or "").upper()
+            if symbol in ignored_symbols:
+                summary["skipped_ignored"] += 1
+                continue
             if summary["buy_evaluated"] >= self.config.max_buy_evaluations_per_cycle:
                 summary["reason"] = summary["reason"] or "BUY_EVALUATION_LIMIT_REACHED"
                 break

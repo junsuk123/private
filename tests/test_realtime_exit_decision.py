@@ -671,10 +671,14 @@ class _FixedSellDecisionEngine:
 
 
 class _FixedBuyDecisionEngine:
+    def __init__(self) -> None:
+        self.calls = 0
+
     def evaluate_exit_for_holding(self, *args, **kwargs):  # pragma: no cover - no holdings
         raise AssertionError("sell path should not be reached")
 
     def evaluate_buy(self, symbol, account, **kwargs):
+        self.calls += 1
         order = FinalOrder(
             ticker=symbol,
             market="KR",
@@ -739,6 +743,61 @@ class _NoQuantityAmendCoordinator(_AmendAwareCoordinator):
 
 
 class RealtimeSellAmendTest(unittest.TestCase):
+    def test_ignored_holding_skips_sell_evaluation(self) -> None:
+        ignored = Holding(
+            ticker="LCFYW",
+            market="NASDAQ",
+            company_name="Locafy Warrant",
+            sector="Tech",
+            quantity=1,
+            average_price=1.0,
+            last_price=1.0,
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(ignored,), cash_by_currency={"USD": 1_000.0})
+        decision_engine = _FixedSellDecisionEngine()
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+        )
+
+        with patch.dict("os.environ", {"REALTIME_IGNORE_SYMBOLS": "lcfyw"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["skipped_ignored"], 1)
+        self.assertEqual(summary["sell_evaluated"], 0)
+        self.assertEqual(decision_engine.calls, 0)
+        self.assertEqual(len(coordinator.submitted), 0)
+
+    def test_ignored_buy_candidate_does_not_block_later_candidates(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        decision_engine = _FixedBuyDecisionEngine()
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("LCFYW", "000660"),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_buy_orders_per_cycle=1),
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"REALTIME_IGNORE_SYMBOLS": "LCFYW", "REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "false"},
+        ):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["skipped_ignored"], 1)
+        self.assertEqual(summary["buy_evaluated"], 1)
+        self.assertEqual(decision_engine.calls, 1)
+        self.assertEqual(coordinator.submitted[0].ticker, "000660")
+
     def test_domestic_buy_is_skipped_outside_core_session(self) -> None:
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
         coordinator = _AmendAwareCoordinator()

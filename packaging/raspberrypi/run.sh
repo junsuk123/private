@@ -44,6 +44,7 @@ setdefault ONTOLOGY_ACCELERATOR "CPU"
 setdefault REALTIME_LATENCY_PROFILE "balanced"
 setdefault ONTOLOGY_NPU_ENABLED "false"
 setdefault ONTOLOGY_FILTER1_NATIVE "auto"
+setdefault KIS_REALTIME_WS_PING_INTERVAL_SECONDS "0"
 unset OPENVINO_DEVICE OPENVINO_HINT_PERFORMANCE_MODE OPENVINO_ENABLE_CPU_PINNING 2>/dev/null || true
 
 # News/event sentiment: local LLM (Ollama) with automatic keyword fallback.
@@ -67,6 +68,10 @@ setdefault AUTO_START_LIVE_TRAINING "true"
 setdefault LIVE_TRAINING_INTERVAL_SECONDS "120"
 setdefault LIVE_REFRESH_SECONDS "15"
 setdefault RESEARCH_RETENTION_DAYS "30"
+setdefault REALTIME_IGNORE_SYMBOLS "LCFYW"
+setdefault REALTIME_MIN_BUY_NET_RETURN_US "0.0035"
+setdefault REALTIME_FALLBACK_EDGE_BPS_PER_SCORE "220"
+setdefault REALTIME_US_EXCLUDE_SYMBOL_SUFFIXES "U,WS,WT,W,R,P"
 
 # ---- Parse minimal CLI flags -------------------------------------------------
 EXTRA_ARGS=()

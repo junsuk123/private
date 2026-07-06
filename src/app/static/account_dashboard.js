@@ -139,13 +139,17 @@ function renderProfitability(prof, snapshot, trading) {
 }
 
 function renderKpis(snapshot) {
+  const settlementCash = Number(snapshot.settlement_cash_krw || 0);
+  const cashNote = settlementCash > 0
+    ? `외화 ${fmtKrw(snapshot.foreign_cash_krw)} · 결제예정 ${fmtKrw(settlementCash)}`
+    : `외화 ${fmtKrw(snapshot.foreign_cash_krw)}`;
   const rows = [
     ['총자산', fmtKrw(snapshot.total_asset_krw), `순자산 ${fmtKrw(snapshot.net_asset_krw)}`],
     ['평가손익', fmtKrw(snapshot.unrealized_pnl_krw), fmtPct(snapshot.total_pnl_rate), clsPnl(snapshot.unrealized_pnl_krw)],
     ['실현손익', fmtKrw(snapshot.realized_pnl_period_krw), '기간 기준', clsPnl(snapshot.realized_pnl_period_krw)],
     ['주문가능 KRW', fmtMoney((snapshot.orderable_cash_by_currency || {}).KRW || snapshot.krw_cash, 'KRW'), '원화'],
     ['주문가능 USD', fmtMoney((snapshot.orderable_cash_by_currency || {}).USD || 0, 'USD'), '외화'],
-    ['현금성 자산', fmtKrw(snapshot.cash_equivalent_krw), `외화 ${fmtKrw(snapshot.foreign_cash_krw)}`],
+    ['현금성 자산', fmtKrw(snapshot.cash_equivalent_krw), cashNote],
   ];
   document.getElementById('account-kpis').innerHTML = rows.map(([label, value, note, className]) => `
     <div class="kpi-card">
@@ -217,15 +221,21 @@ function renderTrades(rows) {
 
 function renderCash(rows) {
   const body = document.getElementById('cash-body');
-  body.innerHTML = rows.length ? rows.map((row) => `
+  body.innerHTML = rows.length ? rows.map((row) => {
+    const isSettlement = String(row.currency || '').toUpperCase() === 'KRW_SETTLEMENT';
+    const label = isSettlement ? '결제예정' : row.currency;
+    const balance = isSettlement ? fmtKrw(row.cash_balance) : fmtMoney(row.cash_balance, row.currency);
+    const orderable = isSettlement ? '-' : fmtMoney(row.orderable_amount, row.currency);
+    const fx = isSettlement ? '-' : Number(row.fx_rate_to_krw || 0).toLocaleString('ko-KR', { maximumFractionDigits: 4 });
+    return `
     <tr>
-      <td>${row.currency}</td>
-      <td>${fmtMoney(row.cash_balance, row.currency)}</td>
-      <td>${fmtMoney(row.orderable_amount, row.currency)}</td>
+      <td>${escapeHtml(label)}</td>
+      <td>${balance}</td>
+      <td>${orderable}</td>
       <td>${fmtKrw(row.krw_equivalent)}</td>
-      <td>${Number(row.fx_rate_to_krw || 0).toLocaleString('ko-KR', { maximumFractionDigits: 4 })}</td>
-    </tr>
-  `).join('') : `<tr class="empty-row"><td colspan="5">예수금 정보 수집 중</td></tr>`;
+      <td>${fx}</td>
+    </tr>`;
+  }).join('') : `<tr class="empty-row"><td colspan="5">예수금 정보 수집 중</td></tr>`;
 }
 
 function renderSystem(snapshot, logs, trading, runtime) {
@@ -267,10 +277,15 @@ function renderDecisionFlow(trading) {
   const events = document.getElementById('decision-events');
   const rejections = document.getElementById('decision-rejections');
   const badge = document.getElementById('decision-cycle-badge');
+  const liveStrip = document.getElementById('decision-live-strip');
   if (!flow || !events || !rejections || !badge) return;
 
   const status = trading && trading.status ? trading.status : {};
   const summary = status.last_summary || {};
+  const diagnostics = trading && trading.decision_diagnostics ? trading.decision_diagnostics : {};
+  const policyState = diagnostics.policy_state || {};
+  const modelHealth = policyState.model_health || {};
+  const profitabilityDecision = diagnostics.profitability_decision || {};
   const running = Boolean(trading && trading.running);
   badge.textContent = running
     ? `cycle ${Number(status.cycles || 0).toLocaleString('ko-KR')}`
@@ -286,6 +301,28 @@ function renderDecisionFlow(trading) {
   const buyRejected = Number(summary.buy_rejected || 0);
   const sellRejected = Number(summary.sell_rejected || 0);
   const totalEvaluated = buyEvaluated + sellEvaluated;
+  const ignoredSymbols = summary.ignored_symbols || [];
+  if (liveStrip) {
+    const chips = [
+      ['마지막 사이클', status.last_cycle_at ? formatTime(status.last_cycle_at) : '-'],
+      ['상태', running ? '실행 중' : '정지'],
+      ['매수 평가/보류', `${buyEvaluated}/${buyRejected}`],
+      ['매도 평가/보류', `${sellEvaluated}/${sellRejected}`],
+      ['주문 제출', String(submitted)],
+      ['차단/오류', `${blocked}/${errors}`],
+      ['무시 종목', ignoredSymbols.length ? ignoredSymbols.join(', ') : '-'],
+      ['무시 건수', String(Number(summary.skipped_ignored || 0))],
+      ['현재 평가', policyState.symbol ? `${policyState.symbol} ${profitabilityDecision.action || ''}` : '-'],
+      ['모델/시세', `${modelHealth.status || '-'} / ${diagnostics.quote_refresh_status || '-'}`],
+      ['마지막 사유', summary.reason || status.last_reason || '-'],
+    ];
+    liveStrip.innerHTML = chips.map(([label, value]) => `
+      <div class="decision-live-chip">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+      </div>
+    `).join('');
+  }
   const stages = [
     ['계좌', running ? '자동 실행' : '대기', status.last_cycle_at ? formatTime(status.last_cycle_at) : '-'],
     ['매도 평가', `${sellEvaluated}건`, `${Number(summary.sell_submitted || 0)} 제출 · ${sellRejected} 보류`],

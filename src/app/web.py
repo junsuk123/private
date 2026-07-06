@@ -1365,7 +1365,9 @@ TRADE_DISPLAY_HTML = """<!doctype html>
     var list=document.getElementById("list");
     renderOverview(d.overview);
     document.getElementById("dot").className="dot"+(d.running?"":" off");
-    document.getElementById("status").textContent=(d.running?"자동매매 실행 중":"자동매매 정지")+(d.buy_enabled===false?" · 매수 비활성":"")+" · 갱신 "+new Date().toLocaleTimeString("ko-KR",{hour12:false});
+    var a=d.activity||{};
+    var activityText="cycle "+(a.cycle||0)+" | buy "+(a.buy_evaluated||0)+"/"+(a.buy_rejected||0)+" | sell "+(a.sell_evaluated||0)+"/"+(a.sell_rejected||0)+" | orders "+(a.submitted||0)+" | ignored "+(a.skipped_ignored||0);
+    document.getElementById("status").textContent=(d.running?"자동매매 실행 중":"자동매매 정지")+(d.buy_enabled===false?" · 매수 비활성":"")+" · "+activityText+" · 갱신 "+new Date().toLocaleTimeString("ko-KR",{hour12:false});
     var cards=(d&&d.cards)||[];
     list.innerHTML="";
     if(!cards.length){
@@ -2297,8 +2299,8 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         # Total equity from the CORRECTED parts (sane FX): KRW cash + foreign cash +
         # stock value. Do not trust a broker-provided total that can embed a bad FX
         # rate (which inflated both 외화 예수금 and the domestic-vs-total composition).
-        broker_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
         corrected_parts_equity = krw_cash + foreign_cash_krw + invested_value_krw
+        broker_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
         actual_equity = broker_equity if broker_equity > corrected_parts_equity else corrected_parts_equity
         result["cash"] = krw_cash
         result["cash_equivalent_krw"] = cash_equivalent_krw
@@ -3162,7 +3164,9 @@ def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
             "cards": [],
         }
     status = engine.get_status()
+    diagnostics = engine.decision_engine.get_diagnostics() if hasattr(engine, "decision_engine") else None
     events = status.get("recent_events") or []
+    summary = status.get("last_summary") or {}
     keep_outcomes = {"submitted", "amended", "filled", "partially_filled", "blocked", "error", "open_sell_kept"}
     action_label = {
         "submitted": "주문", "amended": "정정", "filled": "체결", "partially_filled": "일부 체결",
@@ -3216,13 +3220,185 @@ def _trade_explanation_cards(limit: int = 14) -> dict[str, Any]:
         )
         if len(cards) >= limit:
             break
+    if len(cards) < limit:
+        cards.extend(_recent_evaluation_cards(summary, now, limit - len(cards)))
+    if len(cards) < limit:
+        diag_card = _diagnostic_evaluation_card(diagnostics, now)
+        if diag_card is not None:
+            cards.append(diag_card)
+    if not cards:
+        cards.append(_engine_heartbeat_card(status, now, running))
+    activity = _realtime_activity_payload(status, summary, diagnostics)
     return {
         "generated_at": now.isoformat(),
         "running": running,
         "buy_enabled": bool(status.get("buy_enabled")),
         "last_reason": status.get("last_reason"),
+        "activity": activity,
         "overview": _kiosk_market_overview(now),
         "cards": cards,
+    }
+
+
+def _realtime_activity_payload(
+    status: dict[str, Any],
+    summary: dict[str, Any],
+    diagnostics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnostics = diagnostics or {}
+    policy_state = diagnostics.get("policy_state") if isinstance(diagnostics.get("policy_state"), dict) else {}
+    model_health = policy_state.get("model_health") if isinstance(policy_state.get("model_health"), dict) else {}
+    profitability = diagnostics.get("profitability_decision") if isinstance(diagnostics.get("profitability_decision"), dict) else {}
+    return {
+        "cycle": status.get("cycles"),
+        "last_cycle_at": status.get("last_cycle_at"),
+        "reason": summary.get("reason") or status.get("last_reason"),
+        "buy_evaluated": summary.get("buy_evaluated", 0),
+        "buy_rejected": summary.get("buy_rejected", 0),
+        "sell_evaluated": summary.get("sell_evaluated", 0),
+        "sell_rejected": summary.get("sell_rejected", 0),
+        "submitted": summary.get("submitted", 0),
+        "blocked": summary.get("blocked", 0),
+        "errors": summary.get("errors", 0),
+        "skipped_ignored": summary.get("skipped_ignored", 0),
+        "ignored_symbols": list(summary.get("ignored_symbols") or ()),
+        "current_symbol": policy_state.get("symbol") or profitability.get("symbol"),
+        "current_action": profitability.get("action"),
+        "model_status": model_health.get("status"),
+        "quote_refresh_status": diagnostics.get("quote_refresh_status"),
+    }
+
+
+def _recent_evaluation_cards(summary: dict[str, Any], now: datetime, remaining: int) -> list[dict[str, Any]]:
+    if remaining <= 0:
+        return []
+    at = str(summary.get("at") or now.isoformat())
+    cards: list[dict[str, Any]] = []
+    ignored = [str(symbol) for symbol in (summary.get("ignored_symbols") or ()) if str(symbol)]
+    skipped_ignored = int(summary.get("skipped_ignored") or 0)
+    if ignored and skipped_ignored:
+        cards.append(
+            {
+                "kind": "CYCLE",
+                "outcome": "ignored",
+                "tone": "hold",
+                "symbol": ", ".join(ignored[:4]),
+                "name": ", ".join(ignored[:4]),
+                "headline": f"{', '.join(ignored[:4])} ignored by realtime trading",
+                "reasons": ["REALTIME_IGNORE_SYMBOLS", f"skipped {skipped_ignored} locked/special symbol"],
+                "time_ago": _time_ago_ko(at, now),
+                "time_hm": _kst_hm(at),
+            }
+        )
+    for row in (summary.get("rejections") or []):
+        if len(cards) >= remaining:
+            break
+        symbol = str(row.get("symbol") or "")
+        side = str(row.get("side") or "").upper()
+        codes = [str(code) for code in (row.get("reason_codes") or ()) if str(code)]
+        primary = _humanize_reason(codes[0]) if codes else "evaluation held"
+        reasons = []
+        for code in codes[:4]:
+            text = _humanize_reason(code)
+            if text and text not in reasons:
+                reasons.append(text)
+        name = _resolve_instrument_label(symbol) if symbol else symbol
+        verb = "BUY" if side == "BUY" else "SELL" if side == "SELL" else "CHECK"
+        headline = f"{name or symbol} {verb} evaluated, no order"
+        cards.append(
+            {
+                "kind": side or "EVAL",
+                "outcome": "held",
+                "tone": "hold",
+                "symbol": symbol,
+                "name": name or symbol,
+                "headline": headline,
+                "reasons": reasons or [primary],
+                "time_ago": _time_ago_ko(at, now),
+                "time_hm": _kst_hm(at),
+            }
+        )
+    if not cards and any(int(summary.get(key) or 0) for key in ("buy_evaluated", "sell_evaluated")):
+        cards.append(
+            {
+                "kind": "CYCLE",
+                "outcome": "evaluated",
+                "tone": "hold",
+                "symbol": "",
+                "name": "Realtime cycle",
+                "headline": "Realtime cycle completed with no order",
+                "reasons": [
+                    f"buy evaluated {int(summary.get('buy_evaluated') or 0)} / rejected {int(summary.get('buy_rejected') or 0)}",
+                    f"sell evaluated {int(summary.get('sell_evaluated') or 0)} / rejected {int(summary.get('sell_rejected') or 0)}",
+                ],
+                "time_ago": _time_ago_ko(at, now),
+                "time_hm": _kst_hm(at),
+            }
+        )
+    return cards[:remaining]
+
+
+def _diagnostic_evaluation_card(diagnostics: dict[str, Any] | None, now: datetime) -> dict[str, Any] | None:
+    from zoneinfo import ZoneInfo
+
+    if not isinstance(diagnostics, dict) or not diagnostics:
+        return None
+    policy_state = diagnostics.get("policy_state") if isinstance(diagnostics.get("policy_state"), dict) else {}
+    profitability = diagnostics.get("profitability_decision") if isinstance(diagnostics.get("profitability_decision"), dict) else {}
+    model_health = policy_state.get("model_health") if isinstance(policy_state.get("model_health"), dict) else {}
+    symbol = str(policy_state.get("symbol") or profitability.get("symbol") or "")
+    if not symbol:
+        return None
+    action = str(profitability.get("action") or "CHECK").upper()
+    allowed = bool(profitability.get("allowed"))
+    reason_codes = []
+    for code in profitability.get("rejection_reasons") or ():
+        reason_codes.append(str(code))
+    for code in model_health.get("reason_codes") or ():
+        reason_codes.append(str(code))
+    reasons = []
+    for code in reason_codes[:4]:
+        text = _humanize_reason(code)
+        if text and text not in reasons:
+            reasons.append(text)
+    if diagnostics.get("quote_refresh_status"):
+        reasons.append(f"quote {diagnostics.get('quote_refresh_status')}")
+    name = _resolve_instrument_label(symbol)
+    return {
+        "kind": action,
+        "outcome": "checking" if allowed else "held",
+        "tone": "buy" if allowed and action == "BUY" else "hold",
+        "symbol": symbol,
+        "name": name or symbol,
+        "headline": f"{name or symbol} {action} checking now",
+        "reasons": reasons or ["decision diagnostics active"],
+        "time_ago": "",
+        "time_hm": now.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M"),
+    }
+
+
+def _engine_heartbeat_card(status: dict[str, Any], now: datetime, running: bool) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    cycles = int(status.get("cycles") or 0)
+    last_cycle = status.get("last_cycle_at")
+    headline = "Realtime trading engine is running" if running else "Realtime trading engine is stopped"
+    reasons = [
+        f"cycles completed {cycles}",
+        "waiting for first completed decision cycle" if running and not last_cycle else f"last cycle {last_cycle}",
+    ]
+    if status.get("buy_enabled") is False:
+        reasons.append(f"buy disabled: {status.get('buy_disabled_reason') or 'configured'}")
+    return {
+        "kind": "CYCLE",
+        "outcome": "heartbeat" if running else "stopped",
+        "tone": "hold",
+        "symbol": "",
+        "name": "Realtime engine",
+        "headline": headline,
+        "reasons": reasons,
+        "time_ago": "",
+        "time_hm": now.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M"),
     }
 
 
@@ -4520,11 +4696,53 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   cached_context = _cached_context_buy_candidates(limit=limit)
   affordable = _live_affordable_buy_candidate_symbols(limit=limit)
   surge = _cached_volume_surge_symbols()
+  ordered = _prioritize_realtime_buy_candidates(
+      tuple(dict.fromkeys((*surge, *cached_context, *fresh, *config_symbols, *affordable)))
+  )
   return _filter_realtime_buy_candidates_by_affordability(
-      tuple(dict.fromkeys((*cached_context, *fresh, *surge, *config_symbols, *affordable))),
+      ordered,
       limit=limit,
       prevalidated_symbols=affordable,
   )
+
+
+def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, ...]:
+  """Keep active US symbols within the realtime engine's first evaluation window."""
+  open_groups = set(_active_live_market_groups())
+  if "US" not in open_groups:
+    return symbols
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:  # noqa: BLE001 - preserve original ordering on account lookup failure.
+    return symbols
+  usd_cash = float((getattr(account, "cash_by_currency", {}) or {}).get("USD") or 0.0) if account is not None else 0.0
+  if usd_cash <= 0:
+    return symbols
+  us_symbols: list[str] = []
+  other_symbols: list[str] = []
+  seen: set[str] = set()
+  for raw in symbols:
+    symbol = str(raw or "").upper().strip()
+    if not symbol or symbol in seen:
+      continue
+    seen.add(symbol)
+    if _ticker_market_group_for_live_trading(symbol, "") == "US":
+      us_symbols.append(symbol)
+    else:
+      other_symbols.append(symbol)
+  return tuple((*us_symbols, *other_symbols))
+
+
+def _is_excluded_us_live_candidate(symbol: str) -> bool:
+  text = str(symbol or "").upper().strip()
+  if not text or _ticker_market_group_for_live_trading(text, "") != "US":
+    return False
+  suffixes = tuple(
+      item.strip().upper()
+      for item in os.getenv("REALTIME_US_EXCLUDE_SYMBOL_SUFFIXES", "U,WS,WT,W,R,P").split(",")
+      if item.strip()
+  )
+  return any(text.endswith(suffix) and len(text) > len(suffix) for suffix in suffixes)
 
 
 def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
@@ -4547,7 +4765,33 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
   symbols: list[str] = []
   max_count = max(1, int(limit))
 
-  if "KRX" in open_groups and float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0) > 0:
+  if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0:
+    try:
+      us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "60")))
+    except ValueError:
+      us_limit = 60
+    try:
+      us_universe = tuple(load_us_listed_universe(limit=None) or ())
+    except Exception as exc:  # noqa: BLE001 - discovery is optional.
+      audit.record("realtime_us_discovery_candidate_load_failed", {"error": str(exc)})
+      us_universe = ()
+    us_symbols: list[str] = []
+    for symbol in _rotated_symbols(us_universe):
+      ticker = str(symbol or "").upper().strip().split(".", 1)[0]
+      if ticker and ticker not in excluded and not _is_excluded_us_live_candidate(ticker):
+        us_symbols.append(ticker)
+      if len(us_symbols) >= min(max_count - len(symbols), us_limit):
+        break
+    symbols.extend(
+        _broker_affordable_candidate_symbols(
+            tuple(us_symbols),
+            "NASDAQ",
+            account,
+            max_symbols=max(0, min(max_count - len(symbols), us_limit)),
+        )
+    )
+
+  if "KRX" in open_groups and float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0) > 0 and len(symbols) < max_count:
     try:
       krx_limit = max(0, int(os.getenv("REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT", "60")))
     except ValueError:
@@ -4570,32 +4814,6 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
             "KOSPI",
             account,
             max_symbols=max(0, min(max_count, krx_limit)),
-        )
-    )
-
-  if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0 and len(symbols) < max_count:
-    try:
-      us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "60")))
-    except ValueError:
-      us_limit = 60
-    try:
-      us_universe = tuple(load_us_listed_universe(limit=None) or ())
-    except Exception as exc:  # noqa: BLE001 - discovery is optional.
-      audit.record("realtime_us_discovery_candidate_load_failed", {"error": str(exc)})
-      us_universe = ()
-    us_symbols: list[str] = []
-    for symbol in _rotated_symbols(us_universe):
-      ticker = str(symbol or "").upper().strip().split(".", 1)[0]
-      if ticker and ticker not in excluded:
-        us_symbols.append(ticker)
-      if len(us_symbols) >= min(max_count - len(symbols), us_limit):
-        break
-    symbols.extend(
-        _broker_affordable_candidate_symbols(
-            tuple(us_symbols),
-            "NASDAQ",
-            account,
-            max_symbols=max(0, min(max_count - len(symbols), us_limit)),
         )
     )
 
@@ -4697,6 +4915,8 @@ def _filter_realtime_buy_candidates_by_affordability(
   for symbol in symbols:
     ticker = str(symbol or "").upper().strip()
     if not ticker or ticker in seen:
+      continue
+    if _is_excluded_us_live_candidate(ticker):
       continue
     if ticker not in prevalidated:
       market = context_markets.get(ticker)
@@ -5579,7 +5799,7 @@ def _live_affordable_us_discovery_targets(
       universe = ()
     for symbol in _rotated_symbols(tuple(universe)):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
-      if ticker in seen or ticker in excluded or not ticker:
+      if ticker in seen or ticker in excluded or not ticker or _is_excluded_us_live_candidate(ticker):
         continue
       candidates.append(_placeholder_live_market(ticker, "NASDAQ"))
       seen.add(ticker)
@@ -5667,8 +5887,16 @@ def _rotated_affordable_markets(markets: tuple[MarketSnapshot, ...]) -> tuple[Ma
 def _rotated_symbols(symbols: tuple[Any, ...]) -> tuple[Any, ...]:
   if not symbols:
     return ()
-  offset = datetime.now(timezone.utc).toordinal() % len(symbols)
-  return symbols[offset:] + symbols[:offset]
+  count = len(symbols)
+  bucket = int(time.time() // max(30, int(os.getenv("REALTIME_UNIVERSE_ROTATION_SECONDS", "60"))))
+  offset = bucket % count
+  rotated = symbols[offset:] + symbols[:offset]
+  if count < 80:
+    return rotated
+  step = max(1, min(count - 1, int(os.getenv("REALTIME_UNIVERSE_SPREAD_STEP", "37"))))
+  while math.gcd(step, count) != 1 and step > 1:
+    step -= 1
+  return tuple(rotated[(index * step) % count] for index in range(count))
 
 
 def _live_realtime_feature_symbols_for_active_session(context: Any, now_utc: Any | None = None) -> tuple[str, ...]:
