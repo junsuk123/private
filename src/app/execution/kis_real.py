@@ -1323,10 +1323,18 @@ def _first_float(data: dict[str, Any], *keys: str) -> float:
 
 
 def _domestic_cash_from_balance_summary(summary_row: dict[str, Any], holdings: tuple[Holding, ...]) -> float:
+    # Prefer the settlement-inclusive deposit (prvs_rcdl_excc_amt = 가수도정산금액 / D+2,
+    # nxdy_excc_amt = 익일정산금액 / D+1) over dnca_tot_amt (예수금총액, settled-only).
+    # In KRX, sell proceeds are immediately usable for re-buying and are part of total
+    # assets; KIS's own tot_evlu_amt already counts them, so basing cash on dnca_tot_amt
+    # undercounted the total by the pending sell proceeds (e.g. 16,445 vs 89,638) and
+    # made the displayed total wrong (~136k instead of ~205k). Orderable-for-withdrawal
+    # is fetched separately, so trading cash is unaffected.
     explicit_cash = _first_float(
         summary_row,
-        "dnca_tot_amt",
         "prvs_rcdl_excc_amt",
+        "nxdy_excc_amt",
+        "dnca_tot_amt",
         "d2_auto_rdpt_amt",
         "cash",
     )

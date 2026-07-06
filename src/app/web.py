@@ -452,10 +452,14 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   orderable_cash_by_currency = _cash_by_currency_payload(connection.get("orderable_cash_by_currency"), krw_cash)
   foreign_cash_krw = _number_or_zero(connection.get("foreign_cash_krw") or 0)
   cash_equivalent_krw = _number_or_zero(connection.get("cash_equivalent_krw") or 0)
-  if cash_equivalent_krw <= 0:
-    cash_equivalent_krw = cash + foreign_cash_krw
   if cash <= 0:
     cash = krw_cash
+  # cash_equivalent must be at least (deposit + foreign cash) valued at our single FX
+  # rate. KIS's own cash_equivalent field sometimes uses a stale/settlement USD rate,
+  # producing a value BELOW deposit+foreign — that FX split made the displayed total
+  # wobble (e.g. USD counted at ~1440 here but ~1540 in foreign_cash_krw). Never accept
+  # less than the consistently-valued sum.
+  cash_equivalent_krw = max(cash_equivalent_krw, cash + foreign_cash_krw)
   equity = _number_or_zero(
       connection.get("actual_equity")
       or connection.get("equity")
@@ -662,12 +666,60 @@ def _live_risk_rules_for_account(account: AccountSnapshot | None) -> RiskRules:
   )
 
 
+def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | None:
+  """Reject an obviously-degraded (partial) KIS balance fetch and keep the last complete
+  one, so the displayed total asset does not wobble (e.g. 205k -> 124k -> 205k).
+
+  KIS occasionally returns a partial balance (settlement deposit and/or a holding missing),
+  which shows up as a sharp equity DROP with no explaining trade — a real sell ADDS cash
+  rather than shrinking equity, and price moves are gradual. When we detect that, carry
+  forward the last complete basis, bounded by ACCOUNT_DEGRADE_MAX_STALE_SEC so a genuine
+  sustained change still gets through. State lives in _operation_mode_state.
+  """
+  if basis is None:
+    return basis
+  with _live_lock:
+    stable = _operation_mode_state.get("stable_account_basis")
+    degraded_since = _operation_mode_state.get("account_degraded_since")
+  new_equity = _number_or_zero(basis.get("equity"))
+  new_positions = len(tuple(basis.get("positions") or ()))
+  new_cash_equiv = _number_or_zero(basis.get("cash_equivalent_krw"))
+  new_components = _number_or_zero(basis.get("krw_cash")) + _number_or_zero(basis.get("foreign_cash_krw"))
+  drop_ratio = float(os.getenv("ACCOUNT_DEGRADE_DROP_RATIO", "0.85"))
+  max_stale = float(os.getenv("ACCOUNT_DEGRADE_MAX_STALE_SEC", "600"))
+  now = time.time()
+  degraded = False
+  if stable is not None:
+    stable_equity = _number_or_zero(stable.get("equity"))
+    stable_positions = len(tuple(stable.get("positions") or ()))
+    if stable_equity > 0 and new_equity < stable_equity * drop_ratio and (
+        new_positions < stable_positions or new_cash_equiv + 1.0 < new_components
+    ):
+      degraded = True
+  if degraded:
+    since = degraded_since or now
+    with _live_lock:
+      _operation_mode_state["account_degraded_since"] = since
+    if now - since < max_stale:
+      audit.record(
+          "account_basis_degraded_carry_forward",
+          {"new_equity": new_equity, "stable_equity": _number_or_zero((stable or {}).get("equity")),
+           "new_positions": new_positions},
+      )
+      return stable
+  # Accept: this is either complete or a sustained change. Refresh the stable snapshot.
+  with _live_lock:
+    _operation_mode_state["stable_account_basis"] = basis
+    _operation_mode_state["account_degraded_since"] = None
+  return basis
+
+
 def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
   cached = _cached_kis_connection_probe(paper=False, include_account=True)
   if cached.get("account_checked"):
     basis = _account_basis_from_kis_connection(cached)
     if basis is not None:
-      return basis
+      return _stabilize_account_basis(basis)
   try:
     connection = _kis_connection_probe(paper=False, include_account=True)
   except Exception as exc:  # pragma: no cover - defensive guard around broker/network state
@@ -677,6 +729,7 @@ def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
   basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous)
   if basis is None:
     return None
+  basis = _stabilize_account_basis(basis)
   with _live_lock:
     _operation_mode_state["last_kis_connection"] = _connection_with_account_basis(connection, basis)
     _operation_mode_state["last_kis_connection_checked_at"] = time.time()
