@@ -1059,7 +1059,13 @@ class KisDevelopersApiClient:
         )
         self._ensure_success(response, "KIS domestic orderable-cash lookup failed")
         output = response.get("output") or {}
-        return _first_float(output, "ord_psbl_cash")
+        # Prefer nrcvb_buy_amt (미수없는매수금액 = cash + reusable sell proceeds, NO margin)
+        # over ord_psbl_cash (주문가능현금 = settled deposit only). In KRX, sell proceeds are
+        # immediately reusable for buying without going into 미수/credit, so basing orderable
+        # cash on ord_psbl_cash alone locked the account into its tiny settled deposit
+        # (e.g. 16,445) while 85,869 of reusable proceeds sat unused. nrcvb_buy_amt is
+        # KIS-authoritative "how much you can buy without margin", so orders stay margin-free.
+        return _first_float(output, "nrcvb_buy_amt", "ord_psbl_cash")
 
     def _overseas_present_balance_params(self, nation_code: str = "000") -> dict[str, str]:
         return {
