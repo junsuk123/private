@@ -77,6 +77,38 @@ socket every ~90s.
 **Fix**: `kis_realtime.run_kis_realtime_websocket_collector` now echoes any `PINGPONG`
 frame verbatim. Verified: 0 collector errors over 3.5 min (was erroring every ~2 min).
 
+## Day-trading (단타) exit discipline (2026-07-07)
+
+The account was accumulating losses / getting "물림" (stuck) because the exit path ran in
+"investment mode": `SMALL_ACCOUNT_ONE_SHARE_LOSS_BLOCK` (shared_decision_engine.py) held
+every 1-share loser until the 3% hard stop, and `ALLOW_LOSS_EXIT=false` +
+`BLOCK_SELL_BELOW_BREAKEVEN=true` disabled all discretionary stops — so small losses rode
+to −3% while a tiny ₩20 take-profit realized wins at ~0.13%. That is a structurally
+negative-expectancy shape.
+
+Fixed with a research-grounded day-trading profile (sources: Van Tharp Institute on
+expectancy = winrate×avgWin − lossrate×avgLoss and R-multiples; Odean 1998 *J. Finance*
+and Barber–Lee–Liu–Odean on the disposition effect — sold winners beat held losers by
+3.4pp/yr, i.e. holding losers is empirically ruinous; StockCharts ChartSchool on ATR
+stops; PwC/EY on the KR 0.20% sell tax from 2026-01):
+
+- `REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE=false` — **the fix**: 1-share losers can now stop.
+- `REALTIME_ALLOW_LOSS_EXIT=true`, `REALTIME_BLOCK_SELL_BELOW_BREAKEVEN=false` — stops fire.
+- `REALTIME_STOP_LOSS_NET=0.008` (~0.5% gross) — cut each loss small.
+- `REALTIME_QUICK_TAKE_PROFIT_NET=0.014`, `REALTIME_MIN_NET_PROFIT_EXIT=0.008` — realize
+  meaningful net profit (R:R ≈ 1.75:1 on the quick target); `REALTIME_TAKE_PROFIT_AMOUNT_KRW=0`
+  removes the ₩20 micro-take-profit.
+- `REALTIME_HARD_STOP_LOSS=0.02` — capital backstop tightened 3%→2%.
+
+**Top research caveat (must not be forgotten):** small-account day trading is collectively
+negative-expectancy — KR round-trip cost (sell tax 0.20% + commissions ≈ 0.23–0.35%)
+amplifies losses, and studies show <3% of day traders are predictably profitable. This
+discipline MINIMIZES losses and enforces profit realization; it does not guarantee profit.
+Tune the stop/target from realized PnL. Open item: a true intraday time-stop / end-of-session
+flatten (단타=당일청산) — the tight net stop currently prevents most overnight 물림, but an
+explicit session-close liquidation is a recommended follow-up (research could not pin a
+specific time-stop duration to a reputable source).
+
 ## Remaining constraints (not bugs)
 
 - **Capital**: the US cash balance (~$55) can only buy sub-$55 names; KR (₩22k) is the real

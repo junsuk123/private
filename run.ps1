@@ -153,18 +153,32 @@ Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "0.10"
-Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "false"
-Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.03"
-Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "true"
-Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "true"
+# --- Day-trading (단타) exit discipline (2026-07-07) --------------------------------
+# Research-grounded (Van Tharp expectancy/R-multiple; Odean 1998 & Barber-Lee-Liu-Odean
+# on the disposition effect; StockCharts ATR stops; PwC/EY KR 0.20% sell tax). The prior
+# "investment mode" HELD losers (BLOCK_ONE_SHARE_LOSS_REDUCE + no loss exit) until the
+# 3% hard stop — the classic 물림 that let small losses ride to -3%. Day trading requires
+# cutting losses fast and realizing meaningful profits, so:
+#  - allow loss exit + never block a 1-share stop or a below-breakeven stop
+#  - tight net stop ~0.8% (≈0.5% gross) so each loss stays small
+#  - take-profit net 1.4% (quick) / 0.8% (routine); NO tiny won-amount take-profit
+#  - hard stop tightened 3% -> 2% capital backstop
+# NOTE: research's top caveat — small-account day trading is structurally negative-
+# expectancy (round-trip cost amplifies losses); this discipline MINIMIZES losses, it
+# does not guarantee profit. Tune from realized PnL.
+Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
+Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.02"
+Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "false"
+Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "false"
 Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
-Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.035"
+Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.03"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_LIMIT_KRW" "1500"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW" "1000"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE" "0.004"
-Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.012"
+Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.014"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
-Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.004"
+Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.008"
+Set-DefaultEnv "REALTIME_TAKE_PROFIT_AMOUNT_KRW" "0"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
 # Small-account "moderate" buy tuning: lower the KR net-edge floor (0.8% -> 0.4%),
