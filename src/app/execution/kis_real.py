@@ -494,10 +494,12 @@ class KisDevelopersApiClient:
         orderable_cash_by_currency.update(
             {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
         )
-        display_foreign_cash_krw = max(
-            foreign_cash_krw,
-            _foreign_cash_krw_from_currency_balances(foreign_cash_by_currency, foreign_fx_by_currency),
-        )
+        # Display the true foreign (USD etc.) cash valued from currency balances × FX.
+        # KIS's foreign_cash_krw re-includes the domestic KRW deposit (통합증거금), so it
+        # must NOT be shown as "외화" — use the per-currency computation and only fall
+        # back to the broker figure when no currency breakdown is available.
+        _ccy_foreign_krw = _foreign_cash_krw_from_currency_balances(foreign_cash_by_currency, foreign_fx_by_currency)
+        display_foreign_cash_krw = _ccy_foreign_krw if _ccy_foreign_krw > 0 else foreign_cash_krw
         if domestic_error is not None and not foreign_cash_by_currency and foreign_cash_krw <= 0:
             raise domestic_error
         cash_by_currency.update(foreign_cash_by_currency)
@@ -509,22 +511,29 @@ class KisDevelopersApiClient:
             foreign_cash_krw,
             foreign_fx_by_currency,
         )
-        cash_equivalent_krw = cash + foreign_cash_krw
-        total_equity_krw = 0.0
-        if domestic_total_assets_krw > 0 and total_assets_krw >= domestic_total_assets_krw:
-            # KIS domestic balance total and overseas present-balance total overlap
-            # on KRW deposit. Combine both account views, then remove the duplicated
-            # KRW cash bucket. This matches the app's all-assets view better than
-            # treating overseas present-balance `tot_asst_amt` as the whole account.
-            total_equity_krw = domestic_total_assets_krw + total_assets_krw - cash
-            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
-        elif total_assets_krw >= cash + domestic_position_value:
-            total_equity_krw = total_assets_krw
-            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
-        elif domestic_total_assets_krw > 0:
-            total_equity_krw = domestic_total_assets_krw + foreign_cash_krw + overseas_position_value_krw
+        # Pure overseas cash (USD etc.) valued directly from currency balances × FX.
+        # Do NOT use foreign_cash_krw here: KIS's overseas present-balance re-includes the
+        # domestic KRW deposit (통합증거금 cross-view), so adding it to the domestic total
+        # double-counts the KRW cash (the old branch logic tried to dedup this and drifted,
+        # over-reporting the account by ~그 KRW deposit). Total assets is therefore the
+        # KIS domestic total-assets (tot_evlu_amt: D+2 settlement deposit + domestic stock)
+        # + overseas stock + overseas cash — each bucket counted exactly once.
+        usd_cash_krw = 0.0
+        for _ccy, _amt in (cash_by_currency or {}).items():
+            if str(_ccy).upper() == "KRW":
+                continue
+            _rate = float((foreign_fx_by_currency or {}).get(_ccy) or 0.0)
+            if _rate > 0:
+                usd_cash_krw += max(0.0, float(_amt or 0.0)) * _rate
+        if usd_cash_krw <= 0.0:
+            # No per-currency FX available: fall back to the broker's foreign-cash figure
+            # minus the domestic settled deposit it double-counts.
+            usd_cash_krw = max(0.0, foreign_cash_krw - cash)
+        if domestic_total_assets_krw > 0:
+            total_equity_krw = domestic_total_assets_krw + overseas_position_value_krw + usd_cash_krw
             cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
         else:
+            cash_equivalent_krw = cash + usd_cash_krw
             total_equity_krw = cash_equivalent_krw + domestic_position_value + overseas_position_value_krw
         account = AccountSnapshot(
             cash=cash,
