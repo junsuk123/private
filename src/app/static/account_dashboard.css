@@ -325,3 +325,10 @@ tbody tr:hover { background: #f8fbff; }
 .tech-detail span { display: flex; justify-content: space-between; gap: 6px; }
 .tech-detail em { color: #6b7684; font-style: normal; }
 .tech-explain { margin-top: 6px; color: #4a5568; font-size: 11px; line-height: 1.4; }
+
+/* Macro–micro ontology panel (advisory) */
+#macro-micro-panel .mm-macro { margin-bottom: 12px; }
+#macro-micro-panel .mm-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
+}
+#macro-micro-panel .mm-grid article > h3 { margin: 0 0 6px; font-size: 13px; color: #33415c; }

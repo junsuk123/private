@@ -140,12 +140,15 @@ class AccountDashboardService:
         status_provider: Callable[[], dict[str, Any] | None] | None = None,
         logs_provider: Callable[[], dict[str, Any] | None] | None = None,
         technical_provider: Callable[[], list[dict[str, Any]] | None] | None = None,
+        macro_micro_provider: Callable[[], dict[str, Any] | None] | None = None,
         store: AccountSnapshotStore | None = None,
     ) -> None:
         self.status_provider = status_provider
         self.logs_provider = logs_provider
         # Returns the most recent technical decision diagnostics (advisory).
         self.technical_provider = technical_provider
+        # Returns the most recent macro–micro reasoning bundle (advisory).
+        self.macro_micro_provider = macro_micro_provider
         self.store = store or AccountSnapshotStore()
 
     def build_dashboard(self, *, persist: bool = True) -> dict[str, Any]:
@@ -246,6 +249,7 @@ class AccountDashboardService:
             "holding_orders": holding_order_rows,
             "profitability": _profitability_summary(trade_rows, snapshot),
             "technical": build_technical_panel(self._technical_payload()),
+            "macro_micro": build_macro_micro_panel(self._macro_micro_payload()),
             "logs": {
                 "collection_log": list(logs.get("collection_log") or []),
                 "last_error": logs.get("last_error"),
@@ -259,6 +263,9 @@ class AccountDashboardService:
 
     def technical(self) -> dict[str, Any]:
         return build_technical_panel(self._technical_payload())
+
+    def macro_micro(self) -> dict[str, Any]:
+        return build_macro_micro_panel(self._macro_micro_payload())
 
     def holdings(self) -> list[dict[str, Any]]:
         return list(self.build_dashboard(persist=False).get("holdings") or [])
@@ -324,6 +331,14 @@ class AccountDashboardService:
             return list(self.technical_provider() or [])
         except Exception:  # noqa: BLE001 - advisory panel must never break the dashboard.
             return []
+
+    def _macro_micro_payload(self) -> dict[str, Any] | None:
+        if self.macro_micro_provider is None:
+            return None
+        try:
+            return self.macro_micro_provider()
+        except Exception:  # noqa: BLE001 - advisory panel must never break the dashboard.
+            return None
 
 
 def _holding_from_position(position: dict[str, Any], updated_at: str) -> HoldingDashboardRow | None:
@@ -888,4 +903,58 @@ def build_technical_panel(decisions: list[dict[str, Any]] | None) -> dict[str, A
         "sell": by_category.get("sell", []),
         "reduce": by_category.get("reduce", []),
         "hold": by_category.get("hold", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Macro–micro ontology panel (advisory GUI). Pure transform of the latest
+# MacroMicroReasoningBundle dict into a render-ready structure. Describes the
+# market regime, candidate selection, and per-symbol micro reasoning; it never
+# itself decides anything (the gates remain authoritative).
+# ---------------------------------------------------------------------------
+def build_macro_micro_panel(bundle: dict[str, Any] | None) -> dict[str, Any]:
+    if not bundle:
+        return {"available": False, "market_regime": None, "micro": [], "ranked_intents": []}
+    macro = dict(bundle.get("macro_result") or {})
+    micro_rows = []
+    for m in bundle.get("micro_results") or []:
+        micro_rows.append({
+            "symbol": m.get("symbol"),
+            "micro_regime": m.get("micro_regime"),
+            "selected_strategy": m.get("selected_strategy"),
+            "entry_signal": m.get("entry_signal"),
+            "exit_signal": m.get("exit_signal"),
+            "expected_exit_price": m.get("expected_exit_price"),
+            "expected_net_return_bps": m.get("expected_net_return_bps"),
+            "downside_risk_bps": m.get("downside_risk_bps"),
+            "execution_quality": m.get("execution_quality"),
+            "confidence": m.get("confidence"),
+            "reason_codes": list(m.get("reason_codes") or []),
+        })
+    ranked = [
+        {
+            "rank": i.get("rank"), "symbol": i.get("symbol"), "side": i.get("side"),
+            "expected_net_return_bps": i.get("expected_net_return_bps"),
+            "micro_regime": i.get("micro_regime"), "selected_strategy": i.get("selected_strategy"),
+            "confidence": i.get("confidence"),
+        }
+        for i in (bundle.get("ranked_trade_intents") or [])
+    ]
+    return {
+        "available": True,
+        "timestamp": bundle.get("timestamp"),
+        "market_regime": macro.get("market_regime"),
+        "macro_risk_level": macro.get("macro_risk_level"),
+        "macro_confidence": macro.get("macro_confidence"),
+        "blocks_buy": macro.get("blocks_buy"),
+        "sector_rankings": macro.get("sector_rankings") or [],
+        "candidate_symbols": macro.get("candidate_symbols") or [],
+        "allowed_micro_strategies": macro.get("allowed_micro_strategies") or [],
+        "blocked_micro_strategies": macro.get("blocked_micro_strategies") or [],
+        "micro": micro_rows,
+        "ranked_intents": ranked,
+        "sell_reduce_candidates": list(bundle.get("sell_reduce_candidates") or []),
+        "buy_candidates": list(bundle.get("buy_candidates") or []),
+        "blocked_candidates": list(bundle.get("blocked_candidates") or []),
+        "failed_symbols": list(bundle.get("failed_symbols") or []),
     }

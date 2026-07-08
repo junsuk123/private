@@ -255,10 +255,21 @@ def _account_dashboard_technical_provider() -> list[dict]:
         return []
 
 
+def _account_dashboard_macro_micro_provider() -> dict | None:
+    """Latest macro–micro reasoning bundle for the advisory GUI panel."""
+    try:
+        from app.graph.macro_micro_feed import snapshot
+
+        return snapshot()
+    except Exception:  # noqa: BLE001 - advisory panel; never break the dashboard.
+        return None
+
+
 _account_service = AccountDashboardService(
     status_provider=_account_dashboard_status_provider,
     logs_provider=_account_dashboard_logs_provider,
     technical_provider=_account_dashboard_technical_provider,
+    macro_micro_provider=_account_dashboard_macro_micro_provider,
 )
 app.include_router(create_account_router(service=_account_service))
 

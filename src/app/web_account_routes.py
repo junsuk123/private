@@ -65,6 +65,10 @@ def create_account_router(
     def account_technical() -> JSONResponse:
         return JSONResponse(service.technical())
 
+    @router.get("/api/account/macro-micro")
+    def account_macro_micro() -> JSONResponse:
+        return JSONResponse(service.macro_micro())
+
     return router
 
 
@@ -190,6 +194,19 @@ _ACCOUNT_PAGE = """<!doctype html>
           </table>
         </div>
       </article>
+    </section>
+
+    <section class="dashboard-frame" id="macro-micro-panel">
+      <div class="frame-title">
+        <h2>거시–미시 온톨로지 (자문 전용)</h2>
+        <span class="badge" id="macro-micro-badge">-</span>
+      </div>
+      <p class="tech-note">거시 온톨로지가 시장 레짐·후보·허용전략을 정하고, 미시 온톨로지가 종목별로 병렬 추론합니다. 최종 승인은 RiskManager·ProfitabilityGate가 가집니다.</p>
+      <div class="mm-macro" id="mm-macro"></div>
+      <div class="mm-grid">
+        <article><h3>후보 종목 미시 추론</h3><div class="tech-cards" id="mm-micro-cards"></div></article>
+        <article><h3>통합 랭킹 (SELL/REDUCE 우선)</h3><div class="tech-cards" id="mm-ranked"></div></article>
+      </div>
     </section>
 
     <section class="dashboard-frame" id="technical-panel">

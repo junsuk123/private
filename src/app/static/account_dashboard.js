@@ -53,7 +53,68 @@ function renderDashboard(data, trading, runtime) {
   renderSystem(snapshot, data.logs || {}, trading, runtime);
   renderDecisionFlow(trading);
   renderTechnical(data.technical || {});
+  renderMacroMicro(data.macro_micro || {});
   renderLogs(data.logs || {});
+}
+
+function renderMacroMicro(mm) {
+  const badge = document.getElementById('macro-micro-badge');
+  if (badge) {
+    badge.textContent = mm.available ? (mm.market_regime || '-') : '데이터 없음';
+    badge.className = mm.available && !mm.blocks_buy ? 'badge' : 'badge warn';
+  }
+  const macro = document.getElementById('mm-macro');
+  if (macro) {
+    if (!mm.available) {
+      macro.innerHTML = '<div class="tech-card empty">거시 추론 데이터 없음</div>';
+    } else {
+      const sectors = (mm.sector_rankings || []).slice(0, 5)
+        .map((s) => `${s.sector}(${techNum(s.score, 2)})`).join(', ') || '-';
+      const rows = [
+        ['시장 레짐', mm.market_regime || '-'],
+        ['거시 리스크', mm.macro_risk_level || '-'],
+        ['거시 신뢰도', techNum(mm.macro_confidence, 2)],
+        ['신규매수 차단', mm.blocks_buy ? '예' : '아니오'],
+        ['허용 전략', (mm.allowed_micro_strategies || []).join(', ') || '-'],
+        ['차단 전략', (mm.blocked_micro_strategies || []).join(', ') || '-'],
+        ['후보 종목', (mm.candidate_symbols || []).join(', ') || '-'],
+        ['섹터 상위', sectors],
+      ];
+      macro.innerHTML = `<div class="tech-card ${mm.blocks_buy ? 'rejected' : 'approved'}">`
+        + `<div class="tech-detail">${rows.map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('')}</div></div>`;
+    }
+  }
+  const microContainer = document.getElementById('mm-micro-cards');
+  if (microContainer) {
+    const rows = mm.micro || [];
+    microContainer.innerHTML = rows.length ? rows.map((m) => {
+      const buy = m.entry_signal === 'BUY_CANDIDATE';
+      const exit = (m.exit_signal && m.exit_signal !== 'NONE');
+      const kind = buy ? 'approved' : exit ? 'sell' : 'rejected';
+      const detail = [
+        ['미시 레짐', m.micro_regime || '-'],
+        ['전략', m.selected_strategy || '-'],
+        ['진입', m.entry_signal || '-'],
+        ['청산', m.exit_signal || '-'],
+        ['예상순수익', techNum(m.expected_net_return_bps, 1, 'bps')],
+        ['예상청산가', techNum(m.expected_exit_price, 2)],
+        ['체결품질', m.execution_quality || '-'],
+        ['신뢰도', techNum(m.confidence, 2)],
+      ].map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('');
+      return `<div class="tech-card ${kind}"><div class="tech-symbol">${m.symbol || '-'}</div><div class="tech-detail">${detail}</div></div>`;
+    }).join('') : '<div class="tech-card empty">미시 추론 결과 없음</div>';
+  }
+  const rankedContainer = document.getElementById('mm-ranked');
+  if (rankedContainer) {
+    const ranked = mm.ranked_intents || [];
+    rankedContainer.innerHTML = ranked.length ? ranked.map((i) => {
+      const kind = i.side === 'BUY' ? 'approved' : 'sell';
+      return `<div class="tech-card ${kind}"><div class="tech-symbol">#${i.rank} ${i.side} ${i.symbol}</div>`
+        + `<div class="tech-detail"><span><em>전략</em>${i.selected_strategy || '-'}</span>`
+        + `<span><em>순수익</em>${techNum(i.expected_net_return_bps, 1, 'bps')}</span>`
+        + `<span><em>신뢰도</em>${techNum(i.confidence, 2)}</span></div></div>`;
+    }).join('') : '<div class="tech-card empty">랭킹된 의도 없음</div>';
+  }
 }
 
 const TECH_REJECT_TEXT = {
