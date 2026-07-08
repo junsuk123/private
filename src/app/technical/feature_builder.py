@@ -168,3 +168,46 @@ def build_technical_feature_set(
         orderbook_imbalance=imbalance,
         expected_slippage_bps=None,
     )
+
+
+def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalFeatureSet:
+    """Map an already-built ``LiveFeatureFrame`` to a :class:`TechnicalFeatureSet`.
+
+    Reuses the technical columns the live frame now emits (rsi_14,
+    macd_histogram, bollinger_percent_b, ema_gap_bps, donchian_breakout,
+    volume_spike_ratio) plus the existing microstructure/vol columns — so the
+    shared decision engine needs no extra store reads. Missing keys degrade to
+    ``None`` (NaN-safe).
+    """
+    d = frame.as_feature_dict()
+    price = float(getattr(frame, "mark_price", 0.0) or 0.0) or None
+
+    def g(name):
+        v = d.get(name)
+        return float(v) if v is not None else None
+
+    ema_gap_bps = g("ema_gap_bps")
+    # Reconstruct ema_fast/ema_slow so the regime gap calc matches ema_gap_bps.
+    ema_slow = price
+    ema_fast = price * (1.0 + ema_gap_bps / 10_000.0) if (price and ema_gap_bps is not None) else None
+    dist = g("distance_from_vwap")  # fraction (price/vwap - 1)
+    vwap = price / (1.0 + dist) if (price and dist is not None and dist != -1.0) else None
+    return TechnicalFeatureSet(
+        symbol=symbol or getattr(frame, "symbol", ""),
+        price=price,
+        ema_fast=ema_fast,
+        ema_slow=ema_slow,
+        macd_histogram=g("macd_histogram"),
+        short_return=g("return_1m"),
+        rsi=g("rsi_14"),
+        bb_percent_b=g("bollinger_percent_b"),
+        vwap=vwap,
+        vwap_distance_bps=(dist * 10_000.0) if dist is not None else None,
+        relative_volume=g("volume_spike_ratio"),
+        volume_spike_ratio=g("volume_spike_ratio"),
+        breakout_strength=g("donchian_breakout"),
+        realized_volatility=g("realized_volatility_3m"),
+        liquidity_score=g("liquidity_score"),
+        spread_bps=g("spread_bps"),
+        orderbook_imbalance=g("orderbook_imbalance"),
+    )

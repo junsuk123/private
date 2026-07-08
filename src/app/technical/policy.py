@@ -117,3 +117,17 @@ def load_technical_policy(path: str | Path | None = None) -> TechnicalPolicy:
         dict(policy.signal_engine.methodology_weights),
     )
     return policy
+
+
+def build_prediction_engine(policy: TechnicalPolicy | None = None):
+    """Construct a :class:`TechnicalPredictionEngine` wired to the loaded policy."""
+    from app.technical.prediction import TechnicalPredictionEngine
+    from app.technical.regime import TechnicalRegimeClassifier
+    from app.technical.signals import CompositeTechnicalSignalEngine
+
+    policy = policy or load_technical_policy()
+    signal_engine = CompositeTechnicalSignalEngine(
+        policy.signal_engine,
+        regime_classifier=TechnicalRegimeClassifier(policy.regime),
+    )
+    return TechnicalPredictionEngine(signal_engine=signal_engine, config=policy.prediction)

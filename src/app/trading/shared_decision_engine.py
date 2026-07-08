@@ -346,10 +346,40 @@ class SharedLiveDecisionEngine:
         self.position_sizer = PositionSizer()
         self.market_refresher = market_refresher
         self.decision_logger = decision_logger or DecisionLogger()
+        # Advisory technical prediction layer. Produces a conservative expected
+        # exit price / methodology / regime for the ProfitabilityGate and GUI.
+        # It never approves or blocks on its own — the gate + RiskManager remain
+        # authoritative. Disabled cleanly if the policy or import is unavailable.
+        try:
+            from app.technical.policy import build_prediction_engine, load_technical_policy
+
+            self._technical_policy = load_technical_policy()
+            self._technical_engine = build_prediction_engine(self._technical_policy)
+            self._technical_enabled = bool(self._technical_policy.enabled)
+        except Exception:  # noqa: BLE001 - technical layer is strictly advisory.
+            self._technical_policy = None
+            self._technical_engine = None
+            self._technical_enabled = False
         self._last_diagnostics: dict[str, Any] = {}
         # Per-symbol peak net (after-cost) PnL rate, used by the profit-giveback
         # trailing lock so realized gains are not given back on a stall.
         self._peak_net_pnl: dict[str, float] = {}
+
+    def _technical_prediction(self, frame, symbol, *, model_prediction=None):
+        """Best-effort advisory technical prediction from the live frame.
+
+        Returns ``None`` (never raises) when disabled or the frame is missing —
+        the caller then keeps its existing conservative behavior.
+        """
+        if not self._technical_enabled or self._technical_engine is None or frame is None:
+            return None
+        try:
+            from app.technical.feature_builder import technical_feature_set_from_live_frame
+
+            features = technical_feature_set_from_live_frame(frame, symbol)
+            return self._technical_engine.predict(features, model_prediction=model_prediction)
+        except Exception:  # noqa: BLE001 - advisory only; never break the decision path.
+            return None
 
     def evaluate_buy(
         self,
@@ -369,6 +399,7 @@ class SharedLiveDecisionEngine:
             prediction = self.predictor.predict(frame)
         except Exception as exc:  # noqa: BLE001 - model failure can fall back to ontology and rules.
             prediction_error = exc
+        technical_prediction = self._technical_prediction(frame, symbol, model_prediction=prediction)
 
         tick = self.store.latest_tick(symbol)
         market_name = _resolve_order_market(symbol, account)
@@ -733,6 +764,21 @@ class SharedLiveDecisionEngine:
         else:
             fallback_edge_bps_per_score = _env_float("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", 120.0)
             expected_return_bps = max(0.0, fallback_score) * fallback_edge_bps_per_score
+        # --- Technical prediction (preferred, conservative) ---------------------
+        # When the advisory technical layer yields a tradable BUY, prefer its
+        # cost-aware net edge for the gate's expected exit price. It has NO
+        # fabricated floor, so we never inflate: when the model edge is also
+        # positive we take the more conservative (lower) of the two; the gate and
+        # RiskManager still judge it. A blocked/NO_TRADE technical prediction only
+        # surfaces reason codes — it does not itself veto (gates stay authoritative).
+        technical_methodology = None
+        technical_regime = None
+        if technical_prediction is not None:
+            technical_regime = technical_prediction.regime
+            if technical_prediction.tradable and float(technical_prediction.expected_net_return_bps or 0.0) > 0.0:
+                tech_bps = float(technical_prediction.expected_net_return_bps)
+                expected_return_bps = min(expected_return_bps, tech_bps) if expected_return_bps > 0 else tech_bps
+                technical_methodology = technical_prediction.methodology
         gross_expected_return = max(0.0, expected_return_bps / 10_000.0)
         expected_exit_price = price * (1.0 + gross_expected_return)
 
@@ -778,6 +824,9 @@ class SharedLiveDecisionEngine:
                 "profitability_decision": profitability_decision.as_dict(),
                 "model_provider": model_provider,
                 "model_is_fallback": model_is_fallback,
+                "technical_prediction": technical_prediction.as_dict() if technical_prediction is not None else None,
+                "technical_methodology": technical_methodology,
+                "technical_regime": technical_regime,
             }
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
@@ -893,6 +942,9 @@ class SharedLiveDecisionEngine:
             "adaptive_risk_rules": adaptive_rules,
             "risk_metadata": risk.metadata,
             "profitability_decision": profitability_decision.as_dict(),
+            "technical_prediction": technical_prediction.as_dict() if technical_prediction is not None else None,
+            "technical_methodology": technical_methodology,
+            "technical_regime": technical_regime,
         }
         self.auto_tuner.record_feedback(
             {
