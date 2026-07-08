@@ -82,5 +82,40 @@ class TestStoreAdapter:
                     raise RuntimeError("db error")
                 return [SimpleNamespace(price=100 + i, volume=10, exchange_timestamp=_now()) for i in range(30)]
 
+            def recent_orderbooks(self, symbol, since):
+                return ()
+
         f = macro_feature_frame_from_store(_Store(), ["GOOD", "BAD"], now=_now())
         assert "GOOD" in f.per_symbol_return and "BAD" not in f.per_symbol_return
+
+    def test_orderbook_fallback_for_us_style_symbol(self):
+        # US symbol: no ticks, but REST-polled orderbooks -> mid-price series.
+        class _Store:
+            def recent_ticks(self, symbol, since):
+                return ()  # no tick stream (US)
+
+            def recent_orderbooks(self, symbol, since):
+                return [
+                    SimpleNamespace(best_bid=100 + i, best_ask=100.2 + i,
+                                    total_bid_volume=50, total_ask_volume=50)
+                    for i in range(30)
+                ]
+
+        f = macro_feature_frame_from_store(_Store(), ["FLY"], now=_now())
+        assert "FLY" in f.per_symbol_return  # US contributed via orderbook mids
+        assert f.index_trend is not None and f.index_trend > 0
+
+    def test_either_market_alone_is_enough(self):
+        # Only US (orderbooks) present, KR absent -> frame still populated.
+        class _Store:
+            def recent_ticks(self, symbol, since):
+                return ()
+
+            def recent_orderbooks(self, symbol, since):
+                if symbol == "US1":
+                    return [SimpleNamespace(best_bid=10 + i, best_ask=10.1 + i,
+                                            total_bid_volume=10, total_ask_volume=10) for i in range(30)]
+                return ()
+
+        f = macro_feature_frame_from_store(_Store(), ["KR1", "US1"], now=_now())
+        assert f.symbol_count == 1 and "US1" in f.per_symbol_return

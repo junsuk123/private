@@ -129,6 +129,37 @@ def build_macro_feature_frame(
     )
 
 
+def _series_from_store(store: Any, symbol: str, since: datetime) -> tuple[list[float], list[float]]:
+    """Best-available realtime price/volume series for a symbol, market-agnostic.
+
+    Prefers trade ticks (KR websocket); falls back to orderbook mid-prices
+    (used by REST-polled US quotes and any market without a tick stream) — the
+    same fallback the live feature frame uses. Either market's live data counts.
+    """
+    try:
+        ticks = store.recent_ticks(symbol, since)
+    except Exception:  # noqa: BLE001
+        ticks = ()
+    prices = [float(t.price) for t in ticks if getattr(t, "price", 0) and float(t.price) > 0]
+    if prices:
+        volumes = [float(max(0, getattr(t, "volume", 0) or 0)) for t in ticks if getattr(t, "price", 0) and float(t.price) > 0]
+        return prices, volumes
+    # Fallback: orderbook mid-price series (US REST-polled quotes, etc.).
+    try:
+        books = store.recent_orderbooks(symbol, since)
+    except Exception:  # noqa: BLE001
+        books = ()
+    mids: list[float] = []
+    vols: list[float] = []
+    for b in books:
+        bid = float(getattr(b, "best_bid", 0.0) or 0.0)
+        ask = float(getattr(b, "best_ask", 0.0) or 0.0)
+        if bid > 0 and ask > 0:
+            mids.append((bid + ask) / 2.0)
+            vols.append(float((getattr(b, "total_bid_volume", 0.0) or 0.0) + (getattr(b, "total_ask_volume", 0.0) or 0.0)))
+    return mids, vols
+
+
 def macro_feature_frame_from_store(
     store: Any,
     symbols: Sequence[str],
@@ -137,24 +168,22 @@ def macro_feature_frame_from_store(
     lookback_minutes: int = 10,
     sector_of: Mapping[str, str] | None = None,
 ) -> MacroFeatureFrame:
-    """Build a macro frame from ``RealtimeMarketDataStore`` recent ticks.
+    """Build a macro frame from realtime data for EITHER market.
 
-    Best-effort: symbols with no recent ticks are simply omitted. Off-hours with
-    no ticks yields an all-``None`` frame (conservative macro fallback).
+    Uses the best-available series per symbol (ticks, else orderbook mids), so
+    KR (websocket ticks) and US (REST-polled quotes/orderbooks) both contribute.
+    Symbols with no realtime data are omitted; if none have data the frame is
+    all-``None`` (conservative macro fallback). Best-effort and error-isolated.
     """
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(minutes=max(1, lookback_minutes))
     closes: dict[str, list[float]] = {}
     volumes: dict[str, list[float]] = {}
     for symbol in dict.fromkeys(str(s) for s in symbols if str(s)):
-        try:
-            ticks = store.recent_ticks(symbol, since)
-        except Exception:  # noqa: BLE001 - one symbol must not break the frame.
-            continue
-        prices = [float(t.price) for t in ticks if getattr(t, "price", 0) and float(t.price) > 0]
+        prices, vols = _series_from_store(store, symbol, since)
         if prices:
             closes[symbol] = prices
-            volumes[symbol] = [float(max(0, getattr(t, "volume", 0) or 0)) for t in ticks]
+            volumes[symbol] = vols
     return build_macro_feature_frame(
         closes, timestamp=now, volumes_by_symbol=volumes, sector_of=sector_of,
     )
