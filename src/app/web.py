@@ -4896,6 +4896,7 @@ def _build_macro_micro_observer(decision_engine):
     from app.graph.micro_reasoner import MicroSymbolReasoner, MicroReasoningInput
     from app.graph.ontology_coordinator import OntologyCoordinator
     from app.technical.feature_builder import technical_feature_set_from_live_frame
+    from app.features.macro_feature_frame import macro_feature_frame_from_store
 
     policy = load_macro_micro_policy()
   except Exception:  # noqa: BLE001 - advisory layer optional; never break engine build.
@@ -4916,15 +4917,30 @@ def _build_macro_micro_observer(decision_engine):
     if now - last_run[0] < interval:
       return  # throttle to the macro cadence; do not slow the ~1s trade loop
     last_run[0] = now
+    holdings_by_symbol = {str(getattr(h, "ticker", "")): h for h in (getattr(account, "holdings", ()) or ())}
+    # Real market context aggregated across the tracked universe (no index feed
+    # needed). Off-hours / no ticks -> None fields -> conservative macro regime.
+    sector_of = {
+        s: str(getattr(h, "sector", "") or "")
+        for s, h in holdings_by_symbol.items()
+        if getattr(h, "sector", None)
+    }
+    universe = tuple(dict.fromkeys((*candidates, *holdings_by_symbol.keys())))
+    macro_kwargs: dict = {}
+    try:
+        store = getattr(decision_engine, "store", None)
+        if store is not None:
+            frame = macro_feature_frame_from_store(store, universe, now=decision_time, sector_of=sector_of)
+            macro_kwargs = frame.as_macro_kwargs()
+    except Exception:  # noqa: BLE001 - macro features are best-effort.
+        macro_kwargs = {}
     macro_input = MacroReasoningInput(
         timestamp=decision_time,
         market="KR",
         candidate_universe=tuple(candidates),
-        market_breadth=0.55,
-        market_volatility=0.005,
-        index_snapshots={},  # no dedicated index feed yet -> conservative regime
+        provenance={"sector_of": sector_of},
+        **macro_kwargs,
     )
-    holdings_by_symbol = {str(getattr(h, "ticker", "")): h for h in (getattr(account, "holdings", ()) or ())}
 
     def _builder(symbol, macro_result):
       features = None
