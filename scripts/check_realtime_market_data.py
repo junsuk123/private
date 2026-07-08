@@ -9,7 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.data.kis_realtime import QueueMessageSource, KisRealtimeSubscriptionManager
+from app.data.kis_realtime import (
+    KisRealtimeSubscriptionManager,
+    QueueMessageSource,
+    run_kis_realtime_websocket_collector,
+)
 from app.data.market_data_health import evaluate_market_data_health
 from app.data.realtime_store import RealtimeMarketDataStore
 
@@ -25,6 +29,7 @@ def main() -> int:
     symbols = _symbols(args.symbols)
     store = RealtimeMarketDataStore(args.db_path)
     counts = {"messages": 0, "ticks": 0, "orderbooks": 0}
+    collector_error = None
     if args.fixture is not None:
         messages = tuple(line.strip() for line in args.fixture.read_text(encoding="utf-8").splitlines() if line.strip())
         manager = KisRealtimeSubscriptionManager(store, QueueMessageSource(messages))
@@ -33,7 +38,17 @@ def main() -> int:
     elif args.duration_seconds <= 0:
         print("No fixture supplied and duration is zero; running store freshness check only.")
     else:
-        print("Live KIS WebSocket transport is not configured in this local script yet; no orders submitted.")
+        print(f"Collecting KIS domestic realtime data for {args.duration_seconds}s; no orders submitted.")
+        try:
+            counts = asyncio.run(
+                run_kis_realtime_websocket_collector(
+                    symbols=symbols,
+                    store=store,
+                    max_runtime_seconds=float(args.duration_seconds),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics should still report stored freshness.
+            collector_error = f"{exc.__class__.__name__}: {exc}"
 
     health = [
         evaluate_market_data_health(store, symbol, now=datetime.now(timezone.utc))
@@ -43,6 +58,7 @@ def main() -> int:
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "symbols": symbols,
         "counts": counts,
+        "collector_error": collector_error,
         "health": [
             {
                 "symbol": item.symbol,
@@ -56,7 +72,7 @@ def main() -> int:
         "no_orders": True,
     }
     print(json.dumps(report, indent=2, default=str))
-    return 0 if all(item.ok_for_live_buy for item in health) else 1
+    return 0 if collector_error is None and all(item.ok_for_live_buy for item in health) else 1
 
 
 def _symbols(raw: list[str]) -> list[str]:
