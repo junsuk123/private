@@ -1,0 +1,46 @@
+# Hierarchical macro–micro ontology reasoning policy.
+# Advisory tuning only. Nothing here relaxes TradingCostEngine /
+# ProfitabilityGate / RiskManager. Environment variables of the same name
+# override these; effective values are logged at load. Invalid values fall back
+# to conservative defaults and are recorded in diagnostics.
+enabled: true
+
+macro:
+  enabled: true
+  loop_interval_seconds: 60          # macro regime changes slower than tick timing
+  candidate_limit: 30
+  minimum_macro_confidence: 0.5
+  block_buy_on_high_volatility: true
+  block_buy_on_news_shock: true
+  block_buy_on_low_liquidity_market: true
+
+micro:
+  enabled: true
+  loop_interval_seconds: 5           # faster than macro; bounded by CPU/NPU + API load
+  max_parallel_symbols: 20
+  worker_timeout_seconds: 3
+  minimum_micro_confidence: 0.55
+  minimum_expected_net_return_bps: 0
+  block_if_spread_consumes_alpha: true
+  block_if_stale_quote: true
+  block_if_low_liquidity: true
+
+strategy_permissions:
+  TREND_UP:
+    allow: [momentum, breakout, vwap_pullback]
+    block: [aggressive_countertrend_reversion]
+  TREND_DOWN:
+    allow: [sell, reduce_risk, defensive_hold]
+    block: [weak_breakout_buy, low_volume_momentum_buy]
+  RANGE_BOUND:
+    allow: [mean_reversion, vwap_reversion]
+    block: [late_breakout_chasing]
+  HIGH_VOLATILITY_RISK:
+    allow: [sell, reduce_risk, hold]
+    block: [new_buy]
+
+diagnostics:
+  persist_macro_micro_snapshots: true
+  expose_dashboard_payload: true
+  log_reason_codes: true
+  mask_sensitive_fields: true
