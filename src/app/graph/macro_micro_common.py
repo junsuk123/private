@@ -1,0 +1,123 @@
+"""Shared vocabulary for the hierarchical macro–micro ontology reasoning layer.
+
+Enums and reason-code constants used by MacroMarketReasoner, MicroSymbolReasoner,
+OntologyCoordinator, and GlobalTradeArbiter. Everything here is advisory — no
+symbol in this package constructs or submits a broker order. The authoritative
+gates (TradingCostEngine, ProfitabilityGate, PrincipalProtectionEngine,
+RiskManager) and the sole submission path (LiveExecutionCoordinator) are
+untouched.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class MarketRegime(str, Enum):
+    TREND_UP = "TREND_UP"
+    TREND_DOWN = "TREND_DOWN"
+    RANGE_BOUND = "RANGE_BOUND"
+    BREAKOUT_MARKET = "BREAKOUT_MARKET"
+    HIGH_VOLATILITY_RISK = "HIGH_VOLATILITY_RISK"
+    LOW_LIQUIDITY_MARKET = "LOW_LIQUIDITY_MARKET"
+    NEWS_SHOCK = "NEWS_SHOCK"
+    NO_TRADE_MARKET = "NO_TRADE_MARKET"
+
+
+class MacroRiskLevel(str, Enum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    ELEVATED = "ELEVATED"
+    HIGH = "HIGH"
+    BLOCK_BUY = "BLOCK_BUY"
+
+
+class MicroRegime(str, Enum):
+    MOMENTUM_CANDIDATE = "MOMENTUM_CANDIDATE"
+    BREAKOUT_CANDIDATE = "BREAKOUT_CANDIDATE"
+    MEAN_REVERSION_CANDIDATE = "MEAN_REVERSION_CANDIDATE"
+    VWAP_REVERSION_CANDIDATE = "VWAP_REVERSION_CANDIDATE"
+    EXIT_DETERIORATION = "EXIT_DETERIORATION"
+    HOLD_OR_WATCH = "HOLD_OR_WATCH"
+    NO_TRADE_SYMBOL = "NO_TRADE_SYMBOL"
+
+
+class SelectedStrategy(str, Enum):
+    MOMENTUM = "momentum"
+    BREAKOUT = "breakout"
+    MEAN_REVERSION = "mean_reversion"
+    VWAP_REVERSION = "vwap_reversion"
+    REDUCE_RISK = "reduce_risk"
+    SELL = "sell"
+    HOLD = "hold"
+
+
+class EntrySignal(str, Enum):
+    NONE = "NONE"
+    WAIT_CONFIRMATION = "WAIT_CONFIRMATION"
+    BUY_CANDIDATE = "BUY_CANDIDATE"
+    BLOCKED = "BLOCKED"
+
+
+class ExitSignal(str, Enum):
+    NONE = "NONE"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    TRAILING_STOP = "TRAILING_STOP"
+    RISK_REDUCE = "RISK_REDUCE"
+    SELL_CANDIDATE = "SELL_CANDIDATE"
+
+
+class ExecutionQuality(str, Enum):
+    GOOD = "GOOD"
+    ACCEPTABLE = "ACCEPTABLE"
+    WEAK = "WEAK"
+    BLOCKED = "BLOCKED"
+
+
+class IntentType(str, Enum):
+    SELL = "SELL"
+    REDUCE = "REDUCE"
+    BUY = "BUY"
+
+
+# --- Advisory reason codes (diagnostic; NOT authorization outcomes) --------- #
+# Blocked reasons (mirror orchestration_requirements.ranking_policy.blocked_reasons).
+MACRO_BLOCK_BUY = "MACRO_BLOCK_BUY"
+MICRO_STRATEGY_BLOCKED_BY_MACRO = "MICRO_STRATEGY_BLOCKED_BY_MACRO"
+EXPECTED_NET_RETURN_NON_POSITIVE = "EXPECTED_NET_RETURN_NON_POSITIVE"
+SPREAD_CONSUMES_ALPHA = "SPREAD_CONSUMES_ALPHA"
+LOW_LIQUIDITY = "LOW_LIQUIDITY"
+HIGH_VOLATILITY = "HIGH_VOLATILITY"
+STALE_QUOTE = "STALE_QUOTE"
+INSUFFICIENT_CASH = "INSUFFICIENT_CASH"
+RISK_MANAGER_REJECTED = "RISK_MANAGER_REJECTED"
+PROFITABILITY_GATE_REJECTED = "PROFITABILITY_GATE_REJECTED"
+FINAL_TRADE_GATE_REJECTED = "FINAL_TRADE_GATE_REJECTED"
+
+# Macro reason codes.
+MACRO_TREND_UP = "MACRO_TREND_UP"
+MACRO_TREND_DOWN = "MACRO_TREND_DOWN"
+MACRO_RANGE_BOUND = "MACRO_RANGE_BOUND"
+MACRO_HIGH_VOLATILITY = "MACRO_HIGH_VOLATILITY"
+MACRO_LOW_LIQUIDITY = "MACRO_LOW_LIQUIDITY"
+MACRO_NEWS_SHOCK = "MACRO_NEWS_SHOCK"
+MACRO_INSUFFICIENT_DATA = "MACRO_INSUFFICIENT_DATA"
+MACRO_CANDIDATE_SELECTED = "MACRO_CANDIDATE_SELECTED"
+MACRO_SECTOR_STRONG = "MACRO_SECTOR_STRONG"
+MACRO_SECTOR_WEAK = "MACRO_SECTOR_WEAK"
+
+# Micro reason codes.
+MICRO_MOMENTUM_CONFIRMED = "MICRO_MOMENTUM_CONFIRMED"
+MICRO_BREAKOUT_CONFIRMED = "MICRO_BREAKOUT_CONFIRMED"
+MICRO_MEAN_REVERSION_CANDIDATE = "MICRO_MEAN_REVERSION_CANDIDATE"
+MICRO_VWAP_BREAKDOWN = "MICRO_VWAP_BREAKDOWN"
+MICRO_EXIT_DETERIORATION = "MICRO_EXIT_DETERIORATION"
+MICRO_VOLUME_UNCONFIRMED = "MICRO_VOLUME_UNCONFIRMED"
+MICRO_CONFIDENCE_TOO_LOW = "MICRO_CONFIDENCE_TOO_LOW"
+MICRO_SIGNAL_UNAVAILABLE = "MICRO_SIGNAL_UNAVAILABLE"
+MICRO_EXPECTED_NET_RETURN_MISSING = "MICRO_EXPECTED_NET_RETURN_MISSING"
+
+
+def explanation(code: str, text: str, features: dict | None = None) -> dict:
+    """Build one explanation path element (human ``text`` + machine ``code``/features)."""
+    return {"code": code, "text": text, "features": dict(features or {})}
