@@ -38,6 +38,15 @@ prediction:
   min_confidence: 0.5
   min_net_return_bps: 0.0
   spread_alpha_max_ratio: 0.5
+  # Additive per-horizon net-edge buffer (bps). Shorter horizons can demand a
+  # larger edge to clear microstructure noise. Empty/0 keeps the base behavior.
+  # The ProfitabilityGate remains the authoritative net check regardless.
+  horizon_edge_buffer_bps:
+    5: 0.0
+    15: 0.0
+    30: 0.0
+    60: 0.0
+    300: 0.0
 
 diagnostics:
   log_each_decision: true

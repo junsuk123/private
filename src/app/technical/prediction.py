@@ -134,6 +134,10 @@ class ExpectedMoveEstimator:
 class PredictionConfig:
     min_confidence: float = 0.5
     min_net_return_bps: float = 0.0       # net must be > 0; the gate applies the real buffer
+    # Additive per-horizon net-edge buffer (bps): a shorter horizon can demand a
+    # larger edge to overcome noise. Keyed by horizon seconds; default empty ->
+    # no extra buffer. The authoritative net check is still the ProfitabilityGate.
+    horizon_edge_buffer_bps: Mapping[int, float] = field(default_factory=dict)
     model_disagreement_penalty: float = 0.5
     model_confidence_weight: float = 0.4  # blend weight of model probability
     # Warning-only threshold (not a hard block): flags setups whose adverse-
@@ -226,7 +230,10 @@ class TechnicalPredictionEngine:
                                   f"Confidence {confidence:.2f} below minimum.",
                                   exit_price=exit_price, gross_return=gross_return,
                                   net_bps=net_bps, downside_bps=downside_bps, confidence=confidence)
-        if net_bps <= self.config.min_net_return_bps:
+        required_net_bps = self.config.min_net_return_bps + float(
+            self.config.horizon_edge_buffer_bps.get(composite.expected_horizon_seconds, 0.0)
+        )
+        if net_bps <= required_net_bps:
             reason_codes.append(rc.TECHNICAL_EDGE_NON_POSITIVE)
             return self._no_trade(features, composite, reason_codes,
                                   "Expected net return not positive after cost.",

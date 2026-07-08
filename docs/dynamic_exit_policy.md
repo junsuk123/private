@@ -64,3 +64,21 @@ evidence is strong and hold through noise otherwise.
 
 The resolved levels are attached to each exit decision's `strategy_metadata`
 (`resolved_exit_policy`) for the GUI and audit logs.
+
+## Technical deterioration evidence (evidence-based technical layer)
+
+`evaluate_exit_for_holding` consults the advisory technical layer for
+**deterioration evidence** on the held position via
+`CompositeTechnicalSignalEngine.evaluate_exit_deterioration`:
+
+- Deterioration signals — VWAP breakdown, momentum loss (negative MACD
+  histogram), volatility expansion, high false-breakout risk, liquidity
+  deterioration — are surfaced as reason codes
+  (`TECHNICAL_EXIT_DETERIORATION`, `VWAP_BREAKDOWN`, `MOMENTUM_WEAKENED`, …) and
+  recorded in the exit diagnostics (`technical_exit_deterioration`).
+- Strong deterioration applies a **bounded penalty** (≤ 0.5) to the effective
+  ontology score, which can bring a **profitable** position into the existing
+  `invalid_signal_exit` branch sooner (realize profit as the setup breaks down).
+- It **never forces a loss exit**: the hard-stop and emergency-stop circuit
+  breakers, and the `REALTIME_ALLOW_LOSS_EXIT` gate, are unchanged and remain the
+  sole authorities for exiting below break-even.

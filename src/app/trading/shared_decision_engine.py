@@ -365,6 +365,27 @@ class SharedLiveDecisionEngine:
         # trailing lock so realized gains are not given back on a stall.
         self._peak_net_pnl: dict[str, float] = {}
 
+    def _technical_exit_deterioration(self, frame, symbol) -> tuple[tuple[str, ...], float]:
+        """Advisory technical deterioration codes + a bounded ontology penalty.
+
+        Best-effort (never raises). Returns ``((), 0.0)`` when disabled or the
+        frame is missing. The penalty is capped so it can tip a *profitable*
+        position into an earlier exit but cannot by itself force a loss exit.
+        """
+        if not self._technical_enabled or self._technical_engine is None or frame is None:
+            return (), 0.0
+        try:
+            from app.technical.feature_builder import technical_feature_set_from_live_frame
+
+            features = technical_feature_set_from_live_frame(frame, symbol)
+            codes = self._technical_engine.signal_engine.evaluate_exit_deterioration(features)
+            if not codes:
+                return (), 0.0
+            penalty = min(0.5, 0.15 * len(codes))
+            return codes, penalty
+        except Exception:  # noqa: BLE001 - advisory only.
+            return (), 0.0
+
     def _technical_prediction(self, frame, symbol, *, model_prediction=None):
         """Best-effort advisory technical prediction from the live frame.
 
@@ -1033,6 +1054,23 @@ class SharedLiveDecisionEngine:
             except Exception:  # noqa: BLE001 - ontology is an enhancer; never block exits on it.
                 ontology_score = 0.0
 
+        # Advisory technical deterioration evidence (Phase 8). Strong deterioration
+        # (VWAP breakdown, momentum loss, volatility expansion, false-breakout,
+        # liquidity drop) lowers the effective ontology score so a *profitable*
+        # position can be exited earlier via the existing invalid-signal branch.
+        # It NEVER forces a loss exit — hard/emergency stops remain the sole
+        # circuit breakers, and the loss-exit gate is unchanged.
+        technical_exit_codes: tuple[str, ...] = ()
+        technical_exit_penalty = 0.0
+        exit_frame = None
+        try:
+            exit_frame = self.feature_builder.build(symbol, decision_time=decision_time)
+        except Exception:  # noqa: BLE001 - frame is best-effort for advisory deterioration.
+            exit_frame = None
+        technical_exit_codes, technical_exit_penalty = self._technical_exit_deterioration(exit_frame, symbol)
+        if technical_exit_codes:
+            ontology_score -= technical_exit_penalty
+
         target_net_return = max(0.0, float(os.getenv("REALTIME_EXIT_TARGET_NET_RETURN", "0.0003")))
         volume_ratio = self._realtime_volume_surge_ratio(symbol, decision_time)
         market = self._exit_market_snapshot(holding, price, observed_at, received_at)
@@ -1272,10 +1310,11 @@ class SharedLiveDecisionEngine:
                 exit_reason = None
 
         if exit_reason is None:
-            diagnostics = {"exit_policy": exit_policy.as_dict(), "policy": policy.as_dict(), "policy_state": policy_diag, "quote_age_seconds": round(quote_age_seconds, 3), "ontology_score": round(ontology_score, 4)}
+            diagnostics = {"exit_policy": exit_policy.as_dict(), "policy": policy.as_dict(), "policy_state": policy_diag, "quote_age_seconds": round(quote_age_seconds, 3), "ontology_score": round(ontology_score, 4), "technical_exit_deterioration": list(technical_exit_codes)}
             reasons = (
                 "HOLD_RECHECK",
                 "HOLD_BELOW_PROFIT_TARGET",
+                *technical_exit_codes,
                 f"QUOTE_REFRESH:{'quote_refresh_ok' if quote_age_seconds <= exit_policy.time_exit_seconds else 'quote_refresh_not_needed'}",
             )
             self._last_diagnostics = diagnostics
@@ -1400,6 +1439,7 @@ class SharedLiveDecisionEngine:
             "adaptive_risk_rules": adaptive_rules,
             "risk_metadata": risk.metadata,
             "exit_reason": exit_reason,
+            "technical_exit_deterioration": list(technical_exit_codes),
         }
         self.auto_tuner.record_feedback(
             {

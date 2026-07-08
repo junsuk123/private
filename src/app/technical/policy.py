@@ -91,9 +91,13 @@ def load_technical_policy(path: str | Path | None = None) -> TechnicalPolicy:
     )
 
     prediction_env = PredictionConfig.from_env()
+    horizon_buffers = {
+        int(k): float(v) for k, v in (pred_yaml.get("horizon_edge_buffer_bps") or {}).items()
+    }
     prediction = PredictionConfig(
         min_confidence=float(pred_yaml.get("min_confidence", prediction_env.min_confidence)),
         min_net_return_bps=float(pred_yaml.get("min_net_return_bps", prediction_env.min_net_return_bps)),
+        horizon_edge_buffer_bps=horizon_buffers,
     )
 
     diagnostics = raw.get("diagnostics") or {}

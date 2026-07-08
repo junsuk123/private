@@ -97,3 +97,25 @@ US floor `0.012`, `max_spread_rate 0.003`, `max_cost_to_alpha_ratio 0.5`,
   order. Rejections short-circuit with the reason codes above.
 - **Candidate factory** (`strategy/candidate_factory.py`): replaces its bespoke checks
   with the same gate.
+
+## Technical prediction integration (evidence-based technical layer)
+
+The `SharedLiveDecisionEngine` now feeds the gate a **conservative technical
+expected exit price** when the advisory technical layer
+(`src/app/technical/`) yields a tradable BUY:
+
+- The engine maps the already-built `LiveFeatureFrame` to a `TechnicalFeatureSet`
+  and runs `TechnicalPredictionEngine`, which fuses the composite technical
+  signal, the optional trained-model prediction, a VWAP target, realized
+  volatility, and a cost estimate into `expected_exit_price` / `expected_net_return_bps`.
+- The gate's expected exit price **prefers** the technical net edge but is never
+  inflated above the honest model estimate (`min` rule). There is **no fabricated
+  alpha floor**.
+- The gate remains **authoritative**: a positive technical signal cannot approve
+  a buy whose net return after all costs is below the dynamic minimum edge.
+- Diagnostics logged on every buy decision (success and rejection):
+  `technical_prediction` (full dict), `technical_methodology`, `technical_regime`,
+  plus the existing `profitability_decision` (spread_alpha, cost_to_alpha, reasons).
+- `config/technical_prediction_policy.yaml` adds per-methodology minimum
+  confidence and per-horizon net-edge buffers; env vars override, and effective
+  values are logged at load. Thresholds are never relaxed automatically.
