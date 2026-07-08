@@ -324,6 +324,13 @@ class SharedDecisionResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+def _with_advisory(result: SharedDecisionResult, advisory: dict[str, Any]) -> SharedDecisionResult:
+    """Attach macro/micro advisory context to a result's diagnostics (non-authoritative)."""
+    merged = dict(result.diagnostics or {})
+    merged["macro_micro"] = advisory
+    return replace(result, diagnostics=merged)
+
+
 class SharedLiveDecisionEngine:
     def __init__(
         self,
@@ -1461,6 +1468,68 @@ class SharedLiveDecisionEngine:
             reason_codes=risk.rejection_reasons or (exit_reason,),
             diagnostics=diagnostics,
         )
+
+    def consume_bundle(
+        self,
+        bundle: Any,
+        account: AccountSnapshot,
+        *,
+        ontology_graph: Any | None = None,
+        decision_time: datetime | None = None,
+    ) -> list[SharedDecisionResult]:
+        """Adapter: drive decisions from a MacroMicroReasoningBundle (advisory).
+
+        Preserves the SELL/REDUCE-first-then-BUY order (the bundle's ranked
+        intents are already ordered that way) and the authoritative gate flow:
+        SELL/REDUCE route through ``evaluate_exit_for_holding`` and BUY through
+        ``evaluate_buy`` — both unchanged, so TradingCostEngine / ProfitabilityGate
+        / RiskManager stay authoritative and LiveExecutionCoordinator remains the
+        only submission path. Macro BLOCK_BUY short-circuits a BUY to a rejected
+        result BEFORE any gate/broker call (it can only prevent, never authorize).
+        The macro/micro context is attached as advisory diagnostics only.
+        """
+        decision_time = decision_time or datetime.now(timezone.utc)
+        macro = getattr(bundle, "macro_result", None)
+        macro_blocks_buy = bool(getattr(macro, "blocks_buy", False))
+        macro_dict = macro.as_dict() if macro is not None and hasattr(macro, "as_dict") else {}
+        holdings_by_symbol = {
+            str(getattr(h, "ticker", "")): h for h in (getattr(account, "holdings", ()) or ())
+        }
+        results: list[SharedDecisionResult] = []
+        for intent in getattr(bundle, "ranked_trade_intents", ()) or ():
+            side = getattr(intent, "side", "")
+            symbol = getattr(intent, "symbol", "")
+            advisory = {
+                "macro_regime": getattr(intent, "macro_regime", None),
+                "micro_regime": getattr(intent, "micro_regime", None),
+                "selected_strategy": getattr(intent, "selected_strategy", None),
+                "advisory_expected_net_return_bps": getattr(intent, "expected_net_return_bps", None),
+                "advisory_rank": getattr(intent, "rank", None),
+                "macro_blocks_buy": macro_blocks_buy,
+            }
+            if side in ("SELL", "REDUCE"):
+                holding = holdings_by_symbol.get(symbol)
+                if holding is None:
+                    continue  # cannot exit a position we do not hold
+                result = self.evaluate_exit_for_holding(
+                    holding, account, ontology_graph=ontology_graph, decision_time=decision_time
+                )
+                result = _with_advisory(result, advisory)
+                results.append(result)
+            elif side == "BUY":
+                if macro_blocks_buy:
+                    # Reject BEFORE any gate/broker call — advisory macro block can
+                    # only prevent a buy, never authorize one.
+                    diag = {"macro_micro": advisory, "macro_result": macro_dict}
+                    self._last_diagnostics = diag
+                    results.append(SharedDecisionResult(
+                        symbol=symbol, approved=False, final_order=None, prediction=None,
+                        reason_codes=("MACRO_BLOCK_BUY",), diagnostics=diag,
+                    ))
+                    continue
+                result = self.evaluate_buy(symbol, account, ontology_graph=ontology_graph, decision_time=decision_time)
+                results.append(_with_advisory(result, advisory))
+        return results
 
     def _exit_cost_floor(self, holding: Holding, expected_exit_price: float, target_net_return: float):
         symbol = str(getattr(holding, "ticker", "") or "")
