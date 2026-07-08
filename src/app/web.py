@@ -4865,6 +4865,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       market_refresher=_refresh_market_snapshot,
   )
   coordinator = LiveExecutionCoordinator(broker_client)
+  macro_micro_observer = _build_macro_micro_observer(decision_engine)
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
       coordinator=coordinator,
@@ -4874,7 +4875,80 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       ontology_graph_provider=_latest_ontology_graph,
       market_open_provider=_is_open_live_market_ticker,
       cycle_observer=_record_realtime_trading_cycle,
+      macro_micro_observer=macro_micro_observer,
   )
+
+
+def _build_macro_micro_observer(decision_engine):
+  """Advisory per-cycle macro/micro ontology reasoning for the GUI panel.
+
+  Throttled to the macro loop interval. Best-effort and read-only: it builds a
+  MacroMicroReasoningBundle and records it to macro_micro_feed for the dashboard.
+  It NEVER submits or gates an order — the authoritative gates are untouched.
+  Returns ``None`` (disabling the hook) if the layer is disabled or unavailable.
+  """
+  import time as _time
+
+  try:
+    from app.graph import macro_micro_feed
+    from app.graph.macro_micro_config import load_macro_micro_policy
+    from app.graph.macro_reasoner import MacroMarketReasoner, MacroReasoningInput
+    from app.graph.micro_reasoner import MicroSymbolReasoner, MicroReasoningInput
+    from app.graph.ontology_coordinator import OntologyCoordinator
+    from app.technical.feature_builder import technical_feature_set_from_live_frame
+
+    policy = load_macro_micro_policy()
+  except Exception:  # noqa: BLE001 - advisory layer optional; never break engine build.
+    return None
+  if not policy.enabled:
+    return None
+
+  coordinator = OntologyCoordinator(
+      macro_reasoner=MacroMarketReasoner(policy.macro_config),
+      micro_reasoner=MicroSymbolReasoner(policy.micro_config),
+      config=policy.coordinator_config,
+  )
+  interval = max(1, int(policy.macro_loop_interval_seconds))
+  last_run = [0.0]
+
+  def _observer(account, held_symbols, candidates, decision_time):
+    now = _time.monotonic()
+    if now - last_run[0] < interval:
+      return  # throttle to the macro cadence; do not slow the ~1s trade loop
+    last_run[0] = now
+    macro_input = MacroReasoningInput(
+        timestamp=decision_time,
+        market="KR",
+        candidate_universe=tuple(candidates),
+        market_breadth=0.55,
+        market_volatility=0.005,
+        index_snapshots={},  # no dedicated index feed yet -> conservative regime
+    )
+    holdings_by_symbol = {str(getattr(h, "ticker", "")): h for h in (getattr(account, "holdings", ()) or ())}
+
+    def _builder(symbol, macro_result):
+      features = None
+      try:
+        frame = decision_engine.feature_builder.build(symbol, decision_time=decision_time)
+        features = technical_feature_set_from_live_frame(frame, symbol)
+      except Exception:  # noqa: BLE001 - off-hours / missing data -> NO_TRADE micro result.
+        features = None
+      h = holdings_by_symbol.get(symbol)
+      holding_state = None
+      if h is not None:
+        holding_state = {"quantity": int(getattr(h, "quantity", 0) or 0),
+                         "average_price": float(getattr(h, "average_price", 0.0) or 0.0)}
+      return MicroReasoningInput(
+          timestamp=decision_time, symbol=symbol,
+          allowed_micro_strategies=macro_result.allowed_micro_strategies,
+          blocked_micro_strategies=macro_result.blocked_micro_strategies,
+          technical_features=features, holding_state=holding_state,
+      )
+
+    bundle = coordinator.run(macro_input, micro_input_builder=_builder, held_symbols=held_symbols)
+    macro_micro_feed.record_bundle(bundle.as_dict())
+
+  return _observer
 
 
 def _record_realtime_trading_cycle(summary: dict[str, Any]) -> None:

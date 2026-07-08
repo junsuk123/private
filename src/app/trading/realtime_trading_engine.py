@@ -137,6 +137,7 @@ class RealtimeTradingEngine:
         ontology_graph_provider: Callable[[], Any] | None = None,
         market_open_provider: Callable[[str, str], bool] | None = None,
         cycle_observer: Callable[[dict[str, Any]], None] | None = None,
+        macro_micro_observer: Callable[[AccountSnapshot, tuple[str, ...], tuple[str, ...], datetime], None] | None = None,
         config: RealtimeTradingConfig | None = None,
         recent_events_max: int = 50,
     ) -> None:
@@ -149,6 +150,9 @@ class RealtimeTradingEngine:
         # 종목별 시장 세션 게이트: 해당 종목의 거래소가 지금 열려 있는지(닫혀 있으면 주문 보류).
         self.market_open_provider = market_open_provider
         self.cycle_observer = cycle_observer
+        # Advisory-only per-cycle hook: runs macro/micro ontology reasoning and
+        # records the bundle for the GUI panel. It NEVER submits or gates orders.
+        self.macro_micro_observer = macro_micro_observer
         self.config = config or RealtimeTradingConfig()
         # Execution-quality layer (Phase 3): rejects buys whose alpha would be consumed
         # by spread/slippage and records realized slippage per symbol/strategy.
@@ -289,6 +293,15 @@ class RealtimeTradingEngine:
         ignored_symbols = _ignored_realtime_symbols()
         summary["ignored_symbols"] = sorted(ignored_symbols)
         summary["skipped_ignored"] = 0
+
+        # Advisory macro/micro ontology reasoning for the GUI panel (best-effort).
+        # Never submits or gates an order — pure diagnostics.
+        if self.macro_micro_observer is not None:
+            try:
+                candidates = tuple(self.candidate_symbols_provider())
+                self.macro_micro_observer(account, tuple(sorted(held_tickers)), candidates, decision_time)
+            except Exception:  # noqa: BLE001 - advisory panel must never affect trading.
+                pass
 
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
