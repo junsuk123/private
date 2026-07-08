@@ -1,0 +1,45 @@
+# Technical prediction layer policy.
+# Advisory-only tuning for the src/app/technical/ package. Nothing here relaxes
+# TradingCostEngine / ProfitabilityGate / RiskManager. Environment variables of
+# the same name (e.g. TECHNICAL_REGIME_MIN_LIQUIDITY) override these at load
+# time; the effective values are logged on startup.
+enabled: true
+
+default_horizons_seconds: [5, 15, 30, 60, 300]
+
+methodology_weights:
+  momentum_trend_following: 1.0
+  breakout_trading_range_break: 1.0
+  mean_reversion: 0.8
+  vwap_volume_liquidity: 1.2
+  volatility_band_regime: 0.7
+
+minimum_confidence:
+  momentum_trend_following: 0.55
+  breakout_trading_range_break: 0.6
+  mean_reversion: 0.62
+  vwap_volume_liquidity: 0.5
+
+risk_blocks:
+  block_buy_on_high_volatility_risk: true
+  block_buy_on_low_liquidity_risk: true
+  block_buy_when_spread_consumes_alpha: true
+  block_mean_reversion_in_strong_downtrend: true
+  block_breakout_without_volume_confirmation: true
+
+regime:
+  min_liquidity_score: 0.35
+  max_spread_bps: 50.0
+  high_realized_volatility: 0.015
+  high_atr_pct: 0.02
+  high_bandwidth: 0.06
+
+prediction:
+  min_confidence: 0.5
+  min_net_return_bps: 0.0
+  spread_alpha_max_ratio: 0.5
+
+diagnostics:
+  log_each_decision: true
+  persist_signal_snapshots: true
+  expose_gui_payload: true
