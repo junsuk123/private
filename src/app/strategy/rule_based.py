@@ -26,8 +26,8 @@ ONTOLOGY_FLOW_CONTRA_WEIGHTS = {
     "BuyCandidate": 0.25,
 }
 MARKET_CONTEXT_BUY_THRESHOLD = 1.0
-POSITION_REDUCE_WEIGHT = 0.12
-POSITION_SELL_WEIGHT = 0.24
+POSITION_REDUCE_WEIGHT = 0.20
+POSITION_SELL_WEIGHT = 0.40
 
 
 def generate_strategy_signals(
@@ -44,9 +44,9 @@ def generate_strategy_signals(
         if holding is not None:
             position_weight = _holding_position_weight(holding, account)
             exit_score, exit_support, exit_contra = _holding_exit_adjustment(graph, market.ticker, position_weight, holding)
-            if exit_score <= -0.65 or position_weight >= POSITION_SELL_WEIGHT:
+            if exit_score <= -0.85:
                 action = OrderAction.SELL
-            elif exit_score <= -0.10 or position_weight >= POSITION_REDUCE_WEIGHT:
+            elif exit_score <= -0.25:
                 action = OrderAction.REDUCE
             else:
                 action = OrderAction.HOLD
@@ -334,11 +334,11 @@ def _holding_exit_adjustment(
     risk_objects = tuple(triple.object for triple in graph.matching(subject=ticker, predicate="increasesRiskOf"))
 
     if position_weight >= POSITION_SELL_WEIGHT:
-        score -= 1.0
+        score -= 0.35
         supporting.append("OverweightPosition")
     elif position_weight >= POSITION_REDUCE_WEIGHT:
-        score -= 0.55
-        supporting.append("PositionSizedForReduction")
+        score -= 0.2
+        supporting.append("PositionSizedForReview")
     elif position_weight <= 0.05:
         score += 0.15
         supporting.append("LightPosition")
@@ -359,8 +359,8 @@ def _holding_exit_adjustment(
     if any(item in support_objects for item in ("WaitOrTakeProfit", "BreakoutWatch")):
         score += 0.1
 
-    if position_weight >= POSITION_SELL_WEIGHT or holding.unrealized_pnl <= 0:
-        supporting.append("ReduceRiskCandidate")
+    if holding.unrealized_pnl <= 0:
+        supporting.append("UnderwaterPosition")
     return score, supporting, contradicting
 
 

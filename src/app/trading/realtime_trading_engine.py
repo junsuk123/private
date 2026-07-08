@@ -143,6 +143,7 @@ class RealtimeTradingEngine:
         self._last_submit_monotonic: dict[str, float] = {}
         self._error_backoff_until: dict[str, float] = {}
         self._open_sell_orders: dict[str, dict[str, Any]] = {}
+        self._sell_lock_until: dict[str, float] = {}
         # 최근 매도 시각(monotonic) — 재매수 쿨다운(churn 억제)에 사용.
         self._recent_sell_monotonic: dict[str, float] = {}
         self._recent_buy_orders: dict[str, Deque[tuple[float, float]]] = {}
@@ -285,6 +286,10 @@ class RealtimeTradingEngine:
                 summary["skipped_market_closed"] += 1
                 continue  # 거래소 마감: 지금 주문하면 브로커가 거부하므로 보류.
             has_open_sell = holding.ticker in self._open_sell_orders
+            sell_lock_until = self._sell_lock_until.get(holding.ticker)
+            if sell_lock_until is not None and time.monotonic() < sell_lock_until and not has_open_sell:
+                summary["skipped_cooldown"] += 1
+                continue  # 결제/가능수량 잠금이 풀릴 때까지 반복 재시도하지 않는다.
             if self._in_cooldown(holding.ticker) and not has_open_sell:
                 summary["skipped_cooldown"] += 1
                 continue  # 최근 제출한 종목은 쿨다운 동안 재제출하지 않는다(중복/에러 방지).
@@ -305,6 +310,7 @@ class RealtimeTradingEngine:
             if result.approved and result.final_order is not None:
                 final_order = self._fit_sell_order_to_available_quantity(result.final_order, holding)
                 if final_order is None:
+                    self._sell_lock_until[holding.ticker] = time.monotonic() + max(300.0, self.config.sell_inflight_cooldown_sec)
                     summary["sell_rejected"] += 1
                     self._append_rejection(
                         summary,

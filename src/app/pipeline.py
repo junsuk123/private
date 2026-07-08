@@ -397,12 +397,10 @@ def _add_account_position_state_to_graph(graph: KnowledgeGraph, account: Account
         evidence_id = f"account-position:{holding.ticker}:{captured_at.isoformat()}"
         graph.add(holding.ticker, "hasPositionWeight", f"{position_weight:.4f}", evidence_id)
         graph.add(holding.ticker, "supportsSignal", "HeldPosition", evidence_id)
-        if position_weight >= 0.24:
+        if position_weight >= 0.40:
             graph.add(holding.ticker, "increasesRiskOf", "ConcentratedPositionRisk", evidence_id)
-            graph.add(holding.ticker, "supportsSignal", "SellCandidate", evidence_id)
-        elif position_weight >= 0.12:
+        elif position_weight >= 0.20:
             graph.add(holding.ticker, "increasesRiskOf", "ConcentratedPositionRisk", evidence_id)
-            graph.add(holding.ticker, "supportsSignal", "ReduceRiskCandidate", evidence_id)
         elif position_weight <= 0.05:
             graph.add(holding.ticker, "supportsSignal", "WaitOrTakeProfit", evidence_id)
 

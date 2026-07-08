@@ -78,6 +78,30 @@ class TradeHistoryRow:
 
 
 @dataclass(frozen=True)
+class HoldingOrderStatusRow:
+    ticker: str
+    name: str
+    market_group: str
+    market: str
+    exchange: str
+    currency: str
+    quantity: float
+    average_price: float
+    current_price: float
+    order_state: str
+    order_status: str
+    order_action: str
+    order_type: str
+    order_id: str
+    order_quantity: float
+    filled_quantity: float
+    order_price: float
+    order_summary: str
+    occurred_at: str
+    source: str
+
+
+@dataclass(frozen=True)
 class AccountDashboardSnapshot:
     snapshot_id: str
     created_at: str
@@ -210,11 +234,13 @@ class AccountDashboardService:
             data_quality_warnings=_warnings(status, logs, is_stale),
         )
         trade_rows = _trade_rows(logs)
+        holding_order_rows = _holding_order_rows(holdings, logs)
         dashboard = {
             "snapshot": asdict(snapshot),
             "holdings": [asdict(row) for row in holdings],
             "cash": [asdict(row) for row in cash_rows],
             "trades": trade_rows,
+            "holding_orders": holding_order_rows,
             "profitability": _profitability_summary(trade_rows, snapshot),
             "logs": {
                 "collection_log": list(logs.get("collection_log") or []),
@@ -235,6 +261,9 @@ class AccountDashboardService:
 
     def trades(self) -> list[dict[str, Any]]:
         return list(self.build_dashboard(persist=False).get("trades") or [])
+
+    def holding_orders(self) -> list[dict[str, Any]]:
+        return list(self.build_dashboard(persist=False).get("holding_orders") or [])
 
     def logs(self) -> dict[str, Any]:
         return dict(self.build_dashboard(persist=False).get("logs") or {})
@@ -487,6 +516,138 @@ def _trade_rows(logs: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
     return [asdict(_trade_from_dict(item)) for item in rows if isinstance(item, dict)][:50]
+
+
+def _holding_order_rows(holdings: list[HoldingDashboardRow], logs: dict[str, Any]) -> list[dict[str, Any]]:
+    journal = logs.get("live_order_journal")
+    if not isinstance(journal, dict):
+        return [asdict(_holding_order_from_holding(row, None)) for row in holdings]
+    events = []
+    for key in ("recent_orders", "submitted_orders", "recent_executions"):
+        for item in journal.get(key) or []:
+            if isinstance(item, dict):
+                events.append(item)
+    latest_by_ticker: dict[str, dict[str, Any]] = {}
+    latest_key_by_ticker: dict[str, tuple[datetime, int, str]] = {}
+    for item in events:
+        ticker = str(item.get("ticker") or "").upper().strip()
+        if not ticker:
+            continue
+        occurred_at = _parse_time(item.get("occurred_at") or item.get("recorded_at") or item.get("submitted_at") or item.get("filled_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        key = (occurred_at, _order_event_priority(item), str(item.get("broker_order_id") or item.get("order_id") or ""))
+        if ticker not in latest_key_by_ticker or key >= latest_key_by_ticker[ticker]:
+            latest_key_by_ticker[ticker] = key
+            latest_by_ticker[ticker] = item
+    rows: list[HoldingOrderStatusRow] = []
+    for holding in holdings:
+        rows.append(_holding_order_from_holding(holding, latest_by_ticker.get(holding.ticker.upper())))
+    return [asdict(row) for row in rows]
+
+
+def _holding_order_from_holding(
+    holding: HoldingDashboardRow,
+    event: dict[str, Any] | None,
+) -> HoldingOrderStatusRow:
+    if event is None:
+        return HoldingOrderStatusRow(
+            ticker=holding.ticker,
+            name=holding.name,
+            market_group=holding.market_group,
+            market=holding.market,
+            exchange=holding.exchange,
+            currency=holding.currency,
+            quantity=holding.quantity,
+            average_price=holding.average_price,
+            current_price=holding.current_price,
+            order_state="주문 없음",
+            order_status="NO_ORDER",
+            order_action="",
+            order_type="",
+            order_id="",
+            order_quantity=0.0,
+            filled_quantity=0.0,
+            order_price=0.0,
+            order_summary="현재 걸린 주문 없음",
+            occurred_at=holding.updated_at,
+            source="holding_snapshot",
+        )
+    order_status = str(event.get("status") or event.get("order_status") or "").upper()
+    event_type = str(event.get("event_type") or "")
+    order_action = str(event.get("side") or "").upper()
+    order_quantity = _num(event.get("quantity") or event.get("ordered_quantity"))
+    filled_quantity = _num(event.get("filled_quantity"))
+    order_price = _num(event.get("limit_price") or event.get("average_fill_price"))
+    order_state = _humanize_order_state(event_type, order_status)
+    order_summary = _build_order_summary(order_action, order_state, order_quantity, filled_quantity, order_price)
+    return HoldingOrderStatusRow(
+        ticker=holding.ticker,
+        name=holding.name,
+        market_group=holding.market_group,
+        market=holding.market,
+        exchange=holding.exchange,
+        currency=holding.currency,
+        quantity=holding.quantity,
+        average_price=holding.average_price,
+        current_price=holding.current_price,
+        order_state=order_state,
+        order_status=order_status or event_type.upper() or "UNKNOWN",
+        order_action=order_action,
+        order_type=str(event.get("order_type") or ""),
+        order_id=str(event.get("order_id") or event.get("broker_order_id") or ""),
+        order_quantity=order_quantity,
+        filled_quantity=filled_quantity,
+        order_price=order_price,
+        order_summary=order_summary,
+        occurred_at=str(event.get("occurred_at") or event.get("recorded_at") or event.get("submitted_at") or event.get("filled_at") or holding.updated_at),
+        source=str(event.get("source") or event.get("event_type") or "live_order_journal"),
+    )
+
+
+def _order_event_priority(item: dict[str, Any]) -> int:
+    event_type = str(item.get("event_type") or "").lower()
+    status = str(item.get("status") or item.get("order_status") or "").upper()
+    if event_type.endswith("amended"):
+        return 5
+    if status in {"FILLED"}:
+        return 4
+    if status in {"PARTIALLY_FILLED"}:
+        return 3
+    if event_type.endswith("submitted"):
+        return 2
+    if status in {"ACCEPTED", "OPEN", "WORKING"}:
+        return 1
+    return 0
+
+
+def _humanize_order_state(event_type: str, order_status: str) -> str:
+    event_type = str(event_type or "").lower()
+    order_status = str(order_status or "").upper()
+    if event_type.endswith("amended"):
+        return "정정"
+    if order_status == "PARTIALLY_FILLED":
+        return "일부 체결"
+    if order_status == "FILLED":
+        return "체결"
+    if event_type.endswith("submitted"):
+        return "주문"
+    if order_status in {"CANCELED", "CANCELLED"}:
+        return "취소"
+    if order_status in {"REJECTED", "BLOCKED"}:
+        return "차단"
+    if order_status:
+        return order_status
+    return "주문 상태 없음"
+
+
+def _build_order_summary(order_action: str, order_state: str, order_quantity: float, filled_quantity: float, order_price: float) -> str:
+    parts = [part for part in (order_action, order_state) if part]
+    quantity_text = f"{order_quantity:.0f}주" if order_quantity > 0 else ""
+    filled_text = f"체결 {filled_quantity:.0f}주" if filled_quantity > 0 else ""
+    price_text = f"@ {order_price:,.0f}" if order_price > 0 else ""
+    tail = " · ".join(part for part in (quantity_text, filled_text, price_text) if part)
+    if tail:
+        parts.append(tail)
+    return " / ".join(parts) if parts else "현재 걸린 주문 없음"
 
 
 def _trade_from_dict(item: dict[str, Any]) -> TradeHistoryRow:

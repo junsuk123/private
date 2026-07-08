@@ -16,13 +16,13 @@
 # Minimum acceptable net expected return (after all costs) by market.
 # Overridable by REALTIME_MIN_BUY_NET_RETURN_KR / REALTIME_MIN_BUY_NET_RETURN_US.
 min_required_net_return:
-  default: 0.008
-  KR: 0.008
-  US: 0.012
+  default: 0.0
+  KR: 0.0
+  US: 0.002
 
 # Extra net headroom demanded above pure break-even before a buy is worth taking.
 # Overridable by REALTIME_MIN_NET_PROFIT_BUFFER_RATE.
-min_net_profit_buffer_rate: 0.001
+min_net_profit_buffer_rate: 0.0
 
 # Absolute spread ceiling as a fraction of mid ((ask-bid)/mid).
 max_spread_rate: 0.003
@@ -34,7 +34,7 @@ max_slippage_rate: 0.003
 max_spread_alpha_ratio: 0.35
 
 # Cost may not dominate alpha beyond this ratio (all_in_cost_rate / |gross_return|).
-max_cost_to_alpha_ratio: 0.5
+max_cost_to_alpha_ratio: 1.05
 
 # Liquidity floor (0..1 normalized score).
 min_liquidity_score: 0.3
@@ -47,9 +47,9 @@ min_liquidity_score: 0.3
 #       + liquidity_buffer_max * (1 - liquidity_score)
 #       + account_buffer(if small account),
 # )
-volatility_buffer_k: 0.5
+volatility_buffer_k: 0.05
 liquidity_buffer_max: 0.003
 
 account_buffer:
   small_account_equity_krw: 200000.0
-  small_account_extra_net: 0.002
+  small_account_extra_net: 0.0

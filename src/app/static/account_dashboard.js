@@ -48,8 +48,7 @@ function renderDashboard(data, trading, runtime) {
   renderKpis(snapshot);
   renderProfitability(data.profitability || {}, snapshot, trading);
   renderAllocation(snapshot.asset_allocations || []);
-  renderHoldings(data.holdings || []);
-  renderTrades(data.trades || []);
+  renderHoldings(mergeHoldingsWithOrders(data.holdings || [], data.holding_orders || []));
   renderCash(data.cash || []);
   renderSystem(snapshot, data.logs || {}, trading, runtime);
   renderDecisionFlow(trading);
@@ -191,6 +190,8 @@ function renderHoldings(rows) {
     const estNet = hasCost
       ? `<span class="${clsPnl(row.estimated_net_pnl_krw)}">${fmtKrw(row.estimated_net_pnl_krw)}</span>`
       : 'n/a';
+    const orderState = row.order_state ? escapeHtml(row.order_state) : '주문 없음';
+    const orderSummary = escapeHtml(row.order_summary || '현재 걸린 주문 없음');
     return `
     <tr>
       <td><strong>${row.ticker}</strong><br><small>${row.name || ''}</small></td>
@@ -199,6 +200,8 @@ function renderHoldings(rows) {
       <td>${fmtMoney(row.average_price, row.currency)}</td>
       <td>${breakEven}</td>
       <td>${fmtMoney(row.current_price, row.currency)}</td>
+      <td>${orderState}</td>
+      <td>${orderSummary}</td>
       <td>${fmtKrw(row.evaluation_amount_krw)}</td>
       <td class="${clsPnl(row.unrealized_pnl_krw)}">${fmtKrw(row.unrealized_pnl_krw)}</td>
       <td>${estNet}</td>
@@ -206,23 +209,33 @@ function renderHoldings(rows) {
       <td>${fmtPct(row.weight_of_total_asset)}</td>
       <td>${row.currency}</td>
     </tr>`;
-  }).join('') : `<tr class="empty-row"><td colspan="12">현재 보유 종목 없음</td></tr>`;
+  }).join('') : `<tr class="empty-row"><td colspan="13">현재 보유 종목 없음</td></tr>`;
 }
 
-function renderTrades(rows) {
-  const body = document.getElementById('trades-body');
-  body.innerHTML = rows.length ? rows.slice(0, 20).map((row) => `
-    <tr>
-      <td>${formatTime(row.occurred_at)}</td>
-      <td>${row.market_group || row.market}</td>
-      <td>${row.ticker}</td>
-      <td>${row.side}</td>
-      <td>${Number(row.ordered_quantity || 0).toLocaleString()}</td>
-      <td>${Number(row.filled_quantity || 0).toLocaleString()}</td>
-      <td>${fmtKrw(row.amount_krw)}</td>
-      <td>${row.order_status}</td>
-    </tr>
-  `).join('') : `<tr class="empty-row"><td colspan="8">거래 이력 수집 중</td></tr>`;
+function mergeHoldingsWithOrders(holdings, orders) {
+  const orderByTicker = new Map();
+  (orders || []).forEach((order) => {
+    const ticker = String(order && order.ticker ? order.ticker : '').toUpperCase().trim();
+    if (!ticker) return;
+    const current = orderByTicker.get(ticker);
+    const currentTime = current ? Number(new Date(current.occurred_at || 0)) : -Infinity;
+    const nextTime = Number(new Date(order.occurred_at || 0));
+    if (!current || nextTime >= currentTime) {
+      orderByTicker.set(ticker, order);
+    }
+  });
+  return (holdings || []).map((holding) => {
+    const order = orderByTicker.get(String(holding.ticker || '').toUpperCase().trim()) || {};
+    return {
+      ...holding,
+      order_state: order.order_state || order.order_status || '',
+      order_status: order.order_status || '',
+      order_summary: order.order_summary || '',
+      order_id: order.order_id || '',
+      filled_quantity: order.filled_quantity || 0,
+      occurred_at: order.occurred_at || '',
+    };
+  });
 }
 
 function renderCash(rows) {

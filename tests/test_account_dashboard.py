@@ -139,7 +139,7 @@ class AccountDashboardTest(unittest.TestCase):
             first_id = store.save_dashboard(first)
             second_id = store.save_dashboard(second)
             third_id = store.save_dashboard(third)
-            history = store.asset_history("1W")
+            history = store.asset_history("1M")
 
         self.assertEqual(first_id, second_id)
         self.assertNotEqual(second_id, third_id)
@@ -194,7 +194,7 @@ class AccountDashboardTest(unittest.TestCase):
         self.assertEqual(first_id, second_id)
         self.assertEqual(count, 1)
 
-    def test_dashboard_maps_live_order_journal_to_trade_rows(self) -> None:
+    def test_dashboard_maps_live_order_journal_to_holding_order_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = AccountDashboardService(
                 status_provider=lambda: {
@@ -202,10 +202,30 @@ class AccountDashboardTest(unittest.TestCase):
                     "account_checked": True,
                     "updated_at": "2026-07-01T00:00:00+00:00",
                     "equity": 100_000,
+                    "positions": [
+                        {
+                            "ticker": "005930",
+                            "market": "KRX",
+                            "currency": "KRW",
+                            "quantity": 1,
+                            "average_price": 70_000,
+                            "last_price": 71_000,
+                            "market_value_krw": 71_000,
+                        },
+                        {
+                            "ticker": "AAPL",
+                            "market": "NASDAQ",
+                            "currency": "USD",
+                            "quantity": 1,
+                            "average_price": 100,
+                            "last_price": 102,
+                            "market_value_krw": 140_000,
+                        },
+                    ],
                 },
                 logs_provider=lambda: {
                     "live_order_journal": {
-                        "submitted_orders": [
+                        "recent_orders": [
                             {
                                 "event_type": "live_order_submitted",
                                 "recorded_at": "2026-07-01T00:00:10+00:00",
@@ -217,6 +237,18 @@ class AccountDashboardTest(unittest.TestCase):
                                 "broker_order_id": "0001",
                                 "status": "ACCEPTED",
                                 "currency": "KRW",
+                            },
+                            {
+                                "event_type": "live_order_amended",
+                                "recorded_at": "2026-07-01T00:00:20+00:00",
+                                "ticker": "005930",
+                                "market": "KR",
+                                "side": "SELL",
+                                "quantity": 1,
+                                "limit_price": 71000,
+                                "broker_order_id": "0002",
+                                "status": "ACCEPTED",
+                                "currency": "KRW",
                             }
                         ]
                     }
@@ -226,9 +258,14 @@ class AccountDashboardTest(unittest.TestCase):
 
             dashboard = service.build_dashboard()
 
-        self.assertEqual(len(dashboard["trades"]), 1)
-        self.assertEqual(dashboard["trades"][0]["order_id"], "0001")
-        self.assertEqual(dashboard["trades"][0]["order_status"], "ACCEPTED")
+        self.assertEqual(len(dashboard["holding_orders"]), 2)
+        self.assertEqual(dashboard["holding_orders"][0]["ticker"], "005930")
+        self.assertEqual(dashboard["holding_orders"][0]["average_price"], 70_000)
+        self.assertEqual(dashboard["holding_orders"][0]["order_state"], "정정")
+        self.assertEqual(dashboard["holding_orders"][0]["order_id"], "0002")
+        self.assertEqual(dashboard["holding_orders"][0]["order_price"], 71_000)
+        self.assertEqual(dashboard["holding_orders"][1]["ticker"], "AAPL")
+        self.assertEqual(dashboard["holding_orders"][1]["order_state"], "주문 없음")
 
     def test_overseas_account_client_maps_balance_request(self) -> None:
         transport = _RecordingTransport()

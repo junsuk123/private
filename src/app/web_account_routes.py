@@ -51,7 +51,7 @@ def create_account_router(
 
     @router.get("/api/account/trades")
     def account_trades() -> JSONResponse:
-        return JSONResponse({"trades": service.trades()})
+      return JSONResponse({"trades": service.holding_orders()})
 
     @router.get("/api/account/asset-history")
     def account_asset_history(range: str = "1D") -> JSONResponse:  # noqa: A002 - query parameter name.
@@ -156,7 +156,7 @@ _ACCOUNT_PAGE = """<!doctype html>
 
     <section class="dashboard-frame">
       <div class="frame-title">
-        <h2>보유 주식 현황</h2>
+        <h2>보유 주식 관리</h2>
         <div class="account-filters">
           <input id="holding-search" placeholder="종목 검색" />
           <select id="holding-market">
@@ -168,22 +168,13 @@ _ACCOUNT_PAGE = """<!doctype html>
       </div>
       <div class="table-frame">
         <table>
-          <thead><tr><th>종목</th><th>시장</th><th>수량</th><th>평단</th><th>손익분기</th><th>현재가</th><th>평가금액</th><th>평가손익(총)</th><th>예상순손익</th><th>수익률</th><th>비중</th><th>통화</th></tr></thead>
+          <thead><tr><th>종목</th><th>시장</th><th>수량</th><th>평단</th><th>현재가</th><th>주문 상태</th><th>주문 요약</th><th>평가손익</th><th>예상순손익</th><th>수익률</th><th>비중</th><th>통화</th></tr></thead>
           <tbody id="holdings-body"></tbody>
         </table>
       </div>
     </section>
 
     <section class="main-grid">
-      <article class="dashboard-frame">
-        <div class="frame-title"><h2>최근 거래 및 손익</h2></div>
-        <div class="table-frame compact">
-          <table>
-            <thead><tr><th>일시</th><th>시장</th><th>종목</th><th>구분</th><th>주문</th><th>체결</th><th>금액</th><th>상태</th></tr></thead>
-            <tbody id="trades-body"></tbody>
-          </table>
-        </div>
-      </article>
       <article class="dashboard-frame">
         <div class="frame-title"><h2>통화별 예수금</h2></div>
         <div class="table-frame compact">
