@@ -236,9 +236,20 @@ def _account_dashboard_logs_provider() -> dict[str, Any]:
 
 # Single shared service so the HTTP routes and the background asset-history
 # sampler (see _asset_history_sampler_loop) persist to the same snapshot store.
+def _account_dashboard_technical_provider() -> list[dict]:
+    """Latest per-symbol technical decision context for the advisory GUI panel."""
+    try:
+        from app.technical.decision_feed import snapshot
+
+        return snapshot()
+    except Exception:  # noqa: BLE001 - advisory panel; never break the dashboard.
+        return []
+
+
 _account_service = AccountDashboardService(
     status_provider=_account_dashboard_status_provider,
     logs_provider=_account_dashboard_logs_provider,
+    technical_provider=_account_dashboard_technical_provider,
 )
 app.include_router(create_account_router(service=_account_service))
 

@@ -52,7 +52,63 @@ function renderDashboard(data, trading, runtime) {
   renderCash(data.cash || []);
   renderSystem(snapshot, data.logs || {}, trading, runtime);
   renderDecisionFlow(trading);
+  renderTechnical(data.technical || {});
   renderLogs(data.logs || {});
+}
+
+const TECH_REJECT_TEXT = {
+  below_net_edge: '순수익 부족(비용 차감 후 목표 미달)',
+  spread_consumes_alpha: '스프레드가 기대수익을 잠식',
+  low_liquidity: '유동성 부족',
+  high_volatility: '변동성 위험 과다',
+  model_feature_unavailable: '모델/시세 데이터 미가용',
+  no_ontology_support: '온톨로지 근거 부족',
+  other: '기타',
+};
+
+function techNum(value, digits, suffix) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+  return Number(value).toFixed(digits === undefined ? 2 : digits) + (suffix || '');
+}
+
+function renderTechnicalCards(containerId, cards, kind) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  if (!cards || !cards.length) {
+    container.innerHTML = '<div class="tech-card empty">해당 없음</div>';
+    return;
+  }
+  container.innerHTML = cards
+    .map((c) => {
+      const rows = [
+        ['국면', c.regime || '-'],
+        ['방법론', c.methodology || '-'],
+        ['기대엣지', techNum(c.expected_edge_bps, 1, 'bps')],
+        ['기대보유', c.expected_horizon_seconds ? `${c.expected_horizon_seconds}s` : '-'],
+        ['예상청산가', techNum(c.expected_exit_price, 2)],
+        ['하방위험', techNum(c.downside_risk_bps, 1, 'bps')],
+        ['VWAP거리', techNum(c.vwap_distance_bps, 1, 'bps')],
+        ['신뢰도', techNum(c.confidence, 2)],
+        ['게이트순수익', techNum(c.net_expected_return === null ? null : c.net_expected_return * 10000, 1, 'bps')],
+      ];
+      const reject = c.reject_reason ? `<div class="tech-reject">${TECH_REJECT_TEXT[c.reject_reason] || c.reject_reason}</div>` : '';
+      const explain = c.explanation ? `<div class="tech-explain">${c.explanation}</div>` : '';
+      const detail = rows.map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('');
+      return `<div class="tech-card ${kind}"><div class="tech-symbol">${c.symbol || '-'}</div>${reject}<div class="tech-detail">${detail}</div>${explain}</div>`;
+    })
+    .join('');
+}
+
+function renderTechnical(technical) {
+  const badge = document.getElementById('technical-badge');
+  if (badge) {
+    badge.textContent = technical.available ? `${technical.count} 종목` : '데이터 없음';
+    badge.className = technical.available ? 'badge' : 'badge warn';
+  }
+  renderTechnicalCards('tech-buy-approved', technical.buy_approved, 'approved');
+  renderTechnicalCards('tech-buy-rejected', technical.buy_rejected, 'rejected');
+  renderTechnicalCards('tech-sell-reduce', [...(technical.sell || []), ...(technical.reduce || [])], 'sell');
+  renderTechnicalCards('tech-hold', technical.hold, 'hold');
 }
 
 // Human-readable hold/rejection reasons. Mirrors app.web._HOLD_REASON_TEXT so the

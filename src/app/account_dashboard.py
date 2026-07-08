@@ -139,10 +139,13 @@ class AccountDashboardService:
         *,
         status_provider: Callable[[], dict[str, Any] | None] | None = None,
         logs_provider: Callable[[], dict[str, Any] | None] | None = None,
+        technical_provider: Callable[[], list[dict[str, Any]] | None] | None = None,
         store: AccountSnapshotStore | None = None,
     ) -> None:
         self.status_provider = status_provider
         self.logs_provider = logs_provider
+        # Returns the most recent technical decision diagnostics (advisory).
+        self.technical_provider = technical_provider
         self.store = store or AccountSnapshotStore()
 
     def build_dashboard(self, *, persist: bool = True) -> dict[str, Any]:
@@ -242,6 +245,7 @@ class AccountDashboardService:
             "trades": trade_rows,
             "holding_orders": holding_order_rows,
             "profitability": _profitability_summary(trade_rows, snapshot),
+            "technical": build_technical_panel(self._technical_payload()),
             "logs": {
                 "collection_log": list(logs.get("collection_log") or []),
                 "last_error": logs.get("last_error"),
@@ -252,6 +256,9 @@ class AccountDashboardService:
         if persist:
             self.store.save_dashboard(dashboard)
         return dashboard
+
+    def technical(self) -> dict[str, Any]:
+        return build_technical_panel(self._technical_payload())
 
     def holdings(self) -> list[dict[str, Any]]:
         return list(self.build_dashboard(persist=False).get("holdings") or [])
@@ -309,6 +316,14 @@ class AccountDashboardService:
             return dict(self.logs_provider() or {})
         except Exception as exc:  # noqa: BLE001
             return {"last_error": str(exc), "collection_log": []}
+
+    def _technical_payload(self) -> list[dict[str, Any]]:
+        if self.technical_provider is None:
+            return []
+        try:
+            return list(self.technical_provider() or [])
+        except Exception:  # noqa: BLE001 - advisory panel must never break the dashboard.
+            return []
 
 
 def _holding_from_position(position: dict[str, Any], updated_at: str) -> HoldingDashboardRow | None:
@@ -794,3 +809,83 @@ def _parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Technical prediction panel (advisory GUI). Pure transform of the latest
+# per-symbol technical decision diagnostics into a render-ready structure.
+# ---------------------------------------------------------------------------
+_REJECT_CARD_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("high_volatility", ("HIGH_VOLATILITY_TECHNICAL_BLOCK", "HIGH_VOLATILITY_RISK")),
+    ("low_liquidity", ("LOW_LIQUIDITY_TECHNICAL_BLOCK", "LIQUIDITY_TOO_LOW", "LOW_LIQUIDITY_RISK")),
+    ("spread_consumes_alpha", ("SPREAD_CONSUMES_TECHNICAL_ALPHA", "SPREAD_CONSUMES_ALPHA", "SPREAD_TOO_WIDE")),
+    ("model_feature_unavailable", ("MODEL_UNAVAILABLE", "MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE", "MISSING_MARKET_DATA", "TECHNICAL_SIGNAL_UNAVAILABLE")),
+    ("no_ontology_support", ("ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK", "ONTOLOGY_BELOW_ADAPTIVE_THRESHOLD")),
+    ("below_net_edge", ("PROFITABILITY_GATE_REJECTED", "BELOW_TARGET_NET_RETURN_AFTER_COST", "BELOW_BREAK_EVEN_WITH_MARGIN", "TECHNICAL_EDGE_NON_POSITIVE", "BUY_SIGNAL_TOO_WEAK")),
+)
+
+
+def _reject_reason(reason_codes: list[str]) -> str:
+    codes = set(reason_codes or ())
+    for label, triggers in _REJECT_CARD_RULES:
+        if codes & set(triggers):
+            return label
+    return "other"
+
+
+def _technical_card(decision: dict[str, Any]) -> dict[str, Any]:
+    tech = dict(decision.get("technical") or decision.get("technical_prediction") or {})
+    prof = dict(decision.get("profitability") or decision.get("profitability_decision") or {})
+    reason_codes = [str(c) for c in (decision.get("reason_codes") or ())]
+    action = str(decision.get("action") or ("BUY" if decision.get("approved") else "HOLD")).upper()
+    approved = bool(decision.get("approved"))
+    if action in ("SELL", "REDUCE"):
+        category = action.lower()
+    elif approved:
+        category = "buy_approved"
+    elif action == "BUY" or reason_codes:
+        category = "buy_rejected"
+    else:
+        category = "hold"
+    return {
+        "symbol": decision.get("symbol"),
+        "category": category,
+        "reject_reason": _reject_reason(reason_codes) if category == "buy_rejected" else None,
+        "regime": decision.get("technical_regime") or tech.get("regime"),
+        "methodology": decision.get("technical_methodology") or tech.get("methodology"),
+        "expected_edge_bps": tech.get("expected_net_return_bps"),
+        "expected_horizon_seconds": tech.get("expected_horizon_seconds"),
+        "expected_exit_price": tech.get("expected_exit_price"),
+        "downside_risk_bps": tech.get("downside_risk_bps"),
+        "confidence": tech.get("confidence"),
+        "vwap_distance_bps": (tech.get("diagnostics") or {}).get("vwap_distance_bps"),
+        "net_expected_return": prof.get("net_expected_return"),
+        "required_min_net_return": prof.get("required_min_net_return"),
+        "spread_rate": prof.get("spread_rate"),
+        "cost_to_alpha_ratio": prof.get("cost_to_alpha_ratio"),
+        "gate_allowed": prof.get("allowed"),
+        "reason_codes": reason_codes,
+        "explanation": tech.get("explanation"),
+    }
+
+
+def build_technical_panel(decisions: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Transform latest technical decision diagnostics into a GUI panel payload.
+
+    Advisory only: this describes why the (authoritative) gates approved,
+    rejected, held, sold, or reduced — it never itself decides anything.
+    """
+    cards = [_technical_card(d) for d in (decisions or []) if isinstance(d, dict)]
+    by_category: dict[str, list[dict[str, Any]]] = {}
+    for card in cards:
+        by_category.setdefault(card["category"], []).append(card)
+    return {
+        "available": bool(cards),
+        "count": len(cards),
+        "cards": cards,
+        "buy_approved": by_category.get("buy_approved", []),
+        "buy_rejected": by_category.get("buy_rejected", []),
+        "sell": by_category.get("sell", []),
+        "reduce": by_category.get("reduce", []),
+        "hold": by_category.get("hold", []),
+    }

@@ -61,6 +61,10 @@ def create_account_router(
     def account_logs() -> JSONResponse:
         return JSONResponse(service.logs())
 
+    @router.get("/api/account/technical")
+    def account_technical() -> JSONResponse:
+        return JSONResponse(service.technical())
+
     return router
 
 
@@ -184,6 +188,20 @@ _ACCOUNT_PAGE = """<!doctype html>
           </table>
         </div>
       </article>
+    </section>
+
+    <section class="dashboard-frame" id="technical-panel">
+      <div class="frame-title">
+        <h2>기술적 예측 (자문 전용)</h2>
+        <span class="badge" id="technical-badge">-</span>
+      </div>
+      <p class="tech-note">RiskManager·ProfitabilityGate가 최종 권한을 가지며, 아래는 근거·설명일 뿐입니다.</p>
+      <div class="tech-grid">
+        <article><h3>매수 승인</h3><div class="tech-cards" id="tech-buy-approved"></div></article>
+        <article><h3>매수 보류/거부</h3><div class="tech-cards" id="tech-buy-rejected"></div></article>
+        <article><h3>매도/축소</h3><div class="tech-cards" id="tech-sell-reduce"></div></article>
+        <article><h3>보유/관망</h3><div class="tech-cards" id="tech-hold"></div></article>
+      </div>
     </section>
 
     <section class="dashboard-frame system-strip" id="system-strip"></section>

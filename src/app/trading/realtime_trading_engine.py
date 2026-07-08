@@ -69,6 +69,22 @@ def _is_no_available_sell_quantity_error(exc: Exception) -> bool:
     )
 
 
+def _record_technical_decision(symbol: str, action: str, result) -> None:
+    """Best-effort push of a decision's technical context to the GUI feed."""
+    try:
+        from app.technical.decision_feed import record_decision
+
+        record_decision(
+            symbol,
+            action,
+            getattr(result, "approved", False),
+            getattr(result, "reason_codes", ()),
+            getattr(result, "diagnostics", None),
+        )
+    except Exception:  # noqa: BLE001 - advisory GUI feed must never affect trading.
+        pass
+
+
 def _ignored_realtime_symbols() -> set[str]:
     raw = os.getenv("REALTIME_IGNORE_SYMBOLS", "")
     return {
@@ -307,6 +323,7 @@ class RealtimeTradingEngine:
                 summary["errors"] += 1
                 self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
+            _record_technical_decision(holding.ticker, "SELL", result)
             if result.approved and result.final_order is not None:
                 final_order = self._fit_sell_order_to_available_quantity(result.final_order, holding)
                 if final_order is None:
@@ -391,6 +408,7 @@ class RealtimeTradingEngine:
                 summary["errors"] += 1
                 self._record({"at": decision_time.isoformat(), "symbol": symbol, "kind": "BUY", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
+            _record_technical_decision(symbol, "BUY", result)
             if result.approved and result.final_order is not None:
                 buy_submit_attempted += 1
                 summary["buy_submit_attempted"] = buy_submit_attempted
