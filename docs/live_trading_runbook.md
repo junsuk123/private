@@ -156,3 +156,29 @@ order). Runtime profiles and the optional Raspberry Pi monitor node are document
 rejection-reason distribution, and cost-aware realized metrics (net PnL, win rate, payoff,
 expectancy) from `logs/live-orders.jsonl`. Run it before and after to compare — the success
 criterion is improved NET expectancy and fewer net-negative trades, not more trades.
+
+## Technical prediction diagnostics
+
+The evidence-based technical prediction layer (`src/app/technical/`, see
+`docs/technical_prediction_layer.md`) is advisory — it never bypasses the
+ProfitabilityGate or RiskManager.
+
+- **GUI**: `/account` → "기술적 예측 (자문 전용)" panel shows, per symbol, the
+  regime, selected methodology, expected edge/horizon, predicted exit price,
+  downside, VWAP distance, confidence, and the gate result (net vs required),
+  with rejection reason cards (below net edge / spread consumes alpha / low
+  liquidity / high volatility / model feature unavailable / no ontology support).
+  API: `GET /api/account/technical`.
+- **Per-decision diagnostics**: `SharedDecisionResult.diagnostics` carries
+  `technical_prediction`, `technical_methodology`, `technical_regime`, and (on
+  exits) `technical_exit_deterioration`.
+- **Config**: `config/technical_prediction_policy.yaml` (env overrides logged at
+  load). Set `enabled: false` to disable the layer entirely (buys fall back to
+  the prior model/ontology behavior).
+- **Validation**: run `python scripts/replay_technical_prediction.py` and read
+  `data/models/technical_replay_reports/`; judge on realized **net-after-cost**,
+  not gross hit rate (`docs/technical_prediction_validation.md`).
+- **Schema/model**: the live feature schema is now `live_short_horizon_v2` (6
+  technical columns added). Prior model artifacts are retired; retrain before
+  the trained model contributes again — buys stay safe (advisory fallback) until
+  then.

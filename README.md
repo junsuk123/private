@@ -101,6 +101,8 @@ KIS account + realtime ticks/orderbooks + broker quotes
   + public market/macro/news/disclosure data
   -> source trust, freshness, provenance, local SQLite/model storage
   -> live feature frames, indicators, short-horizon artifacts
+  -> evidence-based technical prediction layer (regime + momentum/breakout/
+     mean-reversion/VWAP/volatility signals -> conservative expected exit price)
   -> candidate filtering and NPU/CPU evidence scoring
   -> RDF/RDFS/OWL semantic labels + SHACL validation + Python policy scoring
   -> SharedLiveDecisionEngine
@@ -148,6 +150,8 @@ KIS account + realtime ticks/orderbooks + broker quotes
 - [docs/ontology_standardization_report.md](docs/ontology_standardization_report.md): RDF/OWL/SHACL 온톨로지 설계
 - [docs/npu_runtime_architecture.md](docs/npu_runtime_architecture.md): NPU/CPU 경계와 fallback
 - [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md): Pi CPU-only 배포와 키오스크
+- [docs/technical_prediction_layer.md](docs/technical_prediction_layer.md): 근거 기반 기술적 예측 레이어(자문 전용)
+- [docs/technical_prediction_validation.md](docs/technical_prediction_validation.md): 리플레이/워크포워드 검증(비용 차감 순수익 기준)
 
 ### 수익성 리팩터 (profitability-first refactor)
 

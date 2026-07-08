@@ -295,3 +295,19 @@ and `ONTOLOGY_RDF_LAYER=0` disables the layer entirely.
   the tightest real-time tick loop and scoped to candidates.
 - Future work: incremental/delta materialization, a persistent triple store (e.g. RDF4J/GraphDB) for
   cross-session provenance, SPARQL-backed explainability queries, and richer SHACL-SPARQL rules.
+
+## Technical prediction layer (advisory)
+
+`src/app/technical/` provides a short-horizon predictive layer built on
+evidence-based technical methodologies (momentum, breakout, mean reversion,
+VWAP/volume confirmation, volatility/regime). It emits a rule-based regime, a
+composite signal, and a conservative expected exit price / net return — all
+**advisory evidence only**.
+
+Flow: realtime frame → `TechnicalFeatureSet` → `CompositeTechnicalSignalEngine`
+(regime gate + mandatory VWAP/volume confirmation) → `TechnicalPredictionEngine`
+→ preferred (never inflated) expected exit price into the **ProfitabilityGate**
+→ **RiskManager** → **LiveExecutionCoordinator** (limit-only). Evidence also
+projects into the `KnowledgeGraph`/RDF for the `SemanticPolicyScorer` and graph
+UI. No technical output creates a `FinalOrder`; the gates remain authoritative.
+See `docs/technical_prediction_layer.md`.
