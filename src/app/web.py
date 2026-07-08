@@ -5765,6 +5765,26 @@ def _refresh_live_cache() -> None:
       _set_live_progress(80, "learning", "Collecting live feature frames and training live short-horizon model")
       live_feature_symbols = _live_realtime_feature_symbols_for_active_session(context) if active_mode == "live_trading" else None
       if active_mode == "live_trading" and "US" in set(_active_live_market_groups()):
+        # ALWAYS warm US realtime data for HELD US symbols. The collection context
+        # (reasoning_paths/markets) is KR-centric, so account-held US names never
+        # enter the selection above -> the US REST bridge got 0 symbols and no US
+        # ticks/orderbooks were ever stored (breaking US feature frames, micro
+        # reasoning, and model training). Held symbols must be warmed for exit
+        # signals regardless. Independent of the (separately-broken) affordable
+        # discovery path. Best-effort; bounded by the small holdings count.
+        try:
+          _acct = _live_account_snapshot_for_analysis()
+          _held_us = tuple(
+              str(getattr(h, "ticker", "") or "").upper().strip()
+              for h in (getattr(_acct, "holdings", ()) or ())
+              if _ticker_market_group_for_live_trading(
+                  str(getattr(h, "ticker", "") or ""), str(getattr(h, "market", "") or "")
+              ) == "US"
+          )
+          if _held_us:
+            live_feature_symbols = tuple(dict.fromkeys((*(live_feature_symbols or ()), *_held_us)))
+        except Exception:  # noqa: BLE001 - warming held US symbols is best-effort.
+          pass
         # Warm US realtime data for AFFORDABLE discovery candidates too, not just the
         # ontology BuyCandidates (which skew to unaffordable big-caps). This feeds the
         # REST bridge + feature collection below so cheap US names the account can
