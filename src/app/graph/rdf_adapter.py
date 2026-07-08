@@ -408,3 +408,60 @@ def _kind_from_types(types: list[str]) -> str:
         if local in types:
             return kind
     return "resource"
+
+
+# ---------------------------------------------------------------------------
+# Macro / micro reasoning result projection (hierarchical refactor).
+# Represents MacroReasoningResult / MicroReasoningResult as RDF evidence nodes
+# whose datatype properties satisfy the SHACL shapes in trading_shapes.ttl.
+# ADVISORY ONLY — no FinalOrder is ever asserted here.
+# ---------------------------------------------------------------------------
+def attach_macro_result_rdf(rdf: RdfTradingGraph, macro_result, *, node_name: str = "macro:latest") -> URIRef:
+    node = resource_iri(node_name)
+    rdf.add(node, RDF.type, TR.MacroReasoningResult)
+    rdf.add(node, TR.hasMarketRegimeName, Literal(macro_result.market_regime.value))
+    rdf.add(node, TR.hasMacroRiskLevelName, Literal(macro_result.macro_risk_level.value))
+    rdf.add(node, TR.hasMacroConfidence, Literal(str(round(float(macro_result.macro_confidence), 4)), datatype=XSD.decimal))
+    for code in macro_result.reason_codes:
+        rdf.add(node, TR.hasMacroReasonCode, Literal(str(code)))
+    for sym in macro_result.candidate_symbols:
+        sym_node = resource_iri(str(sym))
+        rdf.add(sym_node, RDF.type, TR.MacroCandidateSymbol)
+        rdf.add(node, TR.selectsCandidateSymbol, sym_node)
+    for strat in macro_result.allowed_micro_strategies:
+        s = resource_iri(f"strategy:allow:{strat}")
+        rdf.add(s, RDF.type, TR.AllowedMicroStrategy)
+        rdf.add(node, TR.allowsMicroStrategy, s)
+    for strat in macro_result.blocked_micro_strategies:
+        s = resource_iri(f"strategy:block:{strat}")
+        rdf.add(s, RDF.type, TR.BlockedMicroStrategy)
+        rdf.add(node, TR.blocksMicroStrategy, s)
+    rdf.add(node, TR.hasAnalysisCycleId, Literal(rdf.cycle_id))
+    return node
+
+
+def attach_micro_result_rdf(rdf: RdfTradingGraph, micro_result, *, node_name: str | None = None) -> URIRef:
+    node = resource_iri(node_name or f"micro:{micro_result.symbol}")
+    rdf.add(node, RDF.type, TR.MicroReasoningResult)
+    rdf.add(node, TR.hasSymbol, Literal(str(micro_result.symbol)))
+    rdf.add(node, TR.hasMicroRegimeName, Literal(micro_result.micro_regime.value))
+    rdf.add(node, TR.hasMicroConfidence, Literal(str(round(float(micro_result.confidence), 4)), datatype=XSD.decimal))
+    rdf.add(node, TR.hasExecutionQualityName, Literal(micro_result.execution_quality.value))
+    rdf.add(node, TR.hasEntrySignalName, Literal(micro_result.entry_signal.value))
+    rdf.add(node, TR.hasExitSignalName, Literal(micro_result.exit_signal.value))
+    rdf.add(node, TR.hasMicroRegimeName, Literal(micro_result.micro_regime.value))
+    _dec = lambda v: Literal(str(round(float(v), 4)), datatype=XSD.decimal)
+    if micro_result.expected_entry_price is not None:
+        rdf.add(node, TR.hasExpectedEntryPrice, _dec(micro_result.expected_entry_price))
+    if micro_result.expected_exit_price is not None:
+        rdf.add(node, TR.hasExpectedExitPrice, _dec(micro_result.expected_exit_price))
+    if micro_result.expected_gross_return_bps is not None:
+        rdf.add(node, TR.hasExpectedGrossReturnBps, _dec(micro_result.expected_gross_return_bps))
+    if micro_result.expected_net_return_bps is not None:
+        rdf.add(node, TR.hasExpectedNetReturnBps, _dec(micro_result.expected_net_return_bps))
+    if micro_result.downside_risk_bps is not None:
+        rdf.add(node, TR.hasDownsideRiskBps, _dec(micro_result.downside_risk_bps))
+    for code in micro_result.reason_codes:
+        rdf.add(node, TR.hasMicroReasonCode, Literal(str(code)))
+    rdf.add(node, TR.hasAnalysisCycleId, Literal(rdf.cycle_id))
+    return node
