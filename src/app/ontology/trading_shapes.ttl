@@ -183,6 +183,47 @@ tr:RiskDecisionShape a sh:NodeShape ;
     ] .
 
 #################################################################
+# LiveTechnicalEvidenceShape: a live technical candidate must expose the
+# evidence a human/gate needs to audit it — expected edge, confidence, horizon,
+# symbol, and a freshness marker. Live-only (targets tr:LiveTechnicalCandidate),
+# so paper/mock runs never fire it. It NEVER grants permission to trade.
+#################################################################
+tr:LiveTechnicalEvidenceShape a sh:NodeShape ;
+    sh:targetClass tr:LiveTechnicalCandidate ;
+    sh:property [
+        sh:path tr:hasSymbol ;
+        sh:minCount 1 ;
+        sh:message "Live technical candidate must carry its symbol." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:expectedEdgeBps ;
+        sh:minCount 1 ;
+        sh:message "Live technical candidate must expose an expected edge (bps)." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:technicalConfidence ;
+        sh:minCount 1 ;
+        sh:minInclusive 0 ;
+        sh:maxInclusive 1 ;
+        sh:message "Live technical candidate must expose a confidence in [0,1]." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:expectedHorizonSeconds ;
+        sh:minCount 1 ;
+        sh:message "Live technical candidate must expose an expected horizon." ;
+        sh:severity sh:Violation ;
+    ] ;
+    sh:property [
+        sh:path tr:hasAsOfTime ;
+        sh:minCount 1 ;
+        sh:message "Live technical candidate must carry a decision/freshness timestamp." ;
+        sh:severity sh:Violation ;
+    ] .
+
+#################################################################
 # FinalOrderShape: a final order must have a RiskManager approval and must
 # not be principal-protection blocked.
 #################################################################

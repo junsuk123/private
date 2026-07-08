@@ -30,6 +30,11 @@ SUPPORT_WEIGHTS = {
     "BuyCandidate": 0.08,
     "AccountCashFeasibleBuyCandidate": 0.06,
     "ExecutableBuyCandidate": 0.10,
+    # Evidence-based technical methodology support objects (advisory; only
+    # affects graphs that carry these objects, emitted by technical_evidence).
+    "VolumeConfirmedMomentum": 0.10,
+    "TechnicalBreakoutBuy": 0.10,
+    "RSIOversold": 0.08,
 }
 CONTRADICTION_WEIGHTS = {
     "ValuationDiscipline": 0.12,
