@@ -4865,6 +4865,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       market_refresher=_refresh_market_snapshot,
   )
   coordinator = LiveExecutionCoordinator(broker_client)
+  _ensure_us_fast_poll_started()
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
@@ -4877,6 +4878,48 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       cycle_observer=_record_realtime_trading_cycle,
       macro_micro_observer=macro_micro_observer,
   )
+
+
+_us_fast_poll_thread = None
+
+
+def _ensure_us_fast_poll_started() -> None:
+  """Start a US-only fast polling loop (separate from the ~minutes-long collection
+  cycle) so HELD US symbols get sub-minute realtime rows in the store, enough for
+  live feature frames / micro reasoning / exit signals. Idempotent; daemon thread."""
+  global _us_fast_poll_thread
+  import threading
+  if os.getenv("REALTIME_US_FAST_POLL_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+    return
+  if _us_fast_poll_thread is not None and _us_fast_poll_thread.is_alive():
+    return
+  t = threading.Thread(target=_us_fast_poll_loop, name="us-fast-poll", daemon=True)
+  _us_fast_poll_thread = t
+  t.start()
+
+
+def _us_fast_poll_loop() -> None:
+  import time as _t
+  from types import SimpleNamespace
+  try:
+    interval = max(5, int(os.getenv("REALTIME_US_FAST_POLL_SEC", "12")))
+  except (TypeError, ValueError):
+    interval = 12
+  while True:
+    try:
+      if "US" in set(_active_live_market_groups()):
+        acct = _live_account_snapshot_for_analysis()
+        held = tuple(dict.fromkeys(
+            str(getattr(h, "ticker", "") or "").upper().strip()
+            for h in (getattr(acct, "holdings", ()) or ())
+            if _ticker_market_group_for_live_trading(str(getattr(h, "ticker", "") or ""), str(getattr(h, "market", "") or "")) == "US"
+        ))
+        if held:
+          from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+          refresh_us_realtime_for_context_buy_candidates(SimpleNamespace(markets=(), reasoning_paths=()), symbols=held)
+    except Exception:  # noqa: BLE001 - best-effort; never crash the poll loop.
+      pass
+    _t.sleep(interval)
 
 
 def _build_macro_micro_observer(decision_engine):
