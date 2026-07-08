@@ -74,6 +74,8 @@ _ACCOUNT_PAGE = """<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Account Dashboard</title>
+  <link rel="icon" type="image/png" href="/static/icon.png" />
+  <link rel="apple-touch-icon" href="/static/icon.png" />
   <link rel="stylesheet" href="/static/account_dashboard.css" />
 </head>
 <body>

@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette import routing as starlette_routing
 
@@ -162,6 +162,15 @@ _ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
+
+_APP_ICON_PATH = Path(__file__).resolve().parent / "static" / "icon.png"
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> FileResponse:
+    # Browsers (and the Pi Chromium kiosk) auto-request /favicon.ico; serve the
+    # app icon so the tab/home-screen icon matches the in-page <link rel=icon>.
+    return FileResponse(_APP_ICON_PATH, media_type="image/png")
 audit = AuditLogger(Path("logs/web-audit.jsonl"))
 sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
@@ -1177,6 +1186,8 @@ DISPLAY_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>온톨로지 디스플레이</title>
+<link rel="icon" type="image/png" href="/static/icon.png">
+<link rel="apple-touch-icon" href="/static/icon.png">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{height:100%;width:100%;overflow:hidden;background:#0b0f16;font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;cursor:default}
@@ -1361,6 +1372,8 @@ TRADE_DISPLAY_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>온톨로지 기반 투자 프로그램</title>
+<link rel="icon" type="image/png" href="/static/icon.png">
+<link rel="apple-touch-icon" href="/static/icon.png">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
   :root{--bg:#0b0f16;--card:#141b26;--line:#263243;--muted:#8b98a9;--txt:#e6edf3}
@@ -7577,7 +7590,8 @@ HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="data:,">
+  <link rel="icon" type="image/png" href="/static/icon.png">
+  <link rel="apple-touch-icon" href="/static/icon.png">
   <title>개인 투자 분석 시스템</title>
   <style>
     :root {
