@@ -89,3 +89,21 @@ python scripts/benchmark_npu_theory_voting.py --device NPU
 python scripts/benchmark_npu_full_decision_pipeline.py --device CPU
 python scripts/benchmark_npu_full_decision_pipeline.py --device NPU
 ```
+
+## Macro–micro reasoning CPU/NPU boundary
+
+The hierarchical macro–micro ontology layer is **CPU-only by default and
+Raspberry-Pi compatible**:
+
+- `MacroMarketReasoner`, `MicroSymbolReasoner`, `OntologyCoordinator`
+  (`ThreadPoolExecutor`), and `GlobalTradeArbiter` run deterministic rule-based
+  Python on CPU. No NPU is required for macro regime classification, candidate
+  selection, strategy permission, ranking, or parallel dispatch.
+- NPU/OpenVINO is used **only** where the reused layers already support it — the
+  trained short-horizon model inside the technical prediction engine that the
+  MicroSymbolReasoner consumes — and it always has an identical-schema CPU
+  fallback (`models/inference_backend.py`). A missing/failed NPU degrades to CPU
+  without changing results' schema.
+- The coordinator's bounded parallelism (`max_parallel_symbols`, worker timeout)
+  caps CPU and API load; a failed/slow micro worker is isolated and never blocks
+  the loop, keeping the Pi runtime responsive.

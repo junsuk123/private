@@ -182,3 +182,28 @@ ProfitabilityGate or RiskManager.
   technical columns added). Prior model artifacts are retired; retrain before
   the trained model contributes again — buys stay safe (advisory fallback) until
   then.
+
+## Macro–micro ontology diagnostics
+
+The hierarchical macro–micro reasoning layer (`src/app/graph/`, see
+`docs/macro_micro_ontology_architecture.md`) is advisory — it selects candidates
+and strategy permissions and ranks intents, but never bypasses the
+ProfitabilityGate or RiskManager.
+
+- **GUI**: `/account` → "거시–미시 온톨로지 (자문 전용)" panel shows the market
+  regime, macro risk level, sector ranking, candidate symbols, allowed/blocked
+  strategies, per-symbol micro regime / entry-exit / expected net return /
+  execution quality, and the SELL/REDUCE-first ranked intents.
+  API: `GET /api/account/macro-micro`.
+- **Config**: `config/macro_micro_ontology.yaml` (env overrides logged at load;
+  invalid values clamp to conservative defaults, recorded in
+  diagnostics.config_fallbacks). Set `enabled: false` to disable the layer.
+- **Loop cadence**: macro reasons slower (default 60s) than micro (default 5s).
+  Macro `BLOCK_BUY` (high volatility / news shock / low liquidity) stops new BUY
+  micro reasoning but held-symbol SELL/REDUCE checks continue.
+- **Validation**: `python scripts/replay_macro_micro_ontology.py --from-bars <file>`
+  → `data/models/macro_micro_replay_reports/`; judge on realized net-after-cost
+  and `avg_edge_error_bps`, not gross signals.
+- **Safety check**: confirm no macro/micro node ever asserts a FinalOrder — every
+  BUY still shows TradingCostEngine/ProfitabilityGate/RiskManager reason codes,
+  and only `LiveExecutionCoordinator` submits (limit orders).

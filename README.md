@@ -103,6 +103,10 @@ KIS account + realtime ticks/orderbooks + broker quotes
   -> live feature frames, indicators, short-horizon artifacts
   -> evidence-based technical prediction layer (regime + momentum/breakout/
      mean-reversion/VWAP/volatility signals -> conservative expected exit price)
+  -> hierarchical macro-micro ontology: MacroMarketReasoner (market regime,
+     sector ranking, candidate symbols, allowed/blocked strategies) ->
+     MicroSymbolReasoner per candidate in parallel (entry/exit/expected net) ->
+     OntologyCoordinator -> GlobalTradeArbiter (SELL/REDUCE ranked before BUY)
   -> candidate filtering and NPU/CPU evidence scoring
   -> RDF/RDFS/OWL semantic labels + SHACL validation + Python policy scoring
   -> SharedLiveDecisionEngine
@@ -152,6 +156,8 @@ KIS account + realtime ticks/orderbooks + broker quotes
 - [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md): Pi CPU-only 배포와 키오스크
 - [docs/technical_prediction_layer.md](docs/technical_prediction_layer.md): 근거 기반 기술적 예측 레이어(자문 전용)
 - [docs/technical_prediction_validation.md](docs/technical_prediction_validation.md): 리플레이/워크포워드 검증(비용 차감 순수익 기준)
+- [docs/macro_micro_ontology_architecture.md](docs/macro_micro_ontology_architecture.md): 거시–미시 계층형 온톨로지 추론 구조(자문 전용)
+- [docs/macro_micro_ontology_validation.md](docs/macro_micro_ontology_validation.md): 거시/미시 no-lookahead 리플레이 검증
 
 ### 수익성 리팩터 (profitability-first refactor)
 
