@@ -2418,9 +2418,9 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         # Fail-safe: a lookup failure must never break the account check, so it
         # degrades to 0 with a diagnostic rather than raising.
         try:
-          from datetime import date as _date
+          from zoneinfo import ZoneInfo
 
-          today = _date.today()
+          today = datetime.now(ZoneInfo("Asia/Seoul")).date()
           result["realized_pnl_today_krw"] = float(client.get_domestic_realized_pnl(today, today))
         except Exception as exc:  # noqa: BLE001 - realized P&L is best-effort.
           result["realized_pnl_today_krw"] = 0.0

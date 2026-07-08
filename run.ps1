@@ -152,7 +152,7 @@ Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"
-Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "0.10"
+Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "1.25"
 # --- Day-trading (단타) exit discipline (2026-07-07) --------------------------------
 # Research-grounded (Van Tharp expectancy/R-multiple; Odean 1998 & Barber-Lee-Liu-Odean
 # on the disposition effect; StockCharts ATR stops; PwC/EY KR 0.20% sell tax). The prior
@@ -166,29 +166,28 @@ Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "0.10"
 # NOTE: research's top caveat — small-account day trading is structurally negative-
 # expectancy (round-trip cost amplifies losses); this discipline MINIMIZES losses, it
 # does not guarantee profit. Tune from realized PnL.
-Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
-Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.02"
+Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "false"
+Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.03"
 Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "false"
 Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "false"
 Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
-Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.03"
+Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.05"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_LIMIT_KRW" "1500"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW" "1000"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE" "0.004"
 Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.014"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
-Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.008"
+Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.0"
 Set-DefaultEnv "REALTIME_TAKE_PROFIT_AMOUNT_KRW" "0"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
-# Small-account "moderate" buy tuning: lower the KR net-edge floor (0.8% -> 0.4%),
-# drop the extra net-return penalty that only applied to small accounts, and shrink
-# the one-share cash headroom (5% -> 2%) so a tiny balance can still afford a share.
-# US floor is left at its already-permissive 0.35% (raising it would cut US buys).
-Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.004"
-Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_US" "0.0035"
+# Small-account buy tuning synced to the Raspberry Pi node:
+# keep the net-edge floor permissive enough for live fills, widen candidate discovery,
+# and reduce quote delay so the local launcher behaves like the deployed service.
+Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.0025"
+Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_US" "0.0025"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EXTRA_NET" "0.0"
-Set-DefaultEnv "REALTIME_ONE_SHARE_CASH_BUFFER" "1.02"
+Set-DefaultEnv "REALTIME_ONE_SHARE_CASH_BUFFER" "1.10"
 Set-DefaultEnv "REALTIME_FALLBACK_EDGE_BPS_PER_SCORE" "220"
 Set-DefaultEnv "REALTIME_US_EXCLUDE_SYMBOL_SUFFIXES" "U,WS,WT,W,R,P"
 Set-DefaultEnv "REALTIME_LOSS_REENTRY_COOLDOWN_SEC" "7200"
@@ -197,6 +196,15 @@ Set-DefaultEnv "REALTIME_LOSS_REBUY_RETURN_THRESHOLD" "-0.004"
 Set-DefaultEnv "REALTIME_MAX_BUY_ORDERS_PER_CYCLE" "1"
 Set-DefaultEnv "REALTIME_BUY_WEIGHT" "0.003"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.001"
+Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "30"
+Set-DefaultEnv "REALTIME_BUY_CANDIDATE_LIMIT" "240"
+Set-DefaultEnv "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC" "300"
+Set-DefaultEnv "REALTIME_US_DISCOVERY_CANDIDATE_LIMIT" "16"
+Set-DefaultEnv "REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT" "12"
+Set-DefaultEnv "REALTIME_AFFORDABLE_CANDIDATE_TTL_SEC" "120"
+Set-DefaultEnv "REALTIME_BROKER_QUOTE_DELAY_SEC" "0.15"
+Set-DefaultEnv "REALTIME_VOLUME_SURGE_LIMIT" "16"
+Set-DefaultEnv "REALTIME_US_FEATURE_WARM_LIMIT" "10"
 Set-DefaultEnv "REALTIME_SYMBOL_VOLATILITY_WINDOW_SEC" "300"
 Set-DefaultEnv "REALTIME_MARKET_VOLATILITY_WINDOW_SEC" "300"
 Set-DefaultEnv "REALTIME_MAX_SYMBOL_VOLATILITY_BUY" "0.015"

@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.cost import TradingCostEngine
 from app.account_snapshot_store import AccountSnapshotStore
+
+
+_COST_ENGINE = TradingCostEngine()
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,8 @@ class AccountDashboardService:
 
     def build_dashboard(self, *, persist: bool = True) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
+        previous_dashboard = self.store.latest_dashboard() or {}
+        previous_snapshot = dict(previous_dashboard.get("snapshot") or {})
         status = self._status_payload()
         logs = self._logs_payload()
         updated_at = _parse_time(status.get("updated_at")) or now
@@ -145,6 +151,16 @@ class AccountDashboardService:
         total_asset_krw = _num(status.get("equity") or status.get("actual_equity") or status.get("account_value"))
         if total_asset_krw <= 0:
             total_asset_krw = cash_equivalent_krw + domestic_value + overseas_value
+        if total_asset_krw <= 0 and previous_snapshot:
+            total_asset_krw = _num(previous_snapshot.get("total_asset_krw") or previous_snapshot.get("net_asset_krw"))
+        if cash_equivalent_krw <= 0 and previous_snapshot:
+            cash_equivalent_krw = _num(previous_snapshot.get("cash_equivalent_krw"))
+        if krw_cash <= 0 and previous_snapshot:
+            krw_cash = _num(previous_snapshot.get("krw_cash"))
+        if foreign_cash_krw <= 0 and previous_snapshot:
+            foreign_cash_krw = _num(previous_snapshot.get("foreign_cash_krw"))
+        if settlement_cash_krw <= 0 and previous_snapshot:
+            settlement_cash_krw = _num(previous_snapshot.get("settlement_cash_krw"))
         holdings = [
             HoldingDashboardRow(**{**asdict(row), "weight_of_total_asset": _ratio(row.evaluation_amount_krw, total_asset_krw)})
             for row in holdings
@@ -285,13 +301,25 @@ def _holding_from_position(position: dict[str, Any], updated_at: str) -> Holding
     if pnl_krw == 0:
         pnl_krw = evaluation_krw - purchase_krw
     # Exit-cost aware fields. round_trip_cost_rate is attached by the realtime exit
-    # decision engine to exit intents; account snapshots rarely carry it, so these
-    # stay 0 and the front-end shows "n/a" rather than fabricating a break-even.
+    # decision engine to exit intents; account snapshots rarely carry it, so we
+    # fall back to a current-price estimate here so the dashboard can show a
+    # realistic break-even and net PnL instead of n/a for every live holding.
     round_trip_cost_rate = _num(
         position.get("round_trip_cost_rate") or position.get("all_in_cost_rate")
     )
+    if round_trip_cost_rate <= 0 and quantity > 0 and average_price > 0 and current_price > 0:
+        round_trip_cost_rate = _estimate_round_trip_cost_rate(
+            market_group=market_group,
+            market=market,
+            exchange=str(position.get("exchange") or market),
+            currency=currency,
+            ticker=str(position.get("ticker") or ""),
+            quantity=quantity,
+            average_price=average_price,
+            current_price=current_price,
+        )
     break_even_price = average_price * (1.0 + round_trip_cost_rate) if (average_price > 0 and round_trip_cost_rate > 0) else 0.0
-    estimated_net_pnl_krw = pnl_krw - round_trip_cost_rate * evaluation_krw if round_trip_cost_rate > 0 else 0.0
+    estimated_net_pnl_krw = pnl_krw - (round_trip_cost_rate * evaluation_krw) if round_trip_cost_rate > 0 else 0.0
     return HoldingDashboardRow(
         market_group=market_group,
         market=market,
@@ -319,6 +347,46 @@ def _holding_from_position(position: dict[str, Any], updated_at: str) -> Holding
         break_even_price=break_even_price,
         estimated_net_pnl_krw=estimated_net_pnl_krw,
     )
+
+
+def _estimate_round_trip_cost_rate(
+    *,
+    market_group: str,
+    market: str,
+    exchange: str,
+    currency: str,
+    ticker: str,
+    quantity: float,
+    average_price: float,
+    current_price: float,
+) -> float:
+    venue = _cost_venue_for_position(market_group=market_group, market=market, exchange=exchange, ticker=ticker)
+    instrument_type = "domestic_stock" if currency == "KRW" else "overseas_stock"
+    try:
+        cost = _COST_ENGINE.estimate(
+            symbol=ticker,
+            market=market,
+            venue=venue,
+            instrument_type=instrument_type,
+            entry_price=average_price,
+            expected_exit_price=current_price,
+            quantity=max(1, int(quantity)),
+        )
+    except Exception:
+        return 0.0
+    return _num(cost.total_cost_rate)
+
+
+def _cost_venue_for_position(*, market_group: str, market: str, exchange: str, ticker: str) -> str:
+    market_name = str(market or exchange or "").upper().strip()
+    ticker_text = str(ticker or "").strip()
+    if market_name in {"NXT", "KOSPI", "KOSDAQ", "KONEX"}:
+        return market_name
+    if market_name in {"KR", "KRX"} or market_group == "domestic" or ticker_text.isdigit():
+        return "KRX"
+    if market_name in {"NASD", "NYSE", "AMEX", "OVERSEAS", "US"}:
+        return "NASD"
+    return "KRX" if market_group == "domestic" else "NASD"
 
 
 def _cash_rows(status: dict[str, Any], updated_at: str) -> list[CashCurrencyRow]:

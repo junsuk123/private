@@ -10,7 +10,7 @@
 
 base_position_weight: 0.003
 min_position_weight: 0.0
-max_position_weight: 0.10
+max_position_weight: 1.25
 
 # Fractional Kelly (never full Kelly).
 kelly_fraction: 0.25

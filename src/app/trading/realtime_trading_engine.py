@@ -762,6 +762,12 @@ class RealtimeTradingEngine:
                 event["detail"] = f"amend_not_available={exc.__class__.__name__}: {exc}"
                 self._record(event)
                 return False
+            if "원주문정보가 존재하지않습니다" in str(exc):
+                self._open_sell_orders.pop(order.ticker, None)
+                event["outcome"] = "open_sell_dropped"
+                event["detail"] = f"amend_missing_origin={exc.__class__.__name__}: {exc}"
+                self._record(event)
+                return self._submit(order, "SELL", reason_codes, decision_time, summary)
             if "정정취소 가능수량" in str(exc) or "no quantity" in str(exc).lower():
                 self._open_sell_orders.pop(order.ticker, None)
                 event["outcome"] = "open_sell_dropped"

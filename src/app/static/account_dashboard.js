@@ -109,14 +109,20 @@ function renderProfitability(prof, snapshot, trading) {
     armedBadge.textContent = isArmed ? '라이브 무장' : (running ? '매수 정지' : '대기');
     armedBadge.className = isArmed ? 'badge' : 'badge warn';
   }
+  const closedTradeCount = Number(prof.closed_trade_count || 0);
+  const zeroTradeState = closedTradeCount === 0;
+  const fallbackValue = (value, formatter, fallback = '0') => {
+    if (value === null || value === undefined) return fallback;
+    return formatter(value);
+  };
   const budgetRemaining = summary.daily_loss_budget_remaining_krw;
   const rows = [
-    ['오늘 순손익(실현−비용)', fmtOrNa(prof.net_after_cost_krw, fmtKrw), `실현 ${fmtKrw(prof.realized_pnl_today_krw)} · 비용 ${fmtKrw(prof.trade_cost_krw)}`, clsPnl(prof.net_after_cost_krw)],
-    ['승률', fmtOrNa(prof.win_rate, fmtPct), `${prof.win_count || 0}승 / ${prof.loss_count || 0}패 (${prof.closed_trade_count || 0}건)`],
-    ['평균 수익', fmtOrNa(prof.avg_win_krw, fmtKrw), '이익 거래 평균', 'positive'],
-    ['평균 손실', fmtOrNa(prof.avg_loss_krw, fmtKrw), '손실 거래 평균', 'negative'],
-    ['손익비 (Payoff)', fmtOrNa(prof.payoff_ratio, (v) => Number(v).toFixed(2)), '평균수익 / |평균손실|'],
-    ['기대값 (Expectancy)', fmtOrNa(prof.expectancy_krw, fmtKrw), '거래당 기대손익', clsPnl(prof.expectancy_krw)],
+    ['오늘 순손익(실현−비용)', fmtKrw(prof.net_after_cost_krw), `실현 ${fmtKrw(prof.realized_pnl_today_krw)} · 비용 ${fmtKrw(prof.trade_cost_krw)}`, clsPnl(prof.net_after_cost_krw)],
+    ['승률', zeroTradeState ? '0.00%' : fallbackValue(prof.win_rate, fmtPct, '0.00%'), `${prof.win_count || 0}승 / ${prof.loss_count || 0}패 (${closedTradeCount}건)`],
+    ['평균 수익', zeroTradeState ? '₩0' : fallbackValue(prof.avg_win_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '이익 거래 평균', 'positive'],
+    ['평균 손실', zeroTradeState ? '₩0' : fallbackValue(prof.avg_loss_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '손실 거래 평균', 'negative'],
+    ['손익비 (Payoff)', zeroTradeState ? '0.00' : fallbackValue(prof.payoff_ratio, (v) => Number(v).toFixed(2), '0.00'), zeroTradeState ? '청산 거래 없음' : '평균수익 / |평균손실|'],
+    ['기대값 (Expectancy)', zeroTradeState ? '₩0' : fallbackValue(prof.expectancy_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '거래당 기대손익', clsPnl(prof.expectancy_krw)],
     ['거래 비용', fmtKrw(prof.trade_cost_krw), `수수료 ${fmtKrw(prof.fees_krw)} · 세금 ${fmtKrw(prof.tax_krw)}`, 'negative'],
     ['일일 손실 한도 잔여', budgetRemaining === null || budgetRemaining === undefined ? 'n/a' : fmtKrw(budgetRemaining), summary.daily_loss_budget_krw ? `한도 ${fmtKrw(summary.daily_loss_budget_krw)}` : '한도 미설정'],
   ];
@@ -132,8 +138,8 @@ function renderProfitability(prof, snapshot, trading) {
   }
   const note = document.getElementById('profitability-note');
   if (note) {
-    note.textContent = (prof.closed_trade_count || 0) === 0
-      ? '체결된 청산 거래가 없어 승률·손익비·기대값은 n/a로 표시됩니다.'
+    note.textContent = zeroTradeState
+      ? '체결된 청산 거래가 없어 승률·손익비·기대값은 0 기준으로 표시됩니다.'
       : '승률·평균손익·손익비·기대값은 최근 청산 거래(실현손익) 기준입니다.';
   }
 }
