@@ -22,6 +22,8 @@ from app.graph.rdf_graph import bind_namespaces
 _ONTOLOGY_DIR = Path(__file__).resolve().parent.parent / "ontology"
 _CORE = _ONTOLOGY_DIR / "trading_core.ttl"
 _RULES = _ONTOLOGY_DIR / "trading_rules.ttl"
+_MACRO = _ONTOLOGY_DIR / "macro_market_ontology.ttl"
+_MICRO = _ONTOLOGY_DIR / "micro_symbol_ontology.ttl"
 
 # module-level cache: (paths signature) -> parsed schema Graph
 _schema_cache: dict[tuple, Graph] = {}
@@ -45,14 +47,21 @@ def _signature(paths: tuple[Path, ...]) -> tuple:
     return tuple(parts)
 
 
-def load_schema_graph(*, include_rules: bool = True) -> SchemaLoadResult:
+def load_schema_graph(*, include_rules: bool = True, include_macro_micro: bool = False) -> SchemaLoadResult:
     """Load (and cache) the core (+ rules) ontology as a single schema graph.
 
     Cached by file mtime; editing a TTL invalidates the cache automatically.
     On failure returns an empty graph and a populated ``error`` so callers can
     surface it in diagnostics and fall back safely (never fail open).
+
+    ``include_macro_micro`` additionally loads the macro + micro ontology files
+    (hierarchical refactor). It defaults to ``False`` so existing OWL closure /
+    materialization behavior is unchanged; callers that need the macro/micro
+    vocabulary opt in explicitly.
     """
-    paths = (_CORE, _RULES) if include_rules else (_CORE,)
+    paths: tuple[Path, ...] = (_CORE, _RULES) if include_rules else (_CORE,)
+    if include_macro_micro:
+        paths = paths + (_MACRO, _MICRO)
     signature = _signature(paths)
     cached = _schema_cache.get(signature)
     if cached is not None:

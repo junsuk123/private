@@ -518,3 +518,35 @@ tr:spreadBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "sprea
 tr:vwapDistanceBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "VWAP distance (bps)" .
 tr:hasMethodologyName a owl:DatatypeProperty ; rdfs:domain tr:TechnicalSignal ; rdfs:range xsd:string ; rdfs:label "has methodology name" .
 tr:hasRegimeName a owl:DatatypeProperty ; rdfs:domain tr:MarketRegimeState ; rdfs:range xsd:string ; rdfs:label "has regime name" .
+
+#################################################################
+# Common macro–micro shared vocabulary (hierarchical refactor)
+#
+# Concepts shared by the Macro Market Ontology and the Micro Symbol Ontology.
+# Defined once here so both layers import/reference (never re-declare) them.
+# Advisory categorization only — the RiskManager remains the sole execution gate.
+#################################################################
+
+tr:Market a owl:Class ; rdfs:subClassOf tr:MarketEntity ; rdfs:label "Market" .
+tr:Strategy a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Strategy" .
+tr:Regime a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Regime" .
+tr:RiskState a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Risk State" .
+tr:Confidence a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Confidence" .
+tr:ExpectedReturn a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Expected Return" .
+tr:ExpectedCost a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Expected Cost" .
+tr:LiquidityState a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Liquidity State" .
+tr:FreshnessState a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Freshness State" .
+tr:TradeCandidate a owl:Class ; rdfs:subClassOf tr:CandidateAsset ; rdfs:label "Trade Candidate" .
+tr:DataSource a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Data Source" .
+tr:Provenance a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Provenance" .
+tr:ExplanationPath a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Explanation Path" .
+
+# Shared reasoning-result roots (macro/micro specialize these).
+tr:ReasoningResult a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Reasoning Result" ;
+    rdfs:comment "Root of MacroReasoningResult / MicroReasoningResult. Advisory evidence; never a FinalOrder." .
+
+# Shared advisory data properties.
+tr:hasReasonCode a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has reason code" .
+tr:hasExplanationText a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has explanation text" .
+tr:hasFreshnessState a owl:ObjectProperty ; rdfs:range tr:FreshnessState ; rdfs:label "has freshness state" .
+tr:derivedFromDataSource a owl:ObjectProperty ; rdfs:range tr:DataSource ; rdfs:label "derived from data source" .

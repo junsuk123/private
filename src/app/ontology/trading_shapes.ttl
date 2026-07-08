@@ -254,3 +254,43 @@ tr:FinalOrderShape a sh:NodeShape ;
             }
         """ ;
     ] .
+
+#################################################################
+# MacroReasoningResultShape / MicroReasoningResultShape
+#
+# Structural validation of the hierarchical macro–micro reasoning outputs when
+# projected to RDF. These NEVER grant permission to trade; RiskManager remains
+# the sole execution gate. Live-mode violations are reported as blocking by the
+# validator; paper-mode as warnings.
+#################################################################
+tr:MacroReasoningResultShape a sh:NodeShape ;
+    sh:targetClass tr:MacroReasoningResult ;
+    sh:property [ sh:path tr:hasMarketRegimeName ; sh:minCount 1 ;
+        sh:message "Macro result must expose a market regime." ; sh:severity sh:Violation ] ;
+    sh:property [ sh:path tr:hasMacroConfidence ; sh:minCount 1 ;
+        sh:minInclusive 0 ; sh:maxInclusive 1 ;
+        sh:message "Macro result must expose a confidence in [0,1]." ; sh:severity sh:Violation ] ;
+    sh:property [ sh:path tr:hasMacroRiskLevelName ; sh:minCount 1 ;
+        sh:message "Macro result must expose a macro risk level." ; sh:severity sh:Violation ] .
+
+tr:MicroReasoningResultShape a sh:NodeShape ;
+    sh:targetClass tr:MicroReasoningResult ;
+    sh:property [ sh:path tr:hasMicroRegimeName ; sh:minCount 1 ;
+        sh:message "Micro result must expose a micro regime." ; sh:severity sh:Violation ] ;
+    sh:property [ sh:path tr:hasMicroConfidence ; sh:minCount 1 ;
+        sh:minInclusive 0 ; sh:maxInclusive 1 ;
+        sh:message "Micro result must expose a confidence in [0,1]." ; sh:severity sh:Violation ] ;
+    sh:property [ sh:path tr:hasExecutionQualityName ; sh:minCount 1 ;
+        sh:message "Micro result must expose an execution quality." ; sh:severity sh:Violation ] ;
+    sh:sparql [
+        sh:message "A micro BUY_CANDIDATE must carry expected exit price and expected net return." ;
+        sh:severity sh:Violation ;
+        sh:select """
+            PREFIX tr: <https://example.com/ontology/trading#>
+            SELECT $this WHERE {
+                $this tr:hasEntrySignalName ?sig .
+                FILTER(?sig = "BUY_CANDIDATE")
+                FILTER NOT EXISTS { $this tr:hasExpectedExitPrice ?ep }
+            }
+        """ ;
+    ] .

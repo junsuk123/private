@@ -103,3 +103,33 @@ tr:Risk_ConcentratedPosition a tr:RiskFactor ; rdfs:label "Concentrated Position
   owl:onProperty tr:supportsSignal ;
   owl:hasValue tr:Signal_WaitOrTakeProfit
 ] rdfs:subClassOf tr:WatchCandidate .
+
+#################################################################
+# Macro market rules (hierarchical macro–micro refactor)
+#
+# Design boundary reminder: numeric market-regime classification, sector
+# scoring, and candidate selection are performed in Python
+# (app.graph.macro_reasoner.MacroMarketReasoner). The axioms below only assert
+# safe categorization so RDFS/OWL-RL can surface macro membership; they never
+# authorize a trade.
+#################################################################
+
+# A macro-selected candidate is a TradeCandidate (already advisory).
+tr:MacroCandidateSymbol rdfs:subClassOf tr:TradeCandidate .
+# A blocked-buy macro risk state contributes risk evidence only.
+tr:MacroRiskState rdfs:subClassOf tr:RiskState .
+
+#################################################################
+# Micro symbol rules (hierarchical macro–micro refactor)
+#
+# Numeric entry/exit timing, expected price, and expected-net-return reasoning
+# are performed in Python (app.graph.micro_reasoner.MicroSymbolReasoner), which
+# reuses the technical prediction layer and enforces the macro strategy
+# permission gate. The axioms below only assert safe categorization.
+#################################################################
+
+# Every micro-BUY strategy signal is a positive strategy signal (advisory).
+tr:MomentumCandidate rdfs:subClassOf tr:MicroRegime .
+tr:BreakoutCandidate rdfs:subClassOf tr:MicroRegime .
+# Exit deterioration contributes SELL/REDUCE evidence, never a forced loss exit.
+tr:ExitDeterioration rdfs:subClassOf tr:MicroRegime .

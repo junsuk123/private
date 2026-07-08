@@ -1,0 +1,81 @@
+@prefix tr:   <https://example.com/ontology/trading#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Micro Symbol Ontology
+#
+# Symbol-level reasoning vocabulary: micro regime, entry/exit timing, expected
+# entry/exit price, expected net return, execution quality, and symbol risk.
+# Imports the common vocabulary (trading_core.ttl). The technical-signal classes
+# (TechnicalSignal, MomentumSignal, BreakoutSignal, MeanReversionSignal,
+# VwapConfirmationSignal) already live in trading_core.ttl and are REFERENCED
+# here, not re-declared. ONE reusable ontology; each symbol is an instance/URI
+# (never one file per symbol). ADVISORY ONLY: never creates a FinalOrder.
+#################################################################
+
+<https://example.com/ontology/trading/micro>
+    a owl:Ontology ;
+    owl:imports <https://example.com/ontology/trading> ;
+    rdfs:label "Micro Symbol Ontology" ;
+    rdfs:comment "Symbol-level technical signal, entry/exit timing, expected price/net-return, execution quality, symbol risk. Advisory categorization only." .
+
+# --- Symbol context + micro regime ------------------------------------------
+tr:SymbolContext a owl:Class ; rdfs:subClassOf tr:MarketEntity ; rdfs:label "Symbol Context" .
+tr:MicroRegime a owl:Class ; rdfs:subClassOf tr:Regime ; rdfs:label "Micro Regime" .
+tr:MomentumCandidate a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "Momentum Candidate" .
+tr:BreakoutCandidate a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "Breakout Candidate" .
+tr:MeanReversionCandidate a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "Mean Reversion Candidate" .
+tr:VWAPReversionCandidate a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "VWAP Reversion Candidate" .
+tr:ExitDeterioration a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "Exit Deterioration" .
+tr:HoldOrWatch a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "Hold Or Watch" .
+tr:NoTradeSymbol a owl:Class ; rdfs:subClassOf tr:MicroRegime ; rdfs:label "No Trade Symbol" .
+
+# --- Technical signals: reference core; add the two micro-only ones ---------
+# (tr:TechnicalSignal / MomentumSignal / BreakoutSignal / MeanReversionSignal /
+#  VwapConfirmationSignal are declared in trading_core.ttl.)
+tr:VWAPSignal a owl:Class ; rdfs:subClassOf tr:TechnicalSignal ; rdfs:label "VWAP Signal" .
+tr:VolumeConfirmation a owl:Class ; rdfs:subClassOf tr:TechnicalSignal ; rdfs:label "Volume Confirmation" .
+
+# --- Symbol-level risk + execution quality + expected-value evidence --------
+tr:SpreadRisk a owl:Class ; rdfs:subClassOf tr:RiskFactor ; rdfs:label "Spread Risk" .
+tr:LiquidityRisk a owl:Class ; rdfs:subClassOf tr:RiskFactor ; rdfs:label "Liquidity Risk" .
+tr:ExecutionQuality a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Execution Quality" .
+tr:ExpectedEntryPrice a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Expected Entry Price" .
+tr:ExpectedExitPrice a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Expected Exit Price" .
+tr:ExpectedNetReturn a owl:Class ; rdfs:subClassOf tr:ExpectedReturn ; rdfs:label "Expected Net Return" .
+tr:DownsideRisk a owl:Class ; rdfs:subClassOf tr:RiskFactor ; rdfs:label "Downside Risk" .
+tr:MicroEvidence a owl:Class ; rdfs:subClassOf tr:EvidenceItem ; rdfs:label "Micro Evidence" .
+tr:MicroReasoningResult a owl:Class ; rdfs:subClassOf tr:ReasoningResult ; rdfs:label "Micro Reasoning Result" ;
+    rdfs:comment "Structured micro output. Advisory OrderIntent-like evidence; never a FinalOrder." .
+
+# --- Object properties ------------------------------------------------------
+tr:hasMicroRegime a owl:ObjectProperty ; rdfs:domain tr:SymbolContext ; rdfs:range tr:MicroRegime ; rdfs:label "has micro regime" .
+tr:hasTechnicalSignal a owl:ObjectProperty ; rdfs:range tr:TechnicalSignal ; rdfs:label "has technical signal" .
+tr:hasExecutionQuality a owl:ObjectProperty ; rdfs:range tr:ExecutionQuality ; rdfs:label "has execution quality" .
+tr:confirmsEntry a owl:ObjectProperty ; rdfs:subPropertyOf tr:hasSemanticEvidence ; rdfs:label "confirms entry" .
+tr:weakensEntry a owl:ObjectProperty ; rdfs:subPropertyOf tr:hasSemanticEvidence ; rdfs:label "weakens entry" .
+tr:confirmsExit a owl:ObjectProperty ; rdfs:subPropertyOf tr:hasSemanticEvidence ; rdfs:label "confirms exit" .
+tr:weakensExit a owl:ObjectProperty ; rdfs:subPropertyOf tr:hasSemanticEvidence ; rdfs:label "weakens exit" .
+tr:isAllowedByMacroStrategy a owl:ObjectProperty ; rdfs:label "is allowed by macro strategy" .
+tr:isBlockedByMacroStrategy a owl:ObjectProperty ; rdfs:label "is blocked by macro strategy" .
+tr:derivedFromRealtimeSource a owl:ObjectProperty ; rdfs:range tr:DataSource ; rdfs:label "derived from realtime source" .
+
+# --- Data properties (reuse core: vwapDistanceBps/spreadBps/liquidityScore/
+#      expectedEdgeBps/technicalConfidence/downsideRiskBps from the technical layer) ---
+tr:hasExpectedEntryPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has expected entry price" .
+tr:hasExpectedExitPrice a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has expected exit price" .
+tr:hasExpectedGrossReturnBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has expected gross return (bps)" .
+tr:hasExpectedNetReturnBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has expected net return (bps)" .
+tr:hasDownsideRiskBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has downside risk (bps)" .
+tr:hasVWAPDistanceBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has VWAP distance (bps)" .
+tr:hasSpreadBps a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has spread (bps)" .
+tr:hasLiquidityScore a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has liquidity score" .
+tr:hasMicroConfidence a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has micro confidence" .
+tr:hasMicroReasonCode a owl:DatatypeProperty ; rdfs:subPropertyOf tr:hasReasonCode ; rdfs:range xsd:string ; rdfs:label "has micro reason code" .
+tr:hasMicroRegimeName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has micro regime name" .
+tr:hasEntrySignalName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has entry signal name" .
+tr:hasExitSignalName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has exit signal name" .
+tr:hasExecutionQualityName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has execution quality name" .

@@ -1,0 +1,68 @@
+@prefix tr:   <https://example.com/ontology/trading#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+#################################################################
+# Macro Market Ontology
+#
+# Market-level reasoning vocabulary: regime, sector strength, macro risk,
+# liquidity environment, candidate selection, and allowed/blocked micro
+# strategies. Imports the common vocabulary in trading_core.ttl (same tr:
+# namespace). ADVISORY ONLY: the macro layer selects candidates and strategy
+# permissions; it never creates a FinalOrder.
+#################################################################
+
+<https://example.com/ontology/trading/macro>
+    a owl:Ontology ;
+    owl:imports <https://example.com/ontology/trading> ;
+    rdfs:label "Macro Market Ontology" ;
+    rdfs:comment "Market regime, sector strength, macro risk, candidate universe, strategy permissions. Advisory categorization only." .
+
+# --- Market context + regime ------------------------------------------------
+tr:MarketContext a owl:Class ; rdfs:subClassOf tr:MarketEntity ; rdfs:label "Market Context" .
+tr:MarketRegime a owl:Class ; rdfs:subClassOf tr:Regime ; rdfs:label "Market Regime" .
+tr:TrendUpMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "Trend Up Market" .
+tr:TrendDownMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "Trend Down Market" .
+tr:RangeBoundMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "Range Bound Market" .
+tr:BreakoutMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "Breakout Market" .
+tr:HighVolatilityMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "High Volatility Market" .
+tr:LowLiquidityMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "Low Liquidity Market" .
+tr:NewsShockMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "News Shock Market" .
+tr:NoTradeMarket a owl:Class ; rdfs:subClassOf tr:MarketRegime ; rdfs:label "No Trade Market" .
+
+# --- Sector context ---------------------------------------------------------
+tr:SectorContext a owl:Class ; rdfs:subClassOf tr:MarketEntity ; rdfs:label "Sector Context" .
+tr:SectorStrength a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Sector Strength" .
+tr:StrongSector a owl:Class ; rdfs:subClassOf tr:SectorStrength ; rdfs:label "Strong Sector" .
+tr:WeakSector a owl:Class ; rdfs:subClassOf tr:SectorStrength ; rdfs:label "Weak Sector" .
+
+# --- Candidate universe + macro risk + strategy permission ------------------
+tr:CandidateUniverse a owl:Class ; rdfs:subClassOf tr:TradingEntity ; rdfs:label "Candidate Universe" .
+tr:MacroCandidateSymbol a owl:Class ; rdfs:subClassOf tr:TradeCandidate ; rdfs:label "Macro Candidate Symbol" .
+tr:MacroRiskState a owl:Class ; rdfs:subClassOf tr:RiskState ; rdfs:label "Macro Risk State" .
+tr:AllowedMicroStrategy a owl:Class ; rdfs:subClassOf tr:Strategy ; rdfs:label "Allowed Micro Strategy" .
+tr:BlockedMicroStrategy a owl:Class ; rdfs:subClassOf tr:Strategy ; rdfs:label "Blocked Micro Strategy" .
+tr:MacroEvidence a owl:Class ; rdfs:subClassOf tr:EvidenceItem ; rdfs:label "Macro Evidence" .
+tr:MacroReasoningResult a owl:Class ; rdfs:subClassOf tr:ReasoningResult ; rdfs:label "Macro Reasoning Result" ;
+    rdfs:comment "Structured macro output. Advisory evidence; never a FinalOrder." .
+
+# --- Object properties ------------------------------------------------------
+tr:hasMarketRegime a owl:ObjectProperty ; rdfs:domain tr:MarketContext ; rdfs:range tr:MarketRegime ; rdfs:label "has market regime" .
+tr:hasSectorStrength a owl:ObjectProperty ; rdfs:domain tr:SectorContext ; rdfs:range tr:SectorStrength ; rdfs:label "has sector strength" .
+tr:hasMacroRiskState a owl:ObjectProperty ; rdfs:range tr:MacroRiskState ; rdfs:label "has macro risk state" .
+tr:selectsCandidateSymbol a owl:ObjectProperty ; rdfs:range tr:MacroCandidateSymbol ; rdfs:label "selects candidate symbol" .
+tr:allowsMicroStrategy a owl:ObjectProperty ; rdfs:range tr:AllowedMicroStrategy ; rdfs:label "allows micro strategy" .
+tr:blocksMicroStrategy a owl:ObjectProperty ; rdfs:range tr:BlockedMicroStrategy ; rdfs:label "blocks micro strategy" .
+tr:derivedFromMarketSource a owl:ObjectProperty ; rdfs:range tr:DataSource ; rdfs:label "derived from market source" .
+
+# --- Data properties --------------------------------------------------------
+tr:hasMarketBreadth a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has market breadth" .
+tr:hasMarketVolatility a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has market volatility" .
+tr:hasTotalTradingValue a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has total trading value" .
+tr:hasSectorVolumeChange a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has sector volume change" .
+tr:hasMacroConfidence a owl:DatatypeProperty ; rdfs:range xsd:decimal ; rdfs:label "has macro confidence" .
+tr:hasMacroReasonCode a owl:DatatypeProperty ; rdfs:subPropertyOf tr:hasReasonCode ; rdfs:range xsd:string ; rdfs:label "has macro reason code" .
+tr:hasMarketRegimeName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has market regime name" .
+tr:hasMacroRiskLevelName a owl:DatatypeProperty ; rdfs:range xsd:string ; rdfs:label "has macro risk level name" .
