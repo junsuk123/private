@@ -529,7 +529,28 @@ class KisDevelopersApiClient:
             # No per-currency FX available: fall back to the broker's foreign-cash figure
             # minus the domestic settled deposit it double-counts.
             usd_cash_krw = max(0.0, foreign_cash_krw - cash)
-        if domestic_total_assets_krw > 0:
+        if total_assets_krw > 0 and total_assets_krw >= cash:
+            # KIS overseas present-balance output3.tot_asst_amt is the broker's own
+            # integrated 총자산 (settled KRW deposit + overseas stock + usable foreign
+            # cash) — exactly what the KIS app shows. Prefer it verbatim so our total
+            # matches the app. It is built from overseas-endpoint fields only, so it
+            # EXCLUDES domestic equity holdings; add those back (counted once).
+            #
+            # Guard `>= cash`: only trust it as the *integrated* total when it actually
+            # covers the domestic KRW deposit (the real integrated view carries the KRW
+            # deposit — tot_dncl_amt — inside tot_asst_amt). Some responses report
+            # tot_asst_amt as a foreign-only figure that omits the KRW deposit; those must
+            # fall through to the component sum below, or the KRW deposit gets dropped.
+            #
+            # Why this beats tot_evlu_amt: while overseas buys are still settling (T+2)
+            # the domestic D+2 deposit (prvs_rcdl_excc_amt, which feeds tot_evlu_amt) is
+            # already reduced by the pending buy, yet we also hold the purchased overseas
+            # stock — so tot_evlu_amt + overseas stock UNDERcounts by the in-flight amount
+            # (e.g. settled 159,638 vs D+2 73,992 → ~85k missing). tot_asst_amt uses the
+            # settled KRW deposit, matching the app through settlement.
+            total_equity_krw = total_assets_krw + domestic_position_value
+            cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
+        elif domestic_total_assets_krw > 0:
             total_equity_krw = domestic_total_assets_krw + overseas_position_value_krw + usd_cash_krw
             cash_equivalent_krw = max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
         else:

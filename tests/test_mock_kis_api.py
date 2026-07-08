@@ -524,12 +524,20 @@ class MockKisApiTest(unittest.TestCase):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):
                 self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
                 if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
-                    return {"rt_cd": "0", "output1": [], "output2": [{"dnca_tot_amt": "20374", "tot_evlu_amt": "99554"}]}
+                    # KRW deposit 20,374 + one domestic holding worth 79,180 = tot_evlu_amt 99,554.
+                    return {
+                        "rt_cd": "0",
+                        "output1": [{"pdno": "005930", "hldg_qty": "1", "ord_psbl_qty": "1", "pchs_avg_pric": "79180", "prpr": "79180"}],
+                        "output2": [{"dnca_tot_amt": "20374", "tot_evlu_amt": "99554"}],
+                    }
                 if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
                     return {"rt_cd": "0", "output": {"ord_psbl_cash": "20374"}}
                 if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
                     return {"rt_cd": "0", "output1": []}
                 if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    # tot_asst_amt is the broker's integrated 총자산 (settled KRW deposit +
+                    # usable foreign cash), which re-includes the domestic KRW deposit and so
+                    # must NOT have KRW cash re-added — only the domestic stock (79,180).
                     return {
                         "rt_cd": "0",
                         "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "38.8", "frcr_drwg_psbl_amt_1": "38.8", "bass_exrt": "1554.1"}],
