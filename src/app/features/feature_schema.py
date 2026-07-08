@@ -25,6 +25,18 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     # realized outcomes. Adding this bumps schema_hash, so existing artifacts are
     # retired and a fresh one retrains — expected and safe (model is advisory).
     "news_sentiment",
+    # Evidence-based technical indicators (Phase 4 of the technical prediction
+    # layer). Computed from the same realtime tick series already used above and
+    # emitted with NEUTRAL finite defaults on short data (rsi 50, %b 0.5, ratios
+    # 0/1), so they never make a live frame fail validation. Adding these bumps
+    # schema_hash: prior artifacts retire and a fresh model retrains — the
+    # designed, advisory-safe flow (see live_short_horizon_v2 below).
+    "rsi_14",
+    "macd_histogram",
+    "bollinger_percent_b",
+    "ema_gap_bps",
+    "donchian_breakout",
+    "volume_spike_ratio",
 )
 
 
@@ -49,7 +61,11 @@ class FeatureSchema:
 
 
 LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
-    version="live_short_horizon_v1",
+    # v2 adds the technical-indicator columns above. The version string is part
+    # of the schema_hash, so bumping it retires prior artifacts and forces a
+    # retrain on the new feature set (advisory model; live buys fall back to the
+    # non-model score until a fresh artifact is trained).
+    version="live_short_horizon_v2",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

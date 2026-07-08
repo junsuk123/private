@@ -131,6 +131,7 @@ class LiveFeatureFrameBuilder:
         bid_depth = float(orderbook.total_bid_volume)
         ask_depth = float(orderbook.total_ask_volume)
         depth_ratio = bid_depth / max(1.0, ask_depth)
+        technical = _technical_columns(prices, volumes)
         feature_dict = {
             "return_30s": _window_return(ticks, decision_time, seconds=30),
             "return_1m": _window_return(ticks, decision_time, seconds=60),
@@ -147,6 +148,7 @@ class LiveFeatureFrameBuilder:
             "cost_to_volatility_ratio": (orderbook.spread_bps / 10_000.0) / max(vol, 1e-6),
             "principal_cushion_ratio": 1.0,
             "news_sentiment": self._news_sentiment(symbol, decision_time),
+            **technical,
         }
         values = tuple(float(feature_dict[name]) for name in self.schema.feature_names)
         provenance = FeatureProvenance(
@@ -199,6 +201,45 @@ class LiveFeatureFrameBuilder:
         }
         with self.journal_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def _technical_columns(prices: list[float], volumes: list[float]) -> dict[str, float]:
+    """Evidence-based technical indicator columns for the live schema.
+
+    Computed from the same realtime tick price/volume series used for the other
+    columns and delegated to ``app.technical.indicators`` (single source of TA
+    truth). Every value is coerced to a NEUTRAL finite default when the
+    indicator is unavailable (short data), so a live frame never fails
+    validation because of these additions.
+    """
+    from app.technical import indicators as ti
+
+    last = prices[-1] if prices else 0.0
+    ema_fast = ti.ema(prices, 12)
+    ema_slow = ti.ema(prices, 26)
+    ema_gap_bps = (
+        (ema_fast - ema_slow) / last * 10_000.0
+        if (ema_fast is not None and ema_slow is not None and last > 0)
+        else 0.0
+    )
+    macd_res = ti.macd(prices)
+    boll = ti.bollinger(prices, 20)
+    donch = ti.donchian(prices, 20, prices)
+    donchian_breakout = (
+        (last - donch.high) / last if (donch.ok and donch.high and last > 0) else 0.0
+    )
+    return {
+        "rsi_14": _finite_or(ti.rsi(prices, 14), 50.0),
+        "macd_histogram": _finite_or(macd_res.histogram if macd_res.ok else None, 0.0),
+        "bollinger_percent_b": _finite_or(boll.percent_b if boll.ok else None, 0.5),
+        "ema_gap_bps": _finite_or(ema_gap_bps, 0.0),
+        "donchian_breakout": _finite_or(donchian_breakout, 0.0),
+        "volume_spike_ratio": _finite_or(ti.volume_spike_ratio(volumes, 20), 1.0),
+    }
+
+
+def _finite_or(value: float | None, default: float) -> float:
+    return float(value) if (value is not None and math.isfinite(value)) else default
 
 
 def _safe_return(current: float, previous: float) -> float:
