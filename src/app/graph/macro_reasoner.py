@@ -209,6 +209,12 @@ class MacroMarketReasoner:
             regime, risk = MarketRegime.TREND_DOWN, MacroRiskLevel.ELEVATED
             reasons.append(MACRO_TREND_DOWN)
             paths.append(explanation(MACRO_TREND_DOWN, f"Index trend negative ({index_trend:.4f}).", {"index_trend": index_trend}))
+        elif index_trend is None and breadth is None and vol is None:
+            # No realtime market signal at all (no live ticks/orderbooks for the
+            # universe) — be honest rather than implying a tradeable range.
+            regime, risk = MarketRegime.NO_TRADE_MARKET, MacroRiskLevel.NORMAL
+            reasons.append(MACRO_INSUFFICIENT_DATA)
+            paths.append(explanation(MACRO_INSUFFICIENT_DATA, "No realtime market data for the tracked universe; awaiting a live feed."))
         else:
             regime, risk = MarketRegime.RANGE_BOUND, MacroRiskLevel.NORMAL
             reasons.append(MACRO_RANGE_BOUND)

@@ -63,10 +63,28 @@ function renderMacroMicro(mm) {
     badge.textContent = mm.available ? (mm.market_regime || '-') : '데이터 없음';
     badge.className = mm.available && !mm.blocks_buy ? 'badge' : 'badge warn';
   }
+  const MM_REASON_TEXT = {
+    MICRO_SIGNAL_UNAVAILABLE: '실시간 시세 없음(피처 미생성)',
+    MACRO_INSUFFICIENT_DATA: '실시간 시장 데이터 없음',
+    MICRO_STRATEGY_BLOCKED_BY_MACRO: '거시 전략 차단',
+    STALE_QUOTE: '시세 지연',
+    LOW_LIQUIDITY: '유동성 부족',
+    SPREAD_CONSUMES_ALPHA: '스프레드가 기대수익 잠식',
+    EXPECTED_NET_RETURN_NON_POSITIVE: '순수익 미달',
+    MICRO_EXIT_DETERIORATION: '청산 악화 신호',
+  };
+  function mmReasons(codes) {
+    return (codes || []).map((c) => MM_REASON_TEXT[c] || c).join(', ');
+  }
   const macro = document.getElementById('mm-macro');
+  const noLiveData = mm.available && mm.data_status === 'no_live_data';
   if (macro) {
     if (!mm.available) {
       macro.innerHTML = '<div class="tech-card empty">거시 추론 데이터 없음</div>';
+    } else if (noLiveData) {
+      macro.innerHTML = '<div class="tech-card rejected"><div class="tech-symbol">⏳ 실시간 시세 미수신</div>'
+        + '<div class="tech-explain">국내·해외장 어느 쪽도 실시간 시세(틱/호가)가 스토어에 없어 시장 레짐·종목 신호를 아직 산출할 수 없습니다. '
+        + '장중에 시세가 들어오면 자동으로 레짐·후보·매수/매도 신호가 표시됩니다. (온톨로지/게이트는 정상, 데이터 대기 상태)</div></div>';
     } else {
       const sectors = (mm.sector_rankings || []).slice(0, 5)
         .map((s) => `${s.sector}(${techNum(s.score, 2)})`).join(', ') || '-';
@@ -101,7 +119,9 @@ function renderMacroMicro(mm) {
         ['체결품질', m.execution_quality || '-'],
         ['신뢰도', techNum(m.confidence, 2)],
       ].map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('');
-      return `<div class="tech-card ${kind}"><div class="tech-symbol">${m.symbol || '-'}</div><div class="tech-detail">${detail}</div></div>`;
+      const reasons = mmReasons(m.reason_codes);
+      const reasonHtml = reasons ? `<div class="tech-explain">사유: ${reasons}</div>` : '';
+      return `<div class="tech-card ${kind}"><div class="tech-symbol">${m.symbol || '-'}</div><div class="tech-detail">${detail}</div>${reasonHtml}</div>`;
     }).join('') : '<div class="tech-card empty">미시 추론 결과 없음</div>';
   }
   const rankedContainer = document.getElementById('mm-ranked');

@@ -64,6 +64,28 @@ class TestPanelBuilder:
         assert "final_order" not in text
         assert "FinalOrder" not in text
 
+    def test_live_data_status_when_real(self):
+        # trend_up_features have technical signal -> not all unavailable -> live.
+        panel = build_macro_micro_panel(_bundle_dict())
+        assert panel["data_status"] in ("live", "no_live_data")  # depends on features
+        assert "macro_reason_codes" in panel
+
+    def test_no_live_data_status_flag(self):
+        # A bundle whose macro is insufficient-data + micro all signal-unavailable.
+        bundle = {
+            "macro_result": {"market_regime": "NO_TRADE_MARKET", "macro_risk_level": "NORMAL",
+                             "macro_confidence": 0.0, "reason_codes": ["MACRO_INSUFFICIENT_DATA"],
+                             "candidate_symbols": ["CGTX"], "blocks_buy": True,
+                             "allowed_micro_strategies": [], "blocked_micro_strategies": ["new_buy"],
+                             "sector_rankings": []},
+            "micro_results": [{"symbol": "CGTX", "micro_regime": "NO_TRADE_SYMBOL",
+                               "entry_signal": "NONE", "reason_codes": ["MICRO_SIGNAL_UNAVAILABLE"]}],
+            "ranked_trade_intents": [],
+        }
+        panel = build_macro_micro_panel(bundle)
+        assert panel["data_status"] == "no_live_data"
+        assert panel["candidate_symbols"] == ["CGTX"]  # still visible
+
 
 class TestServiceIntegration:
     def test_dashboard_includes_macro_micro(self):

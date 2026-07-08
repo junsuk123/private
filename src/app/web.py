@@ -7096,10 +7096,15 @@ def _graph_payload(context: Any) -> dict[str, Any]:
         links,
         _build_reasoning_steps(context.reasoning_paths),
     )
+    # Overlay the hierarchical macro–micro reasoning (advisory) onto the graph so
+    # the visualization reflects market regime -> candidates -> per-symbol micro.
+    # Added AFTER trimming so it always renders; additive (existing graph intact).
+    display_nodes, display_links, macro_micro_summary = _apply_macro_micro_overlay(display_nodes, display_links)
     return {
         "nodes": display_nodes,
         "links": display_links,
         "reasoning_steps": display_steps,
+        "macro_micro": macro_micro_summary,
         "counts": {"nodes": len(nodes), "links": len(links)},
         "display_counts": {"nodes": len(display_nodes), "links": len(display_links)},
         "truncated": len(display_nodes) < len(nodes) or len(display_links) < len(links),
@@ -7289,6 +7294,67 @@ def _resolve_instrument_label(node_id: str) -> str:
     base = text.split(".", 1)[0]
     names = _instrument_name_map()
     return names.get(base) or names.get(text) or text
+
+
+def _apply_macro_micro_overlay(display_nodes: list, display_links: list) -> tuple[list, list, dict | None]:
+    """Overlay the latest macro/micro reasoning bundle onto the graph payload.
+
+    Adds market-regime -> candidate -> micro-regime nodes/links (advisory) using
+    existing node kinds, and returns a compact summary for a dedicated panel.
+    Best-effort: no bundle -> graph unchanged, summary None.
+    """
+    try:
+        from app.graph import macro_micro_feed
+        from app.account_dashboard import build_macro_micro_panel
+
+        bundle = macro_micro_feed.snapshot()
+    except Exception:  # noqa: BLE001 - overlay is advisory; never break the graph.
+        return display_nodes, display_links, None
+    if not bundle:
+        return display_nodes, display_links, None
+
+    macro = bundle.get("macro_result") or {}
+    node_index = {n["id"]: n for n in display_nodes}
+    seen_links = {(str(l.get("source")), str(l.get("predicate")), str(l.get("target"))) for l in display_links}
+
+    def _add_node(nid, label, kind, size=13.0):
+        if nid not in node_index:
+            node_index[nid] = {"id": nid, "label": label, "kind": kind, "importance_score": 0.5, "size": size}
+
+    def _add_link(src, predicate, tgt, evidence):
+        key = (str(src), str(predicate), str(tgt))
+        if key not in seen_links:
+            seen_links.add(key)
+            display_links.append({"source": src, "target": tgt, "predicate": predicate, "evidence_id": evidence})
+
+    regime = macro.get("market_regime") or "NO_TRADE_MARKET"
+    market_id, regime_id = "MacroMarket", f"MarketRegime:{regime}"
+    _add_node(market_id, "시장(거시)", "signal", 18.0)
+    _add_node(regime_id, regime, "signal", 16.0)
+    _add_link(market_id, "hasMarketRegime", regime_id, "macro")
+    for sym in (macro.get("candidate_symbols") or [])[:12]:
+        _add_node(str(sym), str(sym), "candidate", 12.0)
+        _add_link(market_id, "selectsCandidateSymbol", str(sym), "macro")
+    for strat in (macro.get("blocked_micro_strategies") or [])[:6]:
+        bid = f"BlockedStrategy:{strat}"
+        _add_node(bid, str(strat), "risk", 10.0)
+        _add_link(regime_id, "blocksMicroStrategy", bid, "macro")
+    for m in (bundle.get("micro_results") or [])[:12]:
+        sym = str(m.get("symbol") or "")
+        mr = m.get("micro_regime") or "NO_TRADE_SYMBOL"
+        if not sym:
+            continue
+        mrid = f"MicroRegime:{mr}"
+        _add_node(sym, sym, "candidate", 12.0)
+        _add_node(mrid, mr, "signal", 11.0)
+        _add_link(sym, "hasMicroRegime", mrid, "micro")
+
+    summary = None
+    try:
+        summary = build_macro_micro_panel(bundle)
+    except Exception:  # noqa: BLE001
+        summary = None
+    return list(node_index.values()), display_links, summary
 
 
 def _node_payload(

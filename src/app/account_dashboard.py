@@ -940,12 +940,25 @@ def build_macro_micro_panel(bundle: dict[str, Any] | None) -> dict[str, Any]:
         }
         for i in (bundle.get("ranked_trade_intents") or [])
     ]
+    macro_reason_codes = [str(c) for c in (macro.get("reason_codes") or [])]
+    # No live market data anywhere -> every symbol lacks a price series so the
+    # macro regime is NO_TRADE_MARKET(insufficient data) and micro is unavailable.
+    # Surface this explicitly so the panel reads as "awaiting feed" rather than
+    # a wall of blocked rows.
+    micro_all_unavailable = bool(micro_rows) and all(
+        "MICRO_SIGNAL_UNAVAILABLE" in (r.get("reason_codes") or []) for r in micro_rows
+    )
+    no_live_data = "MACRO_INSUFFICIENT_DATA" in macro_reason_codes or (
+        (macro.get("macro_confidence") or 0) == 0 and (not micro_rows or micro_all_unavailable)
+    )
     return {
         "available": True,
+        "data_status": "no_live_data" if no_live_data else "live",
         "timestamp": bundle.get("timestamp"),
         "market_regime": macro.get("market_regime"),
         "macro_risk_level": macro.get("macro_risk_level"),
         "macro_confidence": macro.get("macro_confidence"),
+        "macro_reason_codes": macro_reason_codes,
         "blocks_buy": macro.get("blocks_buy"),
         "sector_rankings": macro.get("sector_rankings") or [],
         "candidate_symbols": macro.get("candidate_symbols") or [],
