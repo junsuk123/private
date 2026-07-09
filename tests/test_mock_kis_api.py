@@ -561,6 +561,72 @@ class MockKisApiTest(unittest.TestCase):
 
         self.assertEqual(portfolio.account.equity, 202_698)
 
+    def test_kis_portfolio_prefers_account_asset_balance_total(self) -> None:
+        class AccountAssetBalanceTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [{"pdno": "232680", "hldg_qty": "1", "ord_psbl_qty": "1", "pchs_avg_pric": "8290", "prpr": "8270"}],
+                        "output2": [{"dnca_tot_amt": "73992", "tot_evlu_amt": "82262"}],
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-account-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output2": {
+                            "tot_asst_amt": "268179",
+                            "dncl_amt": "73992",
+                            "pchs_amt_smtl": "113220",
+                            "evlu_amt_smtl": "109905",
+                        },
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "73992"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [
+                            {
+                                "ovrs_pdno": "HBAN",
+                                "ovrs_item_name": "HBAN",
+                                "ovrs_cblc_qty": "1",
+                                "pchs_avg_pric": "17.41",
+                                "now_pric2": "17.60",
+                                "ovrs_stck_evlu_amt": "17.60",
+                                "tr_crcy_cd": "USD",
+                                "ovrs_excg_cd": "NASD",
+                            }
+                        ],
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output2": [{"crcy_cd": "USD", "frcr_dncl_amt_2": "7.3", "bass_exrt": "1509.9"}],
+                        "output3": {"tot_asst_amt": "0"},
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_amt": "7.3"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=AccountAssetBalanceTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.equity, 268_179)
+        self.assertEqual(portfolio.account.cash_equivalent_krw, 158_274)
+        self.assertAlmostEqual(portfolio.account.foreign_cash_krw, 11_022.27)
+        self.assertAlmostEqual(portfolio.account.cash_by_currency["KRW"], 147_251.73)
+        self.assertEqual(portfolio.account.orderable_cash_by_currency["KRW"], 73_992)
+
     def test_kis_balance_does_not_treat_total_evaluation_as_cash(self) -> None:
         class BalanceOnlyTransport(RecordingKisTransport):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):

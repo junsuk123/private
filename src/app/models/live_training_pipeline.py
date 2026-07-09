@@ -481,6 +481,12 @@ def _frame_passes_training_quality(frame: dict[str, Any]) -> bool:
         return False
     max_spread_bps = _env_float("LIVE_TRAINING_MAX_SPREAD_BPS", 80.0)
     max_cost_to_vol = _env_float("LIVE_TRAINING_MAX_COST_TO_VOLATILITY_RATIO", 5_000.0)
+    drop_flat_frames = os.getenv("LIVE_TRAINING_DROP_FLAT_FRAMES", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     try:
         spread_bps = float(values.get("spread_bps", 0.0))
         bid_depth = float(values.get("bid_depth", 0.0))
@@ -490,7 +496,38 @@ def _frame_passes_training_quality(frame: dict[str, Any]) -> bool:
         return False
     if not all(math.isfinite(value) for value in (spread_bps, bid_depth, ask_depth, cost_to_vol)):
         return False
-    return spread_bps <= max_spread_bps and bid_depth > 0 and ask_depth > 0 and cost_to_vol <= max_cost_to_vol
+    if spread_bps > max_spread_bps or bid_depth <= 0 or ask_depth <= 0 or cost_to_vol > max_cost_to_vol:
+        return False
+    if drop_flat_frames and not _frame_has_training_signal(values):
+        return False
+    return True
+
+
+def _frame_has_training_signal(values: dict[str, Any]) -> bool:
+    """Reject quote-refresh duplicates that carry no usable short-horizon signal."""
+    min_abs_return = _env_float("LIVE_TRAINING_MIN_ABS_RETURN", 0.0001)
+    min_volatility = _env_float("LIVE_TRAINING_MIN_REALIZED_VOLATILITY", 0.000001)
+    min_volume_spike_delta = _env_float("LIVE_TRAINING_MIN_VOLUME_SPIKE_DELTA", 0.05)
+    return_keys = (
+        "return_30s",
+        "return_1m",
+        "return_3m",
+        "distance_from_vwap",
+        "max_drop_3m",
+    )
+    try:
+        return_signal = max(abs(float(values.get(name, 0.0) or 0.0)) for name in return_keys)
+        volatility = abs(float(values.get("realized_volatility_3m", 0.0) or 0.0))
+        volume_spike = abs(float(values.get("volume_spike_ratio", 1.0) or 1.0) - 1.0)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (return_signal, volatility, volume_spike)):
+        return False
+    return (
+        return_signal >= min_abs_return
+        or volatility >= min_volatility
+        or volume_spike >= min_volume_spike_delta
+    )
 
 
 def _env_float(name: str, default: float) -> float:

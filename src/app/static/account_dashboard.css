@@ -265,7 +265,7 @@ body { margin: 0; background: #eef2f5; }
   border-radius: 8px;
 }
 .table-frame.compact { max-height: 300px; }
-table { width: 100%; border-collapse: collapse; min-width: 860px; }
+table { width: 100%; border-collapse: collapse; min-width: 1120px; }
 th, td { padding: 10px 12px; border-bottom: 1px solid #edf1f6; text-align: right; white-space: nowrap; }
 th:first-child, td:first-child,
 th:nth-child(2), td:nth-child(2),
@@ -273,6 +273,14 @@ th:nth-child(3), td:nth-child(3) { text-align: left; }
 thead { position: sticky; top: 0; z-index: 1; background: #f8fafc; }
 tbody tr:hover { background: #f8fbff; }
 .empty-row td { text-align: center; color: #667085; padding: 24px; }
+#holdings-body td { vertical-align: middle; }
+#holdings-body .order-state { max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+#holdings-body .order-summary {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #334155;
+}
 
 .system-strip {
   display: grid;
@@ -306,22 +314,22 @@ tbody tr:hover { background: #f8fbff; }
 /* Technical prediction panel (advisory) */
 #technical-panel .tech-note { margin: 0 0 10px; color: #6b7684; font-size: 12px; }
 #technical-panel .tech-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
 }
 #technical-panel .tech-grid article > h3 { margin: 0 0 6px; font-size: 13px; color: #33415c; }
 .tech-cards { display: flex; flex-direction: column; gap: 8px; }
 .tech-card {
   border: 1px solid #dbe2ea; border-left-width: 4px; border-radius: 8px;
-  padding: 8px 10px; background: #ffffff; font-size: 12px;
+  padding: 10px 12px; background: #ffffff; font-size: 12px;
 }
 .tech-card.empty { color: #9aa5b1; border-left-color: #dbe2ea; text-align: center; }
 .tech-card.approved { border-left-color: #1f9d55; }
 .tech-card.rejected { border-left-color: #e0a800; }
 .tech-card.sell { border-left-color: #e2534a; }
 .tech-card.hold { border-left-color: #8a94a6; }
-.tech-symbol { font-weight: 700; margin-bottom: 4px; }
+.tech-symbol { font-weight: 700; margin-bottom: 6px; color: #172033; }
 .tech-reject { color: #b7791f; font-weight: 600; margin-bottom: 4px; }
-.tech-detail { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; }
+.tech-detail { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 4px 12px; }
 .tech-detail span { display: flex; justify-content: space-between; gap: 6px; }
 .tech-detail em { color: #6b7684; font-style: normal; }
 .tech-explain { margin-top: 6px; color: #4a5568; font-size: 11px; line-height: 1.4; }
@@ -329,6 +337,6 @@ tbody tr:hover { background: #f8fbff; }
 /* Macro–micro ontology panel (advisory) */
 #macro-micro-panel .mm-macro { margin-bottom: 12px; }
 #macro-micro-panel .mm-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px;
 }
 #macro-micro-panel .mm-grid article > h3 { margin: 0 0 6px; font-size: 13px; color: #33415c; }

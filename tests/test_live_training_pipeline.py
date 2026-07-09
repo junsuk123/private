@@ -35,6 +35,15 @@ class LiveTrainingPipelineTest(unittest.TestCase):
         self.assertEqual(set(rows[0]["features"]), set(LIVE_SHORT_HORIZON_SCHEMA.feature_names))
         self.assertIn(rows[0]["label"], {0, 1})
 
+    def test_flat_quote_refresh_frames_are_excluded_from_training(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=8, flat=True)
+
+            rows = build_live_training_rows_from_feature_journal(journal)
+
+        self.assertEqual(rows, [])
+
     def test_training_from_collected_frames_creates_latest_when_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal = Path(tmp) / "frames.jsonl"
@@ -95,7 +104,7 @@ class LiveTrainingPipelineTest(unittest.TestCase):
         self.assertEqual(status["feature_frame_lines"], 0)
 
 
-def _write_frames(path: Path, *, count: int) -> None:
+def _write_frames(path: Path, *, count: int, flat: bool = False) -> None:
     names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
     with path.open("w", encoding="utf-8") as file:
         for index in range(count):
@@ -103,18 +112,18 @@ def _write_frames(path: Path, *, count: int) -> None:
             # 스프레드(=비용)는 양쪽 동일하게 낮게 두어 라벨이 순수히 전방수익 부호로 결정된다.
             positive_phase = index % 2 == 0
             values = {name: 0.0 for name in names}
-            values["return_30s"] = 0.005 if positive_phase else -0.005
-            values["return_1m"] = 0.010 if positive_phase else -0.010
-            values["return_3m"] = 0.015 if positive_phase else -0.015
-            values["distance_from_vwap"] = 0.003 if positive_phase else -0.003
+            values["return_30s"] = 0.0 if flat else (0.005 if positive_phase else -0.005)
+            values["return_1m"] = 0.0 if flat else (0.010 if positive_phase else -0.010)
+            values["return_3m"] = 0.0 if flat else (0.015 if positive_phase else -0.015)
+            values["distance_from_vwap"] = 0.0 if flat else (0.003 if positive_phase else -0.003)
             values["spread_bps"] = 3.0
             values["orderbook_imbalance"] = 0.4 if positive_phase else -0.4
             values["bid_depth"] = 300000.0 if positive_phase else 60000.0
             values["ask_depth"] = 100000.0 if positive_phase else 200000.0
             values["depth_ratio"] = values["bid_depth"] / values["ask_depth"]
             values["liquidity_score"] = 0.9 if positive_phase else 0.2
-            values["realized_volatility_3m"] = 0.002
-            values["max_drop_3m"] = 0.0 if positive_phase else -0.01
+            values["realized_volatility_3m"] = 0.0 if flat else 0.002
+            values["max_drop_3m"] = 0.0 if flat else (0.0 if positive_phase else -0.01)
             values["cost_to_volatility_ratio"] = 0.15 if positive_phase else 2.0
             values["principal_cushion_ratio"] = 1.0
             payload = {

@@ -357,6 +357,48 @@ class RealtimeMarketDataStore:
             for row in rows
         )
 
+    def recent_minute_bars(
+        self,
+        symbol: str,
+        since: datetime,
+        *,
+        limit: int = 120,
+    ) -> tuple[RealtimeMinuteBar, ...]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                select symbol, minute_start, open, high, low, close, volume, vwap,
+                       trade_count, spread_bps, orderbook_imbalance, liquidity_score,
+                       volatility, last_update_age_ms, source_record_ids_json
+                from realtime_minute_bars
+                where symbol = ? and minute_start >= ?
+                order by minute_start desc
+                limit ?
+                """,
+                (symbol, since.isoformat(), int(limit)),
+            ).fetchall()
+        bars = tuple(
+            RealtimeMinuteBar(
+                symbol=row[0],
+                minute_start=_parse_dt(row[1]),
+                open=float(row[2]),
+                high=float(row[3]),
+                low=float(row[4]),
+                close=float(row[5]),
+                volume=int(row[6]),
+                vwap=float(row[7]),
+                trade_count=int(row[8]),
+                spread_bps=float(row[9]),
+                orderbook_imbalance=float(row[10]),
+                liquidity_score=float(row[11]),
+                volatility=float(row[12]),
+                last_update_age_ms=float(row[13]),
+                source_record_ids=tuple(json.loads(row[14] or "[]")),
+            )
+            for row in rows
+        )
+        return tuple(reversed(bars))
+
     def counts_since(self, symbol: str, since: datetime) -> tuple[int, int]:
         with closing(self._connect()) as conn:
             tick_count = conn.execute(

@@ -99,7 +99,7 @@ function renderMacroMicro(mm) {
         ['섹터 상위', sectors],
       ];
       macro.innerHTML = `<div class="tech-card ${mm.blocks_buy ? 'rejected' : 'approved'}">`
-        + `<div class="tech-detail">${rows.map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('')}</div></div>`;
+        + `<div class="tech-detail">${visibleDetailRows(rows)}</div></div>`;
     }
   }
   const microContainer = document.getElementById('mm-micro-cards');
@@ -109,7 +109,7 @@ function renderMacroMicro(mm) {
       const buy = m.entry_signal === 'BUY_CANDIDATE';
       const exit = (m.exit_signal && m.exit_signal !== 'NONE');
       const kind = buy ? 'approved' : exit ? 'sell' : 'rejected';
-      const detail = [
+      const detailRows = [
         ['미시 레짐', m.micro_regime || '-'],
         ['전략', m.selected_strategy || '-'],
         ['진입', m.entry_signal || '-'],
@@ -118,7 +118,8 @@ function renderMacroMicro(mm) {
         ['예상청산가', techNum(m.expected_exit_price, 2)],
         ['체결품질', m.execution_quality || '-'],
         ['신뢰도', techNum(m.confidence, 2)],
-      ].map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('');
+      ];
+      const detail = visibleDetailRows(detailRows);
       const reasons = mmReasons(m.reason_codes);
       const reasonHtml = reasons ? `<div class="tech-explain">사유: ${reasons}</div>` : '';
       return `<div class="tech-card ${kind}"><div class="tech-symbol">${m.symbol || '-'}</div><div class="tech-detail">${detail}</div>${reasonHtml}</div>`;
@@ -152,6 +153,14 @@ function techNum(value, digits, suffix) {
   return Number(value).toFixed(digits === undefined ? 2 : digits) + (suffix || '');
 }
 
+function visibleDetailRows(rows) {
+  return rows
+    .filter(([, value]) => value !== null && value !== undefined && String(value).trim() !== '' && String(value).trim() !== '-')
+    .slice(0, 6)
+    .map(([key, value]) => `<span><em>${key}</em>${value}</span>`)
+    .join('');
+}
+
 function renderTechnicalCards(containerId, cards, kind) {
   const container = document.getElementById(containerId);
   if (!container) return;
@@ -174,7 +183,7 @@ function renderTechnicalCards(containerId, cards, kind) {
       ];
       const reject = c.reject_reason ? `<div class="tech-reject">${TECH_REJECT_TEXT[c.reject_reason] || c.reject_reason}</div>` : '';
       const explain = c.explanation ? `<div class="tech-explain">${c.explanation}</div>` : '';
-      const detail = rows.map(([k, v]) => `<span><em>${k}</em>${v}</span>`).join('');
+      const detail = visibleDetailRows(rows);
       return `<div class="tech-card ${kind}"><div class="tech-symbol">${c.symbol || '-'}</div>${reject}<div class="tech-detail">${detail}</div>${explain}</div>`;
     })
     .join('');
@@ -323,7 +332,6 @@ function renderHoldings(rows) {
   const body = document.getElementById('holdings-body');
   body.innerHTML = filtered.length ? filtered.map((row) => {
     const hasCost = Number(row.round_trip_cost_rate || 0) > 0;
-    const breakEven = hasCost ? fmtMoney(row.break_even_price, row.currency) : 'n/a';
     const estNet = hasCost
       ? `<span class="${clsPnl(row.estimated_net_pnl_krw)}">${fmtKrw(row.estimated_net_pnl_krw)}</span>`
       : 'n/a';
@@ -335,18 +343,16 @@ function renderHoldings(rows) {
       <td>${row.market_group === 'domestic' ? '국내' : '해외'}<br><small>${row.exchange || row.market}</small></td>
       <td>${Number(row.quantity || 0).toLocaleString()}</td>
       <td>${fmtMoney(row.average_price, row.currency)}</td>
-      <td>${breakEven}</td>
       <td>${fmtMoney(row.current_price, row.currency)}</td>
-      <td>${orderState}</td>
-      <td>${orderSummary}</td>
-      <td>${fmtKrw(row.evaluation_amount_krw)}</td>
+      <td class="order-state">${orderState}</td>
+      <td class="order-summary" title="${orderSummary}">${orderSummary}</td>
       <td class="${clsPnl(row.unrealized_pnl_krw)}">${fmtKrw(row.unrealized_pnl_krw)}</td>
       <td>${estNet}</td>
       <td class="${clsPnl(row.unrealized_pnl_rate)}">${fmtPct(row.unrealized_pnl_rate)}</td>
       <td>${fmtPct(row.weight_of_total_asset)}</td>
       <td>${row.currency}</td>
     </tr>`;
-  }).join('') : `<tr class="empty-row"><td colspan="13">현재 보유 종목 없음</td></tr>`;
+  }).join('') : `<tr class="empty-row"><td colspan="12">현재 보유 종목 없음</td></tr>`;
 }
 
 function mergeHoldingsWithOrders(holdings, orders) {

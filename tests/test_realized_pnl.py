@@ -58,6 +58,54 @@ def test_realized_pnl_raises_on_error_response() -> None:
         pass
 
 
+def test_overseas_realized_pnl_reads_summary_total() -> None:
+    resp = {
+        "rt_cd": "0",
+        "output1": [{"ovrs_pdno": "AAPL", "ovrs_rlzt_pfls_amt": "5000"}],
+        "output2": {"ovrs_rlzt_pfls_tot_amt": "77777", "smtl_fee1": "10"},
+    }
+    client = _client(resp)
+    assert client.get_overseas_realized_pnl(date(2026, 7, 2), date(2026, 7, 2)) == 77777.0
+
+
+def test_overseas_realized_pnl_falls_back_to_row_sum() -> None:
+    resp = {
+        "rt_cd": "0",
+        "output1": [
+            {"ovrs_pdno": "AAPL", "ovrs_rlzt_pfls_amt": "12,000"},
+            {"ovrs_pdno": "MSFT", "ovrs_rlzt_pfls_amt": "-2000"},
+        ],
+        "output2": {},
+    }
+    client = _client(resp)
+    assert client.get_overseas_realized_pnl("20260702", "20260702") == 10_000.0
+
+
+def test_overseas_realized_pnl_raises_on_error_response() -> None:
+    resp = {"rt_cd": "1", "msg1": "overseas lookup failed"}
+    client = _client(resp)
+    try:
+        client.get_overseas_realized_pnl(date(2026, 7, 2), date(2026, 7, 2))
+        raise AssertionError("expected KisApiError")
+    except KisApiError:
+        pass
+
+
+def test_overseas_period_profit_requests_krw_and_all_exchanges() -> None:
+    captured: dict = {}
+    client = _client({"rt_cd": "0", "output2": {"ovrs_rlzt_pfls_tot_amt": "0"}})
+    client._get = lambda path, tr_id, params: captured.update(  # type: ignore[attr-defined]
+        {"path": path, "tr_id": tr_id, "params": params}
+    ) or {"rt_cd": "0", "output2": {"ovrs_rlzt_pfls_tot_amt": "0"}}
+    client.get_overseas_realized_pnl("20260702", "20260702")
+    assert captured["tr_id"] == "TTTS3039R"
+    assert captured["path"].endswith("/overseas-stock/v1/trading/inquire-period-profit")
+    # KRW mode so amounts need no FX conversion; blank exchange/currency = all.
+    assert captured["params"]["WCRC_FRCR_DVSN_CD"] == "01"
+    assert captured["params"]["OVRS_EXCG_CD"] == ""
+    assert captured["params"]["CRCY_CD"] == ""
+
+
 def test_account_basis_passes_realized_pnl_through() -> None:
     import app.web as web
 

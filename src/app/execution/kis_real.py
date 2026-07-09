@@ -15,6 +15,7 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnaps
 
 
 KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
+KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
 KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
@@ -223,6 +224,10 @@ class KisEndpointSet:
     @property
     def balance_tr_id(self) -> str:
         return "TTTC8434R"
+
+    @property
+    def account_balance_tr_id(self) -> str:
+        return "CTRP6548R"
 
     @property
     def orderable_cash_tr_id(self) -> str:
@@ -440,6 +445,7 @@ class KisDevelopersApiClient:
         holdings: tuple[Holding, ...] = ()
         cash = 0.0
         domestic_total_assets_krw = 0.0
+        account_asset_summary: dict[str, float] = {}
         cash_by_currency: dict[str, float] = {"KRW": 0.0}
         orderable_cash_by_currency: dict[str, float] = {"KRW": 0.0}
         try:
@@ -464,6 +470,10 @@ class KisDevelopersApiClient:
             orderable_cash_by_currency = dict(cash_by_currency)
             orderable_cash_by_currency["KRW"] = orderable_cash if orderable_cash > 0 else cash
             domestic_total_assets_krw = _domestic_total_assets_from_balance_summary(summary_row)
+            try:
+                account_asset_summary = self._get_account_asset_balance()
+            except Exception:
+                account_asset_summary = {}
         except KisApiError as exc:
             domestic_error = exc
         overseas_holdings: tuple[Holding, ...] = ()
@@ -549,6 +559,20 @@ class KisDevelopersApiClient:
         else:
             cash_equivalent_krw = cash + usd_cash_krw
             total_equity_krw = cash_equivalent_krw + domestic_position_value + overseas_position_value_krw
+        broker_total_assets_krw = _to_float(account_asset_summary.get("total_assets_krw"))
+        if broker_total_assets_krw > 0:
+            broker_cash_krw = _to_float(account_asset_summary.get("cash_krw"))
+            broker_evaluation_krw = _to_float(account_asset_summary.get("evaluation_amount_krw"))
+            if broker_evaluation_krw > 0:
+                broker_cash_krw = max(0.0, broker_total_assets_krw - broker_evaluation_krw)
+            total_equity_krw = broker_total_assets_krw
+            cash_equivalent_krw = (
+                broker_cash_krw
+                if broker_cash_krw > 0
+                else max(0.0, total_equity_krw - domestic_position_value - overseas_position_value_krw)
+            )
+            cash = max(0.0, cash_equivalent_krw - display_foreign_cash_krw)
+            cash_by_currency["KRW"] = cash
         account = AccountSnapshot(
             cash=cash,
             holdings=all_holdings,
@@ -565,6 +589,15 @@ class KisDevelopersApiClient:
             market_prices={holding.ticker: holding.last_price for holding in holdings},
             updated_at=datetime.now(timezone.utc),
         )
+
+    def _get_account_asset_balance(self) -> dict[str, float]:
+        response = self._get(
+            "/uapi/domestic-stock/v1/trading/inquire-account-balance",
+            tr_id=self.endpoints.account_balance_tr_id,
+            params=self._account_balance_params(),
+        )
+        self._ensure_success(response, "KIS account asset-balance lookup failed")
+        return _account_asset_summary_from_response(response)
 
     def _get_domestic_balance_pages(self) -> list[dict[str, Any]]:
         pages: list[dict[str, Any]] = []
@@ -764,6 +797,81 @@ class KisDevelopersApiClient:
             if not isinstance(row, dict):
                 continue
             for key in ("rlzt_pfls", "trad_pfls", "pfls_amt", "evlu_pfls_amt"):
+                if key in row and str(row.get(key)).strip() not in ("", "None"):
+                    total += _to_float(row.get(key))
+                    found = True
+                    break
+        return total if found else 0.0
+
+    def inquire_overseas_period_profit(
+        self,
+        start_date: Any,
+        end_date: Any,
+        *,
+        currency_division: str = "01",
+    ) -> dict[str, Any]:
+        """Raw KIS overseas period-profit inquiry (해외주식 기간손익).
+
+        TR TTTS3039R returns realized (settled) trade profit/loss over
+        [start_date, end_date] for overseas stocks across all exchanges/
+        currencies (blank OVRS_EXCG_CD / CRCY_CD). ``WCRC_FRCR_DVSN_CD`` "01"
+        returns amounts already converted to KRW (원화), "02" in the foreign
+        currency — we default to "01" so no manual FX conversion is needed.
+        """
+        params = {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "OVRS_EXCG_CD": "",
+            "NATN_CD": "",
+            "CRCY_CD": "",
+            "PDNO": "",
+            "INQR_STRT_DT": _kis_yyyymmdd(start_date),
+            "INQR_END_DT": _kis_yyyymmdd(end_date),
+            "WCRC_FRCR_DVSN_CD": currency_division,
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        return self._get(
+            "/uapi/overseas-stock/v1/trading/inquire-period-profit",
+            tr_id="TTTS3039R",
+            params=params,
+        )
+
+    def get_overseas_realized_pnl(self, start_date: Any, end_date: Any) -> float:
+        """Total realized (settled) overseas P&L in KRW over the given dates.
+
+        Mirrors :meth:`get_domestic_realized_pnl`: reads the period-profit
+        summary in KRW (WCRC_FRCR_DVSN_CD "01"), parsing field names
+        defensively, and falls back to summing per-trade rows. Returns 0.0 when
+        the account has no overseas activity. Raises KisApiError on a hard API
+        failure (callers wrap this so it never breaks the domestic figure).
+        """
+        response = self.inquire_overseas_period_profit(start_date, end_date)
+        self._ensure_success(response, "KIS overseas period-profit lookup failed")
+        summary = response.get("output2")
+        summary_row: dict[str, Any] = {}
+        if isinstance(summary, list) and summary:
+            summary_row = summary[0] if isinstance(summary[0], dict) else {}
+        elif isinstance(summary, dict):
+            summary_row = summary
+        for key in (
+            "ovrs_rlzt_pfls_tot_amt",
+            "ovrs_rlzt_pfls_amt",
+            "tot_rlzt_pfls",
+            "rlzt_pfls_smtl_amt",
+            "rlzt_pfls_amt",
+            "rlzt_pfls",
+        ):
+            value = summary_row.get(key)
+            if value is not None and str(value).strip() not in ("", "None"):
+                return _to_float(value)
+        # Fallback: sum per-trade realized P&L rows (output1).
+        total = 0.0
+        found = False
+        for row in response.get("output1") or ():
+            if not isinstance(row, dict):
+                continue
+            for key in ("ovrs_rlzt_pfls_amt", "rlzt_pfls", "trad_pfls", "pfls_amt", "evlu_pfls_amt"):
                 if key in row and str(row.get(key)).strip() not in ("", "None"):
                     total += _to_float(row.get(key))
                     found = True
@@ -1061,6 +1169,14 @@ class KisDevelopersApiClient:
             "PRCS_DVSN": "00",
             "CTX_AREA_FK100": "",
             "CTX_AREA_NK100": "",
+        }
+
+    def _account_balance_params(self) -> dict[str, str]:
+        return {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "INQR_DVSN_1": "",
+            "BSPR_BF_DT_APLY_YN": "",
         }
 
     def _domestic_orderable_cash_params(self) -> dict[str, str]:
@@ -1390,6 +1506,23 @@ def _domestic_total_assets_from_balance_summary(summary_row: dict[str, Any]) -> 
         if value > 0:
             return value
     return 0.0
+
+
+def _account_asset_summary_from_response(response: dict[str, Any]) -> dict[str, float]:
+    summary = response.get("output2") or {}
+    if isinstance(summary, list):
+        summary_row = next((row for row in summary if isinstance(row, dict)), {})
+    else:
+        summary_row = summary if isinstance(summary, dict) else {}
+    if not summary_row:
+        return {}
+    return {
+        "total_assets_krw": _first_float(summary_row, "tot_asst_amt", "nass_tot_amt", "real_nass_amt"),
+        "cash_krw": _first_float(summary_row, "tot_dncl_amt", "dncl_amt", "cma_evlu_amt"),
+        "purchase_amount_krw": _first_float(summary_row, "pchs_amt_smtl"),
+        "evaluation_amount_krw": _first_float(summary_row, "evlu_amt_smtl", "ovrs_stck_evlu_amt1"),
+        "unrealized_pnl_krw": _first_float(summary_row, "evlu_pfls_amt_smtl"),
+    }
 
 
 def _broker_quote_source(ticker: str, scope: str, observed_at: datetime) -> SourceMetadata:

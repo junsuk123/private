@@ -1590,6 +1590,186 @@ TRADE_DISPLAY_HTML = """<!doctype html>
 </body></html>"""
 
 
+CANDIDATE_CHART_DISPLAY_HTML = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>후보별 실시간 차트 분석</title>
+  <style>
+    :root { color-scheme: light; --bg:#f5f7fb; --panel:#fff; --text:#0f1f33; --muted:#64748b; --line:#dbe4f0; --up:#047857; --down:#c0261d; --warn:#b77900; --accent:#2563eb; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { position:sticky; top:0; z-index:3; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; background:rgba(245,247,251,.94); border-bottom:1px solid var(--line); backdrop-filter: blur(10px); }
+    h1 { margin:0; font-size:24px; letter-spacing:0; }
+    .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .badge, button { min-height:34px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--text); padding:7px 11px; font-size:13px; }
+    button { cursor:pointer; font-weight:650; }
+    main { padding:18px 24px 32px; }
+    .summary { display:grid; grid-template-columns: repeat(4, minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+    .metric { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+    .metric .label { color:var(--muted); font-size:12px; }
+    .metric .value { margin-top:6px; font-size:20px; font-weight:760; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap:14px; align-items:start; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 1px 2px rgba(15,31,51,.04); }
+    .card-head { display:grid; grid-template-columns: 1fr auto; gap:8px; align-items:start; padding:14px 16px 10px; border-bottom:1px solid #edf2f7; }
+    .symbol { font-size:20px; font-weight:800; }
+    .price { text-align:right; font-size:20px; font-weight:760; }
+    .age { color:var(--muted); font-size:12px; margin-top:2px; }
+    .chart-wrap { height:250px; padding:8px 12px 0; }
+    canvas { width:100%; height:100%; display:block; }
+    .analysis { display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; padding:10px 16px 14px; border-top:1px solid #edf2f7; }
+    .cell { min-width:0; }
+    .cell span { display:block; color:var(--muted); font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .cell strong { display:block; margin-top:3px; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .reasons { grid-column: 1 / -1; display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+    .chip { border-radius:999px; padding:4px 8px; background:#eef2ff; color:#1e3a8a; font-size:12px; }
+    .empty { padding:36px 18px; text-align:center; color:var(--muted); border:1px dashed var(--line); border-radius:8px; background:var(--panel); }
+    .up { color:var(--up); } .down { color:var(--down); } .warn { color:var(--warn); }
+    @media (max-width: 760px) {
+      header { align-items:flex-start; flex-direction:column; padding:14px; }
+      main { padding:12px; }
+      .summary { grid-template-columns: repeat(2, minmax(0,1fr)); }
+      .grid { grid-template-columns: 1fr; }
+      .analysis { grid-template-columns: repeat(2, 1fr); }
+      .chart-wrap { height:220px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>후보별 실시간 차트 분석</h1>
+      <div class="sub">실시간 체결/호가로 만든 1분봉과 기술 판단 근거를 후보별로 표시합니다.</div>
+    </div>
+    <div class="toolbar">
+      <span class="badge" id="updated">업데이트 -</span>
+      <span class="badge" id="source">데이터 -</span>
+      <button type="button" id="refresh">새로고침</button>
+    </div>
+  </header>
+  <main>
+    <section class="summary">
+      <div class="metric"><div class="label">표시 후보</div><div class="value" id="mSymbols">-</div></div>
+      <div class="metric"><div class="label">실시간 봉 보유</div><div class="value" id="mBars">-</div></div>
+      <div class="metric"><div class="label">최근 체결</div><div class="value" id="mTicks">-</div></div>
+      <div class="metric"><div class="label">평균 스프레드</div><div class="value" id="mSpread">-</div></div>
+    </section>
+    <section class="grid" id="cards"><div class="empty">실시간 후보 데이터를 불러오는 중입니다.</div></section>
+  </main>
+  <script>
+    const cards = document.getElementById('cards');
+    const fmt = (v, d=2) => Number.isFinite(Number(v)) ? Number(v).toLocaleString(undefined, {maximumFractionDigits:d}) : '-';
+    const cls = (v) => Number(v) >= 0 ? 'up' : 'down';
+    function ageLabel(iso){
+      if(!iso) return '-';
+      const sec = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+      if(sec < 60) return `${sec.toFixed(0)}초 전`;
+      if(sec < 3600) return `${(sec/60).toFixed(1)}분 전`;
+      return `${(sec/3600).toFixed(1)}시간 전`;
+    }
+    function drawChart(canvas, bars){
+      const ctx = canvas.getContext('2d');
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      const w = rect.width, h = rect.height;
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,w,h);
+      ctx.strokeStyle = '#e5edf6'; ctx.lineWidth = 1;
+      for(let i=1;i<4;i++){ const y = i*h*.18; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+      if(!bars || !bars.length){
+        ctx.fillStyle = '#94a3b8'; ctx.font = '14px system-ui'; ctx.textAlign = 'center'; ctx.fillText('실시간 1분봉 없음', w/2, h/2);
+        return;
+      }
+      const priceH = h * .72, volTop = priceH + 12, volH = h - volTop - 4;
+      const highs = bars.map(b=>Number(b.high || b.close));
+      const lows = bars.map(b=>Number(b.low || b.close));
+      const maxP = Math.max(...highs), minP = Math.min(...lows);
+      const pad = Math.max((maxP - minP) * .08, Math.abs(maxP) * .002, 0.01);
+      const top = maxP + pad, bot = minP - pad;
+      const maxV = Math.max(1, ...bars.map(b=>Number(b.volume || 0)));
+      const gap = 3, bw = Math.max(3, (w - gap * (bars.length + 1)) / bars.length);
+      const y = (p) => priceH - ((Number(p) - bot) / Math.max(0.000001, top - bot)) * priceH + 2;
+      bars.forEach((b, i) => {
+        const x = gap + i * (bw + gap);
+        const open = Number(b.open), close = Number(b.close), high = Number(b.high), low = Number(b.low);
+        const up = close >= open;
+        ctx.strokeStyle = up ? '#059669' : '#dc2626';
+        ctx.fillStyle = up ? 'rgba(5,150,105,.75)' : 'rgba(220,38,38,.75)';
+        const cx = x + bw / 2;
+        ctx.beginPath(); ctx.moveTo(cx, y(high)); ctx.lineTo(cx, y(low)); ctx.stroke();
+        const bodyY = Math.min(y(open), y(close));
+        const bodyH = Math.max(2, Math.abs(y(open) - y(close)));
+        ctx.fillRect(x, bodyY, bw, bodyH);
+        const vh = (Number(b.volume || 0) / maxV) * volH;
+        ctx.fillStyle = up ? 'rgba(5,150,105,.28)' : 'rgba(220,38,38,.28)';
+        ctx.fillRect(x, volTop + volH - vh, bw, vh);
+      });
+      ctx.fillStyle = '#64748b'; ctx.font = '11px system-ui'; ctx.textAlign = 'right';
+      ctx.fillText(fmt(top), w - 4, 12); ctx.fillText(fmt(bot), w - 4, priceH - 4);
+    }
+    function cardHtml(item){
+      const latest = item.latest_tick || {};
+      const bars = item.bars || [];
+      const first = bars[0], last = bars[bars.length - 1];
+      const delta = first && last ? Number(last.close) - Number(first.open) : 0;
+      const pct = first && Number(first.open) ? delta / Number(first.open) * 100 : 0;
+      const tech = item.technical || {};
+      const orderbook = item.latest_orderbook || {};
+      const reasons = [...(tech.reason_codes || []), ...(item.micro_reasons || [])].slice(0, 5);
+      return `<article class="card">
+        <div class="card-head">
+          <div><div class="symbol">${item.symbol}</div><div class="age">최근 체결 ${ageLabel(latest.received_at)} · 봉 ${bars.length}개</div></div>
+          <div class="price">${fmt(latest.price ?? (last && last.close), 4)}<div class="${cls(delta)}" style="font-size:13px">${delta>=0?'+':''}${fmt(delta,4)} / ${pct>=0?'+':''}${fmt(pct,2)}%</div></div>
+        </div>
+        <div class="chart-wrap"><canvas data-symbol="${item.symbol}"></canvas></div>
+        <div class="analysis">
+          <div class="cell"><span>판단</span><strong>${tech.action || item.micro_regime || '-'}</strong></div>
+          <div class="cell"><span>신뢰도</span><strong>${fmt(tech.confidence ?? item.confidence, 2)}</strong></div>
+          <div class="cell"><span>스프레드</span><strong>${fmt(orderbook.spread_bps ?? item.spread_bps, 2)} bps</strong></div>
+          <div class="cell"><span>호가 불균형</span><strong class="${cls(orderbook.imbalance ?? item.orderbook_imbalance)}">${fmt(orderbook.imbalance ?? item.orderbook_imbalance, 2)}</strong></div>
+          <div class="cell"><span>VWAP</span><strong>${fmt(last && last.vwap, 4)}</strong></div>
+          <div class="cell"><span>거래량</span><strong>${fmt(last && last.volume, 0)}</strong></div>
+          <div class="cell"><span>유동성</span><strong>${fmt(last && last.liquidity_score, 2)}</strong></div>
+          <div class="cell"><span>데이터</span><strong>${item.data_state || '-'}</strong></div>
+          <div class="reasons">${reasons.length ? reasons.map(r=>`<span class="chip">${r}</span>`).join('') : '<span class="chip">근거 없음</span>'}</div>
+        </div>
+      </article>`;
+    }
+    let latestItems = [];
+    async function load(){
+      const res = await fetch('/api/realtime/candidate-charts?limit=12&minutes=90', {cache:'no-store'});
+      const data = await res.json();
+      latestItems = data.symbols || [];
+      document.getElementById('updated').textContent = `업데이트 ${new Date(data.generated_at).toLocaleTimeString()}`;
+      document.getElementById('source').textContent = data.mode || 'realtime_minute_bars';
+      document.getElementById('mSymbols').textContent = fmt(latestItems.length,0);
+      document.getElementById('mBars').textContent = fmt(latestItems.filter(x=>(x.bars||[]).length).length,0);
+      document.getElementById('mTicks').textContent = fmt(latestItems.filter(x=>x.latest_tick).length,0);
+      const spreads = latestItems.map(x=>Number((x.latest_orderbook||{}).spread_bps)).filter(Number.isFinite);
+      document.getElementById('mSpread').textContent = spreads.length ? `${fmt(spreads.reduce((a,b)=>a+b,0)/spreads.length,2)} bps` : '-';
+      cards.innerHTML = latestItems.length ? latestItems.map(cardHtml).join('') : '<div class="empty">표시할 후보가 없습니다. 실시간 수집이 아직 워밍업 중일 수 있습니다.</div>';
+      latestItems.forEach(item => {
+        const canvas = cards.querySelector(`canvas[data-symbol="${CSS.escape(item.symbol)}"]`);
+        if(canvas) drawChart(canvas, item.bars || []);
+      });
+    }
+    document.getElementById('refresh').addEventListener('click', load);
+    window.addEventListener('resize', () => latestItems.forEach(item => {
+      const canvas = cards.querySelector(`canvas[data-symbol="${CSS.escape(item.symbol)}"]`);
+      if(canvas) drawChart(canvas, item.bars || []);
+    }));
+    load().catch(err => { cards.innerHTML = `<div class="empty">불러오기 실패: ${err}</div>`; });
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>"""
+
+
 @app.get("/display", response_class=HTMLResponse)
 def trade_display() -> str:
     return TRADE_DISPLAY_HTML
@@ -1597,7 +1777,12 @@ def trade_display() -> str:
 
 @app.get("/display/ontology", response_class=HTMLResponse)
 def ontology_display() -> str:
-    return DISPLAY_HTML
+    return CANDIDATE_CHART_DISPLAY_HTML
+
+
+@app.get("/display/candidates", response_class=HTMLResponse)
+def candidate_chart_display() -> str:
+    return CANDIDATE_CHART_DISPLAY_HTML
 
 
 @app.post("/api/kiosk/exit")
@@ -1799,6 +1984,62 @@ def ontology_graph() -> JSONResponse:
 @app.get("/api/ontology/runtime")
 def ontology_runtime() -> JSONResponse:
     return _json(get_ontology_runtime().as_dict())
+
+
+@app.get("/api/realtime/candidate-charts")
+def realtime_candidate_charts(limit: int = 12, minutes: int = 90) -> JSONResponse:
+    store = RealtimeMarketDataStore()
+    now = datetime.now(timezone.utc)
+    safe_limit = max(1, min(24, int(limit or 12)))
+    safe_minutes = max(5, min(390, int(minutes or 90)))
+    since = now - timedelta(minutes=safe_minutes)
+    symbols = _candidate_chart_symbols(store, limit=safe_limit)
+    technical_by_symbol = _latest_technical_by_symbol()
+    micro_by_symbol = _latest_micro_by_symbol()
+    rows: list[dict[str, Any]] = []
+    for symbol in symbols:
+        try:
+            store.build_latest_minute_bar(symbol, now=now)
+        except Exception:  # noqa: BLE001 - chart display is diagnostic-only.
+            pass
+        try:
+            bars = store.recent_minute_bars(symbol, since, limit=safe_minutes)
+        except Exception:  # noqa: BLE001
+            bars = ()
+        try:
+            latest_tick = store.latest_tick(symbol)
+        except Exception:  # noqa: BLE001
+            latest_tick = None
+        try:
+            latest_orderbook = store.latest_orderbook(symbol)
+        except Exception:  # noqa: BLE001
+            latest_orderbook = None
+        technical = technical_by_symbol.get(symbol) or {}
+        micro = micro_by_symbol.get(symbol) or {}
+        last_bar = bars[-1] if bars else None
+        rows.append(
+            {
+                "symbol": symbol,
+                "bars": [_realtime_bar_payload(bar) for bar in bars],
+                "latest_tick": _realtime_tick_payload(latest_tick),
+                "latest_orderbook": _realtime_orderbook_payload(latest_orderbook),
+                "technical": _compact_technical_payload(technical),
+                "micro_regime": micro.get("micro_regime"),
+                "micro_reasons": list(micro.get("reason_codes") or micro.get("reasons") or ())[:5],
+                "confidence": micro.get("confidence"),
+                "spread_bps": getattr(last_bar, "spread_bps", None),
+                "orderbook_imbalance": getattr(last_bar, "orderbook_imbalance", None),
+                "data_state": "1분봉" if bars else ("최근 체결만" if latest_tick else "대기"),
+            }
+        )
+    return _json(
+        {
+            "generated_at": now.isoformat(),
+            "mode": "실시간 체결/호가 기반 1분봉",
+            "lookback_minutes": safe_minutes,
+            "symbols": rows,
+        }
+    )
 
 
 @app.get("/api/realtime/runtime")
@@ -2410,17 +2651,26 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         result["actual_equity"] = actual_equity
         result["cash_weight"] = krw_cash / actual_equity if actual_equity > 0 else 0.0
         result["actual_deposit_currency"] = "KRW"
-        # Today's realized (settled) P&L from the KIS period trade-profit inquiry.
-        # Fail-safe: a lookup failure must never break the account check, so it
-        # degrades to 0 with a diagnostic rather than raising.
-        try:
-          from zoneinfo import ZoneInfo
+        # Today's realized (settled) P&L = domestic + overseas, both in KRW.
+        # Fail-safe: each lookup degrades to 0 with a diagnostic rather than
+        # raising, and the overseas leg failing must never drop the domestic
+        # figure (accounts without overseas trading permission return an error).
+        from zoneinfo import ZoneInfo
 
-          today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-          result["realized_pnl_today_krw"] = float(client.get_domestic_realized_pnl(today, today))
+        today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        domestic_realized_krw = 0.0
+        overseas_realized_krw = 0.0
+        try:
+          domestic_realized_krw = float(client.get_domestic_realized_pnl(today, today))
         except Exception as exc:  # noqa: BLE001 - realized P&L is best-effort.
-          result["realized_pnl_today_krw"] = 0.0
           result["realized_pnl_error"] = str(exc)
+        try:
+          overseas_realized_krw = float(client.get_overseas_realized_pnl(today, today))
+        except Exception as exc:  # noqa: BLE001 - overseas realized P&L is best-effort.
+          result["realized_pnl_overseas_error"] = str(exc)
+        result["realized_pnl_today_krw"] = domestic_realized_krw + overseas_realized_krw
+        result["realized_pnl_today_domestic_krw"] = domestic_realized_krw
+        result["realized_pnl_today_overseas_krw"] = overseas_realized_krw
         result["account_api_sources"] = {
             "domestic_balance": "TTTC8434R /uapi/domestic-stock/v1/trading/inquire-balance",
             "domestic_orderable_cash": "TTTC8908R /uapi/domestic-stock/v1/trading/inquire-psbl-order",
@@ -2428,6 +2678,7 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
             "overseas_balance": "TTTS3012R /uapi/overseas-stock/v1/trading/inquire-balance",
             "overseas_present_balance": "CTRP6504R /uapi/overseas-stock/v1/trading/inquire-present-balance",
             "overseas_orderable_cash": "TTTS3007R /uapi/overseas-stock/v1/trading/inquire-psamount",
+            "overseas_realized_pnl": "TTTS3039R /uapi/overseas-stock/v1/trading/inquire-period-profit",
         }
       else:
         result["account_checked"] = False
@@ -4876,25 +5127,42 @@ def _ensure_us_fast_poll_started() -> None:
 def _us_fast_poll_loop() -> None:
   import time as _t
   from types import SimpleNamespace
+
+  from app.data.market_session import is_market_fully_closed
+
   try:
     interval = max(5, int(os.getenv("REALTIME_US_FAST_POLL_SEC", "12")))
   except (TypeError, ValueError):
     interval = 12
+  try:
+    closed_interval = max(60, int(os.getenv("REALTIME_US_CLOSED_FALLBACK_SEC", "300")))
+  except (TypeError, ValueError):
+    closed_interval = 300
   while True:
+    sleep_for = interval
     try:
-      if "US" in set(_active_live_market_groups()):
+      held = ()
+      us_open = "US" in set(_active_live_market_groups())
+      us_closed = is_market_fully_closed("US")
+      if us_open or us_closed:
         acct = _live_account_snapshot_for_analysis()
         held = tuple(dict.fromkeys(
             str(getattr(h, "ticker", "") or "").upper().strip()
             for h in (getattr(acct, "holdings", ()) or ())
             if _ticker_market_group_for_live_trading(str(getattr(h, "ticker", "") or ""), str(getattr(h, "market", "") or "")) == "US"
         ))
-        if held:
-          from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
-          refresh_us_realtime_for_context_buy_candidates(SimpleNamespace(markets=(), reasoning_paths=()), symbols=held)
+      if held and us_open:
+        # In-session: realtime bridge (sub-minute rows tagged as realtime).
+        from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+        refresh_us_realtime_for_context_buy_candidates(SimpleNamespace(markets=(), reasoning_paths=()), symbols=held)
+      elif held and us_closed:
+        # Fully closed: slower REST snapshot fallback (distinct source, not
+        # live-buy eligible) so held US marks stay fresh for valuation/display.
+        _rest_snapshot_fallback_refresh(held, "US")
+        sleep_for = closed_interval
     except Exception:  # noqa: BLE001 - best-effort; never crash the poll loop.
       pass
-    _t.sleep(interval)
+    _t.sleep(sleep_for)
 
 
 def _build_macro_micro_observer(decision_engine):
@@ -5590,8 +5858,37 @@ def _cached_context_symbols(context: Any | None, *, limit: int = 80) -> tuple[st
   return tuple(dict.fromkeys(selected))[: max(1, int(limit))]
 
 
+def _rest_snapshot_fallback_refresh(symbols: tuple[str, ...], group: str) -> dict[str, int]:
+  """Keep last-known prices fresh via REST when a market is fully closed.
+
+  Uses the broker's REST quote (routed by market) and writes a distinct
+  ``KIS_REST_SNAPSHOT_SOURCE`` tick, so closed-market prices feed valuation/display
+  without ever being treated as a live-tradeable realtime quote.
+  """
+  from app.data.rest_snapshot_fallback import refresh_rest_snapshot_into_store
+
+  client = _kis_realtime_collector_client()
+  market_name = "KRX" if str(group).upper() == "KRX" else "NASDAQ"
+
+  def _refresh(symbol: str, market: str, when: datetime):
+    try:
+      return client.get_market_snapshot(symbol, market, company_name=symbol, sector="Unknown")
+    except Exception:  # noqa: BLE001 - closed-market snapshot is best-effort.
+      return None
+
+  return refresh_rest_snapshot_into_store(
+      symbols,
+      store=RealtimeMarketDataStore(),
+      refresher=_refresh,
+      market_of=lambda _symbol: market_name,
+  )
+
+
 def _kis_realtime_collector_loop() -> None:
+  from app.data.market_session import is_market_fully_closed, market_phase
+
   resubscribe_seconds = max(30.0, float(os.getenv("REALTIME_COLLECTOR_RESUBSCRIBE_SECONDS", "300")))
+  closed_fallback_seconds = max(60.0, float(os.getenv("REALTIME_COLLECTOR_CLOSED_FALLBACK_SECONDS", "300")))
   while not _kis_realtime_collector_stop.is_set():
     symbols = _kis_realtime_collector_symbols()
     if not symbols:
@@ -5600,11 +5897,35 @@ def _kis_realtime_collector_loop() -> None:
       if _kis_realtime_collector_stop.wait(30.0):
         return
       continue
+    # The collector subscribes to domestic (KRX) TR_IDs only. When KRX is fully
+    # closed (neither pre, regular, nor after-market) the WebSocket yields no
+    # ticks — so skip the futile subscribe/idle cycle and fall back to REST
+    # snapshots to keep held/candidate prices fresh, reporting the closed phase
+    # clearly instead of an endless ticks:0 "ended" log.
+    if is_market_fully_closed("KRX"):
+      fallback = _rest_snapshot_fallback_refresh(symbols, "KRX")
+      with _live_lock:
+        _append_collection_log_unlocked(
+            "market_closed",
+            "KRX fully closed; REST snapshot fallback (no live ticks)",
+            counts={
+                "phase": market_phase("KRX").value,
+                "symbols": len(symbols),
+                "snapshots_saved": int(fallback.get("saved", 0) or 0),
+            },
+        )
+      if _kis_realtime_collector_stop.wait(closed_fallback_seconds):
+        return
+      continue
     with _live_lock:
       _append_collection_log_unlocked(
           "running",
           "KIS realtime collector subscribed symbols",
-          counts={"symbols": len(symbols), "symbol_sample": list(symbols[:12])},
+          counts={
+              "symbols": len(symbols),
+              "symbol_sample": list(symbols[:12]),
+              "phase": market_phase("KRX").value,
+          },
       )
     try:
       counts = asyncio.run(
@@ -5705,6 +6026,73 @@ def _stop_live_worker() -> None:
   if worker is not None:
     worker.join(timeout=2.0)
   _set_live_progress(0, "idle", "Learning data collection stopped", active=False)
+
+
+def _refresh_us_realtime_bridge_dense(context: Any, *, symbols: tuple[str, ...] | None) -> dict[str, Any]:
+  """Sample US REST quotes more than once per live cycle to reduce flat feature rows."""
+  from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+
+  try:
+    passes = max(1, min(6, int(os.getenv("REALTIME_US_REST_WARM_PASSES", "2"))))
+  except (TypeError, ValueError):
+    passes = 2
+  try:
+    delay_seconds = max(0.0, min(10.0, float(os.getenv("REALTIME_US_REST_WARM_DELAY_SECONDS", "1.5"))))
+  except (TypeError, ValueError):
+    delay_seconds = 1.5
+
+  summaries: list[dict[str, Any]] = []
+  for index in range(passes):
+    summaries.append(
+        refresh_us_realtime_for_context_buy_candidates(
+            context,
+            symbols=symbols,
+        )
+    )
+    if index < passes - 1 and delay_seconds > 0.0:
+      with _live_lock:
+        stopping = bool(_live_state.get("stop"))
+      if stopping:
+        break
+      time.sleep(delay_seconds)
+
+  if not summaries:
+    return {
+        "ok": True,
+        "symbols": tuple(symbols or ()),
+        "saved": {"realtime_ticks": 0, "orderbooks": 0},
+        "touched": {},
+        "errors": {},
+        "passes": 0,
+        "target_source": "context.reasoning_paths",
+    }
+
+  merged_saved = {"realtime_ticks": 0, "orderbooks": 0}
+  merged_touched: dict[str, int] = {}
+  merged_errors: dict[str, str] = {}
+  merged_symbols: list[str] = []
+  for summary in summaries:
+    saved = summary.get("saved") or {}
+    merged_saved["realtime_ticks"] += int(saved.get("realtime_ticks", 0) or 0)
+    merged_saved["orderbooks"] += int(saved.get("orderbooks", 0) or 0)
+    for symbol in tuple(summary.get("symbols") or ()):
+      merged_symbols.append(str(symbol))
+    for key, value in (summary.get("touched") or {}).items():
+      merged_touched[str(key)] = merged_touched.get(str(key), 0) + int(value or 0)
+    for key, value in (summary.get("errors") or {}).items():
+      merged_errors[str(key)] = str(value)
+
+  last = summaries[-1]
+  return {
+      **last,
+      "ok": all(bool(summary.get("ok", False)) for summary in summaries),
+      "symbols": tuple(dict.fromkeys(merged_symbols)),
+      "saved": merged_saved,
+      "touched": merged_touched,
+      "errors": merged_errors,
+      "passes": len(summaries),
+      "delay_seconds": delay_seconds,
+  }
 
 
 def _live_worker_loop() -> None:
@@ -5878,9 +6266,9 @@ def _refresh_live_cache() -> None:
         # actually buy accumulate ticks/orderbook → momentum/model signals. Capped to
         # protect the KIS REST rate limit.
         try:
-          warm_cap = max(0, int(os.getenv("REALTIME_US_FEATURE_WARM_LIMIT", "6")))
+          warm_cap = max(0, int(os.getenv("REALTIME_US_FEATURE_WARM_LIMIT", "10")))
         except (TypeError, ValueError):
-          warm_cap = 6
+          warm_cap = 10
         if warm_cap > 0:
           try:
             affordable_us = tuple(
@@ -5893,9 +6281,7 @@ def _refresh_live_cache() -> None:
       live_us_realtime_bridge_summary = {}
       if active_mode == "live_trading":
         try:
-          from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
-
-          live_us_realtime_bridge_summary = refresh_us_realtime_for_context_buy_candidates(
+          live_us_realtime_bridge_summary = _refresh_us_realtime_bridge_dense(
               context,
               symbols=live_feature_symbols,
           )
@@ -5954,6 +6340,7 @@ def _refresh_live_cache() -> None:
                 "model_artifacts": len(model_paths),
                 "live_feature_frames_built": int(live_feature_collection.get("built", 0) or 0),
         "live_us_realtime_bridge_symbols": len(tuple((live_us_realtime_bridge_summary or {}).get("symbols", ()) or ())),
+        "live_us_realtime_bridge_passes": int((live_us_realtime_bridge_summary or {}).get("passes", 0) or 0),
         "live_us_realtime_bridge_ticks": int(((live_us_realtime_bridge_summary or {}).get("saved", {}) or {}).get("realtime_ticks", 0) or 0),
         "live_us_realtime_bridge_orderbooks": int(((live_us_realtime_bridge_summary or {}).get("saved", {}) or {}).get("orderbooks", 0) or 0),
         "live_us_realtime_bridge_errors": len(((live_us_realtime_bridge_summary or {}).get("errors", {}) or {})),
@@ -7145,6 +7532,140 @@ def _set_live_progress(
 
 def _iso_or_none(value: datetime | None) -> str | None:
   return value.isoformat() if value is not None else None
+
+
+def _candidate_chart_symbols(store: RealtimeMarketDataStore, *, limit: int = 12) -> tuple[str, ...]:
+    symbols: list[str] = []
+
+    def add_many(values: Any) -> None:
+        for value in tuple(values or ()):
+            symbol = str(value or "").upper().strip()
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+
+    add_many(item.get("symbol") for item in _latest_technical_by_symbol().values())
+    try:
+        macro = _latest_macro_micro_bundle()
+        macro_result = (macro or {}).get("macro_result") or {}
+        add_many(macro_result.get("candidate_symbols"))
+        add_many((item or {}).get("symbol") for item in ((macro or {}).get("micro_results") or ()))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        basis = _last_live_account_basis()
+        add_many((p or {}).get("ticker") or (p or {}).get("symbol") for p in ((basis or {}).get("positions") or ()))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        add_many(store.active_symbols(datetime.now(timezone.utc) - timedelta(minutes=30), limit=limit * 3))
+    except Exception:  # noqa: BLE001
+        pass
+    return tuple(symbols[: max(1, int(limit))])
+
+
+def _latest_technical_by_symbol() -> dict[str, dict[str, Any]]:
+    try:
+        from app.technical.decision_feed import snapshot
+
+        rows = snapshot()
+    except Exception:  # noqa: BLE001
+        rows = ()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows or ():
+        symbol = str((row or {}).get("symbol") or "").upper().strip()
+        if symbol:
+            result[symbol] = dict(row or {})
+    return result
+
+
+def _latest_macro_micro_bundle() -> dict[str, Any] | None:
+    try:
+        from app.graph import macro_micro_feed
+
+        bundle = macro_micro_feed.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    return dict(bundle or {}) if bundle else None
+
+
+def _latest_micro_by_symbol() -> dict[str, dict[str, Any]]:
+    bundle = _latest_macro_micro_bundle() or {}
+    result: dict[str, dict[str, Any]] = {}
+    for row in bundle.get("micro_results") or ():
+        symbol = str((row or {}).get("symbol") or "").upper().strip()
+        if symbol:
+            result[symbol] = dict(row or {})
+    return result
+
+
+def _realtime_bar_payload(bar: Any) -> dict[str, Any]:
+    return {
+        "symbol": getattr(bar, "symbol", None),
+        "minute_start": _iso_or_none(getattr(bar, "minute_start", None)),
+        "open": getattr(bar, "open", None),
+        "high": getattr(bar, "high", None),
+        "low": getattr(bar, "low", None),
+        "close": getattr(bar, "close", None),
+        "volume": getattr(bar, "volume", None),
+        "vwap": getattr(bar, "vwap", None),
+        "trade_count": getattr(bar, "trade_count", None),
+        "spread_bps": getattr(bar, "spread_bps", None),
+        "orderbook_imbalance": getattr(bar, "orderbook_imbalance", None),
+        "liquidity_score": getattr(bar, "liquidity_score", None),
+        "volatility": getattr(bar, "volatility", None),
+        "last_update_age_ms": getattr(bar, "last_update_age_ms", None),
+    }
+
+
+def _realtime_tick_payload(tick: Any | None) -> dict[str, Any] | None:
+    if tick is None:
+        return None
+    return {
+        "symbol": getattr(tick, "symbol", None),
+        "exchange_timestamp": _iso_or_none(getattr(tick, "exchange_timestamp", None)),
+        "received_at": _iso_or_none(getattr(tick, "received_at", None)),
+        "source": getattr(tick, "source", None),
+        "price": getattr(tick, "price", None),
+        "volume": getattr(tick, "volume", None),
+        "trade_direction": getattr(tick, "trade_direction", None),
+        "latency_ms": getattr(tick, "latency_ms", None),
+    }
+
+
+def _realtime_orderbook_payload(orderbook: Any | None) -> dict[str, Any] | None:
+    if orderbook is None:
+        return None
+    return {
+        "symbol": getattr(orderbook, "symbol", None),
+        "exchange_timestamp": _iso_or_none(getattr(orderbook, "exchange_timestamp", None)),
+        "received_at": _iso_or_none(getattr(orderbook, "received_at", None)),
+        "source": getattr(orderbook, "source", None),
+        "best_bid": getattr(orderbook, "best_bid", None),
+        "best_ask": getattr(orderbook, "best_ask", None),
+        "spread_bps": getattr(orderbook, "spread_bps", None),
+        "total_bid_volume": getattr(orderbook, "total_bid_volume", None),
+        "total_ask_volume": getattr(orderbook, "total_ask_volume", None),
+        "imbalance": getattr(orderbook, "imbalance", None),
+    }
+
+
+def _compact_technical_payload(row: dict[str, Any]) -> dict[str, Any]:
+    tech = dict(row.get("technical") or {})
+    profit = dict(row.get("profitability") or {})
+    confidence = tech.get("confidence")
+    if confidence is None:
+        confidence = tech.get("score")
+    return {
+        "symbol": row.get("symbol"),
+        "action": row.get("action"),
+        "approved": row.get("approved"),
+        "reason_codes": list(row.get("reason_codes") or ())[:5],
+        "regime": row.get("technical_regime") or tech.get("regime"),
+        "methodology": row.get("technical_methodology") or tech.get("methodology"),
+        "confidence": confidence,
+        "expected_edge_bps": tech.get("expected_edge_bps") or profit.get("expected_net_bps"),
+        "profitability": profit.get("decision") or profit.get("status"),
+    }
 
 
 def _graph_payload(context: Any) -> dict[str, Any]:

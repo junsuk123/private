@@ -7,6 +7,11 @@ from typing import Any
 
 
 KIS_REALTIME_SOURCE = "kis_realtime_websocket"
+# REST snapshot fallback used when a market is fully closed (no pre/regular/after
+# session). Deliberately DISTINCT from KIS_REALTIME_SOURCE so market-data health
+# never marks a closed-market REST quote as live-buy eligible — it only keeps
+# last-known prices fresh for valuation/display/history.
+KIS_REST_SNAPSHOT_SOURCE = "kis_rest_snapshot"
 
 
 @dataclass(frozen=True)
