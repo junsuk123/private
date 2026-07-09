@@ -76,6 +76,32 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh
 
 지속 설정은 `packaging/raspberrypi/pi.env.example`을 `packaging/raspberrypi/pi.env`로 복사해서 수정합니다. KIS secrets는 `pi.env`가 아니라 `config/secrets/kis_api_keys.env`에 둡니다.
 
+## Auto-update (repo watcher)
+
+`origin/main`이 갱신되면 Pi가 자동으로 최신 코드로 맞추고 앱 서버를 재시작합니다. NAT 뒤라서 webhook 대신 systemd 타이머가 ~2분마다 `origin/main`을 폴링합니다.
+
+한 번만 설치(sudo 필요):
+
+```bash
+sudo bash packaging/raspberrypi/install_autoupdate.sh
+# 또는:  make -C packaging/raspberrypi autoupdate-install
+```
+
+설치 내용:
+
+- `/etc/sudoers.d/repo-autoupdate` — 타이머(앱 사용자로 실행)가 **오직** `personal-investment.service`만 무암호로 재시작하도록 좁게 허용
+- `repo-autoupdate.service` / `.timer` — /etc/systemd/system/에 복사 후 enable
+
+동작(`auto_update.sh`): `git fetch` → `HEAD`와 `origin/main` 비교 → 변경 시 `git reset --hard origin/main`(런타임 산출물·시크릿·`pi.env` 보존) → 즉시 `sudo systemctl restart personal-investment.service`. 커밋 단위로만 트리거되므로 앱이 tracked 파일을 수정해도 오탐 없음. flock로 중복 실행 방지.
+
+확인/일시정지:
+
+```bash
+systemctl list-timers repo-autoupdate.timer
+journalctl -u repo-autoupdate.service -f          # 업데이트/재시작 로그
+# 일시정지: pi.env 에 AUTOUPDATE_ENABLED=0
+```
+
 ## Files
 
 | File | Purpose |
@@ -89,6 +115,9 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh
 | `manage_llm_opportunistic.py` | local LLM process manager for idle/off-market windows |
 | `llm-opportunistic.service` / `.timer` | systemd units for opportunistic local LLM management |
 | `personal-investment.service` | systemd auto-start unit |
-| `Makefile` | `make install`, `make run`, `make verify`, `make service-install` |
+| `auto_update.sh` | repo watcher: pulls origin/main on change and restarts the app |
+| `repo-autoupdate.service` / `.timer` | systemd units driving the ~2-min repo poll |
+| `install_autoupdate.sh` | one-time sudo installer for the auto-updater (sudoers + units) |
+| `Makefile` | `make install`, `make run`, `make verify`, `make service-install`, `make autoupdate-install` |
 
 Full guide: [../../docs/raspberry_pi_deployment.md](../../docs/raspberry_pi_deployment.md).

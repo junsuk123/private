@@ -6,7 +6,7 @@
 
 HERE := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: install install-no-apt build-native run verify service-install help
+.PHONY: install install-no-apt build-native run verify service-install autoupdate-install help
 
 ## install: one command — OS deps + venv + Python deps + optional native build + verify
 install:
@@ -34,6 +34,10 @@ service-install:
 	sudo systemctl daemon-reload
 	sudo systemctl enable --now personal-investment.service
 	@echo "Service enabled. Logs: journalctl -u personal-investment.service -f"
+
+## autoupdate-install: install + enable the repo auto-updater timer (needs sudo)
+autoupdate-install:
+	sudo bash "$(HERE)install_autoupdate.sh"
 
 ## help: list targets
 help:

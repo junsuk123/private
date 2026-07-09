@@ -1,0 +1,13 @@
+# systemd timer: poll origin for repo updates every ~2 minutes.
+# Installed/enabled by install_autoupdate.sh.
+[Unit]
+Description=Poll origin for investment-repo updates (drives repo-autoupdate.service)
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=120s
+AccuracySec=15s
+Unit=repo-autoupdate.service
+
+[Install]
+WantedBy=timers.target

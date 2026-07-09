@@ -1,0 +1,17 @@
+# systemd unit: one-shot repo auto-updater for the Raspberry Pi deployment.
+# Driven by repo-autoupdate.timer (every ~2 min). Installed by install_autoupdate.sh.
+#
+# It fetches origin/main, and when it has advanced, mirrors the checkout and
+# restarts personal-investment.service (see auto_update.sh for details).
+[Unit]
+Description=Auto-update investment repo from origin and restart the app on change
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=doingobject
+WorkingDirectory=/home/doingobject/private
+ExecStart=/bin/bash /home/doingobject/private/packaging/raspberrypi/auto_update.sh
+# The update itself is quick; give a generous stop timeout in case a restart is mid-flight.
+TimeoutStartSec=120
