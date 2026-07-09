@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from types import SimpleNamespace
+
 from app.graph.macro_micro_common import (
     EntrySignal,
     ExecutionQuality,
     ExitSignal,
     MicroRegime,
+    MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
 )
 from app.graph.micro_reasoner import MicroReasonerConfig, MicroReasoningInput, MicroSymbolReasoner
 from app.graph.rdf_adapter import attach_micro_result_rdf
@@ -61,6 +64,21 @@ class TestExpectedNetReturnRequired:
         r = _reasoner().reason(_inp(features=TechnicalFeatureSet(symbol="005930")))
         assert r.entry_signal in (EntrySignal.NONE, EntrySignal.BLOCKED)
         assert r.micro_regime in (MicroRegime.NO_TRADE_SYMBOL, MicroRegime.HOLD_OR_WATCH)
+
+    def test_live_quote_without_technical_history_is_wait_not_zero_confidence(self):
+        quote = SimpleNamespace(last_price=70_000.0)
+        r = _reasoner().reason(MicroReasoningInput(
+            timestamp=_now(),
+            symbol="005930",
+            broker_quote=quote,
+        ))
+
+        assert r.micro_regime == MicroRegime.HOLD_OR_WATCH
+        assert r.entry_signal == EntrySignal.WAIT_CONFIRMATION
+        assert r.execution_quality == ExecutionQuality.ACCEPTABLE
+        assert r.confidence > 0.0
+        assert MICRO_TECHNICAL_HISTORY_INSUFFICIENT in r.reason_codes
+        assert r.expected_entry_price == 70_000.0
 
     def test_high_cost_no_positive_net_is_not_buy(self):
         # Force spread to consume alpha via a very wide spread.

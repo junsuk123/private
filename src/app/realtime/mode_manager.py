@@ -41,7 +41,14 @@ class OperationModeState:
 
 class OperationModeManager:
     def start(self, mode: OperationMode | str) -> OperationModeState:
-        selected = OperationMode(mode)
+        requested = str(getattr(mode, "value", mode))
+        if requested in {
+            OperationMode.TESTING.value,
+            OperationMode.PAPER_TRADING.value,
+            OperationMode.PAPER_TRADING_TEST.value,
+        }:
+            requested = OperationMode.LIVE_TRADING.value
+        selected = OperationMode(requested)
         env = DataEnvironment.realtime()
         return OperationModeState(
             mode=selected,
@@ -51,11 +58,7 @@ class OperationModeManager:
             synthetic_data_allowed=False,
             live_orders_allowed=selected == OperationMode.LIVE_TRADING,
             training_allowed=selected in {OperationMode.LEARNING, OperationMode.LIVE_TRADING},
-            paper_trading_allowed=selected in {
-                OperationMode.TESTING,
-                OperationMode.PAPER_TRADING,
-                OperationMode.PAPER_TRADING_TEST,
-            },
+            paper_trading_allowed=False,
             live_readiness_allowed=selected in {
                 OperationMode.LIVE_READINESS,
                 OperationMode.LIVE_TRADING_TEST,
@@ -63,18 +66,17 @@ class OperationModeManager:
             execution_label={
                 OperationMode.LEARNING: "Realtime learning with supervised PnL labels",
                 OperationMode.TESTING: "Legacy paper trading replay",
-                OperationMode.PAPER_TRADING: "KIS paper trading API",
-                OperationMode.PAPER_TRADING_TEST: "KIS paper trading API",
+                OperationMode.PAPER_TRADING: "Deprecated; normalized to live trading",
+                OperationMode.PAPER_TRADING_TEST: "Deprecated; normalized to live trading",
                 OperationMode.LIVE_READINESS: "KIS live readiness check",
                 OperationMode.LIVE_TRADING_TEST: "KIS live readiness check",
                 OperationMode.LIVE_TRADING: "Realtime trading gate",
             }[selected],
             guardrails=(
                 "Use one unified realtime data store only: data/store.",
-                "Synthetic and simulation data are not valid inputs for learning, paper trading, or live trading.",
+                "Synthetic and simulation data are not valid inputs for learning or live trading.",
                 "Learning and information collection continue while the server is running.",
-                "Legacy paper trading replay must not submit live broker orders.",
-                "KIS paper trading may use the virtual broker environment only.",
+                "Paper trading modes are removed and normalized to live trading.",
                 "KIS live readiness may verify authentication but must not submit orders.",
                 "Live trading is the only mode that may reach brokerage execution gates.",
             ),

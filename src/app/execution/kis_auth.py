@@ -8,7 +8,6 @@ from typing import Any
 from app.execution.kis_errors import KisModeMismatchError, KisReadinessError
 from app.execution.kis_real import (
     KIS_LIVE_BASE_URL,
-    KIS_PAPER_BASE_URL,
     KisCredentials,
     KisDevelopersApiClient,
     load_kis_env_file,
@@ -34,24 +33,19 @@ def env_bool(name: str, default: bool) -> bool:
 
 def load_kis_mode() -> KisMode:
     load_kis_env_file()
-    paper = env_bool("KIS_PAPER_TRADING", True)
-    base_url = (
-        os.getenv("KIS_BASE_URL_PAPER" if paper else "KIS_BASE_URL_REAL")
-        or os.getenv("KIS_BASE_URL")
-        or (KIS_PAPER_BASE_URL if paper else KIS_LIVE_BASE_URL)
-    )
+    base_url = os.getenv("KIS_BASE_URL_REAL") or os.getenv("KIS_BASE_URL") or KIS_LIVE_BASE_URL
     live_enabled = env_bool("KIS_LIVE_ENABLED", False)
-    mode = KisMode(paper=paper, live_enabled=live_enabled, base_url=base_url)
+    mode = KisMode(paper=False, live_enabled=live_enabled, base_url=base_url)
     validate_kis_mode(mode)
     return mode
 
 
 def validate_kis_mode(mode: KisMode) -> None:
     base = mode.base_url.lower()
-    if mode.paper and "openapivts" not in base:
-        raise KisModeMismatchError("KIS_PAPER_TRADING=true but base URL is not the paper domain")
-    if not mode.paper and "openapivts" in base:
-        raise KisModeMismatchError("KIS_PAPER_TRADING=false but base URL is the paper domain")
+    if mode.paper:
+        raise KisModeMismatchError("KIS paper trading mode has been removed; live KIS mode is required")
+    if "openapivts" in base:
+        raise KisModeMismatchError("KIS paper trading domain is not allowed; use the live KIS domain")
 
 
 def validate_live_secret_file(path: str | Path = "config/secrets/kis_api_keys.env") -> dict[str, bool]:
@@ -92,14 +86,14 @@ def build_kis_client(
     token_cache_path: str | Path | None = None,
 ) -> KisDevelopersApiClient:
     mode = load_kis_mode()
-    credentials = KisCredentials.from_env(mode.paper)
+    credentials = KisCredentials.from_env(False)
     return KisDevelopersApiClient(
         app_key=credentials.app_key,
         app_secret=credentials.app_secret,
         account_no=credentials.account_no,
         account_product_code=credentials.account_product_code,
         base_url=mode.base_url,
-        paper=mode.paper,
+        paper=False,
         enabled=mode.live_enabled if enabled is None else enabled,
         transport=transport,
         token_cache_path=token_cache_path,

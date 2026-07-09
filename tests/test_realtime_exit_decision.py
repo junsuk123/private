@@ -548,6 +548,22 @@ class RealtimeBuyDecisionTest(unittest.TestCase):
         self.assertNotIn("INSUFFICIENT_CASH_FOR_ONE_SHARE", result.reason_codes)
         self.assertEqual(engine.get_diagnostics()["quote_refresh_status"], "quote_refresh_ok")
 
+    def test_buy_cash_precheck_uses_orderable_cash(self) -> None:
+        engine = SharedLiveDecisionEngine(_BuyStore(price=50_000.0), predictor=_DummyPredictor())
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"KRW": 0.0},
+            orderable_cash_by_currency={"KRW": 100_000.0},
+            cash_equivalent_krw=100_000.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+
+        result = engine.evaluate_buy("005930", account, suggested_weight=0.01, ontology_graph=graph)
+
+        self.assertTrue(result.approved, result.reason_codes)
+        self.assertNotIn("INSUFFICIENT_CASH_FOR_ONE_SHARE", result.reason_codes)
+
     def test_missing_tick_refreshes_broker_quote_before_rejecting(self) -> None:
         now = datetime.now(timezone.utc)
 

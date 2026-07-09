@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import math
@@ -773,8 +773,8 @@ def _cached_kis_connection_probe(
     *,
     max_age_seconds: float | None = None,
 ) -> dict[str, Any]:
-  if paper or not include_account:
-    return _kis_connection_probe(paper=paper, include_account=include_account)
+  if not include_account:
+    return _kis_connection_probe(paper=False, include_account=include_account)
   now = time.time()
   ttl = _kis_account_cache_seconds() if max_age_seconds is None else max(0.0, float(max_age_seconds))
   with _live_lock:
@@ -898,7 +898,7 @@ def _pending_kis_connection_payload(paper: bool, include_account: bool) -> dict[
   return {
       "ok": None,
       "status": "checking",
-      "mode": "paper" if paper else "live",
+      "mode": "live",
       "account_checked": False,
       "account_check_requested": bool(include_account),
       "message": "KIS connection check is running in the background.",
@@ -912,14 +912,14 @@ def _start_kis_connection_probe_background(
   update_live_basis: bool = False,
 ) -> None:
   def worker() -> None:
-    connection = _kis_connection_probe(paper=paper, include_account=include_account)
+    connection = _kis_connection_probe(paper=False, include_account=include_account)
     if update_live_basis:
       with _live_lock:
         _operation_mode_state["last_kis_connection"] = connection
     audit.record(
         "kis_connection_probe_background_finished",
         {
-            "mode": "paper" if paper else "live",
+            "mode": "live",
             "ok": connection.get("ok"),
             "account_checked": connection.get("account_checked", False),
         },
@@ -956,7 +956,7 @@ def _current_data_policy() -> dict[str, Any]:
       "synthetic_data_allowed": False,
       "orders_in_paper_trading": False,
       "model_root": "data/models",
-      "rule": "Learning, paper trading, and live trading all use the unified realtime data store only.",
+      "rule": "Learning and live trading use the unified realtime data store only; paper trading is removed.",
   }
 
 
@@ -2027,7 +2027,6 @@ def _live_training_quality_summary(
 LIVE_FLAG_VALUES = {
     "LIVE_TRADING_ENABLED": "true",
     "KIS_LIVE_ENABLED": "true",
-    "KIS_PAPER_TRADING": "false",
     "LIVE_ORDER_SUBMIT_ENABLED": "true",
     "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED": "false",
     "REQUIRE_MANUAL_ARMING": "false",
@@ -2189,12 +2188,15 @@ async def operation_mode_start(request: Request) -> JSONResponse:
 
 
 def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
-    mode = str(payload.get("mode", "paper_trading"))
+    requested_mode = str(payload.get("mode", "live_trading"))
+    deprecated_paper_modes = {"testing", "paper", "paper_trading", "paper_trading_test"}
+    mode = "live_trading" if requested_mode in deprecated_paper_modes else requested_mode
     if not _operation_mode_lock.acquire(blocking=False):
       return {
           "ok": False,
           "status": "busy",
           "mode": mode,
+          "requested_mode": requested_mode,
           "message": "Another operation-mode request is still being prepared.",
           "request": _operation_mode_request_snapshot(),
       }
@@ -2210,6 +2212,10 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       result = _to_jsonable(state)
       result["ok"] = True
       result["status"] = "started"
+      result["requested_mode"] = requested_mode
+      if requested_mode != mode:
+        result["mode_normalized_from"] = requested_mode
+        result["mode_normalization_message"] = "Paper trading mode has been removed; live trading mode was started instead."
       result["mode_state"] = state
       result["data_policy"] = _current_data_policy()
 
@@ -2217,52 +2223,6 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         _start_live_worker(mode)
         result["training_status"] = "continuous_collection_started"
         result["training_message"] = "Realtime learning and information collection continue while the server is running."
-
-      if mode in {"testing", "paper_trading", "paper_trading_test"}:
-        target_return_rate = _normalised_target_return(payload.get("target_return_rate", 0.02))
-        period_minutes = int(payload.get("period_minutes", 390))
-        initial_cash = _resolve_operating_initial_cash(payload)
-        initial_cash_source = _resolved_initial_cash_source(payload)
-        _ensure_initial_principal_configured(max(1.0, initial_cash))
-        acceleration_factor = float(payload.get("acceleration_factor", 60.0))
-        max_speed = bool(payload.get("max_speed", True))
-        profit_gain = _resolve_auto_profit_gain(payload, initial_cash)
-        demo_id = _start_streaming_demo(
-            target_return_rate=target_return_rate,
-            period_minutes=period_minutes,
-            initial_cash=initial_cash,
-            seed=int(payload.get("seed", 42)),
-            acceleration_factor=acceleration_factor,
-            profit_gain=profit_gain,
-            max_speed=max_speed,
-        )
-        demo = _streaming_demos.get(demo_id)
-        # 학습 플로우와 거래 플로우는 독립적으로 동작한다: 거래 시작은 학습 워커를 건드리지 않는다.
-        # 학습은 서버 기동 시(AUTO_START_LIVE_WORKER) 또는 learning 모드에서 별도로 제어된다.
-        result["paper_trading_status"] = "trading_loop_started_independently"
-        result["paper_trading_kind"] = "legacy_paper_trading" if mode == "testing" else "kis_paper_api"
-        result["demo_id"] = demo_id
-        result["demo_status"] = "initialized"
-        result["target_return_rate"] = target_return_rate
-        result["period_minutes"] = period_minutes
-        result["initial_cash"] = max(1.0, initial_cash)
-        result["initial_cash_source"] = initial_cash_source
-        result["acceleration_factor"] = acceleration_factor
-        result["profit_gain"] = max(0.25, min(4.0, profit_gain))
-        result["profit_gain_source"] = "auto_goal_account_liquidity"
-        result["universe_count"] = len(demo._bars_by_ticker) if demo is not None else 0
-        if mode in {"paper_trading", "paper_trading_test"}:
-          result["kis_connection"] = _pending_kis_connection_payload(paper=True, include_account=True)
-          _start_kis_connection_probe_background(paper=True, include_account=True)
-          result["paper_trading_message"] = (
-              "KIS paper trading API mode started. The dashboard checks the virtual broker connection "
-              "and runs the in-app buy/sell loop; live orders remain blocked."
-          )
-        else:
-          result["paper_trading_message"] = (
-              "Legacy paper-trading replay started in the background; "
-              "no live broker orders will be submitted."
-          )
 
       if mode in {"live_readiness", "live_trading_test"}:
         # 거래/점검 플로우는 학습 워커와 독립적으로 동작한다.
@@ -2331,6 +2291,7 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
           "ok": False,
           "status": "error",
           "mode": mode,
+          "requested_mode": requested_mode,
           "message": str(exc),
           "request": _operation_mode_request_snapshot(),
       }
@@ -2339,9 +2300,9 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[str, Any]:
-    mode = "paper" if paper else "live"
+    mode = "live"
     try:
-      client = KisDevelopersApiClient(paper=paper, enabled=include_account)
+      client = KisDevelopersApiClient(paper=False, enabled=include_account)
       token = client.issue_access_token()
       result: dict[str, Any] = {
           "ok": True,
@@ -2994,7 +2955,7 @@ def mock_kis_order_status(order_id: str) -> JSONResponse:
 
 @app.post("/api/paper-trading/terminate/{demo_id}")
 async def streaming_demo_terminate(demo_id: str) -> JSONResponse:
-    return _json(await run_in_threadpool(_streaming_demo_terminate_response, demo_id))
+    return _paper_trading_removed_response()
 
 
 def _streaming_demo_terminate_response(demo_id: str) -> dict[str, Any]:
@@ -3725,8 +3686,19 @@ def mock_kis_portfolio() -> JSONResponse:
 
 @app.post("/api/paper-trading/start")
 async def paper_trading_start(request: Request) -> JSONResponse:
-    payload = await request.json()
-    return _json(_paper_trading_start_response(payload))
+    return _paper_trading_removed_response()
+
+
+def _paper_trading_removed_response() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "status": "removed",
+            "mode": "live_trading",
+            "message": "Paper trading has been removed. Use /api/operation-mode/start with mode=live_trading.",
+        },
+        status_code=410,
+    )
 
 
 def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3771,8 +3743,7 @@ def _paper_trading_start_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/paper-trading/step")
 async def paper_trading_step(request: Request) -> JSONResponse:
-    payload = await request.json()
-    return _json(await run_in_threadpool(_streaming_demo_step_response, payload))
+    return _paper_trading_removed_response()
 
 
 def _streaming_demo_step_response(payload: dict[str, Any]) -> dict[str, Any]:
@@ -3963,6 +3934,7 @@ def _save_streaming_step_realtime_records(demo_id: str, result: Any) -> dict[str
 @app.get("/api/paper-trading/status/{demo_id}")
 def streaming_demo_status(demo_id: str) -> JSONResponse:
     """Return the current state of a streaming paper-trading demo."""
+    return _paper_trading_removed_response()
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -3983,6 +3955,7 @@ def streaming_demo_status(demo_id: str) -> JSONResponse:
 @app.post("/api/paper-trading/pause/{demo_id}")
 async def streaming_demo_pause(demo_id: str) -> JSONResponse:
     """Pause a streaming paper-trading demo."""
+    return _paper_trading_removed_response()
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -3999,6 +3972,7 @@ async def streaming_demo_pause(demo_id: str) -> JSONResponse:
 @app.post("/api/paper-trading/resume/{demo_id}")
 async def streaming_demo_resume(demo_id: str) -> JSONResponse:
     """Start a temporary accelerated paper-trading demo."""
+    return _paper_trading_removed_response()
     if demo_id not in _streaming_demos:
         raise HTTPException(status_code=404, detail="Demo not found")
     
@@ -4015,6 +3989,7 @@ async def streaming_demo_resume(demo_id: str) -> JSONResponse:
 @app.post("/api/paper-trading/cleanup/{demo_id}")
 async def streaming_demo_cleanup(demo_id: str) -> JSONResponse:
     """Clean up a streaming paper-trading demo."""
+    return _paper_trading_removed_response()
     with _streaming_demos_lock:
         if demo_id in _streaming_demos:
             del _streaming_demos[demo_id]
@@ -4987,11 +4962,34 @@ def _build_macro_micro_observer(decision_engine):
 
     def _builder(symbol, macro_result):
       features = None
+      broker_quote = None
+      realtime_tick = None
+      quote_age_seconds = None
       try:
         frame = decision_engine.feature_builder.build(symbol, decision_time=decision_time)
         features = technical_feature_set_from_live_frame(frame, symbol)
       except Exception:  # noqa: BLE001 - off-hours / missing data -> NO_TRADE micro result.
         features = None
+      try:
+        store = getattr(decision_engine, "store", None)
+        if store is not None and hasattr(store, "latest_tick"):
+          realtime_tick = store.latest_tick(symbol)
+          received_at = getattr(realtime_tick, "received_at", None) if realtime_tick is not None else None
+          if received_at is not None:
+            quote_age_seconds = max(0.0, (decision_time - received_at).total_seconds())
+      except Exception:  # noqa: BLE001 - advisory only.
+        realtime_tick = None
+      if features is None:
+        try:
+          refresher = getattr(decision_engine, "market_refresher", None)
+          if refresher is not None:
+            from app.trading.shared_decision_engine import _resolve_order_market
+
+            broker_quote = refresher(symbol, _resolve_order_market(symbol, account), decision_time)
+            if broker_quote is not None:
+              quote_age_seconds = 0.0
+        except Exception:  # noqa: BLE001 - broker quote fallback is advisory only.
+          broker_quote = None
       h = holdings_by_symbol.get(symbol)
       holding_state = None
       if h is not None:
@@ -5002,6 +5000,8 @@ def _build_macro_micro_observer(decision_engine):
           allowed_micro_strategies=macro_result.allowed_micro_strategies,
           blocked_micro_strategies=macro_result.blocked_micro_strategies,
           technical_features=features, holding_state=holding_state,
+          realtime_tick=realtime_tick, broker_quote=broker_quote,
+          quote_age_seconds=quote_age_seconds,
       )
 
     bundle = coordinator.run(macro_input, micro_input_builder=_builder, held_symbols=held_symbols)
@@ -5549,13 +5549,45 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
     max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "18")))
   except (TypeError, ValueError):
     max_syms = 18
+  domestic_priority: list[str] = []
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:  # noqa: BLE001 - collector can still run with static config.
+    account = None
+  if account is not None:
+    for holding in tuple(getattr(account, "holdings", ()) or ()):
+      ticker = str(getattr(holding, "ticker", "") or "").upper().strip()
+      market = str(getattr(holding, "market", "") or "").upper().strip()
+      if ticker.isdigit() and len(ticker) == 6 and _ticker_market_group_for_live_trading(ticker, market) == "KRX":
+        domestic_priority.append(ticker)
+  with _live_lock:
+    context = _live_state.get("context")
+  for ticker in _cached_context_symbols(context):
+    if ticker.isdigit() and len(ticker) == 6:
+      domestic_priority.append(ticker)
   try:
     extra = _live_affordable_buy_candidate_symbols(limit=max_syms)
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     extra = ()
   kr_extra = [s for s in extra if str(s).isdigit() and len(str(s)) == 6]
-  merged = list(dict.fromkeys([*base, *kr_extra]))
+  merged = list(dict.fromkeys([*domestic_priority, *base, *kr_extra]))
   return tuple(merged[:max_syms])
+
+
+def _cached_context_symbols(context: Any | None, *, limit: int = 80) -> tuple[str, ...]:
+  if context is None:
+    return ()
+  selected: list[str] = []
+  for path in tuple(getattr(context, "reasoning_paths", ()) or ()):
+    ticker = str(getattr(path, "ticker", "") or "").upper().strip()
+    if ticker:
+      selected.append(ticker)
+  selection = getattr(context, "candidate_selection", None)
+  for ticker_value in tuple(getattr(selection, "candidate_stocks", ()) or ()):
+    ticker = str(ticker_value or "").upper().strip()
+    if ticker:
+      selected.append(ticker)
+  return tuple(dict.fromkeys(selected))[: max(1, int(limit))]
 
 
 def _kis_realtime_collector_loop() -> None:
@@ -5568,19 +5600,27 @@ def _kis_realtime_collector_loop() -> None:
       if _kis_realtime_collector_stop.wait(30.0):
         return
       continue
+    with _live_lock:
+      _append_collection_log_unlocked(
+          "running",
+          "KIS realtime collector subscribed symbols",
+          counts={"symbols": len(symbols), "symbol_sample": list(symbols[:12])},
+      )
     try:
       counts = asyncio.run(
           run_kis_realtime_websocket_collector(
               symbols=symbols,
               store=RealtimeMarketDataStore(),
+              client=_kis_realtime_collector_client(),
               stop_event=_kis_realtime_collector_stop,
               max_runtime_seconds=resubscribe_seconds,
           )
       )
       with _live_lock:
+        disconnected = bool(counts.get("connection_closed"))
         _append_collection_log_unlocked(
-            "complete",
-            "KIS realtime collector ended",
+            "error" if disconnected else "complete",
+            "KIS realtime collector disconnected" if disconnected else "KIS realtime collector ended",
             counts=counts,
         )
       if not _kis_realtime_collector_stop.is_set():
@@ -5593,6 +5633,10 @@ def _kis_realtime_collector_loop() -> None:
         )
       if _kis_realtime_collector_stop.wait(30.0):
         return
+
+
+def _kis_realtime_collector_client() -> KisDevelopersApiClient:
+  return KisDevelopersApiClient(paper=False, enabled=True)
 
 
 def _load_realtime_collection_symbols(path: str | Path = "config/realtime_market_data.json") -> tuple[str, ...]:
@@ -7392,11 +7436,11 @@ def _apply_macro_micro_overlay(display_nodes: list, display_links: list) -> tupl
 
     regime = macro.get("market_regime") or "NO_TRADE_MARKET"
     market_id, regime_id = "MacroMarket", f"MarketRegime:{regime}"
-    _add_node(market_id, "시장(거시)", "signal", 18.0)
-    _add_node(regime_id, regime, "signal", 16.0)
+    _add_node(market_id, "시장(거시)", "pipeline", 18.0)
+    _add_node(regime_id, regime, "support", 16.0)
     _add_link(market_id, "hasMarketRegime", regime_id, "macro")
     for sym in (macro.get("candidate_symbols") or [])[:12]:
-        _add_node(str(sym), str(sym), "candidate", 12.0)
+        _add_node(str(sym), str(sym), "ticker", 12.0)
         _add_link(market_id, "selectsCandidateSymbol", str(sym), "macro")
     for strat in (macro.get("blocked_micro_strategies") or [])[:6]:
         bid = f"BlockedStrategy:{strat}"
@@ -7408,8 +7452,8 @@ def _apply_macro_micro_overlay(display_nodes: list, display_links: list) -> tupl
         if not sym:
             continue
         mrid = f"MicroRegime:{mr}"
-        _add_node(sym, sym, "candidate", 12.0)
-        _add_node(mrid, mr, "signal", 11.0)
+        _add_node(sym, sym, "ticker", 12.0)
+        _add_node(mrid, mr, "support", 11.0)
         _add_link(sym, "hasMicroRegime", mrid, "micro")
 
     summary = None
@@ -7956,7 +8000,6 @@ HTML = """
     .ontology-panel .muted { color: #cbd5e1; }
     #ontologyCanvas { width: 100%; height: 760px; display: block; }
     #ontologyTooltip { position: absolute; z-index: 3; pointer-events: none; min-width: 160px; max-width: 260px; padding: 8px 10px; border-radius: 6px; background: rgba(15,23,42,.92); color: #fff; border: 1px solid rgba(255,255,255,.18); font-size: 12px; transform: translate(12px, 12px); display: none; }
-    .ontology-scene { display: none !important; }
     @media (min-width: 901px) {
       .shell { grid-template-columns: 300px minmax(0, 1fr); }
       aside { padding: 14px; max-height: 100vh; overflow: auto; }
@@ -8020,7 +8063,7 @@ HTML = """
       <h2>운영 모드</h2>
       <div class="mode-step-label">실시간 통합 데이터 기준</div>
       <div class="mode-grid" id="modeActionGrid">
-        <button type="button" id="modeTestingButton" onclick="window.startSelectedOperationMode && window.startSelectedOperationMode('paper')">모의투자<small>실제 주문 없이 KIS 모의 서버</small></button>
+        <button type="button" id="modeTestingButton" onclick="window.startSelectedOperationMode && window.startSelectedOperationMode('live')">실전 투자<small>KIS 실전 서버 전용</small></button>
         <button type="button" id="liveFlagsButton" class="secondary" onclick="window.applyLiveFlags && window.applyLiveFlags()">실전 플래그 적용<small>주문 없이 게이트만 전환</small></button>
         <button type="button" id="modeLiveTradingButton" class="danger" onclick="window.startSelectedOperationMode && window.startSelectedOperationMode('live')">실전 투자<small>자동매매 게이트</small></button>
       </div>
@@ -8043,13 +8086,13 @@ HTML = """
           <div class="flow-step" data-flow-step="mode"><i class="flow-dot"></i><div><strong>모드</strong><span>학습/모의투자 선택 대기</span></div></div>
           <div class="flow-step" data-flow-step="data"><i class="flow-dot"></i><div><strong>데이터</strong><span>실시간 자료 상태 확인 중</span></div></div>
           <div class="flow-step" data-flow-step="analysis"><i class="flow-dot"></i><div><strong>분석</strong><span>목표 가능성 또는 전략 계산 대기</span></div></div>
-          <div class="flow-step" data-flow-step="simulation"><i class="flow-dot"></i><div><strong>모의 진행</strong><span>시뮬레이션 대기</span></div></div>
+          <div class="flow-step" data-flow-step="simulation"><i class="flow-dot"></i><div><strong>실전 판단</strong><span>실전 게이트 대기</span></div></div>
         </div>
       </div>
       <form id="goalForm">
         <div class="field"><label for="targetReturn">목표 수익률 (%)</label><input id="targetReturn" name="target_return_rate" type="number" step="0.1" min="0" value="2" placeholder="예: 5"></div>
         <div class="field"><label for="targetMinutes">목표 시간 (분)</label><input id="targetMinutes" name="period_minutes" type="number" min="1" step="1" value="390" placeholder="예: 390"></div>
-        <div class="note" id="autoSimulationBasis">시뮬레이션 기준자금과 수익률 게인은 실전 준비 점검에서 읽은 실계좌 기준으로 자동 산정됩니다.</div>
+        <div class="note" id="autoSimulationBasis">실전 판단 기준자금과 수익률 게인은 실전 계좌 기준으로 자동 산정됩니다.</div>
         <button type="submit">가능성 분석</button>
         <div class="work-status" id="workStatus">
           <strong id="workTitle">작업 대기 중</strong>
@@ -8058,8 +8101,8 @@ HTML = """
         </div>
       </form>
       <hr style="margin: 20px 0; border: none; border-top: 1px solid var(--line);">
-      <h2>시뮬레이션 테스트</h2>
-      <div class="note">시뮬레이션 테스트는 위에 입력한 목표 수익률과 목표 시간으로 자동 진행됩니다.</div>
+      <h2>실전 게이트 상태</h2>
+      <div class="note">모의투자 흐름은 제거되었고, 실전 KIS 게이트 상태만 표시합니다.</div>
       <div class="work-status active" id="streamingDemoContainer" hidden>
         <strong id="streamingDemoStatus">대기 중</strong>
         <div class="bar"><span id="streamingDemoProgress" style="width:0%"></span></div>
@@ -8088,7 +8131,7 @@ HTML = """
     <main>
       <div class="grid">
         <section class="panel span-4"><h2>자산평가</h2><div class="metric" id="equity">-</div><table class="asset-table"><tbody><tr><th>총 자산</th><td id="totalAssets">-</td></tr><tr><th>주문 가능 원화</th><td id="cash">-</td></tr><tr><th>국내 보유 주식</th><td id="domesticInvestedValue">-</td></tr><tr><th>주문 가능 달러</th><td id="usdCash">-</td></tr><tr><th>해외 보유 주식</th><td id="foreignInvestedValue">-</td></tr></tbody></table><span id="investedValue" hidden></span><span id="krwCash" hidden></span><span id="foreignCash" hidden></span><span id="cashWeight" hidden></span></section>
-        <section class="panel span-4"><h2 id="performancePanelTitle">Paper trading 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">모의 손익 -</span><span class="chip" id="mockEquity">모의 평가금 -</span><span class="chip" id="mockTarget">목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">실제 계좌와 분리된 KIS 모의 서버 또는 로컬 paper trading 성과입니다.</p></section>
+        <section class="panel span-4"><h2 id="performancePanelTitle">실전 투자 성과</h2><div class="metric" id="mockReturn">대기 중</div><div class="bar"><span id="mockReturnBar"></span></div><div class="chips" style="margin-top:12px;"><span class="chip" id="mockProfit">실전 손익 -</span><span class="chip" id="mockEquity">실전 평가금 -</span><span class="chip" id="mockTarget">실전 목표 -</span></div><p class="muted" id="mockStatus" style="margin-bottom:0;">KIS 실전 계좌 기준 성과와 게이트 상태를 표시합니다.</p></section>
         <section class="panel span-4">
           <h2>보유 주식 현황</h2>
           <div class="metric" id="brokerDeposit">읽기 전</div>
@@ -8341,9 +8384,9 @@ HTML = """
     }
 
     function applyCompactKoreanDashboard() {
-      document.title = 'Paper Trading Dashboard';
+      document.title = 'Live Trading Dashboard';
       const title = document.querySelector('aside h1');
-      if (title) title.textContent = 'Paper Trading Dashboard';
+      if (title) title.textContent = 'Live Trading Dashboard';
       const gate = document.getElementById('gate');
       if (gate) gate.textContent = 'Learning and collection continue automatically while the server is running.';
       const stepLabel = document.querySelector('.mode-step-label');
@@ -8358,8 +8401,8 @@ HTML = """
         learningButton.onclick = () => loadLearningStatus();
       }
       if (paperButton) {
-        paperButton.innerHTML = 'Paper trading API<small>KIS virtual broker</small>';
-        paperButton.onclick = () => startSelectedOperationMode('paper');
+        paperButton.innerHTML = '실전 투자<small>KIS 실전 서버 전용</small>';
+        paperButton.onclick = () => startSelectedOperationMode('live');
       }
       if (liveButton) {
         liveButton.innerHTML = 'Live readiness<small>Auth check without orders</small>';
@@ -8375,10 +8418,10 @@ HTML = """
         refreshButton.onclick = () => loadLearningStatus();
       }
       const flowCopy = {
-        mode: ['Mode', 'Paper, readiness, or live auto trading'],
+        mode: ['Mode', 'Live auto trading'],
         data: ['Collection', 'Auto refresh while server runs'],
         analysis: ['Learning', 'Realtime store updates'],
-        simulation: ['Paper trading', 'Waiting for KIS/API state'],
+        simulation: ['Live gate', 'Waiting for KIS/API state'],
       };
       document.querySelectorAll('#systemFlowPanel .flow-step').forEach((step) => {
         const copy = flowCopy[step.dataset.flowStep];
@@ -8506,7 +8549,7 @@ HTML = """
     }
     function selectedOperationMode(action) {
       if (action === 'training') return 'learning';
-      if (action === 'testing' || action === 'paper') return 'paper_trading';
+      if (action === 'testing' || action === 'paper') return 'live_trading';
       if (action === 'live_test') return 'live_readiness';
       return 'live_trading';
     }
@@ -8527,7 +8570,7 @@ HTML = """
       updateTerminateTradingButton();
       if (refreshButton) refreshButton.disabled = false;
       if (learningButton) learningButton.innerHTML = '수집/학습 상태<small>서버 실행 중 자동 진행</small>';
-      paperButton.innerHTML = '모의투자 API<small>KIS 모의 서버 연동</small>';
+      paperButton.innerHTML = '실전 투자<small>KIS 실전 서버 전용</small>';
       if (liveButton) liveButton.innerHTML = '실전 준비 점검<small>주문 없이 인증 확인</small>';
       if (liveTradingButton) liveTradingButton.innerHTML = '실전 투자<small>자동매매 게이트</small>';
       if (refreshButton) refreshButton.innerHTML = '상태 새로고침<small>수집은 중단하지 않음</small>';
@@ -8540,7 +8583,7 @@ HTML = """
       button.disabled = operationRequestActive || !canTerminate;
       button.innerHTML = activeOperationMode === 'live_trading'
         ? '조기 종료<small>실전 보유분 지정가 전량 매도</small>'
-        : '조기 종료<small>모의 보유분 전량 매도</small>';
+        : '조기 종료<small>실전 투자 세션 없음</small>';
     }
 
     function setModeButtonsLocked(locked) {
@@ -8578,15 +8621,15 @@ HTML = """
     function modeLabel(mode) {
       return {
         learning: '수집/학습',
-        testing: '레거시 모의투자',
-        paper_trading: '모의투자 API',
+        testing: '실전 투자 진행',
+        paper_trading: '실전 투자 진행',
         live_readiness: '실전 준비 점검',
         live_trading: '실전 투자 진행',
       }[mode] || mode || '운영 모드';
     }
 
     function isPaperTradingMode(mode) {
-      return mode === 'testing' || mode === 'paper_trading';
+      return false;
     }
 
     function isTradingCheckMode(mode) {
@@ -8598,19 +8641,19 @@ HTML = """
     }
 
     function startsStreamingLoop(mode, data) {
-      return isPaperTradingMode(mode) && data && data.demo_id;
+      return false;
     }
 
     function setPerformancePanelMode(mode, statusMessage = '') {
       const isLive = mode === 'live_trading' || mode === 'live';
       const title = document.getElementById('performancePanelTitle');
-      if (title) title.textContent = isLive ? '실전 투자 성과' : 'Paper trading 성과';
+      if (title) title.textContent = '실전 투자 성과';
       const profit = document.getElementById('mockProfit');
       const equity = document.getElementById('mockEquity');
       const target = document.getElementById('mockTarget');
-      if (profit) profit.textContent = isLive ? '실전 손익 -' : '모의 손익 -';
-      if (equity) equity.textContent = isLive ? '실전 평가금 -' : '모의 평가금 -';
-      if (target) target.textContent = isLive ? '실전 목표 -' : '목표 -';
+      if (profit) profit.textContent = '실전 손익 -';
+      if (equity) equity.textContent = '실전 평가금 -';
+      if (target) target.textContent = '실전 목표 -';
       if (statusMessage) {
         const status = document.getElementById('mockStatus');
         if (status) status.textContent = statusMessage;
@@ -8894,8 +8937,8 @@ HTML = """
       updateTerminateTradingButton();
       const labels = {
         learning: 'Learning',
-        testing: 'Legacy paper trading',
-        paper_trading: 'Paper trading API',
+        testing: 'Live trading',
+        paper_trading: 'Live trading',
         live_readiness: 'Live readiness',
         live_trading: 'Live trading',
       };
@@ -10387,7 +10430,10 @@ HTML = """
       if (!ctx) return;
 
       const renderGraph = prepareRenderableGraph(data.nodes || [], data.links || []);
-      const nodes = computeGraphLayout(renderGraph.nodes, renderGraph.links);
+      const nodes = computeSemanticLayout(
+        renderGraph.nodes.map((node, index) => ({ ...node, index })),
+        renderGraph.links
+      );
       const graphMetrics = buildGraphMetrics(nodes, renderGraph.links);
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const activeKinds = new Set(['ticker', 'event', 'temporal', 'sector', 'support', 'risk', 'contradiction', 'pipeline', 'tuning', 'parameter', 'metric', 'entity']);
@@ -11636,3 +11682,4 @@ HTML = """
 </body>
 </html>
 """
+

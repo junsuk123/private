@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import sys
@@ -43,24 +43,26 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertTrue(web_module._is_open_live_market_ticker("005930", "KR", holiday_kst))
         self.assertEqual(web_module._active_live_market_groups(holiday_kst), ("KRX",))
 
-    def test_legacy_paper_trading_replay_uses_unified_realtime_data_without_live_orders(self) -> None:
+    def test_deprecated_testing_mode_is_normalized_to_live_trading(self) -> None:
         state = OperationModeManager().start(OperationMode.TESTING)
 
+        self.assertEqual(state.mode, OperationMode.LIVE_TRADING)
         self.assertEqual(state.data_environment, "realtime")
         self.assertFalse(state.synthetic_data_allowed)
-        self.assertFalse(state.live_orders_allowed)
-        self.assertFalse(state.training_allowed)
-        self.assertTrue(state.paper_trading_allowed)
+        self.assertTrue(state.live_orders_allowed)
+        self.assertTrue(state.training_allowed)
+        self.assertFalse(state.paper_trading_allowed)
         self.assertFalse(state.live_readiness_allowed)
-        self.assertIn("Legacy paper trading replay must not submit live broker orders.", state.guardrails)
+        self.assertIn("Paper trading modes are removed and normalized to live trading.", state.guardrails)
 
-    def test_kis_paper_and_readiness_modes_use_realtime_data_and_keep_live_orders_blocked(self) -> None:
+    def test_kis_paper_mode_is_normalized_to_live_trading(self) -> None:
         paper = OperationModeManager().start(OperationMode.PAPER_TRADING)
         live_readiness = OperationModeManager().start(OperationMode.LIVE_READINESS)
 
-        self.assertTrue(paper.paper_trading_allowed)
-        self.assertFalse(paper.live_orders_allowed)
-        self.assertEqual(paper.execution_label, "KIS paper trading API")
+        self.assertEqual(paper.mode, OperationMode.LIVE_TRADING)
+        self.assertFalse(paper.paper_trading_allowed)
+        self.assertTrue(paper.live_orders_allowed)
+        self.assertEqual(paper.execution_label, "Realtime trading gate")
         self.assertTrue(live_readiness.live_readiness_allowed)
         self.assertFalse(live_readiness.live_orders_allowed)
         self.assertEqual(live_readiness.execution_label, "KIS live readiness check")
@@ -146,30 +148,34 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
         start_worker.assert_called_once_with("learning")
 
-    def test_paper_api_test_starts_background_collection_without_blocking(self) -> None:
+    def test_paper_api_request_starts_live_trading_mode(self) -> None:
         client = TestClient(app)
         with (
             patch("app.web._start_live_worker") as start_worker,
             patch("app.web._start_streaming_demo", return_value="demo-test") as start_demo,
-            patch("app.web._start_kis_connection_probe_background") as kis_probe_background,
+            patch("app.web._start_kis_realtime_collector") as realtime_collector,
+            patch("app.web._start_realtime_trading_engine") as trading_engine,
+            patch(
+                "app.web._kis_connection_probe",
+                return_value={"ok": True, "mode": "live", "account_checked": True, "actual_deposit": 1000000},
+            ) as kis_probe,
             patch("app.web._get_or_refresh_live") as refresh_live,
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
         ):
             data = client.post("/api/operation-mode/start", json={"mode": "paper_trading"}).json()
 
         self.assertTrue(data["ok"])
-        # 학습과 거래 플로우는 독립이므로 거래 시작은 학습 워커를 건드리지 않는다.
-        self.assertEqual(data["paper_trading_status"], "trading_loop_started_independently")
-        self.assertEqual(data["paper_trading_kind"], "kis_paper_api")
-        self.assertEqual(data["demo_id"], "demo-test")
-        self.assertEqual(data["demo_status"], "initialized")
-        self.assertEqual(data["kis_connection"]["status"], "checking")
-        self.assertEqual(data["kis_connection"]["mode"], "paper")
+        self.assertEqual(data["mode"], "live_trading")
+        self.assertEqual(data["requested_mode"], "paper_trading")
+        self.assertEqual(data["mode_normalized_from"], "paper_trading")
+        self.assertEqual(data["kis_connection"]["mode"], "live")
         self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
-        start_demo.assert_called_once()
+        start_demo.assert_not_called()
         start_worker.assert_not_called()
-        kis_probe_background.assert_called_once_with(paper=True, include_account=True)
+        realtime_collector.assert_called_once()
+        trading_engine.assert_called_once()
+        kis_probe.assert_any_call(paper=False, include_account=True)
         refresh_live.assert_not_called()
-
     def test_live_api_test_checks_readiness_without_streaming_orders(self) -> None:
         client = TestClient(app)
         with (
@@ -190,7 +196,7 @@ class RealtimeModesTest(unittest.TestCase):
         # 점검/거래 플로우는 학습 워커와 독립적으로 동작한다.
         start_worker.assert_not_called()
         start_demo.assert_not_called()
-        kis_probe.assert_called_once_with(paper=False, include_account=True)
+        kis_probe.assert_any_call(paper=False, include_account=True)
         refresh_live.assert_not_called()
 
     def test_live_readiness_status_keeps_checked_broker_account(self) -> None:
@@ -331,23 +337,16 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(live_snapshot["status"]["cash_equivalent_krw"], 7364.63)
         self.assertEqual(status["equity"], live_snapshot["status"]["equity"])
 
-    def test_paper_mode_auto_uses_checked_live_account_basis_as_initial_cash(self) -> None:
+    def test_deprecated_paper_operation_request_does_not_start_streaming_demo(self) -> None:
         client = TestClient(app)
-        with web_module._live_lock:
-            web_module._operation_mode_state["last_kis_connection"] = {
-                "ok": True,
-                "mode": "live",
-                "account_checked": True,
-                "actual_deposit": 700000,
-                "invested_value": 300000,
-                "actual_equity": 1000000,
-                "account_suffix": "...28",
-            }
         with (
             patch("app.web._start_live_worker"),
             patch("app.web._start_streaming_demo", return_value="demo-live-basis") as start_demo,
-            patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "paper"}),
+            patch("app.web._start_kis_realtime_collector"),
+            patch("app.web._start_realtime_trading_engine"),
+            patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "live"}),
             patch("app.web._get_or_refresh_live"),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
         ):
             data = client.post(
                 "/api/operation-mode/start",
@@ -361,63 +360,35 @@ class RealtimeModesTest(unittest.TestCase):
             ).json()
 
         self.assertTrue(data["ok"])
-        self.assertEqual(data["initial_cash"], 700000)
-        self.assertEqual(data["initial_cash_source"], "kis_live_account")
-        self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
-        self.assertGreater(data["profit_gain"], 0.25)
-        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 700000)
-        self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
+        self.assertEqual(data["mode"], "live_trading")
+        self.assertEqual(data["mode_normalized_from"], "paper_trading")
+        start_demo.assert_not_called()
 
-    def test_paper_trading_start_defaults_to_live_account_and_auto_gain(self) -> None:
+    def test_paper_trading_start_endpoint_is_removed(self) -> None:
         client = TestClient(app)
-        with web_module._live_lock:
-            web_module._operation_mode_state["last_kis_connection"] = {
-                "ok": True,
-                "mode": "live",
-                "account_checked": True,
-                "actual_deposit": 450000,
-                "invested_value": 550000,
-                "actual_equity": 1000000,
-                "account_suffix": "...28",
-            }
         with patch("app.web._start_streaming_demo", return_value="demo-auto") as start_demo:
-            data = client.post(
+            response = client.post(
                 "/api/paper-trading/start",
                 json={
                     "target_return_rate": 3,
                     "period_minutes": 120,
                     "initial_cash_source": "auto",
                 },
-            ).json()
+            )
 
-        self.assertEqual(data["initial_cash"], 450000)
-        self.assertEqual(data["initial_cash_source"], "kis_live_account")
-        self.assertEqual(data["profit_gain_source"], "auto_goal_account_liquidity")
-        self.assertEqual(data["target_return_rate"], 0.03)
-        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 450000)
-        self.assertEqual(start_demo.call_args.kwargs["profit_gain"], data["profit_gain"])
+        data = response.json()
+        self.assertEqual(response.status_code, 410)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["status"], "removed")
+        self.assertEqual(data["mode"], "live_trading")
+        start_demo.assert_not_called()
 
-    def test_auto_initial_cash_uses_default_without_blocking_when_no_basis_is_cached(self) -> None:
+    def test_paper_trading_step_endpoint_is_removed(self) -> None:
         client = TestClient(app)
-        with web_module._live_lock:
-            web_module._operation_mode_state["last_kis_connection"] = None
-        with (
-            patch("app.web._start_auto_live_readiness_check") as auto_readiness,
-            patch("app.web._start_streaming_demo", return_value="demo-auto-refresh") as start_demo,
-        ):
-            data = client.post(
-                "/api/paper-trading/start",
-                json={
-                    "target_return_rate": 2,
-                    "period_minutes": 390,
-                    "initial_cash_source": "auto",
-                },
-            ).json()
+        response = client.post("/api/paper-trading/step", json={"demo_id": "demo-auto-refresh"})
 
-        auto_readiness.assert_called_once_with()
-        self.assertEqual(data["initial_cash"], 10000000)
-        self.assertEqual(data["initial_cash_source"], "default_auto")
-        self.assertEqual(start_demo.call_args.kwargs["initial_cash"], 10000000)
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()["status"], "removed")
 
     def test_startup_live_readiness_runs_read_only_account_probe(self) -> None:
         class ImmediateThread:
@@ -797,6 +768,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web.KisDevelopersApiClient", FakeKisClient),
                 patch("app.web.load_krx_listed_universe", return_value=("005930.KS", "000660.KS")),
                 patch("app.web.load_us_listed_universe", return_value=("AAPL", "MSFT")),
+                patch("app.web._load_us_listed_exchange_map", return_value={"AAPL": "NASD", "MSFT": "NASD"}),
                 patch("app.web._load_realtime_collection_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
@@ -813,6 +785,43 @@ class RealtimeModesTest(unittest.TestCase):
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
+
+    def test_kis_realtime_collector_symbols_include_held_and_context_krx_names(self) -> None:
+        account = AccountSnapshot(
+            cash=100000.0,
+            holdings=(Holding("006880", "KR", "Unit", "Unknown", 1, 4500.0, 4500.0),),
+            cash_by_currency={"KRW": 100000.0},
+        )
+        cached_context = SimpleNamespace(
+            reasoning_paths=(SimpleNamespace(ticker="232680", conclusion="BuyCandidate"),),
+            candidate_selection=SimpleNamespace(candidate_stocks=("012210", "AAPL")),
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = cached_context
+        try:
+            with (
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=("005930",)),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=("279570", "MSFT")),
+                patch.dict("os.environ", {"REALTIME_COLLECTOR_MAX_SYMBOLS": "8"}),
+            ):
+                symbols = web_module._kis_realtime_collector_symbols()
+
+            self.assertEqual(symbols[:4], ("006880", "232680", "012210", "005930"))
+            self.assertIn("279570", symbols)
+            self.assertNotIn("AAPL", symbols)
+            self.assertNotIn("MSFT", symbols)
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
+    def test_kis_realtime_collector_uses_live_client(self) -> None:
+        with patch.dict("os.environ", {"KIS_PAPER_TRADING": "true"}, clear=False):
+            client = web_module._kis_realtime_collector_client()
+
+        self.assertFalse(client.paper)
+        self.assertTrue(client.enabled)
 
     def test_live_order_journal_snapshot_reports_submitted_and_blocked_orders(self) -> None:
         events = [
@@ -1187,7 +1196,8 @@ class RealtimeModesTest(unittest.TestCase):
 
         with (
             patch("app.web._is_live_market_extended_open", return_value=True),
-            patch("app.web.load_us_listed_universe", return_value=("PENNY", "MICRO", "BIG")),
+            patch("app.web._load_us_listed_exchange_map", return_value={}),
+            patch("app.web._load_us_nasdaq_universe", return_value=("PENNY", "MICRO", "BIG")),
             patch("app.web._rotated_symbols", side_effect=lambda symbols: symbols),
             patch.dict("os.environ", {"LIVE_US_AFFORDABLE_DISCOVERY_LIMIT": "2"}),
         ):
@@ -1218,7 +1228,8 @@ class RealtimeModesTest(unittest.TestCase):
 
         with (
             patch("app.web._is_live_market_extended_open", return_value=True),
-            patch("app.web.load_us_listed_universe", return_value=("PENNY", "MICRO", "BIG")),
+            patch("app.web._load_us_listed_exchange_map", return_value={}),
+            patch("app.web._load_us_nasdaq_universe", return_value=("PENNY", "MICRO", "BIG")),
             patch("app.web._recent_live_buy_tickers", return_value={"MICRO"}),
             patch("app.web._rotated_symbols", side_effect=lambda symbols: symbols),
             patch.dict("os.environ", {"LIVE_US_AFFORDABLE_DISCOVERY_LIMIT": "2"}),
@@ -1332,3 +1343,4 @@ class RealtimeModesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

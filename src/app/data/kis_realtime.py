@@ -30,7 +30,6 @@ TRADE_TR_IDS = {"H0STCNT0", "H0STCNI0"}
 ORDERBOOK_TR_IDS = {"H0STASP0"}
 DEFAULT_SUBSCRIPTION_TR_IDS = ("H0STCNT0", "H0STASP0")
 KIS_REALTIME_LIVE_WS_URL = "ws://ops.koreainvestment.com:21000"
-KIS_REALTIME_PAPER_WS_URL = "ws://ops.koreainvestment.com:31000"
 KIS_EXCHANGE_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
@@ -61,7 +60,12 @@ class KisRealtimeSubscriptionManager:
             raw = await self.message_source()
             if raw is None:
                 break
-            parsed = parse_kis_realtime_message(raw)
+            try:
+                parsed = parse_kis_realtime_message(raw)
+            except ValueError:
+                counts["parse_errors"] = counts.get("parse_errors", 0) + 1
+                counts["messages"] += 1
+                continue
             ticks = tuple(tick for tick in parsed.ticks if not self.symbols or tick.symbol in self.symbols)
             orderbooks = tuple(
                 item for item in parsed.orderbooks if not self.symbols or item.symbol in self.symbols
@@ -80,7 +84,7 @@ class KisRealtimeSubscriptionManager:
         self.running = False
 
 
-def _websocket_ping_setting(name: str, default: float) -> float | None:
+def _websocket_ping_setting(name: str, default: float | None) -> float | None:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -91,6 +95,14 @@ def _websocket_ping_setting(name: str, default: float) -> float | None:
         return max(1.0, float(value))
     except ValueError:
         return default
+
+
+def _websocket_subscription_delay_seconds() -> float:
+    raw = os.getenv("KIS_REALTIME_SUBSCRIBE_DELAY_SEC", "0.15")
+    try:
+        return max(0.0, min(5.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.15
 
 
 async def run_kis_realtime_websocket_collector(
@@ -106,18 +118,38 @@ async def run_kis_realtime_websocket_collector(
     websockets = _load_websockets()
     client = client or build_kis_client(enabled=True)
     approval_key = issue_websocket_approval_key(client)
-    target_url = url or _kis_realtime_websocket_url(paper=client.paper)
+    target_url = url or _kis_realtime_websocket_url()
     normalized_symbols = tuple(symbol for symbol in (normalize_symbol(item) for item in symbols) if symbol)
     store = store or RealtimeMarketDataStore()
-    counts = {"messages": 0, "ticks": 0, "orderbooks": 0, "subscriptions": 0}
+    counts: dict[str, Any] = {
+        "messages": 0,
+        "ticks": 0,
+        "orderbooks": 0,
+        "subscriptions": 0,
+        "mode": "live",
+        "url": target_url,
+    }
     feature_builder = LiveFeatureFrameBuilder(store)
-    ping_interval = _websocket_ping_setting("KIS_REALTIME_WS_PING_INTERVAL_SECONDS", 20.0)
-    ping_timeout = _websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", 20.0)
+    # KIS realtime sends application-level PINGPONG frames and doesn't reliably
+    # respond to RFC websocket pings from the client library. Keep the standard
+    # ping disabled by default; operators can opt in with env vars if needed.
+    ping_interval = _websocket_ping_setting("KIS_REALTIME_WS_PING_INTERVAL_SECONDS", None)
+    ping_timeout = _websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", None)
+    subscribe_delay = _websocket_subscription_delay_seconds()
     async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
         for symbol in normalized_symbols:
             for tr_id in DEFAULT_SUBSCRIPTION_TR_IDS:
-                await websocket.send(kis_realtime_subscription_message(approval_key, tr_id, symbol))
+                try:
+                    await websocket.send(kis_realtime_subscription_message(approval_key, tr_id, symbol))
+                except Exception as exc:
+                    if _is_websocket_connection_closed(exc):
+                        counts["connection_closed"] = 1
+                        counts["last_close_error"] = str(exc) or exc.__class__.__name__
+                        return counts
+                    raise
                 counts["subscriptions"] += 1
+                if subscribe_delay > 0.0:
+                    await asyncio.sleep(subscribe_delay)
         # Optional soft deadline so the caller can periodically reconnect with a
         # refreshed symbol set (e.g. today's affordable candidates), not just the
         # static config list.
@@ -129,22 +161,36 @@ async def run_kis_realtime_websocket_collector(
                 raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
             except TimeoutError:
                 continue
+            except Exception as exc:
+                if _is_websocket_connection_closed(exc):
+                    counts["connection_closed"] = 1
+                    counts["last_close_error"] = str(exc) or exc.__class__.__name__
+                    break
+                raise
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="replace")
             raw = str(raw)
-            # KIS uses application-level PINGPONG keepalive frames (the websockets
-            # library ping is disabled via KIS_REALTIME_WS_PING_INTERVAL_SECONDS=0
-            # because KIS never answers standard WS pings). KIS drops the socket
-            # ("no close frame received or sent") unless every PINGPONG is echoed
-            # back verbatim, so answer it before doing anything else.
+            # KIS uses application-level PINGPONG keepalive frames. KIS drops the
+            # socket ("no close frame received or sent") unless every PINGPONG is
+            # echoed back verbatim, so answer it before doing anything else.
             if raw.startswith("{") and "PINGPONG" in raw:
                 try:
                     await websocket.send(raw)
-                except Exception:  # noqa: BLE001 - a failed echo just forces a reconnect.
-                    pass
+                except Exception as exc:
+                    if _is_websocket_connection_closed(exc):
+                        counts["connection_closed"] = 1
+                        counts["last_close_error"] = str(exc) or exc.__class__.__name__
+                        break
+                    raise
                 counts["pingpongs"] = counts.get("pingpongs", 0) + 1
                 continue
-            parsed = parse_kis_realtime_message(raw)
+            try:
+                parsed = parse_kis_realtime_message(raw)
+            except ValueError as exc:
+                counts["parse_errors"] = counts.get("parse_errors", 0) + 1
+                counts["last_parse_error"] = str(exc) or exc.__class__.__name__
+                counts["messages"] += 1
+                continue
             ticks = tuple(tick for tick in parsed.ticks if tick.symbol in normalized_symbols)
             orderbooks = tuple(book for book in parsed.orderbooks if book.symbol in normalized_symbols)
             counts["ticks"] += store.save_ticks(ticks)
@@ -163,6 +209,17 @@ async def run_kis_realtime_websocket_collector(
     return counts
 
 
+def _is_websocket_connection_closed(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    return (
+        "connectionclosed" in name
+        or "connection closed" in message
+        or "no close frame received or sent" in message
+        or "keepalive ping timeout" in message
+    )
+
+
 def kis_realtime_subscription_message(approval_key: str, tr_id: str, symbol: str) -> str:
     return json.dumps(
         {
@@ -179,14 +236,11 @@ def kis_realtime_subscription_message(approval_key: str, tr_id: str, symbol: str
     )
 
 
-def _kis_realtime_websocket_url(*, paper: bool) -> str:
+def _kis_realtime_websocket_url() -> str:
     explicit = os.getenv("KIS_WEBSOCKET_URL", "").strip()
     if explicit:
         return explicit
-    return os.getenv(
-        "KIS_PAPER_WEBSOCKET_URL" if paper else "KIS_LIVE_WEBSOCKET_URL",
-        KIS_REALTIME_PAPER_WS_URL if paper else KIS_REALTIME_LIVE_WS_URL,
-    ).strip()
+    return os.getenv("KIS_LIVE_WEBSOCKET_URL", KIS_REALTIME_LIVE_WS_URL).strip()
 
 
 def _load_websockets() -> Any:

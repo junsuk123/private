@@ -285,7 +285,7 @@ class AccountDashboardTest(unittest.TestCase):
 
         call = transport.calls[-1]
         self.assertTrue(call["url"].endswith("/uapi/overseas-stock/v1/trading/inquire-balance"))
-        self.assertEqual(call["headers"]["tr_id"], "VTTS3012R")
+        self.assertEqual(call["headers"]["tr_id"], "TTTS3012R")
         self.assertEqual(call["params"]["OVRS_EXCG_CD"], "NASD")
         self.assertEqual(call["params"]["TR_CRCY_CD"], "USD")
 

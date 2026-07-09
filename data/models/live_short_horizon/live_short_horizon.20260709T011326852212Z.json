@@ -1,0 +1,132 @@
+{
+  "artifact_id": "live_short_horizon.20260709T011326852212Z",
+  "classification": {
+    "bias": -1192.871817461844,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      289.2546025782945,
+      110.46542693040891,
+      9.391921796577364,
+      272.19897055180684,
+      -0.05963993483310018,
+      2.502149595818897,
+      1.8555554289291455e-05,
+      -3.3921554850862763e-06,
+      -0.016784065036160468,
+      0.2211312206320888,
+      -203.12589751425446,
+      247.56754231627005,
+      -0.0005695522484942219,
+      0.0,
+      2.0601266662078,
+      -0.1519736112737448,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1200.7930423267926
+    ]
+  },
+  "created_at": "2026-07-09T01:13:26.852212+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio",
+    "news_sentiment",
+    "rsi_14",
+    "macd_histogram",
+    "bollinger_percent_b",
+    "ema_gap_bps",
+    "donchian_breakout",
+    "volume_spike_ratio"
+  ],
+  "feature_schema_hash": "3e480bae46ced55f9a1e573b",
+  "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.5347278561157255,
+    "avg_forward_net_return_bps_top_k": 90.59744393912045,
+    "example_count": 6439.0,
+    "holdout_evaluated": 1.0,
+    "holdout_train_count": 4415.0,
+    "negative_labels": 2775.0,
+    "positive_labels": 3664.0,
+    "precision_at_k": 0.28,
+    "top_k_count": 25.0,
+    "top_k_fraction": 0.012939958592132506,
+    "validation_example_count": 1932.0
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": -9174.681696395104,
+    "family": "linear_regression_sgd",
+    "weights": [
+      -37243.00712751098,
+      8903.39302376807,
+      5927.931092718493,
+      8832.40559894357,
+      -2.1808160765944047,
+      99.21009641585383,
+      3.8071966885176946e-05,
+      -2.0689577848254128e-05,
+      0.11250148456173417,
+      4.543475616289518,
+      19917.00612815647,
+      400.4683144884948,
+      0.030835689291724203,
+      0.0,
+      -30.205009720127514,
+      -6.1672438367090425,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      9480.041059872581
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "triple_barrier tp=25.0bps sl=100.0bps horizon=600.0s net_of_costs (fallback: forward_return_after_30s > 5.0bps)",
+    "row_count": 6439,
+    "row_quality": {
+      "avg_forward_net_return_bps": 4.768802189806147,
+      "label_sources": {
+        "forward_mark_price": 1,
+        "forward_mark_price+market_adjusted": 8,
+        "triple_barrier_stop_loss+market_adjusted": 797,
+        "triple_barrier_take_profit+market_adjusted": 463,
+        "triple_barrier_terminal+market_adjusted": 5170
+      },
+      "max_forward_net_return_bps": 30706.317300161747,
+      "min_forward_net_return_bps": -2032.5424065761354
+    },
+    "schema_hash": "3e480bae46ced55f9a1e573b",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames",
+    "trade_feedback": {
+      "events_total": 531,
+      "filled_events": 107,
+      "latest_event_at": "2026-07-09T01:12:01.265721+00:00",
+      "latest_filled_at": "2026-07-09T01:12:01.265721+00:00",
+      "store_exists": true,
+      "store_path": "data\\store\\account_dashboard.sqlite3"
+    }
+  }
+}

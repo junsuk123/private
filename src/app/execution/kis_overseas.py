@@ -99,21 +99,21 @@ class KisOverseasAccountClient:
         params.update({"OVRS_EXCG_CD": exchange, "TR_CRCY_CD": currency, "PDNO": ticker})
         return self.client._get(  # noqa: SLF001
             "/uapi/overseas-stock/v1/trading/inquire-period-profit",
-            tr_id="TTTS3039R" if not self.client.paper else "VTTS3039R",
+            tr_id="TTTS3039R",
             params=params,
         )
 
     def inquire_overseas_period_transactions(self, start_date: date | str, end_date: date | str) -> dict[str, Any]:
         return self.client._get(  # noqa: SLF001
             "/uapi/overseas-stock/v1/trading/inquire-period-trans",
-            tr_id="CTOS4001R" if not self.client.paper else "VTOS4001R",
+            tr_id="CTOS4001R",
             params=self._date_range_params(start_date, end_date),
         )
 
     def inquire_foreign_margin(self) -> dict[str, Any]:
         return self.client._get(  # noqa: SLF001
             "/uapi/overseas-stock/v1/trading/foreign-margin",
-            tr_id="TTTC2101R" if not self.client.paper else "VTTC2101R",
+            tr_id="TTTC2101R",
             params={"CANO": self.client.credentials.account_no, "ACNT_PRDT_CD": self.client.credentials.account_product_code},
         )
 

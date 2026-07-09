@@ -15,7 +15,6 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnaps
 
 
 KIS_LIVE_BASE_URL = "https://openapi.koreainvestment.com:9443"
-KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
 KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
@@ -90,15 +89,10 @@ class KisCredentials:
     @classmethod
     def from_env(cls, paper: bool = False) -> "KisCredentials":
         load_kis_env_file()
-        prefix = "KIS_PAPER_" if paper else "KIS_"
-        app_key = os.getenv(f"{prefix}APP_KEY") or os.getenv("KIS_APP_KEY", "")
-        app_secret = os.getenv(f"{prefix}APP_SECRET") or os.getenv("KIS_APP_SECRET", "")
-        account_no = os.getenv(f"{prefix}ACCOUNT_NO") or os.getenv("KIS_ACCOUNT_NO", "")
-        product_code = (
-            os.getenv(f"{prefix}ACCOUNT_PRODUCT_CODE")
-            or os.getenv("KIS_ACCOUNT_PRODUCT_CODE")
-            or "01"
-        )
+        app_key = os.getenv("KIS_APP_KEY", "")
+        app_secret = os.getenv("KIS_APP_SECRET", "")
+        account_no = os.getenv("KIS_ACCOUNT_NO", "")
+        product_code = os.getenv("KIS_ACCOUNT_PRODUCT_CODE") or "01"
         return cls.from_values(app_key, app_secret, account_no, product_code)
 
     @classmethod
@@ -143,13 +137,12 @@ class KisEndpointSet:
 
     @classmethod
     def for_mode(cls, paper: bool, base_url: str | None = None) -> "KisEndpointSet":
-        default_base_url = KIS_PAPER_BASE_URL if paper else KIS_LIVE_BASE_URL
-        return cls(base_url=(base_url or default_base_url), paper=paper)
+        return cls(base_url=(base_url or KIS_LIVE_BASE_URL), paper=False)
 
     def tr_id_for_order(self, side: OrderSide) -> str:
         if side == OrderSide.BUY:
-            return "VTTC0012U" if self.paper else "TTTC0012U"
-        return "VTTC0011U" if self.paper else "TTTC0011U"
+            return "TTTC0012U"
+        return "TTTC0011U"
 
     def overseas_tr_id_for_order(self, exchange_code: str, side: OrderSide) -> str:
         exchange = exchange_code.upper()
@@ -187,21 +180,21 @@ class KisEndpointSet:
             )
         if not tr_id:
             raise ValueError(f"unsupported overseas exchange for KIS order: {exchange_code}")
-        return "V" + tr_id[1:] if self.paper else tr_id
+        return tr_id
 
     def overseas_daytime_tr_id_for_order(self, side: OrderSide) -> str:
         if side == OrderSide.BUY:
-            return "VTTT6036U" if self.paper else "TTTS6036U"
-        return "VTTT6037U" if self.paper else "TTTS6037U"
+            return "TTTS6036U"
+        return "TTTS6037U"
 
     @property
     def order_revise_cancel_tr_id(self) -> str:
-        return "VTTC0013U" if self.paper else "TTTC0013U"
+        return "TTTC0013U"
 
     def overseas_revise_cancel_tr_id(self, exchange_code: str) -> str:
         exchange = exchange_code.upper()
         if exchange in {"NASD", "NYSE", "AMEX"}:
-            return "VTTT1004U" if self.paper else "TTTT1004U"
+            return "TTTT1004U"
         tr_id = (
             "TTTS1003U"
             if exchange == "SEHK"
@@ -217,46 +210,46 @@ class KisEndpointSet:
         )
         if not tr_id:
             raise ValueError(f"unsupported overseas exchange for KIS revise/cancel: {exchange_code}")
-        return "V" + tr_id[1:] if self.paper else tr_id
+        return tr_id
 
     @property
     def overseas_daytime_revise_cancel_tr_id(self) -> str:
-        return "VTTT6038U" if self.paper else "TTTS6038U"
+        return "TTTS6038U"
 
     @property
     def order_status_tr_id(self) -> str:
-        return "VTTC8001R" if self.paper else "TTTC8001R"
+        return "TTTC8001R"
 
     @property
     def balance_tr_id(self) -> str:
-        return "VTTC8434R" if self.paper else "TTTC8434R"
+        return "TTTC8434R"
 
     @property
     def orderable_cash_tr_id(self) -> str:
-        return "VTTC8908R" if self.paper else "TTTC8908R"
+        return "TTTC8908R"
 
     @property
     def overseas_present_balance_tr_id(self) -> str:
-        return "VTRP6504R" if self.paper else "CTRP6504R"
+        return "CTRP6504R"
 
     @property
     def overseas_balance_tr_id(self) -> str:
-        return "VTTS3012R" if self.paper else "TTTS3012R"
+        return "TTTS3012R"
 
     @property
     def overseas_orderable_cash_tr_id(self) -> str:
-        return "VTTS3007R" if self.paper else "TTTS3007R"
+        return "TTTS3007R"
 
     @property
     def overseas_order_status_tr_id(self) -> str:
-        return "VTTS3035R" if self.paper else "TTTS3035R"
+        return "TTTS3035R"
 
 
 class KisDevelopersApiClient:
     """KIS Developers REST broker adapter for domestic cash stock orders.
 
-    The same request builder is used for paper and live modes. Tests can inject
-    a fake KisTransport, while production uses urllib and real KIS credentials.
+    Tests can inject a fake KisTransport, while production uses urllib and real
+    KIS live credentials.
     """
 
     def __init__(
@@ -274,13 +267,13 @@ class KisDevelopersApiClient:
         token_cache_path: str | Path | None = None,
     ) -> None:
         load_kis_env_file()
-        self.paper = _env_bool("KIS_PAPER_TRADING", False) if paper is None else paper
+        self.paper = False
         self.credentials = (
-            KisCredentials.from_env(self.paper)
+            KisCredentials.from_env(False)
             if app_key is None and app_secret is None and account_no is None
             else KisCredentials.from_values(app_key, app_secret, account_no, account_product_code)
         )
-        self.endpoints = KisEndpointSet.for_mode(self.paper, base_url or os.getenv("KIS_BASE_URL"))
+        self.endpoints = KisEndpointSet.for_mode(False, base_url or os.getenv("KIS_BASE_URL_REAL") or os.getenv("KIS_BASE_URL"))
         self.enabled = (
             _env_bool("KIS_LIVE_ENABLED", False)
             if enabled is None
@@ -724,8 +717,8 @@ class KisDevelopersApiClient:
     def inquire_domestic_period_profit(self, start_date: Any, end_date: Any) -> dict[str, Any]:
         """Raw KIS domestic period trade-profit inquiry (기간별매매손익현황조회).
 
-        TR TTTC8715R / VTTC8715R (paper). Returns realized (settled) trade
-        profit/loss over [start_date, end_date] for domestic stocks.
+        TR TTTC8715R returns realized (settled) trade profit/loss over
+        [start_date, end_date] for domestic stocks.
         """
         params = {
             "CANO": self.credentials.account_no,
@@ -740,7 +733,7 @@ class KisDevelopersApiClient:
         }
         return self._get(
             "/uapi/domestic-stock/v1/trading/inquire-period-trade-profit",
-            tr_id="VTTC8715R" if self.paper else "TTTC8715R",
+            tr_id="TTTC8715R",
             params=params,
         )
 
@@ -844,17 +837,17 @@ class KisDevelopersApiClient:
         return self.issue_access_token()
 
     def _load_env_token(self, now: datetime | None = None) -> str | None:
-        mode_prefix = "KIS_PAPER_" if self.paper else "KIS_LIVE_"
+        mode_prefix = "KIS_LIVE_"
         token = (
             os.getenv(f"{mode_prefix}ACCESS_TOKEN")
-            or (None if self.paper else os.getenv("KIS_ACCESS_TOKEN"))
+            or os.getenv("KIS_ACCESS_TOKEN")
             or ""
         ).strip()
         if not token:
             return None
         expires_at = _parse_datetime(
             os.getenv(f"{mode_prefix}ACCESS_TOKEN_EXPIRES_AT")
-            or (None if self.paper else os.getenv("KIS_ACCESS_TOKEN_EXPIRES_AT"))
+            or os.getenv("KIS_ACCESS_TOKEN_EXPIRES_AT")
         )
         if expires_at is not None and expires_at <= (now or datetime.now(timezone.utc)):
             return None
@@ -873,7 +866,7 @@ class KisDevelopersApiClient:
         token = str(payload.get("access_token") or "")
         expires_at = _parse_datetime(payload.get("expires_at"))
         mode = str(payload.get("mode") or "")
-        if not token or expires_at is None or mode != ("paper" if self.paper else "live"):
+        if not token or expires_at is None or mode != "live":
             return None
         if expires_at <= (now or datetime.now(timezone.utc)):
             return None
@@ -888,7 +881,7 @@ class KisDevelopersApiClient:
         payload = {
             "access_token": self._access_token,
             "expires_at": self._token_expires_at.isoformat(),
-            "mode": "paper" if self.paper else "live",
+            "mode": "live",
             "base_url": self.endpoints.base_url,
             "account_suffix": self.credentials.account_no[-2:],
         }
@@ -1793,9 +1786,8 @@ def _exchange_rate_from_row(row: dict[str, Any]) -> float:
     return 0.0
 
 
-def _default_token_cache_path(paper: bool) -> Path:
-    mode = "paper" if paper else "live"
-    return Path(os.getenv("KIS_TOKEN_CACHE_DIR", "config/secrets")) / f"kis_access_token.{mode}.json"
+def _default_token_cache_path(paper: bool = False) -> Path:
+    return Path(os.getenv("KIS_TOKEN_CACHE_DIR", "config/secrets")) / "kis_access_token.live.json"
 
 
 def _parse_datetime(value: Any) -> datetime | None:

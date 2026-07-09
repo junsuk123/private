@@ -28,6 +28,7 @@ from app.graph.macro_micro_common import (
     MICRO_MOMENTUM_CONFIRMED,
     MICRO_SIGNAL_UNAVAILABLE,
     MICRO_STRATEGY_BLOCKED_BY_MACRO,
+    MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
     SPREAD_CONSUMES_ALPHA,
     STALE_QUOTE,
     EntrySignal,
@@ -205,6 +206,25 @@ class MicroSymbolReasoner:
         paths: list[dict] = []
 
         if features is None:
+            live_quote = data.realtime_tick is not None or data.broker_quote is not None
+            if live_quote:
+                return self._result(
+                    data,
+                    MicroRegime.HOLD_OR_WATCH,
+                    SelectedStrategy.HOLD,
+                    EntrySignal.WAIT_CONFIRMATION,
+                    ExitSignal.NONE,
+                    ExecutionQuality.ACCEPTABLE,
+                    reasons=[MICRO_TECHNICAL_HISTORY_INSUFFICIENT],
+                    paths=[
+                        explanation(
+                            MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
+                            "Live quote is available, but technical history is not sufficient for a micro signal.",
+                        )
+                    ],
+                    confidence=0.25,
+                    expected_entry_price=_quote_price(data.broker_quote) or _quote_price(data.realtime_tick),
+                )
             return self._result(data, MicroRegime.NO_TRADE_SYMBOL, SelectedStrategy.HOLD,
                                 EntrySignal.NONE, ExitSignal.NONE, ExecutionQuality.BLOCKED,
                                 reasons=[MICRO_SIGNAL_UNAVAILABLE], paths=[explanation(MICRO_SIGNAL_UNAVAILABLE, "No technical features for symbol.")],
@@ -371,6 +391,19 @@ def _confirm_code(strategy: str) -> str:
         "mean_reversion": MICRO_MEAN_REVERSION_CANDIDATE,
         "vwap_reversion": MICRO_MEAN_REVERSION_CANDIDATE,
     }.get(strategy, MICRO_MOMENTUM_CONFIRMED)
+
+
+def _quote_price(quote: Any) -> float | None:
+    if quote is None:
+        return None
+    for name in ("last_price", "price", "mark_price"):
+        try:
+            value = float(getattr(quote, name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0.0:
+            return value
+    return None
 
 
 def _paths_from_codes(codes) -> list[dict]:

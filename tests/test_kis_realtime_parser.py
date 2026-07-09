@@ -6,12 +6,16 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.kis_realtime import (
     KisRealtimeSubscriptionManager,
     QueueMessageSource,
+    _is_websocket_connection_closed,
+    _websocket_subscription_delay_seconds,
+    _websocket_ping_setting,
     kis_realtime_subscription_message,
     normalize_symbol,
     parse_kis_realtime_message,
@@ -92,6 +96,23 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertEqual(bar.close, 70100)
         self.assertEqual(bar.volume, 300)
 
+    def test_subscription_manager_skips_bad_message_without_stopping_ticks(self) -> None:
+        messages = (
+            "unexpected-control-message",
+            "0|H0STCNT0|001|005930^093000^70000^100^BUY^seq-1",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            manager = KisRealtimeSubscriptionManager(store, QueueMessageSource(messages))
+            manager.subscribe(["005930"])
+
+            counts = asyncio.run(manager.run_forever())
+            tick = store.latest_tick("005930")
+
+        self.assertEqual(counts["parse_errors"], 1)
+        self.assertEqual(counts["ticks"], 1)
+        self.assertIsNotNone(tick)
+
     def test_symbol_normalization_keeps_krx_six_digits(self) -> None:
         self.assertEqual(normalize_symbol("660"), "000660")
 
@@ -101,6 +122,27 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertIn('"approval_key":"approval"', payload)
         self.assertIn('"tr_id":"H0STCNT0"', payload)
         self.assertIn('"tr_key":"000660"', payload)
+
+    def test_kis_websocket_standard_ping_is_disabled_by_default(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "KIS_REALTIME_WS_PING_INTERVAL_SECONDS": "",
+                "KIS_REALTIME_WS_PING_TIMEOUT_SECONDS": "",
+            },
+            clear=False,
+        ):
+            self.assertIsNone(_websocket_ping_setting("KIS_REALTIME_WS_PING_INTERVAL_SECONDS", None))
+            self.assertIsNone(_websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", None))
+
+    def test_kis_subscriptions_are_throttled_by_default(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertGreater(_websocket_subscription_delay_seconds(), 0.0)
+
+    def test_connection_closed_message_is_recognized(self) -> None:
+        exc = RuntimeError("no close frame received or sent")
+
+        self.assertTrue(_is_websocket_connection_closed(exc))
 
 
 if __name__ == "__main__":
