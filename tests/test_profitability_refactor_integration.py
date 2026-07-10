@@ -71,13 +71,17 @@ def _engine_with_model(price: float, bps: float) -> SharedLiveDecisionEngine:
 
 class ProfitabilityRefactorIntegrationTest(unittest.TestCase):
     def test_gross_positive_net_negative_buy_is_rejected(self) -> None:
-        # +0.3% predicted move: gross-positive but does not clear KR cost + 0.8% floor.
-        engine = _engine_with_model(price=10_000.0, bps=30.0)
-        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
-        with_env = {"REALTIME_MODEL_AUXILIARY_ONLY": "true"}
+        # +0.3% predicted move: gross-positive but does not clear the KR cost + net floor.
+        # An explicit 0.8% KR floor is set here so this exercises the gate MECHANISM
+        # independent of the deployment's tuned profitability_policy.yaml (which relaxes
+        # the KR floor to 0.0). The policy is read at gate construction, so the env must
+        # be set BEFORE the engine is built.
+        with_env = {"REALTIME_MODEL_AUXILIARY_ONLY": "true", "REALTIME_MIN_BUY_NET_RETURN_KR": "0.008"}
         old = {k: os.environ.get(k) for k in with_env}
         os.environ.update(with_env)
         try:
+            engine = _engine_with_model(price=10_000.0, bps=30.0)
+            account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
             result = engine.evaluate_buy("000660", account, suggested_weight=0.01, ontology_graph=_graph())
         finally:
             for k, v in old.items():

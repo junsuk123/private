@@ -27,6 +27,17 @@ class RealtimeModesTest(unittest.TestCase):
             web_module._operation_mode_state["last_kis_connection"] = None
             web_module._operation_mode_state["live_trading_baseline_equity"] = None
 
+    def _isolate_live_account_refresh(self) -> None:
+        # Hermetic isolation for the status/basis tests: on a machine with working live
+        # KIS credentials the status path fetches the REAL account via
+        # _refresh_live_account_basis_for_auto, overriding the mocked last_kis_connection.
+        # Force it to None so the basis is driven only by the test's explicit mock (as in
+        # CI where live KIS is unavailable). Applied per-test (not in setUp) because the
+        # live-readiness startup test needs the real refresh path with a mocked probe.
+        patcher = patch("app.web._refresh_live_account_basis_for_auto", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_learning_uses_unified_realtime_data_and_disallows_orders(self) -> None:
         state = OperationModeManager().start(OperationMode.LEARNING)
 
@@ -224,6 +235,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(status["kis_connection"]["account_suffix"], "...28")
 
     def test_status_uses_checked_live_account_as_operating_basis(self) -> None:
+        self._isolate_live_account_refresh()
         client = TestClient(app)
         broker_state = {
             "ok": True,
@@ -264,6 +276,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(status["cash_weight"], 0.8)
 
     def test_status_keeps_orderable_krw_cash_separate_from_foreign_cash(self) -> None:
+        self._isolate_live_account_refresh()
         client = TestClient(app)
         broker_state = {
             "ok": True,
@@ -292,6 +305,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(status["cash_weight"], 0.8)
 
     def test_status_and_live_snapshot_use_same_live_account_cash_basis(self) -> None:
+        self._isolate_live_account_refresh()
         client = TestClient(app)
         broker_state = {
             "ok": True,
@@ -669,7 +683,15 @@ class RealtimeModesTest(unittest.TestCase):
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5"}),
             ):
                 store_cls.return_value.active_symbols.return_value = ("222222",)
-                store_cls.return_value.latest_tick.side_effect = lambda symbol: SimpleNamespace(price=5000.0) if symbol in {"111111", "222222"} else None
+                # The affordability filter requires a FRESH (timestamped) tick — a bare
+                # price is treated as stale (price 0) and the candidate is dropped.
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.latest_tick.side_effect = (
+                    lambda symbol: SimpleNamespace(price=5000.0, received_at=_now, exchange_timestamp=_now)
+                    if symbol in {"111111", "222222"}
+                    else None
+                )
+                store_cls.return_value.latest_orderbook.return_value = None
                 candidates = web_module._realtime_buy_candidates()
 
             self.assertEqual(candidates[:2], ("005930", "000660"))
@@ -920,6 +942,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(cached["positions"][0]["ticker"], "005930")
 
     def test_live_trading_progress_reconciles_filled_buy_before_balance_refresh(self) -> None:
+        self._isolate_live_account_refresh()
         client = TestClient(app)
         journal = {
             "path": "logs/live-orders.jsonl",
@@ -1003,6 +1026,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual([item["ticker"] for item in status["positions"]], ["012860", "288180"])
 
     def test_status_exposes_live_positions_for_gui_refresh(self) -> None:
+        self._isolate_live_account_refresh()
         client = TestClient(app)
         connection = {
             "ok": True,

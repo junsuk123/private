@@ -117,8 +117,14 @@ class ProfitabilityGateTest(unittest.TestCase):
 
     def test_small_account_adds_extra_required_net(self) -> None:
         # Use a low market floor so the dynamic buffer path (not the floor) governs,
-        # making the small-account buffer's effect observable.
-        gate = _gate(min_required_net_return={"default": 0.0, "KR": 0.0, "US": 0.0})
+        # making the small-account buffer's effect observable. Set an explicit small-
+        # account buffer so this exercises the MECHANISM regardless of the deployment's
+        # tuned profitability_policy.yaml (which currently relaxes the buffer to 0.0).
+        gate = _gate(
+            min_required_net_return={"default": 0.0, "KR": 0.0, "US": 0.0},
+            small_account_equity_krw=200_000.0,
+            small_account_extra_net=0.002,
+        )
         big = gate.evaluate(
             ProfitabilityInput(symbol="A", market="KR", entry_price=10_000, expected_exit_price=10_300, quantity=1, spread_rate=0.0005, liquidity_score=0.9, account_equity_krw=5_000_000)
         )

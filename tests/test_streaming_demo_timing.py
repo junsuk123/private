@@ -205,125 +205,34 @@ class StreamingDemoTimingTest(unittest.TestCase):
         self.assertGreaterEqual(demo._cash_by_currency["KRW"], 1_000_000)
         self.assertTrue(all(trade.reason == "principal protection reserve" for trade in trades))
 
-    def test_paper_trading_step_runs_immediately_without_time_gate(self) -> None:
-        # 시간 팩터 제거: 봉 간 인위적 지연이 없으므로 첫 스텝이 즉시 실행된다(waiting 없음).
-        previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
-        previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
-        os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
-        os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
+    # --- Paper-trading removal (deprecation contract) --------------------------
+    # Paper trading was removed; the app now trades live only. The old
+    # start/step/terminate demo flow is gone. These verify the graceful deprecation.
+    def test_paper_trading_start_endpoint_removed(self) -> None:
         client = TestClient(app)
-        try:
-            start_response = client.post(
-                "/api/paper-trading/start",
-                json={
-                    "target_return_rate": 0.02,
-                    "period_minutes": 20,
-                    "initial_cash": 10_000_000,
-                },
-            )
-            self.assertEqual(start_response.status_code, 200)
-            demo_id = start_response.json()["demo_id"]
+        response = client.post(
+            "/api/paper-trading/start",
+            json={"target_return_rate": 0.02, "period_minutes": 20, "initial_cash": 10_000_000},
+        )
+        self.assertEqual(response.status_code, 410)
+        payload = response.json()
+        self.assertEqual(payload["status"], "removed")
+        self.assertIn("removed", payload["message"].lower())
 
-            due_step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
-
-            self.assertEqual(due_step["status"], "running")
-            self.assertEqual(due_step["step"], 1)
-            self.assertEqual(due_step["raw_step"], 15)
-            self.assertEqual(due_step["progress"], 5.0)
-            self.assertEqual(due_step["seconds_until_next_step"], 0.0)
-            self.assertIn("ontology_filter_1", due_step)
-            self.assertLessEqual(due_step["ontology_filter_1"]["chart_fetch_count"], len(TEST_TICKERS))
-            self.assertGreaterEqual(due_step["universe_count"], due_step["ontology_filter_1"]["chart_fetch_count"])
-        finally:
-            if previous_limit is None:
-                os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)
-            else:
-                os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = previous_limit
-            if previous_target is None:
-                os.environ.pop("ONTOLOGY_FILTER1_TARGET_COUNT", None)
-            else:
-                os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
-
-    def test_paper_trading_mode_starts_buy_sell_loop(self) -> None:
-        previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
-        previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
-        os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
-        os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
+    def test_paper_trading_step_endpoint_removed(self) -> None:
         client = TestClient(app)
-        try:
-            with (
-                patch("app.web._start_live_worker"),
-                patch("app.web._kis_connection_probe", return_value={"ok": True, "mode": "paper"}),
-            ):
-                start_response = client.post(
-                    "/api/operation-mode/start",
-                    json={
-                        "mode": "paper_trading",
-                        "target_return_rate": 0.02,
-                        "period_minutes": 20,
-                        "initial_cash": 10_000_000,
-                        "acceleration_factor": 120,
-                    },
-                )
-            self.assertEqual(start_response.status_code, 200)
-            start_payload = start_response.json()
-            demo_id = start_payload["demo_id"]
-            self.assertEqual(start_payload["paper_trading_status"], "trading_loop_started_independently")
-            self.assertIn(demo_id, _streaming_demos)
+        response = client.post("/api/paper-trading/step", json={"demo_id": "does-not-exist"})
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()["status"], "removed")
 
-            step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
-
-            self.assertEqual(step["status"], "running")
-            self.assertEqual(step["step"], 1)
-            self.assertGreaterEqual(step["cumulative_trades"], 1)
-            self.assertGreaterEqual(step["trades_in_step"], 1)
-        finally:
-            if previous_limit is None:
-                os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)
-            else:
-                os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = previous_limit
-            if previous_target is None:
-                os.environ.pop("ONTOLOGY_FILTER1_TARGET_COUNT", None)
-            else:
-                os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
-
-    def test_paper_trading_terminate_liquidates_current_holdings(self) -> None:
-        previous_limit = os.environ.get("SIM_STREAMING_UNIVERSE_LIMIT")
-        previous_target = os.environ.get("ONTOLOGY_FILTER1_TARGET_COUNT")
-        os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = str(len(TEST_TICKERS))
-        os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = str(len(TEST_TICKERS))
+    def test_paper_trading_terminate_endpoint_removed(self) -> None:
         client = TestClient(app)
-        try:
-            start_payload = client.post(
-                "/api/paper-trading/start",
-                json={
-                    "target_return_rate": 0.02,
-                    "period_minutes": 20,
-                    "initial_cash": 10_000_000,
-                    "acceleration_factor": 120,
-                },
-            ).json()
-            demo_id = start_payload["demo_id"]
-            _streaming_demos[demo_id]._started_at_monotonic -= 60
-            step = client.post("/api/paper-trading/step", json={"demo_id": demo_id}).json()
-            self.assertGreater(step["cumulative_trades"], 0)
+        response = client.post("/api/paper-trading/terminate/nonexistent-demo-id")
+        self.assertEqual(response.status_code, 410)
+        payload = response.json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "removed")
 
-            terminated = client.post(f"/api/paper-trading/terminate/{demo_id}").json()
-
-            self.assertTrue(terminated["ok"])
-            self.assertEqual(terminated["status"], "terminated")
-            self.assertGreaterEqual(terminated["sell_order_count"], 1)
-            self.assertTrue(all(trade["side"] == "SELL" for trade in terminated["trades"]))
-            self.assertEqual(_streaming_demos[demo_id]._holdings, {})
-        finally:
-            if previous_limit is None:
-                os.environ.pop("SIM_STREAMING_UNIVERSE_LIMIT", None)
-            else:
-                os.environ["SIM_STREAMING_UNIVERSE_LIMIT"] = previous_limit
-            if previous_target is None:
-                os.environ.pop("ONTOLOGY_FILTER1_TARGET_COUNT", None)
-            else:
-                os.environ["ONTOLOGY_FILTER1_TARGET_COUNT"] = previous_target
 
 
 if __name__ == "__main__":

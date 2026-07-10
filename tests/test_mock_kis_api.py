@@ -83,14 +83,18 @@ class RecordingKisTransport:
 
 class MockKisApiTest(unittest.TestCase):
     def test_kis_credentials_can_load_ignored_secret_file(self) -> None:
+        # KIS is live-only now, so credentials come from the KIS_APP_KEY/SECRET/ACCOUNT_NO
+        # vars. This still verifies that a gitignored secrets .env is loaded and that the
+        # already-set process env is not clobbered by the default-file setdefault load in
+        # from_env (override=True on the temp file wins).
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / "kis_api_keys.env"
             env_path.write_text(
                 "\n".join(
                     [
-                        "KIS_PAPER_APP_KEY=paper-app",
-                        "KIS_PAPER_APP_SECRET=paper-secret",
-                        "KIS_PAPER_ACCOUNT_NO=12345678-01",
+                        "KIS_APP_KEY=unit-app",
+                        "KIS_APP_SECRET=unit-secret",
+                        "KIS_ACCOUNT_NO=12345678-01",
                     ]
                 ),
                 encoding="utf-8",
@@ -98,17 +102,17 @@ class MockKisApiTest(unittest.TestCase):
             with patch.dict(
                 "os.environ",
                 {
-                    "KIS_PAPER_APP_KEY": "",
-                    "KIS_PAPER_APP_SECRET": "",
-                    "KIS_PAPER_ACCOUNT_NO": "",
+                    "KIS_APP_KEY": "",
+                    "KIS_APP_SECRET": "",
+                    "KIS_ACCOUNT_NO": "",
                 },
                 clear=False,
             ):
                 self.assertTrue(load_kis_env_file(env_path, override=True))
-                credentials = KisCredentials.from_env(paper=True)
+                credentials = KisCredentials.from_env()
 
-        self.assertEqual(credentials.app_key, "paper-app")
-        self.assertEqual(credentials.app_secret, "paper-secret")
+        self.assertEqual(credentials.app_key, "unit-app")
+        self.assertEqual(credentials.app_secret, "unit-secret")
         self.assertEqual(credentials.account_no, "12345678")
         self.assertEqual(credentials.account_product_code, "01")
 
@@ -166,7 +170,9 @@ class MockKisApiTest(unittest.TestCase):
         self.assertGreater(len(run.kis_executions), 0)
         self.assertGreater(len(run.portfolio.account.holdings), 0)
 
-    def test_paper_kis_client_uses_real_rest_contract_in_mock_cycle(self) -> None:
+    def test_kis_client_uses_real_rest_contract_in_mock_cycle(self) -> None:
+        # KIS is live-only now (paper/VTS API removed; for_mode forces paper=False), so the
+        # order routes to the LIVE host with the LIVE tr_ids over the same REST contract.
         transport = RecordingKisTransport()
         with tempfile.TemporaryDirectory() as tmp:
             broker = KisDevelopersApiClient(
@@ -176,7 +182,7 @@ class MockKisApiTest(unittest.TestCase):
                 paper=True,
                 enabled=True,
                 transport=transport,
-                token_cache_path=Path(tmp) / "kis_access_token.paper.json",
+                token_cache_path=Path(tmp) / "kis_access_token.live.json",
             )
             order = FinalOrder(
                 ticker="005930",
@@ -192,8 +198,8 @@ class MockKisApiTest(unittest.TestCase):
             portfolio = broker.get_portfolio()
 
         order_call = next(call for call in transport.calls if call["url"].endswith("/order-cash"))
-        self.assertIn("openapivts.koreainvestment.com:29443", order_call["url"])
-        self.assertEqual(order_call["headers"]["tr_id"], "VTTC0012U")
+        self.assertIn("openapi.koreainvestment.com:9443", order_call["url"])
+        self.assertEqual(order_call["headers"]["tr_id"], "TTTC0012U")
         self.assertEqual(order_call["headers"]["hashkey"], "paper-hash")
         self.assertEqual(order_call["body"]["CANO"], "12345678")
         self.assertEqual(order_call["body"]["ACNT_PRDT_CD"], "01")
@@ -205,7 +211,7 @@ class MockKisApiTest(unittest.TestCase):
         status_call = next(call for call in transport.calls if call["url"].endswith("/inquire-daily-ccld"))
         self.assertEqual(status_call["params"]["EXCG_ID_DVSN_CD"], "KRX")
         orderable_cash_call = next(call for call in transport.calls if call["url"].endswith("/inquire-psbl-order"))
-        self.assertEqual(orderable_cash_call["headers"]["tr_id"], "VTTC8908R")
+        self.assertEqual(orderable_cash_call["headers"]["tr_id"], "TTTC8908R")
         self.assertEqual(orderable_cash_call["params"]["PDNO"], "")
         self.assertEqual(orderable_cash_call["params"]["ORD_UNPR"], "")
         self.assertEqual(orderable_cash_call["params"]["CMA_EVLU_AMT_ICLD_YN"], "N")
@@ -227,7 +233,9 @@ class MockKisApiTest(unittest.TestCase):
             self.assertEqual(first.issue_access_token(), "paper-token")
             cached_payload = json.loads(token_cache_path.read_text(encoding="utf-8"))
             self.assertEqual(cached_payload["access_token"], "paper-token")
-            self.assertEqual(cached_payload["mode"], "paper")
+            # The KIS client operates in live-only mode now (paper/VTS API was removed;
+            # for_mode forces paper=False), so the cache always records mode "live".
+            self.assertEqual(cached_payload["mode"], "live")
 
             second = KisDevelopersApiClient(
                 app_key="paper-app",
