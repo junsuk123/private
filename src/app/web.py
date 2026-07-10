@@ -2636,8 +2636,23 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         # stock value. Do not trust a broker-provided total that can embed a bad FX
         # rate (which inflated both 외화 예수금 and the domestic-vs-total composition).
         corrected_parts_equity = krw_cash + foreign_cash_krw + invested_value_krw
+        # portfolio.account.equity is total_equity_krw — KIS's integrated 총자산
+        # (tot_asst_amt), the single value kis_real.get_portfolio reconciles across
+        # settlement and the number the KIS app itself shows. Prefer it verbatim.
+        #
+        # corrected_parts_equity (krw_cash + foreign + ALL stock) DOUBLE-COUNTS a
+        # pending same-day domestic BUY: until T+2 settlement the buy cash still sits
+        # in the KRW deposit (krw_cash) while the purchased stock ALSO appears in
+        # invested_value, so the parts sum overstates by the in-flight buy amount
+        # (live: deposit 1,530,244 + stock 889,899 + ... = 2.51M vs true 1.67M). The
+        # old max(broker, parts) then wrongly picked the inflated parts sum. Trust the
+        # broker integrated total when present; fall back to the parts sum only when
+        # the broker gives nothing, and never read below the cash we can see.
         broker_equity = _number_or_zero(getattr(portfolio.account, "equity", 0.0))
-        actual_equity = broker_equity if broker_equity > corrected_parts_equity else corrected_parts_equity
+        if broker_equity > 0:
+          actual_equity = max(broker_equity, krw_cash + foreign_cash_krw)
+        else:
+          actual_equity = corrected_parts_equity
         result["cash"] = krw_cash
         result["cash_equivalent_krw"] = cash_equivalent_krw
         result["actual_deposit"] = krw_cash
@@ -5325,7 +5340,7 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
       tuple(dict.fromkeys((*surge, *cached_context, *fresh, *config_symbols, *affordable)))
   )
   return _filter_realtime_buy_candidates_by_affordability(
-      ordered,
+      tuple(symbol for symbol in ordered if _is_live_buy_candidate_symbol(symbol)),
       limit=limit,
       prevalidated_symbols=affordable,
   )
@@ -5348,7 +5363,7 @@ def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, 
   seen: set[str] = set()
   for raw in symbols:
     symbol = str(raw or "").upper().strip()
-    if not symbol or symbol in seen:
+    if not symbol or symbol in seen or not _is_live_buy_candidate_symbol(symbol):
       continue
     seen.add(symbol)
     if _ticker_market_group_for_live_trading(symbol, "") == "US":
@@ -5368,6 +5383,24 @@ def _is_excluded_us_live_candidate(symbol: str) -> bool:
       if item.strip()
   )
   return any(text.endswith(suffix) and len(text) > len(suffix) for suffix in suffixes)
+
+
+def _is_live_buy_candidate_symbol(symbol: str, market: str = "") -> bool:
+  """Reject symbols that cannot map to a live cash-stock order route.
+
+  KRX cash equities are six digits. US live candidates are alphabetic common-stock
+  style tickers after the warrant/unit suffix filter. Values such as ``0015G0``
+  come from non-cash instruments and otherwise waste quote calls/evaluation slots.
+  """
+  text = str(symbol or "").upper().strip().split(".", 1)[0]
+  if not text:
+    return False
+  group = _ticker_market_group_for_live_trading(text, market)
+  if group == "KRX":
+    return text.isdigit() and len(text) == 6
+  if group == "US":
+    return text[0].isalpha() and not _is_excluded_us_live_candidate(text)
+  return False
 
 
 _affordable_candidate_cache: dict[str, Any] = {"key": None, "at": 0.0, "symbols": ()}
@@ -5478,16 +5511,20 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
     except ValueError:
       krx_limit = 6
     try:
+      krx_scan_limit = max(krx_limit, int(os.getenv("REALTIME_KRX_DISCOVERY_SCAN_LIMIT", "24")))
+    except ValueError:
+      krx_scan_limit = max(krx_limit, 24)
+    try:
       krx_universe = tuple(load_krx_listed_universe(limit=None) or ())
     except Exception as exc:  # noqa: BLE001 - discovery is optional.
       audit.record("realtime_krx_discovery_candidate_load_failed", {"error": str(exc)})
       krx_universe = ()
     krx_symbols: list[str] = []
-    for symbol in krx_universe:
+    for symbol in _rotated_symbols(krx_universe):
       ticker = str(symbol or "").upper().strip().split(".", 1)[0]
       if ticker and ticker not in excluded and ticker.isdigit() and len(ticker) == 6:
         krx_symbols.append(ticker)
-      if len(krx_symbols) >= min(max_count, krx_limit):
+      if len(krx_symbols) >= min(max_count, krx_scan_limit):
         break
     symbols.extend(
         _broker_affordable_candidate_symbols(
@@ -5654,24 +5691,88 @@ def _filter_realtime_buy_candidates_by_affordability(
     if _is_excluded_us_live_candidate(ticker):
       continue
     if ticker not in prevalidated:
-      market = context_markets.get(ticker)
-      if market is not None:
-        if not is_market_affordable_for_account(market, account):
-          continue
-      else:
-        tick = store.latest_tick(ticker)
-        price = float(getattr(tick, "price", 0.0) or 0.0) if tick is not None else 0.0
-        if price <= 0:
-          continue
-        market = _placeholder_live_market(ticker, "KOSPI" if ticker.isdigit() and len(ticker) == 6 else "NASDAQ")
-        market = replace(market, last_price=price)
-        if not is_market_affordable_for_account(market, account):
-          continue
+      market = _candidate_affordability_market(ticker, context_markets.get(ticker), store)
+      if market is None or not _candidate_affordable_with_buffer(ticker, market, account):
+        continue
+      if not _candidate_has_usable_live_liquidity(ticker, store):
+        continue
     selected.append(ticker)
     seen.add(ticker)
     if len(selected) >= max(1, int(limit)):
       break
   return tuple(selected)
+
+
+def _candidate_affordability_market(
+    ticker: str,
+    context_market: MarketSnapshot | None,
+    store: RealtimeMarketDataStore,
+) -> MarketSnapshot | None:
+  tick = store.latest_tick(ticker)
+  tick_price = (
+      float(getattr(tick, "price", 0.0) or 0.0)
+      if tick is not None and _is_recent_realtime_item(tick, "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", 240.0)
+      else 0.0
+  )
+  market = context_market
+  if market is None:
+    if tick_price <= 0:
+      return None
+    market_name = "KOSPI" if ticker.isdigit() and len(ticker) == 6 else "NASDAQ"
+    return replace(_placeholder_live_market(ticker, market_name), last_price=tick_price)
+  if tick_price > 0:
+    return replace(market, last_price=tick_price)
+  return market
+
+
+def _candidate_has_usable_live_liquidity(ticker: str, store: RealtimeMarketDataStore) -> bool:
+  if not (ticker.isdigit() and len(ticker) == 6):
+    return True
+  try:
+    orderbook = store.latest_orderbook(ticker)
+  except Exception:  # noqa: BLE001
+    return True
+  if orderbook is None or not _is_recent_realtime_item(orderbook, "REALTIME_KRX_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 300.0):
+    return True
+  depth = float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) + float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0)
+  liquidity_score = min(1.0, depth / 1_000_000.0)
+  min_score = max(0.0, _env_float_web("REALTIME_KRX_MIN_CANDIDATE_LIQUIDITY_SCORE", 0.30))
+  return liquidity_score >= min_score
+
+
+def _candidate_affordable_with_buffer(ticker: str, market: MarketSnapshot, account: AccountSnapshot) -> bool:
+  if not is_market_affordable_for_account(market, account):
+    return False
+  price = float(getattr(market, "last_price", 0.0) or 0.0)
+  if price <= 0:
+    return False
+  buffer = max(1.0, _env_float_web("REALTIME_ONE_SHARE_CASH_BUFFER", 1.03))
+  available = cash_available_for_market(account, market)
+  if available < price * buffer:
+    return False
+  if ticker.isdigit() and len(ticker) == 6:
+    max_price = max(0.0, _env_float_web("REALTIME_KRX_MAX_ONE_SHARE_PRICE_KRW", 0.0))
+    if max_price > 0.0 and price > max_price:
+      return False
+  return True
+
+
+def _is_recent_realtime_item(item: Any, env_name: str, default_seconds: float) -> bool:
+  received_at = getattr(item, "received_at", None)
+  if received_at is None:
+    return False
+  try:
+    age = max(0.0, (datetime.now(timezone.utc) - received_at).total_seconds())
+  except Exception:  # noqa: BLE001
+    return False
+  return age <= max(1.0, _env_float_web(env_name, default_seconds))
+
+
+def _env_float_web(name: str, default: float) -> float:
+  try:
+    return float(os.getenv(name, str(default)))
+  except (TypeError, ValueError):
+    return default
 
 
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
@@ -6438,6 +6539,8 @@ def _ticker_market_group_for_live_trading(ticker: str, market: str = "") -> str:
   market_name = str(market or "").upper().strip()
   if market_name in _KRX_LIVE_MARKETS or (symbol.isdigit() and len(symbol) == 6):
     return "KRX"
+  if symbol and symbol[0].isdigit():
+    return "UNKNOWN"
   if market_name in _US_LIVE_MARKETS or (symbol and not (symbol.isdigit() and len(symbol) == 6)):
     return "US"
   return "UNKNOWN"
