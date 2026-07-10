@@ -52,6 +52,7 @@
 - [live_trading_setup.md](live_trading_setup.md): 설치, secrets/config, readiness dry-run, arming
 - [live_trading_runbook.md](live_trading_runbook.md): 운영 절차, 대시보드, stall 진단, 종료, emergency stop
 - [live_trading_safety_gates.md](live_trading_safety_gates.md): 제출/BUY/SELL 게이트와 rejection code
+- [execution_risk_and_order_pricing.md](execution_risk_and_order_pricing.md): live SELL/BUY 재가격(order_pricing_policy), no-orderbook·거래소 라우팅 가드(exchange_resolver), advisory trading-domain ontology
 - [small_account_loss_sell_fix_report.md](small_account_loss_sell_fix_report.md): small-account loss churn guard와 현금 분해
 - [live_short_horizon_model_decision.md](live_short_horizon_model_decision.md): live ML 모델은 advisory-only라는 결정 기록
 
