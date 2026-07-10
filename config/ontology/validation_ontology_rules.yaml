@@ -1,0 +1,16 @@
+# Validation ontology rules — prevent overfit/unverified strategies from live BUY.
+# A backtest-only strategy cannot produce an unrestricted live BUY; a strategy with
+# negative net expectancy over a sufficient sample is disabled; overfit-suspected or
+# unvalidated (fallback/heuristic) signals are marked low-reliability and capped.
+validation:
+  enabled: true
+  # Minimum out-of-sample sample size to trust an expectancy sign.
+  min_sample_size: 30
+  # Parameter count above which, absent out-of-sample evidence, overfit is suspected.
+  overfit_parameter_count: 20
+  # Backtest-only strategies must not produce live BUYs.
+  allow_backtest_only_live_buy: false
+  # Strategies with net expectancy <= 0 over a sufficient sample are disabled.
+  block_negative_expectancy: true
+  # Confidence ceiling for low-reliability (overfit/unvalidated) signals.
+  low_reliability_confidence_cap: 0.4

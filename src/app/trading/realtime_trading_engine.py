@@ -1,4 +1,4 @@
-"""실시간(틱 기반) 단타 트레이딩 엔진.
+﻿"""실시간(틱 기반) 단타 트레이딩 엔진.
 
 학습 플로우와 완전히 독립된 전용 스레드에서 동작한다. KIS 실시간 시세 틱을
 소비해 매수/빠른 매도(익절·손절·모델 청산)를 즉시 판단하고, 가드된
@@ -25,6 +25,14 @@ from zoneinfo import ZoneInfo
 
 from app.execution.kis_errors import LiveExecutionBlocked
 from app.execution.execution_quality import ExecutionQualityEngine, ExecutionQualityInput
+from app.execution.order_pricing_policy import (
+    ExecutionPricingPolicy,
+    PricingContext,
+    classify_action_reason,
+    tick_size_for,
+)
+from app.execution.exchange_resolver import ExchangeResolver
+from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.storage.execution_quality_store import ExecutionQualityStore
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding
 
@@ -157,6 +165,11 @@ class RealtimeTradingEngine:
         # Execution-quality layer (Phase 3): rejects buys whose alpha would be consumed
         # by spread/slippage and records realized slippage per symbol/strategy.
         self.execution_quality = ExecutionQualityEngine(store=ExecutionQualityStore())
+        # Executable-price authority: re-prices every order from the live book, side, and
+        # exit urgency before submission (last_price is a reference, not an executable price).
+        self.pricing_policy = ExecutionPricingPolicy()
+        # Routing-exchange resolution + validation (blocks unknown US BUYs in live strict mode).
+        self.exchange_resolver = ExchangeResolver()
         # No-chase guard: last price at which a buy failed to fill, per symbol.
         self._last_failed_entry_price: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -349,12 +362,21 @@ class RealtimeTradingEngine:
                         ("NO_SELLABLE_QUANTITY", "OPEN_ORDER_OR_SETTLEMENT_LOCK"),
                     )
                     continue
+                # Resolve exchange, re-price from the live book (best_bid / marketable
+                # stop), and run the execution-quality gate for the SELL too.
+                priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
+                    holding.ticker, "SELL", final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
+                )
+                if not exec_ok or priced_order is None:
+                    summary["sell_rejected"] += 1
+                    self._append_rejection(summary, holding.ticker, "SELL", (exec_reason,))
+                    continue
                 # Record the sell so we don't immediately re-buy the same name (churn).
                 self._recent_sell_monotonic[holding.ticker] = time.monotonic()
                 if has_open_sell:
-                    if self._amend_open_sell(final_order, result.reason_codes, decision_time, summary):
+                    if self._amend_open_sell(priced_order, result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                         sell_submitted += 1
-                elif self._submit(final_order, "SELL", result.reason_codes, decision_time, summary):
+                elif self._submit(priced_order, "SELL", result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                     sell_submitted += 1
             else:
                 summary["sell_rejected"] += 1
@@ -425,12 +447,14 @@ class RealtimeTradingEngine:
             if result.approved and result.final_order is not None:
                 buy_submit_attempted += 1
                 summary["buy_submit_attempted"] = buy_submit_attempted
-                exec_ok, exec_reason = self._execution_quality_gate(symbol, result, decision_time)
-                if not exec_ok:
+                priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
+                    symbol, "BUY", result.final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
+                )
+                if not exec_ok or priced_order is None:
                     summary["buy_rejected"] += 1
                     self._append_rejection(summary, symbol, "BUY", (exec_reason,))
                     continue
-                if self._submit(result.final_order, "BUY", result.reason_codes, decision_time, summary):
+                if self._submit(priced_order, "BUY", result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                     buy_submitted += 1
             else:
                 summary["buy_rejected"] += 1
@@ -509,66 +533,181 @@ class RealtimeTradingEngine:
             return order
         return replace(order, quantity=available)
 
-    def _execution_quality_gate(
-        self, symbol: str, result: Any, decision_time: datetime
-    ) -> tuple[bool, str]:
-        """Execution-quality pre-submission gate (Phase 3). Best-effort; never raises.
+    def _live_mode(self) -> bool:
+        """True when the coordinator is bound to a live (non-paper) broker.
 
-        Rejects a buy whose alpha would be consumed by spread/expected slippage, blocks
-        chasing a symbol upward after a failed/blocked entry, and records the reference
-        price for realized-slippage tracking. Returns (ok, reason_code).
+        When we cannot tell, assume LIVE so exchange resolution stays strict (blocking
+        an unknown US BUY is the safe default; a false-positive block never loses money).
         """
+        broker = getattr(self.coordinator, "broker", None)
+        return not bool(getattr(broker, "paper", False))
+
+    def _latest_orderbook(self, symbol: str) -> Any | None:
+        store = getattr(self.decision_engine, "store", None)
+        if store is None or not hasattr(store, "latest_orderbook"):
+            return None
         try:
-            final_order = result.final_order
+            return store.latest_orderbook(symbol)
+        except Exception:  # noqa: BLE001 - book fetch is best-effort.
+            return None
+
+    def _prepare_order_for_execution(
+        self,
+        symbol: str,
+        side: str,
+        final_order: FinalOrder,
+        diagnostics: dict[str, Any] | None,
+        reason_codes: tuple[str, ...],
+        account: AccountSnapshot | None,
+        decision_time: datetime,
+    ) -> tuple[FinalOrder | None, bool, str, dict[str, Any]]:
+        """Resolve routing exchange, re-price from the live book, and run the
+        execution-quality gate — for BOTH buys and sells. Returns
+        ``(priced_order, ok, reason_code, diagnostics)``. Best-effort; never raises.
+
+        * BUY: uses best_ask (chase-capped); a missing/stale book blocks the order so it
+          is never priced as if the spread were zero. Keeps the no-chase-after-failure guard.
+        * SELL: uses best_bid (take-profit / model / reduce) or best_bid minus a tick
+          offset (stop / hard-stop / emergency). An urgent stop is still allowed to exit
+          with a discounted reference price when no book exists; a non-urgent no-book SELL
+          is blocked. Exit-edge is never vetoed by BUY-oriented spread/slippage math.
+        * Exchange: unknown US BUY is blocked in live strict mode (never silently NASD).
+        """
+        side_u = str(side).upper()
+        diag: dict[str, Any] = {}
+        try:
             reference_price = float(getattr(final_order, "limit_price", 0.0) or 0.0)
             if reference_price <= 0:
-                return True, "EXEC_OK"  # nothing to assess; defer to downstream gates
-            # No-chase guard: do not re-enter above the last blocked/failed entry price.
-            last_failed = self._last_failed_entry_price.get(symbol)
-            if last_failed is not None and reference_price > last_failed * 1.001:
-                return False, "EXEC_NO_CHASE_AFTER_FAILED_ENTRY"
-            pd = (result.diagnostics or {}).get("profitability_decision") or {}
-            orderbook = None
+                return None, False, "EXEC_INVALID_REFERENCE_PRICE", diag
+            # The execution-risk gate needs an order-book data source. If none is wired
+            # (e.g. a unit harness), the gate cannot assess spread/pricing/exchange, so
+            # submit the decision order unchanged rather than blocking all trading.
+            # Production always wires RealtimeMarketDataStore (has latest_orderbook).
             store = getattr(self.decision_engine, "store", None)
-            if store is not None and hasattr(store, "latest_orderbook"):
-                try:
-                    orderbook = store.latest_orderbook(symbol)
-                except Exception:  # noqa: BLE001
-                    orderbook = None
+            if store is None or not hasattr(store, "latest_orderbook"):
+                return final_order, True, "EXEC_NO_BOOK_SOURCE", diag
+            diagnostics = diagnostics or {}
+            pd = diagnostics.get("profitability_decision") or {}
+            exit_reason = str(diagnostics.get("exit_reason") or "")
+            action_reason = classify_action_reason(side_u, exit_reason, tuple(reason_codes or ()))
+            is_domestic = _is_domestic_symbol_or_market(symbol, getattr(final_order, "market", ""))
+
+            # No-chase guard (BUY only): do not re-enter above the last failed entry price.
+            if side_u == "BUY":
+                last_failed = self._last_failed_entry_price.get(symbol)
+                if last_failed is not None and reference_price > last_failed * 1.001:
+                    return None, False, "EXEC_NO_CHASE_AFTER_FAILED_ENTRY", diag
+
+            # 1) Routing exchange resolution + validation (before pricing/submit).
+            live = self._live_mode()
+            resolution = self.exchange_resolver.resolve(symbol, side_u, account=account, live=live)
+            diag["exchange_resolution_source"] = resolution.source
+            diag["resolved_exchange"] = resolution.exchange
+            diag["exchange_confidence"] = resolution.confidence
+            if not resolution.allowed:
+                return None, False, resolution.reason_code or "US_EXCHANGE_UNKNOWN", diag
+            resolved_market = getattr(final_order, "market", "") or ""
+            if resolution.exchange and resolution.exchange != "KR":
+                resolved_market = resolution.exchange
+
+            # 2) Fetch the order book ONCE; share it with pricing and quality.
+            orderbook = self._latest_orderbook(symbol)
+            best_bid = float(getattr(orderbook, "best_bid", 0.0) or 0.0) if orderbook is not None else 0.0
+            best_ask = float(getattr(orderbook, "best_ask", 0.0) or 0.0) if orderbook is not None else 0.0
+            bid_depth = float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) if orderbook is not None else 0.0
+            ask_depth = float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0) if orderbook is not None else 0.0
+            orderbook_age_sec: float | None = None
+            if orderbook is not None:
+                received_at = getattr(orderbook, "received_at", None)
+                if isinstance(received_at, datetime):
+                    ref_dt = received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
+                    orderbook_age_sec = max(0.0, (decision_time - ref_dt).total_seconds())
+                # A non-live (REST-snapshot) book is not a fresh tradeable book for a BUY.
+                if str(getattr(orderbook, "source", "")) != KIS_REALTIME_SOURCE:
+                    orderbook_age_sec = (orderbook_age_sec or 0.0) + 1e6
+
+            # 3) Executable limit price (side- and urgency-aware).
+            pricing = self.pricing_policy.price(
+                PricingContext(
+                    symbol=symbol,
+                    side=side_u,
+                    action_reason=action_reason,
+                    reference_price=reference_price,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    is_domestic=is_domestic,
+                    min_net_exit_return=float(pd.get("required_min_net_return", 0.0) or 0.0),
+                    expected_net_return=float(pd.get("net_expected_return", 0.0) or 0.0),
+                    orderbook_age_sec=orderbook_age_sec,
+                )
+            )
+            diag.update(
+                {
+                    "pricing_policy": pricing.pricing_policy,
+                    "original_reference_price": reference_price,
+                    "final_limit_price": pricing.limit_price,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread_rate": ((best_ask - best_bid) / ((best_ask + best_bid) / 2.0))
+                    if best_bid > 0 and best_ask >= best_bid
+                    else None,
+                    "orderbook_age_sec": orderbook_age_sec,
+                    "action_reason": action_reason,
+                    "pricing_warnings": list(pricing.warnings),
+                }
+            )
+
+            # 4) Execution-quality gate (side-aware; no-orderbook blocking).
             assessment = self.execution_quality.assess(
                 ExecutionQualityInput(
                     symbol=symbol,
-                    strategy_family=str(getattr(final_order, "strategy_family", "") or "live_short_horizon"),
+                    strategy_family="live_short_horizon",
                     decision_reference_price=reference_price,
                     gross_expected_return=float(pd.get("gross_expected_return", 0.0) or 0.0),
                     net_expected_return=float(pd.get("net_expected_return", 0.0) or 0.0),
                     required_min_net_return=float(pd.get("required_min_net_return", 0.0) or 0.0),
-                    best_bid=float(getattr(orderbook, "best_bid", 0.0) or 0.0) if orderbook is not None else 0.0,
-                    best_ask=float(getattr(orderbook, "best_ask", 0.0) or 0.0) if orderbook is not None else 0.0,
-                    bid_depth=float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) if orderbook is not None else 0.0,
-                    ask_depth=float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0) if orderbook is not None else 0.0,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    bid_depth=bid_depth,
+                    ask_depth=ask_depth,
                     order_quantity=int(getattr(final_order, "quantity", 1) or 1),
-                    side="BUY",
+                    side=side_u,
+                    action_reason=action_reason,
+                    orderbook_age_sec=orderbook_age_sec,
                 )
             )
+            diag["exec_quality_warnings"] = list(assessment.warnings)
             if not assessment.allowed:
-                # Record the rejected price so we do not chase this symbol upward.
-                self._last_failed_entry_price[symbol] = reference_price
-                return False, assessment.reject_reason or "EXEC_QUALITY_REJECTED"
-            # Clear any prior no-chase marker once a clean entry passes.
-            self._last_failed_entry_price.pop(symbol, None)
-            return True, "EXEC_OK"
-        except Exception as exc:  # noqa: BLE001 - execution-quality is best-effort.
+                if side_u == "BUY":
+                    self._last_failed_entry_price[symbol] = reference_price
+                return None, False, assessment.reject_reason or "EXEC_QUALITY_REJECTED", diag
+
+            # 5) Final priced order. If pricing declined (BUY without a usable book) the
+            #    quality gate should already have blocked; guard defensively.
+            if not pricing.priced or pricing.limit_price <= 0:
+                if side_u == "BUY":
+                    self._last_failed_entry_price[symbol] = reference_price
+                    return None, False, "EXEC_NO_ORDERBOOK_BLOCKED", diag
+                # Non-urgent SELL that could not be priced: skip rather than send garbage.
+                return None, False, "EXEC_SELL_NOT_PRICEABLE", diag
+
+            if side_u == "BUY":
+                self._last_failed_entry_price.pop(symbol, None)
+            priced_order = replace(final_order, limit_price=pricing.limit_price, market=resolved_market)
+            return priced_order, True, "EXEC_OK", diag
+        except Exception as exc:  # noqa: BLE001 - preparation is best-effort; never kill the loop.
             self._record(
                 {
                     "at": decision_time.isoformat(),
                     "symbol": symbol,
-                    "kind": "BUY",
-                    "outcome": "exec_quality_error",
+                    "kind": side_u,
+                    "outcome": "exec_prepare_error",
                     "detail": f"{exc.__class__.__name__}: {exc}",
                 }
             )
-            return True, "EXEC_QUALITY_SKIPPED"
+            # On an unexpected error, fall back to submitting the original order so a
+            # bug in preparation never silently halts trading (esp. exits).
+            return final_order, True, "EXEC_PREPARE_SKIPPED", diag
 
     def _submit(
         self,
@@ -577,6 +716,7 @@ class RealtimeTradingEngine:
         reason_codes: tuple[str, ...],
         decision_time: datetime,
         summary: dict[str, Any],
+        pricing_diag: dict[str, Any] | None = None,
     ) -> bool:
         # 제출을 시도한 순간부터 쿨다운 시작(성공/차단/에러 무관) — 매초 재제출 방지.
         self._last_submit_monotonic[order.ticker] = time.monotonic()
@@ -589,6 +729,10 @@ class RealtimeTradingEngine:
             "limit_price": order.limit_price,
             "reason": ";".join(reason_codes or ()),
         }
+        if pricing_diag:
+            # Execution diagnostics for GUI/logging: pricing policy, reference vs final
+            # limit price, book, spread, orderbook age, and exchange resolution.
+            event["execution"] = dict(pricing_diag)
         try:
             submission = self.coordinator.submit_final_order(order)
         except LiveExecutionBlocked as exc:
@@ -759,12 +903,13 @@ class RealtimeTradingEngine:
         reason_codes: tuple[str, ...],
         decision_time: datetime,
         summary: dict[str, Any],
+        pricing_diag: dict[str, Any] | None = None,
     ) -> bool:
         existing = self._open_sell_orders.get(order.ticker)
         broker_order_id = str((existing or {}).get("broker_order_id") or "")
         if not broker_order_id:
             self._open_sell_orders.pop(order.ticker, None)
-            return self._submit(order, "SELL", reason_codes, decision_time, summary)
+            return self._submit(order, "SELL", reason_codes, decision_time, summary, pricing_diag=pricing_diag)
         event: dict[str, Any] = {
             "at": decision_time.isoformat(),
             "symbol": order.ticker,
@@ -776,6 +921,8 @@ class RealtimeTradingEngine:
             "broker_order_id": broker_order_id,
             "action": "amend_existing_sell",
         }
+        if pricing_diag:
+            event["execution"] = dict(pricing_diag)
         previous_order = (existing or {}).get("order")
         previous_price = float(getattr(previous_order, "limit_price", 0.0) or 0.0)
         price_delta = abs(float(order.limit_price or 0.0) - previous_price) / max(previous_price, 1e-9)
@@ -804,7 +951,7 @@ class RealtimeTradingEngine:
                 event["outcome"] = "open_sell_dropped"
                 event["detail"] = f"amend_missing_origin={exc.__class__.__name__}: {exc}"
                 self._record(event)
-                return self._submit(order, "SELL", reason_codes, decision_time, summary)
+                return self._submit(order, "SELL", reason_codes, decision_time, summary, pricing_diag=pricing_diag)
             if "정정취소 가능수량" in str(exc) or "no quantity" in str(exc).lower():
                 self._open_sell_orders.pop(order.ticker, None)
                 event["outcome"] = "open_sell_dropped"
@@ -826,7 +973,7 @@ class RealtimeTradingEngine:
             event["outcome"] = "canceled_for_reorder"
             event["detail"] = f"amend_failed={exc.__class__.__name__}: {exc}"
             self._record(event)
-            return self._submit(order, "SELL", reason_codes, decision_time, summary)
+            return self._submit(order, "SELL", reason_codes, decision_time, summary, pricing_diag=pricing_diag)
         new_order_id = getattr(amended, "broker_order_id", None) or broker_order_id
         self._open_sell_orders[order.ticker] = {
             "broker_order_id": new_order_id,

@@ -307,6 +307,24 @@ Set-DefaultEnv "LLM_EVENT_KNOWN_TICKER_PROMPT_LIMIT" "80"
 Set-DefaultEnv "LLM_EVENT_RESPONSE_MAX_TOKENS" "180"
 Set-DefaultEnv "LLM_EVENT_TIMEOUT_SECONDS" "12"
 
+# --- Execution-safety strict defaults (live) --------------------------------
+# A BUY must have a fresh order book (last_price is a reference, not an executable
+# price); a missing/stale book blocks the buy instead of pricing it at zero spread.
+Set-DefaultEnv "EXEC_REQUIRE_ORDERBOOK_FOR_BUY" "true"
+Set-DefaultEnv "EXEC_REQUIRE_FRESH_ORDERBOOK_FOR_BUY" "true"
+Set-DefaultEnv "EXEC_MAX_ORDERBOOK_AGE_SEC" "3.0"
+Set-DefaultEnv "EXEC_UNKNOWN_SPREAD_PENALTY_RATE" "0.006"
+Set-DefaultEnv "EXEC_BUY_MAX_CHASE_BPS" "20"
+# Urgent stops still exit without a book (discounted reference price); non-urgent
+# no-book sells are held.
+Set-DefaultEnv "EXEC_ALLOW_NO_ORDERBOOK_EMERGENCY_SELL" "true"
+Set-DefaultEnv "EXEC_SELL_EMERGENCY_OFFSET_TICKS" "1"
+Set-DefaultEnv "EXEC_SELL_STOP_OFFSET_TICKS" "1"
+Set-DefaultEnv "EXEC_SELL_EMERGENCY_FALLBACK_OFFSET_RATE" "0.003"
+# Never silently route an unknown US BUY to NASD in live mode.
+Set-DefaultEnv "KIS_US_EXCHANGE_STRICT" "true"
+Set-DefaultEnv "KIS_ALLOW_DEFAULT_US_EXCHANGE_IN_LIVE" "false"
+
 $python = ".\.venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
   $python = "python"

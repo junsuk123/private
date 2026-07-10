@@ -1,0 +1,11 @@
+# Risk ontology rules — inventory, drawdown, principal protection.
+# Blocks additional BUYs under high inventory/downside risk or near the principal floor.
+# SELL stops are supported (never blocked) so losers are cut.
+risk:
+  enabled: true
+  # Block a new BUY when the position weight would exceed this fraction of equity.
+  max_inventory_weight: 0.30
+  # Block a BUY whose modeled short-horizon downside exceeds this rate.
+  high_downside_risk: 0.012
+  # Block a BUY when the remaining cushion to the principal floor is below this fraction.
+  principal_floor_min_distance: 0.1

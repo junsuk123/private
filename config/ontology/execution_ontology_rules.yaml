@@ -1,0 +1,12 @@
+# Execution ontology rules — order book, spread, exchange routing, executable price.
+# A BUY must be executable: last_price is a reference, not an executable price.
+execution:
+  enabled: true
+  # Block a BUY that has no usable order book (never price it as zero-spread).
+  require_orderbook_for_buy: true
+  # Block a BUY whose book is stale (freshness enforced upstream by the execution layer).
+  require_fresh_orderbook_for_buy: true
+  # Block a live US BUY whose routing exchange cannot be resolved (never default to NASD).
+  block_unknown_exchange_buy: true
+  # Block a BUY when the quoted spread alone would dominate the edge.
+  max_spread_rate: 0.01

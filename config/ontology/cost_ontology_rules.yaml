@@ -1,0 +1,6 @@
+# Cost ontology rules — convert gross signals into tradable net edge.
+# ExpectedNetReturn = ExpectedGrossReturn - commission - tax - spread - slippage - safety.
+# Reject a BUY whose net edge is insufficient; mark gross-positive/net-insufficient as CostDominated.
+cost:
+  enabled: true
+  block_cost_dominated_buy: true

@@ -433,6 +433,12 @@ def _final_order_or_reject(
     if quantity <= 0:
         reasons.append("INSUFFICIENT_CASH_FOR_ONE_SHARE")
         return None
+    # NOTE: market.last_price is only a *reference* price for sizing and gating — the
+    # last trade print is NOT an executable price (a BUY posted at it may sit behind the
+    # ask and never fill; a stop SELL posted at it may fail to exit). Live execution MUST
+    # re-price this FinalOrder from the current order book, side, and exit urgency before
+    # submission — see app.execution.order_pricing_policy.ExecutionPricingPolicy, applied
+    # in RealtimeTradingEngine._prepare_order_for_execution.
     return FinalOrder(
         ticker=intent.ticker,
         market=intent.market,

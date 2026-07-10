@@ -42,6 +42,17 @@ class ExecutionQualityInput:
     ask_depth: float = 0.0
     order_quantity: int = 1
     side: str = "BUY"
+    # Normalized exit motive for a SELL: ENTRY / TAKE_PROFIT / STOP_LOSS / HARD_STOP /
+    # EMERGENCY / REDUCE / MODEL_EXIT / TIME_STOP. Drives whether a no-orderbook SELL
+    # is allowed (urgent stops must still exit).
+    action_reason: str = "ENTRY"
+    # Age of the order book in seconds (None = unknown). A stale book is treated as
+    # no book for a BUY when EXEC_REQUIRE_FRESH_ORDERBOOK_FOR_BUY is set.
+    orderbook_age_sec: float | None = None
+
+
+# Urgent SELL motives that must be allowed to exit even without a usable book.
+_URGENT_SELL_REASONS = frozenset({"STOP_LOSS", "HARD_STOP", "EMERGENCY"})
 
 
 @dataclass(frozen=True)
@@ -70,21 +81,67 @@ class ExecutionQualityEngine:
         self.min_fill_probability = _env_float("EXEC_MIN_FILL_PROBABILITY", 0.3)
         # A symbol whose recent realized slippage exceeds this is blocked/penalized.
         self.max_recent_realized_slippage = _env_float("EXEC_MAX_RECENT_REALIZED_SLIPPAGE", 0.006)
+        # No-orderbook / freshness policy. A BUY with no usable (or stale) book must
+        # not be priced as if the spread were zero, so it is blocked by default.
+        self.require_orderbook_for_buy = _env_bool("EXEC_REQUIRE_ORDERBOOK_FOR_BUY", True)
+        self.require_fresh_orderbook_for_buy = _env_bool("EXEC_REQUIRE_FRESH_ORDERBOOK_FOR_BUY", True)
+        self.max_orderbook_age_sec = _env_float("EXEC_MAX_ORDERBOOK_AGE_SEC", 3.0)
+        # Assumed spread when the book is unknown — never 0.0 (which would hide the risk).
+        self.unknown_spread_penalty_rate = _env_float("EXEC_UNKNOWN_SPREAD_PENALTY_RATE", 0.006)
+        self.allow_no_orderbook_emergency_sell = _env_bool("EXEC_ALLOW_NO_ORDERBOOK_EMERGENCY_SELL", True)
 
     def assess(self, request: ExecutionQualityInput) -> ExecutionQualityAssessment:
         bid = max(0.0, float(request.best_bid))
         ask = max(0.0, float(request.best_ask))
         ref = max(_EPSILON, float(request.decision_reference_price))
+        side = request.side.upper()
+        action_reason = str(request.action_reason or "ENTRY").upper()
         warnings: list[str] = []
 
-        if bid > 0 and ask > 0 and ask >= bid:
+        has_book = bid > 0 and ask > 0 and ask >= bid
+        stale_book = False
+        if (
+            has_book
+            and side == "BUY"
+            and self.require_fresh_orderbook_for_buy
+            and request.orderbook_age_sec is not None
+            and float(request.orderbook_age_sec) > self.max_orderbook_age_sec
+        ):
+            # A stale book is as untradeable as no book for a fresh BUY entry.
+            stale_book = True
+            warnings.append("STALE_ORDERBOOK")
+
+        usable_book = has_book and not stale_book
+
+        if not usable_book:
+            # No usable book. Do NOT pretend the spread is zero — that hid execution
+            # risk and let BUYs through blind. Block a BUY (unless disabled); allow an
+            # urgent SELL stop to still exit; block a non-urgent no-book SELL.
+            warnings.append("NO_ORDERBOOK")
+            limit_price = ref
+            if side == "BUY" and self.require_orderbook_for_buy:
+                return self._blocked(request, spread_rate=self.unknown_spread_penalty_rate,
+                                     reject_reason="EXEC_NO_ORDERBOOK_BLOCKED", limit_price=limit_price,
+                                     warnings=warnings)
+            if side == "SELL":
+                urgent = action_reason in _URGENT_SELL_REASONS
+                if urgent and self.allow_no_orderbook_emergency_sell:
+                    warnings.append("NO_ORDERBOOK_EMERGENCY_SELL_ALLOWED")
+                    return self._allowed_no_book(request, limit_price=limit_price, warnings=warnings)
+                if not urgent:
+                    return self._blocked(request, spread_rate=self.unknown_spread_penalty_rate,
+                                         reject_reason="EXEC_NO_ORDERBOOK_SELL_BLOCKED", limit_price=limit_price,
+                                         warnings=warnings)
+                # Urgent sell but fallback disabled: still block, surfacing why.
+                return self._blocked(request, spread_rate=self.unknown_spread_penalty_rate,
+                                     reject_reason="EXEC_NO_ORDERBOOK_SELL_BLOCKED", limit_price=limit_price,
+                                     warnings=warnings)
+            # BUY with the requirement disabled: assess against a penalty spread.
+            mid = ref
+            spread_rate = self.unknown_spread_penalty_rate
+        else:
             mid = (bid + ask) / 2.0
             spread_rate = (ask - bid) / mid
-        else:
-            # No usable book: fall back to the decision price with an unknown-spread flag.
-            mid = ref
-            spread_rate = 0.0
-            warnings.append("NO_ORDERBOOK")
 
         # Order-book pressure in [-1, 1]; positive means bid-heavy (supports a buy).
         total_depth = float(request.bid_depth) + float(request.ask_depth)
@@ -111,22 +168,32 @@ class ExecutionQualityEngine:
 
         execution_adjusted_net = float(request.net_expected_return) - expected_slippage_rate
 
-        # Limit price: for a BUY, cap at the ask (do not chase above it); if no book, use ref.
-        limit_price = ask if (request.side.upper() == "BUY" and ask > 0) else ref
+        # Side-aware limit price: a BUY caps at the ask (do not chase above it); a SELL
+        # posts at the bid (marketable to buyers). The authoritative executable price is
+        # produced by ExecutionPricingPolicy; this mirrors it for the assessment record.
+        if side == "BUY":
+            limit_price = ask if ask > 0 else ref
+        else:
+            limit_price = bid if bid > 0 else ref
 
         reject_reason: str | None = None
-        # Check the symbol's realized-slippage history first — it is the most actionable
-        # reason (a symbol that persistently fills badly should be blocked by name).
-        if recent_realized is not None and recent_realized > self.max_recent_realized_slippage:
-            reject_reason = "EXEC_SYMBOL_SLIPPAGE_HISTORY_BAD"
-        elif spread_alpha_ratio > self.max_spread_alpha_ratio + _EPSILON:
-            reject_reason = "EXEC_SPREAD_CONSUMES_ALPHA"
-        elif expected_slippage_rate > self.max_expected_slippage_rate + _EPSILON:
-            reject_reason = "EXEC_EXPECTED_SLIPPAGE_TOO_HIGH"
-        elif execution_adjusted_net < float(request.required_min_net_return) - _EPSILON:
-            reject_reason = "EXEC_ADJUSTED_NET_BELOW_MIN"
-        elif fill_probability < self.min_fill_probability:
-            reject_reason = "EXEC_FILL_PROBABILITY_TOO_LOW"
+        # The spread/slippage/fill-probability rejections below are ENTRY (BUY) concerns:
+        # they veto a buy whose net edge would be eaten by execution cost. An approved
+        # SELL exit (take-profit / stop) must NOT be blocked by entry-edge math — that
+        # would strand a position — so once a SELL has a usable book it is allowed.
+        if side == "BUY":
+            # Check the symbol's realized-slippage history first — it is the most actionable
+            # reason (a symbol that persistently fills badly should be blocked by name).
+            if recent_realized is not None and recent_realized > self.max_recent_realized_slippage:
+                reject_reason = "EXEC_SYMBOL_SLIPPAGE_HISTORY_BAD"
+            elif spread_alpha_ratio > self.max_spread_alpha_ratio + _EPSILON:
+                reject_reason = "EXEC_SPREAD_CONSUMES_ALPHA"
+            elif expected_slippage_rate > self.max_expected_slippage_rate + _EPSILON:
+                reject_reason = "EXEC_EXPECTED_SLIPPAGE_TOO_HIGH"
+            elif execution_adjusted_net < float(request.required_min_net_return) - _EPSILON:
+                reject_reason = "EXEC_ADJUSTED_NET_BELOW_MIN"
+            elif fill_probability < self.min_fill_probability:
+                reject_reason = "EXEC_FILL_PROBABILITY_TOO_LOW"
 
         return ExecutionQualityAssessment(
             allowed=reject_reason is None,
@@ -139,6 +206,55 @@ class ExecutionQualityEngine:
             execution_adjusted_net_return=execution_adjusted_net,
             limit_price=limit_price,
             reject_reason=reject_reason,
+            warnings=tuple(warnings),
+        )
+
+    def _blocked(
+        self,
+        request: ExecutionQualityInput,
+        *,
+        spread_rate: float,
+        reject_reason: str,
+        limit_price: float,
+        warnings: list[str],
+    ) -> ExecutionQualityAssessment:
+        gross = abs(float(request.gross_expected_return))
+        return ExecutionQualityAssessment(
+            allowed=False,
+            symbol=request.symbol,
+            spread_rate=spread_rate,
+            spread_alpha_ratio=spread_rate / max(gross, _EPSILON),
+            expected_slippage_rate=spread_rate / 2.0,
+            orderbook_pressure=0.0,
+            fill_probability=0.0,
+            execution_adjusted_net_return=float(request.net_expected_return) - spread_rate / 2.0,
+            limit_price=limit_price,
+            reject_reason=reject_reason,
+            warnings=tuple(warnings),
+        )
+
+    def _allowed_no_book(
+        self,
+        request: ExecutionQualityInput,
+        *,
+        limit_price: float,
+        warnings: list[str],
+    ) -> ExecutionQualityAssessment:
+        # An urgent SELL exit is allowed without a book; price via a penalty spread so
+        # the record still reflects that execution quality is degraded.
+        spread_rate = self.unknown_spread_penalty_rate
+        gross = abs(float(request.gross_expected_return))
+        return ExecutionQualityAssessment(
+            allowed=True,
+            symbol=request.symbol,
+            spread_rate=spread_rate,
+            spread_alpha_ratio=spread_rate / max(gross, _EPSILON),
+            expected_slippage_rate=spread_rate / 2.0,
+            orderbook_pressure=0.0,
+            fill_probability=0.5,
+            execution_adjusted_net_return=float(request.net_expected_return) - spread_rate / 2.0,
+            limit_price=limit_price,
+            reject_reason=None,
             warnings=tuple(warnings),
         )
 
@@ -189,3 +305,10 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}

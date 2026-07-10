@@ -1355,3 +1355,44 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OntologyAdvisoryAnnotationTest(unittest.TestCase):
+    """The advisory trading-domain ontology annotates every BUY decision."""
+
+    def test_buy_result_carries_ontology_reasoning(self) -> None:
+        engine = SharedLiveDecisionEngine(_BuyStore(price=5.0), predictor=_DummyPredictor())
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 1_000_000.0, "USD": 100000.0},
+            cash_equivalent_krw=130_000_000.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+        with patch.dict("os.environ", {"REALTIME_FALLBACK_EDGE_BPS_PER_SCORE": "700"}):
+            result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph)
+        self.assertIn("ontology_reasoning", result.diagnostics)
+        onto = result.diagnostics["ontology_reasoning"]
+        self.assertEqual(onto["symbol"], "LAB")
+        self.assertIn("reason_codes", onto)
+        self.assertIn("validation_state", onto)
+
+    def test_enforce_mode_can_block_buy_via_ontology(self) -> None:
+        # With enforcement ON and no order book, the ontology blocks the buy.
+        engine = SharedLiveDecisionEngine(_BuyStore(price=5.0), predictor=_DummyPredictor())
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 1_000_000.0, "USD": 100000.0},
+            cash_equivalent_krw=130_000_000.0,
+        )
+        graph = _FakeGraph(support_objects=("InformedOrderFlowImbalance", "ForeignInstitutionJointBuying"))
+        with patch.dict(
+            "os.environ",
+            {"REALTIME_FALLBACK_EDGE_BPS_PER_SCORE": "700", "TRADING_ONTOLOGY_ENFORCE": "true"},
+        ):
+            result = engine.evaluate_buy("LAB", account, suggested_weight=0.01, ontology_graph=graph)
+        onto = result.diagnostics.get("ontology_reasoning", {})
+        if onto.get("blocked_by"):
+            self.assertFalse(result.approved)
+            self.assertTrue(any(code.startswith("ONTO_") for code in result.reason_codes))

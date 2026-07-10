@@ -18,6 +18,8 @@ from app.trading.auto_tuning_engine import AutoTuningEngine, MarketStateSnapshot
 from app.trading.decision_logger import DecisionLogger
 from app.trading.dynamic_exit_policy import DynamicExitPolicy
 from app.strategy.rule_based import _holding_exit_adjustment, _ontology_flow_adjustment
+from app.ontology.trading_reasoner import TradingDomainReasoner
+from app.ontology.trading_fact_builder import build_trading_facts
 
 
 _NEWS_TRUST_CACHE: dict[str, Any] = {"mtime": None, "scale": 1.0}
@@ -995,15 +997,55 @@ class SharedLiveDecisionEngine:
                 "quote_refresh_status": quote_refresh_status,
             }
         )
+        # Advisory trading-domain ontology reasoning (theory-driven, explainable). It runs
+        # upstream of the final decision and can only ANNOTATE or, when explicitly enforced,
+        # BLOCK — it never authorizes. RiskManager/ProfitabilityGate remain the sole gates.
+        approved = risk.approved and risk.final_order is not None
+        reason_codes: tuple[str, ...] = tuple(risk.rejection_reasons)
+        try:
+            onto = self._ontology_reasoning_for_buy(symbol, market, profitability_decision, prediction)
+            if onto is not None:
+                diagnostics["ontology_reasoning"] = onto.as_dict()
+                if approved and onto.blocked_by and _env_bool("TRADING_ONTOLOGY_ENFORCE", False):
+                    approved = False
+                    reason_codes = tuple(reason_codes) + tuple(onto.blocked_by)
+        except Exception:  # noqa: BLE001 - ontology annotation must never break a decision.
+            pass
         self._last_diagnostics = diagnostics
         return SharedDecisionResult(
             symbol=symbol,
-            approved=risk.approved and risk.final_order is not None,
+            approved=approved,
             final_order=risk.final_order,
             prediction=prediction,
-            reason_codes=risk.rejection_reasons,
+            reason_codes=reason_codes,
             diagnostics=diagnostics,
         )
+
+    def _ontology_reasoning_for_buy(self, symbol, market, profitability_decision, prediction):
+        """Run the advisory trading-domain ontology reasoner for a BUY. Best-effort."""
+        reasoner = getattr(self, "_trading_ontology_reasoner", None)
+        if reasoner is None:
+            reasoner = TradingDomainReasoner()
+            self._trading_ontology_reasoner = reasoner
+        orderbook = None
+        try:
+            orderbook = self.store.latest_orderbook(symbol)
+        except Exception:  # noqa: BLE001
+            orderbook = None
+        best_bid = float(getattr(orderbook, "best_bid", 0.0) or 0.0) if orderbook is not None else 0.0
+        best_ask = float(getattr(orderbook, "best_ask", 0.0) or 0.0) if orderbook is not None else 0.0
+        facts = build_trading_facts(
+            symbol,
+            "BUY",
+            is_domestic=_is_domestic_symbol_or_market(symbol, getattr(market, "market", "")),
+            reference_price=getattr(market, "last_price", 0.0),
+            best_bid=best_bid,
+            best_ask=best_ask,
+            profitability=profitability_decision.as_dict(),
+            model_confidence=float(getattr(prediction, "confidence", 0.0) or 0.0) if prediction is not None else 0.0,
+            signal_family="model",
+        )
+        return reasoner.reason(facts)
 
     def evaluate_exit_for_holding(
         self,

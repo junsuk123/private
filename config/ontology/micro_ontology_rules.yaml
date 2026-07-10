@@ -1,0 +1,7 @@
+# Micro ontology rules — intraday entry signals (momentum / mean reversion).
+# News/sentiment (T4) is auxiliary only and can NEVER trigger a standalone live BUY.
+micro:
+  enabled: true
+  min_model_confidence_for_buy: 0.0
+  # Never allow news/sentiment to be standalone live-BUY evidence.
+  sentiment_standalone_buy_allowed: false

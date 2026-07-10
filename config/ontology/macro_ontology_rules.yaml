@@ -1,0 +1,6 @@
+# Macro ontology rules — market/sector regime and macro risk.
+# When the macro layer flags a no-trade / high-risk market, BUYs are blocked.
+# (Macro signals are supplied via facts.diagnostics: macro_block_buy / macro_risk_high.)
+macro:
+  enabled: true
+  block_buy_on_macro_risk: true
