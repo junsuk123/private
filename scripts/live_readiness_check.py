@@ -13,6 +13,7 @@ from app.execution.kis_auth import build_kis_client, run_kis_health_check, valid
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
+from app.trading.trading_policy import TradingPolicySnapshot
 
 
 def main() -> int:
@@ -68,6 +69,27 @@ def main() -> int:
     )
     secret_ok = all(bool(secrets.get(key)) for key in required_secret_keys) if not args.dry_run else True
     record("kis_secret_file", bool(secret_ok), "missing KIS secret file or required keys")
+
+    # Trading policy snapshot: stamp the policy_version and fail on any FAIL-severity
+    # contradiction (e.g. every routine stop-loss disabled). WARNING-severity conflicts
+    # are surfaced but do not block live readiness.
+    try:
+        snapshot = TradingPolicySnapshot.from_environment()
+        conflicts = snapshot.conflicts()
+        report["policy_version"] = snapshot.policy_version
+        report["trading_policy"] = snapshot.as_dict()
+        fail_conflicts = [c for c in conflicts if c.severity == "FAIL"]
+        record(
+            "trading_policy",
+            not fail_conflicts,
+            ",".join(f"{c.code}:{c.message}" for c in fail_conflicts) if fail_conflicts else None,
+        )
+        if any(c.severity == "WARNING" for c in conflicts):
+            report.setdefault("warnings", {})["trading_policy"] = [
+                f"{c.code}:{c.message}" for c in conflicts if c.severity == "WARNING"
+            ]
+    except Exception as exc:  # noqa: BLE001 - readiness reports all hard failures.
+        record("trading_policy", False, exc.__class__.__name__)
 
     runtime = evaluate_live_runtime_gates(require_manual_arming=False)
     if args.dry_run:

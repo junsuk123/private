@@ -29,6 +29,7 @@ from app.execution.order_pricing_policy import (
     ExecutionPricingPolicy,
     PricingContext,
     classify_action_reason,
+    is_urgent_sell,
     tick_size_for,
 )
 from app.execution.exchange_resolver import ExchangeResolver
@@ -579,18 +580,23 @@ class RealtimeTradingEngine:
             reference_price = float(getattr(final_order, "limit_price", 0.0) or 0.0)
             if reference_price <= 0:
                 return None, False, "EXEC_INVALID_REFERENCE_PRICE", diag
-            # The execution-risk gate needs an order-book data source. If none is wired
-            # (e.g. a unit harness), the gate cannot assess spread/pricing/exchange, so
-            # submit the decision order unchanged rather than blocking all trading.
-            # Production always wires RealtimeMarketDataStore (has latest_orderbook).
-            store = getattr(self.decision_engine, "store", None)
-            if store is None or not hasattr(store, "latest_orderbook"):
-                return final_order, True, "EXEC_NO_BOOK_SOURCE", diag
             diagnostics = diagnostics or {}
             pd = diagnostics.get("profitability_decision") or {}
             exit_reason = str(diagnostics.get("exit_reason") or "")
             action_reason = classify_action_reason(side_u, exit_reason, tuple(reason_codes or ()))
+            urgent_exit = side_u == "SELL" and is_urgent_sell(action_reason)
             is_domestic = _is_domestic_symbol_or_market(symbol, getattr(final_order, "market", ""))
+            # The execution-risk gate needs an order-book data source to assess
+            # spread/pricing/exchange. Missing source is FAIL-CLOSED for BUY (never priced
+            # as if the spread were zero) and for non-urgent SELL (skip). Only an urgent
+            # stop/hard-stop/emergency SELL is allowed to exit at the reference price so a
+            # wiring gap can never trap a losing position.
+            store = getattr(self.decision_engine, "store", None)
+            if store is None or not hasattr(store, "latest_orderbook"):
+                diag["exec_prepare_no_book_source"] = True
+                if urgent_exit:
+                    return final_order, True, "EXEC_NO_BOOK_SOURCE_EMERGENCY_SELL", diag
+                return None, False, "EXEC_NO_BOOK_SOURCE", diag
 
             # No-chase guard (BUY only): do not re-enter above the last failed entry price.
             if side_u == "BUY":
@@ -705,9 +711,21 @@ class RealtimeTradingEngine:
                     "detail": f"{exc.__class__.__name__}: {exc}",
                 }
             )
-            # On an unexpected error, fall back to submitting the original order so a
-            # bug in preparation never silently halts trading (esp. exits).
-            return final_order, True, "EXEC_PREPARE_SKIPPED", diag
+            diag["exec_prepare_error"] = f"{exc.__class__.__name__}: {exc}"
+            # FAIL-CLOSED: a bug in exchange/pricing/quality prep must NOT submit an order
+            # priced at the raw reference (last) price. BUY and non-urgent SELL are blocked.
+            # Only an urgent stop/hard-stop/emergency SELL is still allowed to exit so a
+            # preparation bug can never trap a losing position.
+            try:
+                _reason = classify_action_reason(
+                    side_u, str((diagnostics or {}).get("exit_reason") or ""), tuple(reason_codes or ())
+                )
+                _urgent = side_u == "SELL" and is_urgent_sell(_reason)
+            except Exception:  # noqa: BLE001 - classification must never raise here.
+                _urgent = False
+            if _urgent:
+                return final_order, True, "EXEC_PREPARE_SKIPPED_EMERGENCY_SELL", diag
+            return None, False, "EXEC_PREPARE_FAILED", diag
 
     def _submit(
         self,

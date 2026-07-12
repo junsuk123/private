@@ -18,7 +18,7 @@ from typing import Any, Sequence
 from app.graph.macro_micro_common import IntentType
 from app.graph.macro_reasoner import MacroReasoningResult
 from app.graph.micro_reasoner import MicroReasoningResult
-from app.graph.macro_micro_common import ExitSignal, MicroRegime
+from app.graph.macro_micro_common import ExecutionQuality, ExitSignal, MicroRegime
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,13 @@ class GlobalTradeArbiter:
             if r.is_exit_candidate or r.micro_regime == MicroRegime.EXIT_DETERIORATION:
                 exits.append(r)
             elif r.is_buy_candidate:
-                buys.append(r)
+                # A positive net edge is NOT enough: a BUY whose execution quality is
+                # WEAK/BLOCKED (thin liquidity or a spread that eats the alpha) is excluded
+                # from the BUY ranking rather than ranked on edge alone.
+                if r.execution_quality in (ExecutionQuality.WEAK, ExecutionQuality.BLOCKED):
+                    blocked.append(r)
+                else:
+                    buys.append(r)
             else:
                 blocked.append(r)
 
@@ -122,18 +128,34 @@ class GlobalTradeArbiter:
             "blocked_candidates": tuple(r.symbol for r in blocked),
         }
 
+    # Execution-quality → (liquidity bonus, spread penalty) in [0,1]. The micro reasoner
+    # collapses raw liquidity_score/spread_bps into this ExecutionQuality grade, so it is
+    # the available proxy for both the liquidity_weight and spread_penalty_weight terms.
+    _LIQUIDITY_BONUS = {
+        ExecutionQuality.GOOD: 1.0,
+        ExecutionQuality.ACCEPTABLE: 0.5,
+        ExecutionQuality.WEAK: 0.0,
+        ExecutionQuality.BLOCKED: 0.0,
+    }
+    _SPREAD_PENALTY = {
+        ExecutionQuality.GOOD: 0.0,
+        ExecutionQuality.ACCEPTABLE: 0.5,
+        ExecutionQuality.WEAK: 1.0,
+        ExecutionQuality.BLOCKED: 1.0,
+    }
+
     def _buy_score(self, r: MicroReasoningResult) -> float:
         cfg = self.config
         net = float(r.expected_net_return_bps or 0.0)
         conf = float(r.confidence or 0.0)
-        liq = 0.0
-        spread = 0.0
         downside = float(r.downside_risk_bps or 0.0)
-        diag = r.diagnostics or {}
-        # Liquidity/spread pulled from explanation features if present; default neutral.
+        liq = self._LIQUIDITY_BONUS.get(r.execution_quality, 0.0)
+        spread = self._SPREAD_PENALTY.get(r.execution_quality, 0.5)
         return (
             cfg.net_return_weight * net
             + cfg.confidence_weight * conf * 100.0
+            + cfg.liquidity_weight * liq * 100.0
+            - cfg.spread_penalty_weight * spread * 100.0
             - cfg.downside_penalty_weight * downside * 0.1
         )
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from app.execution.exchange_resolver import ExchangeResolver
 from app.execution.execution_quality import ExecutionQualityEngine, ExecutionQualityInput
@@ -24,6 +26,8 @@ from app.execution.order_pricing_policy import (
     PricingContext,
     classify_action_reason,
 )
+from app.schemas.domain import FinalOrder, OrderSide, OrderType
+from app.trading.realtime_trading_engine import RealtimeTradingEngine
 
 
 class BuyNoOrderbookTest(unittest.TestCase):
@@ -238,6 +242,97 @@ class ActionReasonClassifierTest(unittest.TestCase):
         self.assertEqual(classify_action_reason("SELL", "hard_stop_loss:-8.0%"), HARD_STOP)
         self.assertEqual(classify_action_reason("SELL", "loss_exit:-5.0%"), EMERGENCY)
         self.assertEqual(classify_action_reason("SELL", "quick_take_profit:0.8%"), TAKE_PROFIT)
+
+
+class PrepareOrderFailClosedTest(unittest.TestCase):
+    """Acceptance: _prepare_order_for_execution must FAIL-CLOSED for BUY and non-urgent
+    SELL when the book source is missing or preparation raises; only an urgent stop/
+    hard-stop/emergency SELL may still exit. Regression for the two fail-open escape
+    hatches (EXEC_NO_BOOK_SOURCE / EXEC_PREPARE_SKIPPED) that submitted at last_price.
+    """
+
+    def _order(self, side: str) -> FinalOrder:
+        return FinalOrder(
+            ticker="005930",
+            market="KR",
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY if side == "BUY" else OrderSide.SELL,
+            quantity=1,
+            limit_price=10_000.0,
+        )
+
+    def _prep(self, stub, side, order, diagnostics=None, reason_codes=()):  # type: ignore[no-untyped-def]
+        return RealtimeTradingEngine._prepare_order_for_execution(
+            stub,
+            order.ticker,
+            side,
+            order,
+            diagnostics,
+            reason_codes,
+            None,
+            datetime.now(timezone.utc),
+        )
+
+    def test_no_book_source_blocks_buy(self) -> None:
+        stub = SimpleNamespace(decision_engine=SimpleNamespace(), _last_failed_entry_price={})
+        priced, ok, reason, _ = self._prep(stub, "BUY", self._order("BUY"))
+        self.assertFalse(ok)
+        self.assertIsNone(priced)
+        self.assertEqual(reason, "EXEC_NO_BOOK_SOURCE")
+
+    def test_no_book_source_blocks_non_urgent_sell(self) -> None:
+        stub = SimpleNamespace(decision_engine=SimpleNamespace(), _last_failed_entry_price={})
+        priced, ok, reason, _ = self._prep(
+            stub, "SELL", self._order("SELL"), diagnostics={"exit_reason": "take_profit:0.8%"}
+        )
+        self.assertFalse(ok)
+        self.assertIsNone(priced)
+        self.assertEqual(reason, "EXEC_NO_BOOK_SOURCE")
+
+    def test_no_book_source_allows_urgent_sell(self) -> None:
+        stub = SimpleNamespace(decision_engine=SimpleNamespace(), _last_failed_entry_price={})
+        order = self._order("SELL")
+        priced, ok, reason, _ = self._prep(
+            stub, "SELL", order, diagnostics={"exit_reason": "stop_loss:-1.2%"}
+        )
+        self.assertTrue(ok)
+        self.assertIs(priced, order)  # original order priced at reference so the exit can fill
+        self.assertEqual(reason, "EXEC_NO_BOOK_SOURCE_EMERGENCY_SELL")
+
+    def _raising_stub(self):  # type: ignore[no-untyped-def]
+        def _raise(*_a, **_k):
+            raise RuntimeError("boom")
+
+        return SimpleNamespace(
+            decision_engine=SimpleNamespace(store=SimpleNamespace(latest_orderbook=lambda _s: None)),
+            exchange_resolver=SimpleNamespace(resolve=_raise),
+            _last_failed_entry_price={},
+            _live_mode=lambda: True,
+            _record=lambda _e: None,
+        )
+
+    def test_prepare_exception_blocks_buy(self) -> None:
+        priced, ok, reason, _ = self._prep(self._raising_stub(), "BUY", self._order("BUY"))
+        self.assertFalse(ok)
+        self.assertIsNone(priced)
+        self.assertEqual(reason, "EXEC_PREPARE_FAILED")
+
+    def test_prepare_exception_allows_urgent_sell(self) -> None:
+        order = self._order("SELL")
+        priced, ok, reason, _ = self._prep(
+            self._raising_stub(), "SELL", order, diagnostics={"exit_reason": "hard_stop_loss:-3.0%"}
+        )
+        self.assertTrue(ok)
+        self.assertIs(priced, order)
+        self.assertEqual(reason, "EXEC_PREPARE_SKIPPED_EMERGENCY_SELL")
+
+    def test_prepare_exception_blocks_non_urgent_sell(self) -> None:
+        priced, ok, reason, _ = self._prep(
+            self._raising_stub(), "SELL", self._order("SELL"), diagnostics={"exit_reason": "model_exit"}
+        )
+        self.assertFalse(ok)
+        self.assertIsNone(priced)
+        self.assertEqual(reason, "EXEC_PREPARE_FAILED")
 
 
 if __name__ == "__main__":

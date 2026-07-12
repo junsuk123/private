@@ -29,7 +29,8 @@ def _macro():
     )
 
 
-def _micro(symbol, *, buy=True, net=15.0, conf=0.7, downside=40.0, exit_=False, blocked=False):
+def _micro(symbol, *, buy=True, net=15.0, conf=0.7, downside=40.0, exit_=False, blocked=False,
+           execution_quality=ExecutionQuality.GOOD):
     return MicroReasoningResult(
         timestamp=_now(), symbol=symbol,
         micro_regime=(MicroRegime.EXIT_DETERIORATION if exit_ else
@@ -39,7 +40,7 @@ def _micro(symbol, *, buy=True, net=15.0, conf=0.7, downside=40.0, exit_=False, 
         exit_signal=(ExitSignal.SELL_CANDIDATE if exit_ else ExitSignal.NONE),
         expected_entry_price=100.0, expected_exit_price=101.0,
         expected_gross_return_bps=25.0, expected_net_return_bps=net,
-        downside_risk_bps=downside, confidence=conf, execution_quality=ExecutionQuality.GOOD,
+        downside_risk_bps=downside, confidence=conf, execution_quality=execution_quality,
         reason_codes=(), explanation_paths=(),
     )
 
@@ -71,6 +72,23 @@ class TestArbiter:
         out = GlobalTradeArbiter().rank(_macro(), [_micro("BLK", blocked=True)])
         assert "BLK" in out["blocked_candidates"]
         assert not any(i.symbol == "BLK" for i in out["ranked_trade_intents"])
+
+    def test_liquidity_and_spread_weights_affect_ranking(self):
+        # Same net edge, confidence and downside; only execution quality differs.
+        out = GlobalTradeArbiter().rank(_macro(), [
+            _micro("GOODLIQ", net=20.0, execution_quality=ExecutionQuality.GOOD),
+            _micro("ACCEPT", net=20.0, execution_quality=ExecutionQuality.ACCEPTABLE),
+        ])
+        buys = [i for i in out["ranked_trade_intents"] if i.intent_type == IntentType.BUY]
+        assert [i.symbol for i in buys] == ["GOODLIQ", "ACCEPT"]
+        assert buys[0].score > buys[1].score
+
+    def test_weak_execution_quality_buy_excluded_despite_positive_edge(self):
+        out = GlobalTradeArbiter().rank(_macro(), [
+            _micro("THIN", net=99.0, execution_quality=ExecutionQuality.WEAK),
+        ])
+        assert not any(i.symbol == "THIN" for i in out["ranked_trade_intents"])
+        assert "THIN" in out["blocked_candidates"]
 
     def test_ranked_intent_advisory_only(self):
         out = GlobalTradeArbiter().rank(_macro(), [_micro("A")])

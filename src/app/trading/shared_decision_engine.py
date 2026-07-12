@@ -1042,7 +1042,7 @@ class SharedLiveDecisionEngine:
             best_bid=best_bid,
             best_ask=best_ask,
             profitability=profitability_decision.as_dict(),
-            model_confidence=float(getattr(prediction, "confidence", 0.0) or 0.0) if prediction is not None else 0.0,
+            model_confidence=float(getattr(prediction, "probability_success", 0.0) or 0.0) if prediction is not None else 0.0,
             signal_family="model",
         )
         return reasoner.reason(facts)

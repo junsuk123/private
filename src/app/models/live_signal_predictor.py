@@ -78,15 +78,19 @@ def _prediction_thresholds(artifact_thresholds: dict[str, float]) -> dict[str, f
         safety = load_live_trading_safety_config()
     except LiveConfigError:
         return thresholds
-    thresholds["minimum_probability_success"] = min(
+    # Merge artifact thresholds with the safety config by taking the STRICTER bound in
+    # each direction, so the safety floor can only tighten (never loosen) the gate:
+    #   * minimum floors (probability, expected net return) -> the HIGHER (max)
+    #   * maximum ceilings (uncertainty) -> the LOWER (min)
+    thresholds["minimum_probability_success"] = max(
         thresholds.get("minimum_probability_success", safety.minimum_probability_success),
         safety.minimum_probability_success,
     )
-    thresholds["minimum_expected_net_return_bps"] = min(
+    thresholds["minimum_expected_net_return_bps"] = max(
         thresholds.get("minimum_expected_net_return_bps", safety.minimum_expected_net_return_bps),
         safety.minimum_expected_net_return_bps,
     )
-    thresholds["maximum_uncertainty"] = max(
+    thresholds["maximum_uncertainty"] = min(
         thresholds.get("maximum_uncertainty", 0.48),
         1.0 - max(0.0, min(1.0, safety.minimum_model_confidence)),
     )

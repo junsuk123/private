@@ -107,6 +107,12 @@ class DynamicExitPolicy:
 
     def __init__(self, config_path: Path | str = "config/dynamic_exit_policy.yaml") -> None:
         self.config = _load_config(config_path)
+        try:  # same shared, versioned policy view the ProfitabilityGate stamps
+            from app.trading.trading_policy import TradingPolicySnapshot
+
+            self.policy_version = TradingPolicySnapshot.from_environment().policy_version
+        except Exception:  # noqa: BLE001 - versioning must never block exit resolution
+            self.policy_version = ""
 
     def resolve(
         self,

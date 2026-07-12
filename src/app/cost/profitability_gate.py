@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -177,9 +177,11 @@ class ProfitabilityDecision:
     warnings: tuple[str, ...] = ()
     data_quality_flags: tuple[str, ...] = ()
     breakdown: ProfitabilityBreakdown | None = None
+    policy_version: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
+            "policy_version": self.policy_version,
             "allowed": self.allowed,
             "action": self.action,
             "symbol": self.symbol,
@@ -216,8 +218,20 @@ class ProfitabilityGate:
     ) -> None:
         self.cost_engine = cost_engine or TradingCostEngine()
         self.policy = policy or load_policy(config_path)
+        try:  # stamp every decision with the shared, versioned policy view
+            from app.trading.trading_policy import TradingPolicySnapshot
+
+            self.policy_version = TradingPolicySnapshot.from_environment().policy_version
+        except Exception:  # noqa: BLE001 - versioning must never block a decision
+            self.policy_version = ""
 
     def evaluate(self, request: ProfitabilityInput) -> ProfitabilityDecision:
+        decision = self._evaluate(request)
+        if self.policy_version and not decision.policy_version:
+            return replace(decision, policy_version=self.policy_version)
+        return decision
+
+    def _evaluate(self, request: ProfitabilityInput) -> ProfitabilityDecision:
         symbol = request.symbol
         action = (request.action or "BUY").upper()
         entry_price = max(0.0, float(request.entry_price or 0.0))

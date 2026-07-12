@@ -12,6 +12,15 @@ data/store/
 data/legacy/**/store/
 *.sqlite3
 logs/
+# Runtime logs / build artifacts / editor backups must never be tracked.
+server.log
+*.log
+data/runtime/
+build/
+*.bak
+*.bak_*
+# One-off patch scripts belong in scripts/migrations, not the repo root.
+patch_*.py
 .env
 .env.*
 !.env.example

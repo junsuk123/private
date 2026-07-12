@@ -12,9 +12,61 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderSide, SourceMetadata
 from app.execution.kis_types import LiveOrderSubmission
+from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.schemas.domain import FinalOrder, OrderType
 from app.trading.realtime_trading_engine import RealtimeTradingEngine, RealtimeTradingConfig
 from app.trading.shared_decision_engine import SharedLiveDecisionEngine
+
+
+class _ExecBookStore:
+    """Fresh realtime order book for the execution-prep path in orchestration tests.
+
+    The real ``_prepare_order_for_execution`` now fails closed without a book (the old
+    fail-open bypass was removed), so the test decision-engine doubles must expose a
+    wired store just like production. For SELLs, ``best_bid`` is pinned to the decision
+    limit so the take-profit re-price is a no-op and the amend-price assertions hold.
+    """
+
+    def __init__(self, *, best_bid: float, best_ask: float) -> None:
+        self._best_bid = best_bid
+        self._best_ask = best_ask
+
+    def latest_tick(self, symbol: str):
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(price=self._best_bid, received_at=now, exchange_timestamp=now,
+                               sequence_key=f"exec:{symbol}")
+
+    def latest_orderbook(self, symbol: str):
+        now = datetime.now(timezone.utc)
+        return SimpleNamespace(
+            best_bid=self._best_bid,
+            best_ask=self._best_ask,
+            total_bid_volume=1_000_000.0,
+            total_ask_volume=1_000_000.0,
+            received_at=now,
+            source=KIS_REALTIME_SOURCE,
+        )
+
+
+def _clearing_buy_diag() -> dict:
+    return {
+        "profitability_decision": {
+            "gross_expected_return": 0.03,
+            "net_expected_return": 0.025,
+            "required_min_net_return": 0.008,
+        }
+    }
+
+
+def _tp_sell_diag() -> dict:
+    return {
+        "exit_reason": "take_profit",
+        "profitability_decision": {
+            "gross_expected_return": 0.02,
+            "net_expected_return": 0.02,
+            "required_min_net_return": 0.0,
+        },
+    }
 
 
 class _FakeStore:
@@ -713,6 +765,9 @@ class _FixedSellDecisionEngine:
     def __init__(self, limit_price: float | None = None) -> None:
         self.calls = 0
         self.limit_price = limit_price
+        limit = self.limit_price if self.limit_price is not None else 101.0
+        # best_bid pinned to the decision limit -> take-profit re-price is a no-op.
+        self.store = _ExecBookStore(best_bid=limit, best_ask=round(limit * 1.0005, 4))
 
     def evaluate_exit_for_holding(self, holding, account, **kwargs):
         self.calls += 1
@@ -725,7 +780,9 @@ class _FixedSellDecisionEngine:
             quantity=holding.quantity,
             limit_price=limit_price,
         )
-        return SimpleNamespace(approved=True, final_order=order, reason_codes=("unit_exit",))
+        return SimpleNamespace(
+            approved=True, final_order=order, reason_codes=("unit_exit",), diagnostics=_tp_sell_diag()
+        )
 
     def evaluate_buy(self, *args, **kwargs):  # pragma: no cover - candidates are empty
         raise AssertionError("buy path should not be reached")
@@ -734,6 +791,7 @@ class _FixedSellDecisionEngine:
 class _FixedBuyDecisionEngine:
     def __init__(self) -> None:
         self.calls = 0
+        self.store = _ExecBookStore(best_bid=round(5_000.0 * 0.999, 4), best_ask=round(5_000.0 * 1.001, 4))
 
     def evaluate_exit_for_holding(self, *args, **kwargs):  # pragma: no cover - no holdings
         raise AssertionError("sell path should not be reached")
@@ -748,7 +806,9 @@ class _FixedBuyDecisionEngine:
             quantity=1,
             limit_price=5_000.0,
         )
-        return SimpleNamespace(approved=True, final_order=order, reason_codes=("unit_buy",))
+        return SimpleNamespace(
+            approved=True, final_order=order, reason_codes=("unit_buy",), diagnostics=_clearing_buy_diag()
+        )
 
 
 class _AmendAwareCoordinator:
@@ -996,7 +1056,10 @@ class RealtimeSellAmendTest(unittest.TestCase):
         )
 
         first = engine.run_once()
-        engine.decision_engine = _FixedSellDecisionEngine(limit_price=101.2)
+        # One full KRX tick higher (tick=1 KRW at ~100 KRW). A sub-tick move like 101.2
+        # is not a valid KR limit and now collapses to the same tick after execution
+        # re-pricing, so the "moved enough" case must clear a whole tick.
+        engine.decision_engine = _FixedSellDecisionEngine(limit_price=102.0)
         second = engine.run_once()
 
         self.assertEqual(first["submitted"], 1)
@@ -1004,7 +1067,7 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(len(coordinator.submitted), 1)
         self.assertEqual(len(coordinator.amended), 1)
         self.assertEqual(coordinator.amended[0][0], "SELL0001")
-        self.assertEqual(coordinator.amended[0][1].limit_price, 101.2)
+        self.assertEqual(coordinator.amended[0][1].limit_price, 102.0)
 
     def test_sell_uses_sellable_quantity_instead_of_total_holding_quantity(self) -> None:
         holding = Holding(
@@ -1083,7 +1146,7 @@ class RealtimeSellAmendTest(unittest.TestCase):
         )
 
         first = engine.run_once()
-        engine.decision_engine = _FixedSellDecisionEngine(limit_price=101.2)
+        engine.decision_engine = _FixedSellDecisionEngine(limit_price=102.0)  # one full KRX tick up
         second = engine.run_once()
         third = engine.run_once()
 

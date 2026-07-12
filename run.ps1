@@ -162,12 +162,17 @@ Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "1.25"
 #  - allow loss exit + never block a 1-share stop or a below-breakeven stop
 #  - tight net stop ~0.8% (≈0.5% gross) so each loss stays small
 #  - take-profit net 1.4% (quick) / 0.8% (routine); NO tiny won-amount take-profit
-#  - hard stop tightened 3% -> 2% capital backstop
+#  - hard stop 2% capital backstop; emergency 5%
+# 2026-07-13: the values below were previously wired the OPPOSITE of this comment
+# (ALLOW_LOSS_EXIT=false, STOP_LOSS_NET=0.0, HARD_STOP=0.03) which disabled every
+# routine stop and let losers ride to the 3% hard stop — the 물림 this block set out
+# to fix. Corrected to match the documented discipline. Ordering: net 0.8% < hard 2%
+# < emergency 5%. Validated by TradingPolicySnapshot.conflicts() (no STOP_LOSS_DISABLED).
 # NOTE: research's top caveat — small-account day trading is structurally negative-
 # expectancy (round-trip cost amplifies losses); this discipline MINIMIZES losses, it
 # does not guarantee profit. Tune from realized PnL.
-Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "false"
-Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.03"
+Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
+Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.02"
 Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "false"
 Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "false"
 Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
@@ -177,7 +182,7 @@ Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW" "1000"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE" "0.004"
 Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.014"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
-Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.0"
+Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.008"
 Set-DefaultEnv "REALTIME_TAKE_PROFIT_AMOUNT_KRW" "0"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
