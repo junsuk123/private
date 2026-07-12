@@ -27,6 +27,13 @@ class ModelArtifactRegistry:
     def __init__(self, root: str | Path = "data/models/live_short_horizon") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        # In-memory cache of the parsed latest artifact, keyed by file mtime. The live
+        # predictor calls load_latest_live_eligible() once per candidate AND per holding
+        # every ~1s sweep; latest.json only changes on retrain (~300s), so re-reading and
+        # JSON-parsing the weights every call was pure per-cycle waste. Invalidated
+        # automatically when the file's mtime changes (training writes via os.replace).
+        self._cache_key: int | None = None
+        self._cache_artifact: ModelArtifact | None = None
 
     @property
     def latest_path(self) -> Path:
@@ -45,10 +52,26 @@ class ModelArtifactRegistry:
     def load_latest_live_eligible(self) -> ModelArtifact:
         if not self.latest_path.exists():
             raise RuntimeError("NO_LIVE_ELIGIBLE_MODEL_ARTIFACT")
-        payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
-        artifact = _artifact_from_payload(payload, self.latest_path)
+        artifact = self._load_latest_cached()
         if not artifact.live_eligible:
             raise RuntimeError("LATEST_MODEL_NOT_LIVE_ELIGIBLE")
+        return artifact
+
+    def _load_latest_cached(self) -> ModelArtifact:
+        try:
+            mtime = self.latest_path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        cached = self._cache_artifact
+        if mtime is not None and self._cache_key == mtime and cached is not None:
+            return cached
+        payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
+        artifact = _artifact_from_payload(payload, self.latest_path)
+        # Publish the artifact before the key so a concurrent reader that sees the new
+        # key also sees the matching artifact (write is under the GIL; worst case is a
+        # harmless redundant reload).
+        self._cache_artifact = artifact
+        self._cache_key = mtime
         return artifact
 
 

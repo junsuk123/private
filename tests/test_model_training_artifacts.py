@@ -22,6 +22,25 @@ class ModelTrainingArtifactsTest(unittest.TestCase):
         self.assertEqual(latest.feature_schema_hash, LIVE_SHORT_HORIZON_SCHEMA.schema_hash)
         self.assertGreater(artifact["metrics"]["auc"], 0.55)
 
+    def test_latest_is_cached_and_reloads_on_change(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            train_live_short_horizon_model(_rows(), registry=registry)
+            first = registry.load_latest_live_eligible()
+            # Second call with an unchanged file must return the SAME cached object.
+            second = registry.load_latest_live_eligible()
+            self.assertIs(first, second)
+
+            # Rewrite latest.json with a new artifact_id -> mtime changes -> cache reloads.
+            payload = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+            payload["artifact_id"] = payload["artifact_id"] + "-v2"
+            registry.latest_path.write_text(json.dumps(payload), encoding="utf-8")
+            reloaded = registry.load_latest_live_eligible()
+            self.assertIsNot(reloaded, first)
+            self.assertTrue(reloaded.artifact_id.endswith("-v2"))
+
     def test_zero_positive_labels_never_live_eligible(self) -> None:
         rows = _rows()
         for row in rows:

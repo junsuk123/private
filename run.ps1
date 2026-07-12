@@ -149,6 +149,10 @@ Set-RunEnv "LIVE_TRADING_ENABLED" "true"
 Set-RunEnv "KIS_LIVE_ENABLED" "true"
 Set-RunEnv "KIS_PAPER_TRADING" "false"
 Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
+# Real orders auto-submit with NO manual arming file (operator's explicit choice).
+# To run WITHOUT placing real orders, set this to "true" (then arm via
+# scripts/arm_live_trading.py) or set LIVE_ORDER_SUBMIT_ENABLED "false".
+Set-RunEnv "REQUIRE_MANUAL_ARMING" "false"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"
