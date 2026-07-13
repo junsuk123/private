@@ -224,12 +224,126 @@ def _account_dashboard_status_provider() -> dict[str, Any]:
         "updated_at": _iso_or_none(snapshot.get("last_updated")),
         "last_error": snapshot.get("last_error"),
     }
+  basis = _account_basis_with_realtime_holding_prices(basis)
   return {
       **basis,
       "basis_source": basis.get("source", "kis_live_account"),
       "account_checked": True,
       "updated_at": datetime.now(timezone.utc).isoformat(),
   }
+
+
+def _account_basis_with_realtime_holding_prices(basis: dict[str, Any]) -> dict[str, Any]:
+  positions = list(basis.get("positions") or ())
+  if not positions:
+    return basis
+  try:
+    max_age_seconds = max(1.0, float(os.getenv("ACCOUNT_DASHBOARD_REALTIME_PRICE_MAX_AGE_SEC", "600")))
+  except (TypeError, ValueError):
+    max_age_seconds = 600.0
+  store = RealtimeMarketDataStore()
+  now = datetime.now(timezone.utc)
+  updated_positions: list[dict[str, Any]] = []
+  changed = False
+  for raw in positions:
+    if not isinstance(raw, dict):
+      updated_positions.append(raw)
+      continue
+    position = dict(raw)
+    ticker = str(position.get("ticker") or "").upper().strip()
+    quantity = _number_or_zero(position.get("quantity"))
+    if not ticker or quantity <= 0:
+      updated_positions.append(position)
+      continue
+    quote = _latest_dashboard_holding_quote(store, ticker, now, max_age_seconds)
+    if quote is None:
+      updated_positions.append(position)
+      continue
+    price, source, received_at = quote
+    if price <= 0:
+      updated_positions.append(position)
+      continue
+    old_price = _number_or_zero(position.get("last_price") or position.get("current_price"))
+    position["last_price"] = price
+    position["current_price"] = price
+    position["last_price_source"] = source
+    position["last_price_updated_at"] = received_at.isoformat()
+    currency = str(position.get("currency") or "").upper()
+    market = str(position.get("market") or "").upper()
+    if currency == "KRW" or market in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+      market_value = quantity * price
+      average_price = _number_or_zero(position.get("average_price") or position.get("avg_price"))
+      purchase = _number_or_zero(position.get("purchase_amount_krw")) or (quantity * average_price)
+      position["market_value"] = market_value
+      position["market_value_krw"] = market_value
+      position["evaluation_amount_original"] = market_value
+      position["unrealized_pnl_krw"] = market_value - purchase
+      position["unrealized_pnl_original"] = market_value - purchase
+    changed = changed or abs(price - old_price) > 1e-9
+    updated_positions.append(position)
+  if not changed:
+    return basis
+  merged = dict(basis)
+  merged["positions"] = updated_positions
+  domestic_value = sum(
+      _number_or_zero(item.get("market_value_krw") or item.get("market_value"))
+      for item in updated_positions
+      if isinstance(item, dict)
+      and (
+          str(item.get("currency") or "").upper() == "KRW"
+          or str(item.get("market") or "").upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+      )
+  )
+  overseas_value = sum(
+      _number_or_zero(item.get("market_value_krw") or item.get("market_value"))
+      for item in updated_positions
+      if isinstance(item, dict)
+      and not (
+          str(item.get("currency") or "").upper() == "KRW"
+          or str(item.get("market") or "").upper() in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+      )
+  )
+  invested = domestic_value + overseas_value
+  if invested > 0:
+    merged["invested_value"] = invested
+  return merged
+
+
+def _latest_dashboard_holding_quote(
+    store: RealtimeMarketDataStore,
+    ticker: str,
+    now: datetime,
+    max_age_seconds: float,
+) -> tuple[float, str, datetime] | None:
+  candidates: list[tuple[datetime, float, str]] = []
+  try:
+    tick = store.latest_tick(ticker)
+  except Exception:
+    tick = None
+  if tick is not None:
+    received_at = getattr(tick, "received_at", None)
+    price = _number_or_zero(getattr(tick, "price", 0.0))
+    if received_at is not None and price > 0:
+      candidates.append((received_at, price, str(getattr(tick, "source", "realtime_tick") or "realtime_tick")))
+  try:
+    orderbook = store.latest_orderbook(ticker)
+  except Exception:
+    orderbook = None
+  if orderbook is not None:
+    received_at = getattr(orderbook, "received_at", None)
+    bid = _number_or_zero(getattr(orderbook, "best_bid", 0.0))
+    ask = _number_or_zero(getattr(orderbook, "best_ask", 0.0))
+    if received_at is not None and bid > 0 and ask > 0:
+      candidates.append((received_at, (bid + ask) / 2.0, "realtime_orderbook_mid"))
+  fresh = [
+      item
+      for item in candidates
+      if max(0.0, (now - item[0]).total_seconds()) <= max_age_seconds
+  ]
+  if not fresh:
+    return None
+  received_at, price, source = max(fresh, key=lambda item: item[0])
+  return price, source, received_at
 
 
 def _account_dashboard_logs_provider() -> dict[str, Any]:
@@ -283,6 +397,10 @@ def _env_flag(name: str, default: bool = False) -> bool:
 _live_lock = threading.Lock()
 _refresh_guard = threading.Lock()
 _kis_realtime_collector_stop = threading.Event()
+_kis_realtime_collector_resubscribe = threading.Event()
+_pending_krx_buy_candidate_warmup: dict[str, float] = {}
+_kis_realtime_collector_skipped_subscriptions: dict[tuple[str, str], float] = {}
+_kis_realtime_last_resubscribe_request_at = 0.0
 _mock_kis_lock = threading.Lock()
 _mock_kis: MockKisDevelopersApi | None = None
 _mock_trading_state: dict[str, Any] = {
@@ -2048,11 +2166,11 @@ def realtime_runtime() -> JSONResponse:
     acceleration = RealtimeAccelerationPolicy().status()
     risk_policy = ShortHorizonRiskPolicy()
     ontology_status = get_ontology_npu_classifier().status()
-    training_status = _safe_live_training_status()
+    training_status = _safe_live_training_status_fast()
     return _json(
         {
             "acceleration": acceleration,
-            "event_llm": event_llm_runtime_status(),
+            "event_llm": _event_llm_runtime_status_fast(),
             "ontology_npu": ontology_status,
             "live_training": training_status,
             "short_horizon_policy": risk_policy,
@@ -2067,6 +2185,84 @@ def realtime_runtime() -> JSONResponse:
             },
         }
     )
+
+
+def _event_llm_runtime_status_fast() -> dict[str, Any]:
+    """Return UI-safe LLM status without network/model probes.
+
+    ``event_llm_runtime_status`` may probe local OpenAI-compatible endpoints.
+    This route is polled by the dashboard, so it must be a cheap snapshot rather
+    than a liveness check that can hold the only local app worker.
+    """
+    enabled = os.getenv("LLM_EVENT_CLASSIFIER_ENABLED", "").lower() in {"1", "true", "yes"}
+    provider = os.getenv("LLM_EVENT_PROVIDER", "remote").strip().lower()
+    model = os.getenv("LLM_EVENT_MODEL", "")
+    backend = os.getenv("LLM_EVENT_INFERENCE_BACKEND", "")
+    device = os.getenv("LLM_EVENT_DEVICE", "")
+    status: dict[str, Any] = {
+        "enabled": enabled,
+        "provider": provider,
+        "model": model,
+        "backend": backend,
+        "device": device,
+        "available": False,
+        "reason": None,
+        "probe_skipped": True,
+    }
+    if not enabled:
+        status["reason"] = "LLM_EVENT_CLASSIFIER_ENABLED is false."
+        return status
+    if not model:
+        status["reason"] = "LLM_EVENT_MODEL is not configured."
+        return status
+    if provider in {"local", "ollama", "llamacpp", "llama.cpp"}:
+        status["backend"] = "openai-compatible"
+        status["device"] = "local-server"
+        status["endpoint"] = os.getenv("LLM_EVENT_LOCAL_ENDPOINT") or os.getenv(
+            "LLM_EVENT_ENDPOINT",
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        status["reason"] = "local LLM endpoint probe skipped for dashboard responsiveness."
+        return status
+    if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
+        exists = Path(model).exists()
+        status["available"] = exists
+        status["reason"] = None if exists else f"embedded model path does not exist: {model}"
+        return status
+    if os.getenv("LLM_EVENT_API_KEY") or os.getenv("OPENAI_API_KEY"):
+        status["available"] = True
+        return status
+    status["reason"] = "remote provider needs LLM_EVENT_API_KEY or OPENAI_API_KEY."
+    return status
+
+
+def _safe_live_training_status_fast() -> dict[str, Any]:
+    """Cheap dashboard status for the latest live-eligible model.
+
+    The full training status scans larger runtime artifacts and is still
+    available at ``/api/live-training/status``. The realtime runtime endpoint is
+    polled frequently, so it only checks the registry pointer.
+    """
+    try:
+        artifact = ModelArtifactRegistry().load_latest_live_eligible()
+    except Exception as exc:  # noqa: BLE001 - status endpoint should report, not fail.
+        return {
+            "ok": False,
+            "pipeline": "collect_features_train_save_predict",
+            "model_saved": False,
+            "latest_live_eligible_exists": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+            "fast_status": True,
+        }
+    return {
+        "ok": True,
+        "pipeline": "collect_features_train_save_predict",
+        "model_saved": True,
+        "latest_live_eligible_exists": bool(getattr(artifact, "live_eligible", False)),
+        "latest_live_eligible_model_artifact_id": artifact.artifact_id,
+        "feature_schema_hash": artifact.feature_schema_hash,
+        "fast_status": True,
+    }
 
 
 @app.get("/api/ai/validation")
@@ -3418,12 +3614,12 @@ def _format_price_display(price: Any, is_us: bool) -> str:
 def _kiosk_orderable_cash() -> dict[str, Any]:
     """Orderable cash by currency for the Pi kiosk / mobile overview.
 
-    Reuses the same cached KIS live-account basis the account dashboard reads, so
-    the figures match broker orderable cash (domestic inquire-psbl-order TTTC8908R
-    + overseas inquire-psamount TTTS3007R) without an extra API round trip. The
-    cache in _refresh_live_account_basis_for_auto keeps the 4s kiosk poll cheap.
+    Reuses the same cached KIS live-account basis the account dashboard reads.
+    This endpoint is polled frequently, so it must not trigger broker account
+    refreshes itself; background/account-dashboard refresh paths keep the cache
+    warm.
     """
-    basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
+    basis = _last_live_account_basis()
     if basis is None:
         return {"available": False}
     orderable = {
@@ -3523,6 +3719,21 @@ def _kiosk_market_overview(now: datetime | None = None) -> dict[str, Any]:
         work_label = "최근 분석 완료"
         work_detail = str(latest_log.get("message") or latest_log.get("status") or "대기")
         work_tone = "idle"
+        log_message = work_detail.lower()
+        log_status = str(latest_log.get("status") or "").lower()
+        with _live_lock:
+            collector_running = (
+                _kis_realtime_collector_worker is not None
+                and _kis_realtime_collector_worker.is_alive()
+                and not _kis_realtime_collector_stop.is_set()
+            )
+        if collector_running and "kis realtime collector" in log_message:
+            if log_status == "reconnecting":
+                work_label = "실시간 시세 재연결 중"
+                work_tone = "busy"
+            elif log_status in {"running", "complete", "market_closed"}:
+                work_label = "실시간 시세 수집 중"
+                work_tone = "busy" if log_status == "running" else "idle"
     else:
         work_label = "뉴스 분석 대기"
         work_detail = "새 수집 사이클 대기"
@@ -3813,6 +4024,7 @@ def realtime_trading_status() -> JSONResponse:
       "running": running,
       "auto_start": AUTO_START_REALTIME_TRADING,
       "status": engine.get_status() if engine is not None else None,
+      "buy_warmup_pending": list(_pending_krx_buy_candidate_warmup_symbols()),
       "decision_diagnostics": diagnostics,
     }
   )
@@ -5335,9 +5547,10 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
     fresh = ()
   cached_context = _cached_context_buy_candidates(limit=limit)
   affordable = _live_affordable_buy_candidate_symbols(limit=limit)
+  pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
   surge = _cached_volume_surge_symbols()
   ordered = _prioritize_realtime_buy_candidates(
-      tuple(dict.fromkeys((*surge, *cached_context, *fresh, *config_symbols, *affordable)))
+      tuple(dict.fromkeys((*surge, *cached_context, *fresh, *pending_warmup, *config_symbols, *affordable)))
   )
   return _filter_realtime_buy_candidates_by_affordability(
       tuple(symbol for symbol in ordered if _is_live_buy_candidate_symbol(symbol)),
@@ -5347,17 +5560,19 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
 
 
 def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, ...]:
-  """Keep active US symbols within the realtime engine's first evaluation window."""
+  """Keep currently tradeable cash buckets inside the engine's first evaluation window."""
   open_groups = set(_active_live_market_groups())
-  if "US" not in open_groups:
+  if not ({"KRX", "US"} & open_groups):
     return symbols
   try:
     account = _live_account_snapshot_for_analysis()
   except Exception:  # noqa: BLE001 - preserve original ordering on account lookup failure.
     return symbols
-  usd_cash = float((getattr(account, "cash_by_currency", {}) or {}).get("USD") or 0.0) if account is not None else 0.0
-  if usd_cash <= 0:
+  krw_cash = _account_available_cash(account, "KRW") if account is not None else 0.0
+  usd_cash = _account_available_cash(account, "USD") if account is not None else 0.0
+  if krw_cash <= 0 and usd_cash <= 0:
     return symbols
+  kr_symbols: list[str] = []
   us_symbols: list[str] = []
   other_symbols: list[str] = []
   seen: set[str] = set()
@@ -5366,11 +5581,16 @@ def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, 
     if not symbol or symbol in seen or not _is_live_buy_candidate_symbol(symbol):
       continue
     seen.add(symbol)
-    if _ticker_market_group_for_live_trading(symbol, "") == "US":
+    group = _ticker_market_group_for_live_trading(symbol, "")
+    if group == "KRX" and "KRX" in open_groups and krw_cash > 0:
+      kr_symbols.append(symbol)
+    elif group == "US" and "US" in open_groups and usd_cash > 0:
       us_symbols.append(symbol)
     else:
       other_symbols.append(symbol)
-  return tuple((*us_symbols, *other_symbols))
+  if "KRX" in open_groups and krw_cash > 0:
+    return tuple((*kr_symbols, *us_symbols, *other_symbols))
+  return tuple((*us_symbols, *kr_symbols, *other_symbols))
 
 
 def _is_excluded_us_live_candidate(symbol: str) -> bool:
@@ -5406,6 +5626,21 @@ def _is_live_buy_candidate_symbol(symbol: str, market: str = "") -> bool:
 _affordable_candidate_cache: dict[str, Any] = {"key": None, "at": 0.0, "symbols": ()}
 _broker_quote_backoff_until: dict[str, float] = {}
 _us_nasdaq_universe_cache: dict[str, Any] = {"mtime": None, "symbols": ()}
+
+
+def _account_available_cash(account: AccountSnapshot, currency: str) -> float:
+  code = str(currency or "").upper().strip() or "KRW"
+  orderable = getattr(account, "orderable_cash_by_currency", None) or {}
+  if code in orderable:
+    return float(orderable.get(code) or 0.0)
+  cash_by_currency = getattr(account, "cash_by_currency", None) or {}
+  if code in cash_by_currency:
+    return float(cash_by_currency.get(code) or 0.0)
+  if code == "KRW":
+    return float(getattr(account, "cash", 0.0) or 0.0)
+  if str(getattr(account, "base_currency", "") or "").upper() == code:
+    return float(getattr(account, "cash", 0.0) or 0.0)
+  return 0.0
 
 
 def _load_us_nasdaq_universe() -> tuple[str, ...]:
@@ -5466,8 +5701,8 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
   cache_key = (
       tuple(sorted(open_groups)),
       max_count,
-      round(float((account.cash_by_currency or {}).get("USD") or 0.0), 2),
-      round(float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0), 0),
+      round(_account_available_cash(account, "USD"), 2),
+      round(_account_available_cash(account, "KRW"), 0),
       tuple(sorted(excluded))[:20],
   )
   now = time.monotonic()
@@ -5477,7 +5712,7 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
   ):
     return tuple(_affordable_candidate_cache.get("symbols") or ())[:max_count]
 
-  if "US" in open_groups and float((account.cash_by_currency or {}).get("USD") or 0.0) > 0:
+  if "US" in open_groups and _account_available_cash(account, "USD") > 0:
     try:
       us_limit = max(0, int(os.getenv("REALTIME_US_DISCOVERY_CANDIDATE_LIMIT", "8")))
     except ValueError:
@@ -5505,7 +5740,7 @@ def _live_affordable_buy_candidate_symbols(limit: int = 120) -> tuple[str, ...]:
         )
     )
 
-  if "KRX" in open_groups and float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0) > 0 and len(symbols) < max_count:
+  if "KRX" in open_groups and _account_available_cash(account, "KRW") > 0 and len(symbols) < max_count:
     try:
       krx_limit = max(0, int(os.getenv("REALTIME_KRX_DISCOVERY_CANDIDATE_LIMIT", "6")))
     except ValueError:
@@ -5696,11 +5931,95 @@ def _filter_realtime_buy_candidates_by_affordability(
         continue
       if not _candidate_has_usable_live_liquidity(ticker, store):
         continue
+    if _is_krx_ticker(ticker) and not _candidate_has_fresh_buy_orderbook(ticker, store):
+      _queue_krx_buy_candidate_warmup(ticker)
+      continue
     selected.append(ticker)
     seen.add(ticker)
     if len(selected) >= max(1, int(limit)):
       break
   return tuple(selected)
+
+
+def _is_krx_ticker(ticker: str) -> bool:
+  text = str(ticker or "").upper().strip()
+  return text.isdigit() and len(text) == 6
+
+
+def _candidate_has_fresh_buy_orderbook(ticker: str, store: RealtimeMarketDataStore) -> bool:
+  if not _is_krx_ticker(ticker):
+    return True
+  try:
+    orderbook = store.latest_orderbook(ticker)
+  except Exception:  # noqa: BLE001 - fail closed for live BUY, collector will warm it.
+    return False
+  if orderbook is None:
+    return False
+  bid = _number_or_zero(getattr(orderbook, "best_bid", 0.0))
+  ask = _number_or_zero(getattr(orderbook, "best_ask", 0.0))
+  if bid <= 0 or ask <= 0 or ask < bid:
+    return False
+  if str(getattr(orderbook, "source", "") or "") != "kis_realtime_websocket":
+    return False
+  return _is_recent_realtime_item(orderbook, "EXEC_MAX_ORDERBOOK_AGE_SEC", 10.0)
+
+
+def _queue_krx_buy_candidate_warmup(ticker: str) -> None:
+  symbol = str(ticker or "").upper().strip()
+  if not _is_krx_ticker(symbol):
+    return
+  now = time.monotonic()
+  ttl = max(30.0, _env_float_web("REALTIME_BUY_CANDIDATE_WARMUP_TTL_SEC", 180.0))
+  request_resubscribe = False
+  with _live_lock:
+    request_resubscribe = symbol not in _pending_krx_buy_candidate_warmup
+    _pending_krx_buy_candidate_warmup[symbol] = now + ttl
+  if request_resubscribe:
+    _request_kis_realtime_collector_resubscribe("warmup_candidate", (symbol,))
+
+
+def _pending_krx_buy_candidate_warmup_symbols() -> tuple[str, ...]:
+  now = time.monotonic()
+  with _live_lock:
+    expired = [symbol for symbol, until in _pending_krx_buy_candidate_warmup.items() if float(until or 0.0) <= now]
+    for symbol in expired:
+      _pending_krx_buy_candidate_warmup.pop(symbol, None)
+    return tuple(_pending_krx_buy_candidate_warmup.keys())
+
+
+def _request_kis_realtime_collector_resubscribe(reason: str, symbols: tuple[str, ...] = ()) -> None:
+  global _kis_realtime_last_resubscribe_request_at
+  now = time.monotonic()
+  debounce_seconds = max(
+      5.0,
+      _env_float_web("REALTIME_BUY_CANDIDATE_RESUBSCRIBE_DEBOUNCE_SEC", 30.0),
+  )
+  with _live_lock:
+    if _kis_realtime_collector_resubscribe.is_set():
+      return
+    if now - _kis_realtime_last_resubscribe_request_at < debounce_seconds:
+      _append_collection_log_unlocked(
+          "scheduled",
+          "KIS realtime collector resubscribe deferred for warmup batching",
+          counts={
+              "reason": reason,
+              "symbols": len(symbols),
+              "symbol_sample": list(symbols[:8]),
+              "debounce_seconds": debounce_seconds,
+          },
+      )
+      return
+    _kis_realtime_last_resubscribe_request_at = now
+    _kis_realtime_collector_resubscribe.set()
+    _append_collection_log_unlocked(
+        "scheduled",
+        "KIS realtime collector resubscribe requested",
+        counts={
+            "reason": reason,
+            "symbols": len(symbols),
+            "symbol_sample": list(symbols[:8]),
+        },
+    )
 
 
 def _candidate_affordability_market(
@@ -5915,9 +6234,14 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   """
   base = list(_load_realtime_collection_symbols())
   try:
-    max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "18")))
+    requested_max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "18")))
   except (TypeError, ValueError):
-    max_syms = 18
+    requested_max_syms = 18
+  try:
+    max_subscriptions = max(2, int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")))
+  except (TypeError, ValueError):
+    max_subscriptions = 40
+  max_syms = max(1, min(requested_max_syms, max_subscriptions // 2))
   domestic_priority: list[str] = []
   try:
     account = _live_account_snapshot_for_analysis()
@@ -5938,8 +6262,9 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
     extra = _live_affordable_buy_candidate_symbols(limit=max_syms)
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     extra = ()
+  pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
   kr_extra = [s for s in extra if str(s).isdigit() and len(str(s)) == 6]
-  merged = list(dict.fromkeys([*domestic_priority, *base, *kr_extra]))
+  merged = list(dict.fromkeys([*pending_warmup, *domestic_priority, *base, *kr_extra]))
   return tuple(merged[:max_syms])
 
 
@@ -6025,28 +6350,32 @@ def _kis_realtime_collector_loop() -> None:
           counts={
               "symbols": len(symbols),
               "symbol_sample": list(symbols[:12]),
+              "skipped_subscriptions": len(_kis_realtime_collector_skip_pairs()),
+              "subscription_budget": int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")),
               "phase": market_phase("KRX").value,
           },
       )
     try:
+      _kis_realtime_collector_resubscribe.clear()
       counts = asyncio.run(
           run_kis_realtime_websocket_collector(
               symbols=symbols,
               store=RealtimeMarketDataStore(),
               client=_kis_realtime_collector_client(),
               stop_event=_kis_realtime_collector_stop,
+              resubscribe_event=_kis_realtime_collector_resubscribe,
+              skip_subscriptions=_kis_realtime_collector_skip_pairs(),
               max_runtime_seconds=resubscribe_seconds,
           )
       )
-      with _live_lock:
-        disconnected = bool(counts.get("connection_closed"))
-        _append_collection_log_unlocked(
-            "error" if disconnected else "complete",
-            "KIS realtime collector disconnected" if disconnected else "KIS realtime collector ended",
-            counts=counts,
-        )
+      _record_kis_realtime_collector_result(counts)
       if not _kis_realtime_collector_stop.is_set():
-        time.sleep(2.0)
+        if counts.get("appkey_already_in_use"):
+          time.sleep(max(30.0, _env_float_web("KIS_REALTIME_APPKEY_IN_USE_BACKOFF_SEC", 90.0)))
+        elif counts.get("connection_closed") and int(counts.get("messages") or 0) <= 0:
+          time.sleep(max(2.0, _env_float_web("KIS_REALTIME_RECONNECT_BACKOFF_SEC", 20.0)))
+        else:
+          time.sleep(2.0)
     except Exception as exc:  # noqa: BLE001 - keep app startup alive and surface collector failures.
       with _live_lock:
         _append_collection_log_unlocked(
@@ -6059,6 +6388,55 @@ def _kis_realtime_collector_loop() -> None:
 
 def _kis_realtime_collector_client() -> KisDevelopersApiClient:
   return KisDevelopersApiClient(paper=False, enabled=True)
+
+
+def _record_kis_realtime_collector_result(counts: dict[str, Any]) -> None:
+  disconnected = bool(counts.get("connection_closed"))
+  resubscribe_requested = bool(counts.get("resubscribe_requested"))
+  stopping = _kis_realtime_collector_stop.is_set()
+  appkey_in_use = bool(counts.get("appkey_already_in_use"))
+  if disconnected and not stopping and not appkey_in_use:
+    _record_kis_realtime_collector_bad_subscription(counts)
+  if appkey_in_use and not stopping:
+    status = "reconnecting"
+    message = "KIS realtime collector backing off because appkey is already in use"
+  elif disconnected and not stopping:
+    status = "reconnecting"
+    message = "KIS realtime collector reconnecting after WebSocket close"
+  elif resubscribe_requested and not stopping:
+    status = "running"
+    message = "KIS realtime collector resubscribing with refreshed candidate symbols"
+  elif disconnected:
+    status = "stopped"
+    message = "KIS realtime collector stopped after WebSocket close"
+  else:
+    status = "complete"
+    message = "KIS realtime collector ended"
+  with _live_lock:
+    _append_collection_log_unlocked(status, message, counts=counts)
+
+
+def _kis_realtime_collector_skip_pairs(now: float | None = None) -> tuple[tuple[str, str], ...]:
+  now = time.time() if now is None else now
+  ttl_seconds = max(60.0, float(os.getenv("KIS_REALTIME_BAD_SUBSCRIPTION_TTL_SEC", "600")))
+  expired = [key for key, recorded_at in _kis_realtime_collector_skipped_subscriptions.items() if now - recorded_at > ttl_seconds]
+  for key in expired:
+    _kis_realtime_collector_skipped_subscriptions.pop(key, None)
+  return tuple(sorted(_kis_realtime_collector_skipped_subscriptions))
+
+
+def _record_kis_realtime_collector_bad_subscription(counts: dict[str, Any]) -> None:
+  symbol = str(counts.get("last_subscription_symbol") or "").strip()
+  tr_id = str(counts.get("last_subscription_tr_id") or "").strip()
+  if not symbol or not tr_id:
+    return
+  key = (symbol, tr_id)
+  _kis_realtime_collector_skipped_subscriptions[key] = time.time()
+  counts["bad_subscription_quarantined"] = {"symbol": symbol, "tr_id": tr_id}
+  counts["bad_subscription_skip_ttl_sec"] = max(
+      60,
+      int(float(os.getenv("KIS_REALTIME_BAD_SUBSCRIPTION_TTL_SEC", "600"))),
+  )
 
 
 def _load_realtime_collection_symbols(path: str | Path = "config/realtime_market_data.json") -> tuple[str, ...]:
@@ -6766,7 +7144,7 @@ def _live_affordable_krx_discovery_targets(
     return ()
   if not _is_live_market_extended_open("KRX"):
     return ()
-  krw_cash = float((account.cash_by_currency or {}).get("KRW") or account.cash or 0.0)
+  krw_cash = _account_available_cash(account, "KRW")
   if krw_cash <= 0:
     return ()
   try:
@@ -6832,7 +7210,7 @@ def _live_affordable_us_discovery_targets(
     return ()
   if not _is_live_market_extended_open("US"):
     return ()
-  usd_cash = float((account.cash_by_currency or {}).get("USD") or 0.0)
+  usd_cash = _account_available_cash(account, "USD")
   if usd_cash <= 0:
     return ()
   try:

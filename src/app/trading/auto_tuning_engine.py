@@ -161,14 +161,20 @@ class AutoTuningEngine:
         buy_threshold -= min(0.12, max(0.0, fallback_score) * 0.12)
         buy_threshold -= 0.08 if model_ok else 0.0
         buy_threshold += 0.06 if not model_ok and not fallback_allowed else 0.0
-        buy_threshold = max(0.22, min(0.75, buy_threshold))
+        domestic_fallback = market.market.upper().startswith("K") and not model_ok
+        if domestic_fallback:
+            buy_threshold -= max(0.0, float(os.getenv("REALTIME_KR_FALLBACK_BUY_THRESHOLD_RELIEF", "0.28")))
+            floor = max(0.05, float(os.getenv("REALTIME_KR_FALLBACK_MIN_BUY_THRESHOLD", "0.16")))
+            buy_threshold = max(floor, min(0.75, buy_threshold))
+        else:
+            buy_threshold = max(0.22, min(0.75, buy_threshold))
 
         min_buy_net_return = float(
             os.getenv(
                 "REALTIME_MIN_BUY_NET_RETURN_KR"
                 if market.market.upper().startswith("K")
                 else "REALTIME_MIN_BUY_NET_RETURN_US",
-                "0.008" if market.market.upper().startswith("K") else "0.012",
+                "0.0015" if market.market.upper().startswith("K") else "0.012",
             )
         )
         expected_net_return = max(

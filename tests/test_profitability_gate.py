@@ -43,8 +43,8 @@ class ProfitabilityGateTest(unittest.TestCase):
         self.assertIn("MISSING_EXPECTED_EXIT_PRICE", decision.rejection_reasons)
 
     def test_net_return_below_required_is_rejected(self) -> None:
-        # +0.3% gross does not clear the 0.8% KR floor after cost.
-        decision = _gate().evaluate(
+        # +0.3% gross does not clear a strict 0.8% KR floor after cost.
+        decision = _gate(min_required_net_return={"default": 0.008, "KR": 0.008, "US": 0.012}).evaluate(
             ProfitabilityInput(
                 symbol="005930",
                 market="KR",

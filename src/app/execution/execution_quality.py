@@ -85,7 +85,7 @@ class ExecutionQualityEngine:
         # not be priced as if the spread were zero, so it is blocked by default.
         self.require_orderbook_for_buy = _env_bool("EXEC_REQUIRE_ORDERBOOK_FOR_BUY", True)
         self.require_fresh_orderbook_for_buy = _env_bool("EXEC_REQUIRE_FRESH_ORDERBOOK_FOR_BUY", True)
-        self.max_orderbook_age_sec = _env_float("EXEC_MAX_ORDERBOOK_AGE_SEC", 3.0)
+        self.max_orderbook_age_sec = _env_float("EXEC_MAX_ORDERBOOK_AGE_SEC", 10.0)
         # Assumed spread when the book is unknown — never 0.0 (which would hide the risk).
         self.unknown_spread_penalty_rate = _env_float("EXEC_UNKNOWN_SPREAD_PENALTY_RATE", 0.006)
         self.allow_no_orderbook_emergency_sell = _env_bool("EXEC_ALLOW_NO_ORDERBOOK_EMERGENCY_SELL", True)

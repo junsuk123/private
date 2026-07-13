@@ -11,11 +11,14 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.kis_realtime import (
+    DEFAULT_SUBSCRIPTION_TR_IDS,
     KisRealtimeSubscriptionManager,
     QueueMessageSource,
     _is_websocket_connection_closed,
+    _kis_realtime_websocket_url,
     _websocket_subscription_delay_seconds,
     _websocket_ping_setting,
+    kis_realtime_control_summary,
     kis_realtime_subscription_message,
     normalize_symbol,
     parse_kis_realtime_message,
@@ -123,6 +126,20 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertIn('"tr_id":"H0STCNT0"', payload)
         self.assertIn('"tr_key":"000660"', payload)
 
+    def test_control_summary_keeps_kis_status_without_secrets(self) -> None:
+        raw = (
+            '{"header":{"tr_id":"H0STASP0","tr_key":"005930","approval_key":"secret"},'
+            '"body":{"rt_cd":"1","msg_cd":"OPSP0001","msg1":"subscription failed"}}'
+        )
+
+        summary = kis_realtime_control_summary(raw)
+
+        self.assertEqual(summary["tr_id"], "H0STASP0")
+        self.assertEqual(summary["tr_key"], "005930")
+        self.assertEqual(summary["rt_cd"], "1")
+        self.assertEqual(summary["msg_cd"], "OPSP0001")
+        self.assertNotIn("approval_key", summary)
+
     def test_kis_websocket_standard_ping_is_disabled_by_default(self) -> None:
         with patch.dict(
             "os.environ",
@@ -137,7 +154,19 @@ class KisRealtimeParserTest(unittest.TestCase):
 
     def test_kis_subscriptions_are_throttled_by_default(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            self.assertGreater(_websocket_subscription_delay_seconds(), 0.0)
+            self.assertGreaterEqual(_websocket_subscription_delay_seconds(), 1.0)
+
+    def test_default_kis_subscriptions_request_orderbook_first(self) -> None:
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0STASP0")
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STASP0",))
+
+    def test_default_kis_websocket_url_uses_tryitout_path(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertTrue(_kis_realtime_websocket_url().endswith("/tryitout"))
+
+    def test_bare_kis_websocket_host_is_normalized(self) -> None:
+        with patch.dict("os.environ", {"KIS_WEBSOCKET_URL": "ws://ops.koreainvestment.com:21000"}, clear=True):
+            self.assertEqual(_kis_realtime_websocket_url(), "ws://ops.koreainvestment.com:21000/tryitout")
 
     def test_connection_closed_message_is_recognized(self) -> None:
         exc = RuntimeError("no close frame received or sent")

@@ -584,7 +584,10 @@ class SharedLiveDecisionEngine:
         edge_threshold = float(os.getenv("REALTIME_ONTOLOGY_BUY_MIN_SUPPORTS", "0.5"))
         ontology_score = max(flow_score, edge_score) + news_confirm_bonus
         ontology_ok = flow_score >= flow_threshold or edge_score >= edge_threshold
-        require_ontology_fallback = str(os.getenv("REALTIME_REQUIRE_ONTOLOGY_FOR_MODEL_FALLBACK", "true")).lower() in {
+        require_ontology_default = "false" if symbol.isdigit() and len(symbol) == 6 else "true"
+        require_ontology_fallback = str(
+            os.getenv("REALTIME_REQUIRE_ONTOLOGY_FOR_MODEL_FALLBACK", require_ontology_default)
+        ).lower() in {
             "1",
             "true",
             "yes",

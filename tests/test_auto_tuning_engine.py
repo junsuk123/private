@@ -71,6 +71,37 @@ class AutoTuningEngineTest(unittest.TestCase):
         self.assertLess(weak, 0.5)
         self.assertGreater(strong, weak)
 
+    def test_domestic_model_fallback_uses_relaxed_buy_threshold(self) -> None:
+        market_state = self.engine.snapshot_market_state(
+            symbol="005930",
+            market=self.market,
+            quote_age_seconds=0.0,
+            spread_bps=0.0,
+            orderbook_available=True,
+            volume_ratio=1.0,
+            recent_performance=0.0,
+            fallback_score=0.2,
+            symbol_volatility=0.0,
+            market_volatility=0.0,
+        )
+        policy, _diag = self.engine.build_buy_policy(
+            symbol="005930",
+            account=self.account,
+            market=self.market,
+            market_state=market_state,
+            prediction=None,
+            fallback_allowed=True,
+            ontology_score=0.0,
+            fallback_score=0.2,
+            prediction_confidence=0.5,
+            prediction_error=RuntimeError("model down"),
+            decision_time=datetime.now(timezone.utc),
+        )
+
+        self.assertLessEqual(policy.buy_threshold, 0.25)
+        self.assertEqual(policy.allowed_fallback_mode, "rule_based")
+        self.assertLessEqual(policy.min_expected_net_return, 0.002)
+
     def test_derive_exit_policy_keeps_dynamic_sell_target_reasonable(self) -> None:
         holding = Holding(ticker="005930", market="KR", company_name="Samsung", sector="Tech", quantity=10, average_price=100.0, last_price=100.0)
         policy, cost_floor = derive_exit_policy(

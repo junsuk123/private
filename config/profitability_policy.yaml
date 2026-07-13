@@ -18,7 +18,11 @@
 min_required_net_return:
   default: 0.0
   KR: 0.0
-  US: 0.002
+  # One-share US live probing should still require positive net expectancy after
+  # all fees/slippage, but not a full 20 bps extra floor on top of that. Today's
+  # live candidates included several +6~7 bps net names that were rejected solely
+  # by this floor, leaving no BUY submissions despite sufficient cash.
+  US: 0.0003
 
 # Extra net headroom demanded above pure break-even before a buy is worth taking.
 # Overridable by REALTIME_MIN_NET_PROFIT_BUFFER_RATE.
@@ -50,11 +54,12 @@ min_liquidity_score: 0.3
 #       + liquidity_buffer_max * (1 - liquidity_score)
 #       + account_buffer(if small account),
 # )
-# Relaxed 0.5 -> 0.2 (moderate): the volatility buffer was the dominant term forcing
-# required net to ~0.86% and rejecting every buy. At 0.2 a 1% realized-vol name adds
-# only +0.2%, so the KR market floor (0.004) becomes the binding minimum (~0.45%).
+# Keep the extra buffers light for one-share live probing: the hard rules still require
+# positive net expectancy after costs, liquidity >= min_liquidity_score, and bounded
+# cost/alpha. A larger liquidity buffer was rejecting today's positive-net US candidates
+# by a few bps even after all-in costs were covered.
 volatility_buffer_k: 0.05
-liquidity_buffer_max: 0.003
+liquidity_buffer_max: 0.001
 
 account_buffer:
   small_account_equity_krw: 200000.0
