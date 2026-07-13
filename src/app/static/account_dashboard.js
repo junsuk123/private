@@ -53,7 +53,7 @@ function renderDashboard(data, trading, runtime) {
   renderSystem(snapshot, data.logs || {}, trading, runtime);
   renderDecisionFlow(trading);
   renderTechnical(data.technical || {});
-  renderMacroMicro(data.macro_micro || {});
+  renderMacroMicroVisual(data.macro_micro || {});
   renderLogs(data.logs || {});
 }
 
@@ -136,6 +136,207 @@ function renderMacroMicro(mm) {
         + `<span><em>신뢰도</em>${techNum(i.confidence, 2)}</span></div></div>`;
     }).join('') : '<div class="tech-card empty">랭킹된 의도 없음</div>';
   }
+}
+
+function renderMacroMicroVisual(mm) {
+  const badge = document.getElementById('macro-micro-badge');
+  let graph = document.getElementById('mm-graph');
+  const macro = document.getElementById('mm-macro');
+  const microContainer = document.getElementById('mm-micro-cards');
+  const rankedContainer = document.getElementById('mm-ranked');
+  const panel = document.getElementById('macro-micro-panel');
+  if (!graph && macro) {
+    graph = document.createElement('div');
+    graph.className = 'mm-graph';
+    graph.id = 'mm-graph';
+    macro.parentNode.insertBefore(graph, macro);
+  }
+  if (panel) {
+    const title = panel.querySelector('.frame-title h2');
+    const note = panel.querySelector('.tech-note');
+    const headings = panel.querySelectorAll('.mm-grid article h3');
+    if (title) title.textContent = '거시·미시 온톨로지';
+    if (note) note.textContent = '거시 레짐, 미시 종목 판단, 최종 게이트 흐름을 한 화면에서 확인합니다.';
+    if (headings[0]) headings[0].textContent = '종목별 미시 추론';
+    if (headings[1]) headings[1].textContent = '통합 랭킹';
+  }
+  const available = Boolean(mm && mm.available);
+  const blocked = Boolean(mm && mm.blocks_buy);
+  if (badge) {
+    badge.textContent = available ? `${mm.market_regime || 'regime'} · ${blocked ? '매수 차단' : '매수 허용'}` : '데이터 없음';
+    badge.className = available && !blocked ? 'badge' : 'badge warn';
+  }
+  if (!available) {
+    const empty = '<div class="tech-card empty">거시·미시 온톨로지 데이터 대기 중</div>';
+    if (graph) graph.innerHTML = renderOntologyEmptyGraph('데이터 대기');
+    if (macro) macro.innerHTML = empty;
+    if (microContainer) microContainer.innerHTML = empty;
+    if (rankedContainer) rankedContainer.innerHTML = empty;
+    return;
+  }
+
+  const microRows = Array.isArray(mm.micro) ? mm.micro : [];
+  const ranked = Array.isArray(mm.ranked_intents) ? mm.ranked_intents : [];
+  const sectorRows = Array.isArray(mm.sector_rankings) ? mm.sector_rankings : [];
+  const candidateSymbols = Array.isArray(mm.candidate_symbols) ? mm.candidate_symbols : [];
+  const noLiveData = mm.data_status === 'no_live_data';
+  const buyCount = microRows.filter((m) => m.entry_signal === 'BUY_CANDIDATE').length;
+  const exitCount = microRows.filter((m) => m.exit_signal && m.exit_signal !== 'NONE').length;
+  const holdCount = Math.max(0, microRows.length - buyCount - exitCount);
+
+  if (graph) {
+    graph.innerHTML = renderOntologyFlowSvg({
+      regime: mm.market_regime || '-',
+      risk: mm.macro_risk_level || '-',
+      confidence: Number(mm.macro_confidence || 0),
+      blocked,
+      noLiveData,
+      candidates: candidateSymbols.length,
+      micro: microRows.length,
+      buyCount,
+      exitCount,
+      holdCount,
+      rankedCount: ranked.length,
+    });
+  }
+
+  if (macro) {
+    const topSectors = sectorRows.slice(0, 4);
+    const allowed = (mm.allowed_micro_strategies || []).slice(0, 4);
+    const blockedStrategies = (mm.blocked_micro_strategies || []).slice(0, 4);
+    macro.innerHTML = `
+      <div class="mm-summary-grid">
+        ${metricTile('시장 레짐', mm.market_regime || '-', noLiveData ? '실시간 시세 대기' : `신뢰도 ${techNum(mm.macro_confidence, 2)}`, blocked ? 'warn' : 'ok')}
+        ${metricTile('거시 리스크', mm.macro_risk_level || '-', blocked ? '신규 매수 차단' : '신규 매수 가능', blocked ? 'warn' : 'ok')}
+        ${metricTile('후보 종목', String(candidateSymbols.length), candidateSymbols.slice(0, 6).join(', ') || '-', 'info')}
+        ${metricTile('랭킹 의도', String(ranked.length), ranked.slice(0, 3).map((r) => `${r.side}:${r.symbol}`).join(', ') || '-', 'info')}
+      </div>
+      <div class="mm-lanes">
+        <div>${laneTitle('상위 섹터')}${topSectors.length ? topSectors.map((s) => progressRow(s.sector, Number(s.score || 0), Number(s.confidence || 0))).join('') : '<span class="muted">섹터 데이터 없음</span>'}</div>
+        <div>${laneTitle('허용 전략')}${pillList(allowed, 'ok')}${laneTitle('차단 전략')}${pillList(blockedStrategies, 'warn')}</div>
+      </div>
+    `;
+  }
+
+  if (microContainer) {
+    microContainer.innerHTML = microRows.length ? microRows.slice(0, 10).map((m) => {
+      const action = m.entry_signal === 'BUY_CANDIDATE' ? 'BUY' : (m.exit_signal && m.exit_signal !== 'NONE') ? 'SELL' : 'HOLD';
+      const kind = action === 'BUY' ? 'approved' : action === 'SELL' ? 'sell' : 'hold';
+      const reasons = (m.reason_codes || []).slice(0, 3).map(humanizeReason).join(' · ');
+      const detail = visibleDetailRows([
+        ['레짐', m.micro_regime || '-'],
+        ['전략', m.selected_strategy || '-'],
+        ['순기대', techNum(m.expected_net_return_bps, 1, 'bps')],
+        ['청산가', techNum(m.expected_exit_price, 2)],
+        ['체결', m.execution_quality || '-'],
+        ['신뢰', techNum(m.confidence, 2)],
+      ]);
+      return `<div class="tech-card ${kind}">
+        <div class="tech-symbol">${escapeHtml(m.symbol || '-')} <span class="mm-action ${kind}">${action}</span></div>
+        <div class="tech-detail">${detail}</div>
+        ${reasons ? `<div class="tech-explain">${escapeHtml(reasons)}</div>` : ''}
+      </div>`;
+    }).join('') : '<div class="tech-card empty">미시 추론 결과 없음</div>';
+  }
+
+  if (rankedContainer) {
+    rankedContainer.innerHTML = ranked.length ? ranked.slice(0, 10).map((i) => {
+      const kind = i.side === 'BUY' ? 'approved' : 'sell';
+      return `<div class="mm-rank-card ${kind}">
+        <strong>#${escapeHtml(i.rank || '-')} ${escapeHtml(i.side || '-')} ${escapeHtml(i.symbol || '-')}</strong>
+        <span>${escapeHtml(i.selected_strategy || i.micro_regime || '-')}</span>
+        <div class="mm-rank-bars">
+          <i style="width:${clampPct(Number(i.confidence || 0) * 100)}%"></i>
+        </div>
+        <small>순기대 ${techNum(i.expected_net_return_bps, 1, 'bps')} · 신뢰 ${techNum(i.confidence, 2)}</small>
+      </div>`;
+    }).join('') : '<div class="tech-card empty">랭킹된 의도 없음</div>';
+  }
+}
+
+function renderOntologyEmptyGraph(label) {
+  return `<svg class="mm-graph-svg" viewBox="0 0 920 260" role="img" aria-label="${escapeHtml(label)}">
+    <rect x="0" y="0" width="920" height="260" rx="0" fill="#f8fafc"></rect>
+    <text x="460" y="132" text-anchor="middle" fill="#667085" font-size="16" font-weight="700">${escapeHtml(label)}</text>
+  </svg>`;
+}
+
+function renderOntologyFlowSvg(data) {
+  const nodes = [
+    { id: 'macro', x: 90, y: 78, label: '거시', value: data.regime, tone: data.blocked ? 'warn' : 'ok' },
+    { id: 'risk', x: 265, y: 78, label: '리스크', value: data.risk, tone: data.blocked ? 'warn' : 'info' },
+    { id: 'candidates', x: 440, y: 78, label: '후보', value: `${data.candidates}종목`, tone: data.noLiveData ? 'warn' : 'info' },
+    { id: 'micro', x: 615, y: 78, label: '미시', value: `${data.micro}건`, tone: 'info' },
+    { id: 'gate', x: 790, y: 78, label: '최종 게이트', value: data.blocked ? '차단' : '검증', tone: data.blocked ? 'warn' : 'ok' },
+  ];
+  const bars = [
+    { label: 'BUY', value: data.buyCount, color: '#138a5b' },
+    { label: 'SELL', value: data.exitCount, color: '#c2413a' },
+    { label: 'HOLD', value: data.holdCount, color: '#64748b' },
+    { label: 'RANK', value: data.rankedCount, color: '#2563eb' },
+  ];
+  const max = Math.max(1, ...bars.map((b) => b.value));
+  const links = nodes.slice(0, -1).map((n, idx) => {
+    const next = nodes[idx + 1];
+    return `<path d="M ${n.x + 58} ${n.y} C ${n.x + 95} ${n.y}, ${next.x - 95} ${next.y}, ${next.x - 58} ${next.y}" class="mm-link ${data.blocked && idx >= 1 ? 'blocked' : ''}"></path>`;
+  }).join('');
+  return `<svg class="mm-graph-svg" viewBox="0 0 920 260" role="img" aria-label="거시 미시 온톨로지 흐름">
+    <defs>
+      <filter id="mmShadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="4" stdDeviation="5" flood-color="#0f172a" flood-opacity="0.10"/></filter>
+    </defs>
+    <rect x="0" y="0" width="920" height="260" rx="0" fill="#f8fafc"></rect>
+    ${links}
+    ${nodes.map((n) => graphNode(n)).join('')}
+    <g transform="translate(54 178)">
+      ${bars.map((b, idx) => {
+        const y = idx * 18;
+        const w = Math.max(10, (b.value / max) * 180);
+        return `<g transform="translate(0 ${y})">
+          <text x="0" y="11" fill="#475569" font-size="11" font-weight="700">${b.label}</text>
+          <rect x="48" y="2" width="180" height="10" rx="5" fill="#e2e8f0"></rect>
+          <rect x="48" y="2" width="${w}" height="10" rx="5" fill="${b.color}"></rect>
+          <text x="238" y="11" fill="#0f172a" font-size="11" font-weight="700">${b.value}</text>
+        </g>`;
+      }).join('')}
+    </g>
+    <text x="790" y="204" text-anchor="middle" fill="#475569" font-size="12">거시 신뢰도 ${(Number(data.confidence || 0) * 100).toFixed(0)}%</text>
+  </svg>`;
+}
+
+function graphNode(n) {
+  return `<g class="mm-node ${n.tone}" transform="translate(${n.x} ${n.y})" filter="url(#mmShadow)">
+    <circle r="58"></circle>
+    <text y="-10" text-anchor="middle" class="mm-node-label">${escapeHtml(n.label)}</text>
+    <text y="14" text-anchor="middle" class="mm-node-value">${escapeHtml(n.value)}</text>
+  </g>`;
+}
+
+function metricTile(label, value, note, tone) {
+  return `<div class="mm-metric ${tone || ''}"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(note || '')}</small></div>`;
+}
+
+function laneTitle(text) {
+  return `<h4 class="mm-lane-title">${escapeHtml(text)}</h4>`;
+}
+
+function progressRow(label, score, confidence) {
+  const pct = clampPct(Math.abs(score) * 100);
+  const cls = score >= 0 ? 'positive' : 'negative';
+  return `<div class="mm-progress-row">
+    <span>${escapeHtml(label || '-')}</span>
+    <div><i class="${cls}" style="width:${pct}%"></i></div>
+    <strong>${score.toFixed(2)} · ${(confidence * 100).toFixed(0)}%</strong>
+  </div>`;
+}
+
+function pillList(items, tone) {
+  return items && items.length
+    ? `<div class="mm-pill-list">${items.map((item) => `<span class="${tone || ''}">${escapeHtml(item)}</span>`).join('')}</div>`
+    : '<span class="muted">없음</span>';
+}
+
+function clampPct(value) {
+  return Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
 }
 
 const TECH_REJECT_TEXT = {
