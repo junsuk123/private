@@ -158,7 +158,7 @@ class KisRealtimeParserTest(unittest.TestCase):
 
     def test_default_kis_subscriptions_request_orderbook_first(self) -> None:
         self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0STASP0")
-        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STASP0",))
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STASP0", "H0STCNT0"))
 
     def test_default_kis_websocket_url_uses_tryitout_path(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

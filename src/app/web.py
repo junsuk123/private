@@ -5548,9 +5548,10 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   cached_context = _cached_context_buy_candidates(limit=limit)
   affordable = _live_affordable_buy_candidate_symbols(limit=limit)
   pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
+  domestic_ranked = _cached_domestic_ranking_symbols()
   surge = _cached_volume_surge_symbols()
   ordered = _prioritize_realtime_buy_candidates(
-      tuple(dict.fromkeys((*surge, *cached_context, *fresh, *pending_warmup, *config_symbols, *affordable)))
+      tuple(dict.fromkeys((*domestic_ranked, *surge, *cached_context, *fresh, *pending_warmup, *config_symbols, *affordable)))
   )
   return _filter_realtime_buy_candidates_by_affordability(
       tuple(symbol for symbol in ordered if _is_live_buy_candidate_symbol(symbol)),
@@ -6095,6 +6096,7 @@ def _env_float_web(name: str, default: float) -> float:
 
 
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
+_domestic_ranking_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
 
 
 def _cached_volume_surge_symbols() -> tuple[str, ...]:
@@ -6122,6 +6124,33 @@ def _cached_volume_surge_symbols() -> tuple[str, ...]:
   with _live_lock:
     _volume_surge_cache["at"] = now
     _volume_surge_cache["symbols"] = symbols
+  return symbols
+
+
+def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
+  """KIS domestic ranking APIs supply fresh KRX buy-discovery candidates."""
+  if os.getenv("REALTIME_USE_KRX_RANKING_API", "true").lower() in {"0", "false", "no", "off"}:
+    return ()
+  if "KRX" not in _active_live_market_groups():
+    return ()
+  ttl = float(os.getenv("REALTIME_KRX_RANKING_TTL_SEC", "30"))
+  now = time.monotonic()
+  with _live_lock:
+    if now - float(_domestic_ranking_cache.get("at") or 0.0) < ttl and _domestic_ranking_cache.get("symbols"):
+      return tuple(_domestic_ranking_cache.get("symbols") or ())
+  try:
+    from app.trading.domestic_realtime_bridge import fetch_domestic_ranking_symbols
+
+    raw_sources = os.getenv("REALTIME_KRX_RANKING_SOURCES", "volume_rank,fluctuation,volume_power")
+    sources = tuple(item.strip().lower() for item in raw_sources.split(",") if item.strip())
+    limit = max(1, int(float(os.getenv("REALTIME_KRX_RANKING_CANDIDATE_LIMIT", "24"))))
+    result = fetch_domestic_ranking_symbols(sources=sources, max_symbols=limit)
+    symbols = tuple(result.get("symbols") or ())
+  except Exception:  # noqa: BLE001 - best-effort; never break candidate discovery.
+    symbols = ()
+  with _live_lock:
+    _domestic_ranking_cache["at"] = now
+    _domestic_ranking_cache["symbols"] = symbols
   return symbols
 
 
@@ -6262,9 +6291,14 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
     extra = _live_affordable_buy_candidate_symbols(limit=max_syms)
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     extra = ()
+  try:
+    domestic_ranked = _cached_domestic_ranking_symbols()
+  except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
+    domestic_ranked = ()
   pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
   kr_extra = [s for s in extra if str(s).isdigit() and len(str(s)) == 6]
-  merged = list(dict.fromkeys([*pending_warmup, *domestic_priority, *base, *kr_extra]))
+  kr_ranked = [s for s in domestic_ranked if str(s).isdigit() and len(str(s)) == 6]
+  merged = list(dict.fromkeys([*pending_warmup, *domestic_priority, *base, *kr_ranked, *kr_extra]))
   return tuple(merged[:max_syms])
 
 

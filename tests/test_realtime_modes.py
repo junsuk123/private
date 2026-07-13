@@ -680,6 +680,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5"}),
             ):
                 store_cls.return_value.active_symbols.return_value = ("222222",)
@@ -758,6 +759,50 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
 
+    def test_realtime_buy_candidates_include_domestic_ranking_candidates(self) -> None:
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        market = MarketSnapshot(
+            "035420",
+            "KOSPI",
+            "NAVER",
+            "Technology",
+            50000.0,
+            10_000_000,
+            0.02,
+            SourceMetadata("unit", datetime.now(timezone.utc)),
+        )
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = None
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=()),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=("035420",)),
+                patch("app.web._candidate_affordability_market", return_value=market),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
+            ):
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_orderbook.return_value = SimpleNamespace(
+                    best_bid=49950.0,
+                    best_ask=50000.0,
+                    total_bid_volume=500000.0,
+                    total_ask_volume=500000.0,
+                    received_at=_now,
+                    source="kis_realtime_websocket",
+                )
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates, ("035420",))
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
     def test_realtime_buy_candidates_include_affordable_discovery_when_context_empty(self) -> None:
         class FakeKisClient:
             prices = {"005930": 70_000.0, "000660": 150_000.0, "AAPL": 300.0, "MSFT": 20.0}
@@ -806,6 +851,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._load_realtime_collection_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
             ):
                 _now = datetime.now(timezone.utc)
@@ -847,6 +893,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._live_affordable_buy_candidate_symbols", return_value=("005930",)),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
             ):
                 store_cls.return_value.active_symbols.return_value = ()
@@ -887,6 +934,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
                 patch("app.web._candidate_affordability_market", return_value=market),
                 patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
             ):
@@ -921,6 +969,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._live_account_snapshot_for_analysis", return_value=account),
                 patch("app.web._load_realtime_collection_symbols", return_value=("005930",)),
                 patch("app.web._live_affordable_buy_candidate_symbols", return_value=("279570", "MSFT")),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
                 patch.dict("os.environ", {"REALTIME_COLLECTOR_MAX_SYMBOLS": "8"}),
             ):
                 symbols = web_module._kis_realtime_collector_symbols()
@@ -958,6 +1007,7 @@ class RealtimeModesTest(unittest.TestCase):
             patch("app.web._live_account_snapshot_for_analysis", return_value=account),
             patch("app.web._load_realtime_collection_symbols", return_value=many_symbols),
             patch("app.web._live_affordable_buy_candidate_symbols", return_value=many_symbols),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
             patch.dict(
                 "os.environ",
                 {"REALTIME_COLLECTOR_MAX_SYMBOLS": "40", "KIS_REALTIME_MAX_SUBSCRIPTIONS": "10"},
