@@ -109,3 +109,28 @@ class TestServiceIntegration:
     def test_technical_accessor(self):
         service = AccountDashboardService(technical_provider=lambda: [_buy_approved()])
         assert service.technical()["count"] == 1
+
+
+class TestDecisionFeedCycleBuffer:
+    def test_in_progress_cycle_does_not_hide_last_completed_snapshot(self):
+        from app.technical import decision_feed
+
+        decision_feed.clear()
+        try:
+            decision_feed.record_decision("OLD", "BUY", False, ["MODEL_UNAVAILABLE"], {})
+            decision_feed.begin_cycle()
+            decision_feed.record_decision(
+                "NEW",
+                "BUY",
+                False,
+                ["BELOW_TARGET_NET_RETURN_AFTER_COST"],
+                {},
+            )
+
+            assert [row["symbol"] for row in decision_feed.snapshot()] == ["OLD"]
+
+            decision_feed.commit_cycle()
+
+            assert [row["symbol"] for row in decision_feed.snapshot()] == ["NEW"]
+        finally:
+            decision_feed.clear()

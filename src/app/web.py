@@ -14,6 +14,7 @@ from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -5393,11 +5394,14 @@ def _us_fast_poll_loop() -> None:
 
 
 def _build_macro_micro_observer(decision_engine):
-  """Advisory per-cycle macro/micro ontology reasoning for the GUI panel.
+  """Per-cycle macro/micro ontology reasoning for live candidate control and GUI.
 
-  Throttled to the macro loop interval. Best-effort and read-only: it builds a
-  MacroMicroReasoningBundle and records it to macro_micro_feed for the dashboard.
-  It NEVER submits or gates an order — the authoritative gates are untouched.
+  Throttled to the macro loop interval. Best-effort: it builds a
+  MacroMicroReasoningBundle, records it to macro_micro_feed for the dashboard,
+  and returns it so the realtime engine/candidate selector can use macro blocks
+  and ranked micro BUY candidates. It still never submits an order; the
+  ProfitabilityGate, RiskManager, FinalTradeGate, and broker execution path stay
+  authoritative.
   Returns ``None`` (disabling the hook) if the layer is disabled or unavailable.
   """
   import time as _time
@@ -5424,11 +5428,12 @@ def _build_macro_micro_observer(decision_engine):
   )
   interval = max(1, int(policy.macro_loop_interval_seconds))
   last_run = [0.0]
+  last_bundle = [None]
 
   def _observer(account, held_symbols, candidates, decision_time):
     now = _time.monotonic()
     if now - last_run[0] < interval:
-      return  # throttle to the macro cadence; do not slow the ~1s trade loop
+      return last_bundle[0]  # throttle compute, but keep latest live control bundle available
     last_run[0] = now
     holdings_by_symbol = {str(getattr(h, "ticker", "")): h for h in (getattr(account, "holdings", ()) or ())}
     # Real market context aggregated across the tracked universe (no index feed
@@ -5500,12 +5505,15 @@ def _build_macro_micro_observer(decision_engine):
       )
 
     bundle = coordinator.run(macro_input, micro_input_builder=_builder, held_symbols=held_symbols)
+    last_bundle[0] = bundle
     macro_micro_feed.record_bundle(bundle.as_dict())
+    return bundle
 
   return _observer
 
 
 def _record_realtime_trading_cycle(summary: dict[str, Any]) -> None:
+  _apply_live_buy_candidate_backoff(summary)
   compact = {
       "at": summary.get("at"),
       "reason": summary.get("reason"),
@@ -5530,12 +5538,60 @@ def _record_realtime_trading_cycle(summary: dict[str, Any]) -> None:
   audit.record("realtime_trading_cycle", compact)
 
 
+def _apply_live_buy_candidate_backoff(summary: dict[str, Any]) -> None:
+  now = time.monotonic()
+  hard_cooldown = max(30.0, _env_float_web("REALTIME_US_BAD_CANDIDATE_COOLDOWN_SEC", 900.0))
+  soft_cooldown = max(30.0, _env_float_web("REALTIME_US_WEAK_CANDIDATE_COOLDOWN_SEC", 300.0))
+  updates: dict[str, float] = {}
+  for rejection in tuple(summary.get("rejections") or ()):
+    if str(rejection.get("side") or "").upper() != "BUY":
+      continue
+    symbol = str(rejection.get("symbol") or "").upper().strip()
+    if not symbol or _is_krx_ticker(symbol):
+      continue
+    reason_codes = {str(code) for code in tuple(rejection.get("reason_codes") or ())}
+    warnings = {str(code) for code in tuple(rejection.get("warnings") or ())}
+    reason_text = ",".join((*reason_codes, *warnings))
+    spread_or_liquidity_block = any(
+        code.startswith("WIDE_SPREAD")
+        or code.startswith("SPREAD_TOO_WIDE")
+        for code in reason_codes
+    )
+    hard_block = (
+        "EXEC_NO_ORDERBOOK_BLOCKED" in reason_codes
+        or "INSUFFICIENT_CASH_FOR_ONE_SHARE" in reason_codes
+        or "EMPTY_OR_INVALID_ORDERBOOK" in warnings
+        or "QUOTE_COUNT_ZERO" in reason_text
+        or "ORDERBOOK_COUNT_ZERO" in reason_text
+        or "ORDERBOOK_STALE" in reason_text
+    )
+    soft_block = (
+        {"SPREAD_TOO_WIDE", "SLIPPAGE_RISK_HIGH"} <= reason_codes
+        or spread_or_liquidity_block
+    )
+    if hard_block:
+      updates[symbol] = max(updates.get(symbol, 0.0), now + hard_cooldown)
+    elif soft_block:
+      updates[symbol] = max(updates.get(symbol, 0.0), now + soft_cooldown)
+  if not updates:
+    return
+  with _live_lock:
+    expired = [symbol for symbol, until in _live_buy_candidate_backoff_until.items() if float(until or 0.0) <= now]
+    for symbol in expired:
+      _live_buy_candidate_backoff_until.pop(symbol, None)
+    _live_buy_candidate_backoff_until.update(updates)
+
+
 def _realtime_buy_candidates() -> tuple[str, ...]:
   """실시간 매수 후보 = 설정 심볼 + 스토어에 신선한 틱이 있는 종목(시장 개장 종목만 엔진이 추림).
 
   설정 심볼만 쓰면 후보가 KR 2종목뿐이라 미국 장중에 매수가 전혀 평가되지 않는다.
   스토어에 데이터가 흐르는 종목을 후보로 넓혀 매수·매도가 함께 판단되게 한다.
   """
+  _apply_latest_realtime_candidate_backoff()
+  macro_micro_bundle = _fresh_macro_micro_bundle()
+  if _macro_micro_enforces_live_trading() and _macro_micro_blocks_new_buys(macro_micro_bundle):
+    return ()
   max_age = float(os.getenv("REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", "120"))
   limit = max(1, int(float(os.getenv("REALTIME_BUY_CANDIDATE_LIMIT", "120"))))
   config_symbols = _load_realtime_collection_symbols()
@@ -5546,18 +5602,258 @@ def _realtime_buy_candidates() -> tuple[str, ...]:
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
     fresh = ()
   cached_context = _cached_context_buy_candidates(limit=limit)
-  affordable = _live_affordable_buy_candidate_symbols(limit=limit)
-  pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
-  domestic_ranked = _cached_domestic_ranking_symbols()
-  surge = _cached_volume_surge_symbols()
+  affordable = tuple(_live_affordable_buy_candidate_symbols(limit=limit) or ())
+  pending_warmup = tuple(_pending_krx_buy_candidate_warmup_symbols(clean_ready=False) or ())
+  domestic_ranked = tuple(_cached_domestic_ranking_symbols() or ())
+  surge = tuple(_cached_volume_surge_symbols() or ())
+  macro_micro_ranked = _macro_micro_ranked_buy_candidates(macro_micro_bundle)
+  macro_micro_blocked = set(_macro_micro_blocked_buy_candidates(macro_micro_bundle))
+  us_scan_fallback = _us_open_cash_scan_fallback_candidates(limit=limit)
+  warmed_us = _warm_us_volume_surge_candidates_for_buy_filter(
+      tuple(dict.fromkeys((*macro_micro_ranked, *surge, *us_scan_fallback)))
+  )
+  try:
+    us_scan_priority_limit = max(0, int(os.getenv("REALTIME_US_SCAN_FALLBACK_PRIORITY_LIMIT", "8")))
+  except (TypeError, ValueError):
+    us_scan_priority_limit = 8
+  us_scan_priority = tuple(us_scan_fallback[:us_scan_priority_limit])
+  us_scan_tail = tuple(symbol for symbol in us_scan_fallback if symbol not in set(us_scan_priority))
   ordered = _prioritize_realtime_buy_candidates(
-      tuple(dict.fromkeys((*domestic_ranked, *surge, *cached_context, *fresh, *pending_warmup, *config_symbols, *affordable)))
+      tuple(
+          symbol
+          for symbol in dict.fromkeys((
+              *macro_micro_ranked,
+              *us_scan_priority,
+              *domestic_ranked,
+              *surge,
+              *cached_context,
+              *fresh,
+              *pending_warmup,
+              *config_symbols,
+              *affordable,
+              *us_scan_tail,
+          ))
+          if symbol not in macro_micro_blocked
+      )
   )
   return _filter_realtime_buy_candidates_by_affordability(
       tuple(symbol for symbol in ordered if _is_live_buy_candidate_symbol(symbol)),
       limit=limit,
-      prevalidated_symbols=affordable,
+      prevalidated_symbols=tuple(dict.fromkeys((*affordable, *warmed_us, *us_scan_fallback))),
+      backoff_bypass_symbols=us_scan_fallback,
   )
+
+
+def _apply_latest_realtime_candidate_backoff() -> None:
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if engine is None:
+    return
+  try:
+    status = engine.get_status()
+    summary = status.get("last_summary") if isinstance(status, dict) else None
+  except Exception:  # noqa: BLE001 - advisory only.
+    return
+  if isinstance(summary, dict) and summary:
+    _apply_live_buy_candidate_backoff(summary)
+
+
+def _macro_micro_enforces_live_trading() -> bool:
+  return os.getenv("REALTIME_MACRO_MICRO_ENFORCE", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_bool_web(name: str, default: bool) -> bool:
+  raw = os.getenv(name)
+  if raw is None:
+    return default
+  return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fresh_macro_micro_bundle() -> dict[str, Any] | None:
+  if not _macro_micro_enforces_live_trading():
+    return None
+  bundle = _latest_macro_micro_bundle()
+  if not isinstance(bundle, dict) or not bundle:
+    return None
+  timestamp = _parse_macro_micro_timestamp(bundle.get("timestamp"))
+  if timestamp is None:
+    return None
+  max_age = max(5.0, _env_float_web("REALTIME_MACRO_MICRO_MAX_AGE_SEC", 180.0))
+  age = max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds())
+  return bundle if age <= max_age else None
+
+
+def _parse_macro_micro_timestamp(raw: Any) -> datetime | None:
+  if isinstance(raw, datetime):
+    value = raw
+  else:
+    try:
+      text = str(raw or "").strip()
+      if not text:
+        return None
+      value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+      return None
+  if value.tzinfo is None:
+    value = value.replace(tzinfo=timezone.utc)
+  return value.astimezone(timezone.utc)
+
+
+def _macro_micro_blocks_new_buys(bundle: dict[str, Any] | None) -> bool:
+  if not bundle:
+    return False
+  macro = bundle.get("macro_result") if isinstance(bundle.get("macro_result"), dict) else {}
+  reason_codes = {str(code) for code in tuple(macro.get("reason_codes") or ())}
+  if (
+      "MACRO_INSUFFICIENT_DATA" in reason_codes
+      and not _env_bool_web("REALTIME_MACRO_MICRO_BLOCK_ON_INSUFFICIENT_DATA", False)
+  ):
+    return False
+  return bool(macro.get("blocks_buy"))
+
+
+def _macro_micro_ranked_buy_candidates(bundle: dict[str, Any] | None) -> tuple[str, ...]:
+  if not bundle:
+    return ()
+  if _macro_micro_blocks_new_buys(bundle):
+    return ()
+  ranked: list[str] = []
+  for item in tuple(bundle.get("ranked_trade_intents") or ()):
+    if not isinstance(item, dict):
+      continue
+    if str(item.get("side") or "").upper() != "BUY":
+      continue
+    symbol = str(item.get("symbol") or "").upper().strip()
+    if symbol and _is_live_buy_candidate_symbol(symbol):
+      ranked.append(symbol)
+  if ranked:
+    return tuple(dict.fromkeys(ranked))
+  return tuple(
+      dict.fromkeys(
+          symbol
+          for symbol in (str(raw or "").upper().strip() for raw in tuple(bundle.get("buy_candidates") or ()))
+          if symbol and _is_live_buy_candidate_symbol(symbol)
+      )
+  )
+
+
+def _macro_micro_blocked_buy_candidates(bundle: dict[str, Any] | None) -> tuple[str, ...]:
+  if not bundle:
+    return ()
+  macro = bundle.get("macro_result") if isinstance(bundle.get("macro_result"), dict) else {}
+  reason_codes = {str(code) for code in tuple(macro.get("reason_codes") or ())}
+  if (
+      "MACRO_INSUFFICIENT_DATA" in reason_codes
+      and not _env_bool_web("REALTIME_MACRO_MICRO_BLOCK_ON_INSUFFICIENT_DATA", False)
+  ):
+    return ()
+  micro_results = tuple(row for row in tuple(bundle.get("micro_results") or ()) if isinstance(row, dict))
+  if micro_results:
+    hard_blocked: list[str] = []
+    hard_reason_prefixes = (
+        "LOW_LIQUIDITY_TECHNICAL_BLOCK",
+        "HIGH_VOLATILITY_TECHNICAL_BLOCK",
+        "SPREAD_CONSUMES_TECHNICAL_ALPHA",
+        "EXECUTION_QUALITY_BLOCK",
+    )
+    soft_reasons = {"MICRO_TECHNICAL_HISTORY_INSUFFICIENT", "WAIT_CONFIRMATION"}
+    for row in micro_results:
+      symbol = str(row.get("symbol") or "").upper().strip()
+      if not symbol or not _is_live_buy_candidate_symbol(symbol):
+        continue
+      reason_codes = {str(code) for code in tuple(row.get("reason_codes") or ())}
+      if reason_codes and reason_codes <= soft_reasons:
+        continue
+      micro_regime = str(row.get("micro_regime") or "").upper()
+      execution_quality = str(row.get("execution_quality") or "").upper()
+      has_hard_reason = any(any(code.startswith(prefix) for prefix in hard_reason_prefixes) for code in reason_codes)
+      if micro_regime == "NO_TRADE_SYMBOL" or execution_quality == "BLOCKED" or has_hard_reason:
+        hard_blocked.append(symbol)
+    return tuple(dict.fromkeys(hard_blocked))
+  return tuple(
+      dict.fromkeys(
+          symbol
+          for symbol in (str(raw or "").upper().strip() for raw in tuple(bundle.get("blocked_candidates") or ()))
+          if symbol and _is_live_buy_candidate_symbol(symbol)
+      )
+  )
+
+
+def _us_open_cash_scan_fallback_candidates(limit: int = 8) -> tuple[str, ...]:
+  if "US" not in set(_active_live_market_groups()):
+    return ()
+  try:
+    account = _live_account_snapshot_for_analysis()
+  except Exception:
+    return ()
+  if account is None or _account_available_cash(account, "USD") <= 0:
+    return ()
+  try:
+    cap = max(0, min(int(limit), int(os.getenv("REALTIME_US_SCAN_FALLBACK_LIMIT", "8"))))
+  except (TypeError, ValueError):
+    cap = min(int(limit), 8)
+  if cap <= 0:
+    return ()
+  raw = os.getenv(
+      "REALTIME_US_SCAN_FALLBACK_SYMBOLS",
+      "F,SOFI,INTC,PFE,T,BAC,WBD,SNAP,PLTR,NIO,RIVN,LCID,OPEN,VALE,NU,CCL,KVUE,LYFT,HOOD",
+  )
+  configured = tuple(
+      dict.fromkeys(
+          symbol
+          for symbol in (item.strip().upper() for item in raw.replace(";", ",").split(","))
+          if symbol and _is_live_buy_candidate_symbol(symbol)
+      )
+  )
+  if configured:
+    return configured[:cap]
+  return tuple(
+      symbol
+      for symbol in _load_us_nasdaq_universe()
+      if _is_live_buy_candidate_symbol(symbol) and not _live_buy_candidate_in_backoff(symbol)
+  )[:cap]
+
+
+def _warm_us_volume_surge_candidates_for_buy_filter(symbols: tuple[str, ...]) -> tuple[str, ...]:
+  if "US" not in set(_active_live_market_groups()):
+    return ()
+  try:
+    limit = max(0, int(os.getenv("REALTIME_US_VOLUME_SURGE_WARM_LIMIT", "5")))
+  except (TypeError, ValueError):
+    limit = 5
+  if limit <= 0:
+    return ()
+  target = tuple(
+      dict.fromkeys(
+          symbol
+          for symbol in (str(raw or "").upper().strip() for raw in symbols)
+          if symbol
+          and _ticker_market_group_for_live_trading(symbol, "") == "US"
+          and _is_live_buy_candidate_symbol(symbol)
+          and not _live_buy_candidate_in_backoff(symbol)
+      )
+  )[:limit]
+  if not target:
+    return ()
+  now = time.monotonic()
+  try:
+    interval = max(15.0, float(os.getenv("REALTIME_US_VOLUME_SURGE_WARM_INTERVAL_SEC", "60")))
+  except (TypeError, ValueError):
+    interval = 60.0
+  with _live_lock:
+    last_at = float(_volume_surge_warm_cache.get("at") or 0.0)
+    last_symbols = tuple(_volume_surge_warm_cache.get("symbols") or ())
+    if now - last_at < interval and set(target).issubset(set(last_symbols)):
+      return target
+    _volume_surge_warm_cache["at"] = now
+    _volume_surge_warm_cache["symbols"] = target
+  try:
+    from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+
+    refresh_us_realtime_for_context_buy_candidates(SimpleNamespace(markets=(), reasoning_paths=()), symbols=target)
+    return target
+  except Exception:  # noqa: BLE001 - advisory warmup only; normal filters still protect execution.
+    return target
 
 
 def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, ...]:
@@ -5626,6 +5922,8 @@ def _is_live_buy_candidate_symbol(symbol: str, market: str = "") -> bool:
 
 _affordable_candidate_cache: dict[str, Any] = {"key": None, "at": 0.0, "symbols": ()}
 _broker_quote_backoff_until: dict[str, float] = {}
+_live_buy_candidate_backoff_until: dict[str, float] = {}
+_volume_surge_warm_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
 _us_nasdaq_universe_cache: dict[str, Any] = {"mtime": None, "symbols": ()}
 
 
@@ -5903,6 +6201,7 @@ def _filter_realtime_buy_candidates_by_affordability(
     *,
     limit: int,
     prevalidated_symbols: tuple[str, ...] = (),
+    backoff_bypass_symbols: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
   try:
     account = _live_account_snapshot_for_analysis()
@@ -5920,9 +6219,12 @@ def _filter_realtime_buy_candidates_by_affordability(
   selected: list[str] = []
   seen: set[str] = set()
   prevalidated = {str(symbol or "").upper().strip() for symbol in prevalidated_symbols}
+  backoff_bypass = {str(symbol or "").upper().strip() for symbol in backoff_bypass_symbols}
   for symbol in symbols:
     ticker = str(symbol or "").upper().strip()
     if not ticker or ticker in seen:
+      continue
+    if ticker not in backoff_bypass and _live_buy_candidate_in_backoff(ticker):
       continue
     if _is_excluded_us_live_candidate(ticker):
       continue
@@ -5934,12 +6236,44 @@ def _filter_realtime_buy_candidates_by_affordability(
         continue
     if _is_krx_ticker(ticker) and not _candidate_has_fresh_buy_orderbook(ticker, store):
       _queue_krx_buy_candidate_warmup(ticker)
-      continue
     selected.append(ticker)
     seen.add(ticker)
     if len(selected) >= max(1, int(limit)):
       break
   return tuple(selected)
+
+
+def _live_buy_candidate_in_backoff(ticker: str) -> bool:
+  symbol = str(ticker or "").upper().strip()
+  if not symbol:
+    return False
+  if _is_krx_ticker(symbol):
+    return False
+  now = time.monotonic()
+  with _live_lock:
+    until = float(_live_buy_candidate_backoff_until.get(symbol) or 0.0)
+    if until <= now:
+      _live_buy_candidate_backoff_until.pop(symbol, None)
+      return False
+  if _us_candidate_orderbook_recovered(symbol):
+    with _live_lock:
+      _live_buy_candidate_backoff_until.pop(symbol, None)
+    return False
+  return True
+
+
+def _us_candidate_orderbook_recovered(symbol: str) -> bool:
+  if _ticker_market_group_for_live_trading(symbol, "") != "US":
+    return False
+  try:
+    orderbook = RealtimeMarketDataStore().latest_orderbook(symbol)
+  except Exception:  # noqa: BLE001
+    return False
+  if orderbook is None or not _is_recent_realtime_item(orderbook, "REALTIME_US_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 180.0):
+    return False
+  bid = _number_or_zero(getattr(orderbook, "best_bid", 0.0))
+  ask = _number_or_zero(getattr(orderbook, "best_ask", 0.0))
+  return bid > 0 and ask >= bid
 
 
 def _is_krx_ticker(ticker: str) -> bool:
@@ -5962,13 +6296,20 @@ def _candidate_has_fresh_buy_orderbook(ticker: str, store: RealtimeMarketDataSto
     return False
   if str(getattr(orderbook, "source", "") or "") != "kis_realtime_websocket":
     return False
-  return _is_recent_realtime_item(orderbook, "EXEC_MAX_ORDERBOOK_AGE_SEC", 10.0)
+  return _is_recent_realtime_item(orderbook, "REALTIME_KRX_BUY_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 180.0)
 
 
 def _queue_krx_buy_candidate_warmup(ticker: str) -> None:
   symbol = str(ticker or "").upper().strip()
   if not _is_krx_ticker(symbol):
     return
+  try:
+    if _candidate_has_fresh_buy_orderbook(symbol, RealtimeMarketDataStore()):
+      with _live_lock:
+        _pending_krx_buy_candidate_warmup.pop(symbol, None)
+      return
+  except Exception:  # noqa: BLE001 - queue on uncertainty; collector will refresh it.
+    pass
   now = time.monotonic()
   ttl = max(30.0, _env_float_web("REALTIME_BUY_CANDIDATE_WARMUP_TTL_SEC", 180.0))
   request_resubscribe = False
@@ -5979,10 +6320,21 @@ def _queue_krx_buy_candidate_warmup(ticker: str) -> None:
     _request_kis_realtime_collector_resubscribe("warmup_candidate", (symbol,))
 
 
-def _pending_krx_buy_candidate_warmup_symbols() -> tuple[str, ...]:
+def _pending_krx_buy_candidate_warmup_symbols(*, clean_ready: bool = True) -> tuple[str, ...]:
   now = time.monotonic()
   with _live_lock:
+    pending = dict(_pending_krx_buy_candidate_warmup)
+  ready: list[str] = []
+  if clean_ready:
+    try:
+      store = RealtimeMarketDataStore()
+      ready = [symbol for symbol in pending if _candidate_has_fresh_buy_orderbook(symbol, store)]
+    except Exception:  # noqa: BLE001 - status cleanup is advisory only.
+      ready = []
+  with _live_lock:
     expired = [symbol for symbol, until in _pending_krx_buy_candidate_warmup.items() if float(until or 0.0) <= now]
+    for symbol in ready:
+      _pending_krx_buy_candidate_warmup.pop(symbol, None)
     for symbol in expired:
       _pending_krx_buy_candidate_warmup.pop(symbol, None)
     return tuple(_pending_krx_buy_candidate_warmup.keys())
@@ -6034,15 +6386,37 @@ def _candidate_affordability_market(
       if tick is not None and _is_recent_realtime_item(tick, "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", 240.0)
       else 0.0
   )
+  book_price = _candidate_orderbook_price(ticker, store) if tick_price <= 0 else 0.0
+  live_price = tick_price if tick_price > 0 else book_price
   market = context_market
   if market is None:
-    if tick_price <= 0:
+    if live_price <= 0:
       return None
     market_name = "KOSPI" if ticker.isdigit() and len(ticker) == 6 else "NASDAQ"
-    return replace(_placeholder_live_market(ticker, market_name), last_price=tick_price)
-  if tick_price > 0:
-    return replace(market, last_price=tick_price)
+    return replace(_placeholder_live_market(ticker, market_name), last_price=live_price)
+  if live_price > 0:
+    return replace(market, last_price=live_price)
   return market
+
+
+def _candidate_orderbook_price(ticker: str, store: RealtimeMarketDataStore) -> float:
+  if not (ticker.isdigit() and len(ticker) == 6):
+    return 0.0
+  try:
+    orderbook = store.latest_orderbook(ticker)
+  except Exception:  # noqa: BLE001
+    return 0.0
+  if orderbook is None or not _is_recent_realtime_item(orderbook, "REALTIME_KRX_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 300.0):
+    return 0.0
+  bid = _number_or_zero(getattr(orderbook, "best_bid", 0.0))
+  ask = _number_or_zero(getattr(orderbook, "best_ask", 0.0))
+  if bid > 0 and ask >= bid:
+    return (bid + ask) / 2.0
+  if ask > 0:
+    return ask
+  if bid > 0:
+    return bid
+  return 0.0
 
 
 def _candidate_has_usable_live_liquidity(ticker: str, store: RealtimeMarketDataStore) -> bool:
@@ -6055,6 +6429,11 @@ def _candidate_has_usable_live_liquidity(ticker: str, store: RealtimeMarketDataS
   if orderbook is None or not _is_recent_realtime_item(orderbook, "REALTIME_KRX_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 300.0):
     return True
   depth = float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) + float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0)
+  mid_price = _candidate_orderbook_price(ticker, store)
+  orderbook_value = depth * mid_price if mid_price > 0 else 0.0
+  min_value = max(0.0, _env_float_web("REALTIME_KRX_MIN_CANDIDATE_ORDERBOOK_VALUE_KRW", 5_000_000.0))
+  if orderbook_value >= min_value:
+    return True
   liquidity_score = min(1.0, depth / 1_000_000.0)
   min_score = max(0.0, _env_float_web("REALTIME_KRX_MIN_CANDIDATE_LIQUIDITY_SCORE", 0.30))
   return liquidity_score >= min_score

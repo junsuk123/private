@@ -14,20 +14,20 @@ class DomesticRealtimeBridgeTest(unittest.TestCase):
     def test_fetch_domestic_ranking_symbols_combines_official_ranking_outputs(self) -> None:
         calls: list[tuple[str, str]] = []
 
-        def fake_get(path: str, tr_id: str, params: dict[str, str]) -> dict[str, object]:
-            calls.append((path, tr_id))
-            if tr_id == "FHPST01710000":
+        def fake_get(spec) -> dict[str, object]:
+            calls.append((spec.path, spec.tr_id))
+            if spec.tr_id == "FHPST01710000":
                 return {
                     "output": [
                         {"mksc_shrn_iscd": "005930"},
                         {"mksc_shrn_iscd": "Q530036"},
                     ]
                 }
-            if tr_id == "FHPST01700000":
+            if spec.tr_id == "FHPST01700000":
                 return {"output1": [{"stck_shrn_iscd": "000660"}, {"stck_shrn_iscd": "005930"}]}
             return {"output2": [{"stck_shrn_iscd": "035420"}]}
 
-        with patch("app.trading.domestic_realtime_bridge._kis_get", side_effect=fake_get):
+        with patch("app.trading.domestic_realtime_bridge._domestic_ranking_get", side_effect=fake_get):
             result = fetch_domestic_ranking_symbols(
                 sources=("volume_rank", "fluctuation", "volume_power"),
                 max_symbols=10,

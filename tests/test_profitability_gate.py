@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 
-from app.cost import ProfitabilityGate, ProfitabilityInput, load_policy
+from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine, load_policy
 
 
 def _gate(**policy_overrides) -> ProfitabilityGate:
@@ -57,6 +57,86 @@ class ProfitabilityGateTest(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertIn("BELOW_TARGET_NET_RETURN_AFTER_COST", decision.rejection_reasons)
+
+    def test_tiny_positive_net_shortfall_is_warning_not_rejection(self) -> None:
+        gate = _gate(
+            min_required_net_return={"default": 0.0005, "KR": 0.0005, "US": 0.0005},
+            min_net_profit_buffer_rate=0.0,
+            volatility_buffer_k=0.0,
+            liquidity_buffer_max=0.0,
+            min_liquidity_score=0.0,
+            max_cost_to_alpha_ratio=10.0,
+        )
+        decision = gate.evaluate(
+            ProfitabilityInput(
+                symbol="AAOI",
+                market="US",
+                venue="NASD",
+                instrument_type="overseas_stock",
+                entry_price=100.0,
+                expected_exit_price=100.61,
+                quantity=1,
+                spread_rate=0.0,
+                liquidity_score=1.0,
+            )
+        )
+
+        self.assertTrue(decision.allowed, decision.rejection_reasons)
+        self.assertLess(decision.net_expected_return, decision.required_min_net_return)
+        self.assertIn("NEAR_MIN_NET_RETURN_TOLERANCE", decision.warnings)
+
+    def test_negative_net_shortfall_still_rejected(self) -> None:
+        gate = _gate(
+            min_required_net_return={"default": 0.0005, "KR": 0.0005, "US": 0.0005},
+            min_net_profit_buffer_rate=0.0,
+            volatility_buffer_k=0.0,
+            liquidity_buffer_max=0.0,
+            min_liquidity_score=0.0,
+            max_cost_to_alpha_ratio=10.0,
+        )
+        decision = gate.evaluate(
+            ProfitabilityInput(
+                symbol="AAL",
+                market="US",
+                venue="NASD",
+                instrument_type="overseas_stock",
+                entry_price=100.0,
+                expected_exit_price=100.50,
+                quantity=1,
+                spread_rate=0.0,
+                liquidity_score=1.0,
+            )
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("BELOW_TARGET_NET_RETURN_AFTER_COST", decision.rejection_reasons)
+
+    def test_us_cost_includes_sec_fee_with_minimum(self) -> None:
+        cost = TradingCostEngine().estimate(
+            symbol="AAPL",
+            market="US",
+            venue="NASD",
+            instrument_type="overseas_stock",
+            entry_price=100.0,
+            expected_exit_price=100.5,
+            quantity=1,
+        )
+
+        self.assertGreaterEqual(cost.sell_tax, 0.01)
+        self.assertGreater(cost.break_even_exit_price, 100.5)
+
+    def test_domestic_etf_has_no_stock_transaction_tax(self) -> None:
+        cost = TradingCostEngine().estimate(
+            symbol="069500",
+            market="KR",
+            venue="KRX",
+            instrument_type="domestic_etf",
+            entry_price=10_000.0,
+            expected_exit_price=10_100.0,
+            quantity=1,
+        )
+
+        self.assertEqual(cost.sell_tax, 0.0)
 
     def test_wide_spread_is_rejected(self) -> None:
         decision = _gate().evaluate(

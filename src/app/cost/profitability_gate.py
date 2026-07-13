@@ -305,6 +305,10 @@ class ProfitabilityGate:
             base_min,
             self.policy.min_net_profit_buffer_rate + vol_buffer + liq_buffer + acct_buffer,
         )
+        min_net_shortfall_tolerance = max(
+            0.0,
+            _env_float("REALTIME_PROFITABILITY_MIN_NET_SHORTFALL_TOLERANCE", 0.00005),
+        )
 
         # --- The composite net-edge rule ---------------------------------------
         # 1. Exit price must clear break-even plus a minimum profit buffer.
@@ -312,8 +316,14 @@ class ProfitabilityGate:
         if expected_exit_price < break_even_with_margin - _EPSILON:
             reasons.append(REASON_BELOW_BREAK_EVEN)
         # 2. Net expected return must clear the (dynamic) requirement.
-        if cost.net_expected_return < required_min_net_return - _EPSILON:
+        min_net_shortfall = required_min_net_return - cost.net_expected_return
+        if (
+            cost.net_expected_return < required_min_net_return - _EPSILON
+            and not (cost.net_expected_return > 0.0 and min_net_shortfall <= min_net_shortfall_tolerance + _EPSILON)
+        ):
             reasons.append(REASON_BELOW_MIN_NET)
+        elif cost.net_expected_return < required_min_net_return - _EPSILON:
+            warnings.append("NEAR_MIN_NET_RETURN_TOLERANCE")
         # 3. Cost must not dominate the alpha.
         if cost.cost_to_alpha_ratio > self.policy.max_cost_to_alpha_ratio + _EPSILON:
             reasons.append(REASON_COST_BURDEN)

@@ -150,7 +150,15 @@ class DynamicExitPolicy:
         trailing_giveback = min(0.95, trailing_giveback)
 
         # --- Stops -------------------------------------------------------------
-        stop_loss_net = _resolve("REALTIME_STOP_LOSS_NET", cfg["stop_loss_net"])
+        # REALTIME_STOP_LOSS_NET was historically used as an automatic tight stop.
+        # In live small-account trading that can turn normal noise into fee-inclusive
+        # realized losses. Keep routine loss selling disabled unless the operator
+        # explicitly arms the separate switch.
+        stop_loss_net = (
+            _resolve("REALTIME_STOP_LOSS_NET", cfg["stop_loss_net"])
+            if _resolve_bool("REALTIME_ENABLE_ROUTINE_LOSS_SELL", False)
+            else 0.0
+        )
         soft_stop = max(
             float(cfg["min_soft_stop_rate"]),
             float(cfg["k_downside_soft_stop"]) * max(0.0, float(predicted_downside_risk)) + vol,

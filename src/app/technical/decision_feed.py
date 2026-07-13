@@ -14,6 +14,7 @@ from typing import Any
 
 _LOCK = Lock()
 _FEED: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_IN_PROGRESS: "OrderedDict[str, dict[str, Any]] | None" = None
 _MAX_SYMBOLS = 60
 
 
@@ -43,10 +44,28 @@ def record_decision(
         "profitability": diagnostics.get("profitability_decision"),
     }
     with _LOCK:
-        _FEED.pop(symbol, None)
-        _FEED[symbol] = payload
-        while len(_FEED) > _MAX_SYMBOLS:
-            _FEED.popitem(last=False)
+        target = _IN_PROGRESS if _IN_PROGRESS is not None else _FEED
+        target.pop(symbol, None)
+        target[symbol] = payload
+        while len(target) > _MAX_SYMBOLS:
+            target.popitem(last=False)
+
+
+def begin_cycle() -> None:
+    """Collect decisions for a new engine cycle without hiding the last complete one."""
+    global _IN_PROGRESS
+    with _LOCK:
+        _IN_PROGRESS = OrderedDict()
+
+
+def commit_cycle() -> None:
+    """Publish the current engine cycle atomically to dashboard readers."""
+    global _IN_PROGRESS
+    with _LOCK:
+        if _IN_PROGRESS is not None:
+            _FEED.clear()
+            _FEED.update(_IN_PROGRESS)
+            _IN_PROGRESS = None
 
 
 def snapshot() -> list[dict[str, Any]]:
@@ -55,5 +74,7 @@ def snapshot() -> list[dict[str, Any]]:
 
 
 def clear() -> None:
+    global _IN_PROGRESS
     with _LOCK:
         _FEED.clear()
+        _IN_PROGRESS = None

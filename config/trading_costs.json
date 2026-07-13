@@ -18,6 +18,26 @@
     "default_fee_rate": 0.000146527,
     "sell_tax_rate": 0.0
   },
+  "overseas_stock": {
+    "NASD": {
+      "buy_fee_rate": 0.0025,
+      "sell_fee_rate": 0.0025,
+      "sell_tax_rate": 0.0000206,
+      "minimum_sell_tax": 0.01
+    },
+    "NYSE": {
+      "buy_fee_rate": 0.0025,
+      "sell_fee_rate": 0.0025,
+      "sell_tax_rate": 0.0000206,
+      "minimum_sell_tax": 0.01
+    },
+    "AMEX": {
+      "buy_fee_rate": 0.0025,
+      "sell_fee_rate": 0.0025,
+      "sell_tax_rate": 0.0000206,
+      "minimum_sell_tax": 0.01
+    }
+  },
   "slippage": {
     "default_slippage_rate": 0.0005,
     "use_dynamic_slippage_if_orderbook_exists": true

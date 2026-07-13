@@ -198,10 +198,13 @@ def _resolve_order_market(symbol: str, account: AccountSnapshot | None = None) -
     return os.getenv("KIS_DEFAULT_US_EXCHANGE", "NASD").upper() or "NASD"
 
 
-def _cost_context_for_holding(symbol: str, market: str) -> tuple[str, str]:
+def _cost_context_for_holding(symbol: str, market: str, company_name: str = "", sector: str = "") -> tuple[str, str]:
     s = str(symbol or "").strip().upper()
     market_name = str(market or "").strip().upper()
     if s.isdigit() and len(s) == 6 or market_name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+        descriptor = f"{company_name} {sector}".lower()
+        if any(token in descriptor for token in ("etf", "etn", "elw", "상장지수", "인버스", "레버리지")):
+            return "KRX", "domestic_etf"
         return "KRX", "domestic_stock"
     if "NYSE" in market_name:
         return "NYSE", "overseas_stock"
@@ -599,7 +602,15 @@ class SharedLiveDecisionEngine:
         spread_bps = 0.0
         if orderbook is not None:
             spread_bps = max(0.0, float(getattr(orderbook, "spread_bps", 0.0) or 0.0))
-            liquidity_score = min(1.0, (float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) + float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0)) / 1_000_000)
+            orderbook_liquidity_score = min(
+                1.0,
+                (
+                    float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0)
+                    + float(getattr(orderbook, "total_ask_volume", 0.0) or 0.0)
+                )
+                / 1_000_000,
+            )
+            liquidity_score = max(liquidity_score, orderbook_liquidity_score)
 
         fallback_score = self.auto_tuner.fallback_buy_score(
             ontology_score=ontology_score,
@@ -807,6 +818,11 @@ class SharedLiveDecisionEngine:
         else:
             fallback_edge_bps_per_score = _env_float("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", 120.0)
             expected_return_bps = max(0.0, fallback_score) * fallback_edge_bps_per_score
+            if runtime_fallback_support or runtime_probe_support:
+                expected_return_bps = max(
+                    expected_return_bps,
+                    max(0.0, _env_float("REALTIME_RUNTIME_PROBE_MIN_GROSS_EDGE_BPS", 180.0)),
+                )
         # --- Technical prediction (preferred, conservative) ---------------------
         # When the advisory technical layer yields a tradable BUY, prefer its
         # cost-aware net edge for the gate's expected exit price. It has NO
@@ -826,7 +842,12 @@ class SharedLiveDecisionEngine:
         expected_exit_price = price * (1.0 + gross_expected_return)
 
         # --- Unified profitability gate (authoritative, mandatory) --------------
-        gate_venue, gate_instrument = _cost_context_for_holding(symbol, market_name)
+        gate_venue, gate_instrument = _cost_context_for_holding(
+            symbol,
+            market_name,
+            getattr(market, "company_name", ""),
+            getattr(market, "sector", ""),
+        )
         gate_orderbook = None
         if orderbook is not None:
             gate_orderbook = {
@@ -1231,8 +1252,9 @@ class SharedLiveDecisionEngine:
         lock_arm_net = max(0.0, resolved_exit.profit_lock_arm_net)
         lock_giveback = min(0.95, max(0.0, resolved_exit.trailing_giveback_rate))
         profit_time_exit_sec = max(0.0, resolved_exit.profit_time_exit_sec)
-        # Routine tight net stop (opt-in via REALTIME_STOP_LOSS_NET > 0). Keeps each
-        # loss small and symmetric with the small take-profit.
+        # Routine tight net stop is double opt-in. REALTIME_STOP_LOSS_NET may remain
+        # in old launcher environments, but the resolver zeros it unless
+        # REALTIME_ENABLE_ROUTINE_LOSS_SELL=true.
         stop_loss_net = max(0.0, resolved_exit.stop_loss_net)
         # Every profit-motivated exit must lock a MEANINGFUL net gain (after the full
         # round-trip cost), never churn a ~break-even position.
@@ -1392,7 +1414,6 @@ class SharedLiveDecisionEngine:
         # the prior behaviour: a pinned REALTIME_STOP_LOSS_NET never actually sold).
         deliberate_loss_stop = exit_reason.startswith(
             (
-                "stop_loss",
                 "hard_stop_loss",
                 "domestic_emergency_exit",
                 "loss_exit",
@@ -1401,7 +1422,7 @@ class SharedLiveDecisionEngine:
                 "domestic_concentration_reduce",
             )
         )
-        if resolved_exit.block_sell_below_breakeven and not deliberate_loss_stop and not profitable_after_cost:
+        if resolved_exit.block_sell_below_breakeven and not deliberate_loss_stop and net_pnl_rate < 0.0:
             diagnostics = {
                 "exit_policy": exit_policy.as_dict(),
                 "policy": policy.as_dict(),
@@ -1590,7 +1611,12 @@ class SharedLiveDecisionEngine:
         symbol = str(getattr(holding, "ticker", "") or "")
         market = str(getattr(holding, "market", "") or "")
         quantity = max(1, int(getattr(holding, "quantity", 0) or 0))
-        venue, instrument_type = _cost_context_for_holding(symbol, market)
+        venue, instrument_type = _cost_context_for_holding(
+            symbol,
+            market,
+            getattr(holding, "company_name", ""),
+            getattr(holding, "sector", ""),
+        )
         return TradingCostEngine().estimate(
             symbol=symbol,
             market=market or ("KR" if instrument_type == "domestic_stock" else venue),

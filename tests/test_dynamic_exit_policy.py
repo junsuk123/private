@@ -22,6 +22,28 @@ class DynamicExitPolicyTest(unittest.TestCase):
             levels = self.policy.resolve(all_in_cost_rate=0.003)
         self.assertEqual(levels.quick_take_profit_net, 0.02)
 
+    def test_stop_loss_net_requires_separate_routine_loss_sell_optin(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0.004",
+                "REALTIME_ENABLE_ROUTINE_LOSS_SELL": "false",
+            },
+        ):
+            levels = self.policy.resolve(all_in_cost_rate=0.003)
+        self.assertEqual(levels.stop_loss_net, 0.0)
+
+    def test_stop_loss_net_honored_when_routine_loss_sell_is_armed(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0.004",
+                "REALTIME_ENABLE_ROUTINE_LOSS_SELL": "true",
+            },
+        ):
+            levels = self.policy.resolve(all_in_cost_rate=0.003)
+        self.assertEqual(levels.stop_loss_net, 0.004)
+
     def test_hard_stop_always_permits_loss_exit(self) -> None:
         levels = self.policy.resolve(all_in_cost_rate=0.003)
         allowed, reason = self.policy.loss_exit_decision(

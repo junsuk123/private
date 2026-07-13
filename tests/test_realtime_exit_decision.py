@@ -15,7 +15,7 @@ from app.execution.kis_types import LiveOrderSubmission
 from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.schemas.domain import FinalOrder, OrderType
 from app.trading.realtime_trading_engine import RealtimeTradingEngine, RealtimeTradingConfig
-from app.trading.shared_decision_engine import SharedLiveDecisionEngine
+from app.trading.shared_decision_engine import SharedLiveDecisionEngine, _cost_context_for_holding
 
 
 class _ExecBookStore:
@@ -145,6 +145,11 @@ def _account(holding: Holding, cash: float = 0.0) -> AccountSnapshot:
 
 
 class RealtimeExitDecisionTest(unittest.TestCase):
+    def test_domestic_etf_cost_context_uses_etf_fee_tax_policy(self) -> None:
+        venue, instrument = _cost_context_for_holding("069500", "KR", "KODEX 200 ETF", "ETF")
+        self.assertEqual(venue, "KRX")
+        self.assertEqual(instrument, "domestic_etf")
+
     def test_small_account_one_share_loss_concentration_should_hold(self) -> None:
         holding = Holding(
             ticker="005930",
@@ -212,16 +217,25 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         self.assertFalse(result.approved, result.reason_codes)
         self.assertIsNone(result.final_order)
 
-    def test_optin_tight_stop_sells_when_enabled(self) -> None:
+    def test_stop_loss_net_alone_does_not_sell_fee_inclusive_loss(self) -> None:
         # A tight stop is opt-in (scalping); enabling it cuts a -2% loser.
         engine = _engine(price=98.0)
-        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0.004"}):
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0.004",
+                "REALTIME_ENABLE_ROUTINE_LOSS_SELL": "false",
+            },
+        ):
             result = engine.evaluate_exit_for_holding(_holding(100.0), _account(_holding(100.0)), take_profit=0.006, stop_loss=0.01)
-        self.assertTrue(result.approved, result.reason_codes)
-        self.assertEqual(result.final_order.side, OrderSide.SELL)
-        self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
+        self.assertFalse(result.approved, result.reason_codes)
+        self.assertIsNone(result.final_order)
+        self.assertTrue(
+            any(code in result.reason_codes for code in ("HOLD_BELOW_PROFIT_TARGET", "HOLD_LOSS_EXIT_DISABLED")),
+            result.reason_codes,
+        )
 
-    def test_optin_tight_stop_sells_even_when_block_below_breakeven_is_on(self) -> None:
+    def test_routine_tight_stop_requires_explicit_loss_sell_optin(self) -> None:
         # REGRESSION: run.ps1 pins REALTIME_STOP_LOSS_NET=0.004 AND
         # REALTIME_BLOCK_SELL_BELOW_BREAKEVEN=true together. The net tight stop is
         # documented to "fire regardless of allow_loss_exit", but the break-even
@@ -234,7 +248,8 @@ class RealtimeExitDecisionTest(unittest.TestCase):
             "os.environ",
             {
                 "REALTIME_STOP_LOSS_NET": "0.004",
-                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "true",
+                "REALTIME_ENABLE_ROUTINE_LOSS_SELL": "true",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "false",
                 "REALTIME_ALLOW_LOSS_EXIT": "false",
                 "REALTIME_HARD_STOP_LOSS": "0.03",
             },
@@ -303,7 +318,14 @@ class RealtimeExitDecisionTest(unittest.TestCase):
         # -2% 잔고가로 손절이 발동하면 = 잔고가가 실제로 사용된 것.
         engine = SharedLiveDecisionEngine(SimpleNamespace(latest_tick=lambda s: None), predictor=_DummyPredictor())
         holding = _holding(100.0, last_price=98.0)  # -2% via broker mark
-        with patch.dict("os.environ", {"REALTIME_STOP_LOSS_NET": "0.004"}):
+        with patch.dict(
+            "os.environ",
+            {
+                "REALTIME_STOP_LOSS_NET": "0.004",
+                "REALTIME_ENABLE_ROUTINE_LOSS_SELL": "true",
+                "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN": "false",
+            },
+        ):
             result = engine.evaluate_exit_for_holding(holding, _account(holding), take_profit=0.006, stop_loss=0.01)
         self.assertTrue(result.approved, result.reason_codes)
         self.assertTrue(any(code.startswith("stop_loss") for code in result.reason_codes), result.reason_codes)
@@ -811,6 +833,23 @@ class _FixedBuyDecisionEngine:
         )
 
 
+class _RejectingBuyDecisionEngine(_FixedBuyDecisionEngine):
+    def evaluate_buy(self, symbol, account, **kwargs):
+        self.calls += 1
+        return SimpleNamespace(
+            approved=False,
+            final_order=None,
+            reason_codes=("BELOW_TARGET_NET_RETURN_AFTER_COST", "PROFITABILITY_GATE_REJECTED"),
+            diagnostics={
+                "profitability_decision": {
+                    "allowed": False,
+                    "net_expected_return": -0.001,
+                    "required_min_net_return": 0.0005,
+                }
+            },
+        )
+
+
 class _MissingFirstBookBuyDecisionEngine(_FixedBuyDecisionEngine):
     def __init__(self, missing_symbol: str) -> None:
         super().__init__()
@@ -956,6 +995,55 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(summary["buy_evaluated"], 0)
         self.assertEqual(summary["skipped_market_closed"], 1)
         self.assertEqual(len(coordinator.submitted), 0)
+
+    def test_macro_micro_block_buy_disables_new_buy_cycle(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _AmendAwareCoordinator()
+        decision_engine = _FixedBuyDecisionEngine()
+        bundle = SimpleNamespace(macro_result=SimpleNamespace(blocks_buy=True))
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660",),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            macro_micro_observer=lambda account, held, candidates, decision_time: bundle,
+            config=RealtimeTradingConfig(max_buy_orders_per_cycle=1),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "false"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_evaluated"], 0)
+        self.assertTrue(summary["buy_disabled"])
+        self.assertEqual(summary["buy_disabled_reason"], "MACRO_MICRO_BLOCK_BUY")
+        self.assertEqual(decision_engine.calls, 0)
+        self.assertEqual(len(coordinator.submitted), 0)
+
+    def test_macro_micro_insufficient_data_does_not_disable_buy_cycle(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _AmendAwareCoordinator()
+        decision_engine = _FixedBuyDecisionEngine()
+        macro = SimpleNamespace(blocks_buy=True, reason_codes=("MACRO_INSUFFICIENT_DATA",))
+        bundle = SimpleNamespace(macro_result=macro)
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660",),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            macro_micro_observer=lambda account, held, candidates, decision_time: bundle,
+            config=RealtimeTradingConfig(max_buy_orders_per_cycle=1),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "false"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_evaluated"], 1)
+        self.assertNotEqual(summary.get("buy_disabled_reason"), "MACRO_MICRO_BLOCK_BUY")
+        self.assertEqual(decision_engine.calls, 1)
 
     def test_failed_buy_submission_counts_toward_cycle_attempt_limit(self) -> None:
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
@@ -1435,6 +1523,26 @@ class RebuyCooldownTest(unittest.TestCase):
         self.assertEqual(summary["buy_evaluated"], 0)
         self.assertEqual(summary["skipped_cooldown"], 1)
         self.assertEqual(summary["rejections"][0]["reason_codes"], ("RECENT_LOSS_SYMBOL_COOLDOWN",))
+
+    def test_cycle_summary_counts_rejection_reasons(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        candidates = tuple(f"{index:06d}" for index in range(1, 16))
+        engine = RealtimeTradingEngine(
+            decision_engine=_RejectingBuyDecisionEngine(),
+            coordinator=_AmendAwareCoordinator(),
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: candidates,
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(submit_cooldown_sec=0, max_buy_evaluations_per_cycle=15),
+        )
+
+        summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_rejected"], 15)
+        self.assertEqual(len(summary["rejections"]), 12)
+        self.assertEqual(summary["rejection_reason_counts"]["BELOW_TARGET_NET_RETURN_AFTER_COST"], 15)
+        self.assertEqual(summary["rejection_reason_counts"]["PROFITABILITY_GATE_REJECTED"], 15)
 
     def test_submitted_loss_round_trip_creates_symbol_cooldown(self) -> None:
         engine = RealtimeTradingEngine(

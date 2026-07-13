@@ -66,7 +66,7 @@ def test_required_exit_price_for_target_net_return_exceeds_break_even() -> None:
     assert cost.net_expected_return > 0.01
 
 
-def test_overseas_stock_cost_policy_does_not_apply_domestic_sell_tax() -> None:
+def test_overseas_stock_cost_policy_uses_us_sec_fee_not_domestic_tax() -> None:
     cost = TradingCostEngine().estimate(
         symbol="AAPL",
         market="NASDAQ",
@@ -77,7 +77,7 @@ def test_overseas_stock_cost_policy_does_not_apply_domestic_sell_tax() -> None:
         quantity=1,
     )
 
-    assert cost.sell_tax == 0
+    assert 0 < cost.sell_tax < 0.02
     assert cost.buy_fee > 0
     assert cost.venue == "NASD"
 

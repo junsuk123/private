@@ -94,6 +94,78 @@ def _record_technical_decision(symbol: str, action: str, result) -> None:
         pass
 
 
+def _begin_technical_decision_cycle() -> None:
+    """Collect dashboard technical decisions for this engine cycle."""
+    try:
+        from app.technical.decision_feed import begin_cycle
+
+        begin_cycle()
+    except Exception:  # noqa: BLE001 - advisory GUI feed must never affect trading.
+        pass
+
+
+def _commit_technical_decision_cycle() -> None:
+    """Publish this cycle's technical decisions to the GUI feed."""
+    try:
+        from app.technical.decision_feed import commit_cycle
+
+        commit_cycle()
+    except Exception:  # noqa: BLE001 - advisory GUI feed must never affect trading.
+        pass
+
+
+def _rejection_reason_counts(summary: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for rejection in tuple(summary.get("rejections") or ()):
+        if not isinstance(rejection, dict):
+            continue
+        for raw in tuple(rejection.get("reason_codes") or ()):
+            code = str(raw or "").split(":", 1)[0].strip()
+            if code:
+                counts[code] = counts.get(code, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _record_rejection_reason_counts(summary: dict[str, Any], reason_codes: tuple[str, ...]) -> None:
+    counts = summary.setdefault("rejection_reason_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+        summary["rejection_reason_counts"] = counts
+    for raw in tuple(reason_codes or ()):
+        code = str(raw or "").split(":", 1)[0].strip()
+        if code:
+            counts[code] = int(counts.get(code, 0) or 0) + 1
+
+
+def _macro_micro_blocks_buy(bundle: Any | None) -> bool:
+    if bundle is None:
+        return False
+    macro = getattr(bundle, "macro_result", None)
+    if macro is not None and hasattr(macro, "blocks_buy"):
+        reason_codes = {str(code) for code in tuple(getattr(macro, "reason_codes", ()) or ())}
+        if "MACRO_INSUFFICIENT_DATA" in reason_codes and not _env_bool(
+            "REALTIME_MACRO_MICRO_BLOCK_ON_INSUFFICIENT_DATA", False
+        ):
+            return False
+        return bool(getattr(macro, "blocks_buy", False))
+    if isinstance(bundle, dict):
+        macro_dict = bundle.get("macro_result") if isinstance(bundle.get("macro_result"), dict) else {}
+        reason_codes = {str(code) for code in tuple(macro_dict.get("reason_codes") or ())}
+        if "MACRO_INSUFFICIENT_DATA" in reason_codes and not _env_bool(
+            "REALTIME_MACRO_MICRO_BLOCK_ON_INSUFFICIENT_DATA", False
+        ):
+            return False
+        return bool(macro_dict.get("blocks_buy"))
+    return False
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _ignored_realtime_symbols() -> set[str]:
     raw = os.getenv("REALTIME_IGNORE_SYMBOLS", "")
     return {
@@ -113,7 +185,8 @@ class RealtimeTradingConfig:
     # Keep fresh-account live trading conservative: after one accepted buy, wait for
     # the next broker account snapshot before sizing another buy.
     max_buy_orders_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_BUY_ORDERS_PER_CYCLE", 1)))
-    max_buy_evaluations_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 30)))
+    max_buy_evaluations_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 8)))
+    max_cycle_seconds: float = field(default_factory=lambda: max(1.0, _env_float("REALTIME_MAX_CYCLE_SECONDS", 12.0)))
     # 같은 종목을 매 사이클(~1s) 재제출해 중복 주문/에러가 쌓이는 것을 막는 쿨다운.
     submit_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SUBMIT_COOLDOWN_SEC", 20.0))
     # 하드 거부(브로커 에러/게이트 차단) 종목은 더 길게 쉬어 에러 폭주를 막는다(ETP 미신청·자금부족 등).
@@ -146,7 +219,7 @@ class RealtimeTradingEngine:
         ontology_graph_provider: Callable[[], Any] | None = None,
         market_open_provider: Callable[[str, str], bool] | None = None,
         cycle_observer: Callable[[dict[str, Any]], None] | None = None,
-        macro_micro_observer: Callable[[AccountSnapshot, tuple[str, ...], tuple[str, ...], datetime], None] | None = None,
+        macro_micro_observer: Callable[[AccountSnapshot, tuple[str, ...], tuple[str, ...], datetime], Any] | None = None,
         config: RealtimeTradingConfig | None = None,
         recent_events_max: int = 50,
     ) -> None:
@@ -242,6 +315,7 @@ class RealtimeTradingEngine:
     # ---- one cycle ------------------------------------------------------
     def run_once(self, decision_time: datetime | None = None) -> dict[str, Any]:
         decision_time = decision_time or datetime.now(timezone.utc)
+        _begin_technical_decision_cycle()
         summary: dict[str, Any] = {
             "at": decision_time.isoformat(),
             "submitted": 0,
@@ -307,15 +381,35 @@ class RealtimeTradingEngine:
         ignored_symbols = _ignored_realtime_symbols()
         summary["ignored_symbols"] = sorted(ignored_symbols)
         summary["skipped_ignored"] = 0
+        try:
+            cycle_buy_candidates = tuple(
+                str(symbol or "").upper()
+                for symbol in tuple(self.candidate_symbols_provider() or ())
+                if str(symbol or "").strip()
+            )
+        except Exception as exc:  # noqa: BLE001 - candidate discovery failure should be visible, not fatal.
+            cycle_buy_candidates = ()
+            summary["errors"] += 1
+            summary["reason"] = summary["reason"] or f"BUY_CANDIDATE_PROVIDER_ERROR:{exc.__class__.__name__}"
+        summary["buy_candidate_count"] = len(cycle_buy_candidates)
+        summary["buy_candidate_sample"] = list(cycle_buy_candidates[:10])
 
-        # Advisory macro/micro ontology reasoning for the GUI panel (best-effort).
-        # Never submits or gates an order — pure diagnostics.
+        # Macro/micro ontology reasoning for live candidate control and diagnostics.
+        # It can only rank or block new BUY candidates; it never submits an order.
+        macro_micro_bundle = None
         if self.macro_micro_observer is not None:
             try:
-                candidates = tuple(self.candidate_symbols_provider())
-                self.macro_micro_observer(account, tuple(sorted(held_tickers)), candidates, decision_time)
+                macro_micro_bundle = self.macro_micro_observer(
+                    account,
+                    tuple(sorted(held_tickers)),
+                    cycle_buy_candidates,
+                    decision_time,
+                )
             except Exception:  # noqa: BLE001 - advisory panel must never affect trading.
-                pass
+                macro_micro_bundle = None
+        if buy_enabled and _macro_micro_blocks_buy(macro_micro_bundle):
+            buy_enabled = False
+            self._buy_disabled_reason = "MACRO_MICRO_BLOCK_BUY"
 
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
@@ -394,8 +488,13 @@ class RealtimeTradingEngine:
             self._finish_cycle(summary)
             return summary
 
-        for symbol in self.candidate_symbols_provider():
+        skipped_market_closed_symbols: list[str] = []
+        buy_loop_started = time.monotonic()
+        for symbol in cycle_buy_candidates:
             symbol = str(symbol or "").upper()
+            if time.monotonic() - buy_loop_started >= self.config.max_cycle_seconds:
+                summary["reason"] = summary["reason"] or "CYCLE_TIME_BUDGET_REACHED"
+                break
             if symbol in ignored_symbols:
                 summary["skipped_ignored"] += 1
                 continue
@@ -427,6 +526,8 @@ class RealtimeTradingEngine:
                 continue
             if self.market_open_provider is not None and not self.market_open_provider(symbol, ""):
                 summary["skipped_market_closed"] += 1
+                if len(skipped_market_closed_symbols) < 10:
+                    skipped_market_closed_symbols.append(symbol)
                 continue  # 거래소 마감: 신규 매수 보류.
             if self._in_cooldown(symbol):
                 summary["skipped_cooldown"] += 1
@@ -464,6 +565,8 @@ class RealtimeTradingEngine:
         summary["buy_submitted"] = buy_submitted
         summary["buy_submit_attempted"] = buy_submit_attempted
         summary["sell_submitted"] = sell_submitted
+        if skipped_market_closed_symbols:
+            summary["skipped_market_closed_symbols"] = skipped_market_closed_symbols
         self._finish_cycle(summary)
         return summary
 
@@ -487,6 +590,7 @@ class RealtimeTradingEngine:
         reason_codes: tuple[str, ...],
         diagnostics: dict[str, Any] | None = None,
     ) -> None:
+        _record_rejection_reason_counts(summary, tuple(reason_codes or ()))
         rejections = summary.setdefault("rejections", [])
         if len(rejections) >= 12:
             return
@@ -551,6 +655,26 @@ class RealtimeTradingEngine:
             return store.latest_orderbook(symbol)
         except Exception:  # noqa: BLE001 - book fetch is best-effort.
             return None
+
+    def _refresh_us_orderbook_for_execution(self, symbol: str, decision_time: datetime) -> Any | None:
+        if _is_domestic_symbol_or_market(symbol):
+            return None
+        try:
+            from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
+
+            refresh_us_realtime_for_context_buy_candidates(object(), symbols=(symbol,), max_symbols=1)
+        except Exception:  # noqa: BLE001 - execution prep still fails closed if refresh fails.
+            return None
+        orderbook = self._latest_orderbook(symbol)
+        if orderbook is None:
+            return None
+        received_at = getattr(orderbook, "received_at", None)
+        if isinstance(received_at, datetime):
+            ref_dt = received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
+            max_age = max(1.0, _env_float("REALTIME_EXEC_US_ORDERBOOK_MAX_AGE_SEC", 180.0))
+            if max(0.0, (decision_time - ref_dt).total_seconds()) > max_age:
+                return None
+        return orderbook
 
     def _prepare_order_for_execution(
         self,
@@ -618,6 +742,20 @@ class RealtimeTradingEngine:
 
             # 2) Fetch the order book ONCE; share it with pricing and quality.
             orderbook = self._latest_orderbook(symbol)
+            if side_u == "BUY" and not is_domestic:
+                stale_or_missing_book = orderbook is None
+                if orderbook is not None:
+                    received_at = getattr(orderbook, "received_at", None)
+                    if isinstance(received_at, datetime):
+                        ref_dt = received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
+                        stale_or_missing_book = max(0.0, (decision_time - ref_dt).total_seconds()) > max(
+                            1.0,
+                            _env_float("REALTIME_EXEC_US_ORDERBOOK_MAX_AGE_SEC", 180.0),
+                        )
+                if stale_or_missing_book:
+                    refreshed_book = self._refresh_us_orderbook_for_execution(symbol, decision_time)
+                    if refreshed_book is not None:
+                        orderbook = refreshed_book
             best_bid = float(getattr(orderbook, "best_bid", 0.0) or 0.0) if orderbook is not None else 0.0
             best_ask = float(getattr(orderbook, "best_ask", 0.0) or 0.0) if orderbook is not None else 0.0
             bid_depth = float(getattr(orderbook, "total_bid_volume", 0.0) or 0.0) if orderbook is not None else 0.0
@@ -1012,6 +1150,13 @@ class RealtimeTradingEngine:
         return True
 
     def _finish_cycle(self, summary: dict[str, Any]) -> None:
+        if not isinstance(summary.get("rejection_reason_counts"), dict):
+            summary["rejection_reason_counts"] = _rejection_reason_counts(summary)
+        else:
+            summary["rejection_reason_counts"] = dict(
+                sorted(summary["rejection_reason_counts"].items(), key=lambda item: (-int(item[1] or 0), item[0]))
+            )
+        _commit_technical_decision_cycle()
         should_observe = self._should_observe_cycle(summary)
         with self._lock:
             self._status["cycles"] += 1

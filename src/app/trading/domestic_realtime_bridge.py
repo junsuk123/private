@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from app.trading.us_realtime_bridge import _kis_get
+from app.execution.kis_auth import build_kis_client
 
 
 @dataclass(frozen=True)
@@ -112,7 +112,7 @@ def fetch_domestic_ranking_symbols(
             errors[key] = "unknown domestic ranking source"
             continue
         try:
-            data = _kis_get(spec.path, spec.tr_id, spec.params)
+            data = _domestic_ranking_get(spec)
         except Exception as exc:  # noqa: BLE001 - discovery is best-effort.
             errors[key] = f"{exc.__class__.__name__}: {exc}"
             continue
@@ -135,6 +135,15 @@ def _ranking_rows(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         elif isinstance(value, dict):
             rows.append(value)
     return tuple(rows)
+
+
+def _domestic_ranking_get(spec: DomesticRankingSpec) -> dict[str, Any]:
+    client = build_kis_client(enabled=True)
+    data = client._get(spec.path, spec.tr_id, spec.params)
+    rt_cd = str(data.get("rt_cd", "0"))
+    if rt_cd not in {"0", ""}:
+        raise RuntimeError(f"KIS rt_cd={rt_cd} {spec.path} {data}")
+    return data
 
 
 def _extract_domestic_symbol(row: dict[str, Any], keys: tuple[str, ...]) -> str:

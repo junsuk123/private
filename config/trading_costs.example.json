@@ -2,6 +2,8 @@
   "broker_buy_fee_rate": "USER_MUST_SET",
   "broker_sell_fee_rate": "USER_MUST_SET",
   "sell_transaction_tax_rate": "USER_MUST_SET",
+  "us_sec_fee_rate": 0.0000206,
+  "us_sec_fee_minimum_usd": 0.01,
   "minimum_fee_krw": 0,
   "slippage_bps_default": 10,
   "market_impact_bps_default": 5,

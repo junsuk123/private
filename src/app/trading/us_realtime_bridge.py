@@ -20,6 +20,7 @@ from app.data.realtime_types import (
     RealtimeOrderbookSnapshot,
     RealtimeTradeTick,
 )
+from app.execution.kis_auth import build_kis_client
 from app.execution.kis_real import load_kis_env_file
 
 STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
@@ -109,9 +110,8 @@ def _kis_headers(tr_id: str) -> dict[str, str]:
 
 
 def _kis_get(path: str, tr_id: str, params: dict[str, str]) -> dict[str, Any]:
-    query = urlencode(params)
-    url = f"{_base_url()}{path}?{query}"
-    data = _json_request("GET", url, headers=_kis_headers(tr_id))
+    client = build_kis_client(enabled=True)
+    data = client._get(path, tr_id, params)
     rt_cd = str(data.get("rt_cd", "0"))
     if rt_cd not in {"0", ""}:
         raise RuntimeError(f"KIS rt_cd={rt_cd} {path} {data}")
@@ -143,9 +143,7 @@ def fetch_overseas_volume_surge_symbols(
         params = {
             "AUTH": "",
             "EXCD": exchange,
-            "NDAY": "0",
-            "PRC1": "0",
-            "PRC2": "0",
+            "MINX": "0",
             "VOL_RANG": "0",
             "KEYB": "",
         }
@@ -380,6 +378,8 @@ def _extract_price_book(payload: dict[str, Any]) -> dict[str, float]:
 
     if bid is None or ask is None:
         raise RuntimeError(f"MISSING_BID_ASK_FIELDS keys={sorted(flat.keys())[:80]}")
+    if bid <= 0 or ask <= 0 or ask < bid:
+        raise RuntimeError(f"INVALID_BID_ASK_FIELDS bid={bid} ask={ask} keys={sorted(flat.keys())[:80]}")
     if last is None:
         raise RuntimeError(f"MISSING_LAST_PRICE_FIELDS keys={sorted(flat.keys())[:80]}")
 

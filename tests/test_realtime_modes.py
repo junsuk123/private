@@ -26,6 +26,12 @@ class RealtimeModesTest(unittest.TestCase):
         with web_module._live_lock:
             web_module._operation_mode_state["last_kis_connection"] = None
             web_module._operation_mode_state["live_trading_baseline_equity"] = None
+            web_module._affordable_candidate_cache.update({"key": None, "at": 0.0, "symbols": ()})
+            web_module._live_buy_candidate_backoff_until.clear()
+            web_module._volume_surge_warm_cache.update({"at": 0.0, "symbols": ()})
+        from app.graph import macro_micro_feed
+
+        macro_micro_feed.clear()
 
     def _isolate_live_account_refresh(self) -> None:
         # Hermetic isolation for the status/basis tests: on a machine with working live
@@ -759,6 +765,110 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
 
+    def test_realtime_buy_candidates_prioritize_macro_micro_ranked_intents(self) -> None:
+        from app.graph import macro_micro_feed
+
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        macro_micro_feed.record_bundle(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "macro_result": {"blocks_buy": False},
+                "ranked_trade_intents": [
+                    {"side": "BUY", "symbol": "000660", "rank": 0},
+                    {"side": "BUY", "symbol": "005930", "rank": 1},
+                ],
+                "blocked_candidates": ["111111"],
+            }
+        )
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._load_realtime_collection_symbols", return_value=("111111",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
+                patch("app.web._cached_context_buy_candidates", return_value=()),
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "5", "REALTIME_MACRO_MICRO_ENFORCE": "true"}),
+            ):
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = SimpleNamespace(
+                    best_bid=4990.0,
+                    best_ask=5010.0,
+                    total_bid_volume=500000.0,
+                    total_ask_volume=500000.0,
+                    received_at=_now,
+                    source="kis_realtime_websocket",
+                )
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates[:2], ("000660", "005930"))
+            self.assertNotIn("111111", candidates)
+        finally:
+            macro_micro_feed.clear()
+
+    def test_macro_micro_block_buy_removes_new_buy_candidates(self) -> None:
+        from app.graph import macro_micro_feed
+
+        macro_micro_feed.record_bundle(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "macro_result": {"blocks_buy": True},
+                "ranked_trade_intents": [{"side": "BUY", "symbol": "005930", "rank": 0}],
+            }
+        )
+        try:
+            with patch.dict("os.environ", {"REALTIME_MACRO_MICRO_ENFORCE": "true"}):
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates, ())
+        finally:
+            macro_micro_feed.clear()
+
+    def test_macro_micro_insufficient_data_does_not_remove_fallback_candidates(self) -> None:
+        from app.graph import macro_micro_feed
+
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        macro_micro_feed.record_bundle(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "macro_result": {"blocks_buy": True, "reason_codes": ["MACRO_INSUFFICIENT_DATA"]},
+                "ranked_trade_intents": [],
+                "blocked_candidates": ["005930"],
+            }
+        )
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._load_realtime_collection_symbols", return_value=("005930",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
+                patch("app.web._cached_context_buy_candidates", return_value=()),
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict("os.environ", {"REALTIME_MACRO_MICRO_ENFORCE": "true"}),
+            ):
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = SimpleNamespace(
+                    best_bid=69900.0,
+                    best_ask=70000.0,
+                    total_bid_volume=500000.0,
+                    total_ask_volume=500000.0,
+                    received_at=_now,
+                    source="kis_realtime_websocket",
+                )
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates, ("005930",))
+        finally:
+            macro_micro_feed.clear()
+
     def test_realtime_buy_candidates_include_domestic_ranking_candidates(self) -> None:
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
         market = MarketSnapshot(
@@ -784,7 +894,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web._cached_domestic_ranking_symbols", return_value=("035420",)),
                 patch("app.web._candidate_affordability_market", return_value=market),
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
-                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4", "REALTIME_US_SCAN_FALLBACK_LIMIT": "0"}),
             ):
                 _now = datetime.now(timezone.utc)
                 store_cls.return_value.active_symbols.return_value = ()
@@ -799,6 +909,40 @@ class RealtimeModesTest(unittest.TestCase):
                 candidates = web_module._realtime_buy_candidates()
 
             self.assertEqual(candidates, ("035420",))
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+
+    def test_realtime_buy_candidates_price_domestic_ranking_from_orderbook_without_tick(self) -> None:
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            web_module._live_state["context"] = None
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("KRX",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=()),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=("066430",)),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4", "REALTIME_US_SCAN_FALLBACK_LIMIT": "0"}),
+            ):
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = SimpleNamespace(
+                    best_bid=2005.0,
+                    best_ask=2015.0,
+                    total_bid_volume=500000.0,
+                    total_ask_volume=500000.0,
+                    received_at=_now,
+                    source="kis_realtime_websocket",
+                )
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertEqual(candidates, ("066430",))
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
@@ -852,7 +996,7 @@ class RealtimeModesTest(unittest.TestCase):
                 patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._cached_volume_surge_symbols", return_value=()),
                 patch("app.web._cached_domestic_ranking_symbols", return_value=()),
-                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4"}),
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4", "REALTIME_US_SCAN_FALLBACK_LIMIT": "0"}),
             ):
                 _now = datetime.now(timezone.utc)
                 store_cls.return_value.active_symbols.return_value = ()
@@ -876,6 +1020,114 @@ class RealtimeModesTest(unittest.TestCase):
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
+
+    def test_us_buy_candidate_with_no_orderbook_is_temporarily_backed_off(self) -> None:
+        account = AccountSnapshot(cash=1000.0, holdings=(), cash_by_currency={"USD": 1000.0})
+        with web_module._live_lock:
+            previous_backoff = dict(web_module._live_buy_candidate_backoff_until)
+            web_module._live_buy_candidate_backoff_until.clear()
+        try:
+            web_module._apply_live_buy_candidate_backoff(
+                {
+                    "rejections": [
+                        {
+                            "symbol": "WBI",
+                            "side": "BUY",
+                            "reason_codes": ["EXEC_NO_ORDERBOOK_BLOCKED"],
+                        }
+                    ]
+                }
+            )
+
+            with (
+                patch("app.web._active_live_market_groups", return_value=("US",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=()),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=("WBI", "MSFT")),
+                patch("app.web._cached_volume_surge_symbols", return_value=()),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "4", "REALTIME_US_SCAN_FALLBACK_LIMIT": "0"}),
+            ):
+                _now = datetime.now(timezone.utc)
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.side_effect = (
+                    lambda symbol: SimpleNamespace(price=100.0, received_at=_now, exchange_timestamp=_now)
+                    if symbol == "MSFT"
+                    else None
+                )
+                store_cls.return_value.latest_orderbook.return_value = None
+                candidates = web_module._realtime_buy_candidates()
+
+            self.assertNotIn("WBI", candidates)
+            self.assertIn("MSFT", candidates)
+        finally:
+            with web_module._live_lock:
+                web_module._live_buy_candidate_backoff_until.clear()
+                web_module._live_buy_candidate_backoff_until.update(previous_backoff)
+
+    def test_us_buy_candidate_with_wide_spread_is_temporarily_rotated_out(self) -> None:
+        with web_module._live_lock:
+            previous_backoff = dict(web_module._live_buy_candidate_backoff_until)
+            web_module._live_buy_candidate_backoff_until.clear()
+        try:
+            web_module._apply_live_buy_candidate_backoff(
+                {
+                    "rejections": [
+                        {
+                            "symbol": "DEFT",
+                            "side": "BUY",
+                            "reason_codes": ["WIDE_SPREAD:159.9>70.0bps", "LOW_LIQUIDITY"],
+                        }
+                    ]
+                }
+            )
+
+            self.assertTrue(web_module._live_buy_candidate_in_backoff("DEFT"))
+        finally:
+            with web_module._live_lock:
+                web_module._live_buy_candidate_backoff_until.clear()
+                web_module._live_buy_candidate_backoff_until.update(previous_backoff)
+
+    def test_realtime_buy_candidates_warm_volume_surge_before_filtering(self) -> None:
+        account = AccountSnapshot(cash=1000.0, holdings=(), cash_by_currency={"USD": 1000.0})
+        with web_module._live_lock:
+            previous_context = web_module._live_state.get("context")
+            previous_warm = dict(web_module._volume_surge_warm_cache)
+            web_module._live_state["context"] = None
+            web_module._volume_surge_warm_cache.update({"at": 0.0, "symbols": ()})
+        calls = []
+
+        def fake_refresh(context, *, symbols):
+            calls.append(tuple(symbols))
+            return {"ok": True, "symbols": tuple(symbols), "saved": {"realtime_ticks": 0, "orderbooks": 0}}
+
+        try:
+            with (
+                patch("app.web._active_live_market_groups", return_value=("US",)),
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=()),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=()),
+                patch("app.web._cached_volume_surge_symbols", return_value=("DEFT", "TTGT", "ABCWS")),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+                patch("app.trading.us_realtime_bridge.refresh_us_realtime_for_context_buy_candidates", side_effect=fake_refresh),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch.dict(
+                    "os.environ",
+                    {"REALTIME_BUY_CANDIDATE_LIMIT": "4", "REALTIME_US_VOLUME_SURGE_WARM_LIMIT": "2"},
+                ),
+            ):
+                store_cls.return_value.active_symbols.return_value = ()
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = None
+                web_module._realtime_buy_candidates()
+
+            self.assertEqual(calls, [("DEFT", "TTGT")])
+        finally:
+            with web_module._live_lock:
+                web_module._live_state["context"] = previous_context
+                web_module._volume_surge_warm_cache.clear()
+                web_module._volume_surge_warm_cache.update(previous_warm)
 
     def test_krx_buy_candidate_without_orderbook_is_warmed_before_evaluation(self) -> None:
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
@@ -902,7 +1154,7 @@ class RealtimeModesTest(unittest.TestCase):
                 candidates = web_module._realtime_buy_candidates()
                 collector_symbols = web_module._kis_realtime_collector_symbols()
 
-            self.assertNotIn("005930", candidates)
+            self.assertIn("005930", candidates)
             self.assertIn("005930", collector_symbols)
             self.assertEqual(collector_symbols[0], "005930")
             with web_module._live_lock:
@@ -946,6 +1198,30 @@ class RealtimeModesTest(unittest.TestCase):
         finally:
             with web_module._live_lock:
                 web_module._live_state["context"] = previous_context
+                web_module._pending_krx_buy_candidate_warmup.clear()
+                web_module._pending_krx_buy_candidate_warmup.update(previous_pending)
+
+    def test_pending_krx_buy_candidate_is_cleared_after_fresh_orderbook(self) -> None:
+        with web_module._live_lock:
+            previous_pending = dict(web_module._pending_krx_buy_candidate_warmup)
+            web_module._pending_krx_buy_candidate_warmup.clear()
+            web_module._pending_krx_buy_candidate_warmup["005930"] = time.monotonic() + 120.0
+        try:
+            fresh_orderbook = SimpleNamespace(
+                best_bid=69900.0,
+                best_ask=70000.0,
+                source="kis_realtime_websocket",
+                received_at=datetime.now(timezone.utc),
+            )
+            with patch("app.web.RealtimeMarketDataStore") as store_cls:
+                store_cls.return_value.latest_orderbook.return_value = fresh_orderbook
+                pending = web_module._pending_krx_buy_candidate_warmup_symbols()
+
+            self.assertNotIn("005930", pending)
+            with web_module._live_lock:
+                self.assertNotIn("005930", web_module._pending_krx_buy_candidate_warmup)
+        finally:
+            with web_module._live_lock:
                 web_module._pending_krx_buy_candidate_warmup.clear()
                 web_module._pending_krx_buy_candidate_warmup.update(previous_pending)
 
@@ -999,6 +1275,36 @@ class RealtimeModesTest(unittest.TestCase):
             ordered = web_module._prioritize_realtime_buy_candidates(("AAPL", "005930", "MSFT", "066310"))
 
         self.assertEqual(ordered[:2], ("005930", "066310"))
+
+    def test_realtime_buy_candidates_place_us_scan_before_broad_affordable_scan(self) -> None:
+        account = AccountSnapshot(cash=0.0, holdings=(), cash_by_currency={"USD": 1000.0})
+        captured: list[tuple[str, ...]] = []
+
+        def capture_filter(symbols, **kwargs):
+            captured.append(tuple(symbols))
+            return tuple(symbols)
+
+        with (
+            patch("app.web._active_live_market_groups", return_value=("US",)),
+            patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+            patch("app.web._load_realtime_collection_symbols", return_value=()),
+            patch("app.web._cached_context_buy_candidates", return_value=()),
+            patch("app.web._live_affordable_buy_candidate_symbols", return_value=("ACET", "ACFN")),
+            patch("app.web._pending_krx_buy_candidate_warmup_symbols", return_value=()),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch("app.web._cached_volume_surge_symbols", return_value=()),
+            patch("app.web._fresh_macro_micro_bundle", return_value=None),
+            patch("app.web._warm_us_volume_surge_candidates_for_buy_filter", return_value=()),
+            patch("app.web._us_open_cash_scan_fallback_candidates", return_value=("RBBN", "BZ")),
+            patch("app.web._filter_realtime_buy_candidates_by_affordability", side_effect=capture_filter),
+            patch("app.web.RealtimeMarketDataStore") as store_cls,
+            patch.dict("os.environ", {"REALTIME_BUY_CANDIDATE_LIMIT": "8"}),
+        ):
+            store_cls.return_value.active_symbols.return_value = ()
+            candidates = web_module._realtime_buy_candidates()
+
+        self.assertEqual(candidates[:4], ("RBBN", "BZ", "ACET", "ACFN"))
+        self.assertEqual(captured[0][:4], ("RBBN", "BZ", "ACET", "ACFN"))
 
     def test_kis_realtime_collector_symbols_are_capped_by_subscription_budget(self) -> None:
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})

@@ -15,9 +15,9 @@ DEFAULT_TRADING_COST_CONFIG: dict[str, Any] = {
         "NXT": {"buy_fee_rate": 0.000130527, "sell_fee_rate": 0.000130527, "sell_tax_rate": 0.002},
     },
     "overseas_stock": {
-        "NASD": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
-        "NYSE": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
-        "AMEX": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0},
+        "NASD": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
+        "NYSE": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
+        "AMEX": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
         "SEHK": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0013},
         "SHAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
         "SZAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
@@ -44,6 +44,7 @@ class FeePolicy:
     buy_fee_rate: float
     sell_fee_rate: float
     sell_tax_rate: float
+    minimum_sell_tax: float
     slippage_rate: float
     spread_rate: float
     market_impact_rate: float
@@ -118,6 +119,8 @@ class TradingCostEngine:
         buy_fee = notional * policy.buy_fee_rate
         sell_fee = gross_received * policy.sell_fee_rate
         sell_tax = gross_received * policy.sell_tax_rate
+        if policy.sell_tax_rate > 0.0 and policy.minimum_sell_tax > 0.0 and gross_received > 0.0:
+            sell_tax = max(sell_tax, policy.minimum_sell_tax)
         slippage_cost = notional * policy.slippage_rate
         spread_cost = notional * policy.spread_rate
         market_impact_cost = notional * self._market_impact_rate(quantity, entry_price, average_daily_trading_value, policy)
@@ -193,16 +196,19 @@ class TradingCostEngine:
             buy_fee_rate = float(policy.get("buy_fee_rate", 0.0025))
             sell_fee_rate = float(policy.get("sell_fee_rate", 0.0025))
             sell_tax_rate = float(policy.get("sell_tax_rate", 0.0))
+            minimum_sell_tax = float(policy.get("minimum_sell_tax", 0.0))
         elif instrument_type in {"domestic_etf", "domestic_etn", "domestic_elw", "etf", "etn", "elw"}:
             product = self.config.get("domestic_etf_etn_elw", {})
             buy_fee_rate = sell_fee_rate = float(product.get("default_fee_rate", 0.000146527))
             sell_tax_rate = float(product.get("sell_tax_rate", 0.0))
+            minimum_sell_tax = float(product.get("minimum_sell_tax", 0.0))
         else:
             domestic = self.config.get("domestic_stock", {})
             policy = domestic.get(venue) or domestic.get("KRX") or DEFAULT_TRADING_COST_CONFIG["domestic_stock"]["KRX"]
             buy_fee_rate = float(policy.get("buy_fee_rate", 0.000140527))
             sell_fee_rate = float(policy.get("sell_fee_rate", 0.000140527))
             sell_tax_rate = float(policy.get("sell_tax_rate", 0.002))
+            minimum_sell_tax = float(policy.get("minimum_sell_tax", 0.0))
 
         slippage_config = self.config.get("slippage", {})
         slippage_rate = float(slippage_config.get("default_slippage_rate", 0.0005))
@@ -217,6 +223,7 @@ class TradingCostEngine:
             buy_fee_rate=buy_fee_rate,
             sell_fee_rate=sell_fee_rate,
             sell_tax_rate=sell_tax_rate,
+            minimum_sell_tax=minimum_sell_tax,
             slippage_rate=slippage_rate,
             spread_rate=spread_rate,
             market_impact_rate=float(self.config.get("market_impact", {}).get("default_market_impact_rate", 0.0)),

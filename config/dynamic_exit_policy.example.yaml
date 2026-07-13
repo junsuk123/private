@@ -38,7 +38,7 @@ emergency_stop_loss_rate: 0.05        # env: REALTIME_EMERGENCY_STOP_LOSS (run.p
 # Loss exits are neither always-blocked nor always-allowed: permitted only on strong
 # deterioration evidence, blocked for noise-level losses.
 allow_loss_exit: false                 # env: REALTIME_ALLOW_LOSS_EXIT
-block_sell_below_breakeven: false      # env: REALTIME_BLOCK_SELL_BELOW_BREAKEVEN
+block_sell_below_breakeven: true       # env: REALTIME_BLOCK_SELL_BELOW_BREAKEVEN
 ontology_sell_dominance: -0.55         # ontology_score <= this permits a loss exit
 strong_negative_forecast_bps: 8.0      # model net-return <= -this (bps) permits a loss exit
 noise_band_loss_rate: 0.004            # |loss| within this band is noise -> hold

@@ -373,6 +373,8 @@ def _holding_from_position(position: dict[str, Any], updated_at: str) -> Holding
             exchange=str(position.get("exchange") or market),
             currency=currency,
             ticker=str(position.get("ticker") or ""),
+            name=str(position.get("name") or position.get("company_name") or ""),
+            sector=str(position.get("sector") or ""),
             quantity=quantity,
             average_price=average_price,
             current_price=current_price,
@@ -418,9 +420,11 @@ def _estimate_round_trip_cost_rate(
     quantity: float,
     average_price: float,
     current_price: float,
+    name: str = "",
+    sector: str = "",
 ) -> float:
     venue = _cost_venue_for_position(market_group=market_group, market=market, exchange=exchange, ticker=ticker)
-    instrument_type = "domestic_stock" if currency == "KRW" else "overseas_stock"
+    instrument_type = _cost_instrument_for_position(currency=currency, ticker=ticker, name=name, sector=sector)
     try:
         cost = _COST_ENGINE.estimate(
             symbol=ticker,
@@ -434,6 +438,15 @@ def _estimate_round_trip_cost_rate(
     except Exception:
         return 0.0
     return _num(cost.total_cost_rate)
+
+
+def _cost_instrument_for_position(*, currency: str, ticker: str, name: str = "", sector: str = "") -> str:
+    if str(currency or "").upper() != "KRW":
+        return "overseas_stock"
+    descriptor = f"{ticker} {name} {sector}".lower()
+    if any(token in descriptor for token in ("etf", "etn", "elw", "상장지수", "인버스", "레버리지")):
+        return "domestic_etf"
+    return "domestic_stock"
 
 
 def _cost_venue_for_position(*, market_group: str, market: str, exchange: str, ticker: str) -> str:
