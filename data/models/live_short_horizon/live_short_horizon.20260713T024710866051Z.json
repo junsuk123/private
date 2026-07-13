@@ -1,0 +1,135 @@
+{
+  "artifact_id": "live_short_horizon.20260713T024710866051Z",
+  "classification": {
+    "bias": -14.339250339788377,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      -441.35691816944495,
+      -229.16524023682544,
+      -263.4907839801574,
+      -116.886467285414,
+      -0.12041445928843875,
+      -3.4469668083165312,
+      -4.622444757908377e-05,
+      -1.6252916077501995e-05,
+      0.0032852582191985973,
+      -0.5999069860351479,
+      464.66882482070736,
+      -604.6875331720233,
+      0.0016605856994617247,
+      0.0,
+      -0.01847042786235828,
+      -0.04043340440590901,
+      -0.5504624791761757,
+      4.208549034934712,
+      -1.5062413156990055,
+      -760.5667532520727,
+      16.534730887838474
+    ]
+  },
+  "created_at": "2026-07-13T02:47:10.866051+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio",
+    "news_sentiment",
+    "rsi_14",
+    "macd_histogram",
+    "bollinger_percent_b",
+    "ema_gap_bps",
+    "donchian_breakout",
+    "volume_spike_ratio"
+  ],
+  "feature_schema_hash": "3e480bae46ced55f9a1e573b",
+  "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.6281762422027612,
+    "avg_forward_net_return_bps_top_k": -1.9032409347266803,
+    "example_count": 13853.0,
+    "holdout_evaluated": 1.0,
+    "holdout_train_count": 9615.0,
+    "negative_labels": 6524.0,
+    "positive_labels": 7329.0,
+    "precision_at_k": 0.4878048780487805,
+    "top_k_count": 41.0,
+    "top_k_fraction": 0.009865255052935515,
+    "validation_example_count": 4156.0
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": -547.3689697455243,
+    "family": "linear_regression_sgd",
+    "weights": [
+      -850.2057068458953,
+      1715.7474939889648,
+      4971.470090223762,
+      -10950.200118760258,
+      -0.9154765070655606,
+      4.555672441195345,
+      -0.00018271655319433212,
+      0.0002051112238705261,
+      0.03096779032063631,
+      0.08169130868747577,
+      -14837.268405856681,
+      -11184.057779806362,
+      0.007857001229876804,
+      0.0,
+      -34.83962882971413,
+      -0.2954023507901415,
+      -8.289530655040439,
+      127.38733817064215,
+      3.144288841533865,
+      3797.3957199608053,
+      499.9547559628149
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "triple_barrier tp=25.0bps sl=100.0bps horizon=600.0s net_of_costs (fallback: forward_return_after_30s > 5.0bps)",
+    "row_count": 13853,
+    "row_quality": {
+      "avg_forward_net_return_bps": 0.13759142721654635,
+      "label_sources": {
+        "forward_mark_price": 34,
+        "forward_mark_price+market_adjusted": 44,
+        "triple_barrier_stop_loss": 63,
+        "triple_barrier_stop_loss+market_adjusted": 1041,
+        "triple_barrier_take_profit": 12,
+        "triple_barrier_take_profit+market_adjusted": 806,
+        "triple_barrier_terminal": 498,
+        "triple_barrier_terminal+market_adjusted": 11355
+      },
+      "max_forward_net_return_bps": 30706.317300161747,
+      "min_forward_net_return_bps": -2037.4806432880143
+    },
+    "schema_hash": "3e480bae46ced55f9a1e573b",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames",
+    "trade_feedback": {
+      "events_total": 630,
+      "filled_events": 135,
+      "latest_event_at": "2026-07-13T02:09:31.948671+00:00",
+      "latest_filled_at": "2026-07-13T00:03:46.395041+00:00",
+      "store_exists": true,
+      "store_path": "data\\store\\account_dashboard.sqlite3"
+    }
+  }
+}
