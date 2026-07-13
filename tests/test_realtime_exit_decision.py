@@ -811,6 +811,24 @@ class _FixedBuyDecisionEngine:
         )
 
 
+class _MissingFirstBookBuyDecisionEngine(_FixedBuyDecisionEngine):
+    def __init__(self, missing_symbol: str) -> None:
+        super().__init__()
+        self.missing_symbol = missing_symbol
+        live_store = self.store
+
+        class _Store:
+            def latest_tick(self, symbol: str):
+                return live_store.latest_tick(symbol)
+
+            def latest_orderbook(_self, symbol: str):
+                if symbol == missing_symbol:
+                    return None
+                return live_store.latest_orderbook(symbol)
+
+        self.store = _Store()
+
+
 class _AmendAwareCoordinator:
     def __init__(self) -> None:
         self.submitted = []
@@ -958,6 +976,30 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(summary["buy_submit_attempted"], 1)
         self.assertEqual(summary["errors"], 1)
         self.assertEqual(len(coordinator.submitted), 1)
+
+    def test_exec_prepare_rejected_buy_does_not_consume_submit_slot(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        coordinator = _AmendAwareCoordinator()
+        decision_engine = _MissingFirstBookBuyDecisionEngine("123456")
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("123456", "000660"),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_orders_per_cycle=8, max_buy_orders_per_cycle=1, error_cooldown_sec=0),
+        )
+
+        with patch.dict("os.environ", {"REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY": "false"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(summary["buy_evaluated"], 2)
+        self.assertEqual(summary["buy_rejected"], 1)
+        self.assertEqual(summary["buy_submit_attempted"], 1)
+        self.assertEqual(summary["buy_submitted"], 1)
+        self.assertEqual(coordinator.submitted[0].ticker, "000660")
+        self.assertEqual(summary["rejections"][0]["reason_codes"], ("EXEC_NO_ORDERBOOK_BLOCKED",))
 
     def test_buy_disabled_flag_skips_buy_path(self) -> None:
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})

@@ -446,8 +446,6 @@ class RealtimeTradingEngine:
                 continue
             _record_technical_decision(symbol, "BUY", result)
             if result.approved and result.final_order is not None:
-                buy_submit_attempted += 1
-                summary["buy_submit_attempted"] = buy_submit_attempted
                 priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
                     symbol, "BUY", result.final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
                 )
@@ -455,6 +453,8 @@ class RealtimeTradingEngine:
                     summary["buy_rejected"] += 1
                     self._append_rejection(summary, symbol, "BUY", (exec_reason,))
                     continue
+                buy_submit_attempted += 1
+                summary["buy_submit_attempted"] = buy_submit_attempted
                 if self._submit(priced_order, "BUY", result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                     buy_submitted += 1
             else:
