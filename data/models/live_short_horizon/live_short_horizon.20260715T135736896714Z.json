@@ -1,0 +1,133 @@
+{
+  "artifact_id": "live_short_horizon.20260715T135736896714Z",
+  "classification": {
+    "bias": -8.491197158282892,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      -635.4212508860501,
+      -336.2267514187387,
+      53.37170971067425,
+      -520.2537814894736,
+      -0.0694202472939949,
+      0.2948879924116833,
+      -1.5486704378409174e-05,
+      -2.0660020970497476e-05,
+      -0.006902103003962753,
+      1.2253206249008997,
+      773.5559656749303,
+      -67.90777979045706,
+      0.0001301266034701764,
+      0.0,
+      1.0009459850340057,
+      0.006997356773999606,
+      -0.08527342685906031,
+      2.4101986711352867,
+      -0.018394360691032258,
+      1373.7000098816538,
+      7.397208739844236
+    ]
+  },
+  "created_at": "2026-07-15T13:57:36.896714+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio",
+    "news_sentiment",
+    "rsi_14",
+    "macd_histogram",
+    "bollinger_percent_b",
+    "ema_gap_bps",
+    "donchian_breakout",
+    "volume_spike_ratio"
+  ],
+  "feature_schema_hash": "3e480bae46ced55f9a1e573b",
+  "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
+  "live_eligible": true,
+  "metrics": {
+    "auc": 0.7207752677970881,
+    "avg_forward_net_return_bps_top_k": 5.947156648935975,
+    "example_count": 38948.0,
+    "holdout_evaluated": 1.0,
+    "holdout_train_count": 27016.0,
+    "negative_labels": 17929.0,
+    "positive_labels": 21019.0,
+    "precision_at_k": 0.603448275862069,
+    "top_k_count": 116.0,
+    "top_k_fraction": 0.009927257167308514,
+    "validation_example_count": 11685.0
+  },
+  "reason_codes": [],
+  "regression": {
+    "bias": -105.18014580077956,
+    "family": "linear_regression_sgd",
+    "weights": [
+      -5796.816351367048,
+      -1253.6916209112912,
+      -158.20813156949015,
+      -2610.859783070639,
+      -0.7601386319144694,
+      7.456099877761871,
+      0.0006600213122714888,
+      -0.0011809022116813625,
+      -0.010498901527772197,
+      6.3957754593891964,
+      1883.3856606269155,
+      -1727.7728074443996,
+      0.00023581238871741255,
+      0.0,
+      -123.68002445316866,
+      1.4674101994587447,
+      -2.427251217330073,
+      108.91016682600817,
+      -3.0126526309632755,
+      17241.610788999726,
+      -2.753957021445204
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "triple_barrier tp=25.0bps sl=100.0bps horizon=600.0s net_of_costs (fallback: forward_return_after_30s > 5.0bps)",
+    "row_count": 38948,
+    "row_quality": {
+      "avg_forward_net_return_bps": -0.16685690975722237,
+      "label_sources": {
+        "forward_mark_price": 55,
+        "forward_mark_price+market_adjusted": 372,
+        "triple_barrier_stop_loss": 93,
+        "triple_barrier_stop_loss+market_adjusted": 2073,
+        "triple_barrier_take_profit": 44,
+        "triple_barrier_take_profit+market_adjusted": 2085,
+        "triple_barrier_terminal": 742,
+        "triple_barrier_terminal+market_adjusted": 33484
+      },
+      "max_forward_net_return_bps": 30706.317300161747,
+      "min_forward_net_return_bps": -2037.4806432880143
+    },
+    "schema_hash": "3e480bae46ced55f9a1e573b",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames",
+    "trade_feedback": {
+      "events_total": 864,
+      "filled_events": 226,
+      "latest_event_at": "2026-07-15T00:03:42.802744+00:00",
+      "latest_filled_at": "2026-07-15T00:03:42.802744+00:00",
+      "store_exists": true,
+      "store_path": "data\\store\\account_dashboard.sqlite3"
+    }
+  }
+}

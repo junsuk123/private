@@ -333,6 +333,11 @@ tbody tr:hover { background: #f8fbff; }
 .tech-detail span { display: flex; justify-content: space-between; gap: 6px; }
 .tech-detail em { color: #6b7684; font-style: normal; }
 .tech-explain { margin-top: 6px; color: #4a5568; font-size: 11px; line-height: 1.4; }
+.tech-card .mm-ontology-svg.micro {
+  margin: 6px 0 8px;
+  border: 1px solid #edf1f6;
+  background: #fff;
+}
 
 /* Macro–micro ontology panel (advisory) */
 #macro-micro-panel .mm-macro { margin-bottom: 12px; }
@@ -346,6 +351,77 @@ tbody tr:hover { background: #f8fbff; }
   border: 1px solid #dbe2ea;
   background: #f8fafc;
   overflow: hidden;
+}
+.mm-ontology-panel {
+  background: #f8fafc;
+}
+.mm-ontology-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 8px;
+}
+.mm-ontology-header h3 {
+  margin: 0;
+  color: #172033;
+  font-size: 14px;
+}
+.mm-ontology-header span {
+  color: #667085;
+  font-size: 12px;
+  text-align: right;
+}
+.mm-ontology-header.micro {
+  border-top: 1px solid #e2e8f0;
+}
+.mm-ontology-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.mm-ontology-svg.macro {
+  min-height: 245px;
+  border-top: 1px solid #edf1f6;
+  border-bottom: 1px solid #edf1f6;
+}
+.mm-micro-graph-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+.mm-micro-ontology {
+  min-width: 0;
+  border: 1px solid #dbe2ea;
+  background: #fff;
+  overflow: hidden;
+}
+.mm-ontology-edge line {
+  stroke: #8091a7;
+  stroke-width: 1.8;
+}
+.mm-ontology-edge text {
+  fill: #64748b;
+  paint-order: stroke;
+  stroke: #f8fafc;
+  stroke-width: 4px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.mm-ontology-node circle {
+  fill: #fff;
+  stroke-width: 2;
+  filter: drop-shadow(0 3px 5px rgba(15, 23, 42, 0.10));
+}
+.mm-ontology-node.ok circle { stroke: #1f9d55; }
+.mm-ontology-node.warn circle { stroke: #d89a00; }
+.mm-ontology-node.info circle { stroke: #2563eb; }
+.mm-ontology-node.hold circle { stroke: #94a3b8; }
+.mm-edge-note {
+  fill: #475569;
+  font-size: 12px;
+  font-weight: 700;
 }
 .mm-graph-svg {
   display: block;
@@ -513,4 +589,7 @@ tbody tr:hover { background: #f8fbff; }
   .mm-lanes { grid-template-columns: 1fr; }
   .mm-progress-row { grid-template-columns: 84px 1fr; }
   .mm-progress-row strong { grid-column: 2; }
+  .mm-ontology-header { align-items: flex-start; flex-direction: column; }
+  .mm-ontology-header span { text-align: left; }
+  .mm-micro-graph-grid { grid-template-columns: 1fr; }
 }

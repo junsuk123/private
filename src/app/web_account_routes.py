@@ -80,7 +80,7 @@ _ACCOUNT_PAGE = """<!doctype html>
   <title>Account Dashboard</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
   <link rel="apple-touch-icon" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/account_dashboard.css" />
+  <link rel="stylesheet" href="/static/account_dashboard.css?v=20260714-profit-exit2" />
 </head>
 <body>
   <main class="account-dashboard" id="account-dashboard">
@@ -231,7 +231,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="log-panel" id="account-logs"></div>
     </details>
   </main>
-  <script src="/static/account_dashboard.js"></script>
+  <script src="/static/account_dashboard.js?v=20260714-profit-exit2"></script>
 </body>
 </html>
 """

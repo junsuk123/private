@@ -436,7 +436,19 @@ class KisDevelopersApiClient:
             for row in _response_rows(response)
             if str(row.get("odno") or row.get("ODNO") or "") == order_id
         ]
-        row = rows[0] if rows else _first_response_row(response)
+        if not rows:
+            return MockKisExecution(
+                order_id=order_id,
+                ticker=order.ticker,
+                side=order.side,
+                quantity=0,
+                price=0.0,
+                executed_value=0.0,
+                status="OPEN",
+                message="KIS overseas order status not found for this order id.",
+                executed_at=datetime.now(timezone.utc),
+            )
+        row = rows[0]
         return self._overseas_execution_from_status(order_id, row, order)
 
     def get_portfolio(self) -> MockKisPortfolio:

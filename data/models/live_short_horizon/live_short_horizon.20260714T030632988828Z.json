@@ -1,0 +1,135 @@
+{
+  "artifact_id": "live_short_horizon.20260714T030632988828Z",
+  "classification": {
+    "bias": -16.258932455549868,
+    "family": "logistic_regression_sgd",
+    "weights": [
+      -339.07659053651736,
+      -157.41936998244887,
+      -212.7969624847294,
+      -426.90635471700654,
+      -0.0779664103228098,
+      3.9506785491758065,
+      3.12121384423293e-05,
+      -1.6495845851650153e-05,
+      0.012844931233373318,
+      4.566806883671256,
+      -588.6892918906627,
+      -286.10208394105825,
+      -0.0017011284370133323,
+      0.0,
+      1.2723294493440982,
+      0.012227989722248051,
+      -0.13147861011016498,
+      4.149677307323279,
+      -0.009020515295000886,
+      2290.586518831776,
+      11.830322121659524
+    ]
+  },
+  "created_at": "2026-07-14T03:06:32.988828+00:00",
+  "feature_names": [
+    "return_30s",
+    "return_1m",
+    "return_3m",
+    "distance_from_vwap",
+    "spread_bps",
+    "orderbook_imbalance",
+    "bid_depth",
+    "ask_depth",
+    "depth_ratio",
+    "liquidity_score",
+    "realized_volatility_3m",
+    "max_drop_3m",
+    "cost_to_volatility_ratio",
+    "principal_cushion_ratio",
+    "news_sentiment",
+    "rsi_14",
+    "macd_histogram",
+    "bollinger_percent_b",
+    "ema_gap_bps",
+    "donchian_breakout",
+    "volume_spike_ratio"
+  ],
+  "feature_schema_hash": "3e480bae46ced55f9a1e573b",
+  "label_definition": "label=1 when forward_net_return_bps > LIVE_LABEL_MIN_NET_RETURN_BPS after costs",
+  "live_eligible": false,
+  "metrics": {
+    "auc": 0.604009225363605,
+    "avg_forward_net_return_bps_top_k": -14.342518848801285,
+    "example_count": 31354.0,
+    "holdout_evaluated": 1.0,
+    "holdout_train_count": 21740.0,
+    "negative_labels": 14177.0,
+    "positive_labels": 17177.0,
+    "precision_at_k": 0.19148936170212766,
+    "top_k_count": 94.0,
+    "top_k_fraction": 0.00999255873285851,
+    "validation_example_count": 9407.0
+  },
+  "reason_codes": [
+    "METRICS_BELOW_LIVE_THRESHOLDS"
+  ],
+  "regression": {
+    "bias": -171.50808497400536,
+    "family": "linear_regression_sgd",
+    "weights": [
+      948.4735321314924,
+      -4418.15523824698,
+      -9233.078429269193,
+      5676.355739047753,
+      -1.4553714412926273,
+      46.17191366966165,
+      0.0007545077256631915,
+      0.002223465719826276,
+      0.09999864967509643,
+      42.05988076691481,
+      -7959.7388680914755,
+      -5877.669756168049,
+      -0.06762638093957597,
+      0.0,
+      69.00024413850018,
+      1.4881587486415138,
+      -1.899577681682016,
+      71.32319448980886,
+      -2.0977513982842813,
+      16957.069219569104,
+      39.24002120443565
+    ]
+  },
+  "thresholds": {
+    "maximum_uncertainty": 0.49,
+    "minimum_expected_net_return_bps": 10.0,
+    "minimum_probability_success": 0.51
+  },
+  "training_data": {
+    "label_rule": "triple_barrier tp=25.0bps sl=100.0bps horizon=600.0s net_of_costs (fallback: forward_return_after_30s > 5.0bps)",
+    "row_count": 31354,
+    "row_quality": {
+      "avg_forward_net_return_bps": 0.06782737713222778,
+      "label_sources": {
+        "forward_mark_price": 38,
+        "forward_mark_price+market_adjusted": 359,
+        "triple_barrier_stop_loss": 71,
+        "triple_barrier_stop_loss+market_adjusted": 1806,
+        "triple_barrier_take_profit": 40,
+        "triple_barrier_take_profit+market_adjusted": 1711,
+        "triple_barrier_terminal": 571,
+        "triple_barrier_terminal+market_adjusted": 26758
+      },
+      "max_forward_net_return_bps": 30706.317300161747,
+      "min_forward_net_return_bps": -2037.4806432880143
+    },
+    "schema_hash": "3e480bae46ced55f9a1e573b",
+    "source": "logs\\live-feature-frames.jsonl",
+    "source_type": "collected_live_feature_frames",
+    "trade_feedback": {
+      "events_total": 826,
+      "filled_events": 218,
+      "latest_event_at": "2026-07-14T01:19:08.564323+00:00",
+      "latest_filled_at": "2026-07-14T01:15:37.110847+00:00",
+      "store_exists": true,
+      "store_path": "data\\store\\account_dashboard.sqlite3"
+    }
+  }
+}

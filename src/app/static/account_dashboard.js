@@ -13,6 +13,12 @@ async function fetchJson(url) {
   return response.json();
 }
 
+async function postJson(url) {
+  const response = await fetch(url, { method: 'POST', cache: 'no-store' });
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return response.json();
+}
+
 async function refreshDashboard() {
   const data = await fetchJson('/api/account/dashboard');
   let trading = null;
@@ -185,18 +191,17 @@ function renderMacroMicroVisual(mm) {
   const holdCount = Math.max(0, microRows.length - buyCount - exitCount);
 
   if (graph) {
-    graph.innerHTML = renderOntologyFlowSvg({
-      regime: mm.market_regime || '-',
-      risk: mm.macro_risk_level || '-',
-      confidence: Number(mm.macro_confidence || 0),
+    graph.innerHTML = renderOntologyGraphPanel({
+      mm,
+      microRows,
+      sectorRows,
+      ranked,
+      candidateSymbols,
       blocked,
       noLiveData,
-      candidates: candidateSymbols.length,
-      micro: microRows.length,
       buyCount,
       exitCount,
       holdCount,
-      rankedCount: ranked.length,
     });
   }
 
@@ -233,6 +238,7 @@ function renderMacroMicroVisual(mm) {
       ]);
       return `<div class="tech-card ${kind}">
         <div class="tech-symbol">${escapeHtml(m.symbol || '-')} <span class="mm-action ${kind}">${action}</span></div>
+        ${renderMicroOntologySvg(m, { compact: true })}
         <div class="tech-detail">${detail}</div>
         ${reasons ? `<div class="tech-explain">${escapeHtml(reasons)}</div>` : ''}
       </div>`;
@@ -252,6 +258,143 @@ function renderMacroMicroVisual(mm) {
       </div>`;
     }).join('') : '<div class="tech-card empty">랭킹된 의도 없음</div>';
   }
+}
+
+function renderOntologyGraphPanel(data) {
+  const microRows = (data.microRows || []).slice(0, 12);
+  const microGraphs = microRows.length
+    ? microRows.map((row) => `<article class="mm-micro-ontology">${renderMicroOntologySvg(row)}</article>`).join('')
+    : '<div class="tech-card empty">미시 온톨로지 그래프 대기 중</div>';
+  return `<div class="mm-ontology-panel">
+    <div class="mm-ontology-header">
+      <h3>거시 온톨로지 노드·엣지</h3>
+      <span>${escapeHtml(data.mm.market_regime || '-')} · 후보 ${data.candidateSymbols.length} · 미시 ${data.microRows.length}</span>
+    </div>
+    ${renderMacroOntologySvg(data)}
+    <div class="mm-ontology-header micro">
+      <h3>종목별 미시 온톨로지 노드·엣지</h3>
+      <span>N×M 레이아웃 · 최대 12개 표시</span>
+    </div>
+    <div class="mm-micro-graph-grid">${microGraphs}</div>
+  </div>`;
+}
+
+function renderMacroOntologySvg(data) {
+  const mm = data.mm || {};
+  const allowed = (mm.allowed_micro_strategies || []).slice(0, 2).join(', ') || '-';
+  const blockedStrategies = (mm.blocked_micro_strategies || []).slice(0, 2).join(', ') || '-';
+  const topSector = (data.sectorRows || [])[0];
+  const nodes = [
+    { id: 'market', x: 98, y: 118, label: 'Market', value: mm.market_regime || '-', tone: data.blocked ? 'warn' : 'ok' },
+    { id: 'risk', x: 276, y: 58, label: 'Risk', value: mm.macro_risk_level || '-', tone: data.blocked ? 'warn' : 'info' },
+    { id: 'confidence', x: 276, y: 178, label: 'Confidence', value: `${(Number(mm.macro_confidence || 0) * 100).toFixed(0)}%`, tone: 'info' },
+    { id: 'sector', x: 460, y: 58, label: 'Sector', value: topSector ? topSector.sector : '-', tone: 'info' },
+    { id: 'allow', x: 460, y: 178, label: 'Allows', value: allowed, tone: 'ok' },
+    { id: 'block', x: 640, y: 58, label: 'Blocks', value: blockedStrategies, tone: data.blocked ? 'warn' : 'hold' },
+    { id: 'candidates', x: 640, y: 178, label: 'Candidates', value: `${data.candidateSymbols.length} symbols`, tone: data.noLiveData ? 'warn' : 'info' },
+    { id: 'gate', x: 820, y: 118, label: 'Gate', value: data.blocked ? 'BUY BLOCK' : 'BUY OPEN', tone: data.blocked ? 'warn' : 'ok' },
+  ];
+  const edges = [
+    ['market', 'risk', 'has_risk'],
+    ['market', 'confidence', 'measured_by'],
+    ['risk', 'sector', 'weights'],
+    ['confidence', 'allow', 'supports'],
+    ['sector', 'block', 'constrains'],
+    ['allow', 'candidates', 'permits'],
+    ['block', 'gate', data.blocked ? 'blocks' : 'monitors'],
+    ['candidates', 'gate', 'feeds'],
+  ];
+  return `<svg class="mm-ontology-svg macro" viewBox="0 0 920 260" role="img" aria-label="거시 온톨로지 노드 엣지 그래프">
+    <defs>
+      <marker id="mmArrowMacro" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L0,6 L8,3 z" fill="#8091a7"></path>
+      </marker>
+    </defs>
+    <rect x="0" y="0" width="920" height="260" fill="#f8fafc"></rect>
+    ${edges.map((edge) => ontologyEdge(edge, nodes, 'mmArrowMacro')).join('')}
+    ${nodes.map((node) => ontologyNode(node)).join('')}
+    <g transform="translate(42 226)">
+      <text x="0" y="0" class="mm-edge-note">BUY ${data.buyCount} · SELL ${data.exitCount} · HOLD ${data.holdCount} · ranked ${(data.ranked || []).length}</text>
+    </g>
+  </svg>`;
+}
+
+function renderMicroOntologySvg(row, options) {
+  const compact = Boolean(options && options.compact);
+  const width = compact ? 470 : 520;
+  const height = compact ? 190 : 230;
+  const markerId = compact ? 'mmArrowMicroCompact' : 'mmArrowMicroFull';
+  const reasons = (row.reason_codes || []).slice(0, 2).map(humanizeReason).join(', ') || '-';
+  const entry = row.entry_signal || 'NONE';
+  const exit = row.exit_signal || 'NONE';
+  const actionTone = entry === 'BUY_CANDIDATE' ? 'ok' : exit !== 'NONE' ? 'warn' : 'hold';
+  const nodes = [
+    { id: 'symbol', x: 78, y: compact ? 88 : 108, label: 'Symbol', value: row.symbol || '-', tone: actionTone },
+    { id: 'regime', x: 220, y: 48, label: 'Regime', value: row.micro_regime || '-', tone: actionTone },
+    { id: 'strategy', x: 220, y: compact ? 132 : 168, label: 'Strategy', value: row.selected_strategy || '-', tone: 'info' },
+    { id: 'entry', x: 365, y: 48, label: 'Entry', value: entry, tone: entry === 'BUY_CANDIDATE' ? 'ok' : 'hold' },
+    { id: 'exit', x: 365, y: compact ? 132 : 168, label: 'Exit', value: exit, tone: exit !== 'NONE' ? 'warn' : 'hold' },
+  ];
+  if (!compact) {
+    nodes.push(
+      { id: 'net', x: 78, y: 188, label: 'Net Edge', value: techNum(row.expected_net_return_bps, 1, 'bps'), tone: Number(row.expected_net_return_bps || 0) > 0 ? 'ok' : 'warn' },
+      { id: 'quality', x: 365, y: 108, label: 'Quality', value: row.execution_quality || '-', tone: row.execution_quality === 'WEAK' ? 'warn' : 'info' },
+      { id: 'reason', x: 220, y: 108, label: 'Reason', value: reasons, tone: 'hold' },
+    );
+  }
+  const edges = compact
+    ? [
+        ['symbol', 'regime', 'classified_as'],
+        ['symbol', 'strategy', 'selects'],
+        ['regime', 'entry', 'emits'],
+        ['strategy', 'exit', 'guards'],
+      ]
+    : [
+        ['symbol', 'regime', 'classified_as'],
+        ['symbol', 'net', 'expects'],
+        ['regime', 'reason', 'explained_by'],
+        ['reason', 'quality', 'constrained_by'],
+        ['regime', 'entry', 'emits'],
+        ['strategy', 'exit', 'guards'],
+        ['net', 'strategy', 'selects'],
+        ['quality', 'exit', 'routes'],
+      ];
+  return `<svg class="mm-ontology-svg micro${compact ? ' compact' : ''}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(row.symbol || 'symbol')} 미시 온톨로지 그래프">
+    <defs>
+      <marker id="${markerId}" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L0,6 L7,3 z" fill="#8091a7"></path>
+      </marker>
+    </defs>
+    <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+    ${edges.map((edge) => ontologyEdge(edge, nodes, markerId)).join('')}
+    ${nodes.map((node) => ontologyNode(node, compact ? 42 : 46)).join('')}
+  </svg>`;
+}
+
+function ontologyEdge(edge, nodes, markerId) {
+  const from = nodes.find((node) => node.id === edge[0]);
+  const to = nodes.find((node) => node.id === edge[1]);
+  if (!from || !to) return '';
+  const midX = (from.x + to.x) / 2;
+  const midY = (from.y + to.y) / 2;
+  return `<g class="mm-ontology-edge">
+    <line x1="${from.x}" y1="${from.y}" x2="${to.x}" y2="${to.y}" marker-end="url(#${markerId})"></line>
+    <text x="${midX}" y="${midY - 5}" text-anchor="middle">${escapeHtml(edge[2])}</text>
+  </g>`;
+}
+
+function ontologyNode(node, radius) {
+  const r = radius || 50;
+  return `<g class="mm-ontology-node ${node.tone || 'info'}" transform="translate(${node.x} ${node.y})">
+    <circle r="${r}"></circle>
+    <text y="-7" text-anchor="middle" class="mm-node-label">${escapeHtml(node.label)}</text>
+    <text y="14" text-anchor="middle" class="mm-node-value">${escapeHtml(shortNodeValue(node.value))}</text>
+  </g>`;
+}
+
+function shortNodeValue(value) {
+  const text = String(value == null ? '-' : value);
+  return text.length > 18 ? `${text.slice(0, 17)}...` : text;
 }
 
 function renderOntologyEmptyGraph(label) {
@@ -848,19 +991,18 @@ async function terminateProgram() {
   const button = document.getElementById('account-terminate');
   const source = document.getElementById('account-source');
   if (button) button.disabled = true;
-  if (source) source.textContent = 'Termination requested: BUY disabled, submitting profit-seeking SELL orders...';
+  if (source) source.textContent = 'Termination requested: BUY evaluation disabled, sell-only liquidation mode starting...';
   try {
-    const data = await fetchJson('/api/live-trading/terminate?shutdown=true');
+    const data = await postJson('/api/live-trading/terminate?shutdown=false');
     if (source) {
+      const engine = data.engine_status || {};
+      const sellSubmitted = Number(engine.sell_submitted || (data.cycle_summary || {}).sell_submitted || data.submitted_sell_orders || 0);
       source.textContent = data.ok
-        ? `Termination complete: SELL orders ${Number(data.submitted_sell_orders || 0)}, server shutdown scheduled`
+        ? `Sell-only liquidation active: BUY disabled, submitted SELL total ${sellSubmitted}`
         : `Termination blocked: ${data.message || data.status || 'unknown'}`;
     }
     if (data.ok) {
-      setTimeout(() => {
-        window.open('', '_self');
-        window.close();
-      }, 800);
+      await refreshDashboard();
     } else if (button) {
       button.disabled = false;
     }

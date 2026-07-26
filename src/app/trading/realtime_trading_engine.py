@@ -13,6 +13,7 @@ LiveExecutionCoordinator를 통해 주문을 제출한다.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -20,6 +21,7 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time as day_time, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Deque
 from zoneinfo import ZoneInfo
 
@@ -33,9 +35,10 @@ from app.execution.order_pricing_policy import (
     tick_size_for,
 )
 from app.execution.exchange_resolver import ExchangeResolver
+from app.cost import TradingCostEngine
 from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.storage.execution_quality_store import ExecutionQualityStore
-from app.schemas.domain import AccountSnapshot, FinalOrder, Holding
+from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide, OrderType
 
 
 def _env_float(name: str, default: float) -> float:
@@ -76,6 +79,35 @@ def _is_no_available_sell_quantity_error(exc: Exception) -> bool:
         or "available quantity" in message
         or "apbk0988" in message
     )
+
+
+def _is_market_closed_order_error(exc: Exception) -> bool:
+    raw = str(exc)
+    message = raw.lower()
+    return (
+        "장운영시간이 아닙니다" in raw
+        or "market closed" in message
+        or "not market" in message
+        or "not trading" in message
+        or "apbk2995" in message
+    )
+
+
+def _cost_context_for_liquidation_holding(holding: Holding) -> tuple[str, str, str]:
+    symbol = str(getattr(holding, "ticker", "") or "").strip().upper()
+    market = str(getattr(holding, "market", "") or "").strip().upper()
+    if (symbol.isdigit() and len(symbol) == 6) or market in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+        descriptor = f"{getattr(holding, 'company_name', '')} {getattr(holding, 'sector', '')}".lower()
+        if any(token in descriptor for token in ("etf", "etn", "elw", "상장지수", "인버스", "레버리지")):
+            return "KR", "KRX", "domestic_etf"
+        return "KR", "KRX", "domestic_stock"
+    venue = market or "NASD"
+    return venue, venue, "overseas_stock"
+
+
+def _is_loss_minimizing_liquidation(reason_codes: tuple[str, ...]) -> bool:
+    text = " ".join(str(code or "").upper() for code in reason_codes or ())
+    return "LOSS_MINIMIZING_LIQUIDATION" in text or "BREAKEVEN_OR_BETTER" in text
 
 
 def _record_technical_decision(symbol: str, action: str, result) -> None:
@@ -191,6 +223,8 @@ class RealtimeTradingConfig:
     submit_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SUBMIT_COOLDOWN_SEC", 20.0))
     # 하드 거부(브로커 에러/게이트 차단) 종목은 더 길게 쉬어 에러 폭주를 막는다(ETP 미신청·자금부족 등).
     error_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_ERROR_COOLDOWN_SEC", 300.0))
+    # 장운영시간 거절은 종목 문제가 아니라 세션 문제이므로 더 길게 쉬어 API 거절 폭주를 막는다.
+    market_closed_error_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_MARKET_CLOSED_ERROR_COOLDOWN_SEC", 1800.0))
     # 매도 주문을 낸 종목은 그 주문이 처리될 때까지 재매도 금지(가능수량 초과 APBK0988 방지).
     sell_inflight_cooldown_sec: float = field(default_factory=lambda: _env_float("REALTIME_SELL_INFLIGHT_COOLDOWN_SEC", 600.0))
     sell_amend_min_price_delta: float = field(default_factory=lambda: _env_float("REALTIME_SELL_AMEND_MIN_PRICE_DELTA", 0.0005))
@@ -258,6 +292,8 @@ class RealtimeTradingEngine:
         self._recent: Deque[dict[str, Any]] = deque(maxlen=recent_events_max)
         self._buy_enabled = os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         self._buy_disabled_reason: str | None = None
+        self._liquidation_requested = False
+        self._liquidation_reason: str | None = None
         self._last_observed_cycle_monotonic = 0.0
         self._last_observed_cycle_reason: str | None = None
         self._status: dict[str, Any] = {
@@ -289,6 +325,27 @@ class RealtimeTradingEngine:
             }
         )
 
+    def request_full_liquidation(self, reason: str = "LIVE_TERMINATION_FULL_LIQUIDATION") -> None:
+        """Switch the engine into sell-only liquidation mode.
+
+        BUY discovery/evaluation is skipped, existing holdings are evaluated every
+        cycle, and any HOLD result is upgraded to a full-quantity SELL intent.
+        """
+        self.disable_buys(reason)
+        self._liquidation_requested = True
+        self._liquidation_reason = reason
+        self._last_submit_monotonic.clear()
+        self._error_backoff_until.clear()
+        self._sell_lock_until.clear()
+        self._record(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "kind": "CONTROL",
+                "outcome": "full_liquidation_requested",
+                "detail": reason,
+            }
+        )
+
     def get_status(self) -> dict[str, Any]:
         with self._lock:
             status = dict(self._status)
@@ -303,6 +360,8 @@ class RealtimeTradingEngine:
             }
             status["buy_enabled"] = self._buy_enabled
             status["buy_disabled_reason"] = self._buy_disabled_reason
+            status["liquidation_requested"] = self._liquidation_requested
+            status["liquidation_reason"] = self._liquidation_reason
             status["loss_cooldown_symbols"] = sorted(
                 symbol for symbol, until in self._loss_cooldown_until.items() if until > time.monotonic()
             )
@@ -350,7 +409,11 @@ class RealtimeTradingEngine:
         sell_submitted = 0
         buy_submitted = 0
         buy_submit_attempted = 0
+        liquidation_mode = self._liquidation_requested
         buy_enabled = self._buy_enabled and os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        if liquidation_mode:
+            buy_enabled = False
+            self._buy_disabled_reason = self._liquidation_reason or "LIVE_TERMINATION_FULL_LIQUIDATION"
         realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
         account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
         daily_loss_stop_krw = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0))
@@ -369,6 +432,8 @@ class RealtimeTradingEngine:
             max(0.0, daily_loss_threshold + realized_pnl_today) if daily_loss_threshold > 0.0 else None
         )
         summary["live_armed"] = buy_enabled
+        summary["liquidation_requested"] = liquidation_mode
+        summary["liquidation_reason"] = self._liquidation_reason
 
         # 최신 온톨로지 추론 그래프(분석 컨텍스트)를 1회 조회해 매도 판단에 반영한다.
         ontology_graph = None
@@ -381,16 +446,19 @@ class RealtimeTradingEngine:
         ignored_symbols = _ignored_realtime_symbols()
         summary["ignored_symbols"] = sorted(ignored_symbols)
         summary["skipped_ignored"] = 0
-        try:
-            cycle_buy_candidates = tuple(
-                str(symbol or "").upper()
-                for symbol in tuple(self.candidate_symbols_provider() or ())
-                if str(symbol or "").strip()
-            )
-        except Exception as exc:  # noqa: BLE001 - candidate discovery failure should be visible, not fatal.
+        if liquidation_mode:
             cycle_buy_candidates = ()
-            summary["errors"] += 1
-            summary["reason"] = summary["reason"] or f"BUY_CANDIDATE_PROVIDER_ERROR:{exc.__class__.__name__}"
+        else:
+            try:
+                cycle_buy_candidates = tuple(
+                    str(symbol or "").upper()
+                    for symbol in tuple(self.candidate_symbols_provider() or ())
+                    if str(symbol or "").strip()
+                )
+            except Exception as exc:  # noqa: BLE001 - candidate discovery failure should be visible, not fatal.
+                cycle_buy_candidates = ()
+                summary["errors"] += 1
+                summary["reason"] = summary["reason"] or f"BUY_CANDIDATE_PROVIDER_ERROR:{exc.__class__.__name__}"
         summary["buy_candidate_count"] = len(cycle_buy_candidates)
         summary["buy_candidate_sample"] = list(cycle_buy_candidates[:10])
 
@@ -417,7 +485,7 @@ class RealtimeTradingEngine:
             if holding_symbol in ignored_symbols:
                 summary["skipped_ignored"] += 1
                 continue
-            if sell_submitted >= self.config.max_orders_per_cycle:
+            if not liquidation_mode and sell_submitted >= self.config.max_orders_per_cycle:
                 break
             if self.market_open_provider is not None and not self.market_open_provider(holding.ticker, holding.market or ""):
                 summary["skipped_market_closed"] += 1
@@ -445,6 +513,8 @@ class RealtimeTradingEngine:
                 self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
                 continue
             _record_technical_decision(holding.ticker, "SELL", result)
+            if liquidation_mode:
+                result = self._forced_liquidation_result(holding, result)
             if result.approved and result.final_order is not None:
                 final_order = self._fit_sell_order_to_available_quantity(result.final_order, holding)
                 if final_order is None:
@@ -800,6 +870,19 @@ class RealtimeTradingEngine:
                     "pricing_warnings": list(pricing.warnings),
                 }
             )
+            if side_u == "SELL" and _is_loss_minimizing_liquidation(tuple(reason_codes or ())):
+                protected_limit = max(float(pricing.limit_price or 0.0), reference_price)
+                if protected_limit > 0:
+                    tick = tick_size_for(protected_limit, is_domestic)
+                    protected_limit = max(tick, math.ceil(protected_limit / max(tick, 1e-9)) * tick)
+                    pricing = replace(
+                        pricing,
+                        limit_price=round(protected_limit, 4),
+                        pricing_policy=f"{pricing.pricing_policy}_BREAKEVEN_OR_BETTER",
+                        warnings=tuple(pricing.warnings) + ("LOSS_MINIMIZING_LIMIT_PRESERVED",),
+                    )
+                    diag["final_limit_price"] = pricing.limit_price
+                    diag["loss_minimizing_limit_preserved"] = True
 
             # 4) Execution-quality gate (side-aware; no-orderbook blocking).
             assessment = self.execution_quality.assess(
@@ -865,6 +948,62 @@ class RealtimeTradingEngine:
                 return final_order, True, "EXEC_PREPARE_SKIPPED_EMERGENCY_SELL", diag
             return None, False, "EXEC_PREPARE_FAILED", diag
 
+    def _forced_liquidation_result(self, holding: Holding, original_result: Any) -> Any:
+        last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
+        average_price = float(getattr(holding, "average_price", 0.0) or 0.0)
+        reference_price = last_price or average_price
+        quantity = int(getattr(holding, "sellable_quantity", None) or getattr(holding, "quantity", 0) or 0)
+        try:
+            target_net_return = max(0.0, _env_float("LIVE_TERMINATION_TARGET_PROFIT_RATE", 0.0025))
+            market, venue, instrument_type = _cost_context_for_liquidation_holding(holding)
+            cost = TradingCostEngine().estimate(
+                symbol=str(getattr(holding, "ticker", "") or ""),
+                market=market,
+                venue=venue,
+                instrument_type=instrument_type,
+                entry_price=average_price,
+                expected_exit_price=max(reference_price, average_price),
+                quantity=max(1, quantity),
+                target_net_return=target_net_return,
+            )
+            reference_price = max(reference_price, cost.required_exit_price)
+        except Exception:  # noqa: BLE001 - fallback still avoids knowingly selling below average cost.
+            reference_price = max(reference_price, average_price * (1.0 + _env_float("LIVE_TERMINATION_TARGET_PROFIT_RATE", 0.0025)))
+        order = FinalOrder(
+            ticker=str(getattr(holding, "ticker", "") or ""),
+            market=str(getattr(holding, "market", "") or "KR"),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.SELL,
+            quantity=max(0, quantity),
+            limit_price=reference_price,
+            manual_approval_required=False,
+        )
+        original_codes = tuple(getattr(original_result, "reason_codes", ()) or ())
+        reason_codes = (
+            "LIVE_TERMINATION_LOSS_MINIMIZING_LIQUIDATION",
+            "SELL_BREAKEVEN_OR_BETTER_REQUESTED",
+            *original_codes,
+        )
+        diagnostics = dict(getattr(original_result, "diagnostics", None) or {})
+        diagnostics["exit_reason"] = "loss_minimizing_liquidation"
+        diagnostics["liquidation_override"] = True
+        diagnostics["loss_minimizing_reference_price"] = reference_price
+        try:
+            return replace(
+                original_result,
+                approved=True,
+                final_order=order,
+                reason_codes=reason_codes,
+                diagnostics=diagnostics,
+            )
+        except TypeError:
+            return SimpleNamespace(
+                approved=True,
+                final_order=order,
+                reason_codes=reason_codes,
+                diagnostics=diagnostics,
+            )
+
     def _submit(
         self,
         order: FinalOrder,
@@ -889,6 +1028,17 @@ class RealtimeTradingEngine:
             # Execution diagnostics for GUI/logging: pricing policy, reference vs final
             # limit price, book, spread, orderbook age, and exchange resolution.
             event["execution"] = dict(pricing_diag)
+        if str(side).upper() == "BUY" and (
+            self._liquidation_requested
+            or not self._buy_enabled
+            or os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}
+        ):
+            summary["blocked"] += 1
+            summary["buy_rejected"] = int(summary.get("buy_rejected") or 0) + 1
+            event["outcome"] = "blocked"
+            event["detail"] = self._buy_disabled_reason or self._liquidation_reason or "BUY_SUBMIT_DISABLED"
+            self._record(event)
+            return False
         try:
             submission = self.coordinator.submit_final_order(order)
         except LiveExecutionBlocked as exc:
@@ -902,7 +1052,12 @@ class RealtimeTradingEngine:
             summary["errors"] += 1
             event["outcome"] = "error"
             event["detail"] = f"{exc.__class__.__name__}: {exc}"
-            self._error_backoff_until[order.ticker] = time.monotonic() + self.config.error_cooldown_sec
+            cooldown = (
+                self.config.market_closed_error_cooldown_sec
+                if _is_market_closed_order_error(exc)
+                else self.config.error_cooldown_sec
+            )
+            self._error_backoff_until[order.ticker] = time.monotonic() + cooldown
             self._record(event)
             return False
         summary["submitted"] += 1

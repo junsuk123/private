@@ -899,6 +899,12 @@ class _AmendAwareCoordinator:
         raise AssertionError("cancel should not be needed")
 
 
+class _MarketClosedSellCoordinator(_AmendAwareCoordinator):
+    def submit_final_order(self, order):
+        self.submitted.append(order)
+        raise RuntimeError("KIS overseas order rejected: 주간거래 장운영시간이 아닙니다 APBK2995")
+
+
 class _FailingBuyCoordinator:
     def __init__(self) -> None:
         self.submitted = []
@@ -1112,6 +1118,108 @@ class RealtimeSellAmendTest(unittest.TestCase):
             self.assertEqual(summary["reason"], "unit_shutdown")
             self.assertEqual(len(coordinator.submitted), 0)
             self.assertFalse(engine.get_status()["buy_enabled"])
+
+    def test_full_liquidation_disables_buy_discovery_and_forces_sell_all(self) -> None:
+        holding = Holding(
+            ticker="005930",
+            market="KR",
+            company_name="Samsung",
+            sector="Tech",
+            quantity=7,
+            average_price=70_000.0,
+            last_price=68_000.0,
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(holding,), cash_by_currency={"KRW": 1_000_000.0})
+        candidate_calls = {"count": 0}
+
+        class _HoldExitDecisionEngine:
+            def __init__(self) -> None:
+                self.store = _ExecBookStore(best_bid=67_900.0, best_ask=68_000.0)
+                self.exit_calls = 0
+
+            def evaluate_exit_for_holding(self, *args, **kwargs):
+                self.exit_calls += 1
+                return SimpleNamespace(
+                    approved=False,
+                    final_order=None,
+                    reason_codes=("HOLD_BELOW_PROFIT_TARGET",),
+                    diagnostics={"exit_reason": "hold"},
+                )
+
+            def evaluate_buy(self, *args, **kwargs):  # pragma: no cover
+                raise AssertionError("buy path should not be reached")
+
+        decision_engine = _HoldExitDecisionEngine()
+        coordinator = _AmendAwareCoordinator()
+
+        def candidates():
+            candidate_calls["count"] += 1
+            return ("000660",)
+
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=candidates,
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_orders_per_cycle=8, max_buy_orders_per_cycle=1),
+        )
+
+        engine.request_full_liquidation("unit_liquidation")
+        summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(candidate_calls["count"], 0)
+        self.assertEqual(summary["buy_evaluated"], 0)
+        self.assertTrue(summary["liquidation_requested"])
+        self.assertEqual(summary["sell_evaluated"], 1)
+        self.assertEqual(summary["sell_submitted"], 1)
+        self.assertEqual(len(coordinator.submitted), 1)
+        self.assertEqual(coordinator.submitted[0].side, OrderSide.SELL)
+        self.assertEqual(coordinator.submitted[0].quantity, 7)
+        self.assertGreater(coordinator.submitted[0].limit_price, holding.average_price)
+        reasons = [str(event.get("reason") or event.get("detail") or "") for event in engine.get_status()["recent_events"]]
+        self.assertTrue(
+            any("LIVE_TERMINATION_LOSS_MINIMIZING_LIQUIDATION" in reason for reason in reasons),
+            reasons,
+        )
+
+    def test_full_liquidation_respects_market_closed_error_backoff(self) -> None:
+        holding = Holding(
+            ticker="AIV",
+            market="NYSE",
+            company_name="Apartment Investment",
+            sector="Real Estate",
+            quantity=1,
+            average_price=2.82,
+            last_price=2.84,
+        )
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(holding,), cash_by_currency={"USD": 10.0})
+        decision_engine = _FixedSellDecisionEngine(limit_price=2.84)
+        coordinator = _MarketClosedSellCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(
+                submit_cooldown_sec=0,
+                error_cooldown_sec=0,
+                market_closed_error_cooldown_sec=1800,
+            ),
+        )
+        engine.request_full_liquidation("unit_liquidation")
+
+        first = engine.run_once(datetime(2026, 7, 14, 0, 31, tzinfo=timezone.utc))
+        second = engine.run_once(datetime(2026, 7, 14, 0, 32, tzinfo=timezone.utc))
+
+        self.assertEqual(first["errors"], 1)
+        self.assertEqual(first["sell_evaluated"], 1)
+        self.assertEqual(second["sell_evaluated"], 0)
+        self.assertEqual(second["skipped_cooldown"], 1)
+        self.assertEqual(len(coordinator.submitted), 1)
 
     def test_daily_realized_loss_stops_new_buys_but_keeps_runtime_alive(self) -> None:
         account = AccountSnapshot(

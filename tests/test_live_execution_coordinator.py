@@ -94,6 +94,37 @@ class OrderTransport:
         raise AssertionError(f"unexpected request: {url}")
 
 
+class MismatchedOverseasStatusTransport(OrderTransport):
+    def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+        if url.endswith("/uapi/overseas-stock/v1/trading/inquire-ccnl"):
+            self.calls.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": dict(headers),
+                    "body": dict(body or {}),
+                    "params": dict(params or {}),
+                }
+            )
+            return {
+                "rt_cd": "0",
+                "output": [
+                    {
+                        "odno": "OTHER0001",
+                        "pdno": "IBN",
+                        "sll_buy_dvsn_cd": "02",
+                        "ft_ord_qty": "1",
+                        "ft_ccld_qty": "1",
+                        "nccs_qty": "0",
+                        "ft_ord_unpr3": "28.91000000",
+                        "ft_ccld_unpr3": "28.91000000",
+                        "prcs_stat_name": "완료",
+                    }
+                ],
+            }
+        return super().request(method, url, headers, body=body, params=params, timeout=timeout)
+
+
 class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_default_runtime_flags_block_submission_before_broker_order(self) -> None:
         transport = OrderTransport()
@@ -194,6 +225,28 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
         self.assertEqual(execution.ticker, "SOXX")
         self.assertEqual(execution.status, "OPEN")
         self.assertEqual(execution.quantity, 0)
+
+    def test_overseas_order_status_does_not_use_mismatched_order_row(self) -> None:
+        transport = MismatchedOverseasStatusTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            client = KisDevelopersApiClient(
+                app_key="app",
+                app_secret="secret",
+                account_no="12345678-01",
+                base_url="https://openapi.koreainvestment.com:9443",
+                paper=False,
+                enabled=True,
+                transport=transport,
+                token_cache_path=Path(tmp) / "token.json",
+            )
+            client._orders["OVRS000010"] = _overseas_order()
+
+            execution = client.get_order_status("OVRS000010")
+
+        self.assertEqual(execution.ticker, "SOXX")
+        self.assertEqual(execution.status, "OPEN")
+        self.assertEqual(execution.quantity, 0)
+        self.assertEqual(execution.executed_value, 0.0)
 
     def test_live_submission_routes_us_daytime_order_to_daytime_api(self) -> None:
         transport = OrderTransport()

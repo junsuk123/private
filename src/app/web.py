@@ -4019,12 +4019,17 @@ def realtime_trading_status() -> JSONResponse:
     engine = _realtime_trading_engine
     running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
   diagnostics = engine.decision_engine.get_diagnostics() if engine is not None and hasattr(engine, "decision_engine") else None
+  engine_status = engine.get_status() if engine is not None else None
   return _json(
     {
       "ok": True,
       "running": running,
       "auto_start": AUTO_START_REALTIME_TRADING,
-      "status": engine.get_status() if engine is not None else None,
+      "status": engine_status,
+      "buy_enabled": engine_status.get("buy_enabled") if isinstance(engine_status, dict) else None,
+      "buy_disabled_reason": engine_status.get("buy_disabled_reason") if isinstance(engine_status, dict) else None,
+      "liquidation_requested": engine_status.get("liquidation_requested") if isinstance(engine_status, dict) else None,
+      "liquidation_reason": engine_status.get("liquidation_reason") if isinstance(engine_status, dict) else None,
       "buy_warmup_pending": list(_pending_krx_buy_candidate_warmup_symbols()),
       "decision_diagnostics": diagnostics,
     }
@@ -4082,13 +4087,33 @@ def _live_trading_terminate_response(shutdown: bool = True) -> dict[str, Any]:
     active_mode_value = getattr(active_mode, "value", active_mode)
     if active_mode_value != "live_trading":
         return {"ok": False, "status": "not_live_trading", "message": "Live trading is not the active operation mode."}
-    # 청산 전에 실시간 거래 엔진을 멈춰 신규 주문 유입을 차단한다.
+    # 청산 모드는 엔진을 멈추지 않는다. BUY 평가만 즉시 닫고, 엔진의 SELL
+    # 경로를 계속 살려 보유분 전량 청산을 반복 평가/제출하게 한다.
     os.environ["REALTIME_BUY_ENABLED"] = "false"
     with _realtime_trading_lock:
         engine = _realtime_trading_engine
+    if engine is not None and hasattr(engine, "request_full_liquidation"):
+        engine.request_full_liquidation("LIVE_TERMINATION_FULL_LIQUIDATION")
+        status = engine.get_status() if hasattr(engine, "get_status") else {}
+        audit.record(
+            "live_trading_liquidation_requested",
+            {
+                "buy_enabled": False,
+                "shutdown_requested": shutdown,
+                "engine_status": status,
+            },
+        )
+        return {
+            "ok": True,
+            "status": "liquidation_started",
+            "buy_enabled": False,
+            "liquidation_requested": True,
+            "shutdown_scheduled": False,
+            "engine_status": status,
+            "message": "BUY evaluation is disabled. Realtime engine will keep running sell-only full-liquidation cycles.",
+        }
     if engine is not None and hasattr(engine, "disable_buys"):
-        engine.disable_buys("LIVE_TERMINATION_BUY_DISABLED")
-    _stop_realtime_trading_engine()
+        engine.disable_buys("LIVE_TERMINATION_FULL_LIQUIDATION")
     config = load_short_horizon_strategy_config()
     config_live_enabled = bool(config.get("execution", {}).get("live_trading_enabled", False))
     env_live_enabled = _env_flag("LIVE_TRADING_ENABLED", False) and _env_flag("KIS_LIVE_ENABLED", False)
@@ -6602,6 +6627,11 @@ def _realtime_trading_loop() -> None:
     return
   with _realtime_trading_lock:
     _realtime_trading_engine = engine
+  if os.getenv("LIVE_TERMINATION_SELL_ONLY_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}:
+    try:
+      engine.request_full_liquidation("LIVE_TERMINATION_SELL_ONLY_ON_START")
+    except Exception as exc:  # noqa: BLE001 - keep server alive; submit guard still blocks BUY.
+      audit.record("realtime_trading_sell_only_start_failed", {"error": str(exc) or exc.__class__.__name__})
   audit.record("realtime_trading_engine_started", {"auto_start": AUTO_START_REALTIME_TRADING})
   engine.run_forever(_realtime_trading_stop)
 
