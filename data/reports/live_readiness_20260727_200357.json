@@ -1,0 +1,53 @@
+{
+  "checked_at": "2026-07-27T11:03:57.022156+00:00",
+  "dry_run": false,
+  "failures": {
+    "trading_policy": "STOP_LOSS_DISABLED:REALTIME_ALLOW_LOSS_EXIT=false and REALTIME_STOP_LOSS_NET=0.0 disable every routine stop-loss; only the hard/emergency backstop remains."
+  },
+  "gates": {
+    "kis_health": true,
+    "kis_secret_file": true,
+    "live_eligible_model": true,
+    "live_flags": true,
+    "live_trading_safety_config": true,
+    "order_execution_config": true,
+    "trading_policy": false
+  },
+  "no_orders": true,
+  "policy_version": "tp_b4caddd8cf3e",
+  "trading_policy": {
+    "allow_loss_exit": false,
+    "confidence_threshold": 0.51,
+    "conflicts": [
+      {
+        "code": "STOP_LOSS_DISABLED",
+        "message": "REALTIME_ALLOW_LOSS_EXIT=false and REALTIME_STOP_LOSS_NET=0.0 disable every routine stop-loss; only the hard/emergency backstop remains.",
+        "severity": "FAIL"
+      },
+      {
+        "code": "EMERGENCY_STOP_NOT_WIDER_THAN_HARD",
+        "message": "REALTIME_EMERGENCY_STOP_LOSS is tighter than REALTIME_HARD_STOP_LOSS.",
+        "severity": "WARNING"
+      }
+    ],
+    "emergency_stop_rate": 0.05,
+    "hard_stop_rate": 0.08,
+    "label_horizon_seconds": 600.0,
+    "label_stop_loss_bps": 100.0,
+    "label_take_profit_bps": 25.0,
+    "maximum_position_weight": 0.1,
+    "minimum_net_edge_kr": 0.008,
+    "minimum_net_edge_us": 0.012,
+    "policy_version": "tp_b4caddd8cf3e",
+    "profit_time_exit_seconds": 300.0,
+    "quick_take_profit_net_rate": 0.008,
+    "source": "environment",
+    "stop_loss_net_rate": 0.0,
+    "take_profit_net_rate": 0.0025
+  },
+  "warnings": {
+    "trading_policy": [
+      "EMERGENCY_STOP_NOT_WIDER_THAN_HARD:REALTIME_EMERGENCY_STOP_LOSS is tighter than REALTIME_HARD_STOP_LOSS."
+    ]
+  }
+}

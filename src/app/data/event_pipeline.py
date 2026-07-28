@@ -1,0 +1,400 @@
+from __future__ import annotations
+
+import asyncio
+import math
+import re
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import TypeAlias
+
+from app.data.realtime_types import (
+    RealtimeMinuteBar,
+    RealtimeOrderbookSnapshot,
+    RealtimeTradeTick,
+)
+
+
+MarketEvent: TypeAlias = RealtimeTradeTick | RealtimeOrderbookSnapshot
+
+
+@dataclass(frozen=True)
+class EventBusStats:
+    published: int
+    consumed: int
+    coalesced: int
+    dropped: int
+    depth: int
+    capacity: int
+
+
+class BoundedMarketEventBus:
+    """In-process bounded bus; market events coalesce by symbol and kind."""
+
+    def __init__(self, capacity: int = 4096) -> None:
+        if capacity <= 0:
+            raise ValueError("event bus capacity must be positive")
+        self.capacity = capacity
+        self._items: deque[MarketEvent] = deque()
+        self._condition = asyncio.Condition()
+        self._published = 0
+        self._consumed = 0
+        self._coalesced = 0
+        self._dropped = 0
+
+    async def publish(self, event: MarketEvent) -> bool:
+        async with self._condition:
+            self._published += 1
+            if len(self._items) >= self.capacity:
+                key = (event.symbol, type(event))
+                for index in range(len(self._items) - 1, -1, -1):
+                    queued = self._items[index]
+                    if (queued.symbol, type(queued)) == key:
+                        self._items[index] = event
+                        self._coalesced += 1
+                        self._condition.notify()
+                        return True
+                self._items.popleft()
+                self._dropped += 1
+            self._items.append(event)
+            self._condition.notify()
+            return True
+
+    async def get(self) -> MarketEvent:
+        async with self._condition:
+            while not self._items:
+                await self._condition.wait()
+            self._consumed += 1
+            return self._items.popleft()
+
+    def stats(self) -> EventBusStats:
+        return EventBusStats(
+            published=self._published,
+            consumed=self._consumed,
+            coalesced=self._coalesced,
+            dropped=self._dropped,
+            depth=len(self._items),
+            capacity=self.capacity,
+        )
+
+
+@dataclass(frozen=True)
+class IncrementalFeatureState:
+    symbol: str
+    as_of: datetime
+    last_price: float
+    mid: float | None
+    spread_bps: float | None
+    microprice: float | None
+    orderbook_imbalance: float | None
+    order_flow_imbalance: float
+    aggressor_trade_imbalance: float
+    vwap: float
+    realized_volatility: float
+    fresh: bool
+    sequence_uncertain: bool
+
+
+@dataclass
+class SymbolMarketState:
+    symbol: str
+    latest_tick: RealtimeTradeTick | None = None
+    latest_book: RealtimeOrderbookSnapshot | None = None
+    duplicate_count: int = 0
+    out_of_order_count: int = 0
+    gap_count: int = 0
+    sequence_uncertain: bool = False
+    _seen_ids: deque[str] = field(default_factory=lambda: deque(maxlen=2048))
+    _seen_set: set[str] = field(default_factory=set)
+    _last_numeric_sequence: dict[str, int] = field(default_factory=dict)
+    _vwap_numerator: float = 0.0
+    _vwap_denominator: float = 0.0
+    _returns: deque[float] = field(default_factory=lambda: deque(maxlen=300))
+    _buy_volume: float = 0.0
+    _sell_volume: float = 0.0
+    _ofi: float = 0.0
+
+    def apply(self, event: MarketEvent) -> bool:
+        record_id = event.record_id
+        if record_id in self._seen_set:
+            self.duplicate_count += 1
+            return False
+        if len(self._seen_ids) == self._seen_ids.maxlen:
+            self._seen_set.discard(self._seen_ids[0])
+        self._seen_ids.append(record_id)
+        self._seen_set.add(record_id)
+
+        kind = "trade" if isinstance(event, RealtimeTradeTick) else "book"
+        previous = self.latest_tick if kind == "trade" else self.latest_book
+        if previous is not None and event.exchange_timestamp < previous.exchange_timestamp:
+            self.out_of_order_count += 1
+            return False
+        self._check_sequence(kind, event.sequence_key)
+        if isinstance(event, RealtimeTradeTick):
+            self._apply_tick(event)
+        else:
+            self._apply_book(event)
+        return True
+
+    def mark_reconnected(self) -> None:
+        self.sequence_uncertain = True
+        self._last_numeric_sequence.clear()
+        self._ofi = 0.0
+
+    def features(self, now: datetime, staleness_ms: int) -> IncrementalFeatureState | None:
+        if self.latest_tick is None:
+            return None
+        book = self.latest_book
+        bid = book.best_bid if book else 0.0
+        ask = book.best_ask if book else 0.0
+        mid = (bid + ask) / 2 if bid > 0 and ask >= bid else None
+        spread = book.spread_bps if book and mid else None
+        microprice = None
+        imbalance = None
+        if book and book.levels:
+            level = book.levels[0]
+            total = level.bid_size + level.ask_size
+            if total > 0:
+                microprice = (
+                    level.ask_price * level.bid_size + level.bid_price * level.ask_size
+                ) / total
+            imbalance = book.imbalance
+        total_trade = self._buy_volume + self._sell_volume
+        trade_imbalance = (
+            (self._buy_volume - self._sell_volume) / total_trade if total_trade > 0 else 0.0
+        )
+        vwap = (
+            self._vwap_numerator / self._vwap_denominator
+            if self._vwap_denominator > 0
+            else self.latest_tick.price
+        )
+        rv = math.sqrt(sum(value * value for value in self._returns))
+        latest_receive = max(
+            self.latest_tick.received_at,
+            book.received_at if book else self.latest_tick.received_at,
+        )
+        age_ms = max(0.0, (now - latest_receive).total_seconds() * 1000)
+        return IncrementalFeatureState(
+            symbol=self.symbol,
+            as_of=max(
+                self.latest_tick.exchange_timestamp,
+                book.exchange_timestamp if book else self.latest_tick.exchange_timestamp,
+            ),
+            last_price=self.latest_tick.price,
+            mid=mid,
+            spread_bps=spread,
+            microprice=microprice,
+            orderbook_imbalance=imbalance,
+            order_flow_imbalance=self._ofi,
+            aggressor_trade_imbalance=trade_imbalance,
+            vwap=vwap,
+            realized_volatility=rv,
+            fresh=age_ms <= staleness_ms,
+            sequence_uncertain=self.sequence_uncertain,
+        )
+
+    def _apply_tick(self, tick: RealtimeTradeTick) -> None:
+        if self.latest_tick and self.latest_tick.price > 0:
+            self._returns.append(math.log(tick.price / self.latest_tick.price))
+        quantity = max(0.0, float(tick.volume))
+        self._vwap_numerator += tick.price * quantity
+        self._vwap_denominator += quantity
+        direction = str(tick.trade_direction or "").upper()
+        if direction in {"BUY", "B"}:
+            self._buy_volume += quantity
+        elif direction in {"SELL", "S"}:
+            self._sell_volume += quantity
+        self.latest_tick = tick
+
+    def _apply_book(self, book: RealtimeOrderbookSnapshot) -> None:
+        previous = self.latest_book
+        if previous and previous.levels and book.levels:
+            old = previous.levels[0]
+            new = book.levels[0]
+            self._ofi += (
+                (new.bid_size if new.bid_price >= old.bid_price else 0)
+                - (old.bid_size if new.bid_price <= old.bid_price else 0)
+                - (new.ask_size if new.ask_price <= old.ask_price else 0)
+                + (old.ask_size if new.ask_price >= old.ask_price else 0)
+            )
+        self.latest_book = book
+        # A full snapshot after reconnect establishes a new trustworthy baseline.
+        self.sequence_uncertain = False
+
+    def _check_sequence(self, kind: str, sequence_key: str | None) -> None:
+        if not sequence_key:
+            return
+        match = re.search(r"(\d+)$", sequence_key)
+        if not match:
+            return
+        current = int(match.group(1))
+        previous = self._last_numeric_sequence.get(kind)
+        if previous is not None and current > previous + 1:
+            self.gap_count += 1
+            self.sequence_uncertain = True
+        if previous is None or current > previous:
+            self._last_numeric_sequence[kind] = current
+
+
+class MarketState:
+    def __init__(self) -> None:
+        self._symbols: dict[str, SymbolMarketState] = {}
+
+    def apply(self, event: MarketEvent) -> bool:
+        state = self._symbols.setdefault(event.symbol, SymbolMarketState(event.symbol))
+        return state.apply(event)
+
+    def symbol(self, symbol: str) -> SymbolMarketState | None:
+        return self._symbols.get(symbol)
+
+    def mark_reconnected(self) -> None:
+        for state in self._symbols.values():
+            state.mark_reconnected()
+
+
+@dataclass
+class IncrementalMinuteBarBuilder:
+    symbol: str
+    _minute_start: datetime | None = None
+    _open: float = 0.0
+    _high: float = 0.0
+    _low: float = 0.0
+    _close: float = 0.0
+    _volume: int = 0
+    _notional: float = 0.0
+    _count: int = 0
+    _source_ids: list[str] = field(default_factory=list)
+
+    def update(self, tick: RealtimeTradeTick) -> RealtimeMinuteBar | None:
+        minute = tick.exchange_timestamp.replace(second=0, microsecond=0)
+        completed = self.current_bar() if self._minute_start and minute > self._minute_start else None
+        if self._minute_start is None or minute > self._minute_start:
+            self._reset(minute, tick)
+        elif minute == self._minute_start:
+            self._high = max(self._high, tick.price)
+            self._low = min(self._low, tick.price)
+            self._close = tick.price
+            self._volume += max(0, tick.volume)
+            self._notional += tick.price * max(0, tick.volume)
+            self._count += 1
+            self._source_ids.append(tick.record_id)
+        return completed
+
+    def current_bar(self) -> RealtimeMinuteBar | None:
+        if self._minute_start is None:
+            return None
+        return RealtimeMinuteBar(
+            symbol=self.symbol,
+            minute_start=self._minute_start,
+            open=self._open,
+            high=self._high,
+            low=self._low,
+            close=self._close,
+            volume=self._volume,
+            vwap=self._notional / self._volume if self._volume else self._close,
+            trade_count=self._count,
+            spread_bps=0.0,
+            orderbook_imbalance=0.0,
+            liquidity_score=0.0,
+            volatility=0.0,
+            last_update_age_ms=0.0,
+            source_record_ids=tuple(self._source_ids),
+        )
+
+    def _reset(self, minute: datetime, tick: RealtimeTradeTick) -> None:
+        self._minute_start = minute
+        self._open = self._high = self._low = self._close = tick.price
+        self._volume = max(0, tick.volume)
+        self._notional = tick.price * self._volume
+        self._count = 1
+        self._source_ids = [tick.record_id]
+
+
+@dataclass(frozen=True)
+class RuntimeStats:
+    fast_path_events: int
+    rejected_events: int
+    persistence_enqueued: int
+    persistence_dropped: int
+    persistence_completed: int
+
+
+class EventDrivenMarketRuntime:
+    """Separates in-memory fast-path updates from blocking persistence."""
+
+    def __init__(
+        self,
+        bus: BoundedMarketEventBus,
+        *,
+        store: object | None = None,
+        persistence_capacity: int = 8192,
+    ) -> None:
+        self.bus = bus
+        self.store = store
+        self.state = MarketState()
+        self._bars: dict[str, IncrementalMinuteBarBuilder] = {}
+        self._persistence: asyncio.Queue[
+            tuple[MarketEvent, RealtimeMinuteBar | None]
+        ] = asyncio.Queue(maxsize=persistence_capacity)
+        self._fast_path_events = 0
+        self._rejected_events = 0
+        self._persistence_enqueued = 0
+        self._persistence_dropped = 0
+        self._persistence_completed = 0
+        self.last_processed_event: MarketEvent | None = None
+
+    async def process_one(self) -> bool:
+        event = await self.bus.get()
+        self.last_processed_event = event
+        accepted = self.state.apply(event)
+        self._fast_path_events += 1
+        if not accepted:
+            self._rejected_events += 1
+            return False
+        completed_bar = None
+        if isinstance(event, RealtimeTradeTick):
+            builder = self._bars.setdefault(
+                event.symbol, IncrementalMinuteBarBuilder(event.symbol)
+            )
+            completed_bar = builder.update(event)
+        if self.store is not None:
+            try:
+                self._persistence.put_nowait((event, completed_bar))
+                self._persistence_enqueued += 1
+            except asyncio.QueueFull:
+                # Market-state truth remains in memory; persistence loss is
+                # explicit telemetry and replay can recover from the raw feed.
+                self._persistence_dropped += 1
+        return True
+
+    async def persist_one(self) -> None:
+        event, completed_bar = await self._persistence.get()
+        try:
+            await asyncio.to_thread(self._persist, event, completed_bar)
+            self._persistence_completed += 1
+        finally:
+            self._persistence.task_done()
+
+    async def wait_for_persistence(self) -> None:
+        await self._persistence.join()
+
+    def stats(self) -> RuntimeStats:
+        return RuntimeStats(
+            fast_path_events=self._fast_path_events,
+            rejected_events=self._rejected_events,
+            persistence_enqueued=self._persistence_enqueued,
+            persistence_dropped=self._persistence_dropped,
+            persistence_completed=self._persistence_completed,
+        )
+
+    def _persist(
+        self,
+        event: MarketEvent,
+        completed_bar: RealtimeMinuteBar | None,
+    ) -> None:
+        if isinstance(event, RealtimeTradeTick):
+            self.store.save_ticks((event,))  # type: ignore[attr-defined]
+        else:
+            self.store.save_orderbooks((event,))  # type: ignore[attr-defined]
+        if completed_bar is not None:
+            self.store.save_minute_bars((completed_bar,))  # type: ignore[attr-defined]

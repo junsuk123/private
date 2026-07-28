@@ -1,0 +1,26 @@
+{
+  "checkpoint": "data\\models\\strategy_utility\\rgcn_shadow.npz",
+  "config": {
+    "batch_size": 1,
+    "feature_dim": 12,
+    "hidden_dim": 16,
+    "max_nodes": 1,
+    "relation_count": 1,
+    "seed": 17,
+    "strategy_count": 7,
+    "time_steps": 1
+  },
+  "live_authorized": false,
+  "method": "causal_feature_encoder_plus_ridge_calibrated_heads",
+  "rows": 34888,
+  "snapshots": 4984,
+  "strategies": {
+    "breakout_volume": 4984,
+    "cross_sectional_relative_strength": 4984,
+    "event_momentum": 4984,
+    "gap_context": 4984,
+    "intraday_momentum": 4984,
+    "liquidity_shock_reversal": 4984,
+    "vwap_mean_reversion": 4984
+  }
+}

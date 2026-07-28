@@ -1,0 +1,17 @@
+{
+  "mode": "shadow",
+  "broker_submission_enabled": false,
+  "maximum_order_notional": 0,
+  "allowed_symbols": [],
+  "flags": {
+    "legacy_vote_path": true,
+    "websocket_market_data": true,
+    "local_chart_engine": true,
+    "ontology_router": true,
+    "gnn_shadow": true,
+    "gnn_rerank": false,
+    "npu_inference": false,
+    "strategy_owned_execution": false,
+    "live_enabled": false
+  }
+}

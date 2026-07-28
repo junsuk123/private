@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -42,12 +43,32 @@ class ModelArtifactRegistry:
     def save(self, artifact: dict[str, Any]) -> Path:
         artifact_id = str(artifact["artifact_id"])
         path = self.root / f"{artifact_id}.json"
+        incumbent = self._read_latest_payload()
+        promoted, reason = _promotion_decision(artifact, incumbent)
+        artifact["deployment"] = {
+            "promoted": promoted,
+            "reason": reason,
+            "incumbent_artifact_id": (
+                str(incumbent.get("artifact_id") or "") if incumbent else None
+            ),
+        }
         payload = json.dumps(artifact, indent=2, sort_keys=True)
         _atomic_write_text(path, payload)
-        if artifact.get("live_eligible") is True:
-            # 적격 모델만 latest를 갱신 — 주기적 재학습이 부적격이면 기존 적격 모델을 보존한다.
+        if promoted:
+            # Only a live-eligible challenger that improves on the incumbent
+            # becomes the active model. Threshold eligibility alone is not
+            # sufficient to replace a stronger production model.
             _atomic_write_text(self.latest_path, payload)
         return path
+
+    def _read_latest_payload(self) -> dict[str, Any] | None:
+        if not self.latest_path.exists():
+            return None
+        try:
+            payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def load_latest_live_eligible(self) -> ModelArtifact:
         if not self.latest_path.exists():
@@ -90,6 +111,69 @@ def _atomic_write_text(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _promotion_decision(
+    candidate: dict[str, Any],
+    incumbent: dict[str, Any] | None,
+) -> tuple[bool, str]:
+    if candidate.get("live_eligible") is not True:
+        return False, "NOT_LIVE_ELIGIBLE"
+    if not incumbent or incumbent.get("live_eligible") is not True:
+        return True, "FIRST_LIVE_ELIGIBLE_MODEL"
+
+    candidate_metrics = candidate.get("metrics") or {}
+    incumbent_metrics = incumbent.get("metrics") or {}
+    candidate_auc = _finite_metric(candidate_metrics, "auc")
+    candidate_precision = _finite_metric(candidate_metrics, "precision_at_k")
+    candidate_return = _finite_metric(
+        candidate_metrics,
+        "avg_forward_net_return_bps_top_k",
+    )
+    incumbent_auc = _finite_metric(incumbent_metrics, "auc")
+    incumbent_precision = _finite_metric(incumbent_metrics, "precision_at_k")
+    incumbent_return = _finite_metric(
+        incumbent_metrics,
+        "avg_forward_net_return_bps_top_k",
+    )
+
+    max_auc_drop = _env_float("LIVE_MODEL_PROMOTION_MAX_AUC_DROP", 0.01)
+    max_precision_drop = _env_float("LIVE_MODEL_PROMOTION_MAX_PRECISION_DROP", 0.02)
+    max_return_drop = _env_float("LIVE_MODEL_PROMOTION_MAX_RETURN_BPS_DROP", 2.0)
+    no_material_regression = (
+        candidate_auc >= incumbent_auc - max_auc_drop
+        and candidate_precision >= incumbent_precision - max_precision_drop
+        and candidate_return >= incumbent_return - max_return_drop
+    )
+    improves = (
+        candidate_auc >= incumbent_auc + _env_float("LIVE_MODEL_PROMOTION_MIN_AUC_GAIN", 0.005)
+        or candidate_precision
+        >= incumbent_precision
+        + _env_float("LIVE_MODEL_PROMOTION_MIN_PRECISION_GAIN", 0.01)
+        or candidate_return
+        >= incumbent_return
+        + _env_float("LIVE_MODEL_PROMOTION_MIN_RETURN_BPS_GAIN", 1.0)
+    )
+    if not no_material_regression:
+        return False, "CHALLENGER_REGRESSES_ACTIVE_MODEL"
+    if not improves:
+        return False, "NO_MEASURABLE_IMPROVEMENT"
+    return True, "CHALLENGER_IMPROVED_ACTIVE_MODEL"
+
+
+def _finite_metric(metrics: dict[str, Any], key: str) -> float:
+    try:
+        value = float(metrics.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _artifact_from_payload(payload: dict[str, Any], path: Path) -> ModelArtifact:

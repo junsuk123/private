@@ -24,6 +24,7 @@ from app.research import ResearchService
 from app.storage import LocalResearchStore
 from app.trading.live_runtime_guard import env_bool as runtime_env_bool
 from app.trading_pipeline import load_short_horizon_strategy_config
+from app.config.refactor_profile import load_refactor_profile
 
 
 def main() -> None:
@@ -100,6 +101,7 @@ def run_startup_checks(research_config: Path) -> dict[str, Any]:
     )
 
     strategy_config = load_short_horizon_strategy_config()
+    refactor_profile = load_refactor_profile()
     execution = dict(strategy_config.get("execution", {}) or {})
     live_enabled_by_config = bool(execution.get("live_trading_enabled", False))
     live_enabled_by_env = runtime_env_bool("LIVE_TRADING_ENABLED", False) and runtime_env_bool("KIS_LIVE_ENABLED", False)
@@ -125,6 +127,13 @@ def run_startup_checks(research_config: Path) -> dict[str, Any]:
         "live_trading_enabled": live_enabled_by_config and live_enabled_by_env,
         "live_trading_enabled_by_config": live_enabled_by_config,
         "live_trading_enabled_by_env": live_enabled_by_env,
+        "refactor_runtime": {
+            "mode": refactor_profile.mode.value,
+            "broker_submission_enabled": refactor_profile.broker_submission_enabled,
+            "maximum_order_notional": refactor_profile.maximum_order_notional,
+            "allowed_symbol_count": len(refactor_profile.allowed_symbols),
+            "flags": asdict(refactor_profile.flags),
+        },
     }
     audit.record("startup_checks", summary)
     return summary

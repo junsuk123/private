@@ -313,14 +313,43 @@ class RealtimeTradingEngine:
 
     # ---- status ---------------------------------------------------------
     def disable_buys(self, reason: str = "BUY_DISABLED") -> None:
+        # Engine control is instance-local. Process-wide runtime policy belongs
+        # to the orchestration layer (app.web explicitly updates the environment
+        # during live termination). Mutating os.environ here disabled every
+        # subsequently constructed engine and made recovery/tests order-dependent.
         self._buy_enabled = False
         self._buy_disabled_reason = reason
-        os.environ["REALTIME_BUY_ENABLED"] = "false"
         self._record(
             {
                 "at": datetime.now(timezone.utc).isoformat(),
                 "kind": "CONTROL",
                 "outcome": "buy_disabled",
+                "detail": reason,
+            }
+        )
+
+    def enable_buys(self, reason: str = "BUY_REENABLED") -> None:
+        """Re-enable entries after a transient reliability demotion.
+
+        Position monitoring never stops during a demotion; this control only
+        restores new entries after the orchestration layer has revalidated the
+        broker, policy, model, and at least one live market.
+        """
+        if self._liquidation_requested:
+            return
+        configured = os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self._buy_enabled = configured
+        self._buy_disabled_reason = None if configured else "REALTIME_BUY_ENABLED=false"
+        self._record(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "kind": "CONTROL",
+                "outcome": "buy_enabled" if configured else "buy_remains_disabled",
                 "detail": reason,
             }
         )

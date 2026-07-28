@@ -251,6 +251,34 @@ class MockKisApiTest(unittest.TestCase):
         token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
         self.assertEqual(len(token_calls), 1)
 
+    def test_kis_access_token_cache_is_not_reused_after_credentials_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_cache_path = Path(tmp) / "kis_access_token.live.json"
+            transport = RecordingKisTransport()
+            first = KisDevelopersApiClient(
+                app_key="first-app",
+                app_secret="first-secret",
+                account_no="12345678-01",
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+            first.issue_access_token()
+            second = KisDevelopersApiClient(
+                app_key="second-app",
+                app_secret="second-secret",
+                account_no="12345678-01",
+                enabled=True,
+                transport=transport,
+                token_cache_path=token_cache_path,
+            )
+
+            second.issue_access_token()
+
+        token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
+        self.assertEqual(len(token_calls), 2)
+        self.assertEqual(second.token_source, "issued")
+
     def test_unwritable_kis_token_cache_blocks_token_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             token_cache_path = Path(tmp) / "kis_access_token.paper.json"
@@ -568,6 +596,54 @@ class MockKisApiTest(unittest.TestCase):
         portfolio = broker.get_portfolio()
 
         self.assertEqual(portfolio.account.equity, 202_698)
+
+    def test_kis_krw_only_account_does_not_render_integrated_cash_as_foreign_cash(self) -> None:
+        class KrwOnlyIntegratedMarginTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": dict(body or {}), "params": dict(params or {})})
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    return {
+                        "rt_cd": "0",
+                        "output1": [],
+                        "output2": [{"dnca_tot_amt": "200000", "tot_evlu_amt": "200000"}],
+                    }
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_cash": "200000"}}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-balance"):
+                    return {"rt_cd": "0", "output1": []}
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-present-balance"):
+                    # KIS may echo the KRW integrated-margin deposit in this
+                    # foreign-looking summary even though no currency row exists.
+                    return {
+                        "rt_cd": "0",
+                        "output1": [],
+                        "output2": [],
+                        "output3": {
+                            "tot_asst_amt": "200000",
+                            "tot_frcr_cblc_smtl": "200000",
+                        },
+                    }
+                if url.endswith("/uapi/overseas-stock/v1/trading/inquire-psamount"):
+                    return {"rt_cd": "0", "output": {"ord_psbl_amt": "0"}}
+                raise AssertionError(f"unexpected KIS request: {method} {url}")
+
+        broker = KisDevelopersApiClient(
+            app_key="paper-app",
+            app_secret="paper-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=KrwOnlyIntegratedMarginTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.equity, 200_000)
+        self.assertEqual(portfolio.account.cash, 200_000)
+        self.assertEqual(portfolio.account.cash_equivalent_krw, 200_000)
+        self.assertEqual(portfolio.account.foreign_cash_krw, 0)
+        self.assertEqual(portfolio.account.cash_by_currency, {"KRW": 200_000})
 
     def test_kis_portfolio_prefers_account_asset_balance_total(self) -> None:
         class AccountAssetBalanceTransport(RecordingKisTransport):

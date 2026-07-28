@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from app.config import OrderExecutionConfig, load_order_execution_config
 from app.config.live_config import LiveConfigError, load_live_trading_safety_config
+from app.config.refactor_flags import RefactorFeatureFlags
+from app.execution.causal_journal import CausalOrderJournal
 from app.execution.idempotency_store import IdempotencyStore
 from app.execution.kis_real import KisApiError
 from app.execution.kis_auth import run_kis_health_check
@@ -18,6 +20,12 @@ from app.execution.kis_types import LiveOrderSubmission
 from app.execution.live_order_journal import LiveOrderJournal
 from app.execution.order_status_tracker import OrderStatusTracker
 from app.schemas.domain import FinalOrder, OrderType
+from app.trading.contracts import (
+    IntentAction,
+    OrderIntent as CausalOrderIntent,
+    RiskVerdict,
+    RiskVerdictAction,
+)
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
 
 
@@ -30,11 +38,13 @@ class LiveExecutionCoordinator:
         *,
         idempotency_store: IdempotencyStore | None = None,
         journal: LiveOrderJournal | None = None,
+        causal_journal: CausalOrderJournal | None = None,
         execution_config: OrderExecutionConfig | None = None,
     ) -> None:
         self.broker = broker
         self.idempotency_store = idempotency_store or IdempotencyStore()
         self.journal = journal or LiveOrderJournal()
+        self.causal_journal = causal_journal
         self.execution_config = execution_config or load_order_execution_config(allow_example=True)
         self.status_tracker = OrderStatusTracker(broker)
 
@@ -62,6 +72,31 @@ class LiveExecutionCoordinator:
             raise LiveExecutionBlocked(tuple(failures))
 
         execution_id = f"LIVE-{uuid4().hex}"
+        pending_result = {
+            "execution_id": execution_id,
+            "broker_order_id": None,
+            "status": "PENDING_SUBMISSION",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "order": asdict(order),
+        }
+        reserved, reservation = self.idempotency_store.reserve(
+            key,
+            payload_hash,
+            pending_result,
+            ttl_seconds=self.execution_config.idempotency_ttl_seconds,
+        )
+        if not reserved:
+            if reservation.payload_hash != payload_hash:
+                raise LiveExecutionBlocked(("IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",))
+            result = reservation.result
+            return LiveOrderSubmission(
+                execution_id=str(result.get("execution_id") or key),
+                idempotency_key=key,
+                status=str(result.get("status") or reservation.status),
+                broker_order_id=result.get("broker_order_id"),
+                submitted_at=_parse_dt(result.get("submitted_at")) or reservation.created_at,
+                message="idempotent replay",
+            )
         self.journal.record(
             "live_order_submission_attempt",
             {"execution_id": execution_id, "idempotency_key": key, "order": order},
@@ -88,6 +123,16 @@ class LiveExecutionCoordinator:
                     "error_payload": error_payload,
                 },
             )
+            self.idempotency_store.put(
+                key,
+                payload_hash,
+                "SUBMISSION_ERROR_RECONCILIATION_REQUIRED",
+                {
+                    **pending_result,
+                    "status": "SUBMISSION_ERROR_RECONCILIATION_REQUIRED",
+                    "error_type": exc.__class__.__name__,
+                },
+            )
             raise
 
         broker_order_id = str(getattr(receipt, "order_id", ""))
@@ -109,6 +154,80 @@ class LiveExecutionCoordinator:
             submitted_at=_parse_dt(result["submitted_at"]) or datetime.now(timezone.utc),
             message=str(getattr(receipt, "message", "")),
         )
+
+    def submit_approved_intent(
+        self,
+        intent: CausalOrderIntent,
+        verdict: RiskVerdict,
+        order: FinalOrder,
+    ) -> LiveOrderSubmission:
+        """Submit the strategy-owned path after durable causal validation.
+
+        This path is deliberately separate from the legacy FinalOrder API and
+        remains inaccessible until its feature flag is explicitly enabled.
+        """
+        flags = RefactorFeatureFlags.from_env()
+        if not flags.strategy_owned_execution:
+            raise LiveExecutionBlocked(("STRATEGY_OWNED_EXECUTION_DISABLED",))
+        self._validate_causal_chain(intent, verdict, order)
+        causal_journal = self.causal_journal or CausalOrderJournal()
+        self.causal_journal = causal_journal
+        causal_journal.persist_intent(intent)
+        causal_journal.persist_risk_verdict(verdict)
+        causal_journal.record(
+            "broker_submission_authorized",
+            {
+                "intent_id": intent.intent_id,
+                "verdict_id": verdict.verdict_id,
+                "idempotency_key": intent.idempotency_key,
+                "approved_quantity": verdict.approved_quantity,
+            },
+        )
+        submission = self.submit_final_order(order, idempotency_key=intent.idempotency_key)
+        causal_journal.record(
+            "broker_order_linked",
+            {
+                "intent_id": intent.intent_id,
+                "verdict_id": verdict.verdict_id,
+                "idempotency_key": intent.idempotency_key,
+                "execution_id": submission.execution_id,
+                "broker_order_id": submission.broker_order_id,
+                "status": submission.status,
+                "submitted_at": submission.submitted_at,
+            },
+        )
+        return submission
+
+    def _validate_causal_chain(
+        self,
+        intent: CausalOrderIntent,
+        verdict: RiskVerdict,
+        order: FinalOrder,
+    ) -> None:
+        if verdict.intent_id != intent.intent_id:
+            raise LiveExecutionBlocked(("RISK_VERDICT_INTENT_MISMATCH",))
+        if verdict.action not in {
+            RiskVerdictAction.APPROVE,
+            RiskVerdictAction.RESIZE,
+            RiskVerdictAction.EMERGENCY_EXIT,
+        }:
+            raise LiveExecutionBlocked(("RISK_VERDICT_NOT_EXECUTABLE",))
+        if verdict.approved_quantity <= 0:
+            raise LiveExecutionBlocked(("RISK_APPROVED_QUANTITY_NOT_POSITIVE",))
+        if verdict.approved_quantity > intent.quantity:
+            raise LiveExecutionBlocked(("RISK_QUANTITY_EXCEEDS_INTENT",))
+        if order.quantity != verdict.approved_quantity:
+            raise LiveExecutionBlocked(("FINAL_ORDER_QUANTITY_DIFFERS_FROM_RISK",))
+        if order.ticker.upper() != intent.symbol.upper():
+            raise LiveExecutionBlocked(("FINAL_ORDER_SYMBOL_DIFFERS_FROM_INTENT",))
+        expected_side = {
+            IntentAction.BUY: "BUY",
+            IntentAction.SELL: "SELL",
+        }.get(intent.action)
+        if expected_side is None:
+            raise LiveExecutionBlocked(("INTENT_ACTION_NOT_SUBMITTABLE",))
+        if order.side.value != expected_side:
+            raise LiveExecutionBlocked(("FINAL_ORDER_SIDE_DIFFERS_FROM_INTENT",))
 
     def poll_status(self, broker_order_id: str) -> Any:
         snapshot = self.status_tracker.poll(

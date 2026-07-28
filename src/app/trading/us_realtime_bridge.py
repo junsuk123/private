@@ -592,6 +592,18 @@ def refresh_us_realtime_for_context_buy_candidates(
         else:
             raise RuntimeError("RealtimeMarketDataStore has no save_orderbooks method")
 
+    if ticks or books:
+        from app.data.market_data_health import evaluate_market_data_health
+
+        for symbol in target_symbols:
+            evaluate_market_data_health(
+                store,
+                symbol,
+                max_quote_age_ms=15_000,
+                max_orderbook_age_ms=15_000,
+            )
+            store.build_latest_minute_bar(symbol)
+
     touched = _touch_latest_rows(target_symbols)
 
     return {

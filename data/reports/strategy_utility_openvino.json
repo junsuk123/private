@@ -1,0 +1,38 @@
+{
+  "cpu": {
+    "compile_ms": 89.91499999683583,
+    "compiled_devices": [
+      "CPU"
+    ],
+    "fallback_reason": null,
+    "iterations": 30,
+    "model_hash": "6acf71cd0718e3738b9725df0b616f5cf9bf21892b3592b7952340b050a99ed4",
+    "p50_ms": 0.32869999995455146,
+    "p95_ms": 0.6600999986403622,
+    "p99_ms": 0.6665000037173741,
+    "precision": "FP32",
+    "requested_device": "CPU",
+    "throughput_per_second": 2789.192807137587
+  },
+  "npu": {
+    "compile_ms": 43.786800000816584,
+    "compiled_devices": [
+      "NPU"
+    ],
+    "fallback_reason": null,
+    "iterations": 30,
+    "model_hash": "6acf71cd0718e3738b9725df0b616f5cf9bf21892b3592b7952340b050a99ed4",
+    "p50_ms": 1.1372500011930242,
+    "p95_ms": 1.3975999972899444,
+    "p99_ms": 2.262500005599577,
+    "precision": "FP32",
+    "requested_device": "NPU",
+    "throughput_per_second": 837.0302168570878
+  },
+  "parity": {
+    "max_abs_utility_error": 0.030865192413330078,
+    "no_trade_max_abs_error": 7.655471563339233e-05,
+    "top1_agreement": 1.0
+  },
+  "promotion_eligible": false
+}

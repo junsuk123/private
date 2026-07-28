@@ -1,0 +1,121 @@
+{
+  "configuration": {
+    "history_bars": 30,
+    "horizon_bars": 15,
+    "instrument_type": "overseas_stock",
+    "market": "US",
+    "minimum_symbol_bars": 100,
+    "quantity": 1,
+    "stride_bars": 5,
+    "venue": "NASD"
+  },
+  "coverage": {
+    "bars": 27884,
+    "distinct_utc_dates": 12,
+    "first_event": "2026-06-29T05:22:00+00:00",
+    "last_event": "2026-07-27T23:37:00+00:00",
+    "symbols": 429,
+    "symbols_meeting_minimum": 22
+  },
+  "labels": {
+    "snapshots": 4991,
+    "strategy_labels": 34937
+  },
+  "leakage_audit": {
+    "embargo_enabled": true,
+    "feature_cutoff_precedes_label_window": true,
+    "purging_enabled": true,
+    "rolling_quantiles_use_prior_slice_only": true,
+    "walk_forward_splits": 2
+  },
+  "limitations": [
+    "The local minute store is concentrated in a few US sessions, not the target KRX/NXT market.",
+    "Minute OHLC cannot recover tick-level queue position or intrabar barrier ordering.",
+    "Missing point-in-time events, sector graph, session calendar, and historical legacy decisions prevent the mandatory seven-strategy comparison."
+  ],
+  "mandatory_system_comparison": {
+    "legacy": "UNAVAILABLE",
+    "ontology_only": "NoTrade: required event/sector/session facts fail closed",
+    "tabular_baseline": "evaluated above",
+    "temporal_rgcn_cpu": "UNAVAILABLE_UNTRAINED",
+    "temporal_rgcn_npu": "UNAVAILABLE_UNTRAINED_AND_NPU_BENCHMARK_REJECTED"
+  },
+  "promotion_eligible": false,
+  "reproducibility": {
+    "code_sha256": "b5a2b36689ad39921ffbed77301c025dfd30c27330ce5845e46a4071d1c8c1ba",
+    "config_sha256": "02b6bb8785ca90df05e5773648be6a9af9c6a3a0fbba5bcf4d15c97f6ff9514e",
+    "label_data_sha256": "e8c4033710f7bfbe3c4b28c16df74b1fc730f78cc1ffa3660436ce5c05bee98f"
+  },
+  "status": "NOT_PROMOTED",
+  "strategy_metrics": {
+    "breakout_volume": {
+      "fill_rate_when_triggered": 0.9642049736247174,
+      "filled": 2559,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": -71.47488674133835,
+      "positive_net_rate_when_filled": 0.0,
+      "triggered": 2654
+    },
+    "cross_sectional_relative_strength": {
+      "fill_rate_when_triggered": null,
+      "filled": 0,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": null,
+      "positive_net_rate_when_filled": null,
+      "triggered": 0
+    },
+    "event_momentum": {
+      "fill_rate_when_triggered": null,
+      "filled": 0,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": null,
+      "positive_net_rate_when_filled": null,
+      "triggered": 0
+    },
+    "gap_context": {
+      "fill_rate_when_triggered": null,
+      "filled": 0,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": null,
+      "positive_net_rate_when_filled": null,
+      "triggered": 0
+    },
+    "intraday_momentum": {
+      "fill_rate_when_triggered": 0.9522719843085976,
+      "filled": 2913,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": -72.1986127850666,
+      "positive_net_rate_when_filled": 0.0,
+      "triggered": 3059
+    },
+    "liquidity_shock_reversal": {
+      "fill_rate_when_triggered": 0.9599256900212314,
+      "filled": 3617,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": -72.23067155608743,
+      "positive_net_rate_when_filled": 0.0,
+      "triggered": 3768
+    },
+    "vwap_mean_reversion": {
+      "fill_rate_when_triggered": 0.7688442211055276,
+      "filled": 153,
+      "labels": 4991,
+      "mean_net_return_bps_when_filled": -72.73072076474372,
+      "positive_net_rate_when_filled": 0.0,
+      "triggered": 199
+    }
+  },
+  "unavailable_evidence": {
+    "cross_sectional_relative_strength": "point-in-time sector graph absent",
+    "event_momentum": "point-in-time event feed absent",
+    "gap_context": "authoritative exchange session calendar absent",
+    "legacy": "historical legacy decisions were not journaled against these snapshots",
+    "temporal_rgcn": "no trained/calibrated checkpoint exists"
+  },
+  "walk_forward_tabular_baseline": {
+    "mean_net_return_bps": 0.0,
+    "observations": 1996,
+    "policy": "train-window strategy mean; select only positive expected net utility",
+    "selected_trades": 0
+  }
+}

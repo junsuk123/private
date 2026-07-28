@@ -29,6 +29,9 @@ class RealtimeModesTest(unittest.TestCase):
             web_module._affordable_candidate_cache.update({"key": None, "at": 0.0, "symbols": ()})
             web_module._live_buy_candidate_backoff_until.clear()
             web_module._volume_surge_warm_cache.update({"at": 0.0, "symbols": ()})
+            web_module._us_learning_watchlist_cache.update(
+                {"at": 0.0, "cash_usd": None, "symbols": ()}
+            )
         from app.graph import macro_micro_feed
 
         macro_micro_feed.clear()
@@ -1250,7 +1253,7 @@ class RealtimeModesTest(unittest.TestCase):
             ):
                 symbols = web_module._kis_realtime_collector_symbols()
 
-            self.assertEqual(symbols[:4], ("006880", "232680", "012210", "005930"))
+            self.assertEqual(symbols[:5], ("006880", "279570", "232680", "012210", "005930"))
             self.assertIn("279570", symbols)
             self.assertNotIn("AAPL", symbols)
             self.assertNotIn("MSFT", symbols)
@@ -1260,7 +1263,7 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._pending_krx_buy_candidate_warmup.clear()
                 web_module._pending_krx_buy_candidate_warmup.update(previous_pending)
 
-    def test_realtime_buy_candidates_prefer_krx_during_domestic_session(self) -> None:
+    def test_realtime_buy_candidates_reserve_slots_for_both_open_markets(self) -> None:
         account = AccountSnapshot(
             cash=100000.0,
             holdings=(),
@@ -1274,7 +1277,7 @@ class RealtimeModesTest(unittest.TestCase):
         ):
             ordered = web_module._prioritize_realtime_buy_candidates(("AAPL", "005930", "MSFT", "066310"))
 
-        self.assertEqual(ordered[:2], ("005930", "066310"))
+        self.assertEqual(ordered, ("005930", "AAPL", "066310", "MSFT"))
 
     def test_realtime_buy_candidates_place_us_scan_before_broad_affordable_scan(self) -> None:
         account = AccountSnapshot(cash=0.0, holdings=(), cash_by_currency={"USD": 1000.0})
@@ -1305,6 +1308,73 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(candidates[:4], ("RBBN", "BZ", "ACET", "ACFN"))
         self.assertEqual(captured[0][:4], ("RBBN", "BZ", "ACET", "ACFN"))
+
+    def test_realtime_engine_candidates_do_not_run_synchronous_broker_discovery(self) -> None:
+        with (
+            patch("app.web.RealtimeMarketDataStore") as store_cls,
+            patch("app.web._cached_context_buy_candidates", return_value=("HOWL",)),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch("app.web._prioritize_realtime_buy_candidates", side_effect=lambda symbols: tuple(symbols)),
+            patch("app.web._is_live_buy_candidate_symbol", return_value=True),
+            patch("app.web._is_open_live_market_ticker", return_value=True),
+            patch("app.web._live_affordable_buy_candidate_symbols") as broker_discovery,
+        ):
+            store_cls.return_value.active_symbols.return_value = ("HST", "HUYA")
+            with web_module._live_lock:
+                web_module._us_learning_watchlist_cache["symbols"] = ("HYZD",)
+            candidates = web_module._realtime_engine_buy_candidates()
+
+        self.assertEqual(candidates, ("HOWL", "HYZD", "HST", "HUYA"))
+        broker_discovery.assert_not_called()
+
+    def test_us_learning_watchlist_stays_fixed_during_cache_ttl(self) -> None:
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"USD": 143.25},
+        )
+        with (
+            patch("app.web._account_snapshot_from_live_basis", return_value=account),
+            patch("app.web._last_live_account_basis", return_value={}),
+            patch(
+                "app.web._recent_affordable_us_watchlist",
+                return_value=("AAPL", "MSFT"),
+            ) as recent,
+            patch(
+                "app.web._live_affordable_buy_candidate_symbols",
+                return_value=("NVDA",),
+            ) as discover,
+            patch.dict("os.environ", {"REALTIME_US_WATCHLIST_TTL_SEC": "1800"}),
+        ):
+            first = web_module._sticky_us_learning_symbols(2)
+            second = web_module._sticky_us_learning_symbols(2)
+
+        self.assertEqual(first, ("AAPL", "MSFT"))
+        self.assertEqual(second, first)
+        recent.assert_called_once()
+        discover.assert_not_called()
+
+    def test_us_learning_watchlist_fills_only_missing_slots(self) -> None:
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"USD": 143.25},
+        )
+        with (
+            patch("app.web._account_snapshot_from_live_basis", return_value=account),
+            patch("app.web._last_live_account_basis", return_value={}),
+            patch(
+                "app.web._recent_affordable_us_watchlist",
+                return_value=("AAPL",),
+            ),
+            patch(
+                "app.web._live_affordable_buy_candidate_symbols",
+                return_value=("AAPL", "MSFT", "005930"),
+            ),
+        ):
+            symbols = web_module._sticky_us_learning_symbols(2)
+
+        self.assertEqual(symbols, ("AAPL", "MSFT"))
 
     def test_kis_realtime_collector_symbols_are_capped_by_subscription_budget(self) -> None:
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
@@ -1910,6 +1980,40 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertTrue(web_module._is_live_market_extended_open("KRX", opening_auction))
         self.assertFalse(web_module._is_live_market_core_open("KRX", opening_auction))
+
+    def test_reliability_does_not_require_krx_regular_ticks_during_opening_auction(self) -> None:
+        opening_auction = datetime(2026, 6, 30, 23, 45, tzinfo=timezone.utc)
+        captured: list[tuple[str, ...]] = []
+
+        def market_health(_now, groups):
+            captured.append(tuple(groups))
+            return {"ok": True, "healthy": {"US": ["AAPL", "MSFT"], "KRX": []}}
+
+        with (
+            patch("app.web._active_live_market_groups", return_value=("US", "KRX")),
+            patch("app.web._cached_kis_connection_probe", return_value={
+                "ok": True,
+                "account_checked": True,
+                "actual_equity": 200000.0,
+            }),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
+            patch("app.web.load_short_horizon_strategy_config", return_value={
+                "execution": {"live_trading_enabled": True},
+            }),
+            patch("app.web.TradingPolicySnapshot") as policy,
+            patch("app.web._latest_model_reliability", return_value={"ok": True}),
+            patch("app.web._auto_market_health", side_effect=market_health),
+            patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"}),
+        ):
+            policy.from_environment.return_value.conflicts.return_value = ()
+            result = web_module._evaluate_auto_reliability(opening_auction)
+
+        self.assertEqual(captured, [("US",)])
+        self.assertEqual(result["components"]["market_data"]["required_markets"], ["US"])
+        self.assertEqual(
+            result["components"]["market_data"]["extended_order_markets"],
+            ["US", "KRX"],
+        )
 
     def test_live_affordable_krx_discovery_default_limit_is_broader_for_small_cash(self) -> None:
         stored = StoredResearch(

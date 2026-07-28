@@ -37,10 +37,9 @@ class RealtimeAccelerationPolicy:
         os.environ.setdefault("OPENVINO_HINT_PERFORMANCE_MODE", "LATENCY")
         os.environ.setdefault("OPENVINO_ENABLE_CPU_PINNING", "YES")
         os.environ.setdefault("OPENVINO_CACHE_DIR", "data/runtime/openvino_cache")
-        if self._openvino_npu_available():
-            os.environ.setdefault("LLM_EVENT_INFERENCE_BACKEND", "openvino")
-            os.environ.setdefault("LLM_EVENT_DEVICE", "NPU")
-            os.environ.setdefault("LLM_EVENT_PROVIDER", "openvino-llm")
+        # Event classification is a separate model lifecycle. NPU availability alone
+        # must not turn an Ollama model id into a nonexistent embedded model path.
+        # Explicit LLM_EVENT_* configuration may still select OpenVINO/NPU.
 
     def status(self) -> RealtimeRuntimeStatus:
         self.apply_process_hints()

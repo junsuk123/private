@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +19,8 @@ from app.data.realtime_types import (
 
 
 class RealtimeMarketDataStore:
+    _last_prune_monotonic = 0.0
+
     def __init__(self, db_path: str | Path = "data/store/realtime_market_data.sqlite3") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,9 +110,15 @@ class RealtimeMarketDataStore:
                     source text not null,
                     payload_json text not null
                 );
+                create index if not exists idx_data_source_events_observed
+                    on data_source_events(observed_at);
                 """
             )
             conn.commit()
+        now = time.monotonic()
+        if now - self.__class__._last_prune_monotonic >= 3600:
+            self.prune_operational_history()
+            self.__class__._last_prune_monotonic = now
 
     def save_ticks(self, ticks: tuple[RealtimeTradeTick, ...]) -> int:
         rows = [
@@ -127,7 +137,7 @@ class RealtimeMarketDataStore:
             )
             for tick in ticks
         ]
-        return self._insert_many(
+        inserted = self._insert_many(
             """
             insert or ignore into realtime_ticks
             (record_id, symbol, exchange_timestamp, received_at, source, price, volume,
@@ -136,6 +146,23 @@ class RealtimeMarketDataStore:
             """,
             rows,
         )
+        self._save_source_events(
+            [
+                (
+                    f"trade:{tick.record_id}",
+                    "trade",
+                    tick.symbol,
+                    tick.exchange_timestamp.isoformat(),
+                    tick.source,
+                    json.dumps(
+                        {"price": tick.price, "volume": tick.volume, "record_id": tick.record_id},
+                        ensure_ascii=True,
+                    ),
+                )
+                for tick in ticks
+            ]
+        )
+        return inserted
 
     def save_orderbooks(self, snapshots: tuple[RealtimeOrderbookSnapshot, ...]) -> int:
         rows = [
@@ -158,7 +185,7 @@ class RealtimeMarketDataStore:
             )
             for snapshot in snapshots
         ]
-        return self._insert_many(
+        inserted = self._insert_many(
             """
             insert or ignore into realtime_orderbook
             (record_id, symbol, exchange_timestamp, received_at, source, best_bid, best_ask,
@@ -168,6 +195,28 @@ class RealtimeMarketDataStore:
             """,
             rows,
         )
+        self._save_source_events(
+            [
+                (
+                    f"orderbook:{snapshot.record_id}",
+                    "orderbook",
+                    snapshot.symbol,
+                    snapshot.exchange_timestamp.isoformat(),
+                    snapshot.source,
+                    json.dumps(
+                        {
+                            "best_bid": snapshot.best_bid,
+                            "best_ask": snapshot.best_ask,
+                            "spread_bps": snapshot.spread_bps,
+                            "record_id": snapshot.record_id,
+                        },
+                        ensure_ascii=True,
+                    ),
+                )
+                for snapshot in snapshots
+            ]
+        )
+        return inserted
 
     def save_minute_bars(self, bars: tuple[RealtimeMinuteBar, ...]) -> int:
         rows = [
@@ -190,7 +239,7 @@ class RealtimeMarketDataStore:
             )
             for bar in bars
         ]
-        return self._insert_many(
+        inserted = self._insert_many(
             """
             insert or replace into realtime_minute_bars
             (symbol, minute_start, open, high, low, close, volume, vwap, trade_count,
@@ -200,8 +249,28 @@ class RealtimeMarketDataStore:
             """,
             rows,
         )
+        self._save_source_events(
+            [
+                (
+                    f"minute_bar:{bar.symbol}:{bar.minute_start.isoformat()}",
+                    "minute_bar",
+                    bar.symbol,
+                    bar.minute_start.isoformat(),
+                    "realtime_aggregation",
+                    json.dumps(
+                        {"close": bar.close, "volume": bar.volume, "trade_count": bar.trade_count},
+                        ensure_ascii=True,
+                    ),
+                )
+                for bar in bars
+            ]
+        )
+        return inserted
 
     def save_health(self, health: MarketDataHealth) -> None:
+        # Health is a state sample, not a tick feed. A minute bucket prevents a
+        # tight polling loop from producing millions of duplicate rows per day.
+        checked_at = health.checked_at.replace(second=0, microsecond=0)
         with closing(self._connect()) as conn:
             conn.execute(
                 """
@@ -213,7 +282,7 @@ class RealtimeMarketDataStore:
                 """,
                 (
                     health.symbol,
-                    health.checked_at.isoformat(),
+                    checked_at.isoformat(),
                     health.quote_count,
                     health.orderbook_count,
                     health.latest_tick_at.isoformat() if health.latest_tick_at else None,
@@ -227,6 +296,56 @@ class RealtimeMarketDataStore:
                 ),
             )
             conn.commit()
+
+    def prune_operational_history(self, *, retention_hours: int | None = None) -> int:
+        hours = (
+            max(1, int(retention_hours))
+            if retention_hours is not None
+            else max(1, int(os.getenv("REALTIME_OPERATIONAL_RETENTION_HOURS", "24")))
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with closing(self._connect()) as conn:
+            before = conn.total_changes
+            conn.execute("delete from market_data_health where checked_at < ?", (cutoff,))
+            conn.execute("delete from data_source_events where observed_at < ?", (cutoff,))
+            conn.commit()
+            return int(conn.total_changes - before)
+
+    def backfill_source_events(self, *, retention_hours: int | None = None) -> int:
+        hours = max(
+            1,
+            int(
+                retention_hours
+                if retention_hours is not None
+                else os.getenv("REALTIME_OPERATIONAL_RETENTION_HOURS", "24")
+            ),
+        )
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with closing(self._connect()) as conn:
+            before = conn.total_changes
+            conn.execute(
+                """
+                insert or ignore into data_source_events
+                  (event_id, event_type, symbol, observed_at, source, payload_json)
+                select 'trade:' || record_id, 'trade', symbol, exchange_timestamp, source,
+                       json_object('price', price, 'volume', volume, 'record_id', record_id)
+                from realtime_ticks where exchange_timestamp >= ?
+                """,
+                (cutoff,),
+            )
+            conn.execute(
+                """
+                insert or ignore into data_source_events
+                  (event_id, event_type, symbol, observed_at, source, payload_json)
+                select 'orderbook:' || record_id, 'orderbook', symbol, exchange_timestamp, source,
+                       json_object('best_bid', best_bid, 'best_ask', best_ask,
+                                   'spread_bps', spread_bps, 'record_id', record_id)
+                from realtime_orderbook where exchange_timestamp >= ?
+                """,
+                (cutoff,),
+            )
+            conn.commit()
+            return int(conn.total_changes - before)
 
     def latest_tick(self, symbol: str) -> RealtimeTradeTick | None:
         with closing(self._connect()) as conn:
@@ -458,6 +577,18 @@ class RealtimeMarketDataStore:
             conn.executemany(sql, rows)
             conn.commit()
             return int(conn.total_changes - before)
+
+    def _save_source_events(self, rows: list[tuple[Any, ...]]) -> int:
+        if not rows:
+            return 0
+        return self._insert_many(
+            """
+            insert or ignore into data_source_events
+              (event_id, event_type, symbol, observed_at, source, payload_json)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path, timeout=30)

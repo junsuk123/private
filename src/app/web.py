@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import traceback
@@ -26,6 +27,7 @@ from starlette import routing as starlette_routing
 
 from app.web_account_routes import create_account_router
 from app.account_dashboard import AccountDashboardService
+from app.refactor_dashboard import build_refactor_dashboard, build_strategy_market_view
 from app.audit import AuditLogger
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
@@ -37,6 +39,7 @@ from app.execution.kis_errors import LiveExecutionBlocked
 from app.graph import KnowledgeGraph, get_ontology_runtime
 from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise_goals
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
+from app.config.refactor_flags import RefactorFeatureFlags
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.models.live_training_pipeline import (
@@ -74,7 +77,8 @@ from app.schemas.domain import (
 from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
 from app.trading import run_mock_trading_cycle
-from app.trading.live_runtime_guard import evaluate_live_runtime_gates
+from app.trading.live_runtime_guard import env_bool as live_env_bool, evaluate_live_runtime_gates
+from app.trading.trading_policy import TradingPolicySnapshot
 from app.trading.shared_decision_engine import SharedLiveDecisionEngine, _load_us_listed_exchange_map
 from app.trading.realtime_trading_engine import RealtimeTradingEngine
 from app.backtesting.accelerated_demo import load_krx_listed_universe, load_us_listed_universe
@@ -203,6 +207,7 @@ _auto_live_readiness_started = False
 # kiosk shows the trade display, not /account). Read-only w.r.t. trading.
 AUTO_START_ASSET_HISTORY_SAMPLER = os.getenv("AUTO_START_ASSET_HISTORY_SAMPLER", "true").lower() not in {"0", "false", "no", "off"}
 ASSET_HISTORY_SAMPLE_SECONDS = max(15, int(os.getenv("ASSET_HISTORY_SAMPLE_SECONDS", "60")))
+AUTO_RELIABILITY_MODE_ENABLED = live_env_bool("AUTO_RELIABILITY_MODE_ENABLED", False)
 
 
 def _account_dashboard_status_provider() -> dict[str, Any]:
@@ -386,7 +391,16 @@ _account_service = AccountDashboardService(
     technical_provider=_account_dashboard_technical_provider,
     macro_micro_provider=_account_dashboard_macro_micro_provider,
 )
-app.include_router(create_account_router(service=_account_service))
+app.include_router(
+    create_account_router(
+        service=_account_service,
+        refactor_provider=build_refactor_dashboard,
+        market_view_provider=lambda symbol, limit: build_strategy_market_view(
+            symbol,
+            limit=limit,
+        ),
+    )
+)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -401,6 +415,7 @@ _kis_realtime_collector_stop = threading.Event()
 _kis_realtime_collector_resubscribe = threading.Event()
 _pending_krx_buy_candidate_warmup: dict[str, float] = {}
 _kis_realtime_collector_skipped_subscriptions: dict[tuple[str, str], float] = {}
+_kis_realtime_observed_subscription_capacity: int | None = None
 _kis_realtime_last_resubscribe_request_at = 0.0
 _mock_kis_lock = threading.Lock()
 _mock_kis: MockKisDevelopersApi | None = None
@@ -429,6 +444,25 @@ _operation_mode_state: dict[str, Any] = {
         "last_error": None,
     },
       "live_trading_baseline_equity": None,
+}
+_auto_reliability_worker: threading.Thread | None = None
+_auto_reliability_stop = threading.Event()
+_auto_reliability_state: dict[str, Any] = {
+    "enabled": AUTO_RELIABILITY_MODE_ENABLED,
+    "mode": "learning",
+    "score": 0.0,
+    "ready": False,
+    "ready_streak": 0,
+    "unready_streak": 0,
+    "reasons": ["NOT_EVALUATED"],
+    "components": {},
+    "active_markets": [],
+    "evaluated_at": None,
+    "last_transition_at": None,
+    "last_transition_reason": None,
+    "last_error": None,
+    "last_learning_refresh_at": 0.0,
+    "last_us_warm_at": 0.0,
 }
 
 
@@ -620,7 +654,7 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   invested = _number_or_zero(connection.get("invested_value") or 0)
   if equity <= 0 and (cash > 0 or invested > 0):
     equity = cash + invested
-  if equity <= 0:
+  if equity <= 0 and not connection.get("ok"):
     return None
   cash = max(0.0, cash)
   krw_cash_value = max(0.0, cash_by_currency.get("KRW", krw_cash))
@@ -635,7 +669,7 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "base_currency": "KRW",
       "equity": equity,
       "invested_value": invested,
-      "cash_weight": max(0.0, min(1.0, cash / equity)),
+      "cash_weight": max(0.0, min(1.0, cash / equity)) if equity > 0 else 0.0,
       "source": "kis_live_account",
       "account_suffix": connection.get("account_suffix") or "",
       "positions": list(connection.get("positions") or ()),
@@ -756,6 +790,11 @@ def _goal_account_snapshot(context: Any) -> AccountSnapshot:
 
 def _live_account_snapshot_for_analysis() -> AccountSnapshot | None:
   basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
+  return _account_snapshot_from_live_basis(basis)
+
+
+def _account_snapshot_from_live_basis(basis: dict[str, Any] | None) -> AccountSnapshot | None:
+  """Build an account snapshot without making another broker request."""
   if basis is None:
     return None
   cash_by_currency = dict(basis.get("cash_by_currency") or {"KRW": basis.get("cash", 0.0)})
@@ -870,20 +909,10 @@ def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
     basis = _account_basis_from_kis_connection(cached)
     if basis is not None:
       return _stabilize_account_basis(basis)
-  try:
-    connection = _kis_connection_probe(paper=False, include_account=True)
-  except Exception as exc:  # pragma: no cover - defensive guard around broker/network state
-    audit.record("live_account_basis_auto_refresh_failed", {"error": str(exc)})
-    return None
-  previous = _last_live_account_basis()
-  basis = _merge_live_account_basis_with_previous(_account_basis_from_kis_connection(connection), previous)
-  if basis is None:
-    return None
-  basis = _stabilize_account_basis(basis)
-  with _live_lock:
-    _operation_mode_state["last_kis_connection"] = _connection_with_account_basis(connection, basis)
-    _operation_mode_state["last_kis_connection_checked_at"] = time.time()
-  return basis
+  # _cached_kis_connection_probe already performs one live probe when its cache is
+  # stale. Retrying immediately doubled the broker traffic, hit KIS per-second
+  # limits, and kept the single web worker blocked for another full timeout.
+  return None
 
 
 def _cached_kis_connection_probe(
@@ -1053,6 +1082,392 @@ def _active_operation_mode() -> str:
     return "learning"
   mode_value = getattr(mode, "mode", mode)
   return str(getattr(mode_value, "value", mode_value))
+
+
+def _auto_reliability_int(name: str, default: int, minimum: int = 1) -> int:
+  try:
+    return max(minimum, int(float(os.getenv(name, str(default)))))
+  except (TypeError, ValueError):
+    return max(minimum, default)
+
+
+def _latest_model_reliability(now: datetime) -> dict[str, Any]:
+  root = Path("data/models/live_short_horizon")
+  try:
+    active_path = root / "latest.json"
+    active = json.loads(active_path.read_text(encoding="utf-8"))
+    candidates = [
+        path for path in root.glob("live_short_horizon.*.json")
+        if path.name != "latest.json"
+    ]
+    latest_challenger_path = max(candidates, key=lambda path: path.stat().st_mtime)
+    challenger = json.loads(latest_challenger_path.read_text(encoding="utf-8"))
+    active_modified_at = datetime.fromtimestamp(active_path.stat().st_mtime, timezone.utc)
+    training_modified_at = datetime.fromtimestamp(
+        latest_challenger_path.stat().st_mtime,
+        timezone.utc,
+    )
+  except (OSError, ValueError, json.JSONDecodeError):
+    return {"ok": False, "reason": "MODEL_ARTIFACT_MISSING_OR_INVALID"}
+  active_age_seconds = max(0.0, (now - active_modified_at).total_seconds())
+  training_age_seconds = max(0.0, (now - training_modified_at).total_seconds())
+  maximum_training_age = float(
+      _auto_reliability_int("AUTO_RELIABILITY_MODEL_MAX_AGE_SECONDS", 1800, 60)
+  )
+  maximum_active_age = float(
+      _auto_reliability_int(
+          "AUTO_RELIABILITY_ACTIVE_MODEL_MAX_AGE_SECONDS",
+          2_592_000,
+          3600,
+      )
+  )
+  live_eligible = bool(active.get("live_eligible"))
+  schema_matches = active.get("feature_schema_hash") == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
+  reason_codes: list[str] = []
+  if not live_eligible:
+    reason_codes.append("ACTIVE_MODEL_NOT_LIVE_ELIGIBLE")
+  if not schema_matches:
+    reason_codes.append("ACTIVE_MODEL_SCHEMA_MISMATCH")
+  if active_age_seconds > maximum_active_age:
+    reason_codes.append("ACTIVE_MODEL_EXPIRED")
+  if training_age_seconds > maximum_training_age:
+    reason_codes.append("MODEL_TRAINING_STALE")
+  return {
+      "ok": not reason_codes,
+      "live_eligible": live_eligible,
+      "schema_matches": schema_matches,
+      "age_seconds": active_age_seconds,
+      "maximum_age_seconds": maximum_active_age,
+      "training_age_seconds": training_age_seconds,
+      "maximum_training_age_seconds": maximum_training_age,
+      "artifact_id": active.get("artifact_id"),
+      "reason_codes": reason_codes,
+      "metrics": {
+          "auc": _number_or_zero((active.get("metrics") or {}).get("auc")),
+          "precision_at_k": _number_or_zero((active.get("metrics") or {}).get("precision_at_k")),
+          "live_eligible": live_eligible,
+      },
+      "latest_challenger": {
+          "artifact_id": challenger.get("artifact_id"),
+          "live_eligible": bool(challenger.get("live_eligible")),
+          "reason_codes": list(challenger.get("reason_codes") or ()),
+          "metrics": {
+              "auc": _number_or_zero((challenger.get("metrics") or {}).get("auc")),
+              "precision_at_k": _number_or_zero(
+                  (challenger.get("metrics") or {}).get("precision_at_k")
+              ),
+          },
+      },
+  }
+
+
+def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any]:
+  minimum = _auto_reliability_int("AUTO_RELIABILITY_MIN_HEALTHY_SYMBOLS", 2)
+  minimum_by_market = {
+      "KRX": _auto_reliability_int("AUTO_RELIABILITY_KRX_MIN_HEALTHY_SYMBOLS", 1),
+      "US": _auto_reliability_int("AUTO_RELIABILITY_US_MIN_HEALTHY_SYMBOLS", minimum),
+  }
+  kr_age = _auto_reliability_int("AUTO_RELIABILITY_KRX_MAX_AGE_SECONDS", 20)
+  kr_trade_activity_age = _auto_reliability_int(
+      "AUTO_RELIABILITY_KRX_TRADE_ACTIVITY_MAX_AGE_SECONDS",
+      120,
+  )
+  us_age = _auto_reliability_int("AUTO_RELIABILITY_US_MAX_AGE_SECONDS", 90)
+  database = Path(os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"))
+  healthy: dict[str, list[str]] = {"KRX": [], "US": []}
+  if not database.exists():
+    return {"ok": False, "healthy": healthy, "minimum_per_market": minimum, "reason": "MARKET_DATA_STORE_MISSING"}
+  try:
+    with sqlite3.connect(database, timeout=5.0) as connection:
+      for group in groups:
+        age_seconds = us_age if group == "US" else kr_age
+        book_cutoff = (now - timedelta(seconds=age_seconds)).isoformat()
+        tick_cutoff = (
+            now
+            - timedelta(
+                seconds=kr_trade_activity_age if group == "KRX" else age_seconds
+            )
+        ).isoformat()
+        symbol_filter = (
+            "symbol not glob '[0-9][0-9][0-9][0-9][0-9][0-9]'"
+            if group == "US"
+            else "symbol glob '[0-9][0-9][0-9][0-9][0-9][0-9]'"
+        )
+        ticks = {
+            str(row[0]).upper()
+            for row in connection.execute(
+                f"""
+                select symbol from realtime_ticks
+                where received_at >= ? and source = 'kis_realtime_websocket'
+                  and {symbol_filter}
+                group by symbol
+                limit 500
+                """,
+                (tick_cutoff,),
+            )
+        }
+        books = {
+            str(row[0]).upper()
+            for row in connection.execute(
+                f"""
+                select symbol from realtime_orderbook
+                where received_at >= ? and source = 'kis_realtime_websocket'
+                  and {symbol_filter}
+                group by symbol
+                limit 500
+                """,
+                (book_cutoff,),
+            )
+        }
+        # A KRX orderbook can update continuously while a particular stock has no
+        # trade print for several seconds. A recent trade anywhere in the subscribed
+        # KRX stream proves the trade channel is alive; fresh per-symbol books then
+        # prove those symbols are quote-ready. Per-order symbol freshness remains a
+        # stricter gate in SharedLiveDecisionEngine.
+        healthy[group] = sorted(books if group == "KRX" and ticks else ticks & books)
+  except sqlite3.Error as exc:
+    return {
+        "ok": False,
+        "healthy": healthy,
+        "minimum_per_market": minimum,
+        "reason": f"MARKET_DATA_QUERY_FAILED:{type(exc).__name__}",
+    }
+  missing = [
+      group
+      for group in groups
+      if len(healthy.get(group, ())) < minimum_by_market.get(group, minimum)
+  ]
+  ready_markets = [group for group in groups if group not in missing]
+  return {
+      # Market outages are isolated. Per-symbol quote/orderbook freshness remains
+      # mandatory in SharedLiveDecisionEngine, so a healthy US market can continue
+      # while KRX is degraded (and vice versa) without permitting stale orders.
+      "ok": bool(ready_markets),
+      "healthy": healthy,
+      "minimum_per_market": minimum,
+      "minimum_by_market": minimum_by_market,
+      "ready_markets": ready_markets,
+      "partial": bool(ready_markets and missing),
+      "missing_markets": missing,
+      "max_age_seconds": {
+          "KRX": kr_age,
+          "KRX_TRADE_ACTIVITY": kr_trade_activity_age,
+          "US": us_age,
+      },
+  }
+
+
+def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
+  now = now or datetime.now(timezone.utc)
+  groups = _active_live_market_groups(now)
+  # The domestic H0STCNT0/H0STASP0 stream used by this service is a regular-session
+  # feed. KRX opening-auction/after-hours order routes may be available while those
+  # TRs still emit no tradeable ticks. Requiring 20-second KRX ticks during that
+  # interval creates a permanent false failure and masks a healthy US feed.
+  market_data_groups = tuple(
+      group
+      for group in groups
+      if group != "KRX" or _is_live_market_core_open("KRX", now)
+  )
+  connection = _cached_kis_connection_probe(paper=False, include_account=True)
+  broker_ok = bool(
+      connection.get("ok")
+      and connection.get("account_checked")
+      and _number_or_zero(connection.get("actual_equity") or connection.get("equity")) > 0
+  )
+  runtime = evaluate_live_runtime_gates(require_manual_arming=_manual_arming_required())
+  strategy_config = load_short_horizon_strategy_config()
+  execution_config = dict(strategy_config.get("execution") or {})
+  config_ok = bool(
+      execution_config.get("live_trading_enabled")
+      and _env_flag("LIVE_TRADING_ENABLED", False)
+      and _env_flag("KIS_LIVE_ENABLED", False)
+  )
+  policy_conflicts = [
+      conflict.code
+      for conflict in TradingPolicySnapshot.from_environment().conflicts()
+      if conflict.severity == "FAIL"
+  ]
+  policy_ok = not policy_conflicts
+  model = _latest_model_reliability(now)
+  market = _auto_market_health(now, market_data_groups)
+  market["required_markets"] = list(market_data_groups)
+  market["extended_order_markets"] = list(groups)
+  components = {
+      "broker": {"ok": broker_ok, "weight": 0.20},
+      "runtime": {"ok": bool(runtime.ok), "weight": 0.15, "failures": list(runtime.failures)},
+      "config": {"ok": config_ok, "weight": 0.10},
+      "risk_policy": {"ok": policy_ok, "weight": 0.15, "failures": policy_conflicts},
+      "model": {**model, "weight": 0.20},
+      "market_data": {**market, "weight": 0.20},
+  }
+  score = sum(float(item["weight"]) for item in components.values() if item.get("ok"))
+  threshold = float(os.getenv("AUTO_RELIABILITY_PROMOTE_THRESHOLD", "0.90"))
+  reasons = []
+  if not groups:
+    reasons.append("NO_OPEN_MARKET")
+  for name, item in components.items():
+    if not item.get("ok"):
+      reasons.append(f"{name.upper()}_NOT_READY")
+  return {
+      "score": round(score, 4),
+      "threshold": threshold,
+      "ready": bool(groups) and score >= threshold and not reasons,
+      "reasons": reasons,
+      "components": components,
+      "active_markets": list(groups),
+      "evaluated_at": now.isoformat(),
+  }
+
+
+def _auto_reliability_transition_to_learning(reason: str) -> None:
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if engine is not None and hasattr(engine, "disable_buys"):
+    engine.disable_buys(f"AUTO_RELIABILITY_DEMOTION:{reason}")
+  # Keep the engine alive in sell-only mode. Stopping the worker here stranded
+  # existing positions without take-profit, stop-loss, or time-exit monitoring.
+  state = OperationModeManager().start("learning")
+  with _live_lock:
+    _operation_mode_state["active"] = state
+  _start_live_worker("learning")
+  audit.record("auto_reliability_demoted_to_learning", {"reason": reason})
+
+
+def _auto_reliability_transition_to_live() -> dict[str, Any]:
+  result = _operation_mode_start_response({"mode": "live_trading"})
+  if result.get("ok") and result.get("live_trading_status") == "armed":
+    with _realtime_trading_lock:
+      engine = _realtime_trading_engine
+    if engine is not None and hasattr(engine, "enable_buys"):
+      engine.enable_buys("AUTO_RELIABILITY_PROMOTION")
+  audit.record(
+      "auto_reliability_live_transition",
+      {"ok": result.get("ok"), "status": result.get("status"), "live_status": result.get("live_trading_status")},
+  )
+  return result
+
+
+def _auto_reliability_enter_learning() -> None:
+  state = OperationModeManager().start("learning")
+  with _live_lock:
+    _operation_mode_state["active"] = state
+  _start_live_worker("learning")
+
+
+def _auto_reliability_learning_maintenance(now: datetime, groups: tuple[str, ...]) -> None:
+  refresh_interval = _auto_reliability_int("AUTO_RELIABILITY_LEARNING_REFRESH_SECONDS", 300, 30)
+  now_monotonic = time.monotonic()
+  with _live_lock:
+    last_refresh = float(_auto_reliability_state.get("last_learning_refresh_at") or 0.0)
+  if now_monotonic - last_refresh >= refresh_interval:
+    _ensure_background_refresh()
+    with _live_lock:
+      _auto_reliability_state["last_learning_refresh_at"] = now_monotonic
+  if "US" in groups:
+    _ensure_us_fast_poll_started()
+
+
+def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
+  now = now or datetime.now(timezone.utc)
+  snapshot = _evaluate_auto_reliability(now)
+  current_mode = _active_operation_mode()
+  with _live_lock:
+    active_state = _operation_mode_state.get("active")
+    ready_streak = int(_auto_reliability_state.get("ready_streak") or 0)
+    unready_streak = int(_auto_reliability_state.get("unready_streak") or 0)
+  if snapshot["ready"]:
+    ready_streak += 1
+    unready_streak = 0
+  else:
+    ready_streak = 0
+    unready_streak += 1
+  promote_after = _auto_reliability_int("AUTO_RELIABILITY_PROMOTE_CONSECUTIVE", 4)
+  demote_after = _auto_reliability_int("AUTO_RELIABILITY_DEMOTE_CONSECUTIVE", 2)
+  transition_reason = None
+  if snapshot["ready"] and ready_streak >= promote_after and current_mode != "live_trading":
+    result = _auto_reliability_transition_to_live()
+    if result.get("ok") and result.get("live_trading_status") == "armed":
+      current_mode = "live_trading"
+      transition_reason = "RELIABILITY_SUSTAINED"
+    else:
+      snapshot["ready"] = False
+      snapshot["reasons"] = [*snapshot["reasons"], "LIVE_TRANSITION_NOT_ARMED"]
+      unready_streak = 1
+  elif not snapshot["ready"] and current_mode == "live_trading":
+    critical = any(
+        reason in snapshot["reasons"]
+        for reason in (
+            "BROKER_NOT_READY",
+            "RUNTIME_NOT_READY",
+            "CONFIG_NOT_READY",
+            "RISK_POLICY_NOT_READY",
+            "MODEL_NOT_READY",
+            "NO_OPEN_MARKET",
+        )
+    )
+    if critical or unready_streak >= demote_after:
+      reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
+      _auto_reliability_transition_to_learning(reason)
+      current_mode = "learning"
+      transition_reason = reason
+  elif not snapshot["ready"] and active_state is None:
+    _auto_reliability_enter_learning()
+    current_mode = "learning"
+    transition_reason = ",".join(snapshot["reasons"]) or "INITIAL_LOW_RELIABILITY"
+  if current_mode != "live_trading":
+    _auto_reliability_learning_maintenance(now, tuple(snapshot["active_markets"]))
+  with _live_lock:
+    _auto_reliability_state.update(
+        {
+            **snapshot,
+            "enabled": True,
+            "mode": current_mode,
+            "ready_streak": ready_streak,
+            "unready_streak": unready_streak,
+            "last_error": None,
+        }
+    )
+    if transition_reason:
+      _auto_reliability_state["last_transition_at"] = now.isoformat()
+      _auto_reliability_state["last_transition_reason"] = transition_reason
+    return _to_jsonable(dict(_auto_reliability_state))
+
+
+def _auto_reliability_loop() -> None:
+  interval = _auto_reliability_int("AUTO_RELIABILITY_CHECK_SECONDS", 15, 5)
+  while not _auto_reliability_stop.is_set():
+    try:
+      _auto_reliability_step()
+    except Exception as exc:  # noqa: BLE001 - controller fails closed and retries.
+      error = f"{type(exc).__name__}: {exc}"
+      with _live_lock:
+        _auto_reliability_state["ready"] = False
+        _auto_reliability_state["last_error"] = error
+        _auto_reliability_state["evaluated_at"] = datetime.now(timezone.utc).isoformat()
+      if _active_operation_mode() == "live_trading":
+        _auto_reliability_transition_to_learning(error)
+      audit.record("auto_reliability_controller_error", {"error": error})
+    _auto_reliability_stop.wait(interval)
+
+
+def _start_auto_reliability_controller() -> None:
+  global _auto_reliability_worker
+  if not AUTO_RELIABILITY_MODE_ENABLED:
+    return
+  if _auto_reliability_worker is not None and _auto_reliability_worker.is_alive():
+    return
+  _auto_reliability_stop.clear()
+  _auto_reliability_worker = threading.Thread(
+      target=_auto_reliability_loop,
+      name="auto-reliability-mode-controller",
+      daemon=True,
+  )
+  _auto_reliability_worker.start()
+
+
+def _stop_auto_reliability_controller() -> None:
+  _auto_reliability_stop.set()
 
 
 def _is_simulation_mode(mode: Any | None = None) -> bool:
@@ -1225,6 +1640,7 @@ _live_state: dict[str, Any] = {
     "live_execution_summary": None,
     "refresh_requested_after_current": False,
 }
+_realtime_runtime_static_cache: dict[str, Any] = {}
 
 
 def _clear_live_analysis_cache_unlocked() -> None:
@@ -1281,6 +1697,20 @@ def _stop_asset_history_sampler() -> None:
 @app.on_event("startup")
 def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
+    configure_default_event_llm_env()
+    try:
+      llm_status = event_llm_runtime_status()
+      llm_status["probe_skipped"] = True
+      llm_status["probed_at_startup"] = True
+      _realtime_runtime_static_cache.update(
+          {
+              "acceleration": RealtimeAccelerationPolicy().status(),
+              "event_llm": llm_status,
+              "ontology_npu": get_ontology_npu_classifier().status(),
+          }
+      )
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not block startup.
+      _realtime_runtime_static_cache["error"] = f"{exc.__class__.__name__}: {exc}"
     if AUTO_START_ASSET_HISTORY_SAMPLER:
       _start_asset_history_sampler()
     if AUTO_START_KIS_REALTIME_COLLECTOR:
@@ -1295,10 +1725,13 @@ def _startup_live_worker() -> None:
       _start_realtime_trading_engine()
     if AUTO_START_LIVE_TRAINING:
       _start_live_training_worker()
+    _ensure_us_fast_poll_started()
+    _start_auto_reliability_controller()
 
 
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
+    _stop_auto_reliability_controller()
     _stop_asset_history_sampler()
     _stop_realtime_trading_engine()
     _stop_kis_realtime_collector()
@@ -2163,16 +2596,22 @@ def realtime_candidate_charts(limit: int = 12, minutes: int = 90) -> JSONRespons
 
 @app.get("/api/realtime/runtime")
 def realtime_runtime() -> JSONResponse:
-    configure_default_event_llm_env()
-    acceleration = RealtimeAccelerationPolicy().status()
     risk_policy = ShortHorizonRiskPolicy()
-    ontology_status = get_ontology_npu_classifier().status()
     training_status = _safe_live_training_status_fast()
     return _json(
         {
-            "acceleration": acceleration,
-            "event_llm": _event_llm_runtime_status_fast(),
-            "ontology_npu": ontology_status,
+            "acceleration": _realtime_runtime_static_cache.get(
+                "acceleration",
+                RealtimeAccelerationPolicy().status(),
+            ),
+            "event_llm": _realtime_runtime_static_cache.get(
+                "event_llm",
+                _event_llm_runtime_status_fast(),
+            ),
+            "ontology_npu": _realtime_runtime_static_cache.get(
+                "ontology_npu",
+                {"status": "initializing"},
+            ),
             "live_training": training_status,
             "short_horizon_policy": risk_policy,
             "operation_mode": _operation_mode_state.get("active"),
@@ -2223,7 +2662,10 @@ def _event_llm_runtime_status_fast() -> dict[str, Any]:
             "LLM_EVENT_ENDPOINT",
             "http://127.0.0.1:11434/v1/chat/completions",
         )
-        status["reason"] = "local LLM endpoint probe skipped for dashboard responsiveness."
+        # configure_default_event_llm_env enables this provider only after a
+        # successful local reachability check. Dashboard polls reuse that result.
+        status["available"] = True
+        status["reason"] = None
         return status
     if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
         exists = Path(model).exists()
@@ -2687,6 +3129,10 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         # (주문의 실제 전송은 LiveExecutionCoordinator의 안전 게이트가 최종 결정한다.)
         _start_kis_realtime_collector()
         _start_realtime_trading_engine()
+        with _realtime_trading_lock:
+          active_engine = _realtime_trading_engine
+        if active_engine is not None and hasattr(active_engine, "enable_buys"):
+          active_engine.enable_buys("OPERATION_MODE_LIVE_TRADING")
         config = load_short_horizon_strategy_config()
         execution_config = config.get("execution", {})
         config_live_enabled = bool(execution_config.get("live_trading_enabled", False))
@@ -2960,8 +3406,329 @@ async def operation_mode_status() -> JSONResponse:
             "learning": _learning_state_snapshot(),
             "collection_log": _live_snapshot()["collection_log"],
             "streaming": streaming,
+            "auto_reliability": _auto_reliability_status(),
         }
     )
+
+
+def _auto_reliability_status() -> dict[str, Any]:
+  with _live_lock:
+    return _to_jsonable(dict(_auto_reliability_state))
+
+
+@app.get("/api/auto-reliability/status")
+def auto_reliability_status() -> JSONResponse:
+  return _json(_auto_reliability_status())
+
+
+def _diagnostic_file_state(path: Path, now: datetime) -> dict[str, Any]:
+  try:
+    stat = path.stat()
+  except OSError:
+    return {
+        "path": str(path),
+        "exists": False,
+        "size_bytes": 0,
+        "updated_at": None,
+        "age_seconds": None,
+    }
+  updated = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+  return {
+      "path": str(path),
+      "exists": True,
+      "size_bytes": int(stat.st_size),
+      "updated_at": updated.isoformat(),
+      "age_seconds": round(max(0.0, (now - updated).total_seconds()), 1),
+  }
+
+
+def _latest_collection_entry(
+  rows: list[dict[str, Any]],
+  *,
+  statuses: set[str] | None = None,
+  message_contains: str | None = None,
+) -> dict[str, Any] | None:
+  needle = str(message_contains or "").lower()
+  for row in reversed(rows):
+    if statuses and str(row.get("status") or "").lower() not in statuses:
+      continue
+    if needle and needle not in str(row.get("message") or "").lower():
+      continue
+    return dict(row)
+  return None
+
+
+def _diagnostic_blocker(code: str, components: dict[str, Any]) -> dict[str, Any]:
+  details = {
+      "RISK_POLICY_NOT_READY": (
+          "위험 정책",
+          "손절 정책이 비활성화되어 실거래 승격이 차단되었습니다.",
+          ", ".join((components.get("risk_policy") or {}).get("failures") or ("정책 확인 필요",)),
+      ),
+      "MODEL_NOT_READY": (
+          "모델 성능",
+          "최신 재학습 모델이 실거래 성능 기준을 통과하지 못했습니다.",
+          ", ".join((components.get("model") or {}).get("reason_codes") or ("모델 확인 필요",)),
+      ),
+      "MARKET_DATA_NOT_READY": (
+          "실시간 시세·호가",
+          "현재 열린 시장에서 거래급 체결과 호가가 충분히 들어오지 않습니다.",
+          ", ".join((components.get("market_data") or {}).get("missing_markets") or ("시장 확인 필요",)),
+      ),
+      "BROKER_NOT_READY": (
+          "KIS 연결",
+          "KIS 실계좌 조회 또는 인증 상태가 준비되지 않았습니다.",
+          "계좌 연결 확인 필요",
+      ),
+      "RUNTIME_NOT_READY": (
+          "실행 게이트",
+          "실거래 런타임 안전 게이트가 차단 상태입니다.",
+          ", ".join((components.get("runtime") or {}).get("failures") or ("게이트 확인 필요",)),
+      ),
+      "CONFIG_NOT_READY": (
+          "실거래 설정",
+          "실거래 설정이 완전히 활성화되지 않았습니다.",
+          "설정 확인 필요",
+      ),
+      "MARKET_CLOSED": (
+          "시장 시간",
+          "현재 실거래 가능한 시장이 닫혀 있습니다.",
+          "개장 시간까지 대기",
+      ),
+  }
+  label, message, detail = details.get(
+      code,
+      (code.replace("_", " "), "실거래 승격 조건을 통과하지 못했습니다.", code),
+  )
+  return {"code": code, "label": label, "message": message, "detail": detail}
+
+
+def _system_diagnostics_payload() -> dict[str, Any]:
+  now = datetime.now(timezone.utc)
+  snapshot = _live_snapshot()
+  learning = snapshot.get("learning") or {}
+  rows = list(snapshot.get("collection_log") or ())
+  reliability = _auto_reliability_status()
+  components = dict(reliability.get("components") or {})
+  latest_complete = _latest_collection_entry(rows, statuses={"complete"})
+  latest_training = next(
+      (
+          dict(row)
+          for row in reversed(rows)
+          if any(
+              marker in str(row.get("message") or "").lower()
+              for marker in ("model retrained", "model training skipped", "model challenger")
+          )
+      ),
+      None,
+  )
+  latest_market = next(
+      (
+          dict(row)
+          for row in reversed(rows)
+          if any(
+              marker in str(row.get("message") or "").lower()
+              for marker in ("realtime collector", "realtime bridge", "krx fully closed", "live market data")
+          )
+      ),
+      None,
+  )
+  latest_collector_result = next(
+      (
+          dict(row)
+          for row in reversed(rows)
+          if int(((row.get("counts") or {}).get("control_messages") or 0)) > 0
+      ),
+      None,
+  )
+  with _live_lock:
+    learning_worker_running = bool(_live_worker is not None and _live_worker.is_alive())
+    training_worker_running = bool(
+        _live_training_worker is not None
+        and _live_training_worker.is_alive()
+        and not _live_training_stop.is_set()
+    )
+    collector_running = bool(
+        _kis_realtime_collector_worker is not None
+        and _kis_realtime_collector_worker.is_alive()
+        and not _kis_realtime_collector_stop.is_set()
+    )
+  with _realtime_trading_lock:
+    trading_running = bool(
+        _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+    )
+  us_fast_poll_running = bool(_us_fast_poll_thread is not None and _us_fast_poll_thread.is_alive())
+  reasons = [str(code) for code in reliability.get("reasons") or ()]
+  blockers = [_diagnostic_blocker(code, components) for code in reasons]
+  model_health = dict(components.get("model") or {})
+  training_counts = {
+      **dict(model_health.get("metrics") or {}),
+      **dict((latest_training or {}).get("counts") or {}),
+  }
+  collection_counts = dict((latest_complete or {}).get("counts") or {})
+  market_counts = dict((latest_market or {}).get("counts") or {})
+  collector_counts = dict((latest_collector_result or {}).get("counts") or {})
+  subscription_requests = int(
+      collector_counts.get("subscription_requests")
+      or collector_counts.get("subscriptions")
+      or 0
+  )
+  subscription_rejected = int(
+      collector_counts.get("subscriptions_rejected")
+      or collector_counts.get("control_errors")
+      or 0
+  )
+  subscription_accepted = (
+      int(collector_counts.get("subscriptions_accepted") or 0)
+      if "subscriptions_accepted" in collector_counts
+      else max(0, subscription_requests - subscription_rejected)
+  )
+  market_data = dict(components.get("market_data") or {})
+  healthy = dict(market_data.get("healthy") or {})
+  account = _last_live_account_basis() or {}
+  orderable = account.get("orderable_cash_by_currency") or {}
+  cash_by_currency = account.get("cash_by_currency") or {}
+  usd_orderable = _number_or_zero(
+      orderable.get("USD") if "USD" in orderable else cash_by_currency.get("USD")
+  )
+  active_markets = list(reliability.get("active_markets") or ())
+
+  research_active = bool(learning.get("active") and learning_worker_running)
+  training_active = bool(training_worker_running)
+  trade_data_active = bool(
+      any(healthy.get(market) for market in active_markets)
+      or int(market_counts.get("realtime_ticks") or 0) > 0
+      or int(market_counts.get("live_us_realtime_bridge_ticks") or 0) > 0
+  )
+  if trading_running:
+    headline = "실시간 거래 엔진이 실행 중입니다."
+    summary = "전략 판단과 주문 게이트가 실시간으로 평가되고 있습니다."
+  elif research_active and training_active:
+    headline = "연구·재학습은 진행 중이고, 실거래 승격은 대기 중입니다."
+    summary = "시스템 정지가 아니라 안전 게이트 차단 상태입니다."
+  else:
+    headline = "학습 또는 수집 워커 일부가 중지되어 있습니다."
+    summary = "아래 워커 상태와 최근 활동을 확인하세요."
+
+  file_states = {
+      "research_store": _diagnostic_file_state(Path("data/store/research.sqlite3"), now),
+      "realtime_store": _diagnostic_file_state(Path("data/store/realtime_market_data.sqlite3"), now),
+      "feature_journal": _diagnostic_file_state(Path("logs/live-feature-frames.jsonl"), now),
+      "decision_log": _diagnostic_file_state(Path("logs/decision-log.jsonl"), now),
+  }
+  return {
+      "generated_at": now.isoformat(),
+      "headline": headline,
+      "summary": summary,
+      "mode": reliability.get("mode") or learning.get("mode"),
+      "score": float(reliability.get("score") or 0.0),
+      "threshold": float(reliability.get("threshold") or 0.9),
+      "ready": bool(reliability.get("ready")),
+      "active_markets": active_markets,
+      "account_context": {
+          "krw_orderable": _number_or_zero(orderable.get("KRW")),
+          "usd_orderable": usd_orderable,
+          "us_collection_limited_by_cash": "US" in active_markets and usd_orderable <= 0,
+      },
+      "workers": [
+          {
+              "key": "research_collection",
+              "label": "뉴스·시장 연구 수집",
+              "running": research_active,
+              "detail": "수집 사이클 실행/예약 중" if research_active else "수집 워커 중지",
+          },
+          {
+              "key": "model_training",
+              "label": "단기 모델 재학습",
+              "running": training_active,
+              "detail": (
+                  f"AUC {float(training_counts.get('auc') or 0.0):.4f} · "
+                  f"Precision@K {float(training_counts.get('precision_at_k') or 0.0):.4f}"
+              ),
+          },
+          {
+              "key": "krx_realtime",
+              "label": "KIS 국내 실시간 수집",
+              "running": collector_running,
+              "detail": (
+                  f"승인 {subscription_accepted} / 요청 {subscription_requests} · "
+                  f"거절 {subscription_rejected}"
+                  if collector_counts
+                  else str((latest_market or {}).get("message") or "상태 기록 없음")
+              ),
+          },
+          {
+              "key": "us_realtime",
+              "label": "미국 실시간 보강",
+              "running": us_fast_poll_running or bool(healthy.get("US")),
+              "detail": (
+                  "USD 주문 가능 잔액 0원 · 미국 매수 후보 보강 제한"
+                  if "US" in active_markets and usd_orderable <= 0
+                  else f"건강한 종목 {len(healthy.get('US') or ())}개"
+              ),
+          },
+          {
+              "key": "trading_engine",
+              "label": "실시간 거래 엔진",
+              "running": trading_running,
+              "detail": "실행 중" if trading_running else "신뢰도 게이트 통과 전 대기",
+          },
+      ],
+      "flows": {
+          "research_collection": {
+              "active": research_active,
+              "latest": latest_complete,
+              "counts": collection_counts,
+          },
+          "market_data": {
+              "active": trade_data_active,
+              "healthy": healthy,
+              "minimum_per_market": market_data.get("minimum_per_market"),
+              "minimum_by_market": market_data.get("minimum_by_market"),
+              "ready_markets": market_data.get("ready_markets"),
+              "missing_markets": market_data.get("missing_markets"),
+              "partial": bool(market_data.get("partial")),
+              "latest": latest_market,
+              "subscription": {
+                  "requests": subscription_requests,
+                  "accepted": subscription_accepted,
+                  "rejected": subscription_rejected,
+                  "error_codes": dict(collector_counts.get("subscription_errors_by_code") or {}),
+                  "observed_capacity": _kis_realtime_observed_subscription_capacity,
+                  "limit_reached": bool(collector_counts.get("subscription_limit_reached")),
+              },
+          },
+          "training": {
+              "active": training_active,
+              "latest": latest_training,
+              "metrics": training_counts,
+              "feature_frames_built": int(training_counts.get("feature_frames_built") or 0),
+              "active_model": {
+                  "artifact_id": model_health.get("artifact_id"),
+                  "metrics": dict(model_health.get("metrics") or {}),
+                  "age_seconds": model_health.get("age_seconds"),
+                  "live_eligible": bool(model_health.get("live_eligible")),
+              },
+              "challenger": dict(model_health.get("latest_challenger") or {}),
+              "training_skipped": bool(training_counts.get("training_skipped")),
+              "deployment": {
+                  "deployed": bool(training_counts.get("deployed")),
+                  "reason": training_counts.get("deployment_reason"),
+                  "artifact_id": training_counts.get("artifact_id"),
+              },
+          },
+      },
+      "blockers": blockers,
+      "files": file_states,
+      "recent_activity": rows[-10:],
+      "next_collection_at": learning.get("next_collection_at"),
+      "last_error": reliability.get("last_error") or snapshot.get("last_error"),
+  }
+
+
+@app.get("/api/system-diagnostics")
+def system_diagnostics() -> JSONResponse:
+  return _json(_system_diagnostics_payload())
 
 
 @app.post("/api/operation-mode/stop-learning")
@@ -5275,19 +6042,40 @@ def _live_training_loop() -> None:
       collection = collect_live_feature_frames_from_realtime_store()
       artifact = train_live_short_horizon_from_collected_features()
       metrics = artifact.get("metrics") or {}
+      deployment = artifact.get("deployment") or {}
+      skipped = bool(artifact.get("training_skipped"))
+      promoted = bool(deployment.get("promoted"))
+      if skipped:
+        status = "waiting"
+        message = "Live model training skipped (no newly labelled data)"
+      elif promoted:
+        status = "complete"
+        message = "Live short-horizon model retrained and deployed"
+      elif artifact.get("live_eligible"):
+        status = "complete"
+        message = "Live model challenger qualified but active model remained better"
+      else:
+        status = "running"
+        message = "Live short-horizon model retrained (kept previous eligible model)"
       with _live_lock:
         _append_collection_log_unlocked(
-            "complete" if artifact.get("live_eligible") else "running",
-            (
-                "Live short-horizon model retrained and deployed"
-                if artifact.get("live_eligible")
-                else "Live short-horizon model retrained (kept previous eligible model)"
-            ),
+            status,
+            message,
             counts={
                 "feature_frames_built": int(collection.get("built", 0) or 0),
+                "training_rows": int(float(metrics.get("example_count", 0) or 0)),
                 "auc": round(float(metrics.get("auc", 0.0) or 0.0), 4),
                 "precision_at_k": round(float(metrics.get("precision_at_k", 0.0) or 0.0), 4),
+                "avg_forward_net_return_bps_top_k": round(
+                    float(metrics.get("avg_forward_net_return_bps_top_k", 0.0) or 0.0),
+                    4,
+                ),
                 "live_eligible": bool(artifact.get("live_eligible")),
+                "training_skipped": skipped,
+                "skip_reason": artifact.get("skip_reason"),
+                "deployed": promoted,
+                "deployment_reason": deployment.get("reason"),
+                "artifact_id": artifact.get("artifact_id"),
             },
         )
     except Exception as exc:  # noqa: BLE001 - 학습 실패가 서버/트레이딩을 죽여서는 안 된다.
@@ -5349,14 +6137,81 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
       coordinator=coordinator,
-      account_provider=_live_account_snapshot_for_analysis,
-      candidate_symbols_provider=_realtime_buy_candidates,
+      account_provider=_realtime_engine_account_snapshot,
+      candidate_symbols_provider=_realtime_engine_buy_candidates,
       session_open_provider=lambda: bool(_active_live_market_groups()),
       ontology_graph_provider=_latest_ontology_graph,
       market_open_provider=_is_open_live_market_ticker,
       cycle_observer=_record_realtime_trading_cycle,
       macro_micro_observer=macro_micro_observer,
   )
+
+
+def _realtime_engine_account_snapshot() -> AccountSnapshot | None:
+  """Use the controller's recent authoritative account without blocking a 1s cycle."""
+  cached = _account_snapshot_from_live_basis(_last_live_account_basis())
+  return cached if cached is not None else _live_account_snapshot_for_analysis()
+
+
+def _realtime_engine_buy_candidates() -> tuple[str, ...]:
+  """Return only already-streaming candidates; never run broker scans in the engine."""
+  max_age = max(5.0, _env_float_web("REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", 120.0))
+  limit = max(1, _auto_reliability_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 8))
+  try:
+    since = datetime.now(timezone.utc) - timedelta(seconds=max_age)
+    fresh = tuple(RealtimeMarketDataStore().active_symbols(since, limit=max(32, limit * 4)))
+  except Exception:
+    fresh = ()
+  with _live_lock:
+    sticky_us = tuple(_us_learning_watchlist_cache.get("symbols") or ())
+  cached_context = _cached_context_buy_candidates(limit=max(16, limit * 2))
+  domestic_ranked = tuple(_cached_domestic_ranking_symbols() or ())
+  ordered = _prioritize_realtime_buy_candidates(
+      tuple(dict.fromkeys((*cached_context, *domestic_ranked, *sticky_us, *fresh)))
+  )
+  try:
+    account = _realtime_engine_account_snapshot()
+    store = RealtimeMarketDataStore()
+  except Exception:
+    account = None
+    store = None
+  selected: list[str] = []
+  for symbol in ordered:
+    if not _is_live_buy_candidate_symbol(symbol) or not _is_open_live_market_ticker(symbol):
+      continue
+    group = _ticker_market_group_for_live_trading(symbol)
+    if group == "KRX" and not _is_live_market_core_open("KRX"):
+      continue
+    if account is not None and store is not None and not _cached_candidate_affordable(
+        symbol,
+        account,
+        store,
+    ):
+      continue
+    selected.append(symbol)
+    if len(selected) >= limit:
+      break
+  return tuple(selected)
+
+
+def _cached_candidate_affordable(
+    symbol: str,
+    account: AccountSnapshot,
+    store: RealtimeMarketDataStore,
+) -> bool:
+  """Cheap pre-slot affordability check using the already-persisted live tick."""
+  try:
+    tick = store.latest_tick(symbol)
+  except Exception:
+    return True
+  price = float(getattr(tick, "price", 0.0) or 0.0) if tick is not None else 0.0
+  if price <= 0:
+    return True
+  group = _ticker_market_group_for_live_trading(symbol, "")
+  currency = "KRW" if group == "KRX" else "USD"
+  cash = _account_available_cash(account, currency)
+  buffer_rate = max(1.0, _env_float_web("REALTIME_AFFORDABILITY_BUFFER_RATE", 1.01))
+  return cash + 1e-9 >= price * buffer_rate
 
 
 _us_fast_poll_thread = None
@@ -5398,16 +6253,31 @@ def _us_fast_poll_loop() -> None:
       us_open = "US" in set(_active_live_market_groups())
       us_closed = is_market_fully_closed("US")
       if us_open or us_closed:
-        acct = _live_account_snapshot_for_analysis()
+        acct = _account_snapshot_from_live_basis(_last_live_account_basis())
         held = tuple(dict.fromkeys(
             str(getattr(h, "ticker", "") or "").upper().strip()
             for h in (getattr(acct, "holdings", ()) or ())
             if _ticker_market_group_for_live_trading(str(getattr(h, "ticker", "") or ""), str(getattr(h, "market", "") or "")) == "US"
-        ))
-      if held and us_open:
-        # In-session: realtime bridge (sub-minute rows tagged as realtime).
+        )) if acct is not None else ()
+      if us_open:
+        symbols = held
+        if _active_operation_mode() == "live_trading":
+          with _live_lock:
+            watched = tuple(_us_learning_watchlist_cache.get("symbols") or ())
+          symbols = tuple(dict.fromkeys((*held, *watched)))
+        else:
+          symbols = _sticky_us_learning_symbols(
+              _auto_reliability_int("AUTO_RELIABILITY_US_WARM_SYMBOLS", 4)
+          )
+        # This thread is independent from the account/reliability controller, so a
+        # slow portfolio request cannot stop sub-minute US market-data collection.
         from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
-        refresh_us_realtime_for_context_buy_candidates(SimpleNamespace(markets=(), reasoning_paths=()), symbols=held)
+        if symbols:
+          refresh_us_realtime_for_context_buy_candidates(
+              SimpleNamespace(markets=(), reasoning_paths=()),
+              symbols=symbols,
+          )
+          collect_live_feature_frames_from_realtime_store(symbols=symbols)
       elif held and us_closed:
         # Fully closed: slower REST snapshot fallback (distinct source, not
         # live-buy eligible) so held US marks stay fresh for valuation/display.
@@ -5910,6 +6780,24 @@ def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, 
       us_symbols.append(symbol)
     else:
       other_symbols.append(symbol)
+  if (
+      "KRX" in open_groups
+      and "US" in open_groups
+      and krw_cash > 0
+      and usd_cash > 0
+      and kr_symbols
+      and us_symbols
+  ):
+    # Reserve evaluation capacity for both open markets. A long KRX list must
+    # not consume the whole cycle and starve otherwise healthy US candidates.
+    interleaved: list[str] = []
+    width = max(len(kr_symbols), len(us_symbols))
+    for index in range(width):
+      if index < len(kr_symbols):
+        interleaved.append(kr_symbols[index])
+      if index < len(us_symbols):
+        interleaved.append(us_symbols[index])
+    return tuple((*interleaved, *other_symbols))
   if "KRX" in open_groups and krw_cash > 0:
     return tuple((*kr_symbols, *us_symbols, *other_symbols))
   return tuple((*us_symbols, *kr_symbols, *other_symbols))
@@ -5947,9 +6835,17 @@ def _is_live_buy_candidate_symbol(symbol: str, market: str = "") -> bool:
 
 _affordable_candidate_cache: dict[str, Any] = {"key": None, "at": 0.0, "symbols": ()}
 _broker_quote_backoff_until: dict[str, float] = {}
+_broker_quote_cache: dict[tuple[str, str], tuple[float, MarketSnapshot]] = {}
+_broker_quote_rate_lock = threading.Lock()
+_broker_quote_next_allowed_at = 0.0
 _live_buy_candidate_backoff_until: dict[str, float] = {}
 _volume_surge_warm_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
 _us_nasdaq_universe_cache: dict[str, Any] = {"mtime": None, "symbols": ()}
+_us_learning_watchlist_cache: dict[str, Any] = {
+    "at": 0.0,
+    "cash_usd": None,
+    "symbols": (),
+}
 
 
 def _account_available_cash(account: AccountSnapshot, currency: str) -> float:
@@ -5965,6 +6861,96 @@ def _account_available_cash(account: AccountSnapshot, currency: str) -> float:
   if str(getattr(account, "base_currency", "") or "").upper() == code:
     return float(getattr(account, "cash", 0.0) or 0.0)
   return 0.0
+
+
+def _recent_affordable_us_watchlist(
+    account: AccountSnapshot,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+  """Reuse recently verified US symbols instead of rotating the universe each poll."""
+  cash_usd = _account_available_cash(account, "USD")
+  if cash_usd <= 0 or limit <= 0:
+    return ()
+  database = Path(os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"))
+  if not database.exists():
+    return ()
+  since = (
+      datetime.now(timezone.utc)
+      - timedelta(hours=max(1.0, _env_float_web("REALTIME_US_WATCHLIST_LOOKBACK_HOURS", 6.0)))
+  ).isoformat()
+  try:
+    with sqlite3.connect(database, timeout=5.0) as connection:
+      rows = connection.execute(
+          """
+          select symbol, price, received_at
+          from realtime_ticks
+          where received_at >= ?
+            and symbol not glob '[0-9][0-9][0-9][0-9][0-9][0-9]'
+            and price > 0
+          order by received_at desc
+          limit 5000
+          """,
+          (since,),
+      ).fetchall()
+  except sqlite3.Error:
+    return ()
+  selected: list[str] = []
+  seen: set[str] = set()
+  excluded = _held_or_recent_buy_tickers(account)
+  for symbol, price, _received_at in rows:
+    ticker = str(symbol or "").upper().strip()
+    if (
+        not ticker
+        or ticker in seen
+        or ticker in excluded
+        or _is_excluded_us_live_candidate(ticker)
+        or float(price or 0.0) > cash_usd
+    ):
+      continue
+    seen.add(ticker)
+    selected.append(ticker)
+    if len(selected) >= limit:
+      break
+  return tuple(selected)
+
+
+def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
+  """Hold a small affordable US watchlist long enough to form causal labels."""
+  safe_limit = max(1, int(limit))
+  account = _account_snapshot_from_live_basis(_last_live_account_basis())
+  if account is None:
+    return ()
+  cash_usd = round(_account_available_cash(account, "USD"), 2)
+  if cash_usd <= 0:
+    return ()
+  now = time.monotonic()
+  ttl = max(300.0, _env_float_web("REALTIME_US_WATCHLIST_TTL_SEC", 1800.0))
+  with _live_lock:
+    cached_symbols = tuple(_us_learning_watchlist_cache.get("symbols") or ())
+    cached_at = float(_us_learning_watchlist_cache.get("at") or 0.0)
+    cached_cash = _us_learning_watchlist_cache.get("cash_usd")
+  if (
+      cached_symbols
+      and cached_cash == cash_usd
+      and now - cached_at < ttl
+  ):
+    return cached_symbols[:safe_limit]
+
+  selected = list(_recent_affordable_us_watchlist(account, limit=safe_limit))
+  if len(selected) < safe_limit:
+    discovered = tuple(_live_affordable_buy_candidate_symbols(limit=safe_limit) or ())
+    selected.extend(
+        symbol
+        for symbol in discovered
+        if _ticker_market_group_for_live_trading(symbol, "") == "US"
+    )
+  result = tuple(dict.fromkeys(selected))[:safe_limit]
+  with _live_lock:
+    _us_learning_watchlist_cache.update(
+        {"at": now, "cash_usd": cash_usd, "symbols": result}
+    )
+  return result
 
 
 def _load_us_nasdaq_universe() -> tuple[str, ...]:
@@ -6116,7 +7102,8 @@ def _broker_affordable_candidate_symbols(
   client = KisDevelopersApiClient(paper=False, enabled=True)
   selected: list[str] = []
   errors: list[dict[str, str]] = []
-  quote_delay = max(0.0, float(os.getenv("REALTIME_BROKER_QUOTE_DELAY_SEC", "0.25")))
+  quote_delay = max(0.05, float(os.getenv("REALTIME_BROKER_QUOTE_DELAY_SEC", "0.35")))
+  quote_cache_ttl = max(5.0, float(os.getenv("REALTIME_BROKER_QUOTE_CACHE_TTL_SEC", "60")))
   for symbol in symbols:
     if len(selected) >= max_symbols:
       break
@@ -6126,8 +7113,25 @@ def _broker_affordable_candidate_symbols(
     # NYSE name quoted as NASDAQ returns price 0. exchange_resolver supplies the
     # per-ticker exchange; without it, the fixed market is used (e.g. KRX).
     quote_market = exchange_resolver(symbol) if exchange_resolver is not None else market
+    cache_key = (str(quote_market).upper(), symbol)
+    cached = _broker_quote_cache.get(cache_key)
     try:
-      snapshot = client.get_market_snapshot(symbol, quote_market, company_name=symbol, sector="Unknown")
+      if cached is not None and time.monotonic() - cached[0] < quote_cache_ttl:
+        snapshot = cached[1]
+      else:
+        global _broker_quote_next_allowed_at
+        with _broker_quote_rate_lock:
+          wait_seconds = _broker_quote_next_allowed_at - time.monotonic()
+          if wait_seconds > 0:
+            time.sleep(wait_seconds)
+          snapshot = client.get_market_snapshot(
+              symbol,
+              quote_market,
+              company_name=symbol,
+              sector="Unknown",
+          )
+          _broker_quote_next_allowed_at = time.monotonic() + quote_delay
+        _broker_quote_cache[cache_key] = (time.monotonic(), snapshot)
     except Exception as exc:  # noqa: BLE001 - one failed quote should not stop discovery.
       error_text = str(exc) or exc.__class__.__name__
       errors.append({"ticker": symbol, "market": quote_market, "error": error_text})
@@ -6141,8 +7145,6 @@ def _broker_affordable_candidate_symbols(
       continue
     if snapshot.last_price > 0 and is_market_affordable_for_account(snapshot, account):
       selected.append(snapshot.ticker)
-    if quote_delay > 0.0 and len(selected) < max_symbols:
-      time.sleep(quote_delay)
   if errors:
     audit.record(
         "realtime_affordable_candidate_quote_errors",
@@ -6676,11 +7678,17 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   except (TypeError, ValueError):
     requested_max_syms = 18
   try:
-    max_subscriptions = max(2, int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")))
+    configured_max_subscriptions = max(2, int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")))
   except (TypeError, ValueError):
-    max_subscriptions = 40
+    configured_max_subscriptions = 40
+  max_subscriptions = (
+      min(configured_max_subscriptions, _kis_realtime_observed_subscription_capacity)
+      if _kis_realtime_observed_subscription_capacity
+      else configured_max_subscriptions
+  )
   max_syms = max(1, min(requested_max_syms, max_subscriptions // 2))
-  domestic_priority: list[str] = []
+  held_domestic: list[str] = []
+  context_domestic: list[str] = []
   try:
     account = _live_account_snapshot_for_analysis()
   except Exception:  # noqa: BLE001 - collector can still run with static config.
@@ -6690,12 +7698,12 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
       ticker = str(getattr(holding, "ticker", "") or "").upper().strip()
       market = str(getattr(holding, "market", "") or "").upper().strip()
       if ticker.isdigit() and len(ticker) == 6 and _ticker_market_group_for_live_trading(ticker, market) == "KRX":
-        domestic_priority.append(ticker)
+        held_domestic.append(ticker)
   with _live_lock:
     context = _live_state.get("context")
   for ticker in _cached_context_symbols(context):
     if ticker.isdigit() and len(ticker) == 6:
-      domestic_priority.append(ticker)
+      context_domestic.append(ticker)
   try:
     extra = _live_affordable_buy_candidate_symbols(limit=max_syms)
   except Exception:  # noqa: BLE001 - candidate discovery is best-effort.
@@ -6707,7 +7715,20 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   pending_warmup = _pending_krx_buy_candidate_warmup_symbols()
   kr_extra = [s for s in extra if str(s).isdigit() and len(str(s)) == 6]
   kr_ranked = [s for s in domestic_ranked if str(s).isdigit() and len(str(s)) == 6]
-  merged = list(dict.fromkeys([*pending_warmup, *domestic_priority, *base, *kr_ranked, *kr_extra]))
+  # Affordable/pending candidates get the scarce complete quote+trade pairs
+  # before static blue chips that the account may not be able to buy.
+  merged = list(
+      dict.fromkeys(
+          [
+              *held_domestic,
+              *pending_warmup,
+              *kr_extra,
+              *kr_ranked,
+              *context_domestic,
+              *base,
+          ]
+      )
+  )
   return tuple(merged[:max_syms])
 
 
@@ -6800,8 +7821,13 @@ def _kis_realtime_collector_loop() -> None:
       )
     try:
       _kis_realtime_collector_resubscribe.clear()
+      use_event_driven = RefactorFeatureFlags.from_env().websocket_market_data
+      collector_fn = run_kis_realtime_websocket_collector
+      if use_event_driven:
+        from app.data.event_runtime import run_event_driven_kis_websocket_collector
+        collector_fn = run_event_driven_kis_websocket_collector
       counts = asyncio.run(
-          run_kis_realtime_websocket_collector(
+          collector_fn(
               symbols=symbols,
               store=RealtimeMarketDataStore(),
               client=_kis_realtime_collector_client(),
@@ -6834,10 +7860,21 @@ def _kis_realtime_collector_client() -> KisDevelopersApiClient:
 
 
 def _record_kis_realtime_collector_result(counts: dict[str, Any]) -> None:
+  global _kis_realtime_observed_subscription_capacity
   disconnected = bool(counts.get("connection_closed"))
   resubscribe_requested = bool(counts.get("resubscribe_requested"))
   stopping = _kis_realtime_collector_stop.is_set()
   appkey_in_use = bool(counts.get("appkey_already_in_use"))
+  accepted = int(counts.get("subscriptions_accepted") or 0)
+  if counts.get("subscription_limit_reached") and accepted >= 2:
+    # Keep complete quote+trade pairs only. An odd third slot is not enough to
+    # make another symbol trade-ready and repeatedly causes OPSP0008 noise.
+    _kis_realtime_observed_subscription_capacity = max(2, accepted - (accepted % 2))
+  for item in tuple(counts.get("rejected_subscription_pairs") or ()):
+    symbol = str(item.get("symbol") or "").strip()
+    tr_id = str(item.get("tr_id") or "").strip()
+    if symbol and tr_id and str(item.get("msg_cd") or "").upper() != "OPSP0008":
+      _kis_realtime_collector_skipped_subscriptions[(symbol, tr_id)] = time.time()
   if disconnected and not stopping and not appkey_in_use:
     _record_kis_realtime_collector_bad_subscription(counts)
   if appkey_in_use and not stopping:
@@ -6915,6 +7952,13 @@ def _start_live_worker(learning_mode: str | None = None) -> None:
   global _live_worker
   with _live_lock:
     _live_state["stop"] = False
+    worker_alive = _live_worker is not None and _live_worker.is_alive()
+    if worker_alive:
+      if learning_mode is not None:
+        _live_state["learning_active"] = True
+        _live_state["learning_mode"] = learning_mode
+        _live_state["learning_stopped_at"] = None
+      return
     if learning_mode is not None:
       now = datetime.now(timezone.utc)
       _live_state["learning_active"] = True
@@ -6930,8 +7974,6 @@ def _start_live_worker(learning_mode: str | None = None) -> None:
           "Learning collection started; first cycle is running now",
           mode=learning_mode,
       )
-    if _live_worker is not None and _live_worker.is_alive():
-      return
     _live_worker = threading.Thread(target=_live_worker_loop, name="live-research-refresh", daemon=True)
     _live_worker.start()
 
@@ -7229,6 +8271,23 @@ def _refresh_live_cache() -> None:
           if active_mode == "live_trading"
           else store.save_graph_and_reasoning(context.graph.triples(), context.reasoning_paths)
       )
+      typed_projection_counts = {
+          "typed_ohlcv_bars": store.sync_realtime_ohlcv(),
+          "typed_realtime_quotes": store.sync_realtime_quotes(),
+          "typed_candidate_scores": store.save_typed_candidate_scores(
+              tuple(
+                  {
+                      "ticker": path.ticker,
+                      "observed_at": datetime.now(timezone.utc),
+                      "stage": "ontology_reasoning",
+                      "score": path.confidence,
+                      "reason_mask": 0,
+                      "backend": "ontology",
+                  }
+                  for path in context.reasoning_paths
+              )
+          ),
+      }
       # 주문 실행은 독립 실시간 거래 엔진(_realtime_trading_*)이 단독 수행한다.
       # 학습/새로고침 루프는 데이터·모델 수집만 담당하되, 대시보드 요약은 엔진 실제 활동을 반영한다.
       live_execution_summary = _realtime_engine_execution_summary() if active_mode == "live_trading" else None
@@ -7240,7 +8299,11 @@ def _refresh_live_cache() -> None:
         _live_state["graph_payload_context_id"] = id(context)
         _live_state["live_execution_summary"] = live_execution_summary
         _live_state["store_summary"] = store.summary()
-        _live_state["stored_new_records"] = {**stored_counts, **graph_counts}
+        _live_state["stored_new_records"] = {
+            **stored_counts,
+            **graph_counts,
+            **typed_projection_counts,
+        }
         _live_state["last_updated"] = datetime.now()
         _live_state["last_error"] = None
         duration_ms = int((time.monotonic() - started_at) * 1000)
@@ -7253,6 +8316,7 @@ def _refresh_live_cache() -> None:
             counts={
                 **stored_counts,
                 **graph_counts,
+                **typed_projection_counts,
                 "events_seen": len(research_result.events),
                 "raw_records_seen": len(research_result.raw_records),
                 "market_snapshots_seen": len(research_result.market_snapshots),

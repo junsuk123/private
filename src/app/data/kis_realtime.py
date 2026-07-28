@@ -28,9 +28,14 @@ if TYPE_CHECKING:
 
 TRADE_TR_IDS = {"H0STCNT0", "H0STCNI0"}
 ORDERBOOK_TR_IDS = {"H0STASP0"}
-DEFAULT_SUBSCRIPTION_TR_IDS = ("H0STASP0", "H0STCNT0")
+# Trades come first so a constrained KIS subscription budget still produces
+# candles and activity signals. A complete symbol receives trade + orderbook
+# before the collector advances to the next symbol.
+DEFAULT_SUBSCRIPTION_TR_IDS = ("H0STCNT0", "H0STASP0")
 KIS_REALTIME_LIVE_WS_URL = "ws://ops.koreainvestment.com:21000/tryitout"
 KIS_EXCHANGE_TIMEZONE = ZoneInfo("Asia/Seoul")
+KIS_TRADE_FIELDS_PER_RECORD = 46
+KIS_ORDERBOOK_FIELDS_PER_RECORD = 59
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,7 @@ class ParsedKisRealtimeMessage:
 class KisRealtimeSubscriptionManager:
     store: RealtimeMarketDataStore
     message_source: Callable[[], Awaitable[str | None]]
+    event_sink: Callable[[RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]] | None = None
     symbols: set[str] = field(default_factory=set)
     running: bool = False
 
@@ -70,10 +76,17 @@ class KisRealtimeSubscriptionManager:
             orderbooks = tuple(
                 item for item in parsed.orderbooks if not self.symbols or item.symbol in self.symbols
             )
-            counts["ticks"] += self.store.save_ticks(ticks)
-            counts["orderbooks"] += self.store.save_orderbooks(orderbooks)
-            for symbol in {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}:
-                self.store.build_latest_minute_bar(symbol)
+            if self.event_sink is not None:
+                for event in (*ticks, *orderbooks):
+                    await self.event_sink(event)
+                counts["ticks"] += len(ticks)
+                counts["orderbooks"] += len(orderbooks)
+                counts["events_published"] = counts.get("events_published", 0) + len(ticks) + len(orderbooks)
+            else:
+                counts["ticks"] += self.store.save_ticks(ticks)
+                counts["orderbooks"] += self.store.save_orderbooks(orderbooks)
+                for symbol in {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}:
+                    self.store.build_latest_minute_bar(symbol)
             counts["messages"] += 1
             if max_messages is not None and counts["messages"] >= max_messages:
                 break
@@ -124,7 +137,11 @@ async def run_kis_realtime_websocket_collector(
     skip_subscriptions: Iterable[tuple[str, str]] | None = None,
     max_messages: int | None = None,
     max_runtime_seconds: float | None = None,
-) -> dict[str, int]:
+    event_sink: Callable[
+        [RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]
+    ]
+    | None = None,
+) -> dict[str, Any]:
     websockets = _load_websockets()
     client = client or build_kis_client(enabled=True)
     approval_key = issue_websocket_approval_key(client)
@@ -141,10 +158,15 @@ async def run_kis_realtime_websocket_collector(
         "ticks": 0,
         "orderbooks": 0,
         "subscriptions": 0,
+        "subscription_requests": 0,
+        "subscriptions_accepted": 0,
+        "subscriptions_rejected": 0,
+        "accepted_subscription_pairs": [],
+        "rejected_subscription_pairs": [],
         "mode": "live",
         "url": target_url,
     }
-    feature_builder = LiveFeatureFrameBuilder(store)
+    feature_builder = LiveFeatureFrameBuilder(store) if event_sink is None else None
     # KIS realtime sends application-level PINGPONG frames and doesn't reliably
     # respond to RFC websocket pings from the client library. Keep the standard
     # ping disabled by default; operators can opt in with env vars if needed.
@@ -152,6 +174,7 @@ async def run_kis_realtime_websocket_collector(
     ping_timeout = _websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", None)
     subscribe_delay = _websocket_subscription_delay_seconds()
     post_subscribe_drain = _websocket_post_subscribe_drain_seconds()
+    subscription_limit_reached = False
     async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
         for symbol in normalized_symbols:
             for tr_id in DEFAULT_SUBSCRIPTION_TR_IDS:
@@ -169,6 +192,7 @@ async def run_kis_realtime_websocket_collector(
                         return counts
                     raise
                 counts["subscriptions"] += 1
+                counts["subscription_requests"] += 1
                 if post_subscribe_drain > 0.0:
                     closed = await _drain_kis_realtime_messages(
                         websocket=websocket,
@@ -178,11 +202,24 @@ async def run_kis_realtime_websocket_collector(
                         counts=counts,
                         seconds=post_subscribe_drain,
                         max_messages=max_messages,
+                        event_sink=event_sink,
                     )
                     if closed:
                         return counts
+                    if counts.get("subscription_limit_reached"):
+                        subscription_limit_reached = True
+                        break
                 if subscribe_delay > 0.0:
                     await asyncio.sleep(subscribe_delay)
+            if subscription_limit_reached:
+                break
+        if subscription_limit_reached and int(counts.get("subscriptions_accepted") or 0) >= 2:
+            # Close this exploratory connection immediately. The supervising
+            # worker learns the actual account capacity from the accepted
+            # responses and reconnects with complete trade/orderbook pairs,
+            # instead of holding a partial 5-minute subscription set.
+            counts["resubscribe_for_observed_capacity"] = 1
+            return counts
         # Optional soft deadline so the caller can periodically reconnect with a
         # refreshed symbol set (e.g. today's affordable candidates), not just the
         # static config list.
@@ -210,6 +247,7 @@ async def run_kis_realtime_websocket_collector(
                 store=store,
                 feature_builder=feature_builder,
                 counts=counts,
+                event_sink=event_sink,
             )
             if closed:
                 break
@@ -227,6 +265,10 @@ async def _drain_kis_realtime_messages(
     counts: dict[str, Any],
     seconds: float,
     max_messages: int | None,
+    event_sink: Callable[
+        [RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]
+    ]
+    | None = None,
 ) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -252,6 +294,7 @@ async def _drain_kis_realtime_messages(
             store=store,
             feature_builder=feature_builder,
             counts=counts,
+            event_sink=event_sink,
         )
         if closed:
             return True
@@ -264,8 +307,12 @@ async def _process_kis_realtime_raw(
     websocket: Any,
     symbols: tuple[str, ...],
     store: RealtimeMarketDataStore,
-    feature_builder: LiveFeatureFrameBuilder,
+    feature_builder: LiveFeatureFrameBuilder | None,
     counts: dict[str, Any],
+    event_sink: Callable[
+        [RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]
+    ]
+    | None = None,
 ) -> bool:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
@@ -295,6 +342,16 @@ async def _process_kis_realtime_raw(
             counts["appkey_already_in_use"] = 1
         if _kis_realtime_control_is_error(control):
             counts["control_errors"] = counts.get("control_errors", 0) + 1
+            counts["subscriptions_rejected"] = counts.get("subscriptions_rejected", 0) + 1
+            _append_subscription_control_pair(counts, "rejected_subscription_pairs", control)
+            code = str(control.get("msg_cd") or control.get("rt_cd") or "UNKNOWN")
+            by_code = counts.setdefault("subscription_errors_by_code", {})
+            by_code[code] = int(by_code.get(code, 0) or 0) + 1
+            if code.upper() == "OPSP0008" or "MAX SUBSCRIBE" in str(control.get("msg1") or "").upper():
+                counts["subscription_limit_reached"] = 1
+        elif control.get("tr_id") and control.get("tr_key"):
+            counts["subscriptions_accepted"] = counts.get("subscriptions_accepted", 0) + 1
+            _append_subscription_control_pair(counts, "accepted_subscription_pairs", control)
         counts["messages"] += 1
         return False
     try:
@@ -306,12 +363,21 @@ async def _process_kis_realtime_raw(
         return False
     ticks = tuple(tick for tick in parsed.ticks if tick.symbol in symbols)
     orderbooks = tuple(book for book in parsed.orderbooks if book.symbol in symbols)
+    if event_sink is not None:
+        for event in (*ticks, *orderbooks):
+            await event_sink(event)
+        counts["ticks"] += len(ticks)
+        counts["orderbooks"] += len(orderbooks)
+        counts["events_published"] = counts.get("events_published", 0) + len(ticks) + len(orderbooks)
+        counts["messages"] += 1
+        return False
     counts["ticks"] += store.save_ticks(ticks)
     counts["orderbooks"] += store.save_orderbooks(orderbooks)
     for symbol in {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}:
         store.build_latest_minute_bar(symbol)
         try:
-            feature_builder.build(symbol)
+            if feature_builder is not None:
+                feature_builder.build(symbol)
             counts["feature_frames"] = counts.get("feature_frames", 0) + 1
         except (FeatureFrameError, RuntimeError, ValueError) as exc:
             counts["feature_frame_errors"] = counts.get("feature_frame_errors", 0) + 1
@@ -378,6 +444,24 @@ def kis_realtime_control_summary(raw: str) -> dict[str, Any]:
     return summary or {"control": "empty"}
 
 
+def _append_subscription_control_pair(
+    counts: dict[str, Any],
+    key: str,
+    control: dict[str, Any],
+) -> None:
+    pair = {
+        "symbol": str(control.get("tr_key") or "").upper().strip(),
+        "tr_id": str(control.get("tr_id") or "").upper().strip(),
+        "msg_cd": str(control.get("msg_cd") or "").strip(),
+        "message": str(control.get("msg1") or "").strip(),
+    }
+    if not pair["symbol"] or not pair["tr_id"]:
+        return
+    rows = counts.setdefault(key, [])
+    if pair not in rows and len(rows) < 200:
+        rows.append(pair)
+
+
 def _kis_realtime_control_is_error(summary: dict[str, Any]) -> bool:
     code = str(summary.get("rt_cd") or summary.get("msg_cd") or "").strip().lower()
     message = str(summary.get("msg1") or "").strip().lower()
@@ -435,11 +519,35 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
         return ParsedKisRealtimeMessage(event_type="empty")
     parts = raw.split("|")
     if len(parts) >= 4 and parts[1] in TRADE_TR_IDS:
-        tick = _parse_trade_payload(parts[-1], raw=raw, received_at=received_at)
-        return ParsedKisRealtimeMessage(ticks=(tick,), event_type="trade")
+        payloads = _split_kis_payload_records(
+            parts[-1],
+            _kis_payload_count(parts[2]),
+            KIS_TRADE_FIELDS_PER_RECORD,
+        )
+        ticks = tuple(
+            _parse_trade_payload(
+                payload,
+                raw=f"{parts[0]}|{parts[1]}|001|{payload}",
+                received_at=received_at,
+            )
+            for payload in payloads
+        )
+        return ParsedKisRealtimeMessage(ticks=ticks, event_type="trade")
     if len(parts) >= 4 and parts[1] in ORDERBOOK_TR_IDS:
-        orderbook = _parse_orderbook_payload(parts[-1], raw=raw, received_at=received_at)
-        return ParsedKisRealtimeMessage(orderbooks=(orderbook,), event_type="orderbook")
+        payloads = _split_kis_payload_records(
+            parts[-1],
+            _kis_payload_count(parts[2]),
+            KIS_ORDERBOOK_FIELDS_PER_RECORD,
+        )
+        orderbooks = tuple(
+            _parse_orderbook_payload(
+                payload,
+                raw=f"{parts[0]}|{parts[1]}|001|{payload}",
+                received_at=received_at,
+            )
+            for payload in payloads
+        )
+        return ParsedKisRealtimeMessage(orderbooks=orderbooks, event_type="orderbook")
     if raw.startswith("{"):
         return ParsedKisRealtimeMessage(event_type="json_control")
     raise ValueError("unsupported KIS realtime message format")
@@ -452,9 +560,21 @@ def _parse_trade_payload(payload: str, *, raw: str, received_at: datetime) -> Re
     symbol = normalize_symbol(fields[0])
     exchange_timestamp = _timestamp_from_hhmmss(fields[1], received_at)
     price = _float(fields[2])
-    volume = int(_float(fields[3]))
-    direction = fields[4] if len(fields) > 4 and fields[4] else None
-    sequence = fields[5] if len(fields) > 5 and fields[5] else f"{symbol}:{fields[1]}:{price}:{volume}"
+    if len(fields) >= KIS_TRADE_FIELDS_PER_RECORD:
+        # Official H0STCNT0 layout:
+        # [3] PRDY_VRSS_SIGN, [5] PRDY_CTRT, [12] CNTG_VOL,
+        # [13] ACML_VOL, [14] ACML_TR_PBMN, [21] CCLD_DVSN.
+        volume = int(_float(fields[12]))
+        direction = _kis_trade_direction(fields[21])
+        sequence = (
+            f"{symbol}:{fields[1]}:{fields[13]}:{fields[14]}:"
+            f"{price}:{volume}:{checksum(payload)[:12]}"
+        )
+    else:
+        # Retain the compact test/fixture format used by local adapters.
+        volume = int(_float(fields[3]))
+        direction = fields[4] if len(fields) > 4 and fields[4] else None
+        sequence = fields[5] if len(fields) > 5 and fields[5] else f"{symbol}:{fields[1]}:{price}:{volume}"
     return RealtimeTradeTick(
         symbol=symbol,
         exchange_timestamp=exchange_timestamp,
@@ -467,6 +587,37 @@ def _parse_trade_payload(payload: str, *, raw: str, received_at: datetime) -> Re
         raw_checksum=checksum(raw),
         latency_ms=max(0.0, (received_at - exchange_timestamp).total_seconds() * 1000),
     )
+
+
+def _kis_payload_count(value: str) -> int:
+    try:
+        return max(1, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _split_kis_payload_records(
+    payload: str,
+    count: int,
+    fields_per_record: int,
+) -> tuple[str, ...]:
+    fields = payload.split("^")
+    expected = count * fields_per_record
+    if count <= 1 or len(fields) < expected:
+        return (payload,)
+    return tuple(
+        "^".join(fields[index : index + fields_per_record])
+        for index in range(0, expected, fields_per_record)
+    )
+
+
+def _kis_trade_direction(value: str) -> str | None:
+    code = str(value or "").strip().upper()
+    if code == "1":
+        return "BUY"
+    if code == "5":
+        return "SELL"
+    return code or None
 
 
 def _parse_orderbook_payload(payload: str, *, raw: str, received_at: datetime) -> RealtimeOrderbookSnapshot:

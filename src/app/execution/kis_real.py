@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +22,8 @@ KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
 KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
+_KIS_GET_RATE_LOCK = threading.Lock()
+_KIS_GET_NEXT_ALLOWED_AT = 0.0
 
 
 class KisApiError(RuntimeError):
@@ -513,8 +518,24 @@ class KisDevelopersApiClient:
         # KIS's foreign_cash_krw re-includes the domestic KRW deposit (통합증거금), so it
         # must NOT be shown as "외화" — use the per-currency computation and only fall
         # back to the broker figure when no currency breakdown is available.
-        _ccy_foreign_krw = _foreign_cash_krw_from_currency_balances(foreign_cash_by_currency, foreign_fx_by_currency)
-        display_foreign_cash_krw = _ccy_foreign_krw if _ccy_foreign_krw > 0 else foreign_cash_krw
+        _ccy_foreign_krw = _foreign_cash_krw_from_currency_balances(
+            foreign_cash_by_currency,
+            foreign_fx_by_currency,
+        )
+        # Some KIS integrated-margin responses put the domestic KRW deposit in a
+        # field named like a foreign-cash total.  That summary is not evidence of
+        # actual foreign cash by itself: require an explicit non-KRW currency
+        # balance before using it as the display fallback.  Otherwise a KRW-only
+        # account is rendered as KRW cash + the same amount again as foreign cash.
+        has_explicit_foreign_cash = any(
+            str(currency or "").upper() != "KRW" and _to_float(amount) > 0
+            for currency, amount in foreign_cash_by_currency.items()
+        )
+        display_foreign_cash_krw = (
+            _ccy_foreign_krw
+            if _ccy_foreign_krw > 0
+            else foreign_cash_krw if has_explicit_foreign_cash else 0.0
+        )
         if domestic_error is not None and not foreign_cash_by_currency and foreign_cash_krw <= 0:
             raise domestic_error
         cash_by_currency.update(foreign_cash_by_currency)
@@ -891,6 +912,8 @@ class KisDevelopersApiClient:
         return total if found else 0.0
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(self.transport, UrllibKisTransport):
+            _throttle_kis_get()
         return self.transport.request(
             "GET",
             self._url(path),
@@ -986,7 +1009,13 @@ class KisDevelopersApiClient:
         token = str(payload.get("access_token") or "")
         expires_at = _parse_datetime(payload.get("expires_at"))
         mode = str(payload.get("mode") or "")
-        if not token or expires_at is None or mode != "live":
+        credential_fingerprint = str(payload.get("credential_fingerprint") or "")
+        if (
+            not token
+            or expires_at is None
+            or mode != "live"
+            or credential_fingerprint != self._credential_fingerprint()
+        ):
             return None
         if expires_at <= (now or datetime.now(timezone.utc)):
             return None
@@ -1004,6 +1033,10 @@ class KisDevelopersApiClient:
             "mode": "live",
             "base_url": self.endpoints.base_url,
             "account_suffix": self.credentials.account_no[-2:],
+            # Bind a cached bearer token to the exact app/account credential set.
+            # KIS accepts a token issued for an old app key until expiry, but rejects
+            # subsequent REST headers when the local appSecret has been rotated.
+            "credential_fingerprint": self._credential_fingerprint(),
         }
         try:
             self._token_cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1019,6 +1052,19 @@ class KisDevelopersApiClient:
             raise RuntimeError(
                 f"KIS access token was issued but cache verification failed at {self._token_cache_path}."
             )
+        self._token_source = "issued"
+
+    def _credential_fingerprint(self) -> str:
+        material = "\0".join(
+            (
+                self.credentials.app_key,
+                self.credentials.app_secret,
+                self.credentials.account_no,
+                self.credentials.account_product_code,
+                self.endpoints.base_url,
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def _ensure_token_cache_writable(self) -> None:
         if self._token_cache_path.exists() and self._token_cache_path.is_dir():
@@ -1952,6 +1998,17 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _throttle_kis_get() -> None:
+    """Serialize live KIS GETs across client instances to stay below burst quotas."""
+    global _KIS_GET_NEXT_ALLOWED_AT
+    minimum_interval = max(0.05, float(os.getenv("KIS_GLOBAL_GET_INTERVAL_SEC", "0.25")))
+    with _KIS_GET_RATE_LOCK:
+        wait_seconds = _KIS_GET_NEXT_ALLOWED_AT - time.monotonic()
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _KIS_GET_NEXT_ALLOWED_AT = time.monotonic() + minimum_interval
 
 
 def load_kis_env_file(path: str | Path | None = None, override: bool = False) -> bool:

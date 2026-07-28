@@ -59,7 +59,7 @@ class LocalResearchStore:
 
     def save_research_result(self, result: Any) -> dict[str, int]:
         self.prune_stale()
-        return {
+        saved = {
             "events": self._insert_unique("events", result.events, _event_key, _event_observed_at),
             "raw_records": self._insert_unique(
                 "raw_records", result.raw_records, _raw_key, _raw_observed_at
@@ -71,6 +71,8 @@ class LocalResearchStore:
                 "macro_metrics", result.macro_metrics, _macro_key, _macro_observed_at
             ),
         }
+        self.save_typed_market_snapshots(tuple(result.market_snapshots))
+        return saved
 
     def save_graph_and_reasoning(
         self,
@@ -93,7 +95,7 @@ class LocalResearchStore:
         executions: tuple[RealtimeExecution, ...] = (),
     ) -> dict[str, int]:
         self.prune_stale()
-        return {
+        saved = {
             "realtime_quotes": self._insert_unique(
                 "realtime_quotes", quotes, _realtime_quote_key, _realtime_quote_observed_at
             ),
@@ -104,6 +106,178 @@ class LocalResearchStore:
                 _realtime_execution_observed_at,
             ),
         }
+        self.save_typed_realtime_quotes(quotes)
+        return saved
+
+    def save_typed_market_snapshots(self, snapshots: tuple[MarketSnapshot, ...]) -> int:
+        rows = []
+        for snapshot in snapshots:
+            source = snapshot.source
+            observed_at = source.observed_at or source.retrieved_at
+            source_id = source.source_id or source.source_name
+            rows.append(
+                (
+                    snapshot.ticker,
+                    _as_aware(observed_at).isoformat(),
+                    snapshot.market,
+                    snapshot.last_price,
+                    snapshot.average_daily_trading_value,
+                    snapshot.volatility_20d,
+                    source_id,
+                )
+            )
+        return self._insert_typed(
+            """
+            insert or replace into typed_market_snapshots
+              (ticker, observed_at, market, last_price, average_daily_trading_value,
+               volatility_20d, source_id)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    def save_typed_realtime_quotes(self, quotes: tuple[RealtimeQuote, ...]) -> int:
+        rows = []
+        for quote in quotes:
+            source_id = (
+                (quote.source.source_id or quote.source.source_name)
+                if quote.source is not None
+                else "unknown"
+            )
+            rows.append(
+                (
+                    quote.ticker,
+                    _as_aware(quote.observed_at).isoformat(),
+                    quote.last_price,
+                    quote.bid_price,
+                    quote.ask_price,
+                    quote.volume,
+                    source_id,
+                )
+            )
+        return self._insert_typed(
+            """
+            insert or replace into typed_realtime_quotes
+              (ticker, observed_at, price, bid, ask, volume, source_id)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    def save_typed_ohlcv_bars(self, bars: tuple[Any, ...], *, source_id: str = "realtime") -> int:
+        rows = []
+        for bar in bars:
+            ticker = getattr(bar, "ticker", None) or getattr(bar, "symbol", None)
+            observed_at = getattr(bar, "as_of", None) or getattr(bar, "minute_start", None)
+            if not ticker or observed_at is None:
+                continue
+            rows.append(
+                (
+                    str(ticker),
+                    _as_aware(observed_at).isoformat(),
+                    float(bar.open),
+                    float(bar.high),
+                    float(bar.low),
+                    float(bar.close),
+                    float(bar.volume),
+                    source_id,
+                )
+            )
+        return self._insert_typed(
+            """
+            insert or replace into typed_ohlcv_bars
+              (ticker, observed_at, open, high, low, close, volume, source_id)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    def save_typed_candidate_scores(self, scores: tuple[dict[str, Any], ...]) -> int:
+        rows = []
+        now = datetime.now(timezone.utc)
+        for score in scores:
+            ticker = str(score.get("ticker") or score.get("symbol") or "").strip()
+            if not ticker:
+                continue
+            observed_at = score.get("observed_at") or score.get("as_of") or now
+            if isinstance(observed_at, str):
+                observed_at = datetime.fromisoformat(observed_at)
+            rows.append(
+                (
+                    ticker,
+                    _as_aware(observed_at).isoformat(),
+                    str(score.get("stage") or "candidate_selection"),
+                    float(score.get("score") or 0.0),
+                    int(score.get("reason_mask") or 0),
+                    str(score.get("backend") or "rule"),
+                )
+            )
+        return self._insert_typed(
+            """
+            insert or replace into typed_candidate_scores
+              (ticker, observed_at, stage, score, reason_mask, backend)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+    def sync_realtime_ohlcv(
+        self,
+        realtime_db_path: str | Path = "data/store/realtime_market_data.sqlite3",
+        *,
+        limit: int = 20_000,
+    ) -> int:
+        """Idempotently project recent realtime bars into the research typed schema."""
+        path = Path(realtime_db_path)
+        if not path.exists():
+            return 0
+        with closing(sqlite3.connect(path, timeout=30)) as conn:
+            rows = conn.execute(
+                """
+                select symbol, minute_start, open, high, low, close, volume
+                from realtime_minute_bars
+                order by minute_start desc
+                limit ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return self._insert_typed(
+            """
+            insert or replace into typed_ohlcv_bars
+              (ticker, observed_at, open, high, low, close, volume, source_id)
+            values (?, ?, ?, ?, ?, ?, ?, 'realtime_market_data')
+            """,
+            [tuple(row) for row in rows],
+        )
+
+    def sync_realtime_quotes(
+        self,
+        realtime_db_path: str | Path = "data/store/realtime_market_data.sqlite3",
+        *,
+        limit: int = 20_000,
+    ) -> int:
+        """Idempotently project trade ticks into the typed quote schema."""
+        path = Path(realtime_db_path)
+        if not path.exists():
+            return 0
+        with closing(sqlite3.connect(path, timeout=30)) as conn:
+            rows = conn.execute(
+                """
+                select symbol, exchange_timestamp, price, null, null, volume, source
+                from realtime_ticks
+                order by exchange_timestamp desc
+                limit ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return self._insert_typed(
+            """
+            insert or replace into typed_realtime_quotes
+              (ticker, observed_at, price, bid, ask, volume, source_id)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [tuple(row) for row in rows],
+        )
 
     def load(self) -> StoredResearch:
         self.prune_stale()
@@ -364,6 +538,15 @@ class LocalResearchStore:
             conn.commit()
             inserted = int(conn.total_changes - before)
         return inserted
+
+    def _insert_typed(self, sql: str, rows: list[tuple[Any, ...]]) -> int:
+        if not rows:
+            return 0
+        with closing(self._connect()) as conn:
+            before = conn.total_changes
+            conn.executemany(sql, rows)
+            conn.commit()
+            return int(conn.total_changes - before)
 
     def _read_kind(self, kind: str) -> tuple[dict[str, Any], ...]:
         with closing(self._connect()) as conn:

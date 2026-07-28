@@ -205,6 +205,24 @@ class AccountSnapshotStore:
             row = conn.execute(
                 "select raw_payload_json from account_snapshots order by created_at desc, id desc limit 1"
             ).fetchone()
+        return self._dashboard_from_row(row)
+
+    def latest_dashboard_for_source(self, source: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                select raw_payload_json
+                from account_snapshots
+                where source = ?
+                order by created_at desc, id desc
+                limit 1
+                """,
+                (str(source),),
+            ).fetchone()
+        return self._dashboard_from_row(row)
+
+    @staticmethod
+    def _dashboard_from_row(row: Any) -> dict[str, Any] | None:
         if not row:
             return None
         try:

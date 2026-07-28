@@ -16,6 +16,43 @@ from app.execution.kis_real import KisDevelopersApiClient
 
 
 class AccountDashboardTest(unittest.TestCase):
+    def test_cached_asset_summary_prefers_last_verified_live_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountSnapshotStore(Path(tmp) / "account.sqlite3")
+            store.save_dashboard(
+                {
+                    "snapshot": {
+                        "created_at": "2026-07-01T00:00:00+00:00",
+                        "updated_at": "2026-07-01T00:00:00+00:00",
+                        "source": "kis_live_account",
+                        "is_live": True,
+                        "total_asset_krw": 217_584,
+                    },
+                    "holdings": [{"ticker": "AAPL"}],
+                }
+            )
+            store.save_dashboard(
+                {
+                    "snapshot": {
+                        "created_at": "2026-07-01T00:01:00+00:00",
+                        "updated_at": "2026-07-01T00:01:00+00:00",
+                        "source": "analysis_context_fallback",
+                        "is_live": False,
+                        "total_asset_krw": 1_000_000,
+                    },
+                    "holdings": [],
+                }
+            )
+            service = AccountDashboardService(store=store)
+
+            summary = service.cached_asset_summary()
+
+        self.assertEqual(summary["status"], "last_known")
+        self.assertFalse(summary["authoritative"])
+        self.assertEqual(summary["current_source"], "analysis_context_fallback")
+        self.assertEqual(summary["snapshot"]["total_asset_krw"], 217_584)
+        self.assertEqual(summary["holdings"][0]["ticker"], "AAPL")
+
     def test_dashboard_normalizes_cash_holdings_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             service = AccountDashboardService(
@@ -98,6 +135,42 @@ class AccountDashboardTest(unittest.TestCase):
         self.assertEqual(snapshot["krw_cash"], 22_440)
         self.assertEqual(snapshot["cash_equivalent_krw"], 108_384.165)
         self.assertEqual(len(dashboard["holdings"]), 1)
+
+    def test_live_zero_balance_does_not_reuse_fallback_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AccountSnapshotStore(Path(tmp) / "account.sqlite3")
+            store.save_dashboard(
+                {
+                    "snapshot": {
+                        "created_at": "2026-07-01T00:00:00+00:00",
+                        "source": "analysis_context_fallback",
+                        "total_asset_krw": 1_000_000,
+                        "cash_equivalent_krw": 1_000_000,
+                        "krw_cash": 1_000_000,
+                    }
+                }
+            )
+            service = AccountDashboardService(
+                status_provider=lambda: {
+                    "basis_source": "kis_live_account",
+                    "account_checked": True,
+                    "updated_at": "2026-07-01T00:01:00+00:00",
+                    "equity": 0,
+                    "krw_cash": 0,
+                    "foreign_cash_krw": 0,
+                    "cash_equivalent_krw": 0,
+                    "positions": [],
+                },
+                store=store,
+            )
+
+            snapshot = service.build_dashboard(persist=False)["snapshot"]
+
+        self.assertTrue(snapshot["is_live"])
+        self.assertEqual(snapshot["source"], "kis_live_account")
+        self.assertEqual(snapshot["total_asset_krw"], 0)
+        self.assertEqual(snapshot["krw_cash"], 0)
+        self.assertEqual(snapshot["foreign_cash_krw"], 0)
 
     def test_asset_history_rolls_up_to_one_point_per_minute(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

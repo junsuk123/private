@@ -43,6 +43,78 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertEqual(tick.source, KIS_REALTIME_SOURCE)
         self.assertEqual(tick.sequence_key, "seq-1")
 
+    def test_trade_tick_parser_uses_official_h0stcnt0_field_positions(self) -> None:
+        received_at = datetime(2026, 7, 28, 0, 30, 1, tzinfo=timezone.utc)
+        fields = [
+            "005930", "093000", "70000", "5", "-100", "-0.14", "70010.0",
+            "70100", "70200", "69900", "70100", "70000", "37", "123456",
+            "8641920000", "100", "120", "20", "88.0", "1000", "1200", "1",
+            "54.0", "1.2", "090000", "2", "100", "091000", "5", "-200",
+            "092000", "2", "100", "20260728", "20", "N", "100", "200",
+            "1000", "1200", "0.5", "100000", "123.0", "0", "", "70000",
+        ]
+        raw = f"0|H0STCNT0|001|{'^'.join(fields)}"
+
+        tick = parse_kis_realtime_message(raw, received_at=received_at).ticks[0]
+
+        self.assertEqual(tick.volume, 37)
+        self.assertEqual(tick.trade_direction, "BUY")
+        self.assertNotEqual(tick.sequence_key, fields[5])
+        self.assertIn("123456", tick.sequence_key)
+
+    def test_trade_parser_expands_multi_record_payload(self) -> None:
+        received_at = datetime(2026, 7, 28, 0, 30, 1, tzinfo=timezone.utc)
+
+        def record(symbol: str, hhmmss: str, price: str, volume: str, cumulative: str) -> list[str]:
+            fields = [
+                symbol, hhmmss, price, "2", "100", "0.14", price,
+                price, price, price, price, price, volume, cumulative,
+                str(int(price) * int(cumulative)), "1", "1", "0", "100.0",
+                "1", "1", "1", "50.0", "1.0", hhmmss, "2", "0", hhmmss,
+                "2", "0", hhmmss, "2", "0", "20260728", "20", "N", "1",
+                "1", "1", "1", "0.1", cumulative, "100.0", "0", "", price,
+            ]
+            self.assertEqual(len(fields), 46)
+            return fields
+
+        payload = "^".join(
+            record("005930", "093000", "70000", "10", "100")
+            + record("000660", "093001", "120000", "20", "200")
+        )
+        parsed = parse_kis_realtime_message(
+            f"0|H0STCNT0|002|{payload}",
+            received_at=received_at,
+        )
+
+        self.assertEqual(len(parsed.ticks), 2)
+        self.assertEqual([tick.symbol for tick in parsed.ticks], ["005930", "000660"])
+        self.assertEqual([tick.volume for tick in parsed.ticks], [10, 20])
+
+    def test_orderbook_parser_expands_multi_record_payload(self) -> None:
+        received_at = datetime(2026, 7, 28, 0, 30, 1, tzinfo=timezone.utc)
+
+        def record(symbol: str, hhmmss: str, ask: int, bid: int) -> list[str]:
+            fields = [symbol, hhmmss, "0"]
+            fields += [str(ask + index * 100) for index in range(10)]
+            fields += [str(bid - index * 100) for index in range(10)]
+            fields += [str(1000 + index) for index in range(10)]
+            fields += [str(1200 + index) for index in range(10)]
+            fields += ["10000", "12000", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"]
+            self.assertEqual(len(fields), 59)
+            return fields
+
+        payload = "^".join(
+            record("005930", "093000", 70100, 70000)
+            + record("000660", "093001", 120100, 120000)
+        )
+        parsed = parse_kis_realtime_message(
+            f"0|H0STASP0|002|{payload}",
+            received_at=received_at,
+        )
+
+        self.assertEqual(len(parsed.orderbooks), 2)
+        self.assertEqual([book.symbol for book in parsed.orderbooks], ["005930", "000660"])
+
     def test_orderbook_parser_computes_spread_and_imbalance(self) -> None:
         received_at = datetime(2026, 6, 29, 9, 30, 1, tzinfo=timezone.utc)
         raw = "0|H0STASP0|001|005930^093000^70100^70000^1000^1500^70200^69900^800^700"
@@ -116,6 +188,29 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertEqual(counts["ticks"], 1)
         self.assertIsNotNone(tick)
 
+    def test_subscription_manager_can_publish_without_database_io(self) -> None:
+        messages = ("0|H0STCNT0|001|005930^093000^70000^100^BUY^seq-1",)
+        published = []
+
+        async def sink(event):
+            published.append(event)
+            return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            manager = KisRealtimeSubscriptionManager(
+                store,
+                QueueMessageSource(messages),
+                event_sink=sink,
+            )
+            manager.subscribe(["005930"])
+            counts = asyncio.run(manager.run_forever())
+            tick = store.latest_tick("005930")
+
+        self.assertEqual(counts["events_published"], 1)
+        self.assertEqual(len(published), 1)
+        self.assertIsNone(tick)
+
     def test_symbol_normalization_keeps_krx_six_digits(self) -> None:
         self.assertEqual(normalize_symbol("660"), "000660")
 
@@ -156,9 +251,9 @@ class KisRealtimeParserTest(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertGreaterEqual(_websocket_subscription_delay_seconds(), 1.0)
 
-    def test_default_kis_subscriptions_request_orderbook_first(self) -> None:
-        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0STASP0")
-        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STASP0", "H0STCNT0"))
+    def test_default_kis_subscriptions_request_trade_first(self) -> None:
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0STCNT0")
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STCNT0", "H0STASP0"))
 
     def test_default_kis_websocket_url_uses_tryitout_path(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

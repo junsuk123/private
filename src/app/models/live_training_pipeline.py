@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import sqlite3
@@ -95,6 +96,20 @@ def train_live_short_horizon_from_collected_features(
 ) -> dict[str, Any]:
     _prune_news_sentiment_store()
     rows = build_live_training_rows_from_feature_journal(journal_path, db_path=DEFAULT_REALTIME_STORE_PATH)
+    registry = registry or ModelArtifactRegistry()
+    dataset_fingerprint = _training_rows_fingerprint(rows)
+    previous = _latest_saved_payload(registry)
+    previous_training = (previous or {}).get("training_data") or {}
+    if (
+        previous
+        and dataset_fingerprint
+        and previous_training.get("dataset_fingerprint") == dataset_fingerprint
+    ):
+        return {
+            **previous,
+            "training_skipped": True,
+            "skip_reason": "UNCHANGED_LABELLED_DATASET",
+        }
     update_news_trust_from_rows(rows)
     artifact = train_live_short_horizon_model(
         rows,
@@ -106,11 +121,12 @@ def train_live_short_horizon_from_collected_features(
     )
     _annotate_saved_artifact(
         artifact,
-        registry or ModelArtifactRegistry(),
+        registry,
         {
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
+            "dataset_fingerprint": dataset_fingerprint,
             "trade_feedback": _trade_event_stats(DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH),
             "label_rule": (
                 f"triple_barrier tp={_label_take_profit_bps()}bps sl={_label_stop_loss_bps()}bps "
@@ -623,6 +639,26 @@ def _row_quality_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _training_rows_fingerprint(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(str(row.get("ticker") or "").encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(row.get("as_of") or "").encode("utf-8"))
+        digest.update(b"|")
+        digest.update(str(int(row.get("label") or 0)).encode("ascii"))
+        digest.update(b"|")
+        try:
+            forward_return = float(row.get("forward_net_return_bps") or 0.0)
+        except (TypeError, ValueError):
+            forward_return = 0.0
+        digest.update(f"{forward_return:.8f}".encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _symbols_in_realtime_store(store: RealtimeMarketDataStore) -> tuple[str, ...]:
     with closing(store._connect()) as conn:  # noqa: SLF001 - narrow internal query for pipeline orchestration.
         rows = conn.execute(
@@ -680,7 +716,7 @@ def _parse_frame_time(frame: dict[str, Any]) -> datetime | None:
 
 def _annotate_saved_artifact(artifact: dict[str, Any], registry: ModelArtifactRegistry, training_data: dict[str, Any]) -> None:
     paths = [registry.root / f"{artifact['artifact_id']}.json"]
-    if artifact.get("live_eligible") is True:
+    if bool((artifact.get("deployment") or {}).get("promoted")):
         paths.append(registry.latest_path)
     for path in paths:
         if not path.exists():
@@ -688,6 +724,22 @@ def _annotate_saved_artifact(artifact: dict[str, Any], registry: ModelArtifactRe
         payload = json.loads(path.read_text(encoding="utf-8"))
         payload["training_data"] = training_data
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _latest_saved_payload(registry: ModelArtifactRegistry) -> dict[str, Any] | None:
+    candidates = sorted(
+        (path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def _line_count(path: Path) -> int:
@@ -716,6 +768,9 @@ def _latest_saved_artifact(registry: ModelArtifactRegistry) -> dict[str, Any] | 
         "example_count": int(float((payload.get("metrics") or {}).get("example_count") or 0)),
         "training_rows": int((payload.get("training_data") or {}).get("row_count") or 0),
         "metrics": payload.get("metrics") or {},
+        "deployment": payload.get("deployment") or {},
+        "training_data": payload.get("training_data") or {},
+        "created_at": payload.get("created_at"),
     }
 
 
@@ -734,4 +789,7 @@ def _live_eligible_artifact(registry: ModelArtifactRegistry) -> dict[str, Any] |
         "example_count": int(float((payload.get("metrics") or {}).get("example_count") or 0)),
         "training_rows": int((payload.get("training_data") or {}).get("row_count") or 0),
         "metrics": payload.get("metrics") or {},
+        "deployment": payload.get("deployment") or {},
+        "training_data": payload.get("training_data") or {},
+        "created_at": payload.get("created_at"),
     }

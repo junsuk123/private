@@ -61,6 +61,28 @@ class LiveTrainingPipelineTest(unittest.TestCase):
             self.assertTrue(artifact["live_eligible"], artifact["reason_codes"])
             self.assertTrue(registry.latest_path.exists())
 
+    def test_unchanged_labelled_dataset_skips_duplicate_training_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=200)
+            registry = ModelArtifactRegistry(Path(tmp) / "models")
+            with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
+                first = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+                second = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+
+            candidates = tuple(registry.root.glob("live_short_horizon.*.json"))
+
+        self.assertFalse(first.get("training_skipped", False))
+        self.assertTrue(second["training_skipped"])
+        self.assertEqual(second["skip_reason"], "UNCHANGED_LABELLED_DATASET")
+        self.assertEqual(len(candidates), 1)
+
     def test_insufficient_collected_frames_do_not_create_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal = Path(tmp) / "frames.jsonl"

@@ -12,6 +12,8 @@ def create_account_router(
     *,
     status_provider: Callable[[], dict[str, Any] | None] | None = None,
     logs_provider: Callable[[], dict[str, Any] | None] | None = None,
+    refactor_provider: Callable[[], dict[str, Any]] | None = None,
+    market_view_provider: Callable[[str | None, int], dict[str, Any]] | None = None,
     service: AccountDashboardService | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -21,11 +23,15 @@ def create_account_router(
 
     @router.get("/account", response_class=HTMLResponse)
     def account_dashboard_page() -> HTMLResponse:
-        return HTMLResponse(_ACCOUNT_PAGE)
+        return HTMLResponse(_STRATEGY_TERMINAL_PAGE)
 
     @router.get("/api/account/dashboard")
     def account_dashboard() -> JSONResponse:
         return JSONResponse(service.build_dashboard())
+
+    @router.get("/api/account/summary")
+    def account_summary() -> JSONResponse:
+        return JSONResponse(service.cached_asset_summary())
 
     @router.get("/api/account/holdings")
     def account_holdings() -> JSONResponse:
@@ -69,6 +75,19 @@ def create_account_router(
     def account_macro_micro() -> JSONResponse:
         return JSONResponse(service.macro_micro())
 
+    @router.get("/api/refactor/dashboard")
+    def refactor_dashboard() -> JSONResponse:
+        return JSONResponse(refactor_provider() if refactor_provider else {})
+
+    @router.get("/api/refactor/market-view")
+    def refactor_market_view(symbol: str | None = None, limit: int = 180) -> JSONResponse:
+        if market_view_provider is None:
+            return JSONResponse({})
+        try:
+            return JSONResponse(market_view_provider(symbol, limit))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
     return router
 
 
@@ -80,7 +99,7 @@ _ACCOUNT_PAGE = """<!doctype html>
   <title>Account Dashboard</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
   <link rel="apple-touch-icon" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/account_dashboard.css?v=20260714-profit-exit2" />
+  <link rel="stylesheet" href="/static/account_dashboard.css?v=20260727-strategy-owner" />
 </head>
 <body>
   <main class="account-dashboard" id="account-dashboard">
@@ -112,6 +131,58 @@ _ACCOUNT_PAGE = """<!doctype html>
       </div>
       <div class="kpi-grid" id="profitability-kpis"></div>
       <div class="profitability-note" id="profitability-note"></div>
+    </section>
+
+    <section class="dashboard-frame refactor-console" id="refactor-console">
+      <div class="frame-title refactor-title">
+        <div>
+          <p class="eyebrow">ONTOLOGY-GATED · STRATEGY-OWNED</p>
+          <h2>전략 운영 제어판</h2>
+        </div>
+        <div class="refactor-title-actions">
+          <span id="refactor-device-badge" class="badge neutral">CPU</span>
+          <span id="refactor-mode-badge" class="badge warn">불러오는 중</span>
+        </div>
+      </div>
+      <div class="refactor-safety" id="refactor-safety"></div>
+      <div class="refactor-kpis" id="refactor-kpis"></div>
+      <div class="refactor-section-title">
+        <h3>결정·실행 경로</h3>
+        <span>활성 단계만 주문 경로에 참여합니다</span>
+      </div>
+      <div class="refactor-pipeline" id="refactor-pipeline"></div>
+      <div class="refactor-grid">
+        <article class="refactor-subpanel">
+          <div class="subpanel-heading">
+            <h3>승격 게이트</h3>
+            <span id="refactor-gate-count">-</span>
+          </div>
+          <div class="promotion-gates" id="refactor-promotion-gates"></div>
+        </article>
+        <article class="refactor-subpanel">
+          <div class="subpanel-heading">
+            <h3>전략 소유 포지션</h3>
+            <span id="refactor-owner-count">-</span>
+          </div>
+          <div class="owner-positions" id="refactor-owner-positions"></div>
+        </article>
+      </div>
+      <div class="refactor-grid">
+        <article class="refactor-subpanel">
+          <div class="subpanel-heading">
+            <h3>전략별 반사실 평가</h3>
+            <span id="refactor-eval-status">-</span>
+          </div>
+          <div class="strategy-evaluation" id="refactor-strategy-evaluation"></div>
+        </article>
+        <article class="refactor-subpanel">
+          <div class="subpanel-heading">
+            <h3>Shadow 비교</h3>
+            <span id="refactor-shadow-status">-</span>
+          </div>
+          <div class="shadow-comparison" id="refactor-shadow-comparison"></div>
+        </article>
+      </div>
     </section>
 
     <section class="main-grid">
@@ -231,7 +302,207 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="log-panel" id="account-logs"></div>
     </details>
   </main>
-  <script src="/static/account_dashboard.js?v=20260714-profit-exit2"></script>
+  <script src="/static/account_dashboard.js?v=20260728-market-health"></script>
+</body>
+</html>
+"""
+
+
+_STRATEGY_TERMINAL_PAGE = """<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ontology Strategy Terminal</title>
+  <link rel="icon" type="image/png" href="/static/icon.png" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260727-diagnostics-1" />
+</head>
+<body>
+  <main class="terminal-shell">
+    <header class="terminal-header">
+      <div class="brand">
+        <span class="brand-mark">O</span>
+        <div>
+          <p>ONTOLOGY-GATED EXECUTION</p>
+          <h1>Strategy Trading Terminal</h1>
+        </div>
+      </div>
+      <div class="header-status">
+        <span class="connection"><i></i><b id="feed-state">데이터 연결 확인 중</b></span>
+        <span class="status-chip" id="terminal-mode">SHADOW</span>
+        <time id="terminal-clock">--:--:--</time>
+        <button type="button" id="terminal-refresh" aria-label="새로고침">↻</button>
+      </div>
+    </header>
+
+    <section class="asset-overview" aria-labelledby="asset-overview-title">
+      <div class="asset-overview-head">
+        <div>
+          <p class="panel-kicker">MY ACCOUNT</p>
+          <h2 id="asset-overview-title">내 자산</h2>
+        </div>
+        <div class="asset-trust">
+          <span class="status-chip blocked" id="asset-status">확인 중</span>
+          <small id="asset-verified-at">마지막 확인 -</small>
+        </div>
+      </div>
+      <div class="asset-metrics" id="asset-metrics">
+        <article class="asset-primary">
+          <span>총자산</span>
+          <strong id="asset-total">-</strong>
+          <small id="asset-source">계좌 정보를 불러오는 중입니다.</small>
+        </article>
+        <article><span>현금성 자산</span><strong id="asset-cash">-</strong><small id="asset-cash-detail">원화 - · 외화 -</small></article>
+        <article><span>보유주식 평가</span><strong id="asset-stocks">-</strong><small id="asset-stock-detail">국내 - · 해외 -</small></article>
+        <article><span>평가·실현 손익</span><strong id="asset-pnl">-</strong><small id="asset-pnl-rate">수익률 -</small></article>
+      </div>
+      <div class="asset-warning" id="asset-warning" role="status"></div>
+    </section>
+
+    <section class="diagnostics-panel terminal-panel" aria-labelledby="diagnostics-title">
+      <div class="diagnostics-head">
+        <div>
+          <p class="panel-kicker">SYSTEM LEARNING &amp; TRADE READINESS</p>
+          <h2 id="diagnostics-title">시스템 진행 상태</h2>
+          <p id="diagnostics-summary">학습·수집·실거래 게이트를 확인하는 중입니다.</p>
+        </div>
+        <div class="diagnostics-score">
+          <span id="diagnostics-mode">확인 중</span>
+          <strong id="diagnostics-score">-</strong>
+          <small id="diagnostics-threshold">승격 기준 -</small>
+        </div>
+      </div>
+      <div class="diagnostics-progress" aria-label="실거래 준비도">
+        <i id="diagnostics-progress-bar"></i>
+      </div>
+      <div class="diagnostics-grid">
+        <article>
+          <div class="diagnostics-subhead">
+            <h3>실행 워커</h3>
+            <span id="diagnostics-worker-count">-</span>
+          </div>
+          <div class="worker-grid" id="diagnostics-workers"></div>
+        </article>
+        <article>
+          <div class="diagnostics-subhead">
+            <h3>실거래 정체 원인</h3>
+            <span id="diagnostics-blocker-count">-</span>
+          </div>
+          <div class="blocker-list" id="diagnostics-blockers"></div>
+        </article>
+      </div>
+      <div class="diagnostics-grid diagnostics-lower">
+        <article>
+          <div class="diagnostics-subhead">
+            <h3>수집·학습 증거</h3>
+            <span id="diagnostics-generated-at">-</span>
+          </div>
+          <div class="evidence-grid" id="diagnostics-evidence"></div>
+        </article>
+        <article>
+          <div class="diagnostics-subhead">
+            <h3>최근 활동</h3>
+            <span id="diagnostics-next-run">-</span>
+          </div>
+          <div class="activity-list" id="diagnostics-activity"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="selection-strip">
+      <div class="section-label">
+        <span>01</span>
+        <div><b>온톨로지 후보</b><small>전략 게이트가 평가한 종목</small></div>
+      </div>
+      <div class="candidate-list" id="candidate-list"></div>
+    </section>
+
+    <section class="instrument-hero">
+      <div class="instrument-title">
+        <span class="market-pill" id="instrument-market">ONTOLOGY</span>
+        <h2 id="instrument-symbol">선택 대기</h2>
+        <div class="price-line">
+          <strong id="instrument-price">-</strong>
+          <span id="instrument-change">-</span>
+        </div>
+      </div>
+      <div class="instrument-stats" id="instrument-stats"></div>
+      <article class="algorithm-card">
+        <div class="algorithm-head">
+          <span>SELECTED ALGORITHM</span>
+          <i id="algorithm-state">NO TRADE</i>
+        </div>
+        <h3 id="algorithm-name">온톨로지 선택 대기</h3>
+        <p id="algorithm-thesis">필수 사실과 기대 순효용을 통과한 전략만 표시됩니다.</p>
+        <div class="algorithm-tags" id="algorithm-tags"></div>
+      </article>
+    </section>
+
+    <section class="workspace-grid">
+      <article class="terminal-panel chart-panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">REAL-TIME MARKET</p>
+            <h2>가격·알고리즘 시각화</h2>
+          </div>
+          <div class="chart-legend">
+            <span class="candle-up">상승봉</span>
+            <span class="candle-down">하락봉</span>
+            <span class="ma-fast">MA5</span>
+            <span class="ma-slow">MA20</span>
+            <span class="vwap-line">VWAP</span>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="price-chart"></canvas>
+          <div class="chart-empty" id="chart-empty">선택 종목의 분봉을 기다리고 있습니다.</div>
+        </div>
+        <div class="volume-wrap"><canvas id="volume-chart"></canvas></div>
+        <div class="chart-footer">
+          <span id="chart-range">최근 180개 1분봉</span>
+          <span id="chart-updated">마지막 이벤트 -</span>
+        </div>
+      </article>
+
+      <aside class="terminal-panel ontology-panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">CLOSED-WORLD GATE</p>
+            <h2>온톨로지 결정 근거</h2>
+          </div>
+          <span class="status-chip blocked" id="ontology-status">BLOCKED</span>
+        </div>
+        <div class="ontology-flow" id="ontology-flow"></div>
+        <div class="reason-box">
+          <h3>판정 근거</h3>
+          <div id="ontology-reasons"></div>
+        </div>
+        <div class="decision-compare" id="decision-compare"></div>
+      </aside>
+    </section>
+
+    <section class="terminal-panel execution-panel">
+      <div class="panel-head">
+        <div>
+          <p class="panel-kicker">CAUSAL ORDER LIFECYCLE</p>
+          <h2>주문·체결 과정</h2>
+        </div>
+        <span class="status-chip" id="execution-count">0 EVENTS</span>
+      </div>
+      <div class="execution-track" id="execution-track"></div>
+      <div class="execution-bottom">
+        <div class="execution-tape" id="execution-tape"></div>
+        <div class="orderbook-card" id="orderbook-card"></div>
+      </div>
+    </section>
+
+    <footer class="terminal-footer">
+      <div><span>SAFETY</span><strong id="safety-state">실주문 차단</strong></div>
+      <p id="safety-reason">승격 게이트와 전략 소유 실행 상태를 확인하고 있습니다.</p>
+      <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
+    </footer>
+  </main>
+  <script src="/static/strategy_terminal.js?v=20260728-model-challenger-1"></script>
 </body>
 </html>
 """

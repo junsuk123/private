@@ -1,4 +1,4 @@
-const state = { dashboard: null, range: '1D', market: 'all', query: '' };
+const state = { dashboard: null, refactor: null, range: '1D', market: 'all', query: '' };
 
 const fmtKrw = (value) => `₩${Math.round(Number(value || 0)).toLocaleString('ko-KR')}`;
 const fmtMoney = (value, currency = 'KRW') => currency === 'KRW'
@@ -33,9 +33,17 @@ async function refreshDashboard() {
   } catch (_) {
     runtime = null;
   }
+  let refactor = null;
+  try {
+    refactor = await fetchJson('/api/refactor/dashboard');
+  } catch (_) {
+    refactor = null;
+  }
   state.dashboard = data;
   state.runtime = runtime;
+  state.refactor = refactor;
   renderDashboard(data, trading, runtime);
+  renderRefactorDashboard(refactor);
   await refreshHistory();
 }
 
@@ -61,6 +69,174 @@ function renderDashboard(data, trading, runtime) {
   renderTechnical(data.technical || {});
   renderMacroMicroVisual(data.macro_micro || {});
   renderLogs(data.logs || {});
+}
+
+function renderRefactorDashboard(data) {
+  const modeBadge = document.getElementById('refactor-mode-badge');
+  const deviceBadge = document.getElementById('refactor-device-badge');
+  const safety = document.getElementById('refactor-safety');
+  const kpis = document.getElementById('refactor-kpis');
+  const pipeline = document.getElementById('refactor-pipeline');
+  const gates = document.getElementById('refactor-promotion-gates');
+  const gateCount = document.getElementById('refactor-gate-count');
+  const positions = document.getElementById('refactor-owner-positions');
+  const ownerCount = document.getElementById('refactor-owner-count');
+  const evaluation = document.getElementById('refactor-strategy-evaluation');
+  const evaluationStatus = document.getElementById('refactor-eval-status');
+  const shadow = document.getElementById('refactor-shadow-comparison');
+  const shadowStatus = document.getElementById('refactor-shadow-status');
+  if (!modeBadge || !data || !Object.keys(data).length) {
+    if (modeBadge) {
+      modeBadge.textContent = '상태 없음';
+      modeBadge.className = 'badge blocked';
+    }
+    if (safety) safety.innerHTML = '<strong>진단 불가</strong><span>리팩터링 상태 API를 불러오지 못했습니다.</span>';
+    return;
+  }
+
+  const mode = String(data.mode || 'invalid').toUpperCase();
+  modeBadge.textContent = `${mode} · ${data.live_order_capable ? '주문 가능' : '주문 차단'}`;
+  modeBadge.className = data.live_order_capable ? 'badge' : 'badge blocked';
+  const devices = data.devices || {};
+  deviceBadge.textContent = devices.selected || 'CPU';
+  deviceBadge.className = 'badge neutral';
+
+  const failedGates = (data.promotion_gates || []).filter((gate) => !gate.passed);
+  if (safety) {
+    safety.className = data.live_order_capable ? 'refactor-safety safe' : 'refactor-safety';
+    safety.innerHTML = data.live_order_capable
+      ? '<strong>실행 준비</strong><span>모든 승격 게이트가 통과했고 제한된 주문 경계가 활성화되었습니다.</span>'
+      : `<strong>안전 차단</strong><span>실주문 비활성 · ${failedGates.length}개 승격 게이트 미통과 · NoTrade 우선</span>`;
+  }
+
+  const evalData = data.evaluation || {};
+  const lifecycle = data.lifecycle || {};
+  const cpu = devices.cpu || {};
+  const npu = devices.npu || {};
+  const kpiRows = [
+    ['운영 모드', mode, data.broker_submission_enabled ? 'broker 제출 켜짐' : 'broker 제출 꺼짐'],
+    ['전략 소유 포지션', String(lifecycle.open_positions || 0), `인스턴스 ${lifecycle.instances || 0}`],
+    ['반사실 라벨', Number(evalData.strategy_labels || 0).toLocaleString('ko-KR'), `시점 ${Number(evalData.snapshots || 0).toLocaleString('ko-KR')}`],
+    ['외표본 선택', String(evalData.selected_trades || 0), `관측 ${Number(evalData.walk_forward_observations || 0).toLocaleString('ko-KR')}`],
+    ['추론 장치', devices.selected || 'CPU', `CPU p95 ${formatMs(cpu.p95_ms)} · NPU p95 ${formatMs(npu.p95_ms)}`],
+  ];
+  if (kpis) {
+    kpis.innerHTML = kpiRows.map(([label, value, note]) => `
+      <div class="refactor-metric">
+        <span>${escapeHtml(label)}</span>
+        <strong>${escapeHtml(value)}</strong>
+        <small>${escapeHtml(note)}</small>
+      </div>
+    `).join('');
+  }
+
+  if (pipeline) {
+    pipeline.innerHTML = (data.pipeline || []).map((node, index) => `
+      <div class="pipeline-node ${node.active ? 'active' : 'inactive'}">
+        <span class="pipeline-index">${index + 1}</span>
+        <strong>${escapeHtml(node.label || '-')}</strong>
+        <small>${escapeHtml(node.detail || '-')}</small>
+        <span class="pipeline-state">${node.active ? 'ACTIVE' : 'STANDBY'}</span>
+      </div>
+    `).join('');
+  }
+
+  const promotionGates = data.promotion_gates || [];
+  if (gateCount) gateCount.textContent = `${promotionGates.filter((gate) => gate.passed).length}/${promotionGates.length} 통과`;
+  if (gates) {
+    gates.innerHTML = promotionGates.map((gate) => `
+      <div class="promotion-gate ${gate.passed ? 'pass' : 'fail'}" title="${escapeHtml(gate.reason || '')}">
+        <i class="gate-dot"></i>
+        <strong>${escapeHtml(gate.label || '-')}</strong>
+        <small>${escapeHtml(gate.reason || '-')}</small>
+        <em>${escapeHtml(gate.value || (gate.passed ? 'PASS' : 'BLOCK'))}</em>
+      </div>
+    `).join('');
+  }
+
+  const owned = lifecycle.positions || [];
+  if (ownerCount) ownerCount.textContent = `${owned.length}개`;
+  if (positions) {
+    positions.innerHTML = owned.length ? owned.map((position) => `
+      <div class="owner-row">
+        <strong>${escapeHtml(position.symbol || '-')}</strong>
+        <span title="${escapeHtml(position.strategy_instance_id || '')}">${escapeHtml(position.strategy_id || '-')} · ${escapeHtml(position.strategy_instance_id || '-')}</span>
+        <small>${Number(position.quantity || 0).toLocaleString('ko-KR')}주</small>
+      </div>
+    `).join('') : '<div class="owner-empty">열린 전략 소유 포지션이 없습니다.<br>새 경로는 현재 주문을 생성하지 않습니다.</div>';
+  }
+
+  const strategyNames = {
+    intraday_momentum: '장중 모멘텀',
+    breakout_volume: '거래량 돌파',
+    vwap_mean_reversion: 'VWAP 평균회귀',
+    liquidity_shock_reversal: '유동성 충격 반전',
+    event_momentum: '이벤트 모멘텀',
+    cross_sectional_relative_strength: '횡단면 상대강도',
+    gap_context: '갭 컨텍스트',
+  };
+  const metrics = evalData.strategy_metrics || {};
+  if (evaluationStatus) {
+    evaluationStatus.textContent = `${evalData.status || 'NO REPORT'} · ${evalData.dates || 0}일`;
+  }
+  if (evaluation) {
+    evaluation.innerHTML = Object.entries(strategyNames).map(([id, name]) => {
+      const metric = metrics[id] || {};
+      const triggered = Number(metric.triggered || 0);
+      const filled = Number(metric.filled || 0);
+      const rate = metric.fill_rate_when_triggered;
+      const net = metric.mean_net_return_bps_when_filled;
+      return `
+        <div class="strategy-row ${triggered ? '' : 'disabled'}">
+          <strong title="${escapeHtml(id)}">${escapeHtml(name)}</strong>
+          <span>발동 ${triggered.toLocaleString('ko-KR')}</span>
+          <span>체결 ${filled.toLocaleString('ko-KR')}</span>
+          <div class="strategy-bar" title="평균 순수익 ${formatBps(net)}"><i style="width:${rate === null || rate === undefined ? 0 : Math.max(2, Math.min(100, Number(rate) * 100))}%"></i></div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  const shadowData = data.shadow || {};
+  if (shadowStatus) shadowStatus.textContent = shadowData.available ? `${shadowData.samples || 0} samples` : '대기';
+  if (shadow) {
+    if (!shadowData.available) {
+      shadow.innerHTML = '<div class="shadow-empty">Shadow 비교 로그가 아직 없습니다.<br>주문 없이 legacy·ontology·CPU/NPU 결정을 비교합니다.</div>';
+    } else {
+      const latest = shadowData.latest || {};
+      const decisions = latest.decisions || [];
+      shadow.innerHTML = `
+        <div class="shadow-summary">
+          <div class="shadow-tile"><span>행동 일치율</span><strong>${formatRatio(shadowData.action_agreement_rate)}</strong></div>
+          <div class="shadow-tile"><span>전략 일치율</span><strong>${formatRatio(shadowData.strategy_agreement_rate)}</strong></div>
+        </div>
+        <div class="shadow-decisions">
+          ${decisions.map((decision) => `
+            <div class="shadow-decision">
+              <strong>${escapeHtml(decision.path || '-')}</strong>
+              <span>${escapeHtml(decision.action || '-')}</span>
+              <span>${escapeHtml(decision.strategy_id || 'NoTrade')}</span>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+  }
+}
+
+function formatMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(2)}ms` : '-';
+}
+
+function formatBps(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number.toFixed(1)}bps` : '-';
+}
+
+function formatRatio(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : '-';
 }
 
 function renderMacroMicro(mm) {
@@ -755,7 +931,31 @@ function renderSystem(snapshot, logs, trading, runtime) {
   const llmLabel = eventLlm.available
     ? `LLM ${eventLlm.provider || '-'}`
     : (runtime ? `LLM 대기 (${eventLlm.reason || '미구성'})` : 'n/a');
+  const collectorRows = Array.isArray(logs.collection_log) ? logs.collection_log : [];
+  const collector = [...collectorRows].reverse().find((row) => {
+    const counts = row && row.counts ? row.counts : {};
+    return Number(counts.control_messages || 0) > 0;
+  });
+  const collectorCounts = collector && collector.counts ? collector.counts : {};
+  const subscriptionRequests = Number(
+    collectorCounts.subscription_requests || collectorCounts.subscriptions || 0
+  );
+  const subscriptionRejected = Number(
+    collectorCounts.subscriptions_rejected || collectorCounts.control_errors || 0
+  );
+  const subscriptionAccepted = Object.prototype.hasOwnProperty.call(
+    collectorCounts,
+    "subscriptions_accepted"
+  )
+    ? Number(collectorCounts.subscriptions_accepted || 0)
+    : Math.max(0, subscriptionRequests - subscriptionRejected);
+  const subscriptionLabel = subscriptionRequests
+    ? `${subscriptionAccepted}/${subscriptionRequests} 승인 · ${subscriptionRejected} 거절`
+    : '수집 대기';
+  const sellOnly = Boolean(trading && trading.running && trading.buy_enabled === false);
   const items = [
+    ['KIS 구독', subscriptionLabel],
+    ['포지션 감시', trading && trading.running ? (sellOnly ? '매도 전용 실행' : '매수·매도 실행') : '중지'],
     ['KIS 상태', snapshot.is_live ? '연결됨' : 'fallback'],
     ['자동거래', trading && trading.running ? '실행 중' : '대기'],
     ['자동시작', trading && trading.auto_start ? '켜짐' : '꺼짐'],

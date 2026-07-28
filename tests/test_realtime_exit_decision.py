@@ -1110,6 +1110,7 @@ class RealtimeSellAmendTest(unittest.TestCase):
 
         with patch.dict("os.environ", {"REALTIME_BUY_ENABLED": "true"}):
             engine.disable_buys("unit_shutdown")
+            self.assertEqual(os.environ["REALTIME_BUY_ENABLED"], "true")
             summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
 
             self.assertEqual(summary["buy_evaluated"], 0)

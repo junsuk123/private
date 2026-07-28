@@ -1,5 +1,19 @@
 # Personal Investment Agent
 
+## Strategy-owned event-driven refactor
+
+The repository includes a fail-closed ontology-gated shadow architecture:
+
+- bounded KIS WebSocket event bus, in-memory market state, incremental bars and microstructure features;
+- closed-world, TTL-valid operational ontology strategy gates;
+- seven independent strategy experts with durable position ownership;
+- causal `OrderIntent -> RiskVerdict -> Execution` journaling and restart recovery;
+- cost-aware counterfactual event simulation with NoTrade and purged walk-forward;
+- fixed-shape temporal relational strategy-utility CPU/OpenVINO inference;
+- legacy/ontology/CPU/NPU shadow comparison telemetry.
+
+All `REFACTOR_*` flags remain disabled by default except the legacy path. The measured NPU path is not promoted because it was slower than CPU. See [the refactor architecture](docs/refactor/architecture.md) and [runbook](docs/refactor/runbook.md). These components do not authorize live orders.
+
 KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델, 결정론적 리스크 게이트를 묶은 개인용 자동 투자 분석/운영 시스템입니다. 현재 기준의 대표 실행 경로는 Windows의 `run.ps1`이고, Raspberry Pi에서는 CPU-only 런타임과 LCD 키오스크 GUI를 별도로 제공합니다.
 
 > 핵심 원칙: LLM, NPU, ML, 온톨로지는 분류, 랭킹, 설명, 보조 점수만 제공합니다. 실제 주문은 `RiskManager`, 비용/원금보호/신선도/중복주문/KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
@@ -50,8 +64,8 @@ python scripts/live_readiness_check.py
 
 주요 화면:
 
-- `/account`: 계좌/자산 대시보드. 총자산, 현금, 외화 현금, 보유종목, 실현/평가손익, 자산 배분, 최근 거래, 진단 로그를 보여줍니다.
-- `/account`의 실시간 판단 흐름: 자동거래 루프의 cycle, SELL/BUY 평가 수, 제출/정정/차단 건수, 최근 실행 판단, 최근 보류 사유를 표시합니다.
+- `/account`: 온톨로지 전략 트레이딩 터미널. 온톨로지 후보와 선택 알고리즘, 실시간 1분봉·MA5·MA20·VWAP·거래량, 전략 stop/target, 호가 불균형을 표시합니다.
+- `/account`의 주문·체결 흐름: `Ontology → StrategyInstance → OrderIntent → RiskVerdict → KIS → Fill` 단계를 인과 저널 기준으로 표시합니다. 전략이 선택되지 않았거나 게이트가 차단되면 `NoTrade` 상태를 그대로 보여줍니다.
 - `/account`의 종료 버튼: 먼저 `REALTIME_BUY_ENABLED=false`로 신규 BUY를 막고, 라이브 게이트를 통과하는 profit-seeking SELL 청산 주문을 제출한 뒤 서버 종료를 예약합니다.
 - `/display/ontology`: 온톨로지 지식 그래프와 추론 상태를 전체 화면으로 보여주는 시각화 화면입니다.
 - `/display`: Raspberry Pi LCD에 맞춘 trade-reason board입니다. 최근 자동거래 판단과 사람이 읽을 수 있는 이유 카드를 표시합니다.
@@ -59,6 +73,8 @@ python scripts/live_readiness_check.py
 주요 API:
 
 - `GET /api/account/dashboard`
+- `GET /api/refactor/dashboard`
+- `GET /api/refactor/market-view?symbol=005930&limit=180`
 - `GET /api/account/asset-history?range=1D|1W|1M|3M`
 - `GET /api/realtime-trading/status`
 - `POST /api/live-trading/terminate?shutdown=true`

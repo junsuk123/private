@@ -54,6 +54,24 @@ class ModelTrainingArtifactsTest(unittest.TestCase):
         self.assertEqual(artifact["metrics"]["example_count"], float(len(rows)))
         self.assertEqual(artifact["metrics"]["positive_labels"], 0.0)
 
+    def test_weaker_eligible_challenger_does_not_replace_active_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            incumbent = _artifact("incumbent", auc=0.72, precision=0.43, top_k_return=5.0)
+            challenger = _artifact("challenger", auc=0.60, precision=0.36, top_k_return=1.0)
+
+            registry.save(incumbent)
+            registry.save(challenger)
+            active = registry.load_latest_live_eligible()
+
+        self.assertEqual(active.artifact_id, "incumbent")
+        self.assertTrue(incumbent["deployment"]["promoted"])
+        self.assertFalse(challenger["deployment"]["promoted"])
+        self.assertEqual(
+            challenger["deployment"]["reason"],
+            "CHALLENGER_REGRESSES_ACTIVE_MODEL",
+        )
+
 
 def _rows() -> list[dict]:
     names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
@@ -73,6 +91,31 @@ def _rows() -> list[dict]:
         features["principal_cushion_ratio"] = 1.0
         rows.append({"features": features, "label": int(positive), "forward_net_return_bps": 50 if positive else -30})
     return rows
+
+
+def _artifact(
+    artifact_id: str,
+    *,
+    auc: float,
+    precision: float,
+    top_k_return: float,
+) -> dict:
+    names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
+    return {
+        "artifact_id": artifact_id,
+        "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+        "feature_names": list(names),
+        "classification": {"weights": [0.0] * len(names), "bias": 0.0},
+        "regression": {"weights": [0.0] * len(names), "bias": 0.0},
+        "thresholds": {},
+        "metrics": {
+            "auc": auc,
+            "precision_at_k": precision,
+            "avg_forward_net_return_bps_top_k": top_k_return,
+        },
+        "live_eligible": True,
+        "reason_codes": [],
+    }
 
 
 if __name__ == "__main__":

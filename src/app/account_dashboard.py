@@ -157,6 +157,11 @@ class AccountDashboardService:
         previous_snapshot = dict(previous_dashboard.get("snapshot") or {})
         status = self._status_payload()
         logs = self._logs_payload()
+        authoritative_live = bool(
+            status.get("account_checked")
+            or status.get("basis_source") == "kis_live_account"
+            or status.get("source") == "kis_live_account"
+        )
         updated_at = _parse_time(status.get("updated_at")) or now
         stale_seconds = max(0.0, (now - updated_at).total_seconds())
         is_stale = stale_seconds > 90
@@ -181,15 +186,15 @@ class AccountDashboardService:
         total_asset_krw = _num(status.get("equity") or status.get("actual_equity") or status.get("account_value"))
         if total_asset_krw <= 0:
             total_asset_krw = cash_equivalent_krw + domestic_value + overseas_value
-        if total_asset_krw <= 0 and previous_snapshot:
+        if total_asset_krw <= 0 and previous_snapshot and not authoritative_live:
             total_asset_krw = _num(previous_snapshot.get("total_asset_krw") or previous_snapshot.get("net_asset_krw"))
-        if cash_equivalent_krw <= 0 and previous_snapshot:
+        if cash_equivalent_krw <= 0 and previous_snapshot and not authoritative_live:
             cash_equivalent_krw = _num(previous_snapshot.get("cash_equivalent_krw"))
-        if krw_cash <= 0 and previous_snapshot:
+        if krw_cash <= 0 and previous_snapshot and not authoritative_live:
             krw_cash = _num(previous_snapshot.get("krw_cash"))
-        if foreign_cash_krw <= 0 and previous_snapshot:
+        if foreign_cash_krw <= 0 and previous_snapshot and not authoritative_live:
             foreign_cash_krw = _num(previous_snapshot.get("foreign_cash_krw"))
-        if settlement_cash_krw <= 0 and previous_snapshot:
+        if settlement_cash_krw <= 0 and previous_snapshot and not authoritative_live:
             settlement_cash_krw = _num(previous_snapshot.get("settlement_cash_krw"))
         holdings = [
             HoldingDashboardRow(**{**asdict(row), "weight_of_total_asset": _ratio(row.evaluation_amount_krw, total_asset_krw)})
@@ -207,7 +212,7 @@ class AccountDashboardService:
             created_at=now.isoformat(),
             updated_at=updated_at.isoformat(),
             source=str(status.get("basis_source") or status.get("source") or "local_status"),
-            is_live=bool(status.get("account_checked") or status.get("basis_source") == "kis_live_account"),
+            is_live=authoritative_live,
             is_stale=is_stale,
             stale_seconds=stale_seconds,
             base_currency=str(status.get("base_currency") or "KRW"),
@@ -260,6 +265,37 @@ class AccountDashboardService:
         if persist:
             self.store.save_dashboard(dashboard)
         return dashboard
+
+    def cached_asset_summary(self) -> dict[str, Any]:
+        """Return a fast, broker-call-free asset summary for the trading terminal."""
+        latest = self.store.latest_dashboard() or {}
+        latest_snapshot = dict(latest.get("snapshot") or {})
+        latest_live = self.store.latest_dashboard_for_source("kis_live_account") or {}
+        live_snapshot = dict(latest_live.get("snapshot") or {})
+        latest_is_live = bool(
+            latest_snapshot.get("is_live")
+            and latest_snapshot.get("source") == "kis_live_account"
+        )
+        display_snapshot = latest_snapshot if latest_is_live else live_snapshot
+        if latest_is_live:
+            status = "live"
+            message = "KIS 실계좌 확인값"
+        elif display_snapshot:
+            status = "last_known"
+            message = "KIS 연결을 확인할 수 없어 마지막 실계좌 확인값을 표시합니다."
+        else:
+            status = "unavailable"
+            message = "확인된 KIS 실계좌 자산 정보가 없습니다."
+        verified_at = display_snapshot.get("updated_at") or display_snapshot.get("created_at")
+        return {
+            "status": status,
+            "authoritative": latest_is_live,
+            "message": message,
+            "current_source": latest_snapshot.get("source") or "unavailable",
+            "last_verified_at": verified_at,
+            "snapshot": display_snapshot if display_snapshot else None,
+            "holdings": list((latest if latest_is_live else latest_live).get("holdings") or []),
+        }
 
     def technical(self) -> dict[str, Any]:
         return build_technical_panel(self._technical_payload())
