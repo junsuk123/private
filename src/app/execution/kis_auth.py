@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -60,8 +62,44 @@ def validate_live_secret_file(path: str | Path = "config/secrets/kis_api_keys.en
     return results
 
 
-def issue_websocket_approval_key(client: KisDevelopersApiClient) -> str:
+_approval_key_cache: dict[str, tuple[str, float]] = {}
+_approval_key_lock = threading.Lock()
+
+
+def _approval_key_ttl_seconds() -> float:
+    """How long a cached approval key stays reusable.
+
+    KIS issues a fresh key per request, and each key opens its own realtime
+    session against the account. Requesting a new key on every reconnect made
+    the collector accumulate distinct sessions, so the account's realtime
+    registration budget drained until only one symbol could be subscribed.
+    Reusing one key across reconnects keeps that to a single session.
+    """
+    try:
+        hours = float(os.getenv("KIS_APPROVAL_KEY_TTL_HOURS", "6"))
+    except (TypeError, ValueError):
+        hours = 6.0
+    return max(60.0, hours * 3600.0)
+
+
+def reset_websocket_approval_key_cache() -> None:
+    with _approval_key_lock:
+        _approval_key_cache.clear()
+
+
+def issue_websocket_approval_key(
+    client: KisDevelopersApiClient,
+    *,
+    force_refresh: bool = False,
+) -> str:
     client.credentials.validate()
+    cache_key = str(getattr(client.credentials, "app_key", "") or "")
+    now = time.monotonic()
+    if cache_key and not force_refresh:
+        with _approval_key_lock:
+            cached = _approval_key_cache.get(cache_key)
+        if cached and now - cached[1] < _approval_key_ttl_seconds():
+            return cached[0]
     response = client.transport.request(
         "POST",
         client._url("/oauth2/Approval"),  # KIS approval-key endpoint for WebSocket access.
@@ -76,6 +114,9 @@ def issue_websocket_approval_key(client: KisDevelopersApiClient) -> str:
     key = str(response.get("approval_key") or response.get("approvalKey") or "")
     if not key:
         raise RuntimeError("KIS WebSocket approval-key response did not include approval_key")
+    if cache_key:
+        with _approval_key_lock:
+            _approval_key_cache[cache_key] = (key, now)
     return key
 
 

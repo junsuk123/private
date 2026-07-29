@@ -21,6 +21,8 @@ def train_counterfactual_checkpoint(
     output: str | Path,
     *,
     ridge: float = 1.0,
+    input_feature_schema: str = "counterfactual_quantiles_v1",
+    authorize_live_shadow: bool = False,
 ) -> dict[str, object]:
     """Calibrate strategy heads on causal stored counterfactual labels.
 
@@ -74,13 +76,40 @@ def train_counterfactual_checkpoint(
         ridge,
     )[:, 0]
     checkpoint = model.save_checkpoint(output)
+    minimum_rows = 10_000
+    minimum_snapshots = 1_000
+    strategy_coverage = all(fitted.get(strategy_id, 0) >= 500 for strategy_id in STRATEGY_IDS)
+    live_shadow_authorized = bool(
+        authorize_live_shadow
+        and input_feature_schema == "realtime_microstructure_v1"
+        and len(rows) >= minimum_rows
+        and len(grouped) >= minimum_snapshots
+        and strategy_coverage
+    )
     report = {
         "checkpoint": str(checkpoint),
         "rows": len(rows),
         "snapshots": len(grouped),
         "strategies": fitted,
         "method": "causal_feature_encoder_plus_ridge_calibrated_heads",
-        "live_authorized": False,
+        "input_feature_schema": input_feature_schema,
+        "feature_provenance": (
+            "causal_minute_bar_microstructure_proxy_v1"
+            if input_feature_schema == "realtime_microstructure_v1"
+            else "causal_counterfactual_quantiles_v1"
+        ),
+        "live_authorized": live_shadow_authorized,
+        "authorization_scope": "shadow_inference_only",
+        "authorization_checks": {
+            "requested": bool(authorize_live_shadow),
+            "minimum_rows": minimum_rows,
+            "minimum_snapshots": minimum_snapshots,
+            "strategy_minimum_rows": 500,
+            "row_count_ok": len(rows) >= minimum_rows,
+            "snapshot_count_ok": len(grouped) >= minimum_snapshots,
+            "strategy_coverage_ok": strategy_coverage,
+            "schema_matches_runtime": input_feature_schema == "realtime_microstructure_v1",
+        },
         "config": asdict(config),
     }
     report_path = checkpoint.with_suffix(".json")

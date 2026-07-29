@@ -26,6 +26,7 @@ class EvaluationConfig:
     venue: str = "NASD"
     market: str = "US"
     instrument_type: str = "overseas_stock"
+    feature_schema_name: str = "counterfactual_quantiles_v1"
 
 
 @dataclass(frozen=True)
@@ -193,22 +194,81 @@ def build_labels(
                         cost_bps=outcome.cost_bps,
                         exit_reason=outcome.exit_reason,
                         features=(
-                            quantiles["return"],
-                            quantiles["volume"],
-                            quantiles["breakout"],
-                            quantiles["vwap_deviation"],
-                            quantiles["reversion"],
-                            quantiles["liquidity_shock"],
-                            quantiles["price_drop"],
-                            quantiles["recovery"],
-                            quantiles["liquidity"],
-                            quantiles["event_relevance"],
-                            quantiles["relative_strength"],
-                            quantiles["gap"],
+                            _realtime_microstructure_proxy_features(
+                                current=current,
+                                current_return=current_return,
+                                return_history=return_history,
+                                vwap_proxy=vwap_proxy,
+                            )
+                            if config.feature_schema_name == "realtime_microstructure_v1"
+                            else (
+                                quantiles["return"],
+                                quantiles["volume"],
+                                quantiles["breakout"],
+                                quantiles["vwap_deviation"],
+                                quantiles["reversion"],
+                                quantiles["liquidity_shock"],
+                                quantiles["price_drop"],
+                                quantiles["recovery"],
+                                quantiles["liquidity"],
+                                quantiles["event_relevance"],
+                                quantiles["relative_strength"],
+                                quantiles["gap"],
+                            )
                         ),
                     )
                 )
     return tuple(labels)
+
+
+def _realtime_microstructure_proxy_features(
+    *,
+    current: Bar,
+    current_return: float,
+    return_history: Sequence[float],
+    vwap_proxy: float,
+) -> tuple[float, ...]:
+    """Causal minute-bar proxy for the 12-field live slow-intelligence schema.
+
+    Historical minute bars do not contain L2 depth.  Price, spread, signed-flow,
+    VWAP, and volatility fields retain the live units while unavailable depth
+    fields use neutral closed-world values.  Metadata records this proxy
+    provenance so authorization remains limited to order-free shadow inference.
+    """
+
+    price_scale = 100_000.0
+    bar_range = max(0.0, current.high - current.low)
+    spread_bps = (bar_range / current.close * 10_000.0) if current.close else 0.0
+    close_location = (
+        ((current.close - current.low) - (current.high - current.close)) / bar_range
+        if bar_range
+        else 0.0
+    )
+    mean_return = fmean(return_history) if return_history else 0.0
+    realized_volatility = (
+        (
+            sum((item - mean_return) ** 2 for item in return_history)
+            / max(1, len(return_history))
+        )
+        ** 0.5
+        if return_history
+        else 0.0
+    )
+    signed_flow = current.volume * (1.0 if current_return > 0 else -1.0 if current_return < 0 else 0.0)
+    return (
+        current.close / price_scale,
+        current.close / price_scale,
+        spread_bps / 100.0,
+        current.close / price_scale,
+        max(-1.0, min(1.0, close_location)),
+        signed_flow / 10_000.0,
+        max(-1.0, min(1.0, current_return * 10_000.0)),
+        vwap_proxy / price_scale,
+        realized_volatility * 100.0,
+        1.0,
+        0.0,
+        1.0,
+    )
 
 
 def build_report(

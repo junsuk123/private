@@ -42,6 +42,24 @@ class MarketDataFreshnessTest(unittest.TestCase):
         self.assertIn("QUOTE_STALE", health.reason_codes)
         self.assertIn("ORDERBOOK_COUNT_ZERO", health.reason_codes)
 
+    def test_fresh_orderbook_is_quote_source_when_last_trade_is_stale(self) -> None:
+        now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            store.save_ticks((_tick(now - timedelta(seconds=30)),))
+            store.save_orderbooks((_book(now),))
+
+            health = evaluate_market_data_health(
+                store,
+                "005930",
+                now=now,
+                max_quote_age_ms=3_000,
+                max_orderbook_age_ms=3_000,
+            )
+
+        self.assertTrue(health.ok_for_live_buy, health.reason_codes)
+        self.assertNotIn("QUOTE_STALE", health.reason_codes)
+
 
 def _tick(at: datetime) -> RealtimeTradeTick:
     return RealtimeTradeTick(

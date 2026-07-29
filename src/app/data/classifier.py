@@ -4,6 +4,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 
+from app.data.event_classifier_keyword import KeywordEventClassifier
 from app.data.llm_classifier import JsonEventLLMClassifier
 from app.schemas.domain import ClassifiedEvent, EventType, SentimentDirection, SourceMetadata
 
@@ -61,7 +62,11 @@ def classify_text_event(
     lower = text.lower()
     sentiment = _sentiment(lower)
     aliases = _ticker_aliases(known_tickers)
-    extracted = _extract_tickers(text)
+    extracted = {
+        token
+        for token in _extract_tickers(text)
+        if _ticker_token_is_unambiguous(token, text, known_tickers, aliases)
+    }
     tickers_from_symbols = {
         aliases[token]
         for token in extracted
@@ -88,7 +93,14 @@ def classify_text_event(
     )
     summary = _summarize(body)
     key_facts: tuple[str, ...] = ()
-    event_labels: tuple[str, ...] = ()
+    deterministic = KeywordEventClassifier().classify(
+        title,
+        body,
+        ticker=tickers[0] if len(tickers) == 1 else None,
+    )
+    event_labels: tuple[str, ...] = tuple(
+        label for label in deterministic.event_labels if label != "unknown"
+    )
     classification_confidence = _keyword_confidence(lower)
     classification_model = "keyword_v1"
 
@@ -98,7 +110,7 @@ def classify_text_event(
             sentiment = llm.sentiment
             summary = llm.summary or summary
             key_facts = llm.key_facts
-            event_labels = llm.event_labels
+            event_labels = _merge_strings(event_labels, llm.event_labels)
             tickers = _merge_strings(tickers, _filter_known_tickers(llm.tickers, known_tickers))
             companies = _merge_strings(companies, llm.companies)
             sectors = _merge_strings(sectors, llm.sectors)
@@ -131,6 +143,29 @@ def _extract_tickers(text: str) -> set[str]:
     return {match.upper() for match in re.findall(pattern, text)}
 
 
+def _ticker_token_is_unambiguous(
+    token: str,
+    text: str,
+    known_tickers: dict[str, str],
+    aliases: dict[str, str],
+) -> bool:
+    """Reject ordinary short words that collide with one/two-letter tickers."""
+
+    canonical = aliases.get(token, token)
+    compact = re.sub(r"[^A-Z0-9]", "", token.upper())
+    if compact.isdigit() and len(compact) == 6:
+        return True
+    if len(compact) >= 3:
+        return True
+    if re.search(rf"\${re.escape(compact)}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
+        return True
+    company = str(known_tickers.get(canonical) or "").strip()
+    return bool(
+        _is_meaningful_company_alias(canonical, company)
+        and company.lower() in text.lower()
+    )
+
+
 def _ticker_aliases(known_tickers: dict[str, str]) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for ticker in known_tickers:
@@ -158,6 +193,7 @@ def _tickers_from_known_keys(
         ticker
         for ticker in known_tickers
         if _contains_symbol(text, ticker)
+        and _ticker_token_is_unambiguous(ticker.upper(), text, known_tickers, aliases)
     }
 
 

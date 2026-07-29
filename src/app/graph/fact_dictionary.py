@@ -8,7 +8,7 @@ explanations / GUI can be reconstructed on demand. Ids are assigned densely and
 monotonically per namespace, so a dictionary built deterministically (base
 vocabulary first) yields stable ids that can be hashed for cache versioning.
 
-See docs/ontology_acceleration_audit.md (Phase 2).
+See docs/ontology_and_gnn.md (working triple store).
 """
 
 # Namespaces. Subjects and objects share the ``TERM`` space because an object of

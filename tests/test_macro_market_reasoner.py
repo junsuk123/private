@@ -58,7 +58,31 @@ class TestRegimeClassification:
         assert r.candidate_symbols == ()  # blocked-buy selects no new candidates
 
     def test_news_shock_blocks_buy(self):
-        r = _reasoner().reason(_inp(macro_news_evidence=({"severity": 0.9},)))
+        r = _reasoner().reason(
+            _inp(macro_news_evidence=({"severity": 0.9}, {"severity": 0.85}))
+        )
+        assert r.market_regime == MarketRegime.NEWS_SHOCK
+        assert r.blocks_buy
+
+    def test_single_headline_does_not_declare_a_market_wide_shock(self):
+        """Regression: one mislabelled headline blocked every buy for a full TTL.
+
+        A market-wide shock must be corroborated by independent items.
+        """
+        r = _reasoner().reason(_inp(macro_news_evidence=({"severity": 0.95},)))
+        assert r.market_regime != MarketRegime.NEWS_SHOCK
+        assert not r.blocks_buy
+
+    def test_many_weak_items_do_not_declare_a_shock(self):
+        r = _reasoner().reason(
+            _inp(macro_news_evidence=tuple({"severity": 0.3} for _ in range(6)))
+        )
+        assert r.market_regime != MarketRegime.NEWS_SHOCK
+        assert not r.blocks_buy
+
+    def test_corroboration_requirement_is_configurable(self):
+        strict = MacroMarketReasoner(MacroReasonerConfig(news_shock_minimum_events=1))
+        r = strict.reason(_inp(macro_news_evidence=({"severity": 0.95},)))
         assert r.market_regime == MarketRegime.NEWS_SHOCK
         assert r.blocks_buy
 

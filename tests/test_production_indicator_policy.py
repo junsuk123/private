@@ -11,9 +11,15 @@ from app.indicators import (  # noqa: E402
     build_trusted_indicators_from_markets,
     is_sample_or_hash_indicator,
 )
-from app.pipeline import build_analysis_context  # noqa: E402
+from app.pipeline import _limit_events_for_runtime, build_analysis_context  # noqa: E402
 from app.research import ResearchRunResult  # noqa: E402
-from app.schemas.domain import MarketSnapshot, SourceMetadata  # noqa: E402
+from app.schemas.domain import (  # noqa: E402
+    ClassifiedEvent,
+    EventType,
+    MarketSnapshot,
+    SentimentDirection,
+    SourceMetadata,
+)
 
 
 def test_sample_indicators_are_marked_untrusted_for_live_paths() -> None:
@@ -48,6 +54,30 @@ def test_production_context_does_not_promote_sample_indicators_to_trusted_eviden
     assert context.indicators
     assert all(not is_sample_or_hash_indicator(indicator) for indicator in context.indicators.values())
     assert all(source_id.startswith("broker:") for indicator in context.indicators.values() for source_id in indicator.source_ids)
+    assert all(
+        event.source.raw_url != "local://sample-research"
+        for event in context.events
+    )
+
+
+def test_runtime_removes_ambiguous_short_tickers_from_legacy_events() -> None:
+    source = _market("NVDA").source
+    event = ClassifiedEvent(
+        event_id="legacy-ai-word",
+        event_type=EventType.NEWS,
+        title="Investors debate AI spending and TV advertising",
+        summary="NVDA was named, but AI and TV are ordinary words here.",
+        companies=("NVIDIA",),
+        tickers=("AI", "TV", "NVDA"),
+        sectors=("Technology",),
+        sentiment=SentimentDirection.NEGATIVE,
+        event_date=datetime.now(timezone.utc),
+        source=source,
+    )
+
+    (sanitized,) = _limit_events_for_runtime((event,), (_market("NVDA"),))
+
+    assert sanitized.tickers == ("NVDA",)
 
 
 def _market(ticker: str) -> MarketSnapshot:

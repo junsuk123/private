@@ -55,6 +55,10 @@ class MacroReasonerConfig:
     weak_breadth_threshold: float = 0.45             # advancers / total
     strong_breadth_threshold: float = 0.55
     news_shock_severity_threshold: float = 0.7
+    # A market-wide shock should be corroborated. Requiring a single item to
+    # clear the threshold let one mislabelled headline block every buy for a
+    # full TTL; requiring two independent items is the cheapest real guard.
+    news_shock_minimum_events: int = 2
     block_buy_on_high_volatility: bool = True
     block_buy_on_news_shock: bool = True
     block_buy_on_low_liquidity_market: bool = True
@@ -82,6 +86,12 @@ class MacroReasonerConfig:
             candidate_limit=_i("MACRO_CANDIDATE_LIMIT", cls.candidate_limit),
             minimum_macro_confidence=_f("MACRO_MIN_CONFIDENCE", cls.minimum_macro_confidence),
             high_volatility_threshold=_f("MACRO_HIGH_VOLATILITY", cls.high_volatility_threshold),
+            news_shock_severity_threshold=_f(
+                "MACRO_NEWS_SHOCK_SEVERITY", cls.news_shock_severity_threshold
+            ),
+            news_shock_minimum_events=_i(
+                "MACRO_NEWS_SHOCK_MIN_EVENTS", cls.news_shock_minimum_events
+            ),
         )
 
 
@@ -184,15 +194,35 @@ class MacroMarketReasoner:
         index_trend = self._index_trend(data.index_snapshots)
         breadth = data.market_breadth
         vol = data.market_volatility
-        news_severity = max((float(n.get("severity", 0.0) or 0.0) for n in data.macro_news_evidence), default=0.0)
+        news_severities = sorted(
+            (float(n.get("severity", 0.0) or 0.0) for n in data.macro_news_evidence),
+            reverse=True,
+        )
+        news_severity = news_severities[0] if news_severities else 0.0
+        # Corroboration: how many independent macro items clear the bar. One
+        # mislabelled headline must not be able to declare a market-wide shock.
+        corroborating = sum(
+            1 for value in news_severities if value >= cfg.news_shock_severity_threshold
+        )
+        required_events = max(1, int(cfg.news_shock_minimum_events))
 
         # --- Regime + risk (risk gates first). ---
         regime = MarketRegime.RANGE_BOUND
         risk = MacroRiskLevel.NORMAL
-        if news_severity >= cfg.news_shock_severity_threshold:
+        if corroborating >= required_events:
             regime, risk = MarketRegime.NEWS_SHOCK, (MacroRiskLevel.BLOCK_BUY if cfg.block_buy_on_news_shock else MacroRiskLevel.HIGH)
             reasons.append(MACRO_NEWS_SHOCK)
-            paths.append(explanation(MACRO_NEWS_SHOCK, f"Macro news shock severity {news_severity:.2f}.", {"severity": news_severity}))
+            paths.append(
+                explanation(
+                    MACRO_NEWS_SHOCK,
+                    f"Macro news shock: {corroborating} corroborating items, peak severity {news_severity:.2f}.",
+                    {
+                        "severity": news_severity,
+                        "corroborating_events": corroborating,
+                        "required_events": required_events,
+                    },
+                )
+            )
         elif vol is not None and vol > cfg.high_volatility_threshold:
             regime, risk = MarketRegime.HIGH_VOLATILITY_RISK, (MacroRiskLevel.BLOCK_BUY if cfg.block_buy_on_high_volatility else MacroRiskLevel.HIGH)
             reasons.append(MACRO_HIGH_VOLATILITY)
@@ -297,7 +327,18 @@ class MacroMarketReasoner:
             macro_confidence=confidence,
             reason_codes=tuple(dict.fromkeys(reasons)),
             explanation_paths=tuple(paths),
-            diagnostics={"index_count": len(data.index_snapshots), "sector_count": len(data.sector_snapshots)},
+            diagnostics={
+                "index_count": len(data.index_snapshots),
+                "sector_count": len(data.sector_snapshots),
+                "macro_event_count": len(data.macro_news_evidence),
+                "max_macro_event_severity": max(
+                    (
+                        float(item.get("severity", 0.0) or 0.0)
+                        for item in data.macro_news_evidence
+                    ),
+                    default=0.0,
+                ),
+            },
         )
 
 

@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.kis_realtime import (
     DEFAULT_SUBSCRIPTION_TR_IDS,
+    ORDERBOOK_TR_IDS,
+    TRADE_TR_IDS,
     KisRealtimeSubscriptionManager,
     QueueMessageSource,
     _is_websocket_connection_closed,
@@ -21,6 +23,7 @@ from app.data.kis_realtime import (
     kis_realtime_control_summary,
     kis_realtime_subscription_message,
     normalize_symbol,
+    overseas_realtime_subscription_key,
     parse_kis_realtime_message,
 )
 from app.data.realtime_store import RealtimeMarketDataStore
@@ -146,6 +149,58 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertEqual(book.levels[0].ask_size, 34364)
         self.assertEqual(book.levels[0].bid_size, 28602)
 
+    def test_overseas_trade_parser_uses_official_hdfscnt0_layout(self) -> None:
+        received_at = datetime(2026, 7, 28, 8, 42, 2, tzinfo=timezone.utc)
+        fields = [
+            "DNYSF", "F", "4", "20260728", "20260728", "044201",
+            "20260728", "174201", "14.60", "14.80", "14.50", "14.73",
+            "2", "0.06", "0.41", "14.67", "14.73", "26", "150",
+            "7", "123456", "1812345", "100", "120", "53.2", "2",
+        ]
+
+        parsed = parse_kis_realtime_message(
+            f"0|HDFSCNT0|001|{'^'.join(fields)}",
+            received_at=received_at,
+        )
+
+        tick = parsed.ticks[0]
+        self.assertEqual(parsed.event_type, "overseas_trade")
+        self.assertEqual(tick.symbol, "F")
+        self.assertEqual(tick.price, 14.73)
+        self.assertEqual(tick.volume, 7)
+        self.assertEqual(tick.trade_direction, "BUY")
+        self.assertTrue(str(tick.sequence_key).startswith("us-kis-ws:F:"))
+
+    def test_overseas_orderbook_parser_uses_official_hdfsasp0_one_level(self) -> None:
+        received_at = datetime(2026, 7, 28, 8, 42, 2, tzinfo=timezone.utc)
+        fields = [
+            "DNYSF", "F", "4", "20260728", "044201", "20260728",
+            "174201", "5262", "22478", "0", "0", "14.67", "14.73",
+            "26", "150", "0", "0",
+        ]
+
+        parsed = parse_kis_realtime_message(
+            f"0|HDFSASP0|001|{'^'.join(fields)}",
+            received_at=received_at,
+        )
+
+        book = parsed.orderbooks[0]
+        self.assertEqual(parsed.event_type, "overseas_orderbook")
+        self.assertEqual(book.symbol, "F")
+        self.assertEqual(len(book.levels), 1)
+        self.assertEqual(book.best_bid, 14.67)
+        self.assertEqual(book.best_ask, 14.73)
+        self.assertEqual(book.total_bid_volume, 26)
+        self.assertEqual(book.total_ask_volume, 150)
+        self.assertTrue(str(book.sequence_key).startswith("us-kis-ws:F:"))
+
+    def test_overseas_subscription_key_uses_listed_exchange(self) -> None:
+        with patch(
+            "app.trading.us_realtime_bridge._exchange_code",
+            return_value="NYS",
+        ):
+            self.assertEqual(overseas_realtime_subscription_key("F"), "DNYSF")
+
     def test_subscription_manager_persists_ticks_orderbooks_and_bar(self) -> None:
         messages = (
             "0|H0STCNT0|001|005930^093000^70000^100^BUY^seq-1",
@@ -252,8 +307,13 @@ class KisRealtimeParserTest(unittest.TestCase):
             self.assertGreaterEqual(_websocket_subscription_delay_seconds(), 1.0)
 
     def test_default_kis_subscriptions_request_trade_first(self) -> None:
-        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0STCNT0")
-        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0STCNT0", "H0STASP0"))
+        # Trade before orderbook so a constrained subscription budget still
+        # yields candles. The default feed is now the 통합 (KRX+NXT) pair, which
+        # is what extends coverage past the 09:00-15:30 KRX session.
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS[0], "H0UNCNT0")
+        self.assertEqual(DEFAULT_SUBSCRIPTION_TR_IDS, ("H0UNCNT0", "H0UNASP0"))
+        self.assertIn(DEFAULT_SUBSCRIPTION_TR_IDS[0], TRADE_TR_IDS)
+        self.assertIn(DEFAULT_SUBSCRIPTION_TR_IDS[1], ORDERBOOK_TR_IDS)
 
     def test_default_kis_websocket_url_uses_tryitout_path(self) -> None:
         with patch.dict("os.environ", {}, clear=True):

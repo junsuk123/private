@@ -6,6 +6,21 @@ from dataclasses import dataclass
 
 
 LIVE_FEATURE_NAMES: tuple[str, ...] = (
+    # Tick/microstructure features. These are deliberately separate from the
+    # 30s+ features below so the model can react to entry-timing changes without
+    # pretending that a minute aggregate is a real-time signal.
+    "return_1s",
+    "return_5s",
+    "return_10s",
+    "tick_count_1s",
+    "tick_count_5s",
+    "volume_1s_log",
+    "volume_5s_log",
+    "aggressor_imbalance_5s",
+    "realized_volatility_10s",
+    "spread_change_5s",
+    "orderbook_imbalance_change_5s",
+    "second_data_ready",
     "return_30s",
     "return_1m",
     "return_3m",
@@ -30,7 +45,7 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     # emitted with NEUTRAL finite defaults on short data (rsi 50, %b 0.5, ratios
     # 0/1), so they never make a live frame fail validation. Adding these bumps
     # schema_hash: prior artifacts retire and a fresh model retrains — the
-    # designed, advisory-safe flow (see live_short_horizon_v2 below).
+    # designed, advisory-safe flow (see live_short_horizon_v3_seconds below).
     "rsi_14",
     "macd_histogram",
     "bollinger_percent_b",
@@ -61,11 +76,10 @@ class FeatureSchema:
 
 
 LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
-    # v2 adds the technical-indicator columns above. The version string is part
-    # of the schema_hash, so bumping it retires prior artifacts and forces a
-    # retrain on the new feature set (advisory model; live buys fall back to the
-    # non-model score until a fresh artifact is trained).
-    version="live_short_horizon_v2",
+    # v3 adds true 1/5/10-second microstructure columns. The version string is
+    # part of the schema_hash, so prior artifacts cannot be mistaken for a model
+    # trained on these new inputs.
+    version="live_short_horizon_v3_seconds",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

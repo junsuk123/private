@@ -39,6 +39,10 @@ from app.cost import TradingCostEngine
 from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.storage.execution_quality_store import ExecutionQualityStore
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide, OrderType
+from app.trading.strategy_supervisor import (
+    StrategySupervisor,
+    SupervisorObservation,
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -254,6 +258,8 @@ class RealtimeTradingEngine:
         market_open_provider: Callable[[str, str], bool] | None = None,
         cycle_observer: Callable[[dict[str, Any]], None] | None = None,
         macro_micro_observer: Callable[[AccountSnapshot, tuple[str, ...], tuple[str, ...], datetime], Any] | None = None,
+        strategy_session_manager: Any | None = None,
+        strategy_supervisor: Any | None = None,
         config: RealtimeTradingConfig | None = None,
         recent_events_max: int = 50,
     ) -> None:
@@ -269,6 +275,15 @@ class RealtimeTradingEngine:
         # Advisory-only per-cycle hook: runs macro/micro ontology reasoning and
         # records the bundle for the GUI panel. It NEVER submits or gates orders.
         self.macro_micro_observer = macro_micro_observer
+        # Closed-world owner: elects and locks one symbol + one algorithm until
+        # the broker account confirms that the owned position is flat.
+        self.strategy_session_manager = strategy_session_manager
+        # Background observer. The elected algorithm carries no regime,
+        # liquidity or volatility analysis; this is what watches those and can
+        # halt it (SOFT: no new entries, HARD: exit now).
+        if strategy_supervisor is None and strategy_session_manager is not None:
+            strategy_supervisor = StrategySupervisor()
+        self.strategy_supervisor = strategy_supervisor
         self.config = config or RealtimeTradingConfig()
         # Execution-quality layer (Phase 3): rejects buys whose alpha would be consumed
         # by spread/slippage and records realized slippage per symbol/strategy.
@@ -394,6 +409,10 @@ class RealtimeTradingEngine:
             status["loss_cooldown_symbols"] = sorted(
                 symbol for symbol, until in self._loss_cooldown_until.items() if until > time.monotonic()
             )
+            if self.strategy_session_manager is not None:
+                status["strategy_session"] = self.strategy_session_manager.snapshot()
+            if self.strategy_supervisor is not None:
+                status["strategy_supervisor"] = self.strategy_supervisor.snapshot()
             return status
 
     def _record(self, event: dict[str, Any]) -> None:
@@ -508,6 +527,58 @@ class RealtimeTradingEngine:
             buy_enabled = False
             self._buy_disabled_reason = "MACRO_MICRO_BLOCK_BUY"
 
+        # A single closed-world session owns all new risk. Selection occurs only
+        # after macro/micro ontology reasoning, and remains locked through entry,
+        # monitoring, exit submission, and broker-confirmed flattening.
+        if self.strategy_session_manager is not None:
+            try:
+                strategy_session = self.strategy_session_manager.evaluate(
+                    account,
+                    cycle_buy_candidates,
+                    macro_micro_bundle,
+                    decision_time,
+                )
+                cycle_buy_candidates = self.strategy_session_manager.allowed_buy_candidates(
+                    cycle_buy_candidates,
+                    account,
+                )
+                summary["strategy_session"] = strategy_session
+                summary["owned_buy_candidates"] = list(cycle_buy_candidates)
+            except Exception as exc:  # noqa: BLE001 - ownership failure must fail closed.
+                buy_enabled = False
+                self._buy_disabled_reason = f"STRATEGY_SESSION_ERROR:{exc.__class__.__name__}"
+                summary["errors"] += 1
+                summary["strategy_session"] = {
+                    "phase": "ERROR",
+                    "last_reason": self._buy_disabled_reason,
+                }
+
+        # The elected algorithm contains no market-condition analysis of its
+        # own. The supervisor is what keeps watching: SOFT stops new entries,
+        # HARD also hands the open position to the exit path.
+        if self.strategy_supervisor is not None and self.strategy_session_manager is not None:
+            try:
+                verdict = self._supervise_session(
+                    account,
+                    macro_micro_bundle,
+                    decision_time,
+                )
+            except Exception as exc:  # noqa: BLE001 - supervision must fail closed.
+                buy_enabled = False
+                self._buy_disabled_reason = f"SUPERVISOR_ERROR:{exc.__class__.__name__}"
+                summary["errors"] += 1
+                verdict = None
+            if verdict is not None:
+                summary["strategy_supervisor"] = verdict.as_dict()
+                if verdict.blocks_new_entries:
+                    cycle_buy_candidates = ()
+                    buy_enabled = False
+                    self._buy_disabled_reason = (
+                        f"SUPERVISOR_{verdict.level.value}_HALT:"
+                        f"{','.join(verdict.reason_codes) or 'UNSPECIFIED'}"
+                    )
+                    summary["owned_buy_candidates"] = []
+
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
             holding_symbol = str(getattr(holding, "ticker", "") or "").upper()
@@ -528,19 +599,50 @@ class RealtimeTradingEngine:
                 summary["skipped_cooldown"] += 1
                 continue  # 최근 제출한 종목은 쿨다운 동안 재제출하지 않는다(중복/에러 방지).
             summary["sell_evaluated"] += 1
-            try:
-                result = self.decision_engine.evaluate_exit_for_holding(
+            session_exit_reason = (
+                self.strategy_session_manager.exit_reason_for(holding)
+                if self.strategy_session_manager is not None
+                else None
+            )
+            session_owned = bool(
+                self.strategy_session_manager is not None
+                and self.strategy_session_manager.owns_position(holding.ticker)
+            )
+            if session_owned and not liquidation_mode:
+                if not session_exit_reason:
+                    # Once a strategy owns the position, only that strategy's
+                    # target/stop/trailing/time rules may initiate an exit.
+                    continue
+                result = self._forced_strategy_session_exit_result(
                     holding,
-                    account,
-                    take_profit=self.config.take_profit,
-                    stop_loss=self.config.stop_loss,
-                    ontology_graph=ontology_graph,
-                    decision_time=decision_time,
+                    SimpleNamespace(
+                        approved=False,
+                        final_order=None,
+                        reason_codes=(),
+                        diagnostics={
+                            "selected_strategy": (
+                                self.strategy_session_manager.snapshot().get(
+                                    "selected_strategy"
+                                )
+                            ),
+                        },
+                    ),
+                    session_exit_reason,
                 )
-            except Exception as exc:  # noqa: BLE001 - one symbol must not kill the loop.
-                summary["errors"] += 1
-                self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
-                continue
+            else:
+                try:
+                    result = self.decision_engine.evaluate_exit_for_holding(
+                        holding,
+                        account,
+                        take_profit=self.config.take_profit,
+                        stop_loss=self.config.stop_loss,
+                        ontology_graph=ontology_graph,
+                        decision_time=decision_time,
+                    )
+                except Exception as exc:  # noqa: BLE001 - one symbol must not kill the loop.
+                    summary["errors"] += 1
+                    self._record({"at": decision_time.isoformat(), "symbol": holding.ticker, "kind": "SELL", "outcome": "eval_error", "detail": f"{exc.__class__.__name__}: {exc}"})
+                    continue
             _record_technical_decision(holding.ticker, "SELL", result)
             if liquidation_mode:
                 result = self._forced_liquidation_result(holding, result)
@@ -572,6 +674,11 @@ class RealtimeTradingEngine:
                         sell_submitted += 1
                 elif self._submit(priced_order, "SELL", result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                     sell_submitted += 1
+                    if self.strategy_session_manager is not None:
+                        self.strategy_session_manager.mark_exit_submitted(
+                            holding.ticker,
+                            decision_time,
+                        )
             else:
                 summary["sell_rejected"] += 1
                 self._append_rejection(summary, holding.ticker, "SELL", result.reason_codes, getattr(result, "diagnostics", None))
@@ -632,13 +739,28 @@ class RealtimeTradingEngine:
                 summary["skipped_cooldown"] += 1
                 continue
             summary["buy_evaluated"] += 1
+            selected_strategy = (
+                self.strategy_session_manager.selected_strategy_for(symbol)
+                if self.strategy_session_manager is not None
+                else None
+            )
             try:
+                buy_kwargs = {
+                    "suggested_weight": self.config.buy_weight,
+                    "ontology_graph": None if selected_strategy else ontology_graph,
+                    "decision_time": decision_time,
+                }
+                if selected_strategy:
+                    buy_kwargs["selected_strategy"] = selected_strategy
+                    # Hand the algorithm the slow context frozen at election
+                    # time instead of letting it re-derive market conditions.
+                    election_context = self.strategy_session_manager.election_context_for(symbol)
+                    if election_context:
+                        buy_kwargs["election_context"] = election_context
                 result = self.decision_engine.evaluate_buy(
                     symbol,
                     account,
-                    suggested_weight=self.config.buy_weight,
-                    ontology_graph=ontology_graph,
-                    decision_time=decision_time,
+                    **buy_kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
                 summary["errors"] += 1
@@ -657,6 +779,8 @@ class RealtimeTradingEngine:
                 summary["buy_submit_attempted"] = buy_submit_attempted
                 if self._submit(priced_order, "BUY", result.reason_codes, decision_time, summary, pricing_diag=exec_diag):
                     buy_submitted += 1
+                    if self.strategy_session_manager is not None:
+                        self.strategy_session_manager.mark_entry_submitted(symbol, decision_time)
             else:
                 summary["buy_rejected"] += 1
                 self._append_rejection(summary, symbol, "BUY", result.reason_codes, getattr(result, "diagnostics", None))
@@ -1033,6 +1157,178 @@ class RealtimeTradingEngine:
                 diagnostics=diagnostics,
             )
 
+    def _supervise_session(
+        self,
+        account: AccountSnapshot,
+        macro_micro_bundle: Any,
+        decision_time: datetime,
+    ) -> Any:
+        """Observe the elected/owned symbol and grade any violation.
+
+        Everything read here was previously re-derived inside the strategy on
+        every tick. It now lives in exactly one place, and the only thing it can
+        do is halt — it can never open, price, or size an order.
+        """
+        session = self.strategy_session_manager.snapshot()
+        symbol = str(session.get("selected_symbol") or "").upper()
+        if not symbol:
+            return None
+        phase = str(session.get("phase") or "")
+        holdings = {
+            str(getattr(item, "ticker", "") or "").upper(): item
+            for item in tuple(getattr(account, "holdings", ()) or ())
+        }
+        position_open = symbol in holdings
+
+        tick = None
+        orderbook = None
+        store = getattr(self.decision_engine, "store", None)
+        if store is not None:
+            try:
+                tick = store.latest_tick(symbol)
+                orderbook = store.latest_orderbook(symbol)
+            except Exception:  # noqa: BLE001 - a missing read is itself an observation.
+                tick = orderbook = None
+        data_age = None
+        if tick is not None:
+            received = getattr(tick, "received_at", None)
+            if isinstance(received, datetime):
+                reference = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
+                data_age = max(0.0, (decision_time - reference).total_seconds())
+
+        session_tradable = None
+        if self.market_open_provider is not None:
+            holding = holdings.get(symbol)
+            market = str(getattr(holding, "market", "") or "") if holding is not None else ""
+            try:
+                session_tradable = bool(self.market_open_provider(symbol, market))
+            except Exception:  # noqa: BLE001 - treat an unusable provider as unknown.
+                session_tradable = None
+
+        macro = getattr(macro_micro_bundle, "macro_result", None)
+        macro_risk = getattr(getattr(macro, "risk_level", None), "value", None)
+        allowed = tuple(getattr(macro, "allowed_micro_strategies", ()) or ())
+        blocked = tuple(getattr(macro, "blocked_micro_strategies", ()) or ())
+        strategy_id = str(session.get("selected_strategy") or "") or None
+        ontology_allows = None
+        if strategy_id:
+            # The macro layer uses a coarser strategy vocabulary, so translate
+            # before comparing. An unanswerable check stays None rather than
+            # being read as a withdrawal.
+            from app.technical.strategy_algorithms import macro_strategy_permitted
+
+            ontology_allows = macro_strategy_permitted(strategy_id, allowed, blocked)
+
+        realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
+        account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
+        daily_limit = max(
+            max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0)),
+            account_equity * max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0)),
+        )
+
+        verdict = self.strategy_supervisor.evaluate(
+            SupervisorObservation(
+                symbol=symbol,
+                as_of=decision_time,
+                strategy_id=strategy_id,
+                position_open=position_open,
+                data_age_seconds=data_age,
+                session_tradable=session_tradable,
+                broker_healthy=None,
+                ontology_allows_strategy=ontology_allows,
+                macro_blocks_buy=_macro_micro_blocks_buy(macro_micro_bundle),
+                macro_risk_level=macro_risk,
+                liquidity_score=None,
+                spread_bps=(
+                    float(getattr(orderbook, "spread_bps", 0.0) or 0.0)
+                    if orderbook is not None
+                    else None
+                ),
+                realized_volatility=self._symbol_realtime_volatility_safe(symbol, decision_time),
+                daily_realized_loss=realized_pnl_today,
+                daily_loss_limit=daily_limit or None,
+            )
+        )
+        if verdict.forces_exit and phase in {"ARMED", "ENTERING", "OWNED"}:
+            self.strategy_session_manager.request_halt(
+                symbol, verdict.level.value, verdict.hard_reason_codes
+            )
+            self._record(
+                {
+                    "at": decision_time.isoformat(),
+                    "symbol": symbol,
+                    "kind": "SUPERVISOR",
+                    "outcome": "hard_halt",
+                    "detail": ",".join(verdict.hard_reason_codes) or "UNSPECIFIED",
+                }
+            )
+        elif verdict.level.blocks_new_entries and phase == "ARMED":
+            self.strategy_session_manager.request_halt(
+                symbol, verdict.level.value, verdict.soft_reason_codes
+            )
+        return verdict
+
+    def _symbol_realtime_volatility_safe(self, symbol: str, decision_time: datetime) -> float | None:
+        getter = getattr(self.decision_engine, "_symbol_realtime_volatility", None)
+        if getter is None:
+            return None
+        try:
+            return float(getter(symbol, decision_time))
+        except Exception:  # noqa: BLE001 - volatility is observational only.
+            return None
+
+    def _forced_strategy_session_exit_result(
+        self,
+        holding: Holding,
+        original_result: Any,
+        exit_reason: str,
+    ) -> Any:
+        """Convert a session invalidation/target into a full-position SELL.
+
+        This override does not bypass exchange, executable-price, quantity,
+        account, or broker runtime gates. It only turns the owned strategy's
+        explicit lifecycle exit into the same FinalOrder shape those gates use.
+        """
+        reference_price = float(
+            getattr(holding, "last_price", 0.0)
+            or getattr(holding, "average_price", 0.0)
+            or 0.0
+        )
+        quantity = int(
+            getattr(holding, "sellable_quantity", None)
+            or getattr(holding, "quantity", 0)
+            or 0
+        )
+        order = FinalOrder(
+            ticker=str(getattr(holding, "ticker", "") or ""),
+            market=str(getattr(holding, "market", "") or "KR"),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.SELL,
+            quantity=max(0, quantity),
+            limit_price=reference_price,
+            manual_approval_required=False,
+        )
+        original_codes = tuple(getattr(original_result, "reason_codes", ()) or ())
+        reason_codes = (f"STRATEGY_SESSION_EXIT:{exit_reason}", exit_reason, *original_codes)
+        diagnostics = dict(getattr(original_result, "diagnostics", None) or {})
+        diagnostics["exit_reason"] = exit_reason.lower()
+        diagnostics["strategy_session_override"] = True
+        try:
+            return replace(
+                original_result,
+                approved=True,
+                final_order=order,
+                reason_codes=reason_codes,
+                diagnostics=diagnostics,
+            )
+        except TypeError:
+            return SimpleNamespace(
+                approved=True,
+                final_order=order,
+                reason_codes=reason_codes,
+                diagnostics=diagnostics,
+            )
+
     def _submit(
         self,
         order: FinalOrder,
@@ -1139,12 +1435,22 @@ class RealtimeTradingEngine:
             )
             return
         raw = getattr(snapshot, "raw", None)
+        observed_status = str(getattr(snapshot, "status", "UNKNOWN") or "UNKNOWN").upper()
+        if observed_status in {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            self._open_sell_orders.pop(symbol, None)
+            # Broker account snapshots can lag a terminal order status. Keep the
+            # symbol locked briefly so a stale holding row cannot create/amend a
+            # second SELL after the first order has already filled.
+            self._sell_lock_until[symbol] = time.monotonic() + max(
+                30.0,
+                min(120.0, self.config.sell_inflight_cooldown_sec),
+            )
         self._record(
             {
                 "at": getattr(snapshot, "observed_at", datetime.now(timezone.utc)).isoformat(),
                 "symbol": symbol,
                 "kind": "STATUS",
-                "outcome": str(getattr(snapshot, "status", "UNKNOWN") or "UNKNOWN").lower(),
+                "outcome": observed_status.lower(),
                 "broker_order_id": broker_order_id,
                 "filled_quantity": getattr(raw, "quantity", None),
                 "average_fill_price": getattr(raw, "price", None),

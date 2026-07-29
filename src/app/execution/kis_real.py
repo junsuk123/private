@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from app.execution.kis_errors import LiveExecutionBlocked
 from app.execution.kis_mock import MockKisExecution, MockKisOrderReceipt, MockKisPortfolio
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnapshot, OrderSide, SourceMetadata
 
@@ -24,12 +25,27 @@ KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
 _KIS_GET_RATE_LOCK = threading.Lock()
 _KIS_GET_NEXT_ALLOWED_AT = 0.0
+_KIS_TOKEN_REFRESH_LOCK = threading.Lock()
 
 
 class KisApiError(RuntimeError):
     def __init__(self, message: str, response: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.response = response or {}
+
+
+def _is_expired_token_error(exc: KisApiError) -> bool:
+    response = getattr(exc, "response", {}) or {}
+    message = " ".join(
+        str(value or "")
+        for value in (
+            exc,
+            response.get("msg1"),
+            response.get("message"),
+            response.get("error_description"),
+        )
+    ).lower()
+    return "token" in message and ("expired" in message or "만료" in message)
 
 
 class KisTransport(Protocol):
@@ -301,6 +317,8 @@ class KisDevelopersApiClient:
         )
         self._orders: dict[str, FinalOrder] = {}
         self._order_org_numbers: dict[str, str] = {}
+        # (ticker, exchange) -> (dtm_tr_psbl_yn as bool, monotonic timestamp)
+        self._daytime_tradable_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 
     def place_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
         self._ensure_enabled()
@@ -331,12 +349,63 @@ class KisDevelopersApiClient:
             submitted_at=datetime.now(timezone.utc),
         )
 
+    def overseas_product_info(self, ticker: str, exchange_code: str) -> dict[str, Any]:
+        """해외주식 상품기본정보 (CTPF1702R)."""
+        product_type = US_PRODUCT_TYPE_CODES.get(str(exchange_code or "").upper())
+        if not product_type:
+            raise ValueError(f"no KIS product type code for exchange {exchange_code}")
+        response = self._get(
+            "/uapi/overseas-price/v1/quotations/search-info",
+            tr_id="CTPF1702R",
+            params={"PRDT_TYPE_CD": product_type, "PDNO": str(ticker or "").upper().strip()},
+        )
+        self._ensure_success(response, "KIS overseas product info lookup failed")
+        return dict(response.get("output") or {})
+
+    def is_us_daytime_tradable(self, ticker: str, exchange_code: str) -> bool | None:
+        """``dtm_tr_psbl_yn`` for a US symbol, cached; ``None`` when unknown.
+
+        KIS only supports a subset of US names for 주간거래, and submitting one
+        of the others is rejected by the broker. ``None`` (lookup failed) is not
+        treated as "not tradable" — the caller decides, so a reference-data
+        outage cannot silently stop all daytime trading.
+        """
+        symbol = str(ticker or "").upper().strip()
+        exchange = str(exchange_code or "").upper().strip()
+        if not symbol or exchange not in US_PRODUCT_TYPE_CODES:
+            return None
+        key = (symbol, exchange)
+        cached = self._daytime_tradable_cache.get(key)
+        if cached is not None:
+            value, cached_at = cached
+            if time.monotonic() - cached_at < _daytime_tradable_cache_ttl_seconds():
+                return value
+        try:
+            output = self.overseas_product_info(symbol, exchange)
+        except Exception:  # noqa: BLE001 - reference data must never break the order path.
+            return None
+        raw = str(output.get("dtm_tr_psbl_yn") or "").strip().upper()
+        if raw not in {"Y", "N"}:
+            return None
+        allowed = raw == "Y"
+        self._daytime_tradable_cache[key] = (allowed, time.monotonic())
+        return allowed
+
     def _place_overseas_limit_order(self, order: FinalOrder) -> MockKisOrderReceipt:
         exchange_code = _overseas_exchange_code(order.market)
         body = self._overseas_order_body(order, exchange_code)
         path = "/uapi/overseas-stock/v1/trading/order"
         tr_id = self.endpoints.overseas_tr_id_for_order(exchange_code, order.side)
         if _is_us_daytime_order_session(order.market):
+            # KIS supports only a subset of US names for 주간거래; the rest are
+            # rejected at the broker. Checking here turns a broker rejection
+            # into a local, explainable block.
+            if _enforce_daytime_tradable() and self.is_us_daytime_tradable(
+                order.ticker, exchange_code
+            ) is False:
+                raise LiveExecutionBlocked(
+                    (f"US_DAYTIME_TRADING_NOT_SUPPORTED:{order.ticker}",)
+                )
             path = "/uapi/overseas-stock/v1/trading/daytime-order"
             tr_id = self.endpoints.overseas_daytime_tr_id_for_order(order.side)
         response = self._post(
@@ -508,12 +577,12 @@ class KisDevelopersApiClient:
             foreign_orderable = self._get_overseas_orderable_cash_by_currency()
         except Exception:
             foreign_orderable = {}
-        foreign_cash_by_currency.update(
-            {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
-        )
         orderable_cash_by_currency.update(
             {currency: amount for currency, amount in foreign_orderable.items() if amount > 0}
         )
+        # Foreign buying power is not the settled foreign-currency balance.
+        # Integrated-margin accounts can expose KRW-backed USD buying power here;
+        # copying it into cash_by_currency double-counts the same capital.
         # Display the true foreign (USD etc.) cash valued from currency balances × FX.
         # KIS's foreign_cash_krw re-includes the domestic KRW deposit (통합증거금), so it
         # must NOT be shown as "외화" — use the per-currency computation and only fall
@@ -914,13 +983,25 @@ class KisDevelopersApiClient:
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(self.transport, UrllibKisTransport):
             _throttle_kis_get()
-        return self.transport.request(
-            "GET",
-            self._url(path),
-            headers=self._headers(tr_id),
-            params=params,
-            timeout=self.timeout,
-        )
+        try:
+            return self.transport.request(
+                "GET",
+                self._url(path),
+                headers=self._headers(tr_id),
+                params=params,
+                timeout=self.timeout,
+            )
+        except KisApiError as exc:
+            if not _is_expired_token_error(exc):
+                raise
+            self._refresh_rejected_access_token()
+            return self.transport.request(
+                "GET",
+                self._url(path),
+                headers=self._headers(tr_id),
+                params=params,
+                timeout=self.timeout,
+            )
 
     def _post(
         self,
@@ -932,13 +1013,28 @@ class KisDevelopersApiClient:
         headers = self._headers(tr_id)
         if include_hashkey:
             headers["hashkey"] = self._hashkey(body)
-        return self.transport.request(
-            "POST",
-            self._url(path),
-            headers=headers,
-            body=body,
-            timeout=self.timeout,
-        )
+        try:
+            return self.transport.request(
+                "POST",
+                self._url(path),
+                headers=headers,
+                body=body,
+                timeout=self.timeout,
+            )
+        except KisApiError as exc:
+            if not _is_expired_token_error(exc):
+                raise
+            self._refresh_rejected_access_token()
+            retry_headers = self._headers(tr_id)
+            if include_hashkey:
+                retry_headers["hashkey"] = self._hashkey(body)
+            return self.transport.request(
+                "POST",
+                self._url(path),
+                headers=retry_headers,
+                body=body,
+                timeout=self.timeout,
+            )
 
     def _headers(self, tr_id: str) -> dict[str, str]:
         self.credentials.validate()
@@ -978,6 +1074,20 @@ class KisDevelopersApiClient:
         if cached:
             return cached
         return self.issue_access_token()
+
+    def _refresh_rejected_access_token(self) -> str:
+        """Replace a token KIS rejects before its locally cached expiry time."""
+        rejected = self._access_token
+        with _KIS_TOKEN_REFRESH_LOCK:
+            self._access_token = None
+            self._token_expires_at = None
+            # Another client/thread may already have replaced the shared token.
+            cached = self._load_cached_token()
+            if cached and cached != rejected:
+                return cached
+            self._access_token = None
+            self._token_expires_at = None
+            return self.issue_access_token(force_refresh=True)
 
     def _load_env_token(self, now: datetime | None = None) -> str | None:
         mode_prefix = "KIS_LIVE_"
@@ -1315,7 +1425,10 @@ class KisDevelopersApiClient:
                 if nation_code == "840":
                     return balances, foreign_cash_krw, total_assets_krw, fx_rates
                 continue
-            response_balances = _foreign_orderable_cash_by_currency_from_overseas_response(response, nation_code)
+            response_balances = _foreign_cash_by_currency_from_overseas_response(
+                response,
+                nation_code,
+            )
             response_rates = _foreign_fx_by_currency_from_overseas_response(response, nation_code)
             balances.update(response_balances)
             fx_rates.update(response_rates)
@@ -1614,6 +1727,10 @@ def _is_overseas_order(order: FinalOrder) -> bool:
     )
 
 
+# KIS 상품유형코드 for 해외주식 상품기본정보 (CTPF1702R).
+US_PRODUCT_TYPE_CODES = {"NASD": "512", "NYSE": "513", "AMEX": "529"}
+
+
 def _overseas_exchange_code(market: str) -> str:
     value = str(market or "").upper()
     if "NASDAQ" in value or "NASD" in value:
@@ -1684,6 +1801,20 @@ def _domestic_order_division_code(now: datetime | None = None) -> str:
     if 16 * 60 <= minute <= 18 * 60:
         return "07"
     return "00"
+
+
+def _daytime_tradable_cache_ttl_seconds() -> float:
+    """How long a ``dtm_tr_psbl_yn`` answer stays fresh. It is reference data."""
+    try:
+        hours = float(os.getenv("KIS_DAYTIME_TRADABLE_CACHE_HOURS", "12"))
+    except (TypeError, ValueError):
+        hours = 12.0
+    return max(60.0, hours * 3600.0)
+
+
+def _enforce_daytime_tradable() -> bool:
+    raw = os.getenv("KIS_ENFORCE_US_DAYTIME_TRADABLE", "true").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _is_us_daytime_order_session(market: str, now: datetime | None = None) -> bool:

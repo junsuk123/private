@@ -19,7 +19,12 @@ def evaluate_market_data_health(
     tick = store.latest_tick(symbol)
     orderbook = store.latest_orderbook(symbol)
     reasons: list[str] = []
-    quote_source = tick or orderbook
+    quote_candidates = tuple(item for item in (tick, orderbook) if item is not None)
+    quote_source = (
+        max(quote_candidates, key=lambda item: item.received_at)
+        if quote_candidates
+        else None
+    )
     quote_count = 1 if quote_source is not None else 0
     orderbook_count = 1 if orderbook is not None else 0
 

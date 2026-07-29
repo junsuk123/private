@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+import time
 import uuid
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
@@ -28,6 +30,8 @@ BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 _US_MARKET_NAMES = {"US", "NASDAQ", "NAS", "NYSE", "NYS", "AMEX", "AMS", "ARCA", "BATS", "CBOE", "IEX"}
 _KR_MARKET_NAMES = {"KRX", "KOSPI", "KOSDAQ", "KONEX"}
+_US_POLL_STATE_LOCK = threading.Lock()
+_US_POLL_STATE: dict[str, dict[str, float]] = {}
 
 
 def _env_any(*names: str, default: str = "") -> str:
@@ -426,9 +430,28 @@ def _construct_dataclass(cls: Any, candidates: dict[str, Any]) -> Any:
     raise TypeError(f"Unsupported realtime dataclass: {cls}")
 
 
-def _make_records(symbol: str, exchange: str, data: dict[str, float]) -> tuple[Any, Any]:
+def _make_records(symbol: str, exchange: str, data: dict[str, float]) -> tuple[Any | None, Any]:
     now = datetime.now(timezone.utc)
     seq = f"us-kis-rest:{symbol}:{now.isoformat()}:{uuid.uuid4().hex[:8]}"
+    cumulative_volume = max(0.0, float(data.get("volume") or 0.0))
+    last_price = float(data["last"])
+    with _US_POLL_STATE_LOCK:
+        previous = dict(_US_POLL_STATE.get(symbol) or {})
+        _US_POLL_STATE[symbol] = {
+            "cumulative_volume": cumulative_volume,
+            "last_price": last_price,
+        }
+    previous_volume = previous.get("cumulative_volume")
+    previous_price = previous.get("last_price")
+    volume_delta = 0.0
+    if previous_volume is not None and cumulative_volume >= previous_volume:
+        volume_delta = cumulative_volume - previous_volume
+    price_changed = previous_price is not None and last_price != previous_price
+    # KIS overseas REST quotes expose cumulative session volume, not the size of
+    # a new trade. Do not manufacture a trade tick on every poll. The first
+    # observation seeds state; later observations emit only on actual volume or
+    # last-price movement.
+    emit_tick = previous_volume is not None and (volume_delta > 0.0 or price_changed)
 
     level = OrderbookLevel(
         bid_price=data["bid"],
@@ -448,15 +471,19 @@ def _make_records(symbol: str, exchange: str, data: dict[str, float]) -> tuple[A
         "sequence_key": seq,
     }
 
-    tick = _construct_dataclass(
-        RealtimeTradeTick,
-        {
-            **common,
-            "price": data["last"],
-            "last_price": data["last"],
-            "volume": data["volume"],
-            "record_id": seq + ":tick",
-        },
+    tick = (
+        _construct_dataclass(
+            RealtimeTradeTick,
+            {
+                **common,
+                "price": last_price,
+                "last_price": last_price,
+                "volume": volume_delta,
+                "record_id": seq + ":tick",
+            },
+        )
+        if emit_tick
+        else None
     )
     book = _construct_dataclass(
         RealtimeOrderbookSnapshot,
@@ -564,13 +591,26 @@ def refresh_us_realtime_for_context_buy_candidates(
     ticks = []
     books = []
     errors: dict[str, str] = {}
+    try:
+        symbol_delay_seconds = max(
+            0.0,
+            min(2.0, float(os.getenv("REALTIME_US_REST_SYMBOL_DELAY_SEC", "0.4"))),
+        )
+    except (TypeError, ValueError):
+        symbol_delay_seconds = 0.4
 
-    for symbol in target_symbols:
+    for index, symbol in enumerate(target_symbols):
+        if index > 0 and symbol_delay_seconds > 0.0:
+            # KIS applies a shared per-second request budget across account,
+            # quote, orderbook and ranking endpoints. Spread symbol bursts so
+            # the fourth candidate is not predictably rejected.
+            time.sleep(symbol_delay_seconds)
         try:
             payload = _fetch_overseas_quote(symbol, market_hint_by_symbol.get(symbol, ""))
             extracted = _extract_price_book(payload)
             tick, book = _make_records(symbol, payload["exchange"], extracted)
-            ticks.append(tick)
+            if tick is not None:
+                ticks.append(tick)
             books.append(book)
         except Exception as exc:
             errors[symbol] = f"{exc.__class__.__name__}: {exc}"
@@ -604,7 +644,9 @@ def refresh_us_realtime_for_context_buy_candidates(
             )
             store.build_latest_minute_bar(symbol)
 
-    touched = _touch_latest_rows(target_symbols)
+    # Never rewrite timestamps on historical rows. A failed REST refresh must
+    # remain visibly stale instead of making old data look current.
+    touched: dict[str, int] = {}
 
     return {
         "ok": not errors,

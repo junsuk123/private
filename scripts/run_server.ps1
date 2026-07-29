@@ -14,6 +14,11 @@ if (Test-Path -LiteralPath $envFile) {
   }
 }
 
+# Require true 1/5/10-second tick and orderbook windows for live entries.
+if (-not $env:REALTIME_REQUIRE_SECOND_DATA_FOR_BUY) {
+  $env:REALTIME_REQUIRE_SECOND_DATA_FOR_BUY = "true"
+}
+
 $listener = Get-NetTCPConnection -LocalAddress "127.0.0.1" -LocalPort 8010 -State Listen -ErrorAction SilentlyContinue
 if ($listener) {
   $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue

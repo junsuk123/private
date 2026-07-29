@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
 import os
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Container, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -26,16 +26,64 @@ if TYPE_CHECKING:
     from app.execution.kis_real import KisDevelopersApiClient
 
 
-TRADE_TR_IDS = {"H0STCNT0", "H0STCNI0"}
-ORDERBOOK_TR_IDS = {"H0STASP0"}
+# Domestic realtime feeds. KRX-only TRs cover the 09:00-15:30 regular session;
+# the 통합 (KRX+NXT) TRs additionally carry NXT, whose session runs 08:00-20:00,
+# so they are what makes pre/after-hours data possible at all.
+TRADE_TR_IDS = {"H0STCNT0", "H0STCNI0", "H0UNCNT0", "H0NXCNT0", "H0STOUP0"}
+ORDERBOOK_TR_IDS = {"H0STASP0", "H0UNASP0", "H0NXASP0"}
+OVERSEAS_TRADE_TR_IDS = {"HDFSCNT0"}
+OVERSEAS_ORDERBOOK_TR_IDS = {"HDFSASP0"}
+
+# Records are split positionally, so the field count per TR must be exact.
+# Verified against the official KIS workbook (research_notes/*.xlsx):
+#   trade     H0STCNT0/H0UNCNT0/H0NXCNT0 = 46 fields, identical order
+#             (index 21 is named CCLD_DVSN on KRX, CNTG_CLS_CODE on 통합/NXT)
+#             H0STOUP0 (시간외) = 43 fields
+#   orderbook H0STASP0 = 59; H0UNASP0/H0NXASP0 = 65 (same first 59, then
+#             KMID_*/NMID_* mid-price fields for KRX and NXT)
+KIS_TRADE_FIELDS_PER_RECORD = 46
+KIS_ORDERBOOK_FIELDS_PER_RECORD = 59
+KIS_OVERSEAS_TRADE_FIELDS_PER_RECORD = 26
+# Highest positional index the official trade layout needs ([21] 체결구분) plus
+# one. Gating on this instead of the full record length lets the shorter 시간외
+# record (43 fields) parse with the same code, while still separating it from
+# the compact 6-field fixture format used by local adapters.
+KIS_TRADE_MIN_OFFICIAL_FIELDS = 22
+TRADE_FIELDS_BY_TR_ID = {
+    "H0STCNT0": 46,
+    "H0STCNI0": 46,
+    "H0UNCNT0": 46,
+    "H0NXCNT0": 46,
+    "H0STOUP0": 43,
+}
+ORDERBOOK_FIELDS_BY_TR_ID = {
+    "H0STASP0": 59,
+    "H0UNASP0": 65,
+    "H0NXASP0": 65,
+}
+
+
+def _domestic_subscription_tr_ids() -> tuple[str, str]:
+    """Trade/orderbook TR pair for the domestic collector.
+
+    Defaults to the 통합 feed so one subscription covers KRX plus NXT, which is
+    what extends coverage from 09:00-15:30 to 08:00-20:00. Set
+    ``KIS_REALTIME_FEED=krx`` to fall back to the KRX-only TRs.
+    """
+    feed = os.getenv("KIS_REALTIME_FEED", "unified").strip().lower()
+    if feed in {"krx", "kospi", "kosdaq", "legacy"}:
+        return ("H0STCNT0", "H0STASP0")
+    if feed in {"nxt", "next", "nextrade"}:
+        return ("H0NXCNT0", "H0NXASP0")
+    return ("H0UNCNT0", "H0UNASP0")
+
+
 # Trades come first so a constrained KIS subscription budget still produces
 # candles and activity signals. A complete symbol receives trade + orderbook
 # before the collector advances to the next symbol.
-DEFAULT_SUBSCRIPTION_TR_IDS = ("H0STCNT0", "H0STASP0")
+DEFAULT_SUBSCRIPTION_TR_IDS = _domestic_subscription_tr_ids()
 KIS_REALTIME_LIVE_WS_URL = "ws://ops.koreainvestment.com:21000/tryitout"
 KIS_EXCHANGE_TIMEZONE = ZoneInfo("Asia/Seoul")
-KIS_TRADE_FIELDS_PER_RECORD = 46
-KIS_ORDERBOOK_FIELDS_PER_RECORD = 59
 
 
 @dataclass(frozen=True)
@@ -141,12 +189,28 @@ async def run_kis_realtime_websocket_collector(
         [RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]
     ]
     | None = None,
+    subscription_tr_ids: tuple[str, ...] = DEFAULT_SUBSCRIPTION_TR_IDS,
+    subscription_key_factory: Callable[[str], str] | None = None,
+    symbols_provider: Callable[[], Iterable[str]] | None = None,
 ) -> dict[str, Any]:
+    """Stream KIS realtime data over ONE persistent websocket session.
+
+    When ``symbols_provider`` is supplied the session is long-lived: a
+    resubscribe request re-reads the desired symbols and applies the difference
+    in place with ``tr_type`` 1/2, instead of dropping the connection and
+    reconnecting. That matters because every reconnect used to mint a new
+    approval key, and KIS bills realtime registrations per session — the old
+    behaviour drained the account's budget until a single symbol fit.
+    """
     websockets = _load_websockets()
     client = client or build_kis_client(enabled=True)
     approval_key = issue_websocket_approval_key(client)
     target_url = url or _kis_realtime_websocket_url()
-    normalized_symbols = tuple(symbol for symbol in (normalize_symbol(item) for item in symbols) if symbol)
+    # Mutable so an in-place resubscribe immediately changes which inbound
+    # ticks are accepted; the message handlers only do membership tests.
+    active_symbols: set[str] = {
+        symbol for symbol in (normalize_symbol(item) for item in symbols) if symbol
+    }
     skipped_pairs = {
         (normalize_symbol(symbol), str(tr_id))
         for symbol, tr_id in (skip_subscriptions or ())
@@ -165,6 +229,7 @@ async def run_kis_realtime_websocket_collector(
         "rejected_subscription_pairs": [],
         "mode": "live",
         "url": target_url,
+        "subscription_tr_ids": list(subscription_tr_ids),
     }
     feature_builder = LiveFeatureFrameBuilder(store) if event_sink is None else None
     # KIS realtime sends application-level PINGPONG frames and doesn't reliably
@@ -175,59 +240,159 @@ async def run_kis_realtime_websocket_collector(
     subscribe_delay = _websocket_subscription_delay_seconds()
     post_subscribe_drain = _websocket_post_subscribe_drain_seconds()
     subscription_limit_reached = False
-    async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
-        for symbol in normalized_symbols:
-            for tr_id in DEFAULT_SUBSCRIPTION_TR_IDS:
-                if (symbol, tr_id) in skipped_pairs:
+    # Registrations this session currently holds. KIS bills them against the
+    # account, so they must be released with tr_type=2 before the socket goes
+    # away — otherwise the next session starts with a smaller budget until only
+    # one symbol fits.
+    held_registrations: set[tuple[str, str]] = set()
+
+    async def _release_registrations(websocket) -> None:
+        if not held_registrations:
+            return
+        released = int(counts.get("subscriptions_released") or 0)
+        for tr_key, tr_id in sorted(held_registrations):
+            try:
+                await websocket.send(
+                    kis_realtime_unsubscribe_message(approval_key, tr_id, tr_key)
+                )
+                released += 1
+            except Exception:  # noqa: BLE001 - a closing socket cannot be unsubscribed.
+                break
+        held_registrations.clear()
+        counts["subscriptions_released"] = released
+
+    def _registration_key(symbol: str) -> str:
+        return (
+            str(subscription_key_factory(symbol)).upper().strip()
+            if subscription_key_factory is not None
+            else symbol
+        )
+
+    def _desired_registrations(symbol_set: Iterable[str]) -> list[tuple[str, str, str]]:
+        """(symbol, tr_key, tr_id) triples the session should currently hold."""
+        wanted: list[tuple[str, str, str]] = []
+        for symbol in symbol_set:
+            tr_key = _registration_key(symbol)
+            for tr_id in subscription_tr_ids:
+                if (symbol, tr_id) in skipped_pairs or (tr_key, tr_id) in skipped_pairs:
                     counts["subscriptions_skipped"] = counts.get("subscriptions_skipped", 0) + 1
                     continue
-                counts["last_subscription_symbol"] = symbol
-                counts["last_subscription_tr_id"] = tr_id
-                try:
-                    await websocket.send(kis_realtime_subscription_message(approval_key, tr_id, symbol))
-                except Exception as exc:
-                    if _is_websocket_connection_closed(exc):
-                        counts["connection_closed"] = 1
-                        counts["last_close_error"] = str(exc) or exc.__class__.__name__
-                        return counts
-                    raise
-                counts["subscriptions"] += 1
-                counts["subscription_requests"] += 1
-                if post_subscribe_drain > 0.0:
-                    closed = await _drain_kis_realtime_messages(
-                        websocket=websocket,
-                        symbols=normalized_symbols,
-                        store=store,
-                        feature_builder=feature_builder,
-                        counts=counts,
-                        seconds=post_subscribe_drain,
-                        max_messages=max_messages,
-                        event_sink=event_sink,
-                    )
-                    if closed:
-                        return counts
-                    if counts.get("subscription_limit_reached"):
-                        subscription_limit_reached = True
-                        break
-                if subscribe_delay > 0.0:
-                    await asyncio.sleep(subscribe_delay)
-            if subscription_limit_reached:
-                break
-        if subscription_limit_reached and int(counts.get("subscriptions_accepted") or 0) >= 2:
-            # Close this exploratory connection immediately. The supervising
-            # worker learns the actual account capacity from the accepted
-            # responses and reconnects with complete trade/orderbook pairs,
-            # instead of holding a partial 5-minute subscription set.
-            counts["resubscribe_for_observed_capacity"] = 1
+                wanted.append((symbol, tr_key, tr_id))
+        return wanted
+
+    async def _apply_registrations(websocket, wanted) -> bool:
+        """Bring the live session to ``wanted`` with tr_type 2 then 1. True == closed."""
+        nonlocal subscription_limit_reached
+        target = {(tr_key, tr_id) for _s, tr_key, tr_id in wanted}
+        for tr_key, tr_id in sorted(held_registrations - target):
+            try:
+                await websocket.send(
+                    kis_realtime_unsubscribe_message(approval_key, tr_id, tr_key)
+                )
+            except Exception as exc:
+                if _is_websocket_connection_closed(exc):
+                    counts["connection_closed"] = 1
+                    counts["last_close_error"] = str(exc) or exc.__class__.__name__
+                    return True
+                raise
+            held_registrations.discard((tr_key, tr_id))
+            counts["subscriptions_released"] = int(counts.get("subscriptions_released") or 0) + 1
+        for symbol, tr_key, tr_id in wanted:
+            if (tr_key, tr_id) in held_registrations:
+                continue
+            counts["last_subscription_symbol"] = symbol
+            counts["last_subscription_tr_id"] = tr_id
+            counts["last_subscription_key"] = tr_key
+            try:
+                await websocket.send(
+                    kis_realtime_subscription_message(approval_key, tr_id, tr_key)
+                )
+            except Exception as exc:
+                if _is_websocket_connection_closed(exc):
+                    counts["connection_closed"] = 1
+                    counts["last_close_error"] = str(exc) or exc.__class__.__name__
+                    return True
+                raise
+            held_registrations.add((tr_key, tr_id))
+            counts["subscriptions"] += 1
+            counts["subscription_requests"] += 1
+            if post_subscribe_drain > 0.0:
+                closed = await _drain_kis_realtime_messages(
+                    websocket=websocket,
+                    symbols=active_symbols,
+                    store=store,
+                    feature_builder=feature_builder,
+                    counts=counts,
+                    seconds=post_subscribe_drain,
+                    max_messages=max_messages,
+                    event_sink=event_sink,
+                )
+                if closed:
+                    return True
+                if counts.get("subscription_limit_reached"):
+                    # The account is full. Stop asking for more on this session
+                    # and keep what was accepted — reconnecting would only cost
+                    # another approval key without freeing anything.
+                    subscription_limit_reached = True
+                    return False
+            if subscribe_delay > 0.0:
+                await asyncio.sleep(subscribe_delay)
+        return False
+
+    async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
+        if await _apply_registrations(websocket, _desired_registrations(sorted(active_symbols))):
             return counts
-        # Optional soft deadline so the caller can periodically reconnect with a
-        # refreshed symbol set (e.g. today's affordable candidates), not just the
-        # static config list.
-        deadline = time.monotonic() + max_runtime_seconds if max_runtime_seconds else None
+        # A soft deadline only applies to one-shot callers. With a provider the
+        # session persists and the same interval becomes a re-diff cadence, so
+        # session-derived subscription keys (e.g. the US daytime RBAQ* family
+        # replacing DNAS*) are picked up without dropping the connection.
+        deadline = (
+            time.monotonic() + max_runtime_seconds
+            if max_runtime_seconds and symbols_provider is None
+            else None
+        )
+        resync_interval = (
+            max_runtime_seconds if max_runtime_seconds and symbols_provider is not None else None
+        )
+        next_resync = time.monotonic() + resync_interval if resync_interval else None
+
+        async def _resync() -> bool:
+            """Recompute desired registrations and apply the difference."""
+            nonlocal subscription_limit_reached
+            try:
+                refreshed = {
+                    symbol
+                    for symbol in (normalize_symbol(item) for item in symbols_provider())
+                    if symbol
+                }
+            except Exception:  # noqa: BLE001 - keep streaming on a provider failure.
+                refreshed = set(active_symbols)
+            if refreshed:
+                active_symbols.clear()
+                active_symbols.update(refreshed)
+            wanted = _desired_registrations(sorted(active_symbols))
+            # Diff on registration keys, not on the symbol set: an unchanged
+            # symbol can still need a new key when the session flips.
+            if {(k, t) for _s, k, t in wanted} == held_registrations:
+                return False
+            subscription_limit_reached = False
+            counts["in_place_resubscribes"] = int(counts.get("in_place_resubscribes") or 0) + 1
+            return await _apply_registrations(websocket, wanted)
+
         while stop_event is None or not stop_event.is_set():
             if resubscribe_event is not None and resubscribe_event.is_set():
-                counts["resubscribe_requested"] = 1
-                break
+                counts["resubscribe_requested"] = int(counts.get("resubscribe_requested") or 0) + 1
+                if symbols_provider is None:
+                    break
+                resubscribe_event.clear()
+                if await _resync():
+                    break
+                if resync_interval:
+                    next_resync = time.monotonic() + resync_interval
+            if next_resync is not None and time.monotonic() >= next_resync:
+                next_resync = time.monotonic() + resync_interval
+                if await _resync():
+                    break
             if deadline is not None and time.monotonic() >= deadline:
                 break
             try:
@@ -243,7 +408,7 @@ async def run_kis_realtime_websocket_collector(
             closed = await _process_kis_realtime_raw(
                 raw=raw,
                 websocket=websocket,
-                symbols=normalized_symbols,
+                symbols=active_symbols,
                 store=store,
                 feature_builder=feature_builder,
                 counts=counts,
@@ -253,13 +418,104 @@ async def run_kis_realtime_websocket_collector(
                 break
             if max_messages is not None and counts["messages"] >= max_messages:
                 break
+        # Normal end of run (resubscribe, deadline, stop). Release the account's
+        # registrations so the next connection gets its full budget back.
+        if not counts.get("connection_closed"):
+            await _release_registrations(websocket)
     return counts
+
+
+# KIS routes the US daytime (주간거래) session through different realtime keys:
+# the prefix becomes R and the exchange code switches to the BA* family. The
+# night/regular session keeps D + NAS/NYS/AMS. Subscribing with the wrong pair
+# is silent — KIS accepts it and simply never sends data for that session.
+US_DAYTIME_EXCHANGE_CODES = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
+
+
+def is_us_daytime_quote_session(now: datetime | None = None) -> bool:
+    """True during the KIS US daytime quote window (10:00-16:00 KST, weekdays).
+
+    Window per the HDFSCNT0 documentation. This is the *quote* window; the order
+    routing window in ``app.execution.kis_real`` is deliberately separate.
+    """
+    override = os.getenv("KIS_FORCE_US_DAYTIME_QUOTES", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(KIS_EXCHANGE_TIMEZONE)
+    if local.weekday() >= 5:
+        return False
+    minutes = local.hour * 60 + local.minute
+    return 10 * 60 <= minutes < 16 * 60
+
+
+def overseas_realtime_subscription_key(
+    symbol: str,
+    market_hint: str = "",
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Build the official KIS overseas realtime key for the current session.
+
+    ``DNASAAPL`` during the US night/regular session, ``RBAQAAPL`` during the US
+    daytime session — the exchange code differs, not just the prefix.
+    """
+    from app.trading.us_realtime_bridge import _exchange_code
+
+    ticker = normalize_symbol(symbol).upper()
+    if not ticker or ticker.isdigit():
+        raise ValueError(f"invalid overseas realtime symbol: {symbol}")
+    exchange = _exchange_code(ticker, market_hint)
+    if is_us_daytime_quote_session(now) and exchange in US_DAYTIME_EXCHANGE_CODES:
+        return f"R{US_DAYTIME_EXCHANGE_CODES[exchange]}{ticker}"
+    return f"D{exchange}{ticker}"
+
+
+async def run_kis_overseas_realtime_websocket_collector(
+    *,
+    symbols: Iterable[str],
+    store: RealtimeMarketDataStore | None = None,
+    client: "KisDevelopersApiClient | None" = None,
+    url: str | None = None,
+    stop_event: Any | None = None,
+    resubscribe_event: Any | None = None,
+    max_messages: int | None = None,
+    max_runtime_seconds: float | None = None,
+    symbols_provider: Callable[[], Iterable[str]] | None = None,
+) -> dict[str, Any]:
+    """Collect official KIS US tick trades and best bid/ask WebSocket events.
+
+    KIS HDFSCNT0 provides trade events (0-minute delay for US, so effectively
+    realtime) and also serves the US daytime session. HDFSASP0 officially
+    provides one best-bid/best-ask level for US equities; deeper levels must not
+    be invented.
+
+    The subscription key is session-aware, so a resubscribe across the daytime
+    boundary swaps ``DNASAAPL`` for ``RBAQAAPL`` without reconnecting.
+    """
+    return await run_kis_realtime_websocket_collector(
+        symbols=symbols,
+        store=store,
+        client=client,
+        url=url,
+        stop_event=stop_event,
+        resubscribe_event=resubscribe_event,
+        max_messages=max_messages,
+        max_runtime_seconds=max_runtime_seconds,
+        subscription_tr_ids=("HDFSCNT0", "HDFSASP0"),
+        subscription_key_factory=overseas_realtime_subscription_key,
+        symbols_provider=symbols_provider,
+    )
 
 
 async def _drain_kis_realtime_messages(
     *,
     websocket: Any,
-    symbols: tuple[str, ...],
+    symbols: Container[str],
     store: RealtimeMarketDataStore,
     feature_builder: LiveFeatureFrameBuilder,
     counts: dict[str, Any],
@@ -305,7 +561,7 @@ async def _process_kis_realtime_raw(
     *,
     raw: str | bytes,
     websocket: Any,
-    symbols: tuple[str, ...],
+    symbols: Container[str],
     store: RealtimeMarketDataStore,
     feature_builder: LiveFeatureFrameBuilder | None,
     counts: dict[str, Any],
@@ -397,13 +653,26 @@ def _is_websocket_connection_closed(exc: Exception) -> bool:
     )
 
 
-def kis_realtime_subscription_message(approval_key: str, tr_id: str, symbol: str) -> str:
+def kis_realtime_subscription_message(
+    approval_key: str,
+    tr_id: str,
+    symbol: str,
+    *,
+    tr_type: str = "1",
+) -> str:
+    """Build a KIS realtime control frame.
+
+    ``tr_type`` is ``"1"`` to subscribe and ``"2"`` to unsubscribe. Releasing a
+    subscription matters: KIS counts registrations against the account, so a
+    connection dropped without unsubscribing leaves its slots occupied and the
+    next session gets fewer — eventually only enough for a single symbol.
+    """
     return json.dumps(
         {
             "header": {
                 "approval_key": approval_key,
                 "custtype": os.getenv("KIS_CUSTTYPE", "P"),
-                "tr_type": "1",
+                "tr_type": str(tr_type),
                 "content-type": "utf-8",
             },
             "body": {"input": {"tr_id": tr_id, "tr_key": normalize_symbol(symbol)}},
@@ -411,6 +680,10 @@ def kis_realtime_subscription_message(approval_key: str, tr_id: str, symbol: str
         ensure_ascii=True,
         separators=(",", ":"),
     )
+
+
+def kis_realtime_unsubscribe_message(approval_key: str, tr_id: str, symbol: str) -> str:
+    return kis_realtime_subscription_message(approval_key, tr_id, symbol, tr_type="2")
 
 
 def kis_realtime_control_summary(raw: str) -> dict[str, Any]:
@@ -518,11 +791,36 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
     if not raw:
         return ParsedKisRealtimeMessage(event_type="empty")
     parts = raw.split("|")
+    if len(parts) >= 4 and parts[1] in OVERSEAS_TRADE_TR_IDS:
+        payloads = _split_kis_payload_records(
+            parts[-1],
+            _kis_payload_count(parts[2]),
+            KIS_OVERSEAS_TRADE_FIELDS_PER_RECORD,
+        )
+        ticks = tuple(
+            _parse_overseas_trade_payload(
+                payload,
+                raw=f"{parts[0]}|{parts[1]}|001|{payload}",
+                received_at=received_at,
+            )
+            for payload in payloads
+        )
+        return ParsedKisRealtimeMessage(ticks=ticks, event_type="overseas_trade")
+    if len(parts) >= 4 and parts[1] in OVERSEAS_ORDERBOOK_TR_IDS:
+        orderbook = _parse_overseas_orderbook_payload(
+            parts[-1],
+            raw=f"{parts[0]}|{parts[1]}|{parts[2]}|{parts[-1]}",
+            received_at=received_at,
+        )
+        return ParsedKisRealtimeMessage(
+            orderbooks=(orderbook,),
+            event_type="overseas_orderbook",
+        )
     if len(parts) >= 4 and parts[1] in TRADE_TR_IDS:
         payloads = _split_kis_payload_records(
             parts[-1],
             _kis_payload_count(parts[2]),
-            KIS_TRADE_FIELDS_PER_RECORD,
+            TRADE_FIELDS_BY_TR_ID.get(parts[1], KIS_TRADE_FIELDS_PER_RECORD),
         )
         ticks = tuple(
             _parse_trade_payload(
@@ -537,7 +835,7 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
         payloads = _split_kis_payload_records(
             parts[-1],
             _kis_payload_count(parts[2]),
-            KIS_ORDERBOOK_FIELDS_PER_RECORD,
+            ORDERBOOK_FIELDS_BY_TR_ID.get(parts[1], KIS_ORDERBOOK_FIELDS_PER_RECORD),
         )
         orderbooks = tuple(
             _parse_orderbook_payload(
@@ -553,6 +851,124 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
     raise ValueError("unsupported KIS realtime message format")
 
 
+def _normalize_overseas_realtime_symbol(value: str, fallback: str = "") -> str:
+    text = str(value or "").upper().strip()
+    if len(text) >= 5 and text[0] in {"D", "R"} and text[1:4] in {
+        "NAS",
+        "NYS",
+        "AMS",
+        "BAQ",
+        "BAY",
+        "BAA",
+    }:
+        text = text[4:]
+    return text or str(fallback or "").upper().strip()
+
+
+def _overseas_exchange_timestamp(
+    date_value: str,
+    time_value: str,
+    received_at: datetime,
+) -> datetime:
+    date_text = str(date_value or "").strip()
+    time_text = str(time_value or "").strip()
+    if len(date_text) == 8 and date_text.isdigit() and len(time_text) >= 6 and time_text[:6].isdigit():
+        try:
+            local = datetime.strptime(
+                f"{date_text}{time_text[:6]}",
+                "%Y%m%d%H%M%S",
+            ).replace(tzinfo=ZoneInfo("America/New_York"))
+            return local.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return received_at
+
+
+def _parse_overseas_trade_payload(
+    payload: str,
+    *,
+    raw: str,
+    received_at: datetime,
+) -> RealtimeTradeTick:
+    fields = payload.split("^")
+    if len(fields) < KIS_OVERSEAS_TRADE_FIELDS_PER_RECORD:
+        raise ValueError(
+            f"KIS overseas trade payload has {len(fields)} fields; expected 26"
+        )
+    symbol = _normalize_overseas_realtime_symbol(fields[1], fields[0])
+    exchange_timestamp = _overseas_exchange_timestamp(fields[4], fields[5], received_at)
+    price = _float(fields[11])
+    bid = _float(fields[15])
+    ask = _float(fields[16])
+    volume = max(0, int(_float(fields[19])))
+    direction = "BUY" if ask > 0 and price >= ask else "SELL" if bid > 0 and price <= bid else None
+    sequence = (
+        f"us-kis-ws:{symbol}:{fields[4]}:{fields[5]}:{fields[20]}:"
+        f"{price}:{volume}:{checksum(payload)[:10]}"
+    )
+    return RealtimeTradeTick(
+        symbol=symbol,
+        exchange_timestamp=exchange_timestamp,
+        received_at=received_at,
+        source=KIS_REALTIME_SOURCE,
+        price=price,
+        volume=volume,
+        trade_direction=direction,
+        sequence_key=sequence,
+        raw_checksum=checksum(raw),
+        latency_ms=max(0.0, (received_at - exchange_timestamp).total_seconds() * 1000),
+    )
+
+
+def _parse_overseas_orderbook_payload(
+    payload: str,
+    *,
+    raw: str,
+    received_at: datetime,
+) -> RealtimeOrderbookSnapshot:
+    fields = payload.split("^")
+    # The current official schema has 16 fields. Older official samples include
+    # RSYM before SYMB and therefore contain 17; support both wire layouts.
+    if len(fields) >= 17:
+        symbol = _normalize_overseas_realtime_symbol(fields[1], fields[0])
+        exchange_timestamp = _overseas_exchange_timestamp(fields[3], fields[4], received_at)
+        bid, ask, bid_size, ask_size = map(_float, fields[11:15])
+        sequence_time = fields[4]
+    elif len(fields) >= 16:
+        symbol = _normalize_overseas_realtime_symbol(fields[0])
+        exchange_timestamp = _overseas_exchange_timestamp(fields[2], fields[3], received_at)
+        bid, ask, bid_size, ask_size = map(_float, fields[10:14])
+        sequence_time = fields[3]
+    else:
+        raise ValueError(
+            f"KIS overseas orderbook payload has {len(fields)} fields; expected 16 or 17"
+        )
+    if not symbol or bid <= 0 or ask <= 0 or ask < bid:
+        raise ValueError(
+            f"KIS overseas orderbook invalid symbol/bid/ask: {symbol} {bid} {ask}"
+        )
+    level = OrderbookLevel(
+        bid_price=bid,
+        bid_size=max(0, int(bid_size)),
+        ask_price=ask,
+        ask_size=max(0, int(ask_size)),
+    )
+    sequence = (
+        f"us-kis-ws:{symbol}:{sequence_time}:{bid}:{ask}:"
+        f"{level.bid_size}:{level.ask_size}:{checksum(payload)[:10]}"
+    )
+    return RealtimeOrderbookSnapshot(
+        symbol=symbol,
+        exchange_timestamp=exchange_timestamp,
+        received_at=received_at,
+        source=KIS_REALTIME_SOURCE,
+        levels=(level,),
+        sequence_key=sequence,
+        raw_checksum=checksum(raw),
+        latency_ms=max(0.0, (received_at - exchange_timestamp).total_seconds() * 1000),
+    )
+
+
 def _parse_trade_payload(payload: str, *, raw: str, received_at: datetime) -> RealtimeTradeTick:
     fields = payload.split("^")
     if len(fields) < 4:
@@ -560,10 +976,13 @@ def _parse_trade_payload(payload: str, *, raw: str, received_at: datetime) -> Re
     symbol = normalize_symbol(fields[0])
     exchange_timestamp = _timestamp_from_hhmmss(fields[1], received_at)
     price = _float(fields[2])
-    if len(fields) >= KIS_TRADE_FIELDS_PER_RECORD:
-        # Official H0STCNT0 layout:
+    if len(fields) >= KIS_TRADE_MIN_OFFICIAL_FIELDS:
+        # Official layout, shared by H0STCNT0 (KRX, 46), H0UNCNT0/H0NXCNT0
+        # (통합/NXT, 46) and H0STOUP0 (시간외, 43) — verified field-by-field
+        # against the KIS workbook. Only the name at [21] differs
+        # (CCLD_DVSN vs CNTG_CLS_CODE); the position and meaning are the same.
         # [3] PRDY_VRSS_SIGN, [5] PRDY_CTRT, [12] CNTG_VOL,
-        # [13] ACML_VOL, [14] ACML_TR_PBMN, [21] CCLD_DVSN.
+        # [13] ACML_VOL, [14] ACML_TR_PBMN, [21] 체결구분.
         volume = int(_float(fields[12]))
         direction = _kis_trade_direction(fields[21])
         sequence = (

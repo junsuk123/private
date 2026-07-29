@@ -233,5 +233,5 @@ VERIFICATION_OK - the system runs fully on CPU without NPU.
 
 - [../README.md](../README.md)
 - [README.md](README.md)
-- [live_trading_runbook.md](live_trading_runbook.md)
-- [live_trading_safety_gates.md](live_trading_safety_gates.md)
+- [live_trading.md](live_trading.md) — 게이트, 운영 절차, 비상 정지, 런타임 프로파일
+- [architecture.md](architecture.md) — 모듈 지도와 가속 경계

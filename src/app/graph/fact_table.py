@@ -13,7 +13,7 @@ Confidence and source quality are quantized to 0..255 (uint8-range):
     confidence_q = round(confidence_float * 255)
     confidence_float = confidence_q / 255.0
 
-See docs/ontology_acceleration_audit.md (Phase 2).
+See docs/ontology_and_gnn.md (working triple store).
 """
 
 from typing import NamedTuple

@@ -22,7 +22,7 @@ class KnowledgeGraph:
     ``for_subject`` / ``objects`` / ``reasoning_path_ids`` are O(matches) instead
     of O(total triples). The live tick loop calls ``matching`` repeatedly against a
     cached snapshot graph, so this removes the per-tick linear-scan cost without
-    changing any result. See docs/ontology_acceleration_audit.md.
+    changing any result. See docs/ontology_and_gnn.md.
     """
 
     def __init__(self) -> None:

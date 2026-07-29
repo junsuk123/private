@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.data.market_data_health import evaluate_market_data_health
+from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.feature_provenance import FeatureProvenance
 from app.features.feature_schema import FeatureSchema, LIVE_SHORT_HORIZON_SCHEMA
@@ -83,27 +84,64 @@ class LiveFeatureFrameBuilder:
         return not (s.isdigit() and len(s) == 6)
 
     def build(self, symbol: str, *, decision_time: datetime | None = None) -> LiveFeatureFrame:
+        explicit_decision_time = decision_time is not None
         decision_time = decision_time or datetime.now(timezone.utc)
         is_us = self._is_us_symbol(symbol)
         quote_age_ms = self.max_quote_age_ms_us if is_us else self.max_quote_age_ms
         orderbook_age_ms = self.max_orderbook_age_ms_us if is_us else self.max_orderbook_age_ms
-        health = evaluate_market_data_health(
-            self.store,
-            symbol,
-            max_quote_age_ms=quote_age_ms,
-            max_orderbook_age_ms=orderbook_age_ms,
-            now=decision_time,
-        )
-        if not health.ok_for_live_buy:
-            raise FeatureFrameError("MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE:" + ",".join(health.reason_codes))
         since = decision_time - timedelta(minutes=3)
-        ticks = tuple(tick for tick in self.store.recent_ticks(symbol, since) if tick.exchange_timestamp <= decision_time)
-        orderbook = self.store.latest_orderbook(symbol)
-        orderbooks = tuple(
-            book
-            for book in self.store.recent_orderbooks(symbol, since)
-            if book.exchange_timestamp <= decision_time
+        historical = (
+            explicit_decision_time
+            and decision_time < datetime.now(timezone.utc) - timedelta(seconds=1)
         )
+        ticks = self.store.recent_ticks(
+            symbol,
+            since,
+            until=decision_time if historical else None,
+        )
+        orderbooks = self.store.recent_orderbooks(
+            symbol,
+            since,
+            until=decision_time if historical else None,
+        )
+        orderbook = orderbooks[-1] if orderbooks else None
+        if historical:
+            validation_ticks = ticks
+            validation_orderbook = orderbook
+            if not validation_ticks:
+                prior_ticks = self.store.recent_ticks(
+                    symbol,
+                    decision_time - timedelta(days=1),
+                    until=decision_time,
+                )
+                validation_ticks = prior_ticks[-1:] if prior_ticks else ()
+            if validation_orderbook is None:
+                prior_books = self.store.recent_orderbooks(
+                    symbol,
+                    decision_time - timedelta(days=1),
+                    until=decision_time,
+                )
+                validation_orderbook = prior_books[-1] if prior_books else None
+            self._validate_historical_sources(
+                validation_ticks,
+                validation_orderbook,
+                decision_time,
+                quote_age_ms,
+                orderbook_age_ms,
+            )
+        else:
+            health = evaluate_market_data_health(
+                self.store,
+                symbol,
+                max_quote_age_ms=quote_age_ms,
+                max_orderbook_age_ms=orderbook_age_ms,
+                now=decision_time,
+            )
+            if not health.ok_for_live_buy:
+                raise FeatureFrameError(
+                    "MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE:" + ",".join(health.reason_codes)
+                )
+            orderbook = self.store.latest_orderbook(symbol)
         if orderbook is None:
             raise FeatureFrameError("MISSING_SOURCE_RECORDS")
         if ticks:
@@ -132,7 +170,13 @@ class LiveFeatureFrameBuilder:
         ask_depth = float(orderbook.total_ask_volume)
         depth_ratio = bid_depth / max(1.0, ask_depth)
         technical = _technical_columns(prices, volumes)
+        second_features = _second_level_features(
+            ticks,
+            orderbooks,
+            decision_time,
+        )
         feature_dict = {
+            **second_features,
             "return_30s": _window_return(ticks, decision_time, seconds=30),
             "return_1m": _window_return(ticks, decision_time, seconds=60),
             "return_3m": _safe_return(prices[-1], prices[0]),
@@ -174,6 +218,37 @@ class LiveFeatureFrameBuilder:
         frame.validate()
         self._journal(frame)
         return frame
+
+    @staticmethod
+    def _validate_historical_sources(
+        ticks: tuple,
+        orderbook: object | None,
+        decision_time: datetime,
+        quote_age_ms: int,
+        orderbook_age_ms: int,
+    ) -> None:
+        quote = ticks[-1] if ticks else orderbook
+        reasons: list[str] = []
+        if quote is None:
+            reasons.append("QUOTE_COUNT_ZERO")
+        else:
+            quote_age = (decision_time - quote.received_at).total_seconds() * 1000
+            if quote_age < 0 or quote_age > quote_age_ms:
+                reasons.append("QUOTE_STALE")
+            if quote.source != KIS_REALTIME_SOURCE:
+                reasons.append("QUOTE_SOURCE_NOT_KIS_REALTIME")
+        if orderbook is None:
+            reasons.append("ORDERBOOK_COUNT_ZERO")
+        else:
+            book_age = (decision_time - orderbook.received_at).total_seconds() * 1000
+            if book_age < 0 or book_age > orderbook_age_ms:
+                reasons.append("ORDERBOOK_STALE")
+            if orderbook.source != KIS_REALTIME_SOURCE:
+                reasons.append("ORDERBOOK_SOURCE_NOT_KIS_REALTIME")
+        if reasons:
+            raise FeatureFrameError(
+                "MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE:" + ",".join(reasons)
+            )
 
     def _news_sentiment(self, symbol: str, decision_time: datetime) -> float:
         """Recency-decayed news sentiment as of decision_time (0.0 = no fresh news).
@@ -252,6 +327,77 @@ def _window_return(ticks: tuple, decision_time: datetime, *, seconds: int) -> fl
     if len(visible) < 2:
         return 0.0
     return _safe_return(visible[-1].price, visible[0].price)
+
+
+def _second_level_features(
+    ticks: tuple,
+    orderbooks: tuple,
+    decision_time: datetime,
+) -> dict[str, float]:
+    """Compute entry-timing features from true event timestamps.
+
+    Counts and volume are limited to their exact trailing windows. Values are
+    finite even when the feed is sparse, while ``second_data_ready`` preserves
+    the distinction between a neutral signal and missing microstructure data.
+    """
+    tick_1s = _events_in_window(ticks, decision_time, 1)
+    tick_5s = _events_in_window(ticks, decision_time, 5)
+    tick_10s = _events_in_window(ticks, decision_time, 10)
+    books_5s = _events_in_window(orderbooks, decision_time, 5)
+    returns_10s = _returns([float(tick.price) for tick in tick_10s])
+    buy_volume = sum(
+        max(0.0, float(tick.volume))
+        for tick in tick_5s
+        if str(tick.trade_direction or "").upper() in {"BUY", "B"}
+    )
+    sell_volume = sum(
+        max(0.0, float(tick.volume))
+        for tick in tick_5s
+        if str(tick.trade_direction or "").upper() in {"SELL", "S"}
+    )
+    directed_volume = buy_volume + sell_volume
+    spread_change = 0.0
+    imbalance_change = 0.0
+    if len(books_5s) >= 2:
+        spread_change = (
+            float(books_5s[-1].spread_bps) - float(books_5s[0].spread_bps)
+        ) / 100.0
+        imbalance_change = float(books_5s[-1].imbalance) - float(books_5s[0].imbalance)
+    unique_seconds = {
+        tick.exchange_timestamp.replace(microsecond=0)
+        for tick in tick_10s
+    }
+    return {
+        "return_1s": _event_window_return(tick_1s),
+        "return_5s": _event_window_return(tick_5s),
+        "return_10s": _event_window_return(tick_10s),
+        "tick_count_1s": float(len(tick_1s)),
+        "tick_count_5s": float(len(tick_5s)),
+        "volume_1s_log": math.log1p(sum(max(0.0, float(tick.volume)) for tick in tick_1s)),
+        "volume_5s_log": math.log1p(sum(max(0.0, float(tick.volume)) for tick in tick_5s)),
+        "aggressor_imbalance_5s": (
+            (buy_volume - sell_volume) / directed_volume if directed_volume > 0 else 0.0
+        ),
+        "realized_volatility_10s": _stdev(returns_10s),
+        "spread_change_5s": spread_change,
+        "orderbook_imbalance_change_5s": imbalance_change,
+        "second_data_ready": 1.0 if len(tick_10s) >= 3 and len(unique_seconds) >= 2 and books_5s else 0.0,
+    }
+
+
+def _events_in_window(events: tuple, decision_time: datetime, seconds: int) -> tuple:
+    cutoff = decision_time - timedelta(seconds=seconds)
+    return tuple(
+        event
+        for event in events
+        if cutoff <= event.exchange_timestamp <= decision_time
+    )
+
+
+def _event_window_return(ticks: tuple) -> float:
+    if len(ticks) < 2:
+        return 0.0
+    return _safe_return(float(ticks[-1].price), float(ticks[0].price))
 
 
 def _returns(prices: list[float]) -> list[float]:

@@ -7,13 +7,50 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.refactor_dashboard import build_refactor_dashboard, build_strategy_market_view
+from app.refactor_dashboard import (
+    _second_level_market_series,
+    build_refactor_dashboard,
+    build_strategy_market_stream,
+    build_strategy_market_view,
+)
 from app.web_account_routes import create_account_router
 
 
 def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def test_second_series_uses_real_quote_updates_without_fake_trade_volume() -> None:
+    with sqlite3.connect(":memory:") as connection:
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            create table ticks (
+                exchange_timestamp text, price real, volume integer,
+                trade_direction text
+            );
+            create table books (
+                exchange_timestamp text, best_bid real, best_ask real,
+                spread_bps real, imbalance real
+            );
+            insert into ticks values
+                ('2026-07-28T01:00:00+00:00', 100, 4, 'BUY');
+            insert into books values
+                ('2026-07-28T01:00:00+00:00', 99, 101, 200, 0.1),
+                ('2026-07-28T01:00:01+00:00', 100, 102, 198, 0.2);
+            """
+        )
+        ticks = connection.execute("select * from ticks").fetchall()
+        books = connection.execute("select * from books").fetchall()
+
+    bars, micro = _second_level_market_series(ticks, books)
+
+    assert [bar["bar_source"] for bar in bars] == ["trade", "quote_mid"]
+    assert bars[1]["close"] == 101
+    assert bars[1]["volume"] == 0
+    assert micro["trade_bar_count"] == 1
+    assert micro["quote_bar_count"] == 1
 
 
 def test_refactor_dashboard_is_fail_closed_and_surfaces_evidence(tmp_path: Path) -> None:
@@ -120,6 +157,7 @@ def test_refactor_dashboard_reads_strategy_ownership_without_mutation(tmp_path: 
 
 def test_account_page_and_refactor_api_expose_new_console() -> None:
     app = FastAPI()
+    observed_symbols: list[str] = []
     app.include_router(
         create_account_router(
             refactor_provider=lambda: {
@@ -130,6 +168,12 @@ def test_account_page_and_refactor_api_expose_new_console() -> None:
                 "symbol": symbol or "005930",
                 "limit": limit,
             },
+            market_stream_provider=lambda symbol, limit: {
+                "symbol": symbol,
+                "limit": limit,
+                "stream": True,
+            },
+            market_stream_observer=observed_symbols.append,
         )
     )
     client = TestClient(app)
@@ -150,6 +194,10 @@ def test_account_page_and_refactor_api_expose_new_console() -> None:
     market = client.get("/api/refactor/market-view?symbol=005930&limit=90")
     assert market.status_code == 200
     assert market.json() == {"symbol": "005930", "limit": 90}
+    stream = client.get("/api/refactor/market-stream?symbol=005930&limit=30")
+    assert stream.status_code == 200
+    assert stream.json() == {"symbol": "005930", "limit": 30, "stream": True}
+    assert observed_symbols == ["005930"]
 
 
 def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Path) -> None:
@@ -189,9 +237,10 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
                 price real, volume real, trade_direction text, latency_ms real
             );
             create table realtime_orderbook (
-                symbol text, exchange_timestamp text, best_bid real, best_ask real,
+                symbol text, exchange_timestamp text, received_at text, source text,
+                best_bid real, best_ask real,
                 spread_bps real, total_bid_volume real, total_ask_volume real,
-                imbalance real, latency_ms real
+                imbalance real, latency_ms real, levels_json text
             );
             insert into realtime_minute_bars values (
                 '005930', '2026-07-27T00:00:00+00:00',
@@ -203,7 +252,9 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
             );
             insert into realtime_orderbook values (
                 '005930', '2026-07-27T00:00:30+00:00',
-                101, 102, 2, 100, 80, 0.1, 3
+                '2026-07-27T00:00:31+00:00', 'kis_realtime_websocket',
+                101, 102, 2, 100, 80, 0.1, 3,
+                '[{"bid_price":101,"bid_size":100,"ask_price":102,"ask_size":80}]'
             );
             """
         )
@@ -252,11 +303,39 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
     assert result["symbol"] == "005930"
     assert result["market"]["bars"][0]["close"] == 102
     assert result["market"]["latest_orderbook"]["best_bid"] == 101
+    assert result["market"]["latest_orderbook"]["levels"][0]["ask_size"] == 80
+    assert result["market"]["latest_orderbook"]["stale"] is True
+    assert result["market"]["second_bars"][0]["close"] == 102
+    assert result["market"]["second_bars"][0]["vwap"] == 102
     assert len(result["execution"]["stages"]) == 6
     assert result["selection"]["strategy_id"] == "intraday_momentum"
     assert result["algorithm"]["visual_indicators"] == ["MA5", "MA20", "VWAP", "Volume"]
+    trace = result["decision_ontology"]
+    assert trace["provenance"]["decision"] == "logs/refactor-shadow-comparison.jsonl"
+    assert {source["id"] for source in trace["sources"]} >= {
+        "minute_bars",
+        "orderbook",
+        "event_feed",
+    }
+    assert {indicator["id"] for indicator in trace["indicators"]} >= {
+        "return",
+        "volume",
+        "vwap_deviation",
+    }
+    assert len(trace["algorithms"]) == 7
+    assert next(
+        algorithm
+        for algorithm in trace["algorithms"]
+        if algorithm["id"] == "intraday_momentum"
+    )["final_selected"] is True
+    assert trace["final_decision"]["action"] == "BUY"
     assert result["execution"]["stages"][2]["status"] == "complete"
     assert result["live_order_capable"] is False
+
+    stream = build_strategy_market_stream("005930", root=tmp_path)
+    assert stream["symbol"] == "005930"
+    assert stream["market"]["second_bars"][0]["close"] == 102
+    assert stream["market"]["microstructure"]["tick_count_1s"] == 1
 
 
 def test_market_view_keeps_ontology_admissible_when_gnn_says_no_trade(tmp_path: Path) -> None:
@@ -315,6 +394,19 @@ def test_market_view_keeps_ontology_admissible_when_gnn_says_no_trade(tmp_path: 
     assert result["selection"]["ontology_action"] == "ADMISSIBLE"
     assert result["selection"]["ontology_strategy_id"] == "intraday_momentum"
     assert result["algorithm"]["strategy_id"] == "intraday_momentum"
+    trace = result["decision_ontology"]
+    assert trace["ontology_selection"] == {
+        "strategy_id": "intraday_momentum",
+        "allowed": True,
+        "action": "ADMISSIBLE",
+    }
+    assert trace["final_decision"]["action"] == "NO_TRADE"
+    assert trace["final_decision"]["reason_codes"] == ["NON_POSITIVE_NET_EDGE"]
+    assert next(
+        algorithm
+        for algorithm in trace["algorithms"]
+        if algorithm["id"] == "intraday_momentum"
+    )["ontology_selected"] is True
     candidate = result["candidates"][0]
     assert candidate["ontology_allowed"] is True
     assert candidate["action"] == "ADMISSIBLE"

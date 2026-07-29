@@ -17,8 +17,16 @@ def main() -> None:
         default=Path("data/models/strategy_utility/rgcn_shadow.npz"),
     )
     args = parser.parse_args()
-    labels = build_labels(load_minute_bars(args.database), EvaluationConfig())
-    report = train_counterfactual_checkpoint(labels, args.output)
+    labels = build_labels(
+        load_minute_bars(args.database),
+        EvaluationConfig(feature_schema_name="realtime_microstructure_v1"),
+    )
+    report = train_counterfactual_checkpoint(
+        labels,
+        args.output,
+        input_feature_schema="realtime_microstructure_v1",
+        authorize_live_shadow=True,
+    )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 

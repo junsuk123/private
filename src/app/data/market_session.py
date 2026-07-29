@@ -126,6 +126,35 @@ def is_market_fully_closed(group: str, now_utc: datetime | None = None) -> bool:
     return market_phase(group, now_utc) is MarketPhase.CLOSED
 
 
+def streaming_phase(
+    group: str,
+    now_utc: datetime | None = None,
+    *,
+    include_nxt: bool = True,
+) -> MarketPhase:
+    """Phase for DATA STREAMING, which is wider than the order-gating phase.
+
+    NXT (넥스트레이드, the domestic ATS) quotes and trades 08:00-20:00 KST, so
+    the 통합 (KRX+NXT) realtime feed delivers ticks well outside the KRX
+    09:00-15:30 window. Order gating deliberately does NOT use this: routing an
+    order to KRX at 19:00 would simply be rejected, and NXT order routing is a
+    separate capability.
+    """
+    normalized = _normalize_group(group)
+    current = _as_utc(now_utc)
+    if normalized != "KRX" or not include_nxt:
+        return market_phase(group, current)
+    local = current.astimezone(_SEOUL)
+    if local.weekday() >= 5:
+        return MarketPhase.CLOSED
+    return _phase_from_windows(
+        local.time(),
+        regular=(time(9, 0), time(15, 30)),
+        pre=(time(8, 0), time(9, 0)),
+        after=(time(15, 30), time(20, 0)),
+    )
+
+
 def market_has_live_session(group: str, now_utc: datetime | None = None) -> bool:
     """True when the group is in any tradeable/quotable session (pre/regular/after)."""
     return not is_market_fully_closed(group, now_utc)

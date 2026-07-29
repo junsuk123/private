@@ -328,6 +328,46 @@ class MockKisApiTest(unittest.TestCase):
         token_calls = [call for call in transport.calls if call["url"].endswith("/oauth2/tokenP")]
         self.assertEqual(len(token_calls), 1)
 
+    def test_server_rejected_token_is_force_refreshed_and_get_is_retried(self) -> None:
+        from app.execution.kis_real import KisApiError
+
+        class RejectedTokenTransport:
+            def __init__(self) -> None:
+                self.calls = []
+                self.probe_calls = 0
+
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                self.calls.append((method, url, dict(headers)))
+                if url.endswith("/oauth2/tokenP"):
+                    return {"access_token": "fresh-token", "expires_in": 86400}
+                self.probe_calls += 1
+                if self.probe_calls == 1:
+                    raise KisApiError(
+                        "KIS HTTP 500: 기간이 만료된 token 입니다.",
+                        {"rt_cd": "1", "msg1": "기간이 만료된 token 입니다."},
+                    )
+                return {"rt_cd": "0", "output": {"ok": "Y"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = RejectedTokenTransport()
+            client = KisDevelopersApiClient(
+                app_key="live-app",
+                app_secret="live-secret",
+                account_no="12345678-01",
+                enabled=True,
+                transport=transport,
+                access_token="server-rejected-token",
+                token_cache_path=Path(tmp) / "kis_access_token.live.json",
+            )
+
+            result = client._get("/probe", "TEST0001", {})
+
+        self.assertEqual(result["rt_cd"], "0")
+        self.assertEqual(transport.probe_calls, 2)
+        token_calls = [call for call in transport.calls if call[1].endswith("/oauth2/tokenP")]
+        self.assertEqual(len(token_calls), 1)
+        self.assertEqual(transport.calls[-1][2]["authorization"], "Bearer fresh-token")
+
     def test_kis_live_access_token_env_is_reused_without_issuance(self) -> None:
         transport = RecordingKisTransport()
         with tempfile.TemporaryDirectory() as tmp:
@@ -499,7 +539,8 @@ class MockKisApiTest(unittest.TestCase):
         portfolio = broker.get_portfolio()
 
         self.assertEqual(portfolio.account.cash_by_currency["KRW"], 2401)
-        self.assertEqual(portfolio.account.cash_by_currency["USD"], 0.49)
+        self.assertEqual(portfolio.account.cash_by_currency["USD"], 3.22)
+        self.assertEqual(portfolio.account.orderable_cash_by_currency["USD"], 0.49)
         self.assertEqual(portfolio.account.equity, 9974)
         psamount_call = next(call for call in transport.calls if call["url"].endswith("/inquire-psamount"))
         self.assertEqual(psamount_call["params"]["OVRS_ORD_UNPR"], "1")

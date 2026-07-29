@@ -25,6 +25,51 @@ class LiveFeatureFrameTest(unittest.TestCase):
         self.assertEqual(frame.feature_schema_hash, LIVE_SHORT_HORIZON_SCHEMA.schema_hash)
         self.assertEqual(len(frame.values), len(LIVE_SHORT_HORIZON_SCHEMA.feature_names))
         self.assertGreater(len(frame.provenance.source_record_ids), 0)
+        values = frame.as_feature_dict()
+        self.assertIn("return_1s", values)
+        self.assertIn("aggressor_imbalance_5s", values)
+        self.assertEqual(values["second_data_ready"], 0.0)
+
+    def test_feature_frame_computes_true_second_level_microstructure(self) -> None:
+        now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            ticks = tuple(
+                RealtimeTradeTick(
+                    symbol="005930",
+                    exchange_timestamp=now - timedelta(seconds=4 - index),
+                    received_at=now - timedelta(seconds=4 - index),
+                    source=KIS_REALTIME_SOURCE,
+                    price=70000 + index * 10,
+                    volume=100 + index,
+                    trade_direction="BUY" if index >= 2 else "SELL",
+                    sequence_key=f"tick:{index}",
+                )
+                for index in range(5)
+            )
+            books = tuple(
+                RealtimeOrderbookSnapshot(
+                    symbol="005930",
+                    exchange_timestamp=now - timedelta(seconds=4 - index),
+                    received_at=now - timedelta(seconds=4 - index),
+                    source=KIS_REALTIME_SOURCE,
+                    levels=(OrderbookLevel(70000 + index * 10, 1000 + index * 20, 70020 + index * 10, 900),),
+                    sequence_key=f"book:{index}",
+                )
+                for index in range(5)
+            )
+            store.save_ticks(ticks)
+            store.save_orderbooks(books)
+            frame = LiveFeatureFrameBuilder(
+                store,
+                journal_path=Path(tmp) / "features.jsonl",
+            ).build("005930", decision_time=now)
+
+        values = frame.as_feature_dict()
+        self.assertEqual(values["second_data_ready"], 1.0)
+        self.assertEqual(values["tick_count_5s"], 5.0)
+        self.assertGreater(values["return_5s"], 0.0)
+        self.assertGreater(values["aggressor_imbalance_5s"], 0.0)
 
     def test_feature_frame_can_use_kis_orderbook_when_trade_ticks_are_sparse(self) -> None:
         now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)

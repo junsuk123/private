@@ -148,4 +148,5 @@ def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapsho
         data_fresh=features.fresh,
         tradable=features.fresh and not features.sequence_uncertain,
         allowed_strategy_ids=STRATEGY_IDS,
+        feature_schema_name="realtime_microstructure_v1",
     )

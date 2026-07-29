@@ -6,16 +6,83 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.pipeline import build_analysis_context
 from app.research import ResearchService
-from app.schemas.domain import RawSourceRecord, RealtimeExecution, RealtimeQuote, SourceMetadata
+from app.schemas.domain import (
+    MacroMetricRecord,
+    RawSourceRecord,
+    RealtimeExecution,
+    RealtimeQuote,
+    SourceMetadata,
+)
 from app.storage import LocalResearchStore
 
 
 class StorageTest(unittest.TestCase):
+    def test_low_frequency_macro_metric_uses_long_retention_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalResearchStore(Path(tmp), retention_days=7)
+            observed_at = datetime.now(timezone.utc) - timedelta(days=90)
+            metric = MacroMetricRecord(
+                name="monthly_cpi",
+                value=123.4,
+                observed_at=observed_at,
+                source=SourceMetadata(
+                    source_name="fred_public_csv",
+                    retrieved_at=datetime.now(timezone.utc),
+                    raw_url="https://fred.example/cpi.csv",
+                    source_id="fred:CPI",
+                ),
+            )
+
+            saved = store.save_research_result(
+                SimpleNamespace(
+                    events=(),
+                    raw_records=(),
+                    market_snapshots=(),
+                    macro_metrics=(metric,),
+                )
+            )
+
+            self.assertEqual(saved["macro_metrics"], 1)
+            self.assertEqual(store.summary()["macro_metrics"], 1)
+
+    def test_live_analysis_loader_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalResearchStore(Path(tmp))
+            now = datetime.now(timezone.utc)
+            records = tuple(
+                RawSourceRecord(
+                    source=SourceMetadata(
+                        source_name="unit",
+                        retrieved_at=now + timedelta(seconds=index),
+                        raw_url=f"https://example.test/{index}",
+                        source_id=f"raw:{index}",
+                    ),
+                    content_type="text/plain",
+                    payload=str(index),
+                )
+                for index in range(8)
+            )
+            store.save_research_result(
+                SimpleNamespace(
+                    events=(),
+                    raw_records=records,
+                    market_snapshots=(),
+                    macro_metrics=(),
+                )
+            )
+
+            with patch.dict("os.environ", {"LIVE_RESEARCH_RAW_LIMIT": "3"}):
+                loaded = store.load_live_analysis_inputs()
+
+            self.assertEqual(len(loaded.raw_records), 3)
+            self.assertEqual(loaded.raw_records[0].payload, "7")
+
     def test_store_saves_and_loads_research_for_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LocalResearchStore(Path(tmp))

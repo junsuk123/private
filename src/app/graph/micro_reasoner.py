@@ -26,6 +26,7 @@ from app.graph.macro_micro_common import (
     MICRO_EXPECTED_NET_RETURN_MISSING,
     MICRO_MEAN_REVERSION_CANDIDATE,
     MICRO_MOMENTUM_CONFIRMED,
+    MICRO_NEGATIVE_EVENT_RISK,
     MICRO_SIGNAL_UNAVAILABLE,
     MICRO_STRATEGY_BLOCKED_BY_MACRO,
     MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
@@ -77,6 +78,7 @@ class MicroReasonerConfig:
     block_if_low_liquidity: bool = True
     low_liquidity_score: float = 0.35
     max_quote_age_seconds: float = 90.0
+    negative_event_block_threshold: float = 0.85
 
     @classmethod
     def from_env(cls) -> "MicroReasonerConfig":
@@ -90,6 +92,10 @@ class MicroReasonerConfig:
         return cls(
             minimum_micro_confidence=_f("MICRO_MIN_CONFIDENCE", cls.minimum_micro_confidence),
             minimum_expected_net_return_bps=_f("MICRO_MIN_NET_BPS", cls.minimum_expected_net_return_bps),
+            negative_event_block_threshold=_f(
+                "MICRO_NEGATIVE_EVENT_BLOCK_THRESHOLD",
+                cls.negative_event_block_threshold,
+            ),
         )
 
 
@@ -112,6 +118,7 @@ class MicroReasoningInput:
     all_in_cost_bps: float | None = None
     quote_age_seconds: float | None = None
     source_freshness: Mapping[str, Any] = field(default_factory=dict)
+    event_evidence: tuple[Mapping[str, Any], ...] = ()
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -241,6 +248,40 @@ class MicroSymbolReasoner:
                                 EntrySignal.NONE, exit_signal, ExecutionQuality.ACCEPTABLE,
                                 reasons=reasons, paths=paths, confidence=0.6,
                                 expected_exit_price=(features.vwap if features.vwap else features.price))
+
+        # A recent, high-confidence adverse event is operational ontology
+        # evidence.  It may veto a new entry but never creates a BUY by itself.
+        negative_event_severity = max(
+            (
+                float(item.get("severity", 0.0) or 0.0)
+                for item in data.event_evidence
+                if str(item.get("sentiment") or "").upper() == "NEGATIVE"
+            ),
+            default=0.0,
+        )
+        if not data.is_holding and negative_event_severity >= cfg.negative_event_block_threshold:
+            reasons.append(MICRO_NEGATIVE_EVENT_RISK)
+            paths.append(
+                explanation(
+                    MICRO_NEGATIVE_EVENT_RISK,
+                    "Recent high-confidence adverse event blocks a new entry.",
+                    {
+                        "severity": negative_event_severity,
+                        "threshold": cfg.negative_event_block_threshold,
+                    },
+                )
+            )
+            return self._result(
+                data,
+                MicroRegime.NO_TRADE_SYMBOL,
+                SelectedStrategy.HOLD,
+                EntrySignal.BLOCKED,
+                ExitSignal.NONE,
+                ExecutionQuality.BLOCKED,
+                reasons=reasons,
+                paths=paths,
+                confidence=0.0,
+            )
 
         # --- Freshness gate (stale -> BLOCKED/HOLD, never BUY). ---
         age = data.quote_age_seconds
@@ -373,7 +414,10 @@ class MicroSymbolReasoner:
             execution_quality=exec_quality,
             reason_codes=tuple(dict.fromkeys(reasons)),
             explanation_paths=tuple(paths),
-            diagnostics={"macro_result_ref": data.macro_result_ref},
+            diagnostics={
+                "macro_result_ref": data.macro_result_ref,
+                "event_evidence_count": len(data.event_evidence),
+            },
         )
 
 

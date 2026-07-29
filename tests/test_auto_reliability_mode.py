@@ -98,6 +98,103 @@ def test_model_reliability_uses_active_champion_not_rejected_challenger() -> Non
     assert result["latest_challenger"]["live_eligible"] is False
 
 
+def test_successful_unchanged_training_heartbeat_keeps_incumbent_fresh() -> None:
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        active = {
+            "artifact_id": "active-champion",
+            "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+            "live_eligible": True,
+            "metrics": {"auc": 0.72, "precision_at_k": 0.43},
+            "reason_codes": [],
+        }
+        challenger = {
+            **active,
+            "artifact_id": "unchanged-dataset-challenger",
+            "live_eligible": False,
+        }
+        (root / "latest.json").write_text(json.dumps(active), encoding="utf-8")
+        challenger_path = root / "live_short_horizon.old.json"
+        challenger_path.write_text(json.dumps(challenger), encoding="utf-8")
+        old_timestamp = now.timestamp() - 3_600
+        challenger_path.touch()
+        import os
+
+        os.utime(challenger_path, (old_timestamp, old_timestamp))
+        with web_module._live_lock:
+            previous = dict(web_module._live_training_heartbeat)
+            web_module._live_training_heartbeat.update(
+                {
+                    "finished_at": now.isoformat(),
+                    "ok": True,
+                    "skipped": True,
+                }
+            )
+        try:
+            with (
+                patch.object(web_module, "Path", return_value=root),
+                patch.dict(
+                    "os.environ",
+                    {"AUTO_RELIABILITY_MODEL_MAX_AGE_SECONDS": "1800"},
+                ),
+            ):
+                result = web_module._latest_model_reliability(now)
+        finally:
+            with web_module._live_lock:
+                web_module._live_training_heartbeat.clear()
+                web_module._live_training_heartbeat.update(previous)
+
+    assert result["ok"] is True
+    assert result["training_heartbeat_ok"] is True
+    assert result["training_age_seconds"] < 1
+
+
+def test_recent_running_training_cycle_is_a_healthy_heartbeat() -> None:
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        artifact = {
+            "artifact_id": "active-champion",
+            "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+            "live_eligible": True,
+            "metrics": {"auc": 0.72, "precision_at_k": 0.43},
+            "reason_codes": [],
+        }
+        (root / "latest.json").write_text(json.dumps(artifact), encoding="utf-8")
+        (root / "live_short_horizon.running.json").write_text(
+            json.dumps(artifact),
+            encoding="utf-8",
+        )
+        with web_module._live_lock:
+            previous = dict(web_module._live_training_heartbeat)
+            web_module._live_training_heartbeat.update(
+                {
+                    "started_at": now.isoformat(),
+                    "finished_at": None,
+                    "ok": False,
+                    "error": None,
+                }
+            )
+        try:
+            with (
+                patch.object(web_module, "Path", return_value=root),
+                patch.dict(
+                    "os.environ",
+                    {"LIVE_TRAINING_RUNNING_HEARTBEAT_MAX_SECONDS": "900"},
+                ),
+            ):
+                result = web_module._latest_model_reliability(now)
+        finally:
+            with web_module._live_lock:
+                web_module._live_training_heartbeat.clear()
+                web_module._live_training_heartbeat.update(previous)
+
+    assert result["training_heartbeat_ok"] is True
+    assert result["training_in_progress"] is True
+    assert result["training_heartbeat_at"] == now.isoformat()
+
+
 def test_reliability_step_promotes_only_after_sustained_passes() -> None:
     now = datetime.now(timezone.utc)
     with web_module._live_lock:

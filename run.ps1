@@ -1,3 +1,7 @@
+param(
+  [switch]$Headless
+)
+
 $ErrorActionPreference = "Stop"
 
 function Set-DefaultEnv($Name, $Value) {
@@ -175,10 +179,10 @@ Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "1.25"
 # NOTE: research's top caveat — small-account day trading is structurally negative-
 # expectancy (round-trip cost amplifies losses); this discipline MINIMIZES losses, it
 # does not guarantee profit. Tune from realized PnL.
-Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "false"
-Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.03"
-Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "true"
-Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "true"
+Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
+Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.02"
+Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "false"
+Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "false"
 Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
 Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.05"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_LIMIT_KRW" "1500"
@@ -186,8 +190,8 @@ Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW" "1000"
 Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE" "0.004"
 Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.014"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
-Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.0"
-Set-DefaultEnv "REALTIME_ENABLE_ROUTINE_LOSS_SELL" "false"
+Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.008"
+Set-DefaultEnv "REALTIME_ENABLE_ROUTINE_LOSS_SELL" "true"
 Set-DefaultEnv "REALTIME_TAKE_PROFIT_AMOUNT_KRW" "0"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
 Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
@@ -228,8 +232,8 @@ Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_MAX_BONUS" "0.18"
 Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_ENABLED" "true"
 Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_MARGIN" "0.18"
 Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_WEIGHT" "0.003"
-Set-RunEnv "REALTIME_BUY_ENABLED" "false"
-Set-RunEnv "LIVE_TERMINATION_SELL_ONLY_ON_START" "true"
+Set-RunEnv "REALTIME_BUY_ENABLED" "true"
+Set-RunEnv "LIVE_TERMINATION_SELL_ONLY_ON_START" "false"
 Set-DefaultEnv "REALTIME_IGNORE_SYMBOLS" "LCFYW"
 Set-DefaultEnv "REALTIME_MODEL_AUXILIARY_ONLY" "true"
 Set-DefaultEnv "REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY" "false"
@@ -300,12 +304,13 @@ if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_CLASSIFIER_ENABLED", "
 }
 Set-DefaultEnv "LIVE_REFRESH_SECONDS" "15"
 Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "60"
-Set-DefaultEnv "AUTO_START_LIVE_WORKER" "false"
+Set-DefaultEnv "LIVE_RESEARCH_COLLECTION_INTERVAL_SECONDS" "180"
+Set-DefaultEnv "AUTO_START_LIVE_WORKER" "true"
 Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
 Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "60"
-Set-DefaultEnv "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED" "false"
+Set-DefaultEnv "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED" "true"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"
@@ -313,7 +318,7 @@ Set-DefaultEnv "ONTOLOGY_FILTER1_TARGET_COUNT" "80"
 Set-DefaultEnv "SIM_STRATEGY_CANDIDATES" "160"
 Set-DefaultEnv "SIM_STREAMING_UNIVERSE_LIMIT" "160"
 Set-DefaultEnv "LLM_EVENT_MAX_ITEMS_PER_SOURCE" "1"
-Set-DefaultEnv "LLM_EVENT_MAX_ITEMS_PER_RUN" "1"
+Set-DefaultEnv "LLM_EVENT_MAX_ITEMS_PER_RUN" "3"
 Set-DefaultEnv "LLM_EVENT_KNOWN_TICKER_PROMPT_LIMIT" "80"
 Set-DefaultEnv "LLM_EVENT_RESPONSE_MAX_TOKENS" "180"
 Set-DefaultEnv "LLM_EVENT_TIMEOUT_SECONDS" "12"
@@ -369,8 +374,10 @@ try {
   Write-Host "Account dashboard: $launchUrl"
   Write-Host "Server logs: $serverOutLog"
 
-  $browserExe = Find-BrowserExecutable
-  if ($browserExe) {
+  $browserExe = if ($Headless) { $null } else { Find-BrowserExecutable }
+  if ($Headless) {
+    Write-Host "Headless mode: server will keep running without a managed browser."
+  } elseif ($browserExe) {
     $browserProfile = Join-Path $PSScriptRoot "data\runtime\managed-browser-profile"
     New-Item -ItemType Directory -Force -Path $browserProfile | Out-Null
     $browserStartedAt = Get-Date

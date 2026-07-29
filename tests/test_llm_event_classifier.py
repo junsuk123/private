@@ -37,6 +37,45 @@ class FakeLLMClient:
 
 
 class LLMEventClassifierTest(unittest.TestCase):
+    def test_keyword_semantic_labels_remain_when_llm_omits_labels(self) -> None:
+        event = classify_text_event(
+            title="NVDA wins supply contract",
+            body="NVIDIA signed a material supply deal.",
+            source=source_now("unit", "local://llm", "llm:labels"),
+            known_tickers={"NVDA": "NVIDIA"},
+            llm_classifier=JsonEventLLMClassifier(
+                FakeLLMClient(
+                    {
+                        "sentiment": "POSITIVE",
+                        "summary": "NVIDIA signed a supply deal.",
+                        "key_facts": [],
+                        "event_labels": [],
+                        "companies": ["NVIDIA"],
+                        "tickers": ["NVDA"],
+                        "sectors": ["Semiconductor"],
+                        "confidence": 0.8,
+                    }
+                )
+            ),
+        )
+
+        self.assertIn("supply_contract", event.event_labels)
+
+    def test_ambiguous_short_words_do_not_become_tickers(self) -> None:
+        event = classify_text_event(
+            title="Market talk: investors expect AI spending to be strong",
+            body="A broad market discussion is on TV.",
+            source=source_now("unit", "local://ticker-filter", "ticker-filter:1"),
+            known_tickers={
+                "AI": "C3.ai",
+                "TV": "Grupo Televisa",
+                "NVDA": "NVIDIA",
+            },
+        )
+
+        self.assertNotIn("AI", event.tickers)
+        self.assertNotIn("TV", event.tickers)
+
     def test_llm_classification_overrides_keyword_fallback_and_extracts_facts(self) -> None:
         classifier = JsonEventLLMClassifier(
             FakeLLMClient(
@@ -129,7 +168,9 @@ class LLMEventClassifierTest(unittest.TestCase):
             store.save_research_result(Result())
             loaded = store.load().events[0]
 
-        self.assertEqual(loaded.event_labels, ("AnalystUpgrade", "TargetPriceRaised"))
+        self.assertIn("analyst_report", loaded.event_labels)
+        self.assertIn("AnalystUpgrade", loaded.event_labels)
+        self.assertIn("TargetPriceRaised", loaded.event_labels)
         self.assertEqual(loaded.key_facts, ("Target price raised",))
         self.assertEqual(loaded.classification_model, "fake-mini-llm")
 

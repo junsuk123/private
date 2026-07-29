@@ -420,7 +420,13 @@ class RealtimeMarketDataStore:
             ).fetchall()
         return tuple(str(row[0]) for row in rows if row and row[0])
 
-    def recent_ticks(self, symbol: str, since: datetime) -> tuple[RealtimeTradeTick, ...]:
+    def recent_ticks(
+        self,
+        symbol: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> tuple[RealtimeTradeTick, ...]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -428,9 +434,18 @@ class RealtimeMarketDataStore:
                        trade_direction, sequence_key, raw_checksum, latency_ms
                 from realtime_ticks
                 where symbol = ? and exchange_timestamp >= ?
-                order by exchange_timestamp asc
+                  and (? is null or exchange_timestamp <= ?)
+                  and (? is null or received_at <= ?)
+                order by exchange_timestamp asc, received_at asc
                 """,
-                (symbol, since.isoformat()),
+                (
+                    symbol,
+                    since.isoformat(),
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                ),
             ).fetchall()
         return tuple(
             RealtimeTradeTick(
@@ -448,7 +463,13 @@ class RealtimeMarketDataStore:
             for row in rows
         )
 
-    def recent_orderbooks(self, symbol: str, since: datetime) -> tuple[RealtimeOrderbookSnapshot, ...]:
+    def recent_orderbooks(
+        self,
+        symbol: str,
+        since: datetime,
+        *,
+        until: datetime | None = None,
+    ) -> tuple[RealtimeOrderbookSnapshot, ...]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -456,9 +477,18 @@ class RealtimeMarketDataStore:
                        sequence_key, raw_checksum, latency_ms
                 from realtime_orderbook
                 where symbol = ? and exchange_timestamp >= ?
-                order by exchange_timestamp asc
+                  and (? is null or exchange_timestamp <= ?)
+                  and (? is null or received_at <= ?)
+                order by exchange_timestamp asc, received_at asc
                 """,
-                (symbol, since.isoformat()),
+                (
+                    symbol,
+                    since.isoformat(),
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                    until.isoformat() if until is not None else None,
+                ),
             ).fetchall()
         from app.data.realtime_types import OrderbookLevel
 

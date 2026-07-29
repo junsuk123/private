@@ -9,6 +9,7 @@ from app.graph.macro_micro_common import (
     ExecutionQuality,
     ExitSignal,
     MicroRegime,
+    MICRO_NEGATIVE_EVENT_RISK,
     MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
 )
 from app.graph.micro_reasoner import MicroReasonerConfig, MicroReasoningInput, MicroSymbolReasoner
@@ -87,6 +88,27 @@ class TestExpectedNetReturnRequired:
 
 
 class TestFreshnessAndExit:
+    def test_recent_high_confidence_negative_event_blocks_new_entry(self):
+        data = _inp()
+        data = MicroReasoningInput(
+            **{
+                **data.__dict__,
+                "event_evidence": (
+                    {
+                        "sentiment": "NEGATIVE",
+                        "severity": 0.95,
+                        "event_id": "event-risk-1",
+                    },
+                ),
+            }
+        )
+
+        r = _reasoner().reason(data)
+
+        assert r.entry_signal == EntrySignal.BLOCKED
+        assert MICRO_NEGATIVE_EVENT_RISK in r.reason_codes
+        assert r.diagnostics["event_evidence_count"] == 1
+
     def test_stale_quote_blocks(self):
         r = _reasoner().reason(_inp(quote_age=200.0))
         assert r.entry_signal == EntrySignal.BLOCKED

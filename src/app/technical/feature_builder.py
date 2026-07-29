@@ -210,4 +210,19 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         liquidity_score=g("liquidity_score"),
         spread_bps=g("spread_bps"),
         orderbook_imbalance=g("orderbook_imbalance"),
+        # Sub-second window. The live frame has always computed these; without
+        # this mapping they never reached a strategy, so every "algorithm" was
+        # effectively minute-bar only.
+        return_1s=g("return_1s"),
+        return_5s=g("return_5s"),
+        return_10s=g("return_10s"),
+        tick_count_1s=g("tick_count_1s"),
+        tick_count_5s=g("tick_count_5s"),
+        volume_1s_log=g("volume_1s_log"),
+        volume_5s_log=g("volume_5s_log"),
+        aggressor_imbalance_5s=g("aggressor_imbalance_5s"),
+        realized_volatility_10s=g("realized_volatility_10s"),
+        spread_change_5s=g("spread_change_5s"),
+        orderbook_imbalance_change_5s=g("orderbook_imbalance_change_5s"),
+        second_data_ready=g("second_data_ready"),
     )

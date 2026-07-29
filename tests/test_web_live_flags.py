@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -19,6 +20,42 @@ from app.web import LIVE_FLAG_VALUES, app
 
 
 class WebLiveFlagsTest(unittest.TestCase):
+    def test_live_flags_enable_validated_model_inference(self) -> None:
+        self.assertEqual(
+            LIVE_FLAG_VALUES["LIVE_SIGNAL_MODEL_INFERENCE_ENABLED"],
+            "true",
+        )
+
+    def test_market_view_follows_authoritative_owned_symbol(self) -> None:
+        engine = SimpleNamespace(
+            get_status=lambda: {
+                "strategy_session": {
+                    "phase": "OWNED",
+                    "selected_symbol": "NVDA",
+                    "selected_strategy": "intraday_momentum",
+                    "last_reason": "POSITION_OWNED_MONITORING",
+                }
+            }
+        )
+        with (
+            patch("app.web._realtime_trading_engine", engine),
+            patch(
+                "app.web.build_strategy_market_view",
+                return_value={
+                    "symbol": "NVDA",
+                    "selection": {},
+                    "algorithm": None,
+                },
+            ) as build_view,
+            patch("app.refactor_dashboard._algorithm", return_value={"strategy_id": "intraday_momentum"}),
+        ):
+            payload = web_module._strategy_market_view_with_live_session("005930", 30)
+
+        build_view.assert_called_once_with("NVDA", limit=30)
+        self.assertEqual(payload["symbol"], "NVDA")
+        self.assertEqual(payload["selection"]["strategy_id"], "intraday_momentum")
+        self.assertTrue(payload["selection"]["ontology_allowed"])
+
     def test_apply_live_flags_requires_confirmation(self) -> None:
         client = TestClient(app)
 

@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1640 1835" font-family="Segoe UI, Noto Sans KR, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,3 L0,6 Z" fill="#475569"/></marker>
+    <marker id="arrowlite" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L9,3 L0,6 Z" fill="#94a3b8"/></marker>
+    <style>
+    .bg{fill:#f8fafc}
+    .title{fill:#0f172a;font-size:30px;font-weight:800}
+    .subtitle{fill:#475569;font-size:15px}
+    .band{fill:#f1f5f9;stroke:#cbd5e1}
+    .lane{fill:#94a3b8;font-size:13px;font-weight:800;letter-spacing:.06em}
+    .h{fill:#0f172a;font-size:17px;font-weight:800}
+    .t{fill:#334155;font-size:13px}
+    .m{fill:#64748b;font-size:12px;font-style:italic}
+    .note{fill:#7f1d1d;font-size:12.5px;font-weight:700}
+    .flow{stroke:#475569;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+    .dash{stroke:#94a3b8;stroke-width:2;fill:none;stroke-dasharray:7 6;marker-end:url(#arrowlite)}
+    .badge{fill:#fff;font-size:12.5px;font-weight:800;text-anchor:middle}
+    .foot{fill:#475569;font-size:13px}
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1640" height="1835"/>
+  <text class="title" x="52" y="52">Data → process → decision map</text>
+  <text class="subtitle" x="52" y="79">Which input reaches which processing stage, and which decision it is actually allowed to influence.</text>
+
+  <rect class="band" x="38" y="110" width="1564" height="190" rx="18"/>
+  <text class="lane" x="62" y="136">1 · SOURCES</text>
+  <rect x="62" y="150" width="280" height="132" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <circle cx="88" cy="176" r="13" fill="#10b981"/><text class="badge" x="88" y="181">1</text>
+  <text class="h" x="110" y="182">KIS realtime WebSocket</text>
+  <text class="t" x="82" y="205">Domestic trade ticks</text>
+  <text class="t" x="82" y="224">Orderbook levels</text>
+  <text class="t" x="82" y="243">Session / market phase</text>
+  <text class="m" x="82" y="270">data.kis_realtime</text>
+  <rect x="370" y="150" width="280" height="132" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <circle cx="396" cy="176" r="13" fill="#10b981"/><text class="badge" x="396" y="181">2</text>
+  <text class="h" x="418" y="182">KIS REST</text>
+  <text class="t" x="390" y="205">Account, cash, holdings</text>
+  <text class="t" x="390" y="224">Order status and fills</text>
+  <text class="t" x="390" y="243">Overseas quote polling</text>
+  <text class="m" x="390" y="270">execution.kis_real · kis_overseas</text>
+  <rect x="678" y="150" width="280" height="132" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <circle cx="704" cy="176" r="13" fill="#10b981"/><text class="badge" x="704" y="181">3</text>
+  <text class="h" x="726" y="182">Broker quotes and FX</text>
+  <text class="t" x="698" y="205">Refreshed bid / ask</text>
+  <text class="t" x="698" y="224">Currency cash split</text>
+  <text class="t" x="698" y="243">Tick size and venue rules</text>
+  <text class="m" x="698" y="270">execution.exchange_resolver</text>
+  <rect x="986" y="150" width="280" height="132" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <circle cx="1012" cy="176" r="13" fill="#10b981"/><text class="badge" x="1012" y="181">4</text>
+  <text class="h" x="1034" y="182">News, RSS, disclosure</text>
+  <text class="t" x="1006" y="205">Article and DART events</text>
+  <text class="t" x="1006" y="224">Keyword / OpenVINO / LLM</text>
+  <text class="t" x="1006" y="243">Polarity and novelty</text>
+  <text class="m" x="1006" y="270">data.event_pipeline</text>
+  <rect x="1294" y="150" width="280" height="132" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="1.8"/>
+  <circle cx="1320" cy="176" r="13" fill="#10b981"/><text class="badge" x="1320" y="181">5</text>
+  <text class="h" x="1342" y="182">Market and macro</text>
+  <text class="t" x="1314" y="205">Index and sector snapshots</text>
+  <text class="t" x="1314" y="224">ECOS / FRED macro series</text>
+  <text class="t" x="1314" y="243">Listed universe catalog</text>
+  <text class="m" x="1314" y="270">research.service · public_collectors</text>
+  <rect class="band" x="38" y="334" width="1564" height="190" rx="18"/>
+  <text class="lane" x="62" y="360">2 · NORMALISE, TRUST, STORE</text>
+  <rect x="62" y="374" width="356" height="132" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.8"/>
+  <text class="h" x="82" y="406">Source trust and freshness</text>
+  <text class="t" x="82" y="429">Source-type inference, quality score, live eligibility.</text>
+  <text class="t" x="82" y="448">Synthetic / sample / hash data rejected for live decisions.</text>
+  <text class="t" x="82" y="467">Quote and orderbook age limits enforce staleness blocks.</text>
+  <text class="m" x="82" y="494">data.source_policy · config/live_trading_safety.json</text>
+  <rect x="448" y="374" width="356" height="132" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.8"/>
+  <text class="h" x="468" y="406">Event bus and market state</text>
+  <text class="t" x="468" y="429">Bounded queue keeps DB work off the WebSocket callback.</text>
+  <text class="t" x="468" y="448">In-memory per-symbol state with sequence / gap detection.</text>
+  <text class="t" x="468" y="467">Reconnect marks state uncertain instead of silently resuming.</text>
+  <text class="m" x="468" y="494">data.event_pipeline · data.event_runtime (flagged)</text>
+  <rect x="834" y="374" width="356" height="132" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.8"/>
+  <text class="h" x="854" y="406">Realtime and research stores</text>
+  <text class="t" x="854" y="429">Minute bars, ticks, orderbooks in realtime_market_data.sqlite3.</text>
+  <text class="t" x="854" y="448">Normalised research records, raw archive, account snapshots.</text>
+  <text class="t" x="854" y="467">Retention pruning, deduplication, recursive secret redaction.</text>
+  <text class="m" x="854" y="494">data.realtime_store · storage.local_store · audit.logger</text>
+  <rect x="1220" y="374" width="356" height="132" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.8"/>
+  <text class="h" x="1240" y="406">Session and market phase</text>
+  <text class="t" x="1240" y="429">Exchange calendar classification for KRX / NXT / US.</text>
+  <text class="t" x="1240" y="448">REST snapshot fallback when the market is fully closed.</text>
+  <text class="t" x="1240" y="467">Blank fields and zero ticks resolve to a phase, not an error.</text>
+  <text class="m" x="1240" y="494">data.market_session · data.rest_snapshot_fallback</text>
+  <path class="flow" d="M820,300 L820,330"/>
+  <rect class="band" x="38" y="558" width="1564" height="190" rx="18"/>
+  <text class="lane" x="62" y="584">3 · FEATURES — POINT IN TIME, NO LOOK-AHEAD</text>
+  <rect x="62" y="598" width="356" height="132" rx="12" fill="#fefce8" stroke="#eab308" stroke-width="1.8"/>
+  <text class="h" x="82" y="630">Indicators</text>
+  <text class="t" x="82" y="653">SMA, EMA, MACD, RSI, Bollinger,</text>
+  <text class="t" x="82" y="672">ATR, volume spike, Donchian,</text>
+  <text class="t" x="82" y="691">rolling z-score. NaN-safe, pure.</text>
+  <text class="m" x="82" y="718">features.indicator_engine · technical.indicators</text>
+  <rect x="448" y="598" width="356" height="132" rx="12" fill="#fefce8" stroke="#eab308" stroke-width="1.8"/>
+  <text class="h" x="468" y="630">Microstructure</text>
+  <text class="t" x="468" y="653">mid, spread_bps, microprice,</text>
+  <text class="t" x="468" y="672">orderbook imbalance, OFI,</text>
+  <text class="t" x="468" y="691">trade imbalance, VWAP, RV.</text>
+  <text class="m" x="468" y="718">data.event_pipeline · features.short_horizon_features</text>
+  <rect x="834" y="598" width="356" height="132" rx="12" fill="#fefce8" stroke="#eab308" stroke-width="1.8"/>
+  <text class="h" x="854" y="630">Live feature frame</text>
+  <text class="t" x="854" y="653">Schema live_short_horizon_v2 with</text>
+  <text class="t" x="854" y="672">provenance and freshness flags.</text>
+  <text class="t" x="854" y="691">Triple-barrier short-horizon labels.</text>
+  <text class="m" x="854" y="718">features.live_feature_frame · models.labeling</text>
+  <rect x="1220" y="598" width="356" height="132" rx="12" fill="#fefce8" stroke="#eab308" stroke-width="1.8"/>
+  <text class="h" x="1240" y="630">Semantic and flow features</text>
+  <text class="t" x="1240" y="653">Event polarity and materiality,</text>
+  <text class="t" x="1240" y="672">foreign / institution / retail flow,</text>
+  <text class="t" x="1240" y="691">informed-imbalance derivations.</text>
+  <text class="m" x="1240" y="718">features.semantic_feature_engine · graph.builders</text>
+  <path class="flow" d="M820,524 L820,554"/>
+  <rect class="band" x="38" y="782" width="1564" height="209" rx="18"/>
+  <text class="lane" x="62" y="808">4 · REASONING — ADVISORY EVIDENCE ONLY</text>
+  <rect x="62" y="822" width="356" height="151" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text class="h" x="82" y="854">Technical prediction</text>
+  <text class="t" x="82" y="877">Rule-based regime, methodology</text>
+  <text class="t" x="82" y="896">providers, mandatory VWAP and</text>
+  <text class="t" x="82" y="915">volume confirmation, conservative</text>
+  <text class="t" x="82" y="934">expected exit price and downside.</text>
+  <text class="m" x="82" y="961">app.technical.* — advisory</text>
+  <rect x="448" y="822" width="356" height="151" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text class="h" x="468" y="854">Macro–micro ontology</text>
+  <text class="t" x="468" y="877">Market regime and risk, sector</text>
+  <text class="t" x="468" y="896">ranking, candidate symbols,</text>
+  <text class="t" x="468" y="915">strategy permissions, per-symbol</text>
+  <text class="t" x="468" y="934">entry / exit and SELL-first ranking.</text>
+  <text class="m" x="468" y="961">app.graph.* — advisory</text>
+  <rect x="834" y="822" width="356" height="151" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text class="h" x="854" y="854">Semantic labels and scoring</text>
+  <text class="t" x="854" y="877">RDF / OWL RL inferred classes,</text>
+  <text class="t" x="854" y="896">SHACL validation report, weighted</text>
+  <text class="t" x="854" y="915">support / contradiction / risk</text>
+  <text class="t" x="854" y="934">scoring with reasoning paths.</text>
+  <text class="m" x="854" y="961">graph.reasoner.SemanticPolicyScorer — advisory</text>
+  <rect x="1220" y="822" width="356" height="151" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
+  <text class="h" x="1240" y="854">Learned models</text>
+  <text class="t" x="1240" y="877">Live short-horizon predictor</text>
+  <text class="t" x="1240" y="896">(CPU or OpenVINO, auxiliary only)</text>
+  <text class="t" x="1240" y="915">and the strategy-utility R-GCN</text>
+  <text class="t" x="1240" y="934">running in shadow observation.</text>
+  <text class="m" x="1240" y="961">models.* · routing.shadow_intelligence — advisory</text>
+  <path class="flow" d="M820,748 L820,778"/>
+  <rect class="band" x="38" y="1025" width="1564" height="209" rx="18"/>
+  <text class="lane" x="62" y="1051">5 · DECISION AUTHORITY — DETERMINISTIC, SELL BEFORE BUY</text>
+  <rect x="62" y="1065" width="356" height="151" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text class="h" x="82" y="1097">Exit evaluated first</text>
+  <text class="t" x="82" y="1120">Every cycle scores SELL / REDUCE for held</text>
+  <text class="t" x="82" y="1139">symbols before any BUY is considered.</text>
+  <text class="t" x="82" y="1158">An open SELL at the same effective price</text>
+  <text class="t" x="82" y="1177">is kept instead of re-submitted.</text>
+  <text class="m" x="82" y="1204">trading.shared_decision_engine.evaluate_exit_for_holding</text>
+  <rect x="448" y="1065" width="356" height="151" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text class="h" x="468" y="1097">DynamicExitPolicy</text>
+  <text class="t" x="468" y="1120">One resolver for take-profit, profit lock,</text>
+  <text class="t" x="468" y="1139">trailing giveback, soft / hard / emergency</text>
+  <text class="t" x="468" y="1158">stop. Loss exits need strong deterioration</text>
+  <text class="t" x="468" y="1177">evidence and are blocked inside the noise band.</text>
+  <text class="m" x="468" y="1204">trading.dynamic_exit_policy · config/dynamic_exit_policy.yaml</text>
+  <path class="flow" d="M418,1140 L444,1140"/>
+  <rect x="834" y="1065" width="356" height="151" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text class="h" x="854" y="1097">ProfitabilityGate</text>
+  <text class="t" x="854" y="1120">The single BUY authority. Expected NET return</text>
+  <text class="t" x="854" y="1139">after fees, tax, spread, slippage and impact</text>
+  <text class="t" x="854" y="1158">must clear a volatility- and liquidity-aware</text>
+  <text class="t" x="854" y="1177">minimum edge, or the BUY is rejected.</text>
+  <text class="m" x="854" y="1204">cost.profitability_gate · cost.trading_cost_engine</text>
+  <path class="flow" d="M804,1140 L830,1140"/>
+  <rect x="1220" y="1065" width="356" height="151" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="1.8"/>
+  <text class="h" x="1240" y="1097">Sizing and risk</text>
+  <text class="t" x="1240" y="1120">Risk budget, cash, liquidity and exposure caps</text>
+  <text class="t" x="1240" y="1139">size the order; principal protection and the</text>
+  <text class="t" x="1240" y="1158">RiskManager perform the final validation that</text>
+  <text class="t" x="1240" y="1177">turns an intent into a FinalOrder.</text>
+  <text class="m" x="1240" y="1204">risk.position_sizing · risk.principal_protection · risk.manager</text>
+  <path class="flow" d="M1190,1140 L1216,1140"/>
+  <path class="flow" d="M820,991 L820,1021"/>
+  <rect class="band" x="38" y="1268" width="1564" height="171" rx="18"/>
+  <text class="lane" x="62" y="1294">6 · EXECUTION AND FEEDBACK</text>
+  <rect x="62" y="1308" width="356" height="113" rx="12" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.8"/>
+  <text class="h" x="82" y="1340">Order pricing</text>
+  <text class="t" x="82" y="1363">Limit price from book and tick rules,</text>
+  <text class="t" x="82" y="1382">no-chase cap, emergency sell offsets.</text>
+  <text class="m" x="82" y="1409">execution.order_pricing_policy</text>
+  <rect x="448" y="1308" width="356" height="113" rx="12" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.8"/>
+  <text class="h" x="468" y="1340">Guarded submission</text>
+  <text class="t" x="468" y="1363">Live flags, KIS health, arming, idempotency</text>
+  <text class="t" x="468" y="1382">reservation, limit orders only.</text>
+  <text class="m" x="468" y="1409">execution.live_execution_coordinator</text>
+  <rect x="834" y="1308" width="356" height="113" rx="12" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.8"/>
+  <text class="h" x="854" y="1340">Journals and reconciliation</text>
+  <text class="t" x="854" y="1363">Order and causal journals, status polling,</text>
+  <text class="t" x="854" y="1382">broker-authoritative position rebuild.</text>
+  <text class="m" x="854" y="1409">execution.live_order_journal · causal_journal</text>
+  <rect x="1220" y="1308" width="356" height="113" rx="12" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.8"/>
+  <text class="h" x="1240" y="1340">Surfaces and feedback</text>
+  <text class="t" x="1240" y="1363">/account, /display, /display/ontology,</text>
+  <text class="t" x="1240" y="1382">audit logs, retraining artifacts.</text>
+  <text class="m" x="1240" y="1409">web_account_routes · account_dashboard</text>
+  <path class="flow" d="M820,1234 L820,1264"/>
+  <rect class="band" x="38" y="1473" width="1564" height="310" rx="18"/>
+  <text class="lane" x="62" y="1499">7 · WHICH DATA IS ALLOWED TO DECIDE WHAT</text>
+  <path class="flow" d="M820,1439 L820,1469"/>
+  <rect x="62" y="1513" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="82" y="1545">Orderbook and spread</text>
+  <text class="t" x="82" y="1568">→ BUY gate (SPREAD_TOO_WIDE, SPREAD_CONSUMES_ALPHA)</text>
+  <text class="t" x="82" y="1587">→ execution limit price and no-chase cap</text>
+  <text class="t" x="82" y="1606">→ execution-quality rejection of alpha-eating fills</text>
+  <rect x="578" y="1513" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="598" y="1545">Tick freshness and session</text>
+  <text class="t" x="598" y="1568">→ NoTrade and MODEL_FEATURE_UNAVAILABLE reason codes</text>
+  <text class="t" x="598" y="1587">→ ontology fact validity windows (stale = hard block)</text>
+  <text class="t" x="598" y="1606">→ REST snapshot fallback when the market is closed</text>
+  <rect x="1094" y="1513" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="1114" y="1545">Cash, holdings, realised PnL</text>
+  <text class="t" x="1114" y="1568">→ position sizing and INSUFFICIENT_CASH_FOR_ONE_SHARE</text>
+  <text class="t" x="1114" y="1587">→ daily loss budget and BUY stop thresholds</text>
+  <text class="t" x="1114" y="1606">→ concentration and drawdown reduction exits</text>
+  <rect x="62" y="1647" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="82" y="1679">Volatility and liquidity</text>
+  <text class="t" x="82" y="1702">→ required minimum net return for a BUY</text>
+  <text class="t" x="82" y="1721">→ take-profit, trailing and soft-stop levels</text>
+  <text class="t" x="82" y="1740">→ macro BLOCK_BUY under a high-volatility regime</text>
+  <rect x="578" y="1647" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="598" y="1679">News and disclosure events</text>
+  <text class="t" x="598" y="1702">→ macro risk level and market-wide BUY block</text>
+  <text class="t" x="598" y="1721">→ event-momentum admissibility and TTL expiry</text>
+  <text class="t" x="598" y="1740">→ semantic risk evidence in the reasoning paths</text>
+  <rect x="1094" y="1647" width="483" height="118" rx="12" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.8"/>
+  <text class="h" x="1114" y="1679">Model and ontology output</text>
+  <text class="t" x="1114" y="1702">→ expected exit price (never inflated above the honest estimate)</text>
+  <text class="t" x="1114" y="1721">→ strategy admissibility mask and compatibility score</text>
+  <text class="t" x="1114" y="1740">→ bounded exit-deterioration penalty on profitable positions</text>
+  <text class="note" x="52" y="1813" text-anchor="start">Advisory layers may narrow the action set and supply an honest expected edge. Only the cost, exit, sizing and risk gates can approve, and only LiveExecutionCoordinator can submit.</text>
+</svg>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 import os
 from pathlib import Path
 
@@ -42,6 +43,7 @@ class SlowIntelligenceSnapshot:
     data_fresh: bool
     tradable: bool
     allowed_strategy_ids: tuple[str, ...]
+    feature_schema_name: str = "unspecified"
 
 
 @dataclass(frozen=True)
@@ -80,16 +82,38 @@ class ShadowIntelligenceService:
             )
         )
         self.checkpoint_path = checkpoint_path
-        self.checkpoint_loaded = checkpoint_path.exists()
-        self.model = (
+        checkpoint_model = (
             FixedShapeStrategyUtilityModel.load_checkpoint(checkpoint_path)
+            if checkpoint_path.exists()
+            else None
+        )
+        self.checkpoint_loaded = (
+            checkpoint_model is not None and checkpoint_model.config == config
+        )
+        self.model_input_schema = "unspecified"
+        self.live_authorized = False
+        if self.checkpoint_loaded:
+            try:
+                metadata = json.loads(
+                    checkpoint_path.with_suffix(".json").read_text(encoding="utf-8")
+                )
+                self.model_input_schema = str(
+                    metadata.get("input_feature_schema")
+                    or (
+                        "counterfactual_quantiles_v1"
+                        if metadata.get("method")
+                        == "causal_feature_encoder_plus_ridge_calibrated_heads"
+                        else "unspecified"
+                    )
+                )
+                self.live_authorized = bool(metadata.get("live_authorized"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                self.model_input_schema = "unknown"
+        self.model = (
+            checkpoint_model
             if self.checkpoint_loaded
             else FixedShapeStrategyUtilityModel(config)
         )
-        if self.model.config != config:
-            raise ValueError(
-                "strategy utility checkpoint shape/config does not match shadow runtime"
-            )
         self.cpu = OpenVinoStrategyUtilityRuntime(self.model, requested_device="CPU")
         self.npu = (
             OpenVinoStrategyUtilityRuntime(self.model, requested_device="NPU")
@@ -115,6 +139,31 @@ class ShadowIntelligenceService:
             raise ValueError("slow intelligence feature dimension mismatch")
         self.last_run[snapshot.symbol] = snapshot.as_of
         ontology = self._ontology(snapshot)
+        model_block_reasons = self._model_block_reasons(snapshot)
+        if model_block_reasons:
+            decisions = [
+                ShadowDecision("legacy", legacy_action, None, None, ("LEGACY_OBSERVED",)),
+                ShadowDecision(
+                    "ontology",
+                    "ADMISSIBLE" if ontology.allowed_strategy_ids else "NO_TRADE",
+                    ontology.allowed_strategy_ids[0] if ontology.allowed_strategy_ids else None,
+                    None,
+                    (),
+                ),
+                ShadowDecision("cpu_gnn", "NO_TRADE", None, None, model_block_reasons),
+            ]
+            comparison = self.recorder.compare(
+                correlation_id=snapshot.snapshot_id,
+                symbol=snapshot.symbol,
+                as_of=snapshot.as_of,
+                decisions=tuple(decisions),
+            )
+            return ShadowIntelligenceResult(
+                ontology_snapshot_id=ontology.snapshot_id,
+                cpu_evidence=(),
+                npu_evidence=(),
+                comparison=comparison,
+            )
         inputs = self._inputs(snapshot, ontology.allowed_strategy_ids)
         cpu_output = self.cpu.infer(*inputs)
         cpu_evidence = self._evidence(snapshot, ontology, cpu_output, "openvino-cpu")
@@ -158,6 +207,23 @@ class ShadowIntelligenceService:
             npu_evidence=npu_evidence,
             comparison=comparison,
         )
+
+    def _model_block_reasons(
+        self,
+        snapshot: SlowIntelligenceSnapshot,
+    ) -> tuple[str, ...]:
+        """Reject checkpoint outputs whose provenance cannot support this live frame."""
+        if not self.checkpoint_loaded:
+            return ()
+        reasons: list[str] = []
+        if self.model_input_schema != snapshot.feature_schema_name:
+            reasons.append(
+                "MODEL_INPUT_SCHEMA_MISMATCH:"
+                f"{self.model_input_schema}!={snapshot.feature_schema_name}"
+            )
+        if not self.live_authorized:
+            reasons.append("UTILITY_MODEL_NOT_LIVE_AUTHORIZED")
+        return tuple(reasons)
 
     def _ontology(self, snapshot: SlowIntelligenceSnapshot):
         facts = {

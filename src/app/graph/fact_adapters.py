@@ -7,7 +7,7 @@ This is the compatibility layer: existing code keeps producing/consuming string
 reasoning, hard-reject short-circuit) can operate on the integer ``FactTable``
 and convert back to human-readable form for explanations / GUI.
 
-See docs/ontology_acceleration_audit.md (Phase 2).
+See docs/ontology_and_gnn.md (working triple store).
 """
 
 from collections.abc import Iterable

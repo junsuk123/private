@@ -8,7 +8,7 @@
 # Defaults below match the previous inline defaults for exact backward compatibility;
 # run.ps1 pins the production values. Tune from realized exit-quality logs.
 #
-# See docs/dynamic_exit_policy.md.
+# See docs/decision_and_risk.md.
 
 # --- Take-profit (dynamic) ---------------------------------------------------------
 # take_profit_rate = max(min_take_profit_rate,

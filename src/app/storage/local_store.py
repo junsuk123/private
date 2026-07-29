@@ -322,6 +322,60 @@ class LocalResearchStore:
             reasoning_paths=(),
         )
 
+    def load_live_analysis_inputs(self, *, prune: bool = True) -> StoredResearch:
+        """Load a bounded, recent research window for the live intelligence path.
+
+        The durable store can contain millions of historical market snapshots.
+        Loading all of them every live refresh both stalls the worker and was the
+        reason the live path previously discarded events altogether.  This
+        bounded view keeps current event/macro provenance without putting the
+        historical corpus on the latency-sensitive path.
+        """
+
+        if prune:
+            self.prune_stale()
+
+        def _limit(name: str, default: int) -> int:
+            try:
+                return max(0, int(os.getenv(name, str(default))))
+            except (TypeError, ValueError):
+                return default
+
+        return StoredResearch(
+            events=tuple(
+                _event_from_dict(item)
+                for item in self._read_kind("events", _limit("LIVE_RESEARCH_EVENT_LIMIT", 1000))
+            ),
+            raw_records=tuple(
+                _raw_from_dict(item)
+                for item in self._read_kind("raw_records", _limit("LIVE_RESEARCH_RAW_LIMIT", 1000))
+            ),
+            market_snapshots=tuple(
+                _market_from_dict(item)
+                for item in self._read_kind(
+                    "market_snapshots",
+                    _limit("LIVE_RESEARCH_MARKET_SNAPSHOT_LIMIT", 5000),
+                )
+            ),
+            macro_metrics=tuple(
+                _macro_from_dict(item)
+                for item in self._read_kind("macro_metrics", _limit("LIVE_RESEARCH_MACRO_LIMIT", 500))
+            ),
+            realtime_quotes=tuple(
+                _realtime_quote_from_dict(item)
+                for item in self._read_kind("realtime_quotes", _limit("LIVE_RESEARCH_QUOTE_LIMIT", 5000))
+            ),
+            realtime_executions=tuple(
+                _realtime_execution_from_dict(item)
+                for item in self._read_kind(
+                    "realtime_executions",
+                    _limit("LIVE_RESEARCH_EXECUTION_LIMIT", 5000),
+                )
+            ),
+            graph_triples=(),
+            reasoning_paths=(),
+        )
+
     def summary(self, *, prune: bool = True) -> dict[str, int | str]:
         if prune:
             self.prune_stale()
@@ -408,9 +462,18 @@ class LocalResearchStore:
 
     def prune_stale(self) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
+        macro_cutoff = datetime.now(timezone.utc) - timedelta(days=_macro_retention_days())
         cutoff_text = cutoff.isoformat()
+        macro_cutoff_text = macro_cutoff.isoformat()
         with closing(self._connect()) as conn:
-            cursor = conn.execute("delete from records where observed_at < ?", (cutoff_text,))
+            cursor = conn.execute(
+                """
+                delete from records
+                where (kind = 'macro_metrics' and observed_at < ?)
+                   or (kind <> 'macro_metrics' and observed_at < ?)
+                """,
+                (macro_cutoff_text, cutoff_text),
+            )
             conn.commit()
             return int(cursor.rowcount)
 
@@ -506,13 +569,14 @@ class LocalResearchStore:
     ) -> int:
         inserted = 0
         now = datetime.now(timezone.utc).isoformat()
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         rows = []
         for record in records:
             row = _to_jsonable(record)
             if _is_simulated_row(kind, row):
                 raise ValueError(f"Refusing to save simulated {kind} record into realtime store: {key_fn(row)}")
             observed_at = _as_aware(observed_at_fn(row))
+            retention_days = _macro_retention_days() if kind == "macro_metrics" else self.retention_days
+            cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
             if observed_at < cutoff:
                 continue
             rows.append(
@@ -548,16 +612,21 @@ class LocalResearchStore:
             conn.commit()
             return int(conn.total_changes - before)
 
-    def _read_kind(self, kind: str) -> tuple[dict[str, Any], ...]:
+    def _read_kind(self, kind: str, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+        if limit is not None and limit <= 0:
+            return ()
+        limit_sql = " limit ?" if limit is not None else ""
+        params: tuple[Any, ...] = (kind, int(limit)) if limit is not None else (kind,)
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """
+                f"""
                 select payload
                 from records
                 where kind = ?
                 order by observed_at desc, inserted_at desc
+                {limit_sql}
                 """,
-                (kind,),
+                params,
             ).fetchall()
         return tuple(json.loads(row[0]) for row in rows)
 
@@ -772,6 +841,13 @@ def _triple_key(row: dict[str, Any]) -> str:
 
 def _reasoning_key(row: dict[str, Any]) -> str:
     return row["path_id"]
+
+
+def _macro_retention_days() -> int:
+    try:
+        return max(365, int(os.getenv("MACRO_METRIC_RETENTION_DAYS", "730")))
+    except (TypeError, ValueError):
+        return 730
 
 
 def _is_simulated_row(kind: str, row: dict[str, Any]) -> bool:

@@ -5,7 +5,7 @@ import os
 import math
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.data.realtime_store import RealtimeMarketDataStore
@@ -438,6 +438,45 @@ class SharedLiveDecisionEngine:
         except Exception:  # noqa: BLE001 - advisory only; never break the decision path.
             return None
 
+    def _owned_strategy_prediction(self, frame, symbol, strategy_id, election_context=None):
+        """Return entry timing from the elected strategy, never a replacement strategy.
+
+        ``election_context`` is the slow context the ontology froze when it
+        elected this strategy (event TTL, cross-sectional rank, gap reference).
+        Algorithms that need context they were not given fail closed.
+        """
+        if not self._technical_enabled or self._technical_engine is None or frame is None:
+            return None
+        try:
+            from app.technical.feature_builder import technical_feature_set_from_live_frame
+            from app.technical.strategy_algorithms import ElectionContext
+
+            features = technical_feature_set_from_live_frame(frame, symbol)
+            context = None
+            if isinstance(election_context, ElectionContext):
+                context = election_context
+            elif isinstance(election_context, Mapping):
+                allowed = ElectionContext.__dataclass_fields__.keys()
+                payload = {
+                    key: value
+                    for key, value in dict(election_context).items()
+                    if key in allowed and key != "elected_at"
+                }
+                payload["strategy_id"] = str(strategy_id or "")
+                context = ElectionContext(**payload)
+            composite = self._technical_engine.signal_engine.evaluate_owned_strategy(
+                features,
+                strategy_id,
+                context,
+            )
+            return self._technical_engine.predict(
+                features,
+                composite=composite,
+                model_prediction=None,
+            )
+        except Exception:  # noqa: BLE001 - fail closed in the caller.
+            return None
+
     def evaluate_buy(
         self,
         symbol: str,
@@ -446,6 +485,8 @@ class SharedLiveDecisionEngine:
         suggested_weight: float = 0.01,
         ontology_graph: Any | None = None,
         decision_time: datetime | None = None,
+        selected_strategy: str | None = None,
+        election_context: Mapping[str, Any] | None = None,
     ) -> SharedDecisionResult:
         decision_time = decision_time or datetime.now(timezone.utc)
         frame = None
@@ -456,7 +497,46 @@ class SharedLiveDecisionEngine:
             prediction = self.predictor.predict(frame)
         except Exception as exc:  # noqa: BLE001 - model failure can fall back to ontology and rules.
             prediction_error = exc
-        technical_prediction = self._technical_prediction(frame, symbol, model_prediction=prediction)
+        strategy_locked = bool(str(selected_strategy or "").strip())
+        technical_prediction = (
+            self._owned_strategy_prediction(
+                frame, symbol, selected_strategy, election_context
+            )
+            if strategy_locked
+            else self._technical_prediction(frame, symbol, model_prediction=prediction)
+        )
+        if strategy_locked and (
+            technical_prediction is None or not technical_prediction.tradable
+        ):
+            reason_codes = tuple(
+                getattr(technical_prediction, "reason_codes", ())
+                or ("SELECTED_STRATEGY_ENTRY_NOT_READY",)
+            )
+            diagnostics = {
+                "strategy_locked": True,
+                "selected_strategy": selected_strategy,
+                "technical_prediction": (
+                    technical_prediction.as_dict()
+                    if technical_prediction is not None
+                    else None
+                ),
+                "prediction_error": (
+                    str(prediction_error) if prediction_error is not None else None
+                ),
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                tuple(
+                    dict.fromkeys(
+                        (*reason_codes, "SELECTED_STRATEGY_ENTRY_NOT_READY")
+                    )
+                ),
+                diagnostics,
+            )
 
         tick = self.store.latest_tick(symbol)
         market_name = _resolve_order_market(symbol, account)
@@ -477,6 +557,36 @@ class SharedLiveDecisionEngine:
                 result = SharedDecisionResult(symbol, False, None, prediction, ("MISSING_MARKET_DATA",), {"quote_refresh_status": "missing_market_data"})
                 self._last_diagnostics = result.diagnostics or {}
                 return result
+
+        second_values = (
+            frame.as_feature_dict()
+            if frame is not None and hasattr(frame, "as_feature_dict")
+            else {}
+        )
+        second_data_ready = float(second_values.get("second_data_ready", 0.0) or 0.0) >= 1.0
+        require_second_data = os.getenv(
+            "REALTIME_REQUIRE_SECOND_DATA_FOR_BUY",
+            "false",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if require_second_data and not second_data_ready:
+            diagnostics = {
+                "second_data_ready": False,
+                "tick_count_1s": float(second_values.get("tick_count_1s", 0.0) or 0.0),
+                "tick_count_5s": float(second_values.get("tick_count_5s", 0.0) or 0.0),
+                "return_1s": float(second_values.get("return_1s", 0.0) or 0.0),
+                "return_5s": float(second_values.get("return_5s", 0.0) or 0.0),
+                "prediction_error": str(prediction_error) if prediction_error is not None else None,
+            }
+            result = SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                ("SECOND_LEVEL_DATA_NOT_READY",),
+                diagnostics,
+            )
+            self._last_diagnostics = diagnostics
+            return result
 
         currency = "KRW" if market_name.upper() in ("KR", "KRX", "KOSPI", "KOSDAQ", "KONEX") else "USD"
         available_cash = _available_cash_for_currency(account, currency)
@@ -621,7 +731,24 @@ class SharedLiveDecisionEngine:
             recent_performance=0.0,
         )
         model_ok = bool(prediction is not None and prediction.approved)
+        if strategy_locked and technical_prediction is not None:
+            # Election authority has already been consumed.  The selected
+            # strategy's own timing confidence now drives entry; ontology and
+            # the generic model remain diagnostics only.
+            fallback_score = max(
+                fallback_score,
+                float(technical_prediction.confidence or 0.0),
+            )
+            ontology_ok = True
+            require_ontology_fallback = False
+            ontology_support = (
+                f"StrategyOwner:{selected_strategy}",
+                f"EntryMethod:{technical_prediction.methodology}",
+            )
         model_provider, model_is_fallback = _resolve_model_provider(prediction, model_ok)
+        if strategy_locked:
+            model_provider = "strategy_owned"
+            model_is_fallback = False
         fallback_allowed = True
         policy_state = self.auto_tuner.snapshot_market_state(
             symbol=symbol,
@@ -640,11 +767,15 @@ class SharedLiveDecisionEngine:
             account=account,
             market=market,
             market_state=policy_state,
-            prediction=prediction,
+            prediction=None if strategy_locked else prediction,
             fallback_allowed=fallback_allowed,
             ontology_score=ontology_score,
             fallback_score=fallback_score,
-            prediction_confidence=float(getattr(prediction, "probability_success", 0.5) or 0.5),
+            prediction_confidence=(
+                float(technical_prediction.confidence or 0.0)
+                if strategy_locked and technical_prediction is not None
+                else float(getattr(prediction, "probability_success", 0.5) or 0.5)
+            ),
             prediction_error=prediction_error,
             decision_time=decision_time,
         )
@@ -727,7 +858,7 @@ class SharedLiveDecisionEngine:
                     )
                 )
             )
-        if not model_ok and require_ontology_fallback and not ontology_ok:
+        if not strategy_locked and not model_ok and require_ontology_fallback and not ontology_ok:
             reasons = tuple(getattr(prediction, "reason_codes", ()) or ("MODEL_UNAVAILABLE",))
             blocker_reasons = _buy_blocker_reason_codes(
                 prediction_error=prediction_error,
@@ -757,14 +888,26 @@ class SharedLiveDecisionEngine:
             }
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
-        if not model_ok and policy.allowed_fallback_mode == "no_trade" and fallback_score < policy.buy_threshold:
+        if (
+            not strategy_locked
+            and not model_ok
+            and policy.allowed_fallback_mode == "no_trade"
+            and fallback_score < policy.buy_threshold
+        ):
             reasons = tuple(getattr(prediction, "reason_codes", ()) or ("MODEL_UNAVAILABLE",))
             reasons = (*reasons, "MODEL_FALLBACK_NOT_ALLOWED", f"QUOTE_REFRESH:{quote_refresh_status}")
             diagnostics = {"policy": policy.as_dict(), "policy_state": policy_diag, "quote_refresh_status": quote_refresh_status, "fallback_score": fallback_score}
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
         model_auxiliary_only = os.getenv("REALTIME_MODEL_AUXILIARY_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
-        if model_ok and model_auxiliary_only and not ontology_ok and not runtime_fallback_support and not runtime_probe_support:
+        if (
+            not strategy_locked
+            and model_ok
+            and model_auxiliary_only
+            and not ontology_ok
+            and not runtime_fallback_support
+            and not runtime_probe_support
+        ):
             diagnostics = {
                 "policy": policy.as_dict(),
                 "policy_state": policy_diag,
@@ -786,14 +929,23 @@ class SharedLiveDecisionEngine:
             )
 
         model_score = float(getattr(prediction, "probability_success", 0.0) or 0.0) if model_ok else fallback_score
-        signal_score = max(model_score, ontology_score * 0.35 if not model_ok else ontology_score * 0.25)
-        if not model_ok:
+        signal_score = (
+            float(technical_prediction.confidence or 0.0)
+            if strategy_locked and technical_prediction is not None
+            else max(model_score, ontology_score * 0.35 if not model_ok else ontology_score * 0.25)
+        )
+        if not model_ok and not strategy_locked:
             signal_score = max(signal_score, fallback_score)
         signal_gap = signal_score - effective_buy_threshold
         size_multiplier = 1.0
         if signal_gap < 0:
             min_signal_gap = -runtime_probe_margin if runtime_probe_support else -0.18
-            if signal_gap >= min_signal_gap and policy.allowed_fallback_mode != "no_trade":
+            if strategy_locked:
+                # The expert timing prediction already passed its own confidence
+                # and net-edge thresholds.  Keep risk sizing conservative while
+                # avoiding a second model/fallback selection gate.
+                size_multiplier = max(0.20, min(1.0, signal_score))
+            elif signal_gap >= min_signal_gap and policy.allowed_fallback_mode != "no_trade":
                 size_multiplier = max(0.20, 1.0 + signal_gap * 2.5)
             else:
                 reasons = tuple(getattr(prediction, "reason_codes", ()) or ())
@@ -813,7 +965,13 @@ class SharedLiveDecisionEngine:
         # conservative estimate derived from the adaptive fallback score. Either way
         # the gate below judges it honestly against the real round-trip cost and a
         # dynamic minimum net edge, and REJECTS negative-expectancy buys.
-        if model_ok and prediction is not None and float(prediction.expected_net_return_bps or 0.0) > 0.0:
+        if (
+            strategy_locked
+            and technical_prediction is not None
+            and float(technical_prediction.expected_net_return_bps or 0.0) > 0.0
+        ):
+            expected_return_bps = float(technical_prediction.expected_net_return_bps)
+        elif model_ok and prediction is not None and float(prediction.expected_net_return_bps or 0.0) > 0.0:
             expected_return_bps = float(prediction.expected_net_return_bps)
         else:
             fallback_edge_bps_per_score = _env_float("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", 120.0)
@@ -836,7 +994,11 @@ class SharedLiveDecisionEngine:
             technical_regime = technical_prediction.regime
             if technical_prediction.tradable and float(technical_prediction.expected_net_return_bps or 0.0) > 0.0:
                 tech_bps = float(technical_prediction.expected_net_return_bps)
-                expected_return_bps = min(expected_return_bps, tech_bps) if expected_return_bps > 0 else tech_bps
+                expected_return_bps = (
+                    tech_bps
+                    if strategy_locked
+                    else (min(expected_return_bps, tech_bps) if expected_return_bps > 0 else tech_bps)
+                )
                 technical_methodology = technical_prediction.methodology
         gross_expected_return = max(0.0, expected_return_bps / 10_000.0)
         expected_exit_price = price * (1.0 + gross_expected_return)
@@ -894,8 +1056,12 @@ class SharedLiveDecisionEngine:
             }
             self._last_diagnostics = diagnostics
             return SharedDecisionResult(symbol, False, None, prediction, reasons, diagnostics)
-        confidence = max(policy.confidence_floor, float(getattr(prediction, "probability_success", 0.5) or 0.5) if model_ok else 0.5 + fallback_score * 0.2)
-        if not model_ok:
+        confidence = (
+            max(policy.confidence_floor, float(technical_prediction.confidence or 0.0))
+            if strategy_locked and technical_prediction is not None
+            else max(policy.confidence_floor, float(getattr(prediction, "probability_success", 0.5) or 0.5) if model_ok else 0.5 + fallback_score * 0.2)
+        )
+        if not model_ok and not strategy_locked:
             confidence = max(0.35, confidence - 0.1)
         # Edge/confidence-aware position sizing (Phase 4). Caps the weight by a
         # fractional-Kelly, edge-, liquidity-, and drawdown-scaled size. Never sizes a
@@ -913,12 +1079,24 @@ class SharedLiveDecisionEngine:
         )
         if sizing.position_weight > 0.0:
             suggested_weight = min(suggested_weight, sizing.position_weight)
-        signal_name = "trained_expected_net_return" if model_ok else "ontology_fallback_buy"
-        supporting = ("trained_live_model",) if model_ok else ("ontology_fallback",)
+        signal_name = (
+            f"owned_strategy:{selected_strategy}"
+            if strategy_locked
+            else ("trained_expected_net_return" if model_ok else "ontology_fallback_buy")
+        )
+        supporting = (
+            (f"strategy_owner:{selected_strategy}",)
+            if strategy_locked
+            else (("trained_live_model",) if model_ok else ("ontology_fallback",))
+        )
         if ontology_support:
             supporting = (*supporting, *ontology_support)
         reasoning = f"policy:{policy.risk_mode};score={signal_score:.2f};quote={quote_refresh_status}"
-        artifact_id = str(getattr(prediction, "model_artifact_id", "") or "") if prediction is not None else ""
+        artifact_id = (
+            ""
+            if strategy_locked
+            else (str(getattr(prediction, "model_artifact_id", "") or "") if prediction is not None else "")
+        )
         validation_id = artifact_id or f"adaptive-buy:{symbol}:{decision_time.strftime('%Y%m%d%H%M%S')}"
         source_data_ids = (
             frame.provenance.source_record_ids
@@ -929,7 +1107,11 @@ class SharedLiveDecisionEngine:
             "model_artifact_id": artifact_id,
             "model_provider": model_provider,
             "model_is_fallback": model_is_fallback,
-            "feature_schema_hash": prediction.feature_schema_hash if prediction is not None else "",
+            "feature_schema_hash": (
+                ""
+                if strategy_locked
+                else (prediction.feature_schema_hash if prediction is not None else "")
+            ),
             "ontology_buy_score": round(ontology_score, 4),
             "fallback_score": round(fallback_score, 4),
             "runtime_execution_ready": runtime_execution_ready,
@@ -947,6 +1129,8 @@ class SharedLiveDecisionEngine:
             "stop_loss_price": price * (1.0 - policy.stop_loss),
             "profitability_decision": profitability_decision.as_dict(),
             "position_sizing": sizing.as_dict(),
+            "strategy_locked": strategy_locked,
+            "selected_strategy": selected_strategy,
         }
         if orderbook is not None:
             strategy_metadata["orderbook_snapshot"] = {
@@ -966,8 +1150,16 @@ class SharedLiveDecisionEngine:
             supporting_factors=supporting,
             contradicting_factors=(),
             source_data_ids=source_data_ids,
-            model_uncertainty=prediction.uncertainty_score if prediction is not None else (0.85 if not model_ok else None),
-            strategy_family="live_short_horizon",
+            model_uncertainty=(
+                None
+                if strategy_locked
+                else (prediction.uncertainty_score if prediction is not None else (0.85 if not model_ok else None))
+            ),
+            strategy_family=(
+                str(selected_strategy)
+                if strategy_locked
+                else "live_short_horizon"
+            ),
             signal_name=signal_name,
             expected_exit_price=expected_exit_price,
             expected_holding_minutes=max(1, min(30, int(policy.time_exit_seconds / 60))),
@@ -981,7 +1173,11 @@ class SharedLiveDecisionEngine:
             policy=policy,
             account=account,
             market=market,
-            model_uncertainty=prediction.uncertainty_score if prediction is not None else None,
+                model_uncertainty=(
+                    None
+                    if strategy_locked
+                    else (prediction.uncertainty_score if prediction is not None else None)
+                ),
         )
         adaptive_rules = replace(adaptive_rules, minimum_cash_reserve=0.0)
         risk_manager = RiskManager(adaptive_rules, audit_logger=self.risk_manager.audit_logger)
@@ -1009,6 +1205,8 @@ class SharedLiveDecisionEngine:
             "technical_prediction": technical_prediction.as_dict() if technical_prediction is not None else None,
             "technical_methodology": technical_methodology,
             "technical_regime": technical_regime,
+            "strategy_locked": strategy_locked,
+            "selected_strategy": selected_strategy,
         }
         self.auto_tuner.record_feedback(
             {
@@ -1026,15 +1224,16 @@ class SharedLiveDecisionEngine:
         # BLOCK — it never authorizes. RiskManager/ProfitabilityGate remain the sole gates.
         approved = risk.approved and risk.final_order is not None
         reason_codes: tuple[str, ...] = tuple(risk.rejection_reasons)
-        try:
-            onto = self._ontology_reasoning_for_buy(symbol, market, profitability_decision, prediction)
-            if onto is not None:
-                diagnostics["ontology_reasoning"] = onto.as_dict()
-                if approved and onto.blocked_by and _env_bool("TRADING_ONTOLOGY_ENFORCE", False):
-                    approved = False
-                    reason_codes = tuple(reason_codes) + tuple(onto.blocked_by)
-        except Exception:  # noqa: BLE001 - ontology annotation must never break a decision.
-            pass
+        if not strategy_locked:
+            try:
+                onto = self._ontology_reasoning_for_buy(symbol, market, profitability_decision, prediction)
+                if onto is not None:
+                    diagnostics["ontology_reasoning"] = onto.as_dict()
+                    if approved and onto.blocked_by and _env_bool("TRADING_ONTOLOGY_ENFORCE", False):
+                        approved = False
+                        reason_codes = tuple(reason_codes) + tuple(onto.blocked_by)
+            except Exception:  # noqa: BLE001 - ontology annotation must never break a decision.
+                pass
         self._last_diagnostics = diagnostics
         return SharedDecisionResult(
             symbol=symbol,

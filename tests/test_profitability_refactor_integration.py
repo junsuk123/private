@@ -1,6 +1,6 @@
 """Integration tests for the profitability refactor acceptance criteria.
 
-The headline case comes straight from the replay baseline (docs/profitability_replay_report.md):
+The headline case comes straight from the replay baseline (docs/validation.md):
 the pre-refactor system took trades that were GROSS-positive but NET-negative after costs.
 The unified ProfitabilityGate must now reject exactly those in the live buy path.
 """

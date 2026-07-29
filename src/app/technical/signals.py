@@ -86,6 +86,27 @@ class TechnicalFeatureSet:
     spread_bps: float | None = None
     orderbook_imbalance: float | None = None
     expected_slippage_bps: float | None = None
+    # Tick / sub-second window (live feed only; ``None`` for bar-only callers).
+    # These are what the mechanical entry triggers in
+    # ``app.technical.strategy_algorithms`` actually fire on — the bar columns
+    # above only supply slower context.
+    return_1s: float | None = None
+    return_5s: float | None = None
+    return_10s: float | None = None
+    tick_count_1s: float | None = None
+    tick_count_5s: float | None = None
+    volume_1s_log: float | None = None
+    volume_5s_log: float | None = None
+    aggressor_imbalance_5s: float | None = None
+    realized_volatility_10s: float | None = None
+    spread_change_5s: float | None = None
+    orderbook_imbalance_change_5s: float | None = None
+    second_data_ready: float | None = None
+
+    @property
+    def tick_data_ready(self) -> bool:
+        """True when the sub-second window is populated enough to trigger on."""
+        return bool(self.second_data_ready and self.second_data_ready >= 1.0)
 
     def to_regime_input(self) -> RegimeInput:
         return RegimeInput(
@@ -521,6 +542,16 @@ _REGIME_PREFERRED: dict[MarketRegime, frozenset[str]] = {
     ),
 }
 
+_OWNED_STRATEGY_METHODOLOGY: dict[str, str] = {
+    "intraday_momentum": "momentum_trend_following",
+    "breakout_volume": "breakout_trading_range_break",
+    "vwap_mean_reversion": "mean_reversion",
+    "liquidity_shock_reversal": "mean_reversion",
+    "event_momentum": "momentum_trend_following",
+    "cross_sectional_relative_strength": "momentum_trend_following",
+    "gap_context": "momentum_trend_following",
+}
+
 
 class CompositeTechnicalSignalEngine:
     def __init__(
@@ -541,6 +572,11 @@ class CompositeTechnicalSignalEngine:
                 VolatilityBandSignalProvider(),
             )
         }
+        # Per-strategy mechanical algorithms, built once. Imported lazily to
+        # keep this module importable from the bar-only offline harnesses.
+        from app.technical.strategy_algorithms import build_algorithm_registry
+
+        self._algorithms = build_algorithm_registry()
 
     def evaluate(self, features: TechnicalFeatureSet) -> CompositeTechnicalSignal:
         regime_diag: RegimeDiagnostics = self.regime_classifier.classify(features.to_regime_input())
@@ -635,6 +671,84 @@ class CompositeTechnicalSignalEngine:
                 "vwap_confirms": vwap_confirms,
                 "signals": {n: s.as_dict() for n, s in signals.items()},
             },
+        )
+
+    def evaluate_owned_strategy(
+        self,
+        features: TechnicalFeatureSet,
+        strategy_id: str,
+        context: object | None = None,
+    ) -> CompositeTechnicalSignal:
+        """Run the elected strategy's own mechanical entry trigger.
+
+        Ontology/GNN elects ``strategy_id`` and supplies ``context`` (an
+        :class:`~app.technical.strategy_algorithms.ElectionContext`). Each
+        strategy id resolves to its OWN algorithm — previously four ids shared
+        one momentum provider, so electing different strategies ran identical
+        code.
+
+        Regime, liquidity, volatility and spread admissibility are deliberately
+        NOT evaluated here. They are resolved once at election time and then
+        watched by ``app.trading.strategy_supervisor``, which can halt this
+        algorithm. The regime is still classified, but only as diagnostics.
+        """
+        from app.technical.strategy_algorithms import ElectionContext, get_algorithm
+
+        strategy = str(strategy_id or "").strip().lower()
+        regime_diag = self.regime_classifier.classify(features.to_regime_input())
+        signals = {name: provider.evaluate(features) for name, provider in self.providers.items()}
+        algorithm = get_algorithm(strategy, registry=self._algorithms)
+        if algorithm is None:
+            return self._blocked(
+                features,
+                regime_diag,
+                signals,
+                ("STRATEGY_IMPLEMENTATION_MISSING",),
+            )
+
+        election = context if isinstance(context, ElectionContext) else ElectionContext(strategy_id=strategy)
+        decision = algorithm.entry(features, election)
+        methodology = _OWNED_STRATEGY_METHODOLOGY.get(strategy, strategy)
+        reference = signals.get(methodology)
+        diagnostics = {
+            "owned_strategy_id": strategy,
+            "strategy_locked": True,
+            "algorithm": decision.as_dict(),
+            "election_context": election.as_dict(),
+            # Diagnostics only — the supervisor, not this method, acts on these.
+            "regime": regime_diag.as_dict(),
+            "reference_methodology_signal": reference.as_dict() if reference else None,
+        }
+        if not decision.triggered:
+            return CompositeTechnicalSignal(
+                symbol=features.symbol,
+                direction=SignalDirection.HOLD,
+                score=0.0,
+                confidence=0.0,
+                expected_edge_bps=0.0,
+                expected_horizon_seconds=0,
+                regime=regime_diag.regime,
+                regime_confidence=regime_diag.confidence,
+                selected_methodology="",
+                contributing=(),
+                reason_codes=decision.reason_codes,
+                blocks_buy=False,
+                diagnostics=diagnostics,
+            )
+        return CompositeTechnicalSignal(
+            symbol=features.symbol,
+            direction=SignalDirection.BUY,
+            score=_clamp(decision.score),
+            confidence=max(0.0, min(1.0, decision.confidence)),
+            expected_edge_bps=max(0.0, decision.expected_edge_bps),
+            expected_horizon_seconds=decision.horizon_seconds,
+            regime=regime_diag.regime,
+            regime_confidence=regime_diag.confidence,
+            selected_methodology=strategy,
+            contributing=(reference,) if reference else (),
+            reason_codes=decision.reason_codes,
+            blocks_buy=False,
+            diagnostics=diagnostics,
         )
 
     def evaluate_exit_deterioration(self, features: TechnicalFeatureSet) -> tuple[str, ...]:

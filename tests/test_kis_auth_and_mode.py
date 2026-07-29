@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app.execution.kis_auth import issue_websocket_approval_key, load_kis_mode, run_kis_health_check, validate_live_secret_file
+from app.execution.kis_auth import (
+    issue_websocket_approval_key,
+    load_kis_mode,
+    reset_websocket_approval_key_cache,
+    run_kis_health_check,
+    validate_live_secret_file,
+)
 from app.execution.kis_errors import KisModeMismatchError
 from app.execution.kis_real import KisDevelopersApiClient
 from app.execution.kis_types import KisMode
@@ -79,6 +85,9 @@ class KisAuthAndModeTest(unittest.TestCase):
         self.assertEqual(mode.name, "live")
 
     def test_websocket_approval_key_uses_redactable_contract(self) -> None:
+        # Approval keys are cached so a reconnect reuses one KIS realtime
+        # session; start from a clean cache to observe the request contract.
+        reset_websocket_approval_key_cache()
         transport = RecordingKisTransport()
         with tempfile.TemporaryDirectory() as tmp:
             client = KisDevelopersApiClient(
@@ -97,6 +106,27 @@ class KisAuthAndModeTest(unittest.TestCase):
         self.assertEqual(key, "approval")
         approval_call = next(call for call in transport.calls if call["url"].endswith("/oauth2/Approval"))
         self.assertEqual(approval_call["body"]["grant_type"], "client_credentials")
+
+    def test_reconnect_reuses_one_approval_key(self) -> None:
+        """Regression: a new key per reconnect opened a new KIS realtime session
+        each time, draining the account's subscription budget to one symbol."""
+        reset_websocket_approval_key_cache()
+        transport = RecordingKisTransport()
+        with tempfile.TemporaryDirectory() as tmp:
+            client = KisDevelopersApiClient(
+                app_key="app",
+                app_secret="secret",
+                account_no="12345678-01",
+                paper=True,
+                enabled=True,
+                transport=transport,
+                token_cache_path=Path(tmp) / "token.json",
+            )
+            keys = [issue_websocket_approval_key(client) for _ in range(5)]
+
+        approval_calls = [c for c in transport.calls if c["url"].endswith("/oauth2/Approval")]
+        self.assertEqual(len(approval_calls), 1)
+        self.assertEqual(len(set(keys)), 1)
 
     def test_health_check_covers_token_account_and_websocket(self) -> None:
         transport = RecordingKisTransport()

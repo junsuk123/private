@@ -15,6 +15,9 @@ from app.data.realtime_store import RealtimeMarketDataStore
 from app.data.realtime_types import KIS_REALTIME_SOURCE, OrderbookLevel, RealtimeOrderbookSnapshot, RealtimeTradeTick
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.live_training_pipeline import (
+    _merge_materialized_training_rows,
+    _thin_training_rows,
+    backfill_live_feature_frames_from_realtime_store,
     build_live_training_rows_from_feature_journal,
     collect_live_feature_frames_from_realtime_store,
     live_training_status,
@@ -24,6 +27,59 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 
 
 class LiveTrainingPipelineTest(unittest.TestCase):
+    def test_materialized_rows_replace_matured_label_for_same_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "training.sqlite3"
+            base = _training_row(
+                ticker="F",
+                as_of="2026-07-28T13:00:00+00:00",
+                label=0,
+                label_source="triple_barrier_terminal",
+            )
+            _merge_materialized_training_rows(store, [base])
+            matured = {
+                **base,
+                "label": 1,
+                "label_source": "triple_barrier_take_profit",
+                "forward_net_return_bps": 25.0,
+            }
+
+            rows, stats = _merge_materialized_training_rows(store, [matured])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["label"], 1)
+        self.assertEqual(rows[0]["label_source"], "triple_barrier_take_profit")
+        self.assertEqual(stats["new_rows"], 0)
+
+    def test_training_rows_collapse_sub_five_second_refreshes_per_symbol(self) -> None:
+        rows = [
+            _training_row(
+                ticker="F",
+                as_of=f"2026-07-28T13:00:0{second}+00:00",
+                label=second % 2,
+                label_source="triple_barrier_terminal",
+            )
+            for second in range(5)
+        ]
+        rows.append(
+            _training_row(
+                ticker="396500",
+                as_of="2026-07-28T13:00:01+00:00",
+                label=1,
+                label_source="triple_barrier_take_profit",
+            )
+        )
+
+        with patch.dict(os.environ, {"LIVE_TRAINING_MIN_ROW_SPACING_SECONDS": "5"}):
+            thinned = _thin_training_rows(rows)
+
+        self.assertEqual(len(thinned), 2)
+        self.assertEqual({row["ticker"] for row in thinned}, {"F", "396500"})
+        self.assertEqual(
+            next(row for row in thinned if row["ticker"] == "F")["as_of"],
+            "2026-07-28T13:00:04+00:00",
+        )
+
     def test_builds_rows_from_collected_live_feature_frames(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal = Path(tmp) / "frames.jsonl"
@@ -83,6 +139,102 @@ class LiveTrainingPipelineTest(unittest.TestCase):
         self.assertEqual(second["skip_reason"], "UNCHANGED_LABELLED_DATASET")
         self.assertEqual(len(candidates), 1)
 
+    def test_changed_feature_values_force_retraining_even_when_labels_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=200)
+            registry = ModelArtifactRegistry(Path(tmp) / "models")
+            with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
+                first = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+                frames = [
+                    json.loads(line)
+                    for line in journal.read_text(encoding="utf-8").splitlines()
+                ]
+                frames[0]["values"]["orderbook_imbalance"] += 0.01
+                journal.write_text(
+                    "".join(json.dumps(frame) + "\n" for frame in frames),
+                    encoding="utf-8",
+                )
+                second = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+
+        self.assertNotEqual(first["artifact_id"], second["artifact_id"])
+        self.assertFalse(second.get("training_skipped", False))
+
+    def test_new_mature_labels_accumulate_in_materialized_training_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=200)
+            registry = ModelArtifactRegistry(Path(tmp) / "models")
+            with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
+                first = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+                _write_frames(journal, count=220)
+                second = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+
+        self.assertGreater(
+            second["metrics"]["example_count"],
+            first["metrics"]["example_count"],
+        )
+        self.assertGreater(second["training_data"]["fresh_row_count"], 0)
+        self.assertGreater(second["training_data"]["new_materialized_row_count"], 0)
+        self.assertEqual(first["training_state"]["mode"], "full")
+        self.assertEqual(second["training_state"]["mode"], "incremental")
+        self.assertEqual(
+            second["training_state"]["parent_artifact_id"],
+            first["artifact_id"],
+        )
+        self.assertLess(
+            second["training_state"]["incremental_example_count"],
+            second["training_state"]["cumulative_example_count"],
+        )
+
+    def test_data_format_change_forces_full_retraining(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=200)
+            registry = ModelArtifactRegistry(Path(tmp) / "models")
+            with patch.dict(
+                os.environ,
+                {
+                    "LIVE_LABEL_MIN_NET_RETURN_BPS": "20",
+                    "LIVE_TRAINING_MIN_ROW_SPACING_SECONDS": "5",
+                },
+            ):
+                first = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+            _write_frames(journal, count=220)
+            with patch.dict(
+                os.environ,
+                {
+                    "LIVE_LABEL_MIN_NET_RETURN_BPS": "20",
+                    "LIVE_TRAINING_MIN_ROW_SPACING_SECONDS": "15",
+                },
+            ):
+                second = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+
+        self.assertEqual(first["training_state"]["mode"], "full")
+        self.assertEqual(second["training_state"]["mode"], "full")
+        self.assertEqual(
+            second["training_state"]["full_retrain_reason"],
+            "NO_COMPATIBLE_PARENT_STATE",
+        )
+
     def test_insufficient_collected_frames_do_not_create_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             journal = Path(tmp) / "frames.jsonl"
@@ -112,6 +264,62 @@ class LiveTrainingPipelineTest(unittest.TestCase):
 
             self.assertEqual(result["built"], 1)
             self.assertTrue(journal.exists())
+
+    def test_backfills_multiple_causal_frames_from_retained_events(self) -> None:
+        now = datetime.now(timezone.utc) - timedelta(minutes=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rt.sqlite3"
+            journal = Path(tmp) / "features.jsonl"
+            store = RealtimeMarketDataStore(db_path)
+            for index in range(12):
+                moment = now + timedelta(seconds=index * 5)
+                store.save_ticks(
+                    (
+                        RealtimeTradeTick(
+                            symbol="396500",
+                            exchange_timestamp=moment,
+                            received_at=moment,
+                            source=KIS_REALTIME_SOURCE,
+                            price=10000 + index,
+                            volume=100 + index,
+                            sequence_key=f"backfill-tick:{index}",
+                        ),
+                    )
+                )
+                store.save_orderbooks(
+                    (
+                        RealtimeOrderbookSnapshot(
+                            symbol="396500",
+                            exchange_timestamp=moment,
+                            received_at=moment,
+                            source=KIS_REALTIME_SOURCE,
+                            levels=(
+                                OrderbookLevel(
+                                    9999 + index,
+                                    1000,
+                                    10001 + index,
+                                    900,
+                                ),
+                            ),
+                            sequence_key=f"backfill-book:{index}",
+                        ),
+                    )
+                )
+
+            result = backfill_live_feature_frames_from_realtime_store(
+                db_path=db_path,
+                journal_path=journal,
+                stride_seconds=5,
+                maximum_frames=20,
+                lookback_hours=1,
+            )
+
+            self.assertGreaterEqual(result["built"], 10)
+            frames = [json.loads(line) for line in journal.read_text().splitlines()]
+            self.assertEqual(
+                {frame["feature_schema_hash"] for frame in frames},
+                {LIVE_SHORT_HORIZON_SCHEMA.schema_hash},
+            )
 
     def test_status_explains_missing_live_training_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,6 +364,26 @@ def _write_frames(path: Path, *, count: int, flat: bool = False) -> None:
                 "values": values,
             }
             file.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _training_row(
+    *,
+    ticker: str,
+    as_of: str,
+    label: int,
+    label_source: str,
+) -> dict:
+    return {
+        "features": {name: 0.0 for name in LIVE_SHORT_HORIZON_SCHEMA.feature_names},
+        "label": label,
+        "forward_net_return_bps": 10.0 if label else -10.0,
+        "gross_forward_return_bps": 12.0 if label else -8.0,
+        "label_source": label_source,
+        "ticker": ticker,
+        "as_of": as_of,
+        "source": "test",
+        "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+    }
 
 
 def _seed_realtime_store(store: RealtimeMarketDataStore, now: datetime) -> None:

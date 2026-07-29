@@ -49,6 +49,46 @@ def trend_up_features(**over) -> TechnicalFeatureSet:
     return TechnicalFeatureSet(**base)
 
 
+def tick_features(**over) -> TechnicalFeatureSet:
+    """Trend-up bars plus a populated sub-second window.
+
+    The owned-strategy path fires on ticks, so a bar-only fixture must fail
+    closed. This helper is the fixture for the cases that should fire.
+    """
+    tick = dict(
+        return_1s=0.0002,
+        return_5s=0.0008,
+        return_10s=0.0010,
+        tick_count_1s=2.0,
+        tick_count_5s=9.0,
+        volume_1s_log=6.0,
+        volume_5s_log=8.0,
+        aggressor_imbalance_5s=0.35,
+        realized_volatility_10s=0.0025,
+        spread_change_5s=-0.4,
+        orderbook_imbalance_change_5s=0.1,
+        second_data_ready=1.0,
+    )
+    tick.update(over)
+    return trend_up_features(**tick)
+
+
+def _election(strategy_id: str):
+    """Minimal election context that satisfies each context-dependent algorithm."""
+    from app.technical.strategy_algorithms import ElectionContext
+
+    extra = {
+        "event_momentum": dict(
+            event_fresh=True, event_age_seconds=120.0, event_ttl_seconds=1800.0
+        ),
+        "cross_sectional_relative_strength": dict(sector_rank=1, sector_candidate_count=8),
+        "gap_context": dict(
+            gap_rate=0.02, gap_submode="continuation", session_open_price=99.0
+        ),
+    }
+    return ElectionContext(strategy_id, **extra.get(strategy_id, {}))
+
+
 class TestProviderSchema:
     def test_all_providers_output_valid_schema(self):
         f = trend_up_features()
@@ -191,3 +231,124 @@ class TestCompositeEngine:
     def test_no_exit_deterioration_when_healthy(self):
         codes = self.engine.evaluate_exit_deterioration(trend_up_features())
         assert codes == ()
+
+    def test_owned_strategy_runs_its_own_algorithm(self):
+        features = tick_features(breakout_strength=0.0007)
+        momentum = self.engine.evaluate_owned_strategy(features, "intraday_momentum")
+        breakout = self.engine.evaluate_owned_strategy(features, "breakout_volume")
+        assert momentum.selected_methodology == "intraday_momentum"
+        assert breakout.selected_methodology == "breakout_volume"
+        assert momentum.diagnostics["strategy_locked"] is True
+        assert breakout.diagnostics["strategy_locked"] is True
+        # Distinct algorithms, so distinct evidence — not one shared provider.
+        assert momentum.diagnostics["algorithm"]["strategy_id"] == "intraday_momentum"
+        assert breakout.diagnostics["algorithm"]["strategy_id"] == "breakout_volume"
+        assert set(momentum.reason_codes) != set(breakout.reason_codes)
+
+    def test_owned_strategy_fails_closed_without_tick_data(self):
+        # Bar-only input can never fire a mechanical tick trigger.
+        signal = self.engine.evaluate_owned_strategy(
+            trend_up_features(),
+            "intraday_momentum",
+        )
+        assert signal.direction == SignalDirection.HOLD
+        assert "TICK_WINDOW_NOT_READY" in signal.reason_codes
+
+    def test_owned_momentum_requires_bar_trend_agreement(self):
+        signal = self.engine.evaluate_owned_strategy(
+            tick_features(macd_histogram=-0.4),
+            "intraday_momentum",
+        )
+        assert signal.direction == SignalDirection.HOLD
+        assert "BAR_TREND_DISAGREES" in signal.reason_codes
+
+    def test_owned_momentum_requires_buy_side_aggressor_flow(self):
+        signal = self.engine.evaluate_owned_strategy(
+            tick_features(aggressor_imbalance_5s=-0.4),
+            "intraday_momentum",
+        )
+        assert signal.direction == SignalDirection.HOLD
+        assert "AGGRESSOR_FLOW_NOT_BUY_SIDE" in signal.reason_codes
+
+    def test_every_strategy_id_has_a_distinct_algorithm(self):
+        """Regression: four ids used to resolve to one momentum provider."""
+        from app.technical.strategy_algorithms import ALGORITHM_IDS, build_algorithm_registry
+
+        registry = build_algorithm_registry()
+        assert set(registry) == set(ALGORITHM_IDS)
+        assert len({type(algorithm) for algorithm in registry.values()}) == len(ALGORITHM_IDS)
+        # Exit geometry must also differ by thesis, not just by a bps constant.
+        features = tick_features()
+        bases = {
+            algorithm.exit_rule(100.0, features, _election(strategy_id)).target_basis
+            for strategy_id, algorithm in registry.items()
+        }
+        assert len(bases) >= 4
+
+    def test_mean_reversion_does_not_fire_on_a_momentum_tape(self):
+        signal = self.engine.evaluate_owned_strategy(tick_features(), "vwap_mean_reversion")
+        assert signal.direction == SignalDirection.HOLD
+        assert "VWAP_DISPLACEMENT_TOO_SMALL" in signal.reason_codes
+
+    def test_shock_reversal_needs_a_shock_and_a_contracting_spread(self):
+        shock = tick_features(
+            return_10s=-0.0060,
+            spread_change_5s=-2.5,
+            aggressor_imbalance_5s=-0.20,
+            orderbook_imbalance=0.30,
+        )
+        fired = self.engine.evaluate_owned_strategy(shock, "liquidity_shock_reversal")
+        assert fired.direction == SignalDirection.BUY
+        assert "LIQUIDITY_SHOCK_STABILISED" in fired.reason_codes
+
+        widening = self.engine.evaluate_owned_strategy(
+            tick_features(
+                return_10s=-0.0060,
+                spread_change_5s=3.0,
+                aggressor_imbalance_5s=-0.20,
+                orderbook_imbalance=0.30,
+            ),
+            "liquidity_shock_reversal",
+        )
+        assert widening.direction == SignalDirection.HOLD
+        assert "SPREAD_STILL_WIDENING" in widening.reason_codes
+
+    def test_event_momentum_requires_event_context(self):
+        from app.technical.strategy_algorithms import ElectionContext
+
+        without = self.engine.evaluate_owned_strategy(tick_features(), "event_momentum")
+        assert without.direction == SignalDirection.HOLD
+        assert "EVENT_EVIDENCE_ABSENT" in without.reason_codes
+
+        expired = self.engine.evaluate_owned_strategy(
+            tick_features(),
+            "event_momentum",
+            ElectionContext(
+                "event_momentum",
+                event_fresh=True,
+                event_age_seconds=4000.0,
+                event_ttl_seconds=1800.0,
+            ),
+        )
+        assert "EVENT_TTL_EXPIRED" in expired.reason_codes
+
+    def test_gap_context_picks_exactly_one_submode(self):
+        from app.technical.strategy_algorithms import ElectionContext
+
+        # A continuation mandate can never buy a down gap.
+        signal = self.engine.evaluate_owned_strategy(
+            tick_features(),
+            "gap_context",
+            ElectionContext("gap_context", gap_rate=-0.02, gap_submode="continuation"),
+        )
+        assert "GAP_CONTINUATION_REQUIRES_UP_GAP" in signal.reason_codes
+
+    def test_owned_strategy_no_longer_blocks_on_regime(self):
+        """Regime/liquidity admissibility moved to the supervisor."""
+        signal = self.engine.evaluate_owned_strategy(
+            tick_features(liquidity_score=0.05, realized_volatility=0.05),
+            "intraday_momentum",
+        )
+        assert rc.LOW_LIQUIDITY_TECHNICAL_BLOCK not in signal.reason_codes
+        assert rc.HIGH_VOLATILITY_TECHNICAL_BLOCK not in signal.reason_codes
+        assert "regime" in signal.diagnostics

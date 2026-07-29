@@ -212,7 +212,7 @@ def render_markdown(result: dict[str, Any], metrics: dict[str, Any], journal: Pa
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--journal", default="logs/live-orders.jsonl")
-    parser.add_argument("--markdown", default="docs/profitability_replay_report.md")
+    parser.add_argument("--markdown", default="data/reports/profitability_replay.md")
     args = parser.parse_args()
 
     journal = Path(args.journal)

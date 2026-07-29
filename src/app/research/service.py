@@ -292,7 +292,11 @@ class ResearchService:
                     name=str(target["name"]),
                 )
                 if metric is None:
-                    raise RuntimeError("missing_api_key_or_data")
+                    raise RuntimeError(
+                        "ECOS_API_KEY_MISSING"
+                        if not ecos.api_key
+                        else "ECOS_DATA_UNAVAILABLE"
+                    )
                 else:
                     macro_metrics.append(metric)
 

@@ -1,88 +1,46 @@
-# Documentation Index
+# Documentation
 
-이 디렉터리는 현재 코드 기준의 운영 문서입니다. 최상위 개요는 [../README.md](../README.md)를 먼저 보고, 세부 운영/설계는 아래 문서를 따라가면 됩니다.
+현재 코드 기준의 운영 문서입니다. 최상위 개요는 [../README.md](../README.md)를 먼저 보세요.
 
-![Current runtime architecture](diagrams/system_overview.png)
+문서는 6개로 유지합니다. 새 문서를 만들기 전에 기존 문서를 갱신할 수 있는지 먼저 확인하세요.
 
-## 현재 런타임 계약
+| 문서 | 내용 |
+| --- | --- |
+| [architecture.md](architecture.md) | 런타임 진입점, 모듈 지도, 저장소 레이아웃, API 표면, 운영 모드, 가속 경계, 알려진 한계 |
+| [ontology_and_gnn.md](ontology_and_gnn.md) | 온톨로지 L0–L6 계층, RDF/OWL/SHACL 경계, closed-world 전략 게이트, 거시–미시 추론, strategy-utility R-GCN, NPU/CPU 분할 |
+| [decision_and_risk.md](decision_and_risk.md) | 어떤 데이터가 어떤 판단에 쓰이는지, ProfitabilityGate, DynamicExitPolicy, 사이징·리스크, 실행과 복구, 거부 사유 코드 |
+| [live_trading.md](live_trading.md) | 설치, 점검, 시작, 제출 게이트, 조용한 사이클 진단, 종료/비상 정지, arming, 런타임 프로파일, 로그 |
+| [raspberry_pi_deployment.md](raspberry_pi_deployment.md) | Pi CPU-only 설치/실행/서비스/키오스크 |
+| [validation.md](validation.md) | 측정 결과, 벤치마크, 리플레이 지표, 승격 판정과 거부 사유 |
 
-`run.ps1` 런타임은 KIS live-capable realtime 시스템입니다. 서버 시작 시 KIS 실시간 수집, read-only 실계좌 확인, 주기적 live short-horizon 학습, 독립 자동거래 루프가 자동으로 시작될 수 있습니다. OpenVINO/NPU는 숫자 evidence scoring에만 사용되며, 실패하거나 장치가 없으면 CPU로 fallback합니다.
+## 다이어그램
 
-최종 주문 권한은 항상 CPU 제어 경로에 남아 있습니다.
+`docs/diagrams/`의 SVG는 스크립트로 생성됩니다. 구조가 바뀌면 스크립트를 고치고 재생성하세요.
 
-- `SharedLiveDecisionEngine`: SELL/REDUCE를 BUY보다 먼저 평가
-- `TradingCostEngine`: 수수료, 세금, slippage, spread, net return 검사
-- `PrincipalProtectionEngine`: 원금 보호와 drawdown 예산
-- `RiskManager` / FinalTradeGate: 최종 승인/거부
-- `LiveExecutionCoordinator`: KIS limit order 제출, open order keep/amend, idempotency
+```powershell
+python scripts/gen_docs_diagrams.py         # ontology_gnn_layers, data_to_decision_flow
+python scripts/gen_profitability_diagrams.py # profitability_* 4종
+```
 
-## GUI 문서
+| 파일 | 쓰이는 곳 |
+| --- | --- |
+| `system_overview.png` / `.svg` | 최상위 README, architecture.md |
+| `ontology_gnn_layers.svg` | 최상위 README, ontology_and_gnn.md |
+| `data_to_decision_flow.svg` | 최상위 README, architecture.md, decision_and_risk.md |
+| `ontology_layered_architecture.*`, `ontology_reasoning_boundary.*` | ontology_and_gnn.md, `src/app/ontology/README.md` |
+| `profitability_architecture.svg`, `profitability_decision_flow.svg`, `profitability_dynamic_exit.svg`, `profitability_before_after.svg` | decision_and_risk.md, validation.md |
 
-- Web 운영 화면: `GET /account`
-  - 계좌, 현금, 외화, 보유종목, 실현/평가손익, 자산 히스토리, 자산 배분
-  - 자동거래 cycle, SELL/BUY 평가 흐름, 제출/정정/차단 현황, 최근 보류 사유
-  - 종료 버튼은 신규 BUY를 먼저 비활성화하고, 가능한 profit-seeking SELL 주문을 제출한 뒤 종료를 예약
-- Root 연구 화면: `GET /`
-  - 연구 refresh, operation mode, paper/mock trading, live snapshot, diagnostics, ontology graph
-- Pi/LCD 화면: `GET /display`
-  - 사람이 읽기 쉬운 trade-reason 카드 보드
-- 온톨로지 전체 화면: `GET /display/ontology`
-  - ontology graph payload를 시각화하는 키오스크/전체화면용 화면
+## 코드 옆에 사는 문서
 
-관련 API:
+| 위치 | 내용 |
+| --- | --- |
+| [../src/app/ontology/README.md](../src/app/ontology/README.md) | TTL 파일 구성과 온톨로지 안전 확장 규칙 |
+| [../packaging/raspberrypi/README.md](../packaging/raspberrypi/README.md) | Pi 패키지 파일 맵과 빠른 명령 |
+| [../config/secrets/README.md](../config/secrets/README.md) | secrets 파일 규약 |
 
-- `GET /api/account/dashboard`
-- `GET /api/account/asset-history`
-- `GET /api/realtime-trading/status`
-- `POST /api/live-trading/terminate`
-- `GET /api/trade-explanations`
-- `GET /api/ontology/graph`
-- `GET /api/realtime/runtime`
-- `GET /api/npu/runtime`
+## 읽는 순서
 
-## Core Architecture
-
-- [architecture.md](architecture.md): 런타임 모듈, API surface, operation mode, deterministic safety boundary
-- [system_algorithm_analysis.md](system_algorithm_analysis.md): `src/app` 알고리즘별 구현 맵
-- [data_environment_separation.md](data_environment_separation.md): realtime-only data layout, synthetic-data rejection
-- [realtime_short_horizon_policy.md](realtime_short_horizon_policy.md): 실시간 학습/추론/준비도 정책
-
-## Live Trading
-
-- [live_trading_setup.md](live_trading_setup.md): 설치, secrets/config, readiness dry-run, arming
-- [live_trading_runbook.md](live_trading_runbook.md): 운영 절차, 대시보드, stall 진단, 종료, emergency stop
-- [live_trading_safety_gates.md](live_trading_safety_gates.md): 제출/BUY/SELL 게이트와 rejection code
-- [execution_risk_and_order_pricing.md](execution_risk_and_order_pricing.md): live SELL/BUY 재가격(order_pricing_policy), no-orderbook·거래소 라우팅 가드(exchange_resolver), advisory trading-domain ontology
-- [small_account_loss_sell_fix_report.md](small_account_loss_sell_fix_report.md): small-account loss churn guard와 현금 분해
-- [live_short_horizon_model_decision.md](live_short_horizon_model_decision.md): live ML 모델은 advisory-only라는 결정 기록
-
-## Strategy And Features
-
-- [short_term_trading_strategy_design.md](short_term_trading_strategy_design.md): 단기 전략 연구/게이트 설계
-- [semantic_feature_engine.md](semantic_feature_engine.md): semantic feature, indicator routing, LLM classification, no-lookahead
-- [semantic_feature_codebase_analysis.md](semantic_feature_codebase_analysis.md): semantic feature 통합 분석
-- [theory_aware_ontology_voting.md](theory_aware_ontology_voting.md): ontology triple을 theory vote로 변환하는 경로
-
-## Ontology
-
-- [ontology_standardization_report.md](ontology_standardization_report.md): RDF/RDFS/OWL + SHACL additive layer
-- [ontology_migration_audit.md](ontology_migration_audit.md): custom graph에서 표준 온톨로지로의 mapping
-- Diagrams:
-  - [diagrams/ontology_framework.png](diagrams/ontology_framework.png)
-  - [diagrams/ontology_layered_architecture.png](diagrams/ontology_layered_architecture.png)
-  - [diagrams/ontology_reasoning_boundary.png](diagrams/ontology_reasoning_boundary.png)
-  - [diagrams/ontology_standardization_components.png](diagrams/ontology_standardization_components.png)
-  - [diagrams/ontology_migration_beforeafter.png](diagrams/ontology_migration_beforeafter.png)
-
-## Acceleration
-
-- [npu_runtime_architecture.md](npu_runtime_architecture.md): CPU/NPU split, environment controls, fallback behavior
-- [npu_optimization_audit.md](npu_optimization_audit.md): vectorized screening, Rust/PyO3 native core, rolling cache
-- [npu_benchmark_results.md](npu_benchmark_results.md): CPU vs NPU benchmark snapshots
-
-## Raspberry Pi
-
-- [raspberry_pi_deployment.md](raspberry_pi_deployment.md): CPU-only Pi install/run/service/kiosk guide
-- [../packaging/raspberrypi/README.md](../packaging/raspberrypi/README.md): Pi package file map and quick commands
-
-Pi 기본값은 read-only, CPU-only입니다. `/account`는 LAN 브라우저용이고, `pi-dashboard-launch.sh`는 attached LCD용 `/display` 키오스크를 띄웁니다.
+1. 처음이라면 [../README.md](../README.md) → [architecture.md](architecture.md)
+2. 왜 거래가 안 나가는지 알고 싶다면 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기" → [decision_and_risk.md](decision_and_risk.md)의 거부 사유 코드
+3. 추론 구조를 이해하려면 [ontology_and_gnn.md](ontology_and_gnn.md)
+4. 어떤 주장이 증거를 갖고 있는지 확인하려면 [validation.md](validation.md)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -92,10 +93,11 @@ def build_analysis_context(
     )
     stored_events = stored_research.events if stored_research else ()
     live_events = research_result.events if research_result else ()
-    events = _merge_events(
-        _merge_events(stored_events, live_events),
-        collect_sample_research_events(),
-    )
+    # Sample events are valid only for an explicitly offline/demo context.
+    # Injecting them into a live context creates synthetic ontology evidence even
+    # though the runtime policy says synthetic inputs are forbidden.
+    sample_events = collect_sample_research_events() if demo_offline_context else ()
+    events = _merge_events(_merge_events(stored_events, live_events), sample_events)
     events = _limit_events_for_runtime(events, markets)
     stored_raw_records = getattr(stored_research, "raw_records", ()) if stored_research else ()
     live_raw_records = getattr(research_result, "raw_records", ()) if research_result else ()
@@ -696,6 +698,7 @@ def _limit_events_for_runtime(
     events: tuple[ClassifiedEvent, ...],
     markets: tuple[MarketSnapshot, ...],
 ) -> tuple[ClassifiedEvent, ...]:
+    events = tuple(_sanitize_legacy_event_tickers(event) for event in events)
     try:
         limit = max(25, int(os.getenv("ANALYSIS_EVENT_LIMIT", "180")))
     except ValueError:
@@ -721,3 +724,29 @@ def _limit_events_for_runtime(
         return priority, event.event_date
 
     return tuple(sorted(events, key=score, reverse=True)[:limit])
+
+
+def _sanitize_legacy_event_tickers(event: ClassifiedEvent) -> ClassifiedEvent:
+    """Keep old persisted events from reintroducing ambiguous word/ticker matches.
+
+    New classifications already apply the richer universe-aware check.  This
+    conservative runtime guard is needed for records written before that fix:
+    one- and two-character US symbols are accepted only when the article
+    explicitly marks them as a ticker.
+    """
+
+    text = f"{event.title} {event.summary}"
+    kept: list[str] = []
+    for raw_ticker in event.tickers:
+        ticker = str(raw_ticker).strip().upper()
+        if not ticker:
+            continue
+        if ticker.isdigit() or len(ticker) >= 3:
+            kept.append(ticker)
+            continue
+        escaped = re.escape(ticker)
+        explicit_pattern = rf"(?:\${escaped}\b|(?:NASDAQ|NYSE|AMEX)\s*:\s*{escaped}\b|\bticker\s+{escaped}\b)"
+        if re.search(explicit_pattern, text, flags=re.IGNORECASE):
+            kept.append(ticker)
+    sanitized = tuple(dict.fromkeys(kept))
+    return event if sanitized == event.tickers else replace(event, tickers=sanitized)

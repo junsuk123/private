@@ -71,7 +71,7 @@ class SemanticPolicyScorerConfig:
 
     This is deliberately NOT OWL: all weights, thresholds, and confidence math
     live here in Python. OWL handles semantic categorization; this handles
-    numbers (see docs/ontology_migration_audit.md).
+    numbers (see docs/ontology_and_gnn.md).
     """
 
     base_confidence: float = 0.40

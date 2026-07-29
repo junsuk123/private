@@ -11,7 +11,7 @@
 #   3. built-in defaults in src/app/cost/profitability_gate.py
 #
 # These are INITIAL defaults to be tuned from realized PnL/execution logs — they are
-# not assumed universally optimal. See docs/profitability_gate.md.
+# not assumed universally optimal. See docs/decision_and_risk.md.
 
 # Minimum acceptable net expected return (after all costs) by market.
 # Overridable by REALTIME_MIN_BUY_NET_RETURN_KR / REALTIME_MIN_BUY_NET_RETURN_US.

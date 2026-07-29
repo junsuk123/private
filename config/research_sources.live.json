@@ -79,7 +79,41 @@
     }
   ],
   "yahoo_chart_symbols": [],
-  "fred_series": [],
-  "ecos_series": [],
+  "fred_series": [
+    {
+      "series_id": "FEDFUNDS",
+      "name": "us_federal_funds_rate"
+    },
+    {
+      "series_id": "CPIAUCSL",
+      "name": "us_consumer_price_index"
+    },
+    {
+      "series_id": "UNRATE",
+      "name": "us_unemployment_rate"
+    },
+    {
+      "series_id": "DGS10",
+      "name": "us_treasury_10y_yield"
+    },
+    {
+      "series_id": "VIXCLS",
+      "name": "us_vix_close"
+    },
+    {
+      "series_id": "DTWEXBGS",
+      "name": "us_broad_dollar_index"
+    }
+  ],
+  "ecos_series": [
+    {
+      "statistic_code": "722Y001",
+      "item_code": "0101000",
+      "period": "D",
+      "start_date": "20260101",
+      "end_date": "20261231",
+      "name": "kr_bank_of_korea_base_rate"
+    }
+  ],
   "opendart_disclosures": []
 }

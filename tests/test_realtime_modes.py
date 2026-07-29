@@ -26,6 +26,8 @@ class RealtimeModesTest(unittest.TestCase):
         with web_module._live_lock:
             web_module._operation_mode_state["last_kis_connection"] = None
             web_module._operation_mode_state["live_trading_baseline_equity"] = None
+            web_module._operation_mode_state["stable_account_basis"] = None
+            web_module._operation_mode_state["account_degraded_since"] = None
             web_module._affordable_candidate_cache.update({"key": None, "at": 0.0, "symbols": ()})
             web_module._live_buy_candidate_backoff_until.clear()
             web_module._volume_surge_warm_cache.update({"at": 0.0, "symbols": ()})
@@ -46,6 +48,62 @@ class RealtimeModesTest(unittest.TestCase):
         patcher = patch("app.web._refresh_live_account_basis_for_auto", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_account_stabilizer_rejects_missing_position_without_sale_cash(self) -> None:
+        stable = {
+            "equity": 200_000.0,
+            "cash_equivalent_krw": 150_000.0,
+            "krw_cash": 100_000.0,
+            "foreign_cash_krw": 50_000.0,
+            "positions": [{"ticker": "F", "quantity": 2, "currency": "USD"}],
+        }
+        partial = {
+            **stable,
+            "cash_equivalent_krw": 100_000.0,
+            "krw_cash": 50_000.0,
+            "positions": [],
+        }
+
+        self.assertIs(web_module._stabilize_account_basis(stable), stable)
+        self.assertIs(web_module._stabilize_account_basis(partial), stable)
+
+    def test_account_basis_merge_preserves_transiently_missing_orderable_cash(self) -> None:
+        previous = {
+            "equity": 200_000.0,
+            "krw_cash": 100_000.0,
+            "foreign_cash_krw": 50_000.0,
+            "orderable_cash_by_currency": {"KRW": 99_000.0, "USD": 30.0},
+            "positions": [],
+        }
+        current = {
+            **previous,
+            "equity": 199_500.0,
+            "orderable_cash_by_currency": {"KRW": 0.0, "USD": 30.0},
+        }
+
+        merged = web_module._merge_live_account_basis_with_previous(current, previous)
+
+        self.assertEqual(merged["orderable_cash_by_currency"]["KRW"], 99_000.0)
+
+    def test_account_basis_caps_cash_components_to_broker_equity(self) -> None:
+        basis = web_module._account_basis_from_kis_connection(
+            {
+                "ok": True,
+                "account_checked": True,
+                "actual_equity": 200_000.0,
+                "invested_value": 0.0,
+                "krw_cash": 156_000.0,
+                "cash_equivalent_krw": 200_000.0,
+                "foreign_cash_krw": 92_000.0,
+                "cash_by_currency": {"KRW": 156_000.0, "USD": 67.2},
+                "orderable_cash_by_currency": {"KRW": 99_000.0, "USD": 67.2},
+                "positions": [],
+            }
+        )
+
+        self.assertEqual(basis["equity"], 200_000.0)
+        self.assertEqual(basis["cash_equivalent_krw"], 200_000.0)
+        self.assertEqual(basis["foreign_cash_krw"], 44_000.0)
 
     def test_learning_uses_unified_realtime_data_and_disallows_orders(self) -> None:
         state = OperationModeManager().start(OperationMode.LEARNING)
@@ -1228,6 +1286,61 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._pending_krx_buy_candidate_warmup.clear()
                 web_module._pending_krx_buy_candidate_warmup.update(previous_pending)
 
+    def test_dashboard_stream_symbol_stays_in_collector_priority(self) -> None:
+        from app.data.market_session import MarketPhase
+
+        account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        with web_module._live_lock:
+            previous_watch = dict(web_module._dashboard_krx_watch)
+            web_module._dashboard_krx_watch.clear()
+        try:
+            with (
+                patch("app.data.market_session.market_phase", return_value=MarketPhase.REGULAR),
+                patch("app.web._request_kis_realtime_collector_resubscribe") as request,
+            ):
+                web_module._observe_dashboard_market_stream("396500")
+                web_module._observe_dashboard_market_stream("396500")
+            request.assert_called_once_with("dashboard_stream", ("396500",))
+
+            with (
+                patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+                patch("app.web._load_realtime_collection_symbols", return_value=("005930",)),
+                patch("app.web._live_affordable_buy_candidate_symbols", return_value=("413630",)),
+                patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+                patch("app.web._pending_krx_buy_candidate_warmup_symbols", return_value=()),
+                patch.dict("os.environ", {"REALTIME_COLLECTOR_MAX_SYMBOLS": "2"}),
+            ):
+                symbols = web_module._kis_realtime_collector_symbols()
+
+            self.assertEqual(symbols[0], "396500")
+        finally:
+            with web_module._live_lock:
+                web_module._dashboard_krx_watch.clear()
+                web_module._dashboard_krx_watch.update(previous_watch)
+
+    def test_dashboard_stream_does_not_reconnect_regular_feed_after_hours(self) -> None:
+        from app.data.market_session import MarketPhase
+
+        with web_module._live_lock:
+            previous_watch = dict(web_module._dashboard_krx_watch)
+            web_module._dashboard_krx_watch.clear()
+        try:
+            with (
+                patch("app.data.market_session.market_phase", return_value=MarketPhase.AFTER),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch("app.web._request_kis_realtime_collector_resubscribe") as request,
+            ):
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = None
+                web_module._observe_dashboard_market_stream("396500")
+
+            request.assert_not_called()
+            self.assertEqual(web_module._dashboard_krx_watch_symbols(), ("396500",))
+        finally:
+            with web_module._live_lock:
+                web_module._dashboard_krx_watch.clear()
+                web_module._dashboard_krx_watch.update(previous_watch)
+
     def test_kis_realtime_collector_symbols_include_held_and_context_krx_names(self) -> None:
         account = AccountSnapshot(
             cash=100000.0,
@@ -1324,8 +1437,53 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._us_learning_watchlist_cache["symbols"] = ("HYZD",)
             candidates = web_module._realtime_engine_buy_candidates()
 
-        self.assertEqual(candidates, ("HOWL", "HYZD", "HST", "HUYA"))
+        # Cached ranking/watchlist symbols are ordering hints only. The engine
+        # may evaluate a symbol only when a fresh realtime tick proves that it
+        # is actually streaming.
+        self.assertEqual(candidates, ("HST", "HUYA"))
         broker_discovery.assert_not_called()
+
+    def test_web_macro_observer_uses_live_us_market_context(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        class Store:
+            def recent_ticks(self, symbol, since):
+                return tuple(
+                    SimpleNamespace(
+                        price=100.0 + index,
+                        volume=10,
+                        received_at=now,
+                        exchange_timestamp=now,
+                    )
+                    for index in range(8)
+                )
+
+            def recent_orderbooks(self, symbol, since):
+                return ()
+
+            def latest_tick(self, symbol):
+                return SimpleNamespace(received_at=now, price=107.0)
+
+        feature_builder = SimpleNamespace(
+            build=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no technical frame"))
+        )
+        decision_engine = SimpleNamespace(
+            store=Store(),
+            feature_builder=feature_builder,
+            market_refresher=None,
+        )
+        observer = web_module._build_macro_micro_observer(decision_engine)
+
+        self.assertIsNotNone(observer)
+        bundle = observer(
+            AccountSnapshot(cash=1_000.0, holdings=()),
+            (),
+            ("AAPL",),
+            now,
+        )
+
+        self.assertEqual(bundle.macro_result.candidate_symbols, ("AAPL",))
+        self.assertNotIn("MACRO_INSUFFICIENT_DATA", bundle.macro_result.reason_codes)
 
     def test_us_learning_watchlist_stays_fixed_during_cache_ttl(self) -> None:
         account = AccountSnapshot(
@@ -1376,6 +1534,63 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(symbols, ("AAPL", "MSFT"))
 
+    def test_us_learning_fast_poll_keeps_holdings_ahead_of_warm_symbols(self) -> None:
+        with (
+            patch("app.web._active_operation_mode", return_value="learning"),
+            patch("app.web._sticky_us_learning_symbols", return_value=("EDTK", "MSFT")),
+        ):
+            symbols = web_module._us_fast_poll_target_symbols(("F", "EDTK"))
+
+        self.assertEqual(symbols, ("F", "EDTK", "MSFT"))
+
+    def test_us_live_fast_poll_seeds_empty_watchlist(self) -> None:
+        with web_module._live_lock:
+            previous = dict(web_module._us_learning_watchlist_cache)
+            web_module._us_learning_watchlist_cache.update(
+                {"at": 0.0, "cash_usd": None, "symbols": ()}
+            )
+        try:
+            with (
+                patch("app.web._active_operation_mode", return_value="live_trading"),
+                patch("app.web._sticky_us_learning_symbols", return_value=("AAPL", "MSFT")) as warm,
+                patch.dict("os.environ", {"AUTO_RELIABILITY_US_WARM_SYMBOLS": "2"}),
+            ):
+                symbols = web_module._us_fast_poll_target_symbols(("F",))
+
+            self.assertEqual(symbols, ("F", "AAPL", "MSFT"))
+            warm.assert_called_once_with(2)
+        finally:
+            with web_module._live_lock:
+                web_module._us_learning_watchlist_cache.clear()
+                web_module._us_learning_watchlist_cache.update(previous)
+
+    def test_last_live_account_basis_prefers_stabilized_snapshot(self) -> None:
+        stable = {
+            "equity": 200_000.0,
+            "krw_cash": 100_000.0,
+            "cash_equivalent_krw": 200_000.0,
+            "positions": [],
+            "source": "kis_live_account",
+        }
+        raw = {
+            "account_checked": True,
+            "actual_equity": 120_000.0,
+            "krw_cash": 20_000.0,
+            "cash_equivalent_krw": 120_000.0,
+            "positions": [],
+        }
+        with web_module._live_lock:
+            previous_stable = web_module._operation_mode_state.get("stable_account_basis")
+            previous_connection = web_module._operation_mode_state.get("last_kis_connection")
+            web_module._operation_mode_state["stable_account_basis"] = stable
+            web_module._operation_mode_state["last_kis_connection"] = raw
+        try:
+            self.assertEqual(web_module._last_live_account_basis(), stable)
+        finally:
+            with web_module._live_lock:
+                web_module._operation_mode_state["stable_account_basis"] = previous_stable
+                web_module._operation_mode_state["last_kis_connection"] = previous_connection
+
     def test_kis_realtime_collector_symbols_are_capped_by_subscription_budget(self) -> None:
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
         many_symbols = tuple(f"{index:06d}" for index in range(1, 30))
@@ -1392,6 +1607,16 @@ class RealtimeModesTest(unittest.TestCase):
             symbols = web_module._kis_realtime_collector_symbols()
 
         self.assertLessEqual(len(symbols), 5)
+
+    def test_kis_training_candidate_rejects_penny_wide_spread_symbol(self) -> None:
+        store = SimpleNamespace(
+            latest_tick=lambda _symbol: SimpleNamespace(price=119.0),
+            latest_orderbook=lambda _symbol: SimpleNamespace(spread_bps=84.0),
+        )
+
+        self.assertFalse(
+            web_module._kis_realtime_training_candidate_viable("252670", store)
+        )
 
     def test_kis_realtime_collector_uses_live_client(self) -> None:
         with patch.dict("os.environ", {"KIS_PAPER_TRADING": "true"}, clear=False):
@@ -1483,6 +1708,29 @@ class RealtimeModesTest(unittest.TestCase):
             web_module._kis_realtime_collector_stop.clear()
             with web_module._live_lock:
                 web_module._live_state["collection_log"] = previous_log
+
+    def test_kis_complete_subscription_symbol_feeds_fast_feature_sampler(self) -> None:
+        with web_module._live_lock:
+            previous = web_module._kis_realtime_complete_symbols
+            web_module._kis_realtime_complete_symbols = ()
+        try:
+            web_module._record_kis_realtime_collector_result(
+                {
+                    "subscriptions_accepted": 2,
+                    "accepted_subscription_pairs": [
+                        {"symbol": "396500", "tr_id": "H0STCNT0"},
+                        {"symbol": "396500", "tr_id": "H0STASP0"},
+                    ],
+                }
+            )
+
+            with patch("app.web._dashboard_krx_watch_symbols", return_value=()):
+                symbols = web_module._krx_feature_frame_symbols()
+
+            self.assertEqual(symbols, ("396500",))
+        finally:
+            with web_module._live_lock:
+                web_module._kis_realtime_complete_symbols = previous
 
     def test_live_order_journal_snapshot_reports_submitted_and_blocked_orders(self) -> None:
         events = [

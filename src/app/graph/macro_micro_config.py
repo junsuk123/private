@@ -98,6 +98,12 @@ def load_macro_micro_policy(path: str | Path | None = None) -> MacroMicroPolicy:
     macro_config = MacroReasonerConfig(
         candidate_limit=_clamp_int(macro_raw.get("candidate_limit", macro_env.candidate_limit), macro_env.candidate_limit, lo=1, hi=500, fallbacks=fallbacks, name="candidate_limit"),
         minimum_macro_confidence=_float(macro_raw.get("minimum_macro_confidence", macro_env.minimum_macro_confidence), macro_env.minimum_macro_confidence, fallbacks=fallbacks, name="minimum_macro_confidence"),
+        # These three drive BLOCK_BUY, so they must survive the YAML rebuild;
+        # previously they silently reverted to the class defaults and any env
+        # or YAML override was discarded.
+        high_volatility_threshold=_float(macro_raw.get("high_volatility_threshold", macro_env.high_volatility_threshold), macro_env.high_volatility_threshold, fallbacks=fallbacks, name="high_volatility_threshold"),
+        news_shock_severity_threshold=_float(macro_raw.get("news_shock_severity_threshold", macro_env.news_shock_severity_threshold), macro_env.news_shock_severity_threshold, fallbacks=fallbacks, name="news_shock_severity_threshold"),
+        news_shock_minimum_events=_clamp_int(macro_raw.get("news_shock_minimum_events", macro_env.news_shock_minimum_events), macro_env.news_shock_minimum_events, lo=1, hi=20, fallbacks=fallbacks, name="news_shock_minimum_events"),
         block_buy_on_high_volatility=_as_bool(macro_raw.get("block_buy_on_high_volatility"), True),
         block_buy_on_news_shock=_as_bool(macro_raw.get("block_buy_on_news_shock"), True),
         block_buy_on_low_liquidity_market=_as_bool(macro_raw.get("block_buy_on_low_liquidity_market"), True),

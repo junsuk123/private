@@ -4,7 +4,7 @@ This package adds deterministic technical indicators, a rule-based market
 regime classifier, methodology-specific signal providers, supervised label
 builders, and a conservative prediction engine.
 
-Design contract (see docs/technical_prediction_layer.md):
+Design contract (see docs/decision_and_risk.md):
     * Every output in this package is ADVISORY EVIDENCE ONLY.
     * Nothing here creates or submits a FinalOrder, and nothing here relaxes
       TradingCostEngine / ProfitabilityGate / PrincipalProtectionEngine /

@@ -344,27 +344,54 @@ class FredMacroCollector:
         self.client = client or HttpClient()
 
     def collect_latest(self, series_id: str, name: str) -> MacroMetricRecord | None:
-        if not self.api_key:
+        if self.api_key:
+            payload = self.client.get_json(
+                "https://api.stlouisfed.org/fred/series/observations",
+                {
+                    "series_id": series_id,
+                    "api_key": self.api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 10,
+                },
+            )
+            rows = (
+                (str(item.get("date") or ""), str(item.get("value") or ""))
+                for item in payload.get("observations", [])
+            )
+            raw_url = "https://api.stlouisfed.org/fred/series/observations"
+            source_name = "fred"
+        else:
+            # FRED's public graph CSV is an official structured endpoint and does
+            # not require an API key.  Keep the authenticated API as the primary
+            # path, but do not discard all macro intelligence on installations
+            # where a key has not yet been provisioned.
+            csv_rows = self.client.get_csv_rows(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv",
+                {"id": series_id},
+            )
+            rows = (
+                (
+                    str(item.get("observation_date") or item.get("DATE") or ""),
+                    str(item.get(series_id) or ""),
+                )
+                for item in reversed(csv_rows)
+            )
+            raw_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+            source_name = "fred_public_csv"
+        item_date = ""
+        item_value = ""
+        for candidate_date, candidate_value in rows:
+            if candidate_date and candidate_value not in {"", "."}:
+                item_date, item_value = candidate_date, candidate_value
+                break
+        if not item_date:
             return None
-        payload = self.client.get_json(
-            "https://api.stlouisfed.org/fred/series/observations",
-            {
-                "series_id": series_id,
-                "api_key": self.api_key,
-                "file_type": "json",
-                "sort_order": "desc",
-                "limit": 1,
-            },
-        )
-        observations = payload.get("observations", [])
-        if not observations:
-            return None
-        item = observations[0]
-        source = source_now("fred", "https://api.stlouisfed.org/fred/series/observations", f"fred:{series_id}")
+        source = source_now(source_name, raw_url, f"fred:{series_id}")
         return MacroMetricRecord(
             name=name,
-            value=float(item["value"]),
-            observed_at=datetime.fromisoformat(item["date"]).replace(tzinfo=timezone.utc),
+            value=float(item_value),
+            observed_at=datetime.fromisoformat(item_date).replace(tzinfo=timezone.utc),
             source=source,
         )
 
