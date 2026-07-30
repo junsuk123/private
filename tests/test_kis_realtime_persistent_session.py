@@ -159,3 +159,16 @@ class TestPersistentSession:
         counts = _run(symbols=["005930"], resubscribe_event=event, stop_event=_StopAfter(3))
         assert counts["resubscribe_requested"] == 1
         assert "in_place_resubscribes" not in counts
+
+    def test_session_owner_change_releases_registrations(self, patched):
+        active = iter((True, False))
+        counts = _run(
+            symbols=["005930"],
+            session_active_provider=lambda: next(active),
+            stop_event=_StopAfter(5),
+        )
+        assert counts["session_relinquished"] == 1
+        assert set(patched.frames("2")) == {
+            ("005930", "H0STCNT0"),
+            ("005930", "H0STASP0"),
+        }

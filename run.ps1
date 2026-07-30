@@ -103,7 +103,10 @@ function Wait-LocalAppReady {
   param(
     [string]$Url,
     [System.Diagnostics.Process]$ServerProcess,
-    [int]$TimeoutSeconds = 60
+    # Rebuilding the live feature/GNN state from a large realtime store can
+    # legitimately take longer than one minute.  Do not tear down a healthy
+    # boot while the application is still restoring that state.
+    [int]$TimeoutSeconds = 180
   )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -209,6 +212,14 @@ Set-DefaultEnv "REALTIME_LOSS_REBUY_COOLDOWN_SEC" "86400"
 Set-DefaultEnv "REALTIME_LOSS_REBUY_RETURN_THRESHOLD" "-0.004"
 Set-DefaultEnv "REALTIME_MAX_BUY_ORDERS_PER_CYCLE" "2"
 Set-DefaultEnv "REALTIME_BUY_WEIGHT" "0.4"
+Set-DefaultEnv "REALTIME_TAKE_PROFIT" "0.008"
+Set-DefaultEnv "AUTO_RELIABILITY_US_WARM_SYMBOLS" "6"
+Set-DefaultEnv "KIS_OVERSEAS_REALTIME_MAX_SYMBOLS" "6"
+Set-DefaultEnv "REALTIME_US_ROTATION_POOL_MULTIPLIER" "3"
+# Keep each window for one full model-label horizon before rotating it.
+Set-DefaultEnv "REALTIME_US_WATCHLIST_RECHECK_SEC" "600"
+Set-DefaultEnv "GNN_TRUST_HORIZON_SECONDS" "1800"
+Set-DefaultEnv "STRATEGY_SESSION_MIN_NET_TARGET_BPS" "25"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.0"
 Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_LIMIT" "360"

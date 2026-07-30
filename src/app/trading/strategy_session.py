@@ -17,25 +17,28 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from app.routing.actions import is_actionable_strategy_route
+from app.strategy.catalog import is_known_strategy
 
-_ACTIONABLE_GNN_ACTIONS = {"ACTIVATE", "ADMISSIBLE", "ALLOW", "ALLOWED", "BUY"}
 _MAX_HOLDING_SECONDS = {
-    "intraday_momentum": 420,
-    "breakout_volume": 600,
-    "vwap_mean_reversion": 300,
-    "liquidity_shock_reversal": 240,
-    "event_momentum": 900,
-    "cross_sectional_relative_strength": 900,
-    "gap_context": 720,
+    "intraday_momentum": 1800,
+    "breakout_volume": 2700,
+    "vwap_mean_reversion": 1800,
+    "liquidity_shock_reversal": 1200,
+    "event_momentum": 3600,
+    "cross_sectional_relative_strength": 3600,
+    "gap_context": 2700,
+    "rvgi_box_breakout": 1800,
 }
 _STRATEGY_EXIT_BPS = {
-    "intraday_momentum": (22.0, 40.0, 15.0),
-    "breakout_volume": (25.0, 50.0, 18.0),
-    "vwap_mean_reversion": (18.0, 28.0, 12.0),
-    "liquidity_shock_reversal": (30.0, 45.0, 18.0),
-    "event_momentum": (35.0, 65.0, 24.0),
-    "cross_sectional_relative_strength": (28.0, 55.0, 20.0),
-    "gap_context": (32.0, 60.0, 22.0),
+    "intraday_momentum": (22.0, 100.0, 15.0),
+    "breakout_volume": (25.0, 120.0, 18.0),
+    "vwap_mean_reversion": (18.0, 100.0, 12.0),
+    "liquidity_shock_reversal": (30.0, 100.0, 18.0),
+    "event_momentum": (35.0, 140.0, 24.0),
+    "cross_sectional_relative_strength": (28.0, 120.0, 20.0),
+    "gap_context": (32.0, 130.0, 22.0),
+    "rvgi_box_breakout": (20.0, 120.0, 15.0),
 }
 
 
@@ -51,6 +54,27 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _cost_aware_profit_bps(
+    model_evidence: Mapping[str, Any] | None,
+    configured_profit_bps: float,
+) -> float:
+    """Never arm a target that cannot clear the modelled round-trip cost."""
+    row = model_evidence if isinstance(model_evidence, Mapping) else {}
+    try:
+        expected_cost_bps = max(0.0, float(row.get("expected_cost_bps") or 0.0))
+    except (TypeError, ValueError):
+        expected_cost_bps = 0.0
+    minimum_net_bps = max(
+        0.0,
+        _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 25.0),
+        expected_cost_bps,
+    )
+    return max(
+        float(configured_profit_bps),
+        expected_cost_bps + minimum_net_bps,
+    )
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -118,7 +142,7 @@ class StrategySessionConfig:
         default_factory=lambda: max(1, _env_int("STRATEGY_SESSION_INVALIDATION_CYCLES", 3))
     )
     require_live_gnn: bool = field(
-        default_factory=lambda: os.getenv("STRATEGY_SESSION_REQUIRE_LIVE_GNN", "false").strip().lower()
+        default_factory=lambda: os.getenv("STRATEGY_SESSION_REQUIRE_LIVE_GNN", "true").strip().lower()
         in {"1", "true", "yes", "on"}
     )
     selection_evidence_max_age_seconds: int = field(
@@ -144,6 +168,7 @@ class StrategySessionState:
     position_seen: bool = False
     entry_price: float | None = None
     target_price: float | None = None
+    stop_price: float | None = None
     target_return_rate: float = 0.004
     target_profit_amount: float | None = None
     stop_loss_rate: float = 0.0022
@@ -358,7 +383,7 @@ class StrategySessionManager:
                 )
                 state.entry_price = float(getattr(holding, "average_price", 0.0) or 0.0)
                 if state.entry_price:
-                    state.target_price = state.entry_price * (1.0 + state.target_return_rate)
+                    self._apply_owned_exit_geometry(state.entry_price)
                     state.high_watermark_price = max(
                         state.entry_price,
                         float(getattr(holding, "last_price", 0.0) or 0.0),
@@ -393,7 +418,13 @@ class StrategySessionManager:
             last_price,
             average_price,
         )
-        stop_price = average_price * (1.0 - state.stop_loss_rate) if average_price > 0 else 0.0
+        stop_price = (
+            float(state.stop_price)
+            if state.stop_price
+            else average_price * (1.0 - state.stop_loss_rate)
+            if average_price > 0
+            else 0.0
+        )
         trailing_price = (
             state.high_watermark_price * (1.0 - state.trailing_stop_rate)
             if state.high_watermark_price
@@ -485,7 +516,12 @@ class StrategySessionManager:
             gnn = next((item for item in decisions if item.get("path") == "cpu_gnn"), {})
             gnn_action = str(gnn.get("action") or "UNAVAILABLE").upper()
             gnn_strategy = str(gnn.get("strategy_id") or "")
-            gnn_actionable = gnn_action in _ACTIONABLE_GNN_ACTIONS and bool(gnn_strategy)
+            gnn_reason_codes = list(gnn.get("reason_codes") or ())
+            gnn_actionable = (
+                is_actionable_strategy_route(gnn_action)
+                and is_known_strategy(gnn_strategy)
+                and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
+            )
             if self.config.require_live_gnn and not gnn_actionable:
                 continue
             entry_price = float(getattr(intent, "expected_entry_price", 0.0) or 0.0)
@@ -496,11 +532,30 @@ class StrategySessionManager:
             target_price = (
                 max(expected_exit, entry_price * (1.0 + target_rate)) if entry_price > 0 else None
             )
+            rvgi_context = (
+                row.get("rvgi_box_context")
+                if isinstance(row, Mapping)
+                else None
+            )
             selected_strategy = gnn_strategy if gnn_actionable else ontology_strategy
+            if (
+                not gnn_actionable
+                and ontology_strategy in {"breakout", "rvgi_box_breakout"}
+                and isinstance(rvgi_context, Mapping)
+                and rvgi_context.get("ontology_eligible") is True
+            ):
+                selected_strategy = "rvgi_box_breakout"
+            if selected_strategy == "rvgi_box_breakout":
+                from app.technical.strategy_algorithms import strategy_live_authorized
+
+                if not strategy_live_authorized(selected_strategy):
+                    self._state.last_reason = "RVGI_BOX_NOT_LIVE_AUTHORIZED"
+                    continue
             stop_bps, profit_bps, trailing_bps = _STRATEGY_EXIT_BPS.get(
                 selected_strategy,
                 (25.0, 40.0, 15.0),
             )
+            profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
             target_rate = max(target_rate, profit_bps / 10_000.0)
             target_price = (
                 entry_price * (1.0 + target_rate) if entry_price > 0 else None
@@ -534,7 +589,7 @@ class StrategySessionManager:
                 micro_regime=str(getattr(intent, "micro_regime", "") or ""),
                 ontology_reason_codes=list(getattr(intent, "reason_codes", ()) or ()),
                 gnn_action=gnn_action,
-                gnn_reason_codes=list(gnn.get("reason_codes") or ()),
+                gnn_reason_codes=gnn_reason_codes,
                 explanation_paths=list(getattr(intent, "explanation_paths", ()) or ()),
                 candidate_diagnostics=list(self._state.candidate_diagnostics),
                 election_context=self._election_context(
@@ -550,6 +605,7 @@ class StrategySessionManager:
                         ),
                         None,
                     ),
+                    evidence_row=row,
                 ),
             )
             return
@@ -577,21 +633,38 @@ class StrategySessionManager:
             )
             ontology_action = str(ontology.get("action") or "").upper()
             ontology_strategy = str(ontology.get("strategy_id") or "")
+            # A generic ontology allow/admissible result is only a gate.  It
+            # carries no strategy-specific evidence and must not elect the
+            # first catalog item as an executable strategy.  Explicit
+            # ACTIVATE_STRATEGY decisions are produced by strategy-specific
+            # ontology rules (for example, RVGI box breakout).
             ontology_actionable = (
-                ontology_action in _ACTIONABLE_GNN_ACTIONS and bool(ontology_strategy)
+                ontology_action == "ACTIVATE_STRATEGY"
+                and is_known_strategy(ontology_strategy)
             )
             gnn_action = str(gnn.get("action") or "UNAVAILABLE").upper()
             gnn_strategy = str(gnn.get("strategy_id") or "")
+            gnn_reason_codes = list(gnn.get("reason_codes") or ())
             gnn_actionable = (
-                gnn_action in _ACTIONABLE_GNN_ACTIONS and bool(gnn_strategy)
+                is_actionable_strategy_route(gnn_action)
+                and is_known_strategy(gnn_strategy)
+                and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
             )
             if self.config.require_live_gnn and not gnn_actionable:
+                continue
+            if not gnn_actionable and not ontology_actionable:
                 continue
             selected_strategy = (
                 gnn_strategy if gnn_actionable else ontology_strategy
             )
             if not selected_strategy:
                 continue
+            if selected_strategy == "rvgi_box_breakout":
+                from app.technical.strategy_algorithms import strategy_live_authorized
+
+                if not strategy_live_authorized(selected_strategy):
+                    self._state.last_reason = "RVGI_BOX_NOT_LIVE_AUTHORIZED"
+                    continue
             # The shadow evidence path does not know the macro regime, so it
             # would happily arm a strategy family the macro layer has blocked.
             # The supervisor would then flag it every cycle; refuse it here.
@@ -604,6 +677,7 @@ class StrategySessionManager:
                 selected_strategy,
                 (25.0, 40.0, 15.0),
             )
+            profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
             self._state = StrategySessionState(
                 session_id=f"session-{uuid4().hex}",
                 phase="ARMED",
@@ -632,13 +706,56 @@ class StrategySessionManager:
                     ontology.get("reason_codes") or ()
                 ),
                 gnn_action=gnn_action,
-                gnn_reason_codes=list(gnn.get("reason_codes") or ()),
+                gnn_reason_codes=gnn_reason_codes,
                 candidate_diagnostics=list(self._state.candidate_diagnostics),
-                election_context=self._election_context(selected_strategy, now),
+                election_context=self._election_context(
+                    selected_strategy,
+                    now,
+                    evidence_row=row,
+                ),
             )
             return
+        model_trust_ready = any(
+            "GNN_REALTIME_MODEL_TRUST_PASSED"
+            in tuple(decision.get("reason_codes") or ())
+            for row in (
+                evidence.values()
+                if isinstance(evidence, Mapping)
+                else ()
+            )
+            if isinstance(row, Mapping)
+            for decision in tuple(row.get("decisions") or ())
+            if isinstance(decision, Mapping)
+            and decision.get("path") == "cpu_gnn"
+        )
+        positive_edge_awaiting_validation = any(
+            is_actionable_strategy_route(decision.get("action"))
+            and "GNN_REALTIME_MODEL_TRUST_PASSED"
+            in tuple(decision.get("reason_codes") or ())
+            and "GNN_REALTIME_TRUST_PASSED"
+            not in tuple(decision.get("reason_codes") or ())
+            for row in (
+                evidence.values()
+                if isinstance(evidence, Mapping)
+                else ()
+            )
+            if isinstance(row, Mapping)
+            for decision in tuple(row.get("decisions") or ())
+            if isinstance(decision, Mapping)
+            and decision.get("path") == "cpu_gnn"
+        )
         self._state.last_reason = (
-            "GNN_NOT_LIVE_AUTHORIZED"
+            (
+                (
+                    "GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION"
+                    if positive_edge_awaiting_validation
+                    else (
+                        "NO_POSITIVE_NET_GNN_EDGE"
+                        if model_trust_ready
+                        else "GNN_NOT_LIVE_AUTHORIZED"
+                    )
+                )
+            )
             if self.config.require_live_gnn
             else (
                 "NO_FRESH_STRATEGY_ELECTION"
@@ -655,6 +772,7 @@ class StrategySessionManager:
         intent: Any = None,
         candidate_count: int | None = None,
         micro_result: Any = None,
+        evidence_row: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Freeze the slow context the algorithm will consume.
 
@@ -692,7 +810,71 @@ class StrategySessionManager:
                 value = diagnostics.get(key)
                 if value is not None:
                     context[key] = value
+        rvgi_context = (
+            evidence_row.get("rvgi_box_context")
+            if isinstance(evidence_row, Mapping)
+            else None
+        )
+        if strategy_id == "rvgi_box_breakout" and isinstance(rvgi_context, Mapping):
+            for key in (
+                "rvgi",
+                "rvgi_signal",
+                "rvgi_diff",
+                "rvgi_bullish_cross",
+                "box_high",
+                "box_low",
+                "box_mid",
+                "box_width_pct",
+                "box_position",
+                "box_context_timestamp",
+                "box_previous_close",
+                "volume_confirmed",
+            ):
+                value = rvgi_context.get(key)
+                if value is not None:
+                    context[key] = value
         return context
+
+    def _apply_owned_exit_geometry(self, entry_price: float) -> None:
+        """Resolve the elected algorithm's structural exit rule at fill time."""
+        state = self._state
+        if state.selected_strategy != "rvgi_box_breakout" or entry_price <= 0:
+            state.target_price = entry_price * (1.0 + state.target_return_rate)
+            return
+        try:
+            from app.technical.signals import TechnicalFeatureSet
+            from app.technical.strategy_algorithms import ElectionContext, get_algorithm
+
+            algorithm = get_algorithm(state.selected_strategy)
+            if algorithm is None:
+                return
+            allowed = ElectionContext.__dataclass_fields__.keys()
+            payload = {
+                key: value
+                for key, value in state.election_context.items()
+                if key in allowed and key != "elected_at"
+            }
+            payload["strategy_id"] = state.selected_strategy
+            rule = algorithm.exit_rule(
+                entry_price,
+                TechnicalFeatureSet(symbol=state.selected_symbol or "", price=entry_price),
+                ElectionContext(**payload),
+            )
+            state.stop_price = rule.stop_price
+            algorithm_target_rate = (
+                rule.target_price / entry_price - 1.0
+                if rule.target_price and rule.target_price > entry_price
+                else 0.0
+            )
+            state.target_return_rate = max(
+                state.target_return_rate,
+                algorithm_target_rate,
+            )
+            state.target_price = entry_price * (1.0 + state.target_return_rate)
+            state.trailing_stop_rate = float(rule.trailing_bps or 0.0) / 10_000.0
+            state.max_holding_seconds = int(rule.max_holding_seconds)
+        except Exception:  # noqa: BLE001 - persisted fallback exits remain authoritative.
+            state.target_price = entry_price * (1.0 + state.target_return_rate)
 
     def _fresh_evidence(self, row: Mapping[str, Any], now: datetime) -> bool:
         observed = _parse_time(row.get("as_of"))

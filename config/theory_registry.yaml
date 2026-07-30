@@ -41,6 +41,36 @@ npu:
       enabled: false
 
 theories:
+  rvgi_box_breakout_v1:
+    family: rvgi_box_breakout
+    style: breakout
+    default_action_bias: BUY
+    horizon_bucket: short_intraday
+    expected_holding_minutes: 5
+    required_evidence:
+      - fresh_ohlcv
+      - rvgi_bullish_cross
+      - price_above_frozen_box_high
+      - volume_confirmed_breakout
+    invalid_when:
+      - rvgi_bearish_cross
+      - rvgi_box_false_breakout_risk
+      - spread_too_wide
+      - liquidity_score_low
+    compatible_with:
+      - momentum_confirmation
+      - volume_confirmed_momentum
+    conflicts_with:
+      - strong_downtrend_breakdown
+      - negative_event_hard_block
+    # Shared with the existing technical breakout theory so correlated price
+    # range/volume evidence is capped instead of counted as two confirmations.
+    evidence_cluster: breakout_cluster
+    validation:
+      status: unvalidated
+      default_weight: 0.1
+      min_oos_trades_for_full_weight: 100
+
   jegadeesh_1990_short_term_reversal:
     family: short_term_reversal
     style: contrarian

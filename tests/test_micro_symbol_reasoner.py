@@ -81,6 +81,18 @@ class TestExpectedNetReturnRequired:
         assert MICRO_TECHNICAL_HISTORY_INSUFFICIENT in r.reason_codes
         assert r.expected_entry_price == 70_000.0
 
+    def test_feature_builder_failure_is_reported_separately_from_history(self):
+        quote = SimpleNamespace(last_price=70_000.0)
+        r = _reasoner().reason(MicroReasoningInput(
+            timestamp=_now(),
+            symbol="005930",
+            broker_quote=quote,
+            technical_feature_error_code="MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE",
+        ))
+
+        assert MICRO_TECHNICAL_HISTORY_INSUFFICIENT in r.reason_codes
+        assert "MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE" in r.reason_codes
+
     def test_high_cost_no_positive_net_is_not_buy(self):
         # Force spread to consume alpha via a very wide spread.
         r = _reasoner().reason(_inp(spread_bps=500.0))

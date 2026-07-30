@@ -782,13 +782,13 @@ function renderProfitability(prof, snapshot, trading) {
   };
   const budgetRemaining = summary.daily_loss_budget_remaining_krw;
   const rows = [
-    ['오늘 순손익(실현−비용)', fmtKrw(prof.net_after_cost_krw), `실현 ${fmtKrw(prof.realized_pnl_today_krw)} · 비용 ${fmtKrw(prof.trade_cost_krw)}`, clsPnl(prof.net_after_cost_krw)],
+    ['오늘 순손익(제비용 반영)', fmtKrw(prof.net_after_cost_krw), `KIS 정산손익 ${fmtKrw(prof.realized_pnl_today_krw)} · 제비용 ${fmtKrw(prof.broker_expenses_krw)}`, clsPnl(prof.net_after_cost_krw)],
     ['승률', zeroTradeState ? '0.00%' : fallbackValue(prof.win_rate, fmtPct, '0.00%'), `${prof.win_count || 0}승 / ${prof.loss_count || 0}패 (${closedTradeCount}건)`],
     ['평균 수익', zeroTradeState ? '₩0' : fallbackValue(prof.avg_win_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '이익 거래 평균', 'positive'],
     ['평균 손실', zeroTradeState ? '₩0' : fallbackValue(prof.avg_loss_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '손실 거래 평균', 'negative'],
     ['손익비 (Payoff)', zeroTradeState ? '0.00' : fallbackValue(prof.payoff_ratio, (v) => Number(v).toFixed(2), '0.00'), zeroTradeState ? '청산 거래 없음' : '평균수익 / |평균손실|'],
     ['기대값 (Expectancy)', zeroTradeState ? '₩0' : fallbackValue(prof.expectancy_krw, fmtKrw, '₩0'), zeroTradeState ? '청산 거래 없음' : '거래당 기대손익', clsPnl(prof.expectancy_krw)],
-    ['거래 비용', fmtKrw(prof.trade_cost_krw), `수수료 ${fmtKrw(prof.fees_krw)} · 세금 ${fmtKrw(prof.tax_krw)}`, 'negative'],
+    ['거래 제비용', fmtKrw(prof.broker_expenses_krw), `매입·매도수수료 + 유관기관 제비용 + 제세금 · ${prof.broker_expense_source || '미수집'}`, 'negative'],
     ['일일 손실 한도 잔여', budgetRemaining === null || budgetRemaining === undefined ? 'n/a' : fmtKrw(budgetRemaining), summary.daily_loss_budget_krw ? `한도 ${fmtKrw(summary.daily_loss_budget_krw)}` : '한도 미설정'],
   ];
   const grid = document.getElementById('profitability-kpis');
@@ -1077,7 +1077,7 @@ function renderDecisionFlow(trading) {
     if (p.break_even_exit_price !== undefined && p.break_even_exit_price !== null) chips.push(`손익분기 ${Number(p.break_even_exit_price).toLocaleString()}`);
     if (p.net_expected_return !== undefined && p.net_expected_return !== null) chips.push(`순기대 ${fmtPct(p.net_expected_return)}`);
     if (p.required_min_net_return !== undefined && p.required_min_net_return !== null) chips.push(`요구 ${fmtPct(p.required_min_net_return)}`);
-    if (p.all_in_cost_rate !== undefined && p.all_in_cost_rate !== null) chips.push(`비용 ${fmtPct(p.all_in_cost_rate)}`);
+    if (p.all_in_cost_rate !== undefined && p.all_in_cost_rate !== null) chips.push(`총 거래비용 ${fmtPct(p.all_in_cost_rate)}`);
     if (p.spread_rate !== undefined && p.spread_rate !== null) chips.push(`스프레드 ${fmtPct(p.spread_rate)}`);
     if (p.liquidity_score !== undefined && p.liquidity_score !== null) chips.push(`유동성 ${Number(p.liquidity_score).toFixed(2)}`);
     const chipHtml = chips.length ? `<div class="rejection-metrics">${chips.map((c) => `<span>${escapeHtml(c)}</span>`).join('')}</div>` : '';

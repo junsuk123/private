@@ -15,9 +15,9 @@ DEFAULT_TRADING_COST_CONFIG: dict[str, Any] = {
         "NXT": {"buy_fee_rate": 0.000130527, "sell_fee_rate": 0.000130527, "sell_tax_rate": 0.002},
     },
     "overseas_stock": {
-        "NASD": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
-        "NYSE": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
-        "AMEX": {"buy_fee_rate": 0.0025, "sell_fee_rate": 0.0025, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
+        "NASD": {"buy_fee_rate": 0.0020, "sell_fee_rate": 0.0020, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
+        "NYSE": {"buy_fee_rate": 0.0020, "sell_fee_rate": 0.0020, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
+        "AMEX": {"buy_fee_rate": 0.0020, "sell_fee_rate": 0.0020, "sell_tax_rate": 0.0000206, "minimum_sell_tax": 0.01},
         "SEHK": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0013},
         "SHAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
         "SZAA": {"buy_fee_rate": 0.0030, "sell_fee_rate": 0.0030, "sell_tax_rate": 0.0010},
@@ -82,7 +82,30 @@ class CostBreakdown:
     reject_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.update(
+            {
+                # KIS terminology: explicit broker/exchange/tax deductions.
+                "broker_expenses": self.buy_fee + self.sell_fee + self.sell_tax,
+                "broker_expense_rate": _safe_div(
+                    self.buy_fee + self.sell_fee + self.sell_tax,
+                    max(self.entry_price * self.quantity, 1e-9),
+                ),
+                # Market execution loss is estimated, not a broker charge.
+                "execution_cost": (
+                    self.slippage_cost
+                    + self.spread_cost
+                    + self.market_impact_cost
+                ),
+                "execution_cost_rate": _safe_div(
+                    self.slippage_cost
+                    + self.spread_cost
+                    + self.market_impact_cost,
+                    max(self.entry_price * self.quantity, 1e-9),
+                ),
+            }
+        )
+        return payload
 
 
 class TradingCostEngine:
@@ -193,8 +216,8 @@ class TradingCostEngine:
         if instrument_type == "overseas_stock":
             overseas = self.config.get("overseas_stock", {})
             policy = overseas.get(venue) or overseas.get("NASD") or DEFAULT_TRADING_COST_CONFIG["overseas_stock"]["NASD"]
-            buy_fee_rate = float(policy.get("buy_fee_rate", 0.0025))
-            sell_fee_rate = float(policy.get("sell_fee_rate", 0.0025))
+            buy_fee_rate = float(policy.get("buy_fee_rate", 0.0020))
+            sell_fee_rate = float(policy.get("sell_fee_rate", 0.0020))
             sell_tax_rate = float(policy.get("sell_tax_rate", 0.0))
             minimum_sell_tax = float(policy.get("minimum_sell_tax", 0.0))
         elif instrument_type in {"domestic_etf", "domestic_etn", "domestic_elw", "etf", "etn", "elw"}:

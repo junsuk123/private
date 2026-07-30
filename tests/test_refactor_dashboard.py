@@ -187,6 +187,11 @@ def test_account_page_and_refactor_api_expose_new_console() -> None:
     assert 'id="asset-overview-title"' in page.text
     assert 'id="asset-total"' in page.text
     assert 'id="execution-track"' in page.text
+    assert 'id="ops-overview"' in page.text
+    assert 'id="ops-gate-grid"' in page.text
+    assert 'id="ops-gnn-samples"' in page.text
+    assert 'id="ops-current-reason"' in page.text
+    assert "operations_overview.js" in page.text
     assert "account_dashboard.js" not in page.text
     assert payload.status_code == 200
     assert payload.json()["mode"] == "shadow"
@@ -322,7 +327,7 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
         "volume",
         "vwap_deviation",
     }
-    assert len(trace["algorithms"]) == 7
+    assert len(trace["algorithms"]) == 8
     assert next(
         algorithm
         for algorithm in trace["algorithms"]

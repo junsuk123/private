@@ -170,6 +170,12 @@ class LiveFeatureFrameBuilder:
         ask_depth = float(orderbook.total_ask_volume)
         depth_ratio = bid_depth / max(1.0, ask_depth)
         technical = _technical_columns(prices, volumes)
+        rvgi_box = _rvgi_box_columns(
+            self.store,
+            symbol,
+            decision_time,
+            float(prices[-1]),
+        )
         second_features = _second_level_features(
             ticks,
             orderbooks,
@@ -193,6 +199,7 @@ class LiveFeatureFrameBuilder:
             "principal_cushion_ratio": 1.0,
             "news_sentiment": self._news_sentiment(symbol, decision_time),
             **technical,
+            **rvgi_box,
         }
         values = tuple(float(feature_dict[name]) for name in self.schema.feature_names)
         provenance = FeatureProvenance(
@@ -383,6 +390,93 @@ def _second_level_features(
         "orderbook_imbalance_change_5s": imbalance_change,
         "second_data_ready": 1.0 if len(tick_10s) >= 3 and len(unique_seconds) >= 2 and books_5s else 0.0,
     }
+
+
+def _rvgi_box_columns(
+    store: RealtimeMarketDataStore,
+    symbol: str,
+    decision_time: datetime,
+    current_price: float,
+) -> dict[str, float]:
+    """Build slow descriptors from completed one-minute bars, never ticks."""
+    from app.features.schemas import OHLCVBar
+    from app.technical import indicators as ti
+
+    unavailable = {
+        "rvgi_available": 0.0,
+        "rvgi": 0.0,
+        "rvgi_signal": 0.0,
+        "rvgi_diff": 0.0,
+        "rvgi_slope": 0.0,
+        "rvgi_bullish_cross": 0.0,
+        "box_available": 0.0,
+        "box_high": 0.0,
+        "box_low": 0.0,
+        "box_mid": 0.0,
+        "box_width_pct": 0.0,
+        "box_position": 0.0,
+        "breakout_distance_bps": 0.0,
+        "box_previous_close": 0.0,
+        "box_context_timestamp_epoch": 0.0,
+    }
+    try:
+        raw = store.recent_minute_bars(
+            symbol,
+            decision_time - timedelta(days=2),
+            limit=80,
+        )
+    except Exception:  # noqa: BLE001 - unavailable slow context fails closed.
+        return unavailable
+    completed = tuple(
+        bar
+        for bar in raw
+        if bar.minute_start + timedelta(minutes=1) <= decision_time
+    )
+    bars = tuple(
+        OHLCVBar(
+            ticker=symbol,
+            as_of=bar.minute_start + timedelta(minutes=1),
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=float(bar.volume),
+        )
+        for bar in completed
+    )
+    rvgi_result = ti.rvgi(bars, 10)
+    box = ti.causal_box_geometry(bars, 20)
+    result = dict(unavailable)
+    if rvgi_result.ok and rvgi_result.main is not None and rvgi_result.signal is not None:
+        result.update(
+            rvgi_available=1.0,
+            rvgi=float(rvgi_result.main),
+            rvgi_signal=float(rvgi_result.signal),
+            rvgi_diff=float(rvgi_result.main - rvgi_result.signal),
+            rvgi_slope=float(rvgi_result.slope or 0.0),
+            rvgi_bullish_cross=1.0 if rvgi_result.bullish_cross else 0.0,
+        )
+    if box.ok and box.high is not None and box.low is not None and box.mid is not None:
+        result.update(
+            box_available=1.0,
+            box_high=float(box.high),
+            box_low=float(box.low),
+            box_mid=float(box.mid),
+            box_width_pct=float(box.width_pct or 0.0),
+            box_position=float(box.position or 0.0),
+            breakout_distance_bps=(
+                (current_price / box.high - 1.0) * 10_000.0
+                if current_price > 0 and box.high > 0
+                else 0.0
+            ),
+            box_previous_close=float(bars[-2].close) if len(bars) >= 2 else 0.0,
+            box_context_timestamp_epoch=(
+                float(box.source_timestamp.timestamp())
+                if hasattr(box.source_timestamp, "timestamp")
+                else 0.0
+            ),
+        )
+    return result
 
 
 def _events_in_window(events: tuple, decision_time: datetime, seconds: int) -> tuple:

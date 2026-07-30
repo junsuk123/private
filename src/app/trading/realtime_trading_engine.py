@@ -214,7 +214,9 @@ def _ignored_realtime_symbols() -> set[str]:
 @dataclass
 class RealtimeTradingConfig:
     interval_ms: int = field(default_factory=lambda: max(100, _env_int("REALTIME_TRADING_INTERVAL_MS", 1000)))
-    take_profit: float = field(default_factory=lambda: _env_float("REALTIME_TAKE_PROFIT", 0.0025))
+    # Non-session holdings use the same cost-clearing floor as the dynamic exit
+    # policy. Strategy-owned positions keep their model-cost-aware target.
+    take_profit: float = field(default_factory=lambda: _env_float("REALTIME_TAKE_PROFIT", 0.0080))
     stop_loss: float = field(default_factory=lambda: _env_float("REALTIME_STOP_LOSS", 0.010))
     buy_weight: float = field(default_factory=lambda: _env_float("REALTIME_BUY_WEIGHT", 0.01))
     max_orders_per_cycle: int = field(default_factory=lambda: max(1, _env_int("REALTIME_MAX_ORDERS_PER_CYCLE", 8)))

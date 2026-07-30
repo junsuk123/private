@@ -206,3 +206,32 @@ def test_event_runtime_can_dispatch_slow_shadow_off_fast_path(monkeypatch, tmp_p
             event_runtime.run_event_driven_kis_websocket_collector(store=Store())
         )
     assert result["slow_intelligence_enabled"] is True
+
+
+def test_slow_shadow_worker_continues_after_one_inference_failure() -> None:
+    from app.data.event_runtime import slow_intelligence_worker
+
+    class FlakyService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, _snapshot) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient inference failure")
+
+    async def scenario() -> int:
+        service = FlakyService()
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = asyncio.create_task(slow_intelligence_worker(service, queue))
+        await queue.put(type("Snapshot", (), {"symbol": "SOFI"})())
+        await queue.put(type("Snapshot", (), {"symbol": "PFE"})())
+        await asyncio.wait_for(queue.join(), timeout=2.0)
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        return service.calls
+
+    assert asyncio.run(scenario()) == 2

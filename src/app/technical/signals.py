@@ -77,6 +77,20 @@ class TechnicalFeatureSet:
     breakout_strength: float | None = None       # (price - donchian_high)/price, signed
     donchian_low_distance: float | None = None    # (price - donchian_low)/price, signed
     false_breakout_risk: float | None = None      # [0,1], higher == riskier
+    rvgi: float | None = None
+    rvgi_signal: float | None = None
+    rvgi_diff: float | None = None
+    rvgi_slope: float | None = None
+    rvgi_bullish_cross: bool | None = None
+    rvgi_bearish_cross: bool | None = None
+    box_high: float | None = None
+    box_low: float | None = None
+    box_mid: float | None = None
+    box_width_pct: float | None = None
+    box_position: float | None = None
+    breakout_distance_bps: float | None = None
+    box_context_timestamp: str | None = None
+    box_previous_close: float | None = None
     # Volatility / risk
     atr_pct: float | None = None
     realized_volatility: float | None = None      # per-bar return stdev (fraction)
@@ -550,6 +564,7 @@ _OWNED_STRATEGY_METHODOLOGY: dict[str, str] = {
     "event_momentum": "momentum_trend_following",
     "cross_sectional_relative_strength": "momentum_trend_following",
     "gap_context": "momentum_trend_following",
+    "rvgi_box_breakout": "breakout_trading_range_break",
 }
 
 

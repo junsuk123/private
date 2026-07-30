@@ -20,22 +20,25 @@
   },
   "overseas_stock": {
     "NASD": {
-      "buy_fee_rate": 0.0025,
-      "sell_fee_rate": 0.0025,
+      "buy_fee_rate": 0.002,
+      "sell_fee_rate": 0.002,
       "sell_tax_rate": 0.0000206,
-      "minimum_sell_tax": 0.01
+      "minimum_sell_tax": 0.01,
+      "expense_rate_source": "KIS_TTTS3039R_ACCOUNT_SETTLEMENT_20260728"
     },
     "NYSE": {
-      "buy_fee_rate": 0.0025,
-      "sell_fee_rate": 0.0025,
+      "buy_fee_rate": 0.002,
+      "sell_fee_rate": 0.002,
       "sell_tax_rate": 0.0000206,
-      "minimum_sell_tax": 0.01
+      "minimum_sell_tax": 0.01,
+      "expense_rate_source": "KIS_TTTS3039R_ACCOUNT_SETTLEMENT_20260728"
     },
     "AMEX": {
-      "buy_fee_rate": 0.0025,
-      "sell_fee_rate": 0.0025,
+      "buy_fee_rate": 0.002,
+      "sell_fee_rate": 0.002,
       "sell_tax_rate": 0.0000206,
-      "minimum_sell_tax": 0.01
+      "minimum_sell_tax": 0.01,
+      "expense_rate_source": "KIS_TTTS3039R_ACCOUNT_SETTLEMENT_20260728"
     }
   },
   "slippage": {

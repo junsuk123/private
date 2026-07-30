@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import fmean
@@ -14,19 +14,28 @@ from app.backtesting.event_simulator import EventDrivenFillSimulator
 from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
 from app.trading.contracts import Bar
+from app.features.schemas import OHLCVBar
+from app.technical import indicators as ti
 
 
 @dataclass(frozen=True)
 class EvaluationConfig:
     history_bars: int = 30
-    horizon_bars: int = 15
+    # US BanKIS round-trip expenses are roughly 40bp before spread/slippage.
+    # A 4-10 minute label mostly teaches "cost exceeds move"; use a one-hour
+    # causal window so strategies can learn moves large enough to clear costs.
+    horizon_bars: int = 60
     stride_bars: int = 5
     minimum_symbol_bars: int = 100
+    maximum_bar_gap_seconds: float = 120.0
+    minimum_active_history_fraction: float = 0.10
+    minimum_future_bars: int = 5
     quantity: int = 1
     venue: str = "NASD"
     market: str = "US"
     instrument_type: str = "overseas_stock"
     feature_schema_name: str = "counterfactual_quantiles_v1"
+    infer_market_from_symbol: bool = True
 
 
 @dataclass(frozen=True)
@@ -69,10 +78,16 @@ def load_minute_bars(database: Path) -> dict[str, tuple[Bar, ...]]:
         )
         for symbol, start, open_, high, low, close, volume in rows:
             start_time = datetime.fromisoformat(start)
+            normalized_symbol = str(symbol).upper()
+            venue = (
+                "KRX"
+                if normalized_symbol.isdigit() and len(normalized_symbol) == 6
+                else "NASD"
+            )
             by_symbol[symbol].append(
                 Bar(
                     symbol=symbol,
-                    venue="NASD",
+                    venue=venue,
                     interval="1m",
                     start_time=start_time,
                     end_time=start_time + timedelta(minutes=1),
@@ -98,6 +113,10 @@ def build_labels(
     for symbol, bars in sorted(bars_by_symbol.items()):
         if len(bars) < config.minimum_symbol_bars:
             continue
+        venue, market, instrument_type = _execution_market_for_symbol(
+            symbol,
+            config,
+        )
         returns = [0.0]
         returns.extend(bars[i].close / bars[i - 1].close - 1 for i in range(1, len(bars)))
         volumes = [bar.volume for bar in bars]
@@ -109,6 +128,25 @@ def build_labels(
         ):
             current = bars[index]
             history_start = index - config.history_bars
+            history_window = bars[history_start : index + 1]
+            if not _bars_are_contiguous(
+                history_window,
+                maximum_gap_seconds=config.maximum_bar_gap_seconds,
+            ):
+                continue
+            active_history = sum(
+                bar.high > bar.low
+                or (
+                    position > 0
+                    and bar.close != history_window[position - 1].close
+                )
+                for position, bar in enumerate(history_window)
+            )
+            if (
+                active_history / max(1, len(history_window))
+                < config.minimum_active_history_fraction
+            ):
+                continue
             return_history = returns[history_start:index]
             volume_history = volumes[history_start:index]
             spread_history = spreads[history_start:index]
@@ -117,6 +155,33 @@ def build_labels(
                 bar.close * max(bar.volume, 1.0) for bar in bars[history_start:index]
             ) / sum(max(bar.volume, 1.0) for bar in bars[history_start:index])
             current_return = returns[index]
+            completed = tuple(
+                OHLCVBar(
+                    ticker=bar.symbol,
+                    as_of=bar.end_time,
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume=bar.volume,
+                )
+                for bar in bars[: index + 1]
+            )
+            rvgi_result = ti.rvgi(completed, 10)
+            box = ti.causal_box_geometry(completed, 20)
+            rvgi_diff = (
+                rvgi_result.main - rvgi_result.signal
+                if rvgi_result.ok
+                and rvgi_result.main is not None
+                and rvgi_result.signal is not None
+                else None
+            )
+            box_breakout = bool(
+                box.ok and box.high is not None and current.close > box.high
+            )
+            volume_confirmed = (
+                causal_percentile(current.volume, volume_history) >= 0.65
+            )
             quantiles = {
                 "return": causal_percentile(current_return, return_history),
                 "volume": causal_percentile(current.volume, volume_history),
@@ -144,9 +209,29 @@ def build_labels(
                 "relative_strength": 0.0,
                 "gap": 0.0,
                 "opening_confirmation": 0.0,
+                "rvgi_diff": (
+                    max(0.0, min(1.0, 0.5 + rvgi_diff * 5.0))
+                    if rvgi_diff is not None
+                    else 0.0
+                ),
+                "rvgi_cross": 1.0 if rvgi_result.bullish_cross else 0.0,
+                "box_position": float(box.position or 0.0) if box.ok else 0.0,
+                "false_breakout_risk": (
+                    0.0 if box_breakout and volume_confirmed else 1.0
+                ),
             }
             as_of = current.end_time
-            future = bars[index + 1 : index + 1 + config.horizon_bars]
+            future = _contiguous_future_bars(
+                bars[index + 1 : index + 1 + config.horizon_bars],
+                expected_start=current.end_time,
+                maximum_gap_seconds=config.maximum_bar_gap_seconds,
+            )
+            required_future_bars = max(
+                1,
+                min(config.minimum_future_bars, config.horizon_bars),
+            )
+            if len(future) < required_future_bars:
+                continue
             context = ExpertContext(
                 symbol=symbol,
                 as_of=as_of,
@@ -154,33 +239,63 @@ def build_labels(
                 proposed_quantity=config.quantity,
                 feature_snapshot_id=f"stored:{symbol}:{as_of.isoformat()}",
                 utility_evidence_id="counterfactual",
-                quantiles={
-                    **{name: 1.0 for name in quantiles},
-                    "vwap_deviation": 0.0,
-                },
+                quantiles=quantiles,
             )
             for expert in experts:
                 plan = expert.propose(context)
-                if plan is None:  # all-one quantiles admit all current experts
-                    continue
-                triggered = expert.admissible(
-                    ExpertContext(
+                triggered = plan is not None
+                # A strategy that did not fire is a useful classification
+                # negative, but it is not a hypothetical filled trade.  The
+                # previous implementation forced every expert to propose with
+                # synthetic all-one quantiles, then simulated P&L even when
+                # the real point-in-time context was inadmissible.  That
+                # contaminated the return/cost heads with fabricated losses.
+                if plan is not None:
+                    baseline_cost = simulator.cost_engine.estimate(
                         symbol=symbol,
-                        as_of=as_of,
-                        price=current.close,
-                        proposed_quantity=config.quantity,
-                        feature_snapshot_id=context.feature_snapshot_id,
-                        utility_evidence_id=context.utility_evidence_id,
-                        quantiles=quantiles,
+                        market=market,
+                        venue=venue,
+                        instrument_type=instrument_type,
+                        entry_price=current.close,
+                        expected_exit_price=current.close,
+                        quantity=config.quantity,
                     )
-                )
-                outcome = simulator.simulate(
-                    plan,
-                    future,
-                    as_of=as_of,
-                    venue=config.venue,
-                    market=config.market,
-                    instrument_type=config.instrument_type,
+                    fee_policy = simulator.cost_engine.policy_for(
+                        venue=venue,
+                        instrument_type=instrument_type,
+                    )
+                    cost_bps = baseline_cost.total_cost_rate * 10_000.0
+                    # Target a net reward comparable to the unavoidable
+                    # round-trip cost. A cost+8bp target had very poor
+                    # reward/risk after a normal adverse move.
+                    minimum_gross_bps = (
+                        cost_bps
+                        + fee_policy.safety_margin_rate * 10_000.0
+                        + max(25.0, cost_bps)
+                    )
+                    configured_gross_bps = float(
+                        plan.profit_policy.get("bps", 0.0)
+                    )
+                    target_bps = max(configured_gross_bps, minimum_gross_bps)
+                    plan = replace(
+                        plan,
+                        profit_policy={
+                            **plan.profit_policy,
+                            "bps": target_bps,
+                            "price": current.close * (1.0 + target_bps / 10_000.0),
+                        },
+                    )
+                outcome = (
+                    simulator.simulate(
+                        plan,
+                        future,
+                        as_of=as_of,
+                        venue=venue,
+                        market=market,
+                        instrument_type=instrument_type,
+                    )
+                    if plan is not None
+                    else None
                 )
                 labels.append(
                     CounterfactualLabel(
@@ -189,36 +304,148 @@ def build_labels(
                         symbol=symbol,
                         strategy_id=expert.strategy_id,
                         triggered=triggered,
-                        filled=outcome.filled,
-                        net_return_bps=outcome.net_return_bps,
-                        cost_bps=outcome.cost_bps,
-                        exit_reason=outcome.exit_reason,
-                        features=(
-                            _realtime_microstructure_proxy_features(
-                                current=current,
-                                current_return=current_return,
-                                return_history=return_history,
-                                vwap_proxy=vwap_proxy,
-                            )
-                            if config.feature_schema_name == "realtime_microstructure_v1"
-                            else (
-                                quantiles["return"],
-                                quantiles["volume"],
-                                quantiles["breakout"],
-                                quantiles["vwap_deviation"],
-                                quantiles["reversion"],
-                                quantiles["liquidity_shock"],
-                                quantiles["price_drop"],
-                                quantiles["recovery"],
-                                quantiles["liquidity"],
-                                quantiles["event_relevance"],
-                                quantiles["relative_strength"],
-                                quantiles["gap"],
-                            )
+                        filled=outcome.filled if outcome is not None else False,
+                        net_return_bps=(
+                            outcome.net_return_bps if outcome is not None else 0.0
+                        ),
+                        cost_bps=outcome.cost_bps if outcome is not None else 0.0,
+                        exit_reason=(
+                            outcome.exit_reason
+                            if outcome is not None
+                            else "STRATEGY_NOT_TRIGGERED"
+                        ),
+                        features=_label_features(
+                            config.feature_schema_name,
+                            current=current,
+                            current_return=current_return,
+                            return_history=return_history,
+                            vwap_proxy=vwap_proxy,
+                            rvgi_result=rvgi_result,
+                            box=box,
+                            quantiles=quantiles,
                         ),
                     )
                 )
     return tuple(labels)
+
+
+def _bars_are_contiguous(
+    bars: Sequence[Bar],
+    *,
+    maximum_gap_seconds: float,
+) -> bool:
+    return all(
+        0.0
+        <= (current.start_time - previous.start_time).total_seconds()
+        <= maximum_gap_seconds
+        for previous, current in zip(bars, bars[1:])
+    )
+
+
+def _contiguous_future_bars(
+    bars: Sequence[Bar],
+    *,
+    expected_start: datetime,
+    maximum_gap_seconds: float,
+) -> tuple[Bar, ...]:
+    selected: list[Bar] = []
+    previous_start = expected_start - timedelta(minutes=1)
+    for bar in bars:
+        gap = (bar.start_time - previous_start).total_seconds()
+        if gap < 0.0 or gap > maximum_gap_seconds:
+            break
+        selected.append(bar)
+        previous_start = bar.start_time
+    return tuple(selected)
+
+
+def _execution_market_for_symbol(
+    symbol: str,
+    config: EvaluationConfig,
+) -> tuple[str, str, str]:
+    normalized = str(symbol or "").upper().strip()
+    if config.infer_market_from_symbol and normalized.isdigit() and len(normalized) == 6:
+        return "KRX", "KR", "domestic_stock"
+    if config.infer_market_from_symbol and normalized and normalized[0].isalpha():
+        return "NASD", "US", "overseas_stock"
+    return config.venue, config.market, config.instrument_type
+
+
+def _label_features(
+    schema_name: str,
+    *,
+    current,
+    current_return: float,
+    return_history: Sequence[float],
+    vwap_proxy: float,
+    rvgi_result,
+    box,
+    quantiles: dict[str, float],
+) -> tuple[float, ...]:
+    micro = _realtime_microstructure_proxy_features(
+        current=current,
+        current_return=current_return,
+        return_history=return_history,
+        vwap_proxy=vwap_proxy,
+    )
+    if schema_name == "realtime_microstructure_v1":
+        return micro
+    if schema_name in {
+        "realtime_strategy_context_v2",
+        "realtime_strategy_graph_v3",
+    }:
+        return (*micro, *_rvgi_box_proxy_features(current, rvgi_result, box))
+    if schema_name == "realtime_strategy_graph_v4_market":
+        is_krx = (
+            str(getattr(current, "symbol", "") or "").isdigit()
+            and len(str(getattr(current, "symbol", "") or "")) == 6
+        )
+        return (
+            *micro,
+            *_rvgi_box_proxy_features(current, rvgi_result, box),
+            1.0 if is_krx else 0.0,
+        )
+    return (
+        quantiles["return"],
+        quantiles["volume"],
+        quantiles["breakout"],
+        quantiles["vwap_deviation"],
+        quantiles["reversion"],
+        quantiles["liquidity_shock"],
+        quantiles["price_drop"],
+        quantiles["recovery"],
+        quantiles["liquidity"],
+        quantiles["event_relevance"],
+        quantiles["relative_strength"],
+        quantiles["gap"],
+    )
+
+
+def _rvgi_box_proxy_features(current, rvgi_result, box) -> tuple[float, ...]:
+    scale = max(float(current.close), 1e-12)
+    rvgi_available = 1.0 if rvgi_result.ok else 0.0
+    box_available = 1.0 if box.ok else 0.0
+    main = float(rvgi_result.main or 0.0)
+    signal = float(rvgi_result.signal or 0.0)
+    return (
+        rvgi_available,
+        main,
+        signal,
+        main - signal if rvgi_result.ok else 0.0,
+        float(rvgi_result.slope or 0.0),
+        1.0 if rvgi_result.bullish_cross else 0.0,
+        box_available,
+        float(box.high or 0.0) / scale,
+        float(box.low or 0.0) / scale,
+        float(box.mid or 0.0) / scale,
+        float(box.width_pct or 0.0),
+        float(box.position or 0.0),
+        ((float(current.close) / float(box.high) - 1.0) * 100.0)
+        if box.ok and box.high
+        else 0.0,
+        0.0,
+        1.0 if box.source_timestamp is not None else 0.0,
+    )
 
 
 def _realtime_microstructure_proxy_features(

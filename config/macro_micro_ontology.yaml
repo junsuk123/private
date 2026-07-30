@@ -30,8 +30,8 @@ strategy_permissions:
     allow: [momentum, breakout, vwap_pullback]
     block: [aggressive_countertrend_reversion]
   TREND_DOWN:
-    allow: [sell, reduce_risk, defensive_hold]
-    block: [weak_breakout_buy, low_volume_momentum_buy]
+    allow: [sell, reduce_risk, defensive_hold, mean_reversion, vwap_reversion, relative_strength]
+    block: [weak_breakout_buy, low_volume_momentum_buy, intraday_momentum, event_momentum, gap_context, breakout_volume, rvgi_box_breakout]
   RANGE_BOUND:
     allow: [mean_reversion, vwap_reversion]
     block: [late_breakout_chasing]

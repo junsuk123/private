@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -64,6 +64,7 @@ from app.realtime.learning import (
 from app.graph.npu_classifier import get_ontology_npu_classifier
 from app.npu.runtime_manager import get_npu_runtime_manager
 from app.risk import PrincipalProtectionEngine, RiskManager
+from app.routing.gnn_realtime_trust import GnnRealtimeTrustEvaluator
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
@@ -171,6 +172,17 @@ def _ensure_starlette_router_event_compatibility() -> None:
 _ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
+_gnn_realtime_trust_evaluator = GnnRealtimeTrustEvaluator()
+_live_shadow_lock = threading.RLock()
+_live_shadow_service: Any | None = None
+_live_shadow_state: dict[str, Any] = {
+    "enabled": False,
+    "last_attempt_at": None,
+    "last_success_at": None,
+    "last_symbol": None,
+    "generated": 0,
+    "errors": {},
+}
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 
 _APP_ICON_PATH = Path(__file__).resolve().parent / "static" / "icon.png"
@@ -426,11 +438,23 @@ def _strategy_market_view_with_live_session(
         owned_symbol
         and session.get("phase") in {"ARMED", "ENTERING", "OWNED", "EXITING", "COOLDOWN"}
     )
+    candidate_symbols = tuple(
+        str(item or "").strip().upper()
+        for item in tuple((engine_status.get("last_summary") or {}).get("buy_candidate_sample") or ())
+        if str(item or "").strip()
+    )
+    requested_symbol = str(symbol or "").strip().upper()
     # The browser keeps polling its previous symbol. Once the live session owns
     # a symbol, that client-side query must not override the authoritative
-    # selection; returning the owned symbol makes both the chart and orderbook
-    # switch together on the next market-view refresh.
-    selected = owned_symbol if active_owner else (symbol or None)
+    # selection. During SCANNING, also replace an old/off-market selection with
+    # the first candidate the engine is actually evaluating. This prevents a
+    # stale 005930 shadow row from masquerading as the current US decision.
+    if active_owner:
+        selected = owned_symbol
+    elif candidate_symbols and requested_symbol not in candidate_symbols:
+        selected = candidate_symbols[0]
+    else:
+        selected = requested_symbol or (candidate_symbols[0] if candidate_symbols else None)
     view = build_strategy_market_view(selected, limit=limit)
     view["strategy_session"] = session
     if session and active_owner:
@@ -485,7 +509,28 @@ def _strategy_market_view_with_live_session(
         "last_reason": session.get("last_reason"),
         "last_cycle_at": engine_status.get("last_cycle_at"),
         "buy_disabled_reason": engine_status.get("buy_disabled_reason"),
+        "candidate_symbols": list(candidate_symbols),
     }
+    with _live_shadow_lock:
+        live_shadow = {
+            **_live_shadow_state,
+            "errors": dict(_live_shadow_state.get("errors") or {}),
+        }
+    last_shadow_success = _parse_iso_datetime(live_shadow.get("last_success_at"))
+    live_shadow["age_seconds"] = (
+        max(0.0, (datetime.now(timezone.utc) - last_shadow_success).total_seconds())
+        if last_shadow_success is not None
+        else None
+    )
+    live_shadow["healthy"] = bool(
+        live_shadow.get("enabled")
+        and last_shadow_success is not None
+        and live_shadow["age_seconds"] <= max(
+            15.0,
+            _env_float_web("REALTIME_STRATEGY_SHADOW_HEALTH_MAX_AGE_SECONDS", 30.0),
+        )
+    )
+    view["live_shadow"] = live_shadow
     if engine_running:
         view["mode"] = "live_trading"
     # The refactor dashboard's promotion flags describe shadow-model promotion,
@@ -1660,6 +1705,14 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
       for group in groups
       if group != "KRX" or _is_live_market_core_open("KRX", now)
   )
+  owner = _kis_realtime_session_owner(now)
+  if owner in {"KRX", "US"}:
+    # A KIS AppKey permits one realtime WebSocket session. During overlapping
+    # KRX/US-daytime windows only the elected owner can produce fresh WS books;
+    # do not make the deliberately idle market a reliability hard gate.
+    market_data_groups = tuple(
+        group for group in market_data_groups if group == owner
+    )
   connection = _cached_kis_connection_probe(paper=False, include_account=True)
   broker_ok = bool(
       connection.get("ok")
@@ -2764,6 +2817,12 @@ def kiosk_exit() -> JSONResponse:
     return _json({"ok": True, "closed": closed})
 
 
+@app.get("/api/gnn/realtime-trust")
+def gnn_realtime_trust_status() -> JSONResponse:
+  """Current forward-only confidence gate for ontology-weighted GNN routing."""
+  return _json(_gnn_realtime_trust_evaluator.evaluate().as_dict())
+
+
 @app.get("/api/status")
 def status() -> JSONResponse:
   live_basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
@@ -3748,7 +3807,19 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
         except Exception as exc:  # noqa: BLE001 - realized P&L is best-effort.
           result["realized_pnl_error"] = str(exc)
         try:
-          overseas_realized_krw = float(client.get_overseas_realized_pnl(today, today))
+          overseas_settlement = client.get_overseas_settlement_summary(
+              today,
+              today,
+          )
+          overseas_realized_krw = float(
+              overseas_settlement.get("realized_pnl_krw") or 0.0
+          )
+          result["broker_expenses_today_overseas_krw"] = float(
+              overseas_settlement.get("broker_expenses_krw") or 0.0
+          )
+          result["gross_trading_difference_today_overseas_krw"] = float(
+              overseas_settlement.get("gross_trading_difference_krw") or 0.0
+          )
         except Exception as exc:  # noqa: BLE001 - overseas realized P&L is best-effort.
           result["realized_pnl_overseas_error"] = str(exc)
         result["realized_pnl_today_krw"] = domestic_realized_krw + overseas_realized_krw
@@ -7023,19 +7094,206 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
 
 
 def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, Any]:
-  """Return latest persisted ontology/GNN comparisons for election candidates."""
+  """Generate and return current ontology/GNN evidence for election candidates.
+
+  The live engine's US fast-poll path does not traverse the websocket event
+  runtime, so merely reading its shadow log leaves US evidence frozen at the
+  last domestic websocket event.  Build from the same validated live feature
+  frame used by the decision engine before reading the persisted comparison.
+  """
   wanted = {str(symbol or "").upper() for symbol in symbols}
   if not wanted:
     return {}
+  observed_at = datetime.now(timezone.utc)
+  frames: dict[str, Any] = {}
+  try:
+    from app.features.live_feature_frame import LiveFeatureFrameBuilder
+
+    builder = LiveFeatureFrameBuilder(RealtimeMarketDataStore())
+    for symbol in sorted(wanted):
+      try:
+        frames[symbol] = builder.build(symbol, decision_time=observed_at)
+      except Exception as exc:  # closed-world: no valid frame means no new evidence.
+        _record_live_shadow_error(symbol, exc, observed_at)
+    _refresh_live_candidate_shadow(frames, observed_at)
+  except Exception as exc:
+    _record_live_shadow_error("_pipeline", exc, observed_at)
   try:
     latest = ((build_refactor_dashboard().get("shadow") or {}).get("latest_by_symbol") or {})
   except Exception:
-    return {}
-  return {
+    latest = {}
+  rows = {
       symbol: dict(row)
       for symbol, row in latest.items()
       if str(symbol).upper() in wanted and isinstance(row, dict)
   }
+  # The shadow comparison predates slow completed-bar features. Enrich its
+  # ontology evidence at election time from the same validated KIS live frame
+  # used by SharedDecisionEngine; no synthetic/default RVGI values are allowed.
+  try:
+    from app.features.live_feature_frame import LiveFeatureFrameBuilder
+    from app.routing.actions import StrategyRoutingAction
+    from app.technical.feature_builder import technical_feature_set_from_live_frame
+
+    for symbol in wanted:
+      row = rows.setdefault(symbol, {"symbol": symbol, "decisions": []})
+      try:
+        frame = frames[symbol]
+        features = technical_feature_set_from_live_frame(frame, symbol)
+      except Exception:
+        continue
+      box_width_ok = (
+          features.box_width_pct is not None
+          and 0.002 <= features.box_width_pct <= 0.04
+      )
+      above_box = (
+          features.price is not None
+          and features.box_high is not None
+          and features.price >= features.box_high
+      )
+      volume_confirmed = bool(
+          features.volume_spike_ratio is not None
+          and features.volume_spike_ratio >= 1.5
+      )
+      eligible = bool(
+          features.rvgi is not None
+          and features.rvgi_signal is not None
+          and features.rvgi > features.rvgi_signal
+          and features.rvgi_bullish_cross
+          and box_width_ok
+          and above_box
+          and volume_confirmed
+          and (features.liquidity_score or 0.0) > 0
+          and features.spread_bps is not None
+      )
+      context = {
+          "ontology_eligible": eligible,
+          "rvgi": features.rvgi,
+          "rvgi_signal": features.rvgi_signal,
+          "rvgi_diff": features.rvgi_diff,
+          "rvgi_bullish_cross": features.rvgi_bullish_cross,
+          "box_high": features.box_high,
+          "box_low": features.box_low,
+          "box_mid": features.box_mid,
+          "box_width_pct": features.box_width_pct,
+          "box_position": features.box_position,
+          "box_context_timestamp": features.box_context_timestamp,
+          "box_previous_close": features.box_previous_close,
+          "volume_confirmed": volume_confirmed,
+          "breakout_distance_bps": features.breakout_distance_bps,
+      }
+      row["rvgi_box_context"] = context
+      row["rvgi_box_as_of"] = observed_at.isoformat()
+      if eligible:
+        row["as_of"] = row.get("as_of") or observed_at.isoformat()
+        decisions = [
+            item for item in list(row.get("decisions") or ())
+            if not (
+                isinstance(item, dict)
+                and item.get("path") == "ontology"
+                and item.get("strategy_id") == "rvgi_box_breakout"
+            )
+        ]
+        decisions.insert(
+            0,
+            {
+                "path": "ontology",
+                "action": StrategyRoutingAction.ACTIVATE_STRATEGY.value,
+                "strategy_id": "rvgi_box_breakout",
+                "utility": None,
+                "reason_codes": [
+                    "RVGI_BULLISH_CROSS",
+                    "CAUSAL_BOX_BREAKOUT",
+                    "BREAKOUT_VOLUME_CONFIRMED",
+                    "EVIDENCE_CLUSTER:breakout_cluster",
+                ],
+            },
+        )
+        row["decisions"] = decisions
+  except Exception:
+    pass
+  return rows
+
+
+def _refresh_live_candidate_shadow(
+    frames: dict[str, Any],
+    observed_at: datetime,
+) -> None:
+  """Run the shared ontology+GNN pipeline for valid live election frames."""
+  global _live_shadow_service
+  if not frames:
+    return
+  flags = RefactorFeatureFlags.from_env()
+  require_live_gnn = os.getenv(
+      "STRATEGY_SESSION_REQUIRE_LIVE_GNN",
+      "true",
+  ).strip().lower() in {"1", "true", "yes", "on"}
+  enabled = bool(flags.ontology_router or flags.gnn_shadow or require_live_gnn)
+  with _live_shadow_lock:
+    _live_shadow_state["enabled"] = enabled
+    _live_shadow_state["last_attempt_at"] = observed_at.isoformat()
+    if not enabled:
+      return
+    if _live_shadow_service is None:
+      from app.routing.shadow_intelligence import ShadowIntelligenceService
+
+      try:
+        interval = max(
+            1.0,
+            float(os.getenv("REALTIME_STRATEGY_SHADOW_INTERVAL_SECONDS", "5.0")),
+        )
+      except (TypeError, ValueError):
+        interval = 5.0
+      _live_shadow_service = ShadowIntelligenceService(
+          feature_dim=28,
+          minimum_interval_seconds=interval,
+          enable_npu_comparison=flags.npu_inference,
+      )
+
+    from app.routing.shadow_intelligence import slow_snapshot_from_live_feature_frame
+
+    for symbol, frame in sorted(frames.items()):
+      try:
+        snapshot = slow_snapshot_from_live_feature_frame(frame)
+        result = _live_shadow_service.evaluate(snapshot)
+      except Exception as exc:  # one symbol must never kill the trading cycle.
+        _record_live_shadow_error(symbol, exc, observed_at, lock_held=True)
+        continue
+      if result is None:
+        continue
+      _live_shadow_state["last_success_at"] = observed_at.isoformat()
+      _live_shadow_state["last_symbol"] = symbol
+      _live_shadow_state["generated"] = int(
+          _live_shadow_state.get("generated") or 0
+      ) + 1
+      errors = dict(_live_shadow_state.get("errors") or {})
+      errors.pop(symbol, None)
+      _live_shadow_state["errors"] = errors
+
+
+def _record_live_shadow_error(
+    symbol: str,
+    exc: Exception,
+    observed_at: datetime,
+    *,
+    lock_held: bool = False,
+) -> None:
+  """Keep diagnostics without allowing advisory inference to stop execution."""
+  def update() -> None:
+    errors = dict(_live_shadow_state.get("errors") or {})
+    errors[str(symbol)] = {
+        "code": type(exc).__name__,
+        "detail": str(exc)[:240],
+        "at": observed_at.isoformat(),
+    }
+    _live_shadow_state["errors"] = errors
+    _live_shadow_state["last_attempt_at"] = observed_at.isoformat()
+
+  if lock_held:
+    update()
+  else:
+    with _live_shadow_lock:
+      update()
 
 
 def _realtime_engine_account_snapshot() -> AccountSnapshot | None:
@@ -7060,19 +7318,23 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   except Exception:
     fresh = ()
   fresh_set = {str(symbol or "").upper() for symbol in fresh}
-  with _live_lock:
-    sticky_us = tuple(_us_learning_watchlist_cache.get("symbols") or ())
-  cached_context = _cached_context_buy_candidates(limit=max(16, limit * 2))
-  domestic_ranked = tuple(_cached_domestic_ranking_symbols() or ())
-  ordered = _prioritize_realtime_buy_candidates(
-      tuple(dict.fromkeys((*cached_context, *domestic_ranked, *sticky_us, *fresh)))
-  )
   try:
     account = _realtime_engine_account_snapshot()
     store = RealtimeMarketDataStore()
   except Exception:
     account = None
     store = None
+  with _live_lock:
+    sticky_us = tuple(_us_learning_watchlist_cache.get("symbols") or ())
+  cached_context = _cached_context_buy_candidates(
+      limit=max(16, limit * 2),
+      account=account,
+  )
+  domestic_ranked = tuple(_cached_domestic_ranking_symbols() or ())
+  ordered = _prioritize_realtime_buy_candidates(
+      tuple(dict.fromkeys((*cached_context, *domestic_ranked, *sticky_us, *fresh))),
+      account=account,
+  )
   selected: list[str] = []
   for symbol in ordered:
     if str(symbol or "").upper() not in fresh_set:
@@ -7081,6 +7343,18 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
       continue
     group = _ticker_market_group_for_live_trading(symbol)
     if group == "KRX" and not _is_live_market_core_open("KRX"):
+      continue
+    if (
+        store is not None
+        and group == "KRX"
+        and not _candidate_has_strategy_feature_history(symbol, store)
+    ):
+      continue
+    if (
+        store is not None
+        and group == "KRX"
+        and not _candidate_has_fresh_buy_orderbook(symbol, store)
+    ):
       continue
     if account is not None and store is not None and not _cached_candidate_affordable(
         symbol,
@@ -7202,16 +7476,10 @@ def _krx_feature_frame_loop() -> None:
 def _us_fast_poll_target_symbols(held: tuple[str, ...]) -> tuple[str, ...]:
   """Return stable US poll targets without ever dropping held positions."""
   if _active_operation_mode() == "live_trading":
-    with _live_lock:
-      watched = tuple(_us_learning_watchlist_cache.get("symbols") or ())
     limit = max(1, _auto_reliability_int("AUTO_RELIABILITY_US_WARM_SYMBOLS", 4))
-    # A new live process starts with an empty watchlist. Reading that cache only
-    # creates a circular dependency: no symbols -> no websocket subscriptions ->
-    # no realtime rows -> no symbols. Seed/fill the affordable watchlist through
-    # the broker-backed discovery path before starting HDFSCNT0/HDFSASP0.
-    if len(watched) < limit:
-      warmed = _sticky_us_learning_symbols(limit)
-      watched = tuple(dict.fromkeys((*watched, *warmed)))[:limit]
+    # Always use the TTL-aware selector. Reading the cache directly forever
+    # pinned the first few symbols and starved the wider scanner of live data.
+    watched = _sticky_us_learning_symbols(limit)
     return tuple(dict.fromkeys((*held, *watched)))
   warm = _sticky_us_learning_symbols(
       _auto_reliability_int("AUTO_RELIABILITY_US_WARM_SYMBOLS", 4)
@@ -7261,6 +7529,14 @@ def _kis_overseas_realtime_collector_loop() -> None:
   from app.data.kis_realtime import is_us_daytime_quote_session
 
   while not _kis_overseas_realtime_stop.is_set():
+    if _kis_realtime_session_owner() not in {"US", "BOTH"}:
+      with _live_lock:
+        _kis_overseas_realtime_state.update(
+            {"running": True, "symbols": (), "last_error": None, "session": "standby"}
+        )
+      if _kis_overseas_realtime_stop.wait(15.0):
+        return
+      continue
     phase = market_phase("US")
     # US daytime trading (주간거래) runs 10:00-16:00 KST, which is 21:00-03:00
     # ET — i.e. CLOSED on the US clock. Skipping on that alone meant the
@@ -7304,9 +7580,14 @@ def _kis_overseas_realtime_collector_loop() -> None:
               stop_event=_kis_overseas_realtime_stop,
               resubscribe_event=_kis_overseas_realtime_resubscribe,
               max_runtime_seconds=runtime_seconds,
+              progress_callback=_record_kis_overseas_realtime_progress,
+              session_active_provider=lambda: (
+                  _kis_realtime_session_owner() in {"US", "BOTH"}
+              ),
           )
       )
-      succeeded = int(counts.get("subscriptions_accepted") or 0) > 0
+      status, cycle_message = _classify_kis_overseas_collector_cycle(counts)
+      succeeded = status in {"running", "complete"}
       accepted = int(counts.get("subscriptions_accepted") or 0)
       if counts.get("subscription_limit_reached") and accepted >= 2:
         _kis_overseas_observed_subscription_capacity = max(2, accepted - (accepted % 2))
@@ -7324,8 +7605,8 @@ def _kis_overseas_realtime_collector_loop() -> None:
             }
         )
         _append_collection_log_unlocked(
-            "running" if succeeded else "error",
-            "KIS overseas realtime collector cycle completed",
+            status,
+            cycle_message,
             counts={
                 "phase": phase.value,
                 "symbols": len(symbols),
@@ -7362,6 +7643,102 @@ def _kis_overseas_realtime_collector_loop() -> None:
         )
       if _kis_overseas_realtime_stop.wait(20.0):
         return
+
+
+def _record_kis_overseas_realtime_progress(counts: dict[str, Any]) -> None:
+  """Expose persistent-session control replies without waiting for disconnect."""
+  global _kis_overseas_observed_subscription_capacity, _kis_overseas_observed_capacity_at
+  accepted = int(counts.get("subscriptions_accepted") or 0)
+  has_events = int(counts.get("ticks") or 0) + int(counts.get("orderbooks") or 0) > 0
+  limit_reached = bool(counts.get("subscription_limit_reached"))
+  notice: tuple[str, str] | None = None
+  with _live_lock:
+    _kis_overseas_realtime_state["counts"] = dict(counts)
+    if accepted > 0:
+      _kis_overseas_realtime_state["last_success_at"] = (
+          datetime.now(timezone.utc).isoformat()
+      )
+    _kis_overseas_realtime_state["last_error"] = (
+        None
+        if accepted > 0 or has_events
+        else _kis_overseas_realtime_state.get("last_error")
+    )
+    capacity_is_stale = (
+        _kis_overseas_observed_subscription_capacity is None
+        or time.monotonic() - _kis_overseas_observed_capacity_at >= 600.0
+    )
+    if limit_reached and accepted >= 2 and capacity_is_stale:
+      capacity = max(2, accepted - (accepted % 2))
+      _kis_overseas_observed_subscription_capacity = capacity
+      _kis_overseas_observed_capacity_at = time.monotonic()
+      _kis_overseas_realtime_state["observed_capacity"] = capacity
+      notice = (
+          "waiting",
+          (
+              "KIS overseas subscription capacity detected; "
+              f"reducing to {capacity // 2} complete trade+orderbook symbol"
+          ),
+      )
+    if _kis_overseas_observed_subscription_capacity:
+      _kis_overseas_realtime_state["observed_capacity"] = (
+          _kis_overseas_observed_subscription_capacity
+      )
+  current_symbols = (
+      _kis_overseas_realtime_symbols()
+      if _kis_overseas_observed_subscription_capacity
+      else ()
+  )
+  if current_symbols:
+    with _live_lock:
+      _kis_overseas_realtime_state["symbols"] = current_symbols
+      live_counts = dict(_kis_overseas_realtime_state.get("counts") or {})
+      live_counts["active_complete_subscriptions"] = len(current_symbols) * 2
+      live_counts["active_complete_symbols"] = list(current_symbols)
+      _kis_overseas_realtime_state["counts"] = live_counts
+  if notice is not None:
+    _kis_overseas_realtime_resubscribe.set()
+  if notice is not None:
+    with _live_lock:
+      _append_collection_log_unlocked(notice[0], notice[1], counts=dict(counts))
+
+
+def _classify_kis_overseas_collector_cycle(
+    counts: dict[str, Any],
+) -> tuple[str, str]:
+  accepted = int(counts.get("subscriptions_accepted") or 0)
+  ticks = int(counts.get("ticks") or 0)
+  orderbooks = int(counts.get("orderbooks") or 0)
+  if counts.get("appkey_already_in_use"):
+    return (
+        "waiting",
+        "KIS overseas websocket waiting: AppKey is held by another realtime session",
+    )
+  if counts.get("subscription_limit_reached"):
+    return (
+        "waiting" if accepted > 0 else "error",
+        (
+            "KIS overseas websocket partially subscribed; account subscription limit reached"
+            if accepted > 0
+            else "KIS overseas websocket subscription rejected: account limit reached"
+        ),
+    )
+  if accepted > 0:
+    if counts.get("connection_closed"):
+      return (
+          "waiting",
+          "KIS overseas websocket disconnected after a valid subscription; reconnecting",
+      )
+    return (
+        "running",
+        f"KIS overseas websocket active ({accepted} subscriptions, {ticks} ticks, {orderbooks} books)",
+    )
+  errors = dict(counts.get("subscription_errors_by_code") or {})
+  if errors:
+    detail = ", ".join(f"{code}={count}" for code, count in sorted(errors.items()))
+    return "error", f"KIS overseas websocket subscriptions rejected ({detail})"
+  if counts.get("connection_closed"):
+    return "waiting", "KIS overseas websocket closed before confirmation; reconnecting"
+  return "waiting", "KIS overseas websocket cycle ended without a subscription confirmation"
 
 
 def _has_fresh_us_websocket_book(symbol: str, *, max_age_seconds: float = 30.0) -> bool:
@@ -7643,14 +8020,21 @@ def _build_macro_micro_observer(decision_engine):
 
     def _builder(symbol, macro_result):
       features = None
+      technical_feature_error_code = None
       broker_quote = None
       realtime_tick = None
       quote_age_seconds = None
       try:
         frame = decision_engine.feature_builder.build(symbol, decision_time=decision_time)
         features = technical_feature_set_from_live_frame(frame, symbol)
-      except Exception:  # noqa: BLE001 - off-hours / missing data -> NO_TRADE micro result.
+      except Exception as exc:  # noqa: BLE001 - off-hours / missing data -> NO_TRADE micro result.
         features = None
+        raw_error = str(exc).split(":", 1)[0].strip().upper()
+        technical_feature_error_code = (
+            raw_error
+            if raw_error and all(char.isalnum() or char == "_" for char in raw_error)
+            else type(exc).__name__.upper()
+        )
       try:
         store = getattr(decision_engine, "store", None)
         if store is not None and hasattr(store, "latest_tick"):
@@ -7680,7 +8064,9 @@ def _build_macro_micro_observer(decision_engine):
           timestamp=decision_time, symbol=symbol,
           allowed_micro_strategies=macro_result.allowed_micro_strategies,
           blocked_micro_strategies=macro_result.blocked_micro_strategies,
-          technical_features=features, holding_state=holding_state,
+          technical_features=features,
+          technical_feature_error_code=technical_feature_error_code,
+          holding_state=holding_state,
           realtime_tick=realtime_tick, broker_quote=broker_quote,
           quote_age_seconds=quote_age_seconds,
           event_evidence=symbol_event_evidence.get(symbol, ()),
@@ -8039,15 +8425,20 @@ def _warm_us_volume_surge_candidates_for_buy_filter(symbols: tuple[str, ...]) ->
     return target
 
 
-def _prioritize_realtime_buy_candidates(symbols: tuple[str, ...]) -> tuple[str, ...]:
+def _prioritize_realtime_buy_candidates(
+    symbols: tuple[str, ...],
+    *,
+    account: AccountSnapshot | None = None,
+) -> tuple[str, ...]:
   """Keep currently tradeable cash buckets inside the engine's first evaluation window."""
   open_groups = set(_active_live_market_groups())
   if not ({"KRX", "US"} & open_groups):
     return symbols
-  try:
-    account = _live_account_snapshot_for_analysis()
-  except Exception:  # noqa: BLE001 - preserve original ordering on account lookup failure.
-    return symbols
+  if account is None:
+    try:
+      account = _live_account_snapshot_for_analysis()
+    except Exception:  # noqa: BLE001 - preserve original ordering on account lookup failure.
+      return symbols
   krw_cash = _account_available_cash(account, "KRW") if account is not None else 0.0
   usd_cash = _account_available_cash(account, "USD") if account is not None else 0.0
   if krw_cash <= 0 and usd_cash <= 0:
@@ -8133,6 +8524,8 @@ _us_learning_watchlist_cache: dict[str, Any] = {
     "at": 0.0,
     "cash_usd": None,
     "symbols": (),
+    "pool": (),
+    "rotation_index": 0,
 }
 
 
@@ -8155,56 +8548,176 @@ def _recent_affordable_us_watchlist(
     account: AccountSnapshot,
     *,
     limit: int,
+    database: Path | None = None,
 ) -> tuple[str, ...]:
-  """Reuse recently verified US symbols instead of rotating the universe each poll."""
+  """Rank affordable US symbols by sustained, execution-usable market activity."""
   cash_usd = _account_available_cash(account, "USD")
   if cash_usd <= 0 or limit <= 0:
     return ()
-  database = Path(os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"))
+  database = database or Path(
+      os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3")
+  )
   if not database.exists():
     return ()
+  now = datetime.now(timezone.utc)
   since = (
-      datetime.now(timezone.utc)
+      now
       - timedelta(hours=max(1.0, _env_float_web("REALTIME_US_WATCHLIST_LOOKBACK_HOURS", 6.0)))
   ).isoformat()
+  fresh_since = (
+      now
+      - timedelta(
+          seconds=max(
+              60.0,
+              _env_float_web("REALTIME_US_WATCHLIST_MAX_TICK_AGE_SEC", 180.0),
+          )
+      )
+  ).isoformat()
+  minimum_ticks = max(
+      2,
+      _auto_reliability_int("REALTIME_US_WATCHLIST_MIN_TICKS", 3, 2),
+  )
+  sample_rows = max(
+      1_000,
+      _auto_reliability_int("REALTIME_US_WATCHLIST_SAMPLE_ROWS", 20_000, 1_000),
+  )
   try:
-    with sqlite3.connect(database, timeout=5.0) as connection:
+    with closing(sqlite3.connect(database, timeout=5.0)) as connection:
       rows = connection.execute(
           """
-          select symbol, price, received_at
-          from realtime_ticks
-          where received_at >= ?
-            and symbol not glob '[0-9][0-9][0-9][0-9][0-9][0-9]'
-            and price > 0
-          order by received_at desc
-          limit 5000
+          with recent_ticks as (
+            select symbol, price, volume, received_at
+            from realtime_ticks
+            where received_at >= ?
+              and symbol not glob '[0-9][0-9][0-9][0-9][0-9][0-9]'
+              and price > 0
+            order by received_at desc
+            limit ?
+          ),
+          tick_stats as (
+            select
+              symbol,
+              count(*) as tick_count,
+              max(received_at) as latest_tick_at,
+              sum(price * max(volume, 1)) as observed_notional,
+              min(price) as minimum_price,
+              max(price) as maximum_price
+            from recent_ticks
+            group by symbol
+          ),
+          latest_prices as (
+            select ticks.symbol, max(ticks.price) as latest_price
+            from recent_ticks ticks
+            join tick_stats stats
+              on stats.symbol = ticks.symbol
+             and stats.latest_tick_at = ticks.received_at
+            group by ticks.symbol
+          ),
+          book_stats as (
+            select
+              symbol,
+              count(*) as book_count,
+              avg(spread_bps) as average_spread_bps
+            from realtime_orderbook
+            where received_at >= ?
+              and symbol in (select symbol from tick_stats)
+            group by symbol
+          )
+          select
+            stats.symbol,
+            prices.latest_price,
+            stats.latest_tick_at,
+            stats.tick_count,
+            stats.observed_notional,
+            coalesce(books.book_count, 0) as book_count,
+            coalesce(books.average_spread_bps, 1000000.0) as average_spread_bps,
+            10000.0 * (stats.maximum_price - stats.minimum_price)
+              / max(prices.latest_price, 0.000001) as observed_range_bps
+          from tick_stats stats
+          join latest_prices prices on prices.symbol = stats.symbol
+          left join book_stats books on books.symbol = stats.symbol
+          where stats.tick_count >= ?
+            and stats.latest_tick_at >= ?
+            and prices.latest_price <= ?
+          order by
+            case when coalesce(books.average_spread_bps, 1000000.0) <= 60.0
+              then 0 else 1 end asc,
+            observed_range_bps desc,
+            book_count desc,
+            average_spread_bps asc,
+            stats.tick_count desc,
+            stats.observed_notional desc,
+            stats.latest_tick_at desc
+          limit ?
           """,
-          (since,),
+          (
+              since,
+              sample_rows,
+              since,
+              minimum_ticks,
+              fresh_since,
+              cash_usd,
+              max(limit * 8, limit),
+          ),
       ).fetchall()
   except sqlite3.Error:
     return ()
   selected: list[str] = []
-  seen: set[str] = set()
   excluded = _held_or_recent_buy_tickers(account)
-  for symbol, price, _received_at in rows:
+  for symbol, _price, _received_at, *_quality in rows:
     ticker = str(symbol or "").upper().strip()
     if (
         not ticker
-        or ticker in seen
         or ticker in excluded
         or _is_excluded_us_live_candidate(ticker)
-        or float(price or 0.0) > cash_usd
+        or not _is_live_buy_candidate_symbol(ticker, "US")
     ):
       continue
-    seen.add(ticker)
     selected.append(ticker)
     if len(selected) >= limit:
       break
   return tuple(selected)
 
 
+def _liquid_affordable_us_seed_symbols(
+    account: AccountSnapshot,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+  """Broker-verify a domain-prior list used when learned activity is insufficient."""
+  if limit <= 0:
+    return ()
+  raw = os.getenv(
+      "REALTIME_US_LIQUIDITY_SEED_SYMBOLS",
+      "F,SOFI,INTC,PFE,T,BAC,WBD,SNAP,PLTR,NIO,RIVN,LCID,NU,CCL,KVUE,LYFT,HOOD",
+  )
+  excluded = _held_or_recent_buy_tickers(account)
+  configured = tuple(
+      dict.fromkeys(
+          ticker
+          for ticker in (item.strip().upper() for item in raw.replace(";", ",").split(","))
+          if ticker
+          and ticker not in excluded
+          and _is_live_buy_candidate_symbol(ticker, "US")
+      )
+  )
+  if not configured:
+    return ()
+  try:
+    exchange_map = _load_us_listed_exchange_map()
+  except Exception:
+    exchange_map = {}
+  return _broker_affordable_candidate_symbols(
+      configured,
+      "US",
+      account,
+      max_symbols=limit,
+      exchange_resolver=lambda symbol: exchange_map.get(symbol, "NASDAQ"),
+  )
+
+
 def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
-  """Hold a small affordable US watchlist long enough to form causal labels."""
+  """Hold and rotate a broker-verified US watchlist to form causal labels."""
   safe_limit = max(1, int(limit))
   account = _account_snapshot_from_live_basis(_last_live_account_basis())
   if account is None:
@@ -8214,6 +8727,10 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
     return ()
   now = time.monotonic()
   ttl = max(300.0, _env_float_web("REALTIME_US_WATCHLIST_TTL_SEC", 1800.0))
+  quality_recheck = max(
+      180.0,
+      _env_float_web("REALTIME_US_WATCHLIST_RECHECK_SEC", 300.0),
+  )
   with _live_lock:
     cached_symbols = tuple(_us_learning_watchlist_cache.get("symbols") or ())
     cached_at = float(_us_learning_watchlist_cache.get("at") or 0.0)
@@ -8221,22 +8738,66 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
   if (
       cached_symbols
       and cached_cash == cash_usd
-      and now - cached_at < ttl
+      and now - cached_at < min(ttl, quality_recheck)
   ):
     return cached_symbols[:safe_limit]
 
-  selected = list(_recent_affordable_us_watchlist(account, limit=safe_limit))
-  if len(selected) < safe_limit:
-    discovered = tuple(_live_affordable_buy_candidate_symbols(limit=safe_limit) or ())
-    selected.extend(
+  try:
+    pool_multiplier = max(
+        1,
+        min(6, int(os.getenv("REALTIME_US_ROTATION_POOL_MULTIPLIER", "1"))),
+    )
+  except (TypeError, ValueError):
+    pool_multiplier = 1
+  pool_limit = safe_limit * pool_multiplier
+  pool = list(_recent_affordable_us_watchlist(account, limit=pool_limit))
+  if len(pool) < pool_limit:
+    pool.extend(
+        symbol
+        for symbol in _liquid_affordable_us_seed_symbols(
+            account,
+            limit=pool_limit - len(pool),
+        )
+        if symbol not in pool
+    )
+  if len(pool) < pool_limit:
+    discovered = tuple(
+        _live_affordable_buy_candidate_symbols(limit=pool_limit) or ()
+    )
+    pool.extend(
         symbol
         for symbol in discovered
         if _ticker_market_group_for_live_trading(symbol, "") == "US"
     )
-  result = tuple(dict.fromkeys(selected))[:safe_limit]
+  pool_result = tuple(dict.fromkeys(pool))[:pool_limit]
+  with _live_lock:
+    previous_pool = tuple(_us_learning_watchlist_cache.get("pool") or ())
+    previous_index = int(
+        _us_learning_watchlist_cache.get("rotation_index") or 0
+    )
+  if pool_multiplier > 1 and len(pool_result) > safe_limit:
+    rotation_index = (
+        previous_index + 1
+        if previous_pool == pool_result and cached_symbols
+        else 0
+    )
+    start = (rotation_index * safe_limit) % len(pool_result)
+    result = tuple(
+        pool_result[(start + offset) % len(pool_result)]
+        for offset in range(min(safe_limit, len(pool_result)))
+    )
+  else:
+    rotation_index = 0
+    result = pool_result[:safe_limit]
   with _live_lock:
     _us_learning_watchlist_cache.update(
-        {"at": now, "cash_usd": cash_usd, "symbols": result}
+        {
+            "at": now,
+            "cash_usd": cash_usd,
+            "symbols": result,
+            "pool": pool_result,
+            "rotation_index": rotation_index,
+        }
     )
   return result
 
@@ -8507,7 +9068,11 @@ def _is_market_wide_broker_quote_error(error_text: str) -> bool:
   )
 
 
-def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
+def _cached_context_buy_candidates(
+    limit: int = 30,
+    *,
+    account: AccountSnapshot | None = None,
+) -> tuple[str, ...]:
   with _live_lock:
     context = _live_state.get("context")
   if context is None:
@@ -8516,10 +9081,11 @@ def _cached_context_buy_candidates(limit: int = 30) -> tuple[str, ...]:
   markets = tuple(getattr(context, "markets", ()) or ())
   market_by_ticker = {str(getattr(market, "ticker", "") or "").upper().strip(): market for market in markets}
   open_groups = set(_active_live_market_groups())
-  try:
-    account = _live_account_snapshot_for_analysis()
-  except Exception:  # noqa: BLE001 - fail closed for buy candidates.
-    account = None
+  if account is None:
+    try:
+      account = _live_account_snapshot_for_analysis()
+    except Exception:  # noqa: BLE001 - fail closed for buy candidates.
+      account = None
   selected: list[str] = []
 
   for path in tuple(getattr(context, "reasoning_paths", ()) or ()):
@@ -8650,7 +9216,29 @@ def _candidate_has_fresh_buy_orderbook(ticker: str, store: RealtimeMarketDataSto
     return False
   if str(getattr(orderbook, "source", "") or "") != "kis_realtime_websocket":
     return False
-  return _is_recent_realtime_item(orderbook, "REALTIME_KRX_BUY_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 180.0)
+  received_at = getattr(orderbook, "received_at", None)
+  if received_at is None:
+    return False
+  try:
+    age_seconds = max(
+        0.0,
+        (datetime.now(timezone.utc) - received_at).total_seconds(),
+    )
+  except (TypeError, ValueError):
+    return False
+  # Candidate admission must be at least as strict as the feature builder.
+  # Otherwise a symbol reaches ontology/micro reasoning and is immediately
+  # rejected as MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE, creating a false impression
+  # that strategy election itself is too restrictive.
+  candidate_max_age = max(
+      1.0,
+      _env_float_web("REALTIME_KRX_BUY_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 180.0),
+  )
+  feature_max_age = max(
+      1.0,
+      _env_float_web("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS", 15_000.0) / 1_000.0,
+  )
+  return age_seconds <= min(candidate_max_age, feature_max_age)
 
 
 def _queue_krx_buy_candidate_warmup(ticker: str) -> None:
@@ -8869,6 +9457,40 @@ def _candidate_has_usable_live_liquidity(ticker: str, store: RealtimeMarketDataS
   liquidity_score = min(1.0, depth / 1_000_000.0)
   min_score = max(0.0, _env_float_web("REALTIME_KRX_MIN_CANDIDATE_LIQUIDITY_SCORE", 0.30))
   return liquidity_score >= min_score
+
+
+def _candidate_has_strategy_feature_history(
+    ticker: str,
+    store: RealtimeMarketDataStore,
+) -> bool:
+  """Pre-filter candidates that cannot build the strategy feature frame."""
+  minimum_bars = max(
+      10,
+      _auto_reliability_int("REALTIME_STRATEGY_MINUTE_HISTORY_BARS", 20, 10),
+  )
+  maximum_age_seconds = max(
+      60.0,
+      _env_float_web("REALTIME_STRATEGY_HISTORY_MAX_AGE_SEC", 180.0),
+  )
+  now = datetime.now(timezone.utc)
+  try:
+    bars = store.recent_minute_bars(
+        ticker,
+        now - timedelta(minutes=max(120, minimum_bars * 3)),
+        limit=max(120, minimum_bars),
+    )
+  except Exception:
+    return False
+  if len(bars) < minimum_bars:
+    return False
+  latest = getattr(bars[-1], "minute_start", None)
+  if latest is None:
+    return False
+  try:
+    age = max(0.0, (now - latest).total_seconds())
+  except (TypeError, ValueError):
+    return False
+  return age <= maximum_age_seconds
 
 
 def _candidate_affordable_with_buffer(ticker: str, market: MarketSnapshot, account: AccountSnapshot) -> bool:
@@ -9227,6 +9849,10 @@ def _kis_realtime_collector_loop() -> None:
   resubscribe_seconds = max(30.0, float(os.getenv("REALTIME_COLLECTOR_RESUBSCRIBE_SECONDS", "300")))
   closed_fallback_seconds = max(60.0, float(os.getenv("REALTIME_COLLECTOR_CLOSED_FALLBACK_SECONDS", "300")))
   while not _kis_realtime_collector_stop.is_set():
+    if _kis_realtime_session_owner() not in {"KRX", "BOTH"}:
+      if _kis_realtime_collector_stop.wait(15.0):
+        return
+      continue
     symbols = _kis_realtime_collector_symbols()
     if not symbols:
       with _live_lock:
@@ -9296,6 +9922,9 @@ def _kis_realtime_collector_loop() -> None:
               resubscribe_event=_kis_realtime_collector_resubscribe,
               skip_subscriptions=_kis_realtime_collector_skip_pairs(),
               max_runtime_seconds=resubscribe_seconds,
+              session_active_provider=lambda: (
+                  _kis_realtime_session_owner() in {"KRX", "BOTH"}
+              ),
           )
       )
       _record_kis_realtime_collector_result(counts)
@@ -10075,6 +10704,33 @@ def _active_live_market_groups(now_utc: Any | None = None) -> tuple[str, ...]:
     if _is_live_market_extended_open(group, now_utc):
       groups.append(group)
   return tuple(groups)
+
+
+def _kis_realtime_session_owner(now_utc: Any | None = None) -> str:
+  """Elect the sole market-data WebSocket allowed to use the KIS AppKey.
+
+  KIS rejects a second concurrent realtime socket with OPSP8996. Prefer the
+  actual US exchange session when it is open, KRX during its core session, and
+  US daytime quotes only after the KRX core session has ended. Setting
+  ``KIS_REALTIME_SINGLE_SESSION=false`` restores the legacy parallel behavior
+  for accounts that explicitly support multiple sockets.
+  """
+  if not _env_flag("KIS_REALTIME_SINGLE_SESSION", True):
+    return "BOTH"
+
+  from app.data.kis_realtime import is_us_daytime_quote_session
+  from app.data.market_session import MarketPhase, market_phase, streaming_phase
+
+  current = now_utc or datetime.now(timezone.utc)
+  if market_phase("US", current) is not MarketPhase.CLOSED:
+    return "US"
+  if _is_live_market_core_open("KRX", current):
+    return "KRX"
+  if is_us_daytime_quote_session(current):
+    return "US"
+  if streaming_phase("KRX", current, include_nxt=True) is not MarketPhase.CLOSED:
+    return "KRX"
+  return "NONE"
 
 
 def _is_open_live_market_ticker(ticker: str, market: str = "", now_utc: Any | None = None) -> bool:

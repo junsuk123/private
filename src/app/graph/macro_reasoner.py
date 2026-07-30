@@ -37,7 +37,29 @@ from app.graph.macro_micro_common import (
 DEFAULT_STRATEGY_PERMISSIONS: dict[str, dict[str, tuple[str, ...]]] = {
     MarketRegime.TREND_UP.value: {"allow": ("momentum", "breakout", "vwap_pullback"), "block": ("aggressive_countertrend_reversion",)},
     MarketRegime.BREAKOUT_MARKET.value: {"allow": ("breakout", "momentum", "vwap_pullback"), "block": ("late_breakout_chasing",)},
-    MarketRegime.TREND_DOWN.value: {"allow": ("sell", "reduce_risk", "defensive_hold"), "block": ("weak_breakout_buy", "low_volume_momentum_buy")},
+    # A falling index is not itself a closed-world ban on every long entry.
+    # Permit only strategies whose thesis can still be valid in a weak tape:
+    # liquid mean reversion and stock-specific relative strength.  Directional
+    # momentum/breakout remains excluded unless the regime changes.
+    MarketRegime.TREND_DOWN.value: {
+        "allow": (
+            "sell",
+            "reduce_risk",
+            "defensive_hold",
+            "mean_reversion",
+            "vwap_reversion",
+            "relative_strength",
+        ),
+        "block": (
+            "weak_breakout_buy",
+            "low_volume_momentum_buy",
+            "intraday_momentum",
+            "event_momentum",
+            "gap_context",
+            "breakout_volume",
+            "rvgi_box_breakout",
+        ),
+    },
     MarketRegime.RANGE_BOUND.value: {"allow": ("mean_reversion", "vwap_reversion"), "block": ("late_breakout_chasing",)},
     MarketRegime.HIGH_VOLATILITY_RISK.value: {"allow": ("sell", "reduce_risk", "hold"), "block": ("new_buy",)},
     MarketRegime.LOW_LIQUIDITY_MARKET.value: {"allow": ("sell", "reduce_risk", "hold"), "block": ("new_buy",)},

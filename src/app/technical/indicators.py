@@ -47,6 +47,8 @@ __all__ = [
     "MacdResult",
     "BollingerResult",
     "DonchianResult",
+    "RvgiResult",
+    "BoxGeometryResult",
     "closes",
     "highs",
     "lows",
@@ -64,6 +66,8 @@ __all__ = [
     "volume_spike_ratio",
     "spread_bps",
     "orderbook_imbalance",
+    "rvgi",
+    "causal_box_geometry",
 ]
 
 
@@ -95,6 +99,32 @@ class DonchianResult:
     high: float | None
     low: float | None
     mid: float | None
+    ok: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class RvgiResult:
+    main: float | None
+    signal: float | None
+    previous_main: float | None
+    previous_signal: float | None
+    slope: float | None
+    bullish_cross: bool | None
+    bearish_cross: bool | None
+    ok: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class BoxGeometryResult:
+    high: float | None
+    low: float | None
+    mid: float | None
+    width: float | None
+    width_pct: float | None
+    position: float | None
+    source_timestamp: object | None
     ok: bool
     reason: str = ""
 
@@ -349,3 +379,114 @@ def orderbook_imbalance(bid_size: object, ask_size: object) -> float | None:
     if total <= 0:
         return None
     return (bid - ask) / total
+
+
+def rvgi(
+    bars: Sequence[OHLCVBar],
+    period: int = 10,
+    *,
+    epsilon: float = 1e-12,
+) -> RvgiResult:
+    """Causal Relative Vigor Index over completed bars only.
+
+    The caller owns completion filtering.  A signal needs four consecutive RVGI
+    values, while each RVGI value needs ``period`` four-bar weighted values.
+    """
+    if period <= 0 or epsilon <= 0:
+        return RvgiResult(None, None, None, None, None, None, None, False, "invalid_params")
+    ordered = tuple(bars)
+    required = period + 6
+    if len(ordered) < required:
+        return RvgiResult(None, None, None, None, None, None, None, False, "insufficient_data")
+    bodies: list[float] = []
+    ranges: list[float] = []
+    for bar in ordered:
+        values = (bar.open, bar.high, bar.low, bar.close)
+        if not all(math.isfinite(float(value)) for value in values):
+            return RvgiResult(None, None, None, None, None, None, None, False, "non_finite_data")
+        bodies.append(float(bar.close) - float(bar.open))
+        ranges.append(max(0.0, float(bar.high) - float(bar.low)))
+    weighted_body: list[float] = []
+    weighted_range: list[float] = []
+    for index in range(3, len(ordered)):
+        weighted_body.append(
+            (bodies[index] + 2 * bodies[index - 1] + 2 * bodies[index - 2] + bodies[index - 3])
+            / 6.0
+        )
+        weighted_range.append(
+            (ranges[index] + 2 * ranges[index - 1] + 2 * ranges[index - 2] + ranges[index - 3])
+            / 6.0
+        )
+    rvgi_values: list[float] = []
+    for index in range(period - 1, len(weighted_body)):
+        numerator = fmean(weighted_body[index - period + 1 : index + 1])
+        denominator = fmean(weighted_range[index - period + 1 : index + 1])
+        # A zero-range history has no directional information.  Dividing by
+        # epsilon is safe numerically, but it must not manufacture a signal.
+        rvgi_values.append(0.0 if denominator <= epsilon else numerator / max(denominator, epsilon))
+    if len(rvgi_values) < 4:
+        return RvgiResult(None, None, None, None, None, None, None, False, "insufficient_data")
+    signals = [
+        (rvgi_values[index] + 2 * rvgi_values[index - 1] + 2 * rvgi_values[index - 2] + rvgi_values[index - 3])
+        / 6.0
+        for index in range(3, len(rvgi_values))
+    ]
+    main = rvgi_values[-1]
+    previous_main = rvgi_values[-2]
+    signal = signals[-1]
+    previous_signal = signals[-2] if len(signals) >= 2 else None
+    bullish = (
+        previous_signal is not None
+        and main > signal
+        and previous_main <= previous_signal
+    )
+    bearish = (
+        previous_signal is not None
+        and main < signal
+        and previous_main >= previous_signal
+    )
+    return RvgiResult(
+        main,
+        signal,
+        previous_main,
+        previous_signal,
+        main - previous_main,
+        bullish,
+        bearish,
+        True,
+    )
+
+
+def causal_box_geometry(
+    bars: Sequence[OHLCVBar],
+    lookback: int = 20,
+    *,
+    epsilon: float = 1e-12,
+) -> BoxGeometryResult:
+    """Box ending immediately before the final (signal) completed bar."""
+    ordered = tuple(bars)
+    if lookback <= 0 or len(ordered) < lookback + 1:
+        return BoxGeometryResult(None, None, None, None, None, None, None, False, "insufficient_data")
+    history = ordered[-lookback - 1 : -1]
+    high_values = _finite([bar.high for bar in history])
+    low_values = _finite([bar.low for bar in history])
+    if len(high_values) != lookback or len(low_values) != lookback:
+        return BoxGeometryResult(None, None, None, None, None, None, None, False, "non_finite_data")
+    high = max(high_values)
+    low = min(low_values)
+    width = high - low
+    mid = (high + low) / 2.0
+    if mid <= 0 or width <= epsilon:
+        return BoxGeometryResult(high, low, mid, width, None, None, history[-1].as_of, False, "invalid_geometry")
+    close = float(ordered[-1].close)
+    position = max(0.0, min(1.0, (close - low) / max(width, epsilon)))
+    return BoxGeometryResult(
+        high,
+        low,
+        mid,
+        width,
+        width / mid,
+        position,
+        history[-1].as_of,
+        True,
+    )

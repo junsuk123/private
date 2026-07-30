@@ -252,7 +252,11 @@ class AccountDashboardService:
             "cash": [asdict(row) for row in cash_rows],
             "trades": trade_rows,
             "holding_orders": holding_order_rows,
-            "profitability": _profitability_summary(trade_rows, snapshot),
+            "profitability": _profitability_summary(
+                trade_rows,
+                snapshot,
+                status,
+            ),
             "technical": build_technical_panel(self._technical_payload()),
             "macro_micro": build_macro_micro_panel(self._macro_micro_payload()),
             "logs": {
@@ -796,7 +800,11 @@ def _is_us_market(market: str, ticker: str) -> bool:
     return bool(str(ticker or "").strip()) and not str(ticker or "").isdigit()
 
 
-def _profitability_summary(trades: list[dict[str, Any]], snapshot: AccountDashboardSnapshot) -> dict[str, Any]:
+def _profitability_summary(
+    trades: list[dict[str, Any]],
+    snapshot: AccountDashboardSnapshot,
+    status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Derive win-rate / payoff / expectancy from realized-trade rows.
 
     Uses the same trade rows that feed the trade table. Values that cannot be
@@ -810,6 +818,10 @@ def _profitability_summary(trades: list[dict[str, Any]], snapshot: AccountDashbo
     closed = len(realized)
     fees = sum(_num(t.get("fee_krw")) for t in trades)
     tax = sum(_num(t.get("tax_krw")) for t in trades)
+    broker_expenses = max(
+        fees + tax,
+        _num((status or {}).get("broker_expenses_today_overseas_krw")),
+    )
     win_rate = (len(wins) / closed) if closed else None
     avg_win = (sum(wins) / len(wins)) if wins else None
     avg_loss = (sum(losses) / len(losses)) if losses else None  # negative
@@ -822,13 +834,23 @@ def _profitability_summary(trades: list[dict[str, Any]], snapshot: AccountDashbo
         "closed_trade_count": closed,
         "win_count": len(wins),
         "loss_count": len(losses),
-        "gross_realized_pnl_krw": sum(realized),
+        "gross_realized_pnl_krw": (
+            snapshot.realized_pnl_today_krw + broker_expenses
+        ),
         "realized_pnl_today_krw": snapshot.realized_pnl_today_krw,
         "unrealized_pnl_krw": snapshot.unrealized_pnl_krw,
-        "trade_cost_krw": fees + tax,
+        "trade_cost_krw": broker_expenses,
+        "broker_expenses_krw": broker_expenses,
+        "broker_expense_source": (
+            "KIS_TTTS3039R_SETTLEMENT"
+            if _num((status or {}).get("broker_expenses_today_overseas_krw")) > 0
+            else "ORDER_EVENT_FIELDS"
+        ),
         "fees_krw": fees,
         "tax_krw": tax,
-        "net_after_cost_krw": snapshot.realized_pnl_today_krw - (fees + tax),
+        # KIS period realized P&L is already net of smtl_fee1. Do not subtract
+        # the same broker expense a second time.
+        "net_after_cost_krw": snapshot.realized_pnl_today_krw,
         "win_rate": win_rate,
         "avg_win_krw": avg_win,
         "avg_loss_krw": avg_loss,

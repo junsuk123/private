@@ -52,6 +52,23 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     "ema_gap_bps",
     "donchian_breakout",
     "volume_spike_ratio",
+    # Completed one-minute-bar RVGI/box context. Availability flags prevent
+    # numeric model tensors from disguising missing slow history as a signal.
+    "rvgi_available",
+    "rvgi",
+    "rvgi_signal",
+    "rvgi_diff",
+    "rvgi_slope",
+    "rvgi_bullish_cross",
+    "box_available",
+    "box_high",
+    "box_low",
+    "box_mid",
+    "box_width_pct",
+    "box_position",
+    "breakout_distance_bps",
+    "box_previous_close",
+    "box_context_timestamp_epoch",
 )
 
 
@@ -79,7 +96,7 @@ LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
     # v3 adds true 1/5/10-second microstructure columns. The version string is
     # part of the schema_hash, so prior artifacts cannot be mistaken for a model
     # trained on these new inputs.
-    version="live_short_horizon_v3_seconds",
+    version="live_short_horizon_v4_rvgi_box",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

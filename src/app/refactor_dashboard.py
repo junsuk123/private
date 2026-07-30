@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -417,18 +418,60 @@ def _selection_for_symbol(shadow: dict[str, Any], symbol: str) -> dict[str, Any]
     ontology_action = str(ontology.get("action") or "NO_TRADE").upper()
     ontology_strategy_id = ontology.get("strategy_id")
     ontology_allowed = bool(ontology_strategy_id) and ontology_action in {
+        "ACTIVATE_STRATEGY",
         "ADMISSIBLE",
         "ALLOW",
         "ALLOWED",
         "BUY",
     }
+    as_of = row.get("as_of")
+    evidence_age_seconds: float | None = None
+    if as_of:
+        try:
+            parsed_as_of = datetime.fromisoformat(str(as_of).replace("Z", "+00:00"))
+            if parsed_as_of.tzinfo is None:
+                parsed_as_of = parsed_as_of.replace(tzinfo=timezone.utc)
+            evidence_age_seconds = max(
+                0.0,
+                (datetime.now(timezone.utc) - parsed_as_of).total_seconds(),
+            )
+        except (TypeError, ValueError):
+            evidence_age_seconds = None
+    try:
+        maximum_age = max(
+            10.0,
+            float(os.getenv("STRATEGY_SESSION_EVIDENCE_MAX_AGE_SEC", "120")),
+        )
+    except (TypeError, ValueError):
+        maximum_age = 120.0
+    evidence_missing = not bool(row)
+    evidence_stale = bool(
+        row
+        and (
+            evidence_age_seconds is None
+            or evidence_age_seconds > maximum_age
+        )
+    )
+    reason_codes = list(preferred.get("reason_codes") or [])
+    if evidence_missing:
+        reason_codes.append("DECISION_EVIDENCE_MISSING")
+    elif evidence_stale:
+        reason_codes.append("DECISION_EVIDENCE_STALE")
     return {
-        "as_of": row.get("as_of"),
+        "as_of": as_of,
         "action": preferred.get("action") or "NO_TRADE",
         "strategy_id": preferred.get("strategy_id"),
         "utility": preferred.get("utility"),
-        "reason_codes": preferred.get("reason_codes") or [],
+        "realtime_trust_score": preferred.get("realtime_trust_score"),
+        "realtime_trust_samples": preferred.get("realtime_trust_samples"),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
         "path": preferred.get("path") or "ontology",
+        "evidence_status": (
+            "MISSING" if evidence_missing else "STALE" if evidence_stale else "CURRENT"
+        ),
+        "evidence_stale": evidence_stale,
+        "evidence_age_seconds": evidence_age_seconds,
+        "evidence_max_age_seconds": maximum_age,
         "ontology_allowed": ontology_allowed,
         "ontology_action": ontology_action,
         "ontology_strategy_id": ontology_strategy_id,
@@ -941,6 +984,7 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "event_momentum": ["Event Time", "VWAP", "MA5", "Volume"],
         "cross_sectional_relative_strength": ["Relative Strength", "MA20", "VWAP"],
         "gap_context": ["Session Open", "Gap", "VWAP", "Volume"],
+        "rvgi_box_breakout": ["RVGI", "RVGI Signal", "Box High", "Box Low", "Volume"],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
 
@@ -1011,8 +1055,81 @@ def _decision_ontology(
     liquidity = _finite(latest.get("liquidity_score"))
     volatility = _finite(latest.get("volatility"))
     micro = market.get("microstructure") or {}
+    rvgi_result = None
+    box_result = None
+    try:
+        from app.features.schemas import OHLCVBar
+        from app.technical import indicators as technical_indicators
+
+        typed_bars = tuple(
+            OHLCVBar(
+                ticker=str(market.get("symbol") or ""),
+                as_of=datetime.fromisoformat(
+                    str(row.get("minute_start")).replace("Z", "+00:00")
+                ),
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row.get("volume") or 0.0),
+            )
+            for row in bars
+            if row.get("minute_start")
+        )
+        rvgi_result = technical_indicators.rvgi(typed_bars, 10)
+        box_result = technical_indicators.causal_box_geometry(typed_bars, 20)
+    except (TypeError, ValueError, KeyError):
+        rvgi_result = None
+        box_result = None
 
     indicators = {
+        "rvgi_cross": _indicator(
+            "RVGI bullish cross",
+            1.0 if rvgi_result and rvgi_result.bullish_cross else (
+                0.0 if rvgi_result and rvgi_result.ok else None
+            ),
+            (
+                float(rvgi_result.main)
+                if rvgi_result and rvgi_result.main is not None
+                else None
+            ),
+            (
+                f"signal={rvgi_result.signal:.6f}"
+                if rvgi_result and rvgi_result.signal is not None
+                else "completed bar history unavailable"
+            ),
+            "completed_minute_bars",
+        ),
+        "rvgi_diff": _indicator(
+            "RVGI - signal",
+            _bounded(
+                0.5 + (rvgi_result.main - rvgi_result.signal) * 5.0
+                if rvgi_result
+                and rvgi_result.main is not None
+                and rvgi_result.signal is not None
+                else None
+            ),
+            (
+                rvgi_result.main - rvgi_result.signal
+                if rvgi_result
+                and rvgi_result.main is not None
+                and rvgi_result.signal is not None
+                else None
+            ),
+            "pure causal RVGI",
+            "completed_minute_bars",
+        ),
+        "box_position": _indicator(
+            "Frozen box position",
+            box_result.position if box_result and box_result.ok else None,
+            box_result.high if box_result and box_result.ok else None,
+            (
+                f"low={box_result.low}, high={box_result.high}"
+                if box_result and box_result.ok
+                else "causal box history unavailable"
+            ),
+            "completed_minute_bars",
+        ),
         "return_1s": _indicator(
             "1초 수익률", _bounded(.5 + float(micro.get("return_1s") or 0.0) * 100),
             _finite(micro.get("return_1s")), "직전 1초 체결가 변화", "tick",
@@ -1115,6 +1232,11 @@ def _decision_ontology(
             ("relative_strength", ">=", .8), ("liquidity", ">=", .65),
         ],
         "gap_context": [("gap", ">=", .8), ("opening_confirmation", ">=", .65)],
+        "rvgi_box_breakout": [
+            ("rvgi_cross", ">=", .8),
+            ("box_position", ">=", .8),
+            ("volume", ">=", .65),
+        ],
     }
     ontology_strategy = str(
         selection.get("ontology_strategy_id") or selection.get("strategy_id") or ""
@@ -1125,8 +1247,11 @@ def _decision_ontology(
     for expert_type in ALL_EXPERT_TYPES:
         expert = expert_type()
         checks = []
-        for feature, operator, threshold in requirements[expert.strategy_id]:
-            item = indicators[feature]
+        for feature, operator, threshold in requirements.get(expert.strategy_id, ()):
+            item = indicators.get(
+                feature,
+                _indicator(feature, None, None, "RVGI Box context unavailable", "completed_minute_bars"),
+            )
             value = item["score"]
             passed = (
                 value >= threshold if value is not None and operator == ">="

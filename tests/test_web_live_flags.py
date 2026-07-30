@@ -56,6 +56,36 @@ class WebLiveFlagsTest(unittest.TestCase):
         self.assertEqual(payload["selection"]["strategy_id"], "intraday_momentum")
         self.assertTrue(payload["selection"]["ontology_allowed"])
 
+    def test_market_view_replaces_stale_symbol_with_current_scan_candidate(self) -> None:
+        engine = SimpleNamespace(
+            get_status=lambda: {
+                "last_summary": {
+                    "buy_candidate_sample": ["SOFI", "PFE"],
+                },
+                "strategy_session": {
+                    "phase": "SCANNING",
+                    "selected_symbol": None,
+                    "last_reason": "GNN_NOT_LIVE_AUTHORIZED",
+                },
+            }
+        )
+        with (
+            patch("app.web._realtime_trading_engine", engine),
+            patch(
+                "app.web.build_strategy_market_view",
+                return_value={
+                    "symbol": "SOFI",
+                    "selection": {},
+                    "algorithm": None,
+                },
+            ) as build_view,
+        ):
+            payload = web_module._strategy_market_view_with_live_session("005930", 30)
+
+        build_view.assert_called_once_with("SOFI", limit=30)
+        self.assertEqual(payload["symbol"], "SOFI")
+        self.assertEqual(payload["live_trading"]["candidate_symbols"], ["SOFI", "PFE"])
+
     def test_apply_live_flags_requires_confirmation(self) -> None:
         client = TestClient(app)
 

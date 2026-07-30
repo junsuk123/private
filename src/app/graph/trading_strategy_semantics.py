@@ -13,6 +13,7 @@ POSITIVE_STRATEGY_SIGNALS = {
     "IntradayMomentumBuy",
     "PairMeanReversionBuy",
     "TechnicalBreakoutBuy",
+    "RvgiBoxBreakoutBuy",
     "CostEfficientTrade",
     "RealityCheckPassed",
 }
@@ -32,6 +33,8 @@ RISK_STRATEGY_SIGNALS = {
     "RecentLossReentry",
     "StrategyConflict",
     "ExecutionRisk",
+    "RvgiBearishCross",
+    "RvgiBoxFalseBreakoutRisk",
 }
 # Feature names that the RiskManager should surface as hard no-trade context. Every
 # entry here also resolves to a TradeForbidden target below, so the RiskManager blocks

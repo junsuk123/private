@@ -101,7 +101,9 @@ def test_overseas_period_profit_requests_krw_and_all_exchanges() -> None:
     assert captured["tr_id"] == "TTTS3039R"
     assert captured["path"].endswith("/overseas-stock/v1/trading/inquire-period-profit")
     # KRW mode so amounts need no FX conversion; blank exchange/currency = all.
-    assert captured["params"]["WCRC_FRCR_DVSN_CD"] == "01"
+    # Live KIS returns foreign-currency values for 01 and KRW-converted
+    # settlement values for 02.
+    assert captured["params"]["WCRC_FRCR_DVSN_CD"] == "02"
     assert captured["params"]["OVRS_EXCG_CD"] == ""
     assert captured["params"]["CRCY_CD"] == ""
 

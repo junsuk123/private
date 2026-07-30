@@ -9,6 +9,7 @@ data yields ``None`` fields (NaN-safe) rather than fabricated numbers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from statistics import fmean, pstdev
 from typing import Mapping, Sequence
 
@@ -30,6 +31,8 @@ class FeatureBuilderConfig:
     persistence_window: int = 10
     vol_baseline_window: int = 20
     vol_recent_window: int = 5
+    rvgi_period: int = 10
+    box_lookback: int = 20
 
 
 def _orderbook_field(orderbook: Mapping[str, float] | object, name: str) -> float | None:
@@ -128,6 +131,12 @@ def build_technical_feature_set(
             risk += 0.3
         false_breakout_risk = min(1.0, risk)
 
+    rvgi_result = ti.rvgi(bars, cfg.rvgi_period) if bars else None
+    box = ti.causal_box_geometry(bars, cfg.box_lookback) if bars else None
+    breakout_distance_bps = None
+    if box and box.ok and box.high and last_price:
+        breakout_distance_bps = (last_price / box.high - 1.0) * 10_000.0
+
     best_bid = _orderbook_field(orderbook, "best_bid")
     best_ask = _orderbook_field(orderbook, "best_ask")
     spread_bps = _orderbook_field(orderbook, "spread_bps")
@@ -160,6 +169,28 @@ def build_technical_feature_set(
         breakout_strength=breakout_strength,
         donchian_low_distance=donchian_low_distance,
         false_breakout_risk=false_breakout_risk,
+        rvgi=rvgi_result.main if rvgi_result and rvgi_result.ok else None,
+        rvgi_signal=rvgi_result.signal if rvgi_result and rvgi_result.ok else None,
+        rvgi_diff=(
+            rvgi_result.main - rvgi_result.signal
+            if rvgi_result and rvgi_result.ok and rvgi_result.main is not None and rvgi_result.signal is not None
+            else None
+        ),
+        rvgi_slope=rvgi_result.slope if rvgi_result and rvgi_result.ok else None,
+        rvgi_bullish_cross=rvgi_result.bullish_cross if rvgi_result and rvgi_result.ok else None,
+        rvgi_bearish_cross=rvgi_result.bearish_cross if rvgi_result and rvgi_result.ok else None,
+        box_high=box.high if box and box.ok else None,
+        box_low=box.low if box and box.ok else None,
+        box_mid=box.mid if box and box.ok else None,
+        box_width_pct=box.width_pct if box and box.ok else None,
+        box_position=box.position if box and box.ok else None,
+        breakout_distance_bps=breakout_distance_bps,
+        box_context_timestamp=(
+            box.source_timestamp.isoformat()
+            if box and box.ok and hasattr(box.source_timestamp, "isoformat")
+            else None
+        ),
+        box_previous_close=float(bars[-2].close) if len(bars) >= 2 else None,
         atr_pct=atr_pct,
         realized_volatility=realized_vol,
         volatility_expansion=volatility_expansion,
@@ -206,6 +237,27 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         relative_volume=g("volume_spike_ratio"),
         volume_spike_ratio=g("volume_spike_ratio"),
         breakout_strength=g("donchian_breakout"),
+        rvgi=g("rvgi") if (g("rvgi_available") or 0.0) >= 1.0 else None,
+        rvgi_signal=g("rvgi_signal") if (g("rvgi_available") or 0.0) >= 1.0 else None,
+        rvgi_diff=g("rvgi_diff") if (g("rvgi_available") or 0.0) >= 1.0 else None,
+        rvgi_slope=g("rvgi_slope") if (g("rvgi_available") or 0.0) >= 1.0 else None,
+        rvgi_bullish_cross=bool(g("rvgi_bullish_cross")) if (g("rvgi_available") or 0.0) >= 1.0 else None,
+        box_high=g("box_high") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_low=g("box_low") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_mid=g("box_mid") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_width_pct=g("box_width_pct") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_position=g("box_position") if (g("box_available") or 0.0) >= 1.0 else None,
+        breakout_distance_bps=g("breakout_distance_bps") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_previous_close=g("box_previous_close") if (g("box_available") or 0.0) >= 1.0 else None,
+        box_context_timestamp=(
+            datetime.fromtimestamp(
+                g("box_context_timestamp_epoch") or 0.0,
+                tz=timezone.utc,
+            ).isoformat()
+            if (g("box_available") or 0.0) >= 1.0
+            and (g("box_context_timestamp_epoch") or 0.0) > 0
+            else None
+        ),
         realized_volatility=g("realized_volatility_3m"),
         liquidity_score=g("liquidity_score"),
         spread_bps=g("spread_bps"),

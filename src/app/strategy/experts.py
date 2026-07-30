@@ -6,6 +6,7 @@ from typing import Mapping
 from uuid import uuid4
 
 from app.trading.contracts import IntentAction, OrderIntent, TradePlan
+from app.strategy.catalog import STRATEGY_IDS
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ class StrategyExpert:
 class IntradayMomentumExpert(StrategyExpert):
     strategy_id = "intraday_momentum"
     thesis = "robust intraday return continuation with volume confirmation"
-    default_config = ExpertConfig(stop_bps=22, profit_bps=40, max_holding_seconds=420)
+    default_config = ExpertConfig(stop_bps=22, profit_bps=100, max_holding_seconds=1800)
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("return") >= self.config.entry_quantile and c.q(
@@ -90,7 +91,7 @@ class IntradayMomentumExpert(StrategyExpert):
 class BreakoutVolumeExpert(StrategyExpert):
     strategy_id = "breakout_volume"
     thesis = "causal range breakout confirmed by unusual volume"
-    default_config = ExpertConfig(stop_bps=25, profit_bps=50, max_holding_seconds=600)
+    default_config = ExpertConfig(stop_bps=25, profit_bps=120, max_holding_seconds=2700)
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("breakout") >= self.config.entry_quantile and c.q(
@@ -101,18 +102,25 @@ class BreakoutVolumeExpert(StrategyExpert):
 class VwapMeanReversionExpert(StrategyExpert):
     strategy_id = "vwap_mean_reversion"
     thesis = "liquid downside displacement from VWAP with reversion confirmation"
-    default_config = ExpertConfig(stop_bps=18, profit_bps=28, max_holding_seconds=300)
+    default_config = ExpertConfig(stop_bps=18, profit_bps=100, max_holding_seconds=1800)
 
     def admissible(self, c: ExpertContext) -> bool:
-        return c.q("vwap_deviation") <= 1 - self.config.entry_quantile and c.q(
-            "reversion"
-        ) >= self.config.confirmation_quantile
+        return (
+            c.q("vwap_deviation") <= 1 - self.config.entry_quantile
+            and c.q("reversion") >= self.config.confirmation_quantile
+            # Mean reversion is only executable when the displacement occurs
+            # in an actively traded, tight-spread state.  Without these two
+            # confirmations the GNN repeatedly elected stale/thin symbols whose
+            # apparent edge disappeared after realistic execution costs.
+            and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
 
 
 class LiquidityShockReversalExpert(StrategyExpert):
     strategy_id = "liquidity_shock_reversal"
     thesis = "temporary liquidity shock reversal after spread/depth normalization"
-    default_config = ExpertConfig(stop_bps=30, profit_bps=45, max_holding_seconds=240)
+    default_config = ExpertConfig(stop_bps=30, profit_bps=100, max_holding_seconds=1200)
 
     def admissible(self, c: ExpertContext) -> bool:
         return (
@@ -125,7 +133,7 @@ class LiquidityShockReversalExpert(StrategyExpert):
 class EventMomentumExpert(StrategyExpert):
     strategy_id = "event_momentum"
     thesis = "fresh high-relevance event continuation with market confirmation"
-    default_config = ExpertConfig(stop_bps=35, profit_bps=65, max_holding_seconds=900)
+    default_config = ExpertConfig(stop_bps=35, profit_bps=140, max_holding_seconds=3600)
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("event_relevance") >= self.config.entry_quantile and c.q(
@@ -136,7 +144,7 @@ class EventMomentumExpert(StrategyExpert):
 class CrossSectionalRelativeStrengthExpert(StrategyExpert):
     strategy_id = "cross_sectional_relative_strength"
     thesis = "sector-neutral relative strength with sufficient liquidity"
-    default_config = ExpertConfig(stop_bps=28, profit_bps=55, max_holding_seconds=900)
+    default_config = ExpertConfig(stop_bps=28, profit_bps=120, max_holding_seconds=3600)
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("relative_strength") >= self.config.entry_quantile and c.q(
@@ -147,12 +155,27 @@ class CrossSectionalRelativeStrengthExpert(StrategyExpert):
 class GapContextExpert(StrategyExpert):
     strategy_id = "gap_context"
     thesis = "opening gap continuation only after price-discovery confirmation"
-    default_config = ExpertConfig(stop_bps=32, profit_bps=60, max_holding_seconds=720)
+    default_config = ExpertConfig(stop_bps=32, profit_bps=130, max_holding_seconds=2700)
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("gap") >= self.config.entry_quantile and c.q(
             "opening_confirmation"
         ) >= self.config.confirmation_quantile
+
+
+class RvgiBoxBreakoutExpert(StrategyExpert):
+    strategy_id = "rvgi_box_breakout"
+    thesis = "RVGI-confirmed causal price-box breakout with volume acceptance"
+    default_config = ExpertConfig(stop_bps=20, profit_bps=120, max_holding_seconds=1800)
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            c.q("rvgi_diff") >= self.config.confirmation_quantile
+            and c.q("rvgi_cross") >= self.config.entry_quantile
+            and c.q("box_position") >= self.config.entry_quantile
+            and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("false_breakout_risk") <= 1 - self.config.confirmation_quantile
+        )
 
 
 ALL_EXPERT_TYPES = (
@@ -163,7 +186,10 @@ ALL_EXPERT_TYPES = (
     EventMomentumExpert,
     CrossSectionalRelativeStrengthExpert,
     GapContextExpert,
+    RvgiBoxBreakoutExpert,
 )
+
+assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS
 
 
 class OwnedStrategyLifecycle:

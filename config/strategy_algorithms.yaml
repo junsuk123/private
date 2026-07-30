@@ -94,3 +94,26 @@ gap_context:
   fill_capture_fraction: 0.5
   stop_buffer_bps: 10.0
   trailing_bps: 16.0
+
+# Bullish-only RVGI-confirmed breakout above a frozen causal 20-bar box.
+rvgi_box_breakout:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  rvgi_period: 10
+  box_lookback: 20
+  cross_confirm_bars: 3
+  entry_buffer_bps: 3.0
+  max_extension_bps: 35.0
+  min_volume_spike_ratio: 1.5
+  min_aggressor_imbalance: 0.05
+  min_box_width_pct: 0.002
+  max_box_width_pct: 0.04
+  target_capture_fraction: 0.5
+  max_target_return: 0.012
+  stop_buffer_bps: 10.0
+  stop_atr_multiple: 1.0
+  failure_tolerance_bps: 12.0
+  trailing_bps: 15.0
+  horizon_seconds: 300

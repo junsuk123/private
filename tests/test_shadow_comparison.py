@@ -18,10 +18,22 @@ def test_shadow_comparison_records_disagreement_without_execution(tmp_path) -> N
             ShadowDecision("cpu_gnn", "ACTIVATE", "momentum", 2, ()),
             ShadowDecision("npu_gnn", "ACTIVATE", "momentum", 2.01, ()),
         ),
+        validation_candidates=(
+            ShadowDecision(
+                "cpu_gnn_validation",
+                "VALIDATE_ONLY",
+                "momentum",
+                -1.0,
+                ("ORDER_PERMISSION_NOT_GRANTED",),
+                expected_net_return_bps=-2.0,
+            ),
+        ),
     )
     assert not comparison.action_agreement
     assert not comparison.strategy_agreement
     assert comparison.utility_spread == 2.01
     payload = json.loads((tmp_path / "shadow.jsonl").read_text().strip())
     assert len(payload["decisions"]) == 4
+    assert len(payload["validation_candidates"]) == 1
+    assert payload["validation_candidates"][0]["action"] == "VALIDATE_ONLY"
     assert not hasattr(recorder, "broker")

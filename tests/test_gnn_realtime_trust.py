@@ -1,0 +1,426 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import json
+import sqlite3
+
+from app.routing.gnn_realtime_trust import GnnRealtimeTrustEvaluator
+
+
+def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    database = tmp_path / "realtime.sqlite3"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "checkpoint-v3"}),
+        encoding="utf-8",
+    )
+    base = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            create table realtime_ticks (
+                symbol text not null,
+                received_at text not null,
+                price real not null
+            )
+            """
+        )
+        rows = []
+        payloads = []
+        for index in range(10):
+            observed = base + timedelta(seconds=index * 31)
+            rows.extend(
+                (
+                    ("005930", observed.isoformat(), 100.0),
+                    (
+                        "005930",
+                        (observed + timedelta(seconds=30)).isoformat(),
+                        100.5,
+                    ),
+                )
+            )
+            payloads.append(
+                {
+                    "as_of": observed.isoformat(),
+                    "symbol": "005930",
+                    "decisions": [
+                        {
+                            "path": "cpu_gnn",
+                            "action": "ACTIVATE_STRATEGY",
+                            "strategy_id": "intraday_momentum",
+                            "probability_success": 0.8,
+                            "expected_net_return_bps": 19.0,
+                            "total_uncertainty": 0.1,
+                            "expected_cost_bps": 1.0,
+                            "ontology_compatibility": 0.8,
+                            "checkpoint_hash": "checkpoint-v3",
+                        }
+                    ],
+                }
+            )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            rows,
+        )
+    log_path.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads),
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=database,
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+        window_samples=20,
+        cache_seconds=1,
+    )
+
+    result = evaluator.evaluate(base + timedelta(seconds=400))
+
+    assert result.passed
+    assert result.sample_count == 10
+    assert result.positive_net_rate == 1.0
+    assert result.mean_realized_net_bps is not None
+    assert result.mean_realized_net_bps > 0
+    assert result.strategy_sample_counts == {"intraday_momentum": 10}
+    assert result.trusted_strategy_ids == ("intraday_momentum",)
+    assert result.strategy_metrics["intraday_momentum"]["passed"] is True
+
+
+def test_realtime_trust_only_samples_actionable_ontology_admissible_routes(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "active-checkpoint"}),
+        encoding="utf-8",
+    )
+    base = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+
+    def decision(
+        *,
+        action: str = "ACTIVATE_STRATEGY",
+        compatibility: float = 0.8,
+        checkpoint_hash: str = "active-checkpoint",
+        validation_strategy: str = "intraday_momentum",
+    ) -> dict:
+        return {
+            "path": "cpu_gnn",
+            "action": action,
+            "strategy_id": "intraday_momentum",
+            "validation_strategy_id": validation_strategy,
+            "probability_success": 0.7,
+            "expected_net_return_bps": 12.0,
+            "total_uncertainty": 0.2,
+            "expected_cost_bps": 2.0,
+            "ontology_compatibility": compatibility,
+            "checkpoint_hash": checkpoint_hash,
+        }
+
+    payloads = (
+        {
+            "as_of": base.isoformat(),
+            "symbol": "005930",
+            "decisions": [decision()],
+        },
+        {
+            "as_of": (base + timedelta(seconds=31)).isoformat(),
+            "symbol": "000660",
+            "decisions": [decision(action="NO_TRADE")],
+        },
+        {
+            "as_of": (base + timedelta(seconds=62)).isoformat(),
+            "symbol": "035420",
+            "decisions": [decision(compatibility=0.0)],
+        },
+        {
+            "as_of": (base + timedelta(seconds=93)).isoformat(),
+            "symbol": "051910",
+            "decisions": [decision(validation_strategy="event_momentum")],
+        },
+        {
+            "as_of": (base + timedelta(seconds=124)).isoformat(),
+            "symbol": "068270",
+            "decisions": [decision(checkpoint_hash="retired-checkpoint")],
+        },
+    )
+    log_path.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads),
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=tmp_path / "unused.sqlite3",
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+        allow_checkpoint_history=False,
+    )
+
+    candidates = evaluator._prediction_candidates(
+        base + timedelta(seconds=300)
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["symbol"] == "005930"
+
+
+def test_realtime_trust_fails_closed_before_enough_mature_samples(tmp_path) -> None:
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=tmp_path / "missing.jsonl",
+        database_path=tmp_path / "missing.sqlite3",
+        minimum_samples=10,
+    )
+
+    result = evaluator.evaluate(datetime.now(timezone.utc))
+
+    assert not result.passed
+    assert "GNN_TRUST_LOG_MISSING" in result.reason_codes
+
+
+def test_validation_only_negative_forecast_is_retained_as_calibration_sample(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "active-checkpoint"}),
+        encoding="utf-8",
+    )
+    observed = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    log_path.write_text(
+        json.dumps(
+            {
+                "as_of": observed.isoformat(),
+                "symbol": "SOFI",
+                "decisions": [{"path": "cpu_gnn", "action": "NO_TRADE"}],
+                "validation_candidates": [
+                    {
+                        "path": "cpu_gnn_validation",
+                        "action": "VALIDATE_ONLY",
+                        "strategy_id": "vwap_mean_reversion",
+                        "validation_strategy_id": "vwap_mean_reversion",
+                        "probability_success": 0.3,
+                        "expected_net_return_bps": -12.0,
+                        "expected_cost_bps": 50.0,
+                        "total_uncertainty": 0.4,
+                        "ontology_compatibility": 0.7,
+                        "checkpoint_hash": "active-checkpoint",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=tmp_path / "unused.sqlite3",
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+    )
+
+    candidates = evaluator._prediction_candidates(
+        observed + timedelta(seconds=60)
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["strategy_id"] == "vwap_mean_reversion"
+    assert candidates[0]["expected_net_return_bps"] == -12.0
+
+
+def test_horizon_bucket_retains_first_actionable_positive_forecast(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "active-checkpoint"}),
+        encoding="utf-8",
+    )
+    observed = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+
+    def payload(at: datetime, expected_net: float) -> dict:
+        return {
+            "as_of": at.isoformat(),
+            "symbol": "SOFI",
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "vwap_mean_reversion",
+                    "validation_strategy_id": "vwap_mean_reversion",
+                    "probability_success": 0.7,
+                    "expected_net_return_bps": expected_net,
+                    "expected_cost_bps": 50.0,
+                    "total_uncertainty": 0.2,
+                    "ontology_compatibility": 0.8,
+                    "checkpoint_hash": "active-checkpoint",
+                }
+            ],
+        }
+
+    log_path.write_text(
+        "\n".join(
+            json.dumps(item)
+            for item in (
+                payload(observed, -8.0),
+                payload(observed + timedelta(seconds=10), 15.0),
+                payload(observed + timedelta(seconds=20), 25.0),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=tmp_path / "unused.sqlite3",
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+    )
+
+    candidates = evaluator._prediction_candidates(
+        observed + timedelta(seconds=60)
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["as_of"] == observed + timedelta(seconds=10)
+    assert candidates[0]["expected_net_return_bps"] == 15.0
+
+
+def test_realtime_outcome_uses_first_strategy_exit_before_horizon_reversal(
+    tmp_path,
+) -> None:
+    database = tmp_path / "realtime.sqlite3"
+    observed = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            create table realtime_ticks (
+                symbol text not null,
+                received_at text not null,
+                price real not null
+            )
+            """
+        )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            (
+                ("SOFI", observed.isoformat(), 100.0),
+                ("SOFI", (observed + timedelta(seconds=10)).isoformat(), 102.0),
+                ("SOFI", (observed + timedelta(seconds=30)).isoformat(), 99.5),
+            ),
+        )
+        evaluator = GnnRealtimeTrustEvaluator(
+            comparison_path=tmp_path / "unused.jsonl",
+            database_path=database,
+            horizon_seconds=30,
+            minimum_samples=10,
+        )
+        outcome = evaluator._outcome(
+            connection,
+            {
+                "symbol": "SOFI",
+                "as_of": observed,
+                "probability": 0.8,
+                "uncertainty": 0.1,
+                "cost_bps": 49.0,
+                "expected_net_return_bps": 30.0,
+                "strategy_id": "vwap_mean_reversion",
+                "horizon_seconds": 30,
+            },
+        )
+
+    assert outcome is not None
+    assert outcome[0] > 0.0
+
+
+def test_negative_calibration_does_not_grant_positive_entry_authority(
+    tmp_path,
+) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    database = tmp_path / "realtime.sqlite3"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "checkpoint-v4"}),
+        encoding="utf-8",
+    )
+    base = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    payloads = []
+    rows = []
+    for index in range(10):
+        observed = base + timedelta(seconds=index * 31)
+        rows.extend(
+            (
+                ("SOFI", observed.isoformat(), 100.0),
+                (
+                    "SOFI",
+                    (observed + timedelta(seconds=30)).isoformat(),
+                    99.5,
+                ),
+            )
+        )
+        payloads.append(
+            {
+                "as_of": observed.isoformat(),
+                "symbol": "SOFI",
+                "validation_candidates": [
+                    {
+                        "path": "cpu_gnn_validation",
+                        "action": "VALIDATE_ONLY",
+                        "strategy_id": "breakout_volume",
+                        "validation_strategy_id": "breakout_volume",
+                        "probability_success": 0.1,
+                        "expected_net_return_bps": -40.0,
+                        "expected_cost_bps": 5.0,
+                        "total_uncertainty": 0.1,
+                        "ontology_compatibility": 0.8,
+                        "checkpoint_hash": "checkpoint-v4",
+                    }
+                ],
+            }
+        )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            create table realtime_ticks (
+                symbol text not null,
+                received_at text not null,
+                price real not null
+            )
+            """
+        )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            rows,
+        )
+    log_path.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads),
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=database,
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+        window_samples=20,
+        cache_seconds=1,
+    )
+
+    result = evaluator.evaluate(base + timedelta(seconds=400))
+
+    assert result.passed is True
+    assert result.calibrated_strategy_ids == ("breakout_volume",)
+    assert result.trusted_strategy_ids == ()
+    metrics = result.strategy_metrics["breakout_volume"]
+    assert metrics["calibration_passed"] is True
+    assert metrics["entry_authorized"] is False
+    assert metrics["execution_validation_stage"] == (
+        "CALIBRATED_AWAITING_POSITIVE_EDGE"
+    )

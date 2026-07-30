@@ -957,6 +957,19 @@ class SharedLiveDecisionEngine:
         suggested_weight = max(0.001, suggested_weight * size_multiplier)
         if runtime_probe_support and not runtime_fallback_support:
             suggested_weight = min(suggested_weight, _env_float("REALTIME_RUNTIME_PROBE_BUY_WEIGHT", 0.003))
+        gate_venue, gate_instrument = _cost_context_for_holding(
+            symbol,
+            market_name,
+            getattr(market, "company_name", ""),
+            getattr(market, "sector", ""),
+        )
+        gate_orderbook = None
+        if orderbook is not None:
+            gate_orderbook = {
+                "best_bid": float(getattr(orderbook, "best_bid", 0.0) or 0.0),
+                "best_ask": float(getattr(orderbook, "best_ask", 0.0) or 0.0),
+            }
+
         # --- Honest expected return (no fabricated positive floor) --------------
         # The expected exit price handed to the ProfitabilityGate must reflect a REAL
         # predicted edge, not the old synthetic 100bps / fallback*300bps floor that
@@ -970,9 +983,35 @@ class SharedLiveDecisionEngine:
             and technical_prediction is not None
             and float(technical_prediction.expected_net_return_bps or 0.0) > 0.0
         ):
-            expected_return_bps = float(technical_prediction.expected_net_return_bps)
+            expected_return_bps = max(
+                0.0,
+                float(technical_prediction.expected_gross_return or 0.0)
+                * 10_000.0,
+            )
         elif model_ok and prediction is not None and float(prediction.expected_net_return_bps or 0.0) > 0.0:
-            expected_return_bps = float(prediction.expected_net_return_bps)
+            baseline_cost_bps = (
+                self.profitability_gate.cost_engine.estimate(
+                    symbol=symbol,
+                    market=market_name,
+                    venue=gate_venue,
+                    instrument_type=gate_instrument,
+                    entry_price=price,
+                    expected_exit_price=price,
+                    quantity=1,
+                    orderbook_snapshot=gate_orderbook,
+                    average_daily_trading_value=float(
+                        getattr(market, "average_daily_trading_value", 0.0)
+                        or 0.0
+                    ),
+                ).total_cost_rate
+                * 10_000.0
+            )
+            # The live model emits a post-cost net edge, while the
+            # ProfitabilityGate accepts an expected exit (gross move) and
+            # subtracts all-in costs itself.
+            expected_return_bps = (
+                float(prediction.expected_net_return_bps) + baseline_cost_bps
+            )
         else:
             fallback_edge_bps_per_score = _env_float("REALTIME_FALLBACK_EDGE_BPS_PER_SCORE", 120.0)
             expected_return_bps = max(0.0, fallback_score) * fallback_edge_bps_per_score
@@ -993,7 +1032,11 @@ class SharedLiveDecisionEngine:
         if technical_prediction is not None:
             technical_regime = technical_prediction.regime
             if technical_prediction.tradable and float(technical_prediction.expected_net_return_bps or 0.0) > 0.0:
-                tech_bps = float(technical_prediction.expected_net_return_bps)
+                tech_bps = max(
+                    0.0,
+                    float(technical_prediction.expected_gross_return or 0.0)
+                    * 10_000.0,
+                )
                 expected_return_bps = (
                     tech_bps
                     if strategy_locked
@@ -1004,18 +1047,6 @@ class SharedLiveDecisionEngine:
         expected_exit_price = price * (1.0 + gross_expected_return)
 
         # --- Unified profitability gate (authoritative, mandatory) --------------
-        gate_venue, gate_instrument = _cost_context_for_holding(
-            symbol,
-            market_name,
-            getattr(market, "company_name", ""),
-            getattr(market, "sector", ""),
-        )
-        gate_orderbook = None
-        if orderbook is not None:
-            gate_orderbook = {
-                "best_bid": float(getattr(orderbook, "best_bid", 0.0) or 0.0),
-                "best_ask": float(getattr(orderbook, "best_ask", 0.0) or 0.0),
-            }
         profitability_decision = self.profitability_gate.evaluate(
             ProfitabilityInput(
                 symbol=symbol,

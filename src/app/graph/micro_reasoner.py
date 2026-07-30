@@ -108,6 +108,7 @@ class MicroReasoningInput:
     allowed_micro_strategies: tuple[str, ...] = ()
     blocked_micro_strategies: tuple[str, ...] = ()
     technical_features: TechnicalFeatureSet | None = None
+    technical_feature_error_code: str | None = None
     short_horizon_prediction: Any = None            # LiveSignalPrediction-like or None
     realtime_tick: Any = None
     orderbook: Any = None
@@ -213,6 +214,9 @@ class MicroSymbolReasoner:
         paths: list[dict] = []
 
         if features is None:
+            feature_reasons = [MICRO_TECHNICAL_HISTORY_INSUFFICIENT]
+            if data.technical_feature_error_code:
+                feature_reasons.append(data.technical_feature_error_code)
             live_quote = data.realtime_tick is not None or data.broker_quote is not None
             if live_quote:
                 return self._result(
@@ -222,19 +226,23 @@ class MicroSymbolReasoner:
                     EntrySignal.WAIT_CONFIRMATION,
                     ExitSignal.NONE,
                     ExecutionQuality.ACCEPTABLE,
-                    reasons=[MICRO_TECHNICAL_HISTORY_INSUFFICIENT],
+                    reasons=feature_reasons,
                     paths=[
                         explanation(
                             MICRO_TECHNICAL_HISTORY_INSUFFICIENT,
                             "Live quote is available, but technical history is not sufficient for a micro signal.",
+                            {"feature_error_code": data.technical_feature_error_code},
                         )
                     ],
                     confidence=0.25,
                     expected_entry_price=_quote_price(data.broker_quote) or _quote_price(data.realtime_tick),
                 )
+            unavailable_reasons = [MICRO_SIGNAL_UNAVAILABLE]
+            if data.technical_feature_error_code:
+                unavailable_reasons.append(data.technical_feature_error_code)
             return self._result(data, MicroRegime.NO_TRADE_SYMBOL, SelectedStrategy.HOLD,
                                 EntrySignal.NONE, ExitSignal.NONE, ExecutionQuality.BLOCKED,
-                                reasons=[MICRO_SIGNAL_UNAVAILABLE], paths=[explanation(MICRO_SIGNAL_UNAVAILABLE, "No technical features for symbol.")],
+                                reasons=unavailable_reasons, paths=[explanation(MICRO_SIGNAL_UNAVAILABLE, "No technical features for symbol.", {"feature_error_code": data.technical_feature_error_code})],
                                 confidence=0.0)
 
         # --- Held-position exit deterioration (SELL/REDUCE evidence) comes first. ---

@@ -972,24 +972,55 @@ function formatSignedDecimal(value) {
 }
 
 function renderOntology(selection, market) {
-  const allowed = Boolean(selection.ontology_allowed);
+  const evidenceStatus = String(
+    selection.evidence_status || (selection.as_of ? 'CURRENT' : 'MISSING'),
+  ).toUpperCase();
+  const evidenceCurrent = evidenceStatus === 'CURRENT';
+  const allowed = Boolean(selection.ontology_allowed) && evidenceCurrent;
   const ontologyStrategyId = selection.ontology_strategy_id || selection.strategy_id || null;
   const finalAction = String(selection.action || 'NO_TRADE').toUpperCase();
-  const utilityPassed = finalAction !== 'NO_TRADE';
+  const utilityPassed = evidenceCurrent && finalAction !== 'NO_TRADE';
+  const reasons = selection.reason_codes || [];
+  const utility = Number(selection.utility);
+  const hasUtility = selection.utility !== null
+    && selection.utility !== undefined
+    && Number.isFinite(utility);
+  const netEdgeReason = reasons.find((reason) => String(reason).includes('NON_POSITIVE_NET_EDGE'));
+  const uncertaintyReason = reasons.find((reason) => String(reason).includes('UNCERTAINTY'));
+  const utilityReason = reasons.find((reason) => String(reason).includes('UTILITY'));
+  const trustReason = reasons.find((reason) => String(reason).includes('GNN_REALTIME_TRUST'));
+  const contractReason = reasons.find((reason) => (
+    String(reason).includes('SCHEMA_MISMATCH')
+    || String(reason).includes('CATALOG_MISMATCH')
+    || String(reason).includes('CHECKPOINT')
+    || String(reason).includes('NOT_LIVE_AUTHORIZED')
+  ));
   const status = document.getElementById('ontology-status');
-  status.textContent = allowed ? 'ONTOLOGY ALLOWED' : 'NO TRADE';
+  status.textContent = !evidenceCurrent
+    ? `EVIDENCE ${evidenceStatus}`
+    : allowed ? 'ONTOLOGY ALLOWED' : 'NO TRADE';
   status.className = allowed ? 'status-chip' : 'status-chip blocked';
   const nodes = [
+    ['DECISION EVIDENCE', `${evidenceStatus} · ${shortClock(selection.as_of)}`, evidenceCurrent],
     ['데이터 신선도', market.stale ? 'STALE · 신규 진입 차단' : 'FRESH', !market.stale],
     ['운영 사실 검증', allowed ? '필수 사실 충족' : '필수 사실 미충족', allowed],
     ['전략 호환성', ontologyStrategyId || '허용 전략 없음', allowed],
-    ['순효용·불확실성', selection.utility === null || selection.utility === undefined ? 'NON_POSITIVE_NET_EDGE' : `utility ${Number(selection.utility).toFixed(3)}`, utilityPassed],
+    ['모델 계약', contractReason || '스키마·전략 카탈로그 일치', !contractReason],
+    [
+      '실시간 GNN 신뢰도',
+      trustReason
+        ? `${trustReason} · score ${Number(selection.realtime_trust_score || 0).toFixed(3)} · n=${selection.realtime_trust_samples || 0}`
+        : '실시간 검증 결과 없음',
+      trustReason === 'GNN_REALTIME_TRUST_PASSED',
+    ],
+    ['순수익', netEdgeReason || (hasUtility ? '양의 순수익 조건 통과' : '모델 평가 없음'), !netEdgeReason && hasUtility],
+    ['불확실성', uncertaintyReason || (hasUtility ? '허용 범위' : '모델 평가 없음'), !uncertaintyReason && hasUtility],
+    ['순효용', utilityReason || (hasUtility ? `utility ${utility.toFixed(3)}` : '모델 평가 없음'), !utilityReason && hasUtility && utilityPassed],
     ['최종 라우팅', finalAction, utilityPassed],
   ];
   document.getElementById('ontology-flow').innerHTML = nodes.map(([label, detail, pass]) => `
     <div class="ontology-node ${pass ? 'pass' : 'block'}"><i></i><b>${escapeHtml(label)}</b><small>${escapeHtml(detail)}</small></div>
   `).join('');
-  const reasons = selection.reason_codes || [];
   document.getElementById('ontology-reasons').innerHTML = reasons.length
     ? reasons.map((reason) => `<span class="reason-chip">${escapeHtml(reason)}</span>`).join('')
     : `<span class="reason-chip">${allowed ? 'ALL_REQUIRED_FACTS_VALID' : 'NO_ADMISSIBLE_STRATEGY'}</span>`;

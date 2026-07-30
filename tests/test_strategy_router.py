@@ -22,7 +22,12 @@ def _ontology(*allowed: str) -> OntologyDecision:
     )
 
 
-def _evidence(strategy: str, utility: float, net: float = 10) -> StrategyUtilityEvidence:
+def _evidence(
+    strategy: str,
+    utility: float,
+    net: float = 10,
+    compatibility: float = 1.0,
+) -> StrategyUtilityEvidence:
     return StrategyUtilityEvidence(
         evidence_id=f"evidence-{strategy}",
         as_of=NOW,
@@ -30,7 +35,7 @@ def _evidence(strategy: str, utility: float, net: float = 10) -> StrategyUtility
         strategy_id=strategy,
         ontology_allowed=True,
         hard_block_reasons=(),
-        compatibility_score=1,
+        compatibility_score=compatibility,
         probability_success=0.6,
         expected_gross_return_bps=net + 5,
         expected_cost_bps=5,
@@ -60,6 +65,23 @@ def test_router_selects_highest_utility_only_from_ontology_allowed() -> None:
     assert decision.selected.strategy_id == "momentum"
 
 
+def test_router_ranks_gnn_utility_weighted_by_ontology_compatibility() -> None:
+    decision = StrategyRouter().route(
+        as_of=NOW,
+        symbol="005930",
+        ontology=_ontology("momentum", "breakout"),
+        evidence=(
+            _evidence("momentum", 10, compatibility=0.1),
+            _evidence("breakout", 4, compatibility=0.9),
+        ),
+    )
+
+    assert decision.selected is not None
+    assert decision.selected.strategy_id == "breakout"
+    assert decision.weighted_utility == 3.6
+    assert decision.reason_codes == ("MAX_ONTOLOGY_WEIGHTED_NET_UTILITY",)
+
+
 def test_no_trade_is_first_class_for_non_positive_net_edge() -> None:
     decision = StrategyRouter().route(
         as_of=NOW,
@@ -69,6 +91,20 @@ def test_no_trade_is_first_class_for_non_positive_net_edge() -> None:
     )
     assert decision.is_no_trade
     assert decision.reason_codes == ("NON_POSITIVE_NET_EDGE:momentum",)
+
+
+def test_router_rejects_positive_edge_below_execution_floor() -> None:
+    decision = StrategyRouter(minimum_net_edge_bps=5.0).route(
+        as_of=NOW,
+        symbol="005930",
+        ontology=_ontology("momentum"),
+        evidence=(_evidence("momentum", 2, net=1.0),),
+    )
+
+    assert decision.is_no_trade
+    assert decision.reason_codes == (
+        "NET_EDGE_BELOW_EXECUTION_FLOOR:momentum",
+    )
 
 
 def test_router_cannot_transfer_owned_position() -> None:

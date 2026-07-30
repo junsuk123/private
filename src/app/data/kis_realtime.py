@@ -192,6 +192,8 @@ async def run_kis_realtime_websocket_collector(
     subscription_tr_ids: tuple[str, ...] = DEFAULT_SUBSCRIPTION_TR_IDS,
     subscription_key_factory: Callable[[str], str] | None = None,
     symbols_provider: Callable[[], Iterable[str]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    session_active_provider: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Stream KIS realtime data over ONE persistent websocket session.
 
@@ -245,6 +247,14 @@ async def run_kis_realtime_websocket_collector(
     # away — otherwise the next session starts with a smaller budget until only
     # one symbol fits.
     held_registrations: set[tuple[str, str]] = set()
+
+    def _notify_progress() -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(dict(counts))
+        except Exception:
+            pass
 
     async def _release_registrations(websocket) -> None:
         if not held_registrations:
@@ -328,19 +338,23 @@ async def run_kis_realtime_websocket_collector(
                     event_sink=event_sink,
                 )
                 if closed:
+                    _notify_progress()
                     return True
                 if counts.get("subscription_limit_reached"):
                     # The account is full. Stop asking for more on this session
                     # and keep what was accepted — reconnecting would only cost
                     # another approval key without freeing anything.
                     subscription_limit_reached = True
+                    _notify_progress()
                     return False
             if subscribe_delay > 0.0:
                 await asyncio.sleep(subscribe_delay)
+        _notify_progress()
         return False
 
     async with websockets.connect(target_url, ping_interval=ping_interval, ping_timeout=ping_timeout) as websocket:
         if await _apply_registrations(websocket, _desired_registrations(sorted(active_symbols))):
+            _notify_progress()
             return counts
         # A soft deadline only applies to one-shot callers. With a provider the
         # session persists and the same interval becomes a re-diff cadence, so
@@ -380,6 +394,14 @@ async def run_kis_realtime_websocket_collector(
             return await _apply_registrations(websocket, wanted)
 
         while stop_event is None or not stop_event.is_set():
+            if session_active_provider is not None:
+                try:
+                    session_active = bool(session_active_provider())
+                except Exception:
+                    session_active = True
+                if not session_active:
+                    counts["session_relinquished"] = 1
+                    break
             if resubscribe_event is not None and resubscribe_event.is_set():
                 counts["resubscribe_requested"] = int(counts.get("resubscribe_requested") or 0) + 1
                 if symbols_provider is None:
@@ -416,12 +438,14 @@ async def run_kis_realtime_websocket_collector(
             )
             if closed:
                 break
+            _notify_progress()
             if max_messages is not None and counts["messages"] >= max_messages:
                 break
         # Normal end of run (resubscribe, deadline, stop). Release the account's
         # registrations so the next connection gets its full budget back.
         if not counts.get("connection_closed"):
             await _release_registrations(websocket)
+        _notify_progress()
     return counts
 
 
@@ -486,6 +510,8 @@ async def run_kis_overseas_realtime_websocket_collector(
     max_messages: int | None = None,
     max_runtime_seconds: float | None = None,
     symbols_provider: Callable[[], Iterable[str]] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    session_active_provider: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Collect official KIS US tick trades and best bid/ask WebSocket events.
 
@@ -509,6 +535,8 @@ async def run_kis_overseas_realtime_websocket_collector(
         subscription_tr_ids=("HDFSCNT0", "HDFSASP0"),
         subscription_key_factory=overseas_realtime_subscription_key,
         symbols_provider=symbols_provider,
+        progress_callback=progress_callback,
+        session_active_provider=session_active_provider,
     )
 
 
@@ -594,20 +622,38 @@ async def _process_kis_realtime_raw(
         control = kis_realtime_control_summary(raw)
         counts["control_messages"] = counts.get("control_messages", 0) + 1
         counts["last_control_message"] = control
+        control_message = str(control.get("msg1") or "").upper()
+        control_code = str(control.get("msg_cd") or "").upper()
+        if "UNSUBSCRIBE" in control_message or control_code in {"OPSP0001", "OPSP0003"}:
+            key = (
+                "unsubscribe_errors"
+                if _kis_realtime_control_is_error(control)
+                else "unsubscribe_confirmations"
+            )
+            counts[key] = int(counts.get(key) or 0) + 1
+            counts["messages"] += 1
+            return False
         if _kis_realtime_control_is_appkey_in_use(control):
             counts["appkey_already_in_use"] = 1
         if _kis_realtime_control_is_error(control):
             counts["control_errors"] = counts.get("control_errors", 0) + 1
-            counts["subscriptions_rejected"] = counts.get("subscriptions_rejected", 0) + 1
             _append_subscription_control_pair(counts, "rejected_subscription_pairs", control)
+            counts["subscriptions_rejected"] = len(
+                counts.get("rejected_subscription_pairs") or ()
+            )
             code = str(control.get("msg_cd") or control.get("rt_cd") or "UNKNOWN")
             by_code = counts.setdefault("subscription_errors_by_code", {})
             by_code[code] = int(by_code.get(code, 0) or 0) + 1
             if code.upper() == "OPSP0008" or "MAX SUBSCRIBE" in str(control.get("msg1") or "").upper():
                 counts["subscription_limit_reached"] = 1
         elif control.get("tr_id") and control.get("tr_key"):
-            counts["subscriptions_accepted"] = counts.get("subscriptions_accepted", 0) + 1
             _append_subscription_control_pair(counts, "accepted_subscription_pairs", control)
+            # KIS also acknowledges tr_type=2 unsubscribe frames. The response
+            # does not reliably echo tr_type, so count unique successful pairs
+            # instead of incrementing every control acknowledgement.
+            counts["subscriptions_accepted"] = len(
+                counts.get("accepted_subscription_pairs") or ()
+            )
         counts["messages"] += 1
         return False
     try:

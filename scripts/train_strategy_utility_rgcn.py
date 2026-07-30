@@ -19,12 +19,12 @@ def main() -> None:
     args = parser.parse_args()
     labels = build_labels(
         load_minute_bars(args.database),
-        EvaluationConfig(feature_schema_name="realtime_microstructure_v1"),
+        EvaluationConfig(feature_schema_name="realtime_strategy_graph_v4_market"),
     )
     report = train_counterfactual_checkpoint(
         labels,
         args.output,
-        input_feature_schema="realtime_microstructure_v1",
+        input_feature_schema="realtime_strategy_graph_v4_market",
         authorize_live_shadow=True,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))

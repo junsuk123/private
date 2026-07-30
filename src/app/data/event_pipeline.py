@@ -368,12 +368,22 @@ class EventDrivenMarketRuntime:
         return True
 
     async def persist_one(self) -> None:
-        event, completed_bar = await self._persistence.get()
+        batch = [await self._persistence.get()]
+        # One SQLite transaction per market event cannot keep up with an active
+        # symbol and makes fresh quotes appear stale while thousands of writes
+        # wait in FIFO order. Drain a bounded batch and persist each event type
+        # together; ordering within each type is preserved.
+        while len(batch) < 128:
+            try:
+                batch.append(self._persistence.get_nowait())
+            except asyncio.QueueEmpty:
+                break
         try:
-            await asyncio.to_thread(self._persist, event, completed_bar)
-            self._persistence_completed += 1
+            await asyncio.to_thread(self._persist_batch, batch)
+            self._persistence_completed += len(batch)
         finally:
-            self._persistence.task_done()
+            for _ in batch:
+                self._persistence.task_done()
 
     async def wait_for_persistence(self) -> None:
         await self._persistence.join()
@@ -398,3 +408,23 @@ class EventDrivenMarketRuntime:
             self.store.save_orderbooks((event,))  # type: ignore[attr-defined]
         if completed_bar is not None:
             self.store.save_minute_bars((completed_bar,))  # type: ignore[attr-defined]
+
+    def _persist_batch(
+        self,
+        batch: list[tuple[MarketEvent, RealtimeMinuteBar | None]],
+    ) -> None:
+        ticks = tuple(
+            event for event, _bar in batch if isinstance(event, RealtimeTradeTick)
+        )
+        books = tuple(
+            event
+            for event, _bar in batch
+            if isinstance(event, RealtimeOrderbookSnapshot)
+        )
+        bars = tuple(bar for _event, bar in batch if bar is not None)
+        if ticks:
+            self.store.save_ticks(ticks)  # type: ignore[attr-defined]
+        if books:
+            self.store.save_orderbooks(books)  # type: ignore[attr-defined]
+        if bars:
+            self.store.save_minute_bars(bars)  # type: ignore[attr-defined]

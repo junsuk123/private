@@ -171,6 +171,16 @@ class TestMacroPermissionTranslation:
         assert macro_strategy_permitted("breakout_volume", ("breakout",), ()) is True
         assert macro_strategy_permitted("vwap_mean_reversion", ("vwap_reversion",), ()) is True
         assert macro_strategy_permitted("liquidity_shock_reversal", ("mean_reversion",), ()) is True
+        assert macro_strategy_permitted(
+            "cross_sectional_relative_strength",
+            ("relative_strength",),
+            (),
+        ) is True
+        assert macro_strategy_permitted(
+            "intraday_momentum",
+            ("mean_reversion", "relative_strength"),
+            ("intraday_momentum",),
+        ) is False
 
     def test_blocked_family_blocks_the_fine_id(self):
         from app.technical.strategy_algorithms import macro_strategy_permitted

@@ -9,7 +9,7 @@ from app.trading.contracts import IntentAction
 NOW = datetime(2026, 7, 27, 1, 0, tzinfo=timezone.utc)
 
 
-def test_all_seven_experts_create_independent_trade_plans() -> None:
+def test_all_eight_experts_create_independent_trade_plans() -> None:
     quantiles = {
         "return": 0.9,
         "volume": 0.9,
@@ -25,6 +25,10 @@ def test_all_seven_experts_create_independent_trade_plans() -> None:
         "liquidity": 0.9,
         "gap": 0.9,
         "opening_confirmation": 0.9,
+        "rvgi_diff": 0.9,
+        "rvgi_cross": 0.9,
+        "box_position": 0.9,
+        "false_breakout_risk": 0.1,
     }
     context = ExpertContext(
         symbol="005930",
@@ -36,10 +40,10 @@ def test_all_seven_experts_create_independent_trade_plans() -> None:
         quantiles=quantiles,
     )
     plans = tuple(expert_type().propose(context) for expert_type in ALL_EXPERT_TYPES)
-    assert len(plans) == 7
+    assert len(plans) == 8
     assert all(plan is not None for plan in plans)
-    assert len({plan.strategy_id for plan in plans if plan}) == 7
-    assert len({plan.strategy_instance_id for plan in plans if plan}) == 7
+    assert len({plan.strategy_id for plan in plans if plan}) == 8
+    assert len({plan.strategy_instance_id for plan in plans if plan}) == 8
 
 
 def test_strategy_instance_owns_entry_and_mechanical_exit() -> None:

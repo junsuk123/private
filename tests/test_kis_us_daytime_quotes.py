@@ -177,3 +177,27 @@ class TestCollectorUsesDaytimeKeys:
         assert socket.keys("1") == ["DNASAAPL"]
         # And the registration is handed back rather than orphaned.
         assert socket.keys("2") == ["DNASAAPL"]
+
+    def test_forwards_session_owner_callback(self, monkeypatch):
+        captured = {}
+
+        async def fake_collector(**kwargs):
+            captured.update(kwargs)
+            return {"session_relinquished": 1}
+
+        session_active_provider = lambda: False
+        monkeypatch.setattr(
+            kis_realtime,
+            "run_kis_realtime_websocket_collector",
+            fake_collector,
+        )
+
+        counts = asyncio.run(
+            run_kis_overseas_realtime_websocket_collector(
+                symbols=["AAPL"],
+                session_active_provider=session_active_provider,
+            )
+        )
+
+        assert counts == {"session_relinquished": 1}
+        assert captured["session_active_provider"] is session_active_provider

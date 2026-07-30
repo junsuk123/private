@@ -910,7 +910,7 @@ class KisDevelopersApiClient:
         start_date: Any,
         end_date: Any,
         *,
-        currency_division: str = "01",
+        currency_division: str = "02",
     ) -> dict[str, Any]:
         """Raw KIS overseas period-profit inquiry (해외주식 기간손익).
 
@@ -979,6 +979,46 @@ class KisDevelopersApiClient:
                     found = True
                     break
         return total if found else 0.0
+
+    def get_overseas_settlement_summary(
+        self,
+        start_date: Any,
+        end_date: Any,
+    ) -> dict[str, float]:
+        """Return settled overseas P&L and KIS 제비용 in KRW.
+
+        Live KIS responses use WCRC_FRCR_DVSN_CD=02 for won-converted
+        amounts. ``smtl_fee1`` is explicit broker/exchange/tax expense; it
+        does not include spread or slippage.
+        """
+        response = self.inquire_overseas_period_profit(
+            start_date,
+            end_date,
+            currency_division="02",
+        )
+        self._ensure_success(response, "KIS overseas period-profit lookup failed")
+        summary = response.get("output2")
+        row = (
+            summary[0]
+            if isinstance(summary, list)
+            and summary
+            and isinstance(summary[0], dict)
+            else summary if isinstance(summary, dict) else {}
+        )
+        return {
+            "sell_amount_krw": _to_float(row.get("stck_sll_amt_smtl")),
+            "purchase_amount_krw": _to_float(row.get("stck_buy_amt_smtl")),
+            "gross_trading_difference_krw": _to_float(
+                row.get("excc_dfrm_amt")
+            ),
+            "broker_expenses_krw": _to_float(row.get("smtl_fee1")),
+            "realized_pnl_krw": _first_float(
+                row,
+                "ovrs_rlzt_pfls_tot_amt",
+                "ovrs_rlzt_pfls_amt",
+                "rlzt_pfls_amt",
+            ),
+        }
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
         if isinstance(self.transport, UrllibKisTransport):
@@ -1821,8 +1861,11 @@ def _is_us_daytime_order_session(market: str, now: datetime | None = None) -> bo
     market_name = str(market or "").upper()
     if not any(token in market_name for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "OVERSEAS")):
         return False
-    if os.getenv("KIS_FORCE_OVERSEAS_DAYTIME_ORDER", "").strip().lower() in {"1", "true", "yes", "on"}:
+    override = os.getenv("KIS_FORCE_OVERSEAS_DAYTIME_ORDER", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
         return True
+    if override in {"0", "false", "no", "off"}:
+        return False
     try:
         from zoneinfo import ZoneInfo
     except ImportError:

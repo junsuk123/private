@@ -136,6 +136,19 @@ def _series_from_store(store: Any, symbol: str, since: datetime) -> tuple[list[f
     (used by REST-polled US quotes and any market without a tick stream) — the
     same fallback the live feature frame uses. Either market's live data counts.
     """
+    # Macro windows are minute-scale. Prefer completed bars so a five-period
+    # trend means five minutes, not five high-frequency websocket ticks.
+    try:
+        bars = store.recent_minute_bars(symbol, since, limit=120)
+    except Exception:  # noqa: BLE001
+        bars = ()
+    if bars:
+        valid_bars = tuple(bar for bar in bars if float(bar.close) > 0)
+        if valid_bars:
+            return (
+                [float(bar.close) for bar in valid_bars],
+                [float(max(0, bar.volume)) for bar in valid_bars],
+            )
     try:
         ticks = store.recent_ticks(symbol, since)
     except Exception:  # noqa: BLE001

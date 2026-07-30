@@ -74,7 +74,9 @@ class ProfitabilityGateTest(unittest.TestCase):
                 venue="NASD",
                 instrument_type="overseas_stock",
                 entry_price=100.0,
-                expected_exit_price=100.61,
+                # With the observed BanKIS 0.20% per-side expense rate,
+                # 100.51 leaves a positive return just under the 5bp floor.
+                expected_exit_price=100.51,
                 quantity=1,
                 spread_rate=0.0,
                 liquidity_score=1.0,
@@ -123,7 +125,8 @@ class ProfitabilityGateTest(unittest.TestCase):
         )
 
         self.assertGreaterEqual(cost.sell_tax, 0.01)
-        self.assertGreater(cost.break_even_exit_price, 100.5)
+        self.assertGreater(cost.break_even_exit_price, 100.4)
+        self.assertLess(cost.break_even_exit_price, 100.5)
 
     def test_domestic_etf_has_no_stock_transaction_tax(self) -> None:
         cost = TradingCostEngine().estimate(

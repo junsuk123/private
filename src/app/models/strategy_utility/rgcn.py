@@ -185,17 +185,21 @@ def output_from_raw(
     strategy_mask: np.ndarray,
 ) -> StrategyUtilityOutput:
         probability = _sigmoid(raw[..., 0])
-        gross = raw[..., 1] * 25
         cost = _softplus(raw[..., 2]) * 10
         mae = _softplus(raw[..., 3]) * 15
         mfe = _softplus(raw[..., 4]) * 20
+        # MAE/MFE are conditional loss/win magnitudes.  Averaging raw gross
+        # returns across a heavily imbalanced trigger set makes every rare
+        # profitable setup look negative even when the calibrated success
+        # probability is high.  Use the hurdle-model expectation instead:
+        # P(win)*E[net win] - P(loss)*E[net loss].
+        net = probability * mfe - (1.0 - probability) * mae
+        gross = cost + net
         fill = _sigmoid(raw[..., 5])
         holding = _softplus(raw[..., 6]) * 60
         uncertainty = _softplus(raw[..., 7])
-        net = gross - cost
         utility = (
-            probability * net
-            - (1 - probability) * mae
+            net
             - uncertainty
             + 0.1 * fill * mfe
         )

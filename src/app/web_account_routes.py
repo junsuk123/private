@@ -315,7 +315,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="log-panel" id="account-logs"></div>
     </details>
   </main>
-  <script src="/static/account_dashboard.js?v=20260728-market-health"></script>
+  <script src="/static/account_dashboard.js?v=20260730-expenses-gnn-trust"></script>
 </body>
 </html>
 """
@@ -328,7 +328,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260729-strategy-owned-2" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260730-ops-overview-1" />
+  <link rel="stylesheet" href="/static/operations_overview.css?v=20260730-ops-overview-1" />
 </head>
 <body>
   <main class="terminal-shell">
@@ -347,6 +348,93 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <button type="button" id="terminal-refresh" aria-label="새로고침">↻</button>
       </div>
     </header>
+
+    <section class="ops-overview" id="ops-overview" aria-labelledby="ops-overview-title">
+      <div class="ops-overview-head">
+        <div>
+          <p class="panel-kicker">LIVE OPERATIONS OVERVIEW</p>
+          <h2 id="ops-overview-title">통합 운영 관제</h2>
+          <p id="ops-overall-summary">서버와 실거래 파이프라인 상태를 불러오는 중입니다.</p>
+        </div>
+        <div class="ops-overall-state waiting" id="ops-overall-state">
+          <i></i>
+          <div><strong>확인 중</strong><small id="ops-updated-at">갱신 대기</small></div>
+        </div>
+      </div>
+
+      <div class="ops-alert waiting" id="ops-alert">
+        <span>현재 핵심 상태</span>
+        <strong id="ops-alert-title">상태 확인 중</strong>
+        <p id="ops-alert-detail">각 운영 게이트의 최신 값을 확인하고 있습니다.</p>
+      </div>
+
+      <div class="ops-gate-grid" id="ops-gate-grid">
+        <article class="waiting" data-ops-gate="server"><span>01 서버</span><strong>확인 중</strong><small>-</small></article>
+        <article class="waiting" data-ops-gate="broker"><span>02 계좌·브로커</span><strong>확인 중</strong><small>-</small></article>
+        <article class="waiting" data-ops-gate="market"><span>03 실시간 시세</span><strong>확인 중</strong><small>-</small></article>
+        <article class="waiting" data-ops-gate="ontology"><span>04 온톨로지</span><strong>확인 중</strong><small>-</small></article>
+        <article class="waiting" data-ops-gate="gnn"><span>05 GNN 신뢰도</span><strong>확인 중</strong><small>-</small></article>
+        <article class="waiting" data-ops-gate="execution"><span>06 전략·주문</span><strong>확인 중</strong><small>-</small></article>
+      </div>
+
+      <div class="ops-detail-grid">
+        <article class="ops-card">
+          <div class="ops-card-head"><h3>실시간 시장 데이터</h3><span id="ops-feed-state">-</span></div>
+          <div class="ops-kpi-grid">
+            <div><span>구독 종목</span><strong id="ops-feed-symbols">-</strong></div>
+            <div><span>구독 승인</span><strong id="ops-feed-accepted">-</strong></div>
+            <div><span>체결 / 호가</span><strong id="ops-feed-events">-</strong></div>
+            <div><span>건강 종목</span><strong id="ops-feed-healthy">-</strong></div>
+          </div>
+          <p class="ops-card-note" id="ops-feed-note">실시간 수집 상태 확인 중</p>
+        </article>
+
+        <article class="ops-card">
+          <div class="ops-card-head"><h3>온톨로지·연구 파이프라인</h3><span id="ops-ontology-state">-</span></div>
+          <div class="ops-kpi-grid">
+            <div><span>컨텍스트 이벤트</span><strong id="ops-context-events">-</strong></div>
+            <div><span>온톨로지 연결</span><strong id="ops-ontology-links">-</strong></div>
+            <div><span>연구 사이클</span><strong id="ops-research-cycle">-</strong></div>
+            <div><span>모델 상태</span><strong id="ops-model-state">-</strong></div>
+          </div>
+          <p class="ops-card-note" id="ops-ontology-note">연구 및 그래프 상태 확인 중</p>
+        </article>
+
+        <article class="ops-card ops-gnn-card">
+          <div class="ops-card-head"><h3>GNN 실시간 신뢰도</h3><span id="ops-gnn-state">-</span></div>
+          <div class="ops-score-line">
+            <strong id="ops-gnn-score">-</strong>
+            <div><span id="ops-gnn-samples">표본 -</span><small id="ops-gnn-trusted">신뢰 전략 -</small></div>
+          </div>
+          <div class="ops-progress"><i id="ops-gnn-progress"></i></div>
+          <div class="ops-mini-metrics">
+            <span>양수 순효율 <b id="ops-gnn-positive">-</b></span>
+            <span>평균 순효율 <b id="ops-gnn-net">-</b></span>
+            <span>불확실성 <b id="ops-gnn-uncertainty">-</b></span>
+          </div>
+          <div class="ops-strategy-list" id="ops-strategy-list"></div>
+        </article>
+
+        <article class="ops-card">
+          <div class="ops-card-head"><h3>전략 선택·실거래 엔진</h3><span id="ops-engine-state">-</span></div>
+          <div class="ops-kpi-grid">
+            <div><span>세션 단계</span><strong id="ops-session-phase">-</strong></div>
+            <div><span>선택 전략</span><strong id="ops-selected-strategy">-</strong></div>
+            <div><span>매수 후보</span><strong id="ops-buy-candidates">-</strong></div>
+            <div><span>주문 / 오류</span><strong id="ops-order-errors">-</strong></div>
+          </div>
+          <p class="ops-card-note" id="ops-engine-note">전략 세션 상태 확인 중</p>
+        </article>
+      </div>
+
+      <div class="ops-footer">
+        <div><span>운영 모드</span><strong id="ops-mode">-</strong></div>
+        <div><span>자동 신뢰도</span><strong id="ops-reliability">-</strong></div>
+        <div><span>GNN 실거래 필수</span><strong id="ops-gnn-required">-</strong></div>
+        <div><span>누적 엔진 주기</span><strong id="ops-engine-cycles">-</strong></div>
+        <div class="ops-footer-wide"><span>현재 판단 사유</span><strong id="ops-current-reason">-</strong></div>
+      </div>
+    </section>
 
     <section class="live-owner-strip" aria-labelledby="live-owner-title">
       <div class="live-owner-heading">
@@ -642,7 +730,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260729-strategy-owned-2"></script>
+  <script src="/static/strategy_terminal.js?v=20260730-entry-trust-v2"></script>
+  <script src="/static/operations_overview.js?v=20260730-entry-trust-v2"></script>
 </body>
 </html>
 """

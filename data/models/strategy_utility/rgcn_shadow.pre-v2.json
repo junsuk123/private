@@ -1,0 +1,39 @@
+{
+  "authorization_checks": {
+    "minimum_rows": 10000,
+    "minimum_snapshots": 1000,
+    "requested": true,
+    "row_count_ok": true,
+    "schema_matches_runtime": true,
+    "snapshot_count_ok": true,
+    "strategy_coverage_ok": true,
+    "strategy_minimum_rows": 500
+  },
+  "authorization_scope": "shadow_inference_only",
+  "checkpoint": "data\\models\\strategy_utility\\rgcn_shadow.npz",
+  "config": {
+    "batch_size": 1,
+    "feature_dim": 12,
+    "hidden_dim": 16,
+    "max_nodes": 1,
+    "relation_count": 1,
+    "seed": 17,
+    "strategy_count": 7,
+    "time_steps": 1
+  },
+  "feature_provenance": "causal_minute_bar_microstructure_proxy_v1",
+  "input_feature_schema": "realtime_microstructure_v1",
+  "live_authorized": true,
+  "method": "causal_feature_encoder_plus_ridge_calibrated_heads",
+  "rows": 38668,
+  "snapshots": 5524,
+  "strategies": {
+    "breakout_volume": 5524,
+    "cross_sectional_relative_strength": 5524,
+    "event_momentum": 5524,
+    "gap_context": 5524,
+    "intraday_momentum": 5524,
+    "liquidity_shock_reversal": 5524,
+    "vwap_mean_reversion": 5524
+  }
+}

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +33,13 @@ class RealtimeModesTest(unittest.TestCase):
             web_module._live_buy_candidate_backoff_until.clear()
             web_module._volume_surge_warm_cache.update({"at": 0.0, "symbols": ()})
             web_module._us_learning_watchlist_cache.update(
-                {"at": 0.0, "cash_usd": None, "symbols": ()}
+                {
+                    "at": 0.0,
+                    "cash_usd": None,
+                    "symbols": (),
+                    "pool": (),
+                    "rotation_index": 0,
+                }
             )
         from app.graph import macro_micro_feed
 
@@ -1427,7 +1434,10 @@ class RealtimeModesTest(unittest.TestCase):
             patch("app.web.RealtimeMarketDataStore") as store_cls,
             patch("app.web._cached_context_buy_candidates", return_value=("HOWL",)),
             patch("app.web._cached_domestic_ranking_symbols", return_value=()),
-            patch("app.web._prioritize_realtime_buy_candidates", side_effect=lambda symbols: tuple(symbols)),
+            patch(
+                "app.web._prioritize_realtime_buy_candidates",
+                side_effect=lambda symbols, **_: tuple(symbols),
+            ),
             patch("app.web._is_live_buy_candidate_symbol", return_value=True),
             patch("app.web._is_open_live_market_ticker", return_value=True),
             patch("app.web._live_affordable_buy_candidate_symbols") as broker_discovery,
@@ -1502,6 +1512,10 @@ class RealtimeModesTest(unittest.TestCase):
                 "app.web._live_affordable_buy_candidate_symbols",
                 return_value=("NVDA",),
             ) as discover,
+            patch(
+                "app.web._liquid_affordable_us_seed_symbols",
+                return_value=(),
+            ),
             patch.dict("os.environ", {"REALTIME_US_WATCHLIST_TTL_SEC": "1800"}),
         ):
             first = web_module._sticky_us_learning_symbols(2)
@@ -1529,10 +1543,143 @@ class RealtimeModesTest(unittest.TestCase):
                 "app.web._live_affordable_buy_candidate_symbols",
                 return_value=("AAPL", "MSFT", "005930"),
             ),
+            patch(
+                "app.web._liquid_affordable_us_seed_symbols",
+                return_value=(),
+            ),
         ):
             symbols = web_module._sticky_us_learning_symbols(2)
 
         self.assertEqual(symbols, ("AAPL", "MSFT"))
+
+    def test_us_learning_watchlist_prefers_liquid_seed_before_random_discovery(self) -> None:
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"USD": 67.57},
+        )
+        with (
+            patch("app.web._account_snapshot_from_live_basis", return_value=account),
+            patch("app.web._last_live_account_basis", return_value={}),
+            patch("app.web._recent_affordable_us_watchlist", return_value=("T",)),
+            patch(
+                "app.web._liquid_affordable_us_seed_symbols",
+                return_value=("SOFI",),
+            ) as seed,
+            patch(
+                "app.web._live_affordable_buy_candidate_symbols",
+                return_value=("STHO",),
+            ) as discover,
+        ):
+            symbols = web_module._sticky_us_learning_symbols(2)
+
+        self.assertEqual(symbols, ("T", "SOFI"))
+        seed.assert_called_once_with(account, limit=1)
+        discover.assert_not_called()
+
+    def test_us_learning_watchlist_rotates_broker_verified_pool(self) -> None:
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"USD": 200.0},
+        )
+        with (
+            patch("app.web._account_snapshot_from_live_basis", return_value=account),
+            patch("app.web._last_live_account_basis", return_value={}),
+            patch(
+                "app.web._recent_affordable_us_watchlist",
+                return_value=("AAPL", "MSFT", "SOFI", "PFE"),
+            ),
+            patch(
+                "app.web._liquid_affordable_us_seed_symbols",
+                return_value=(),
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "REALTIME_US_ROTATION_POOL_MULTIPLIER": "2",
+                    "REALTIME_US_WATCHLIST_RECHECK_SEC": "180",
+                },
+            ),
+        ):
+            first = web_module._sticky_us_learning_symbols(2)
+            with web_module._live_lock:
+                web_module._us_learning_watchlist_cache["at"] = 0.0
+            second = web_module._sticky_us_learning_symbols(2)
+
+        self.assertEqual(first, ("AAPL", "MSFT"))
+        self.assertEqual(second, ("SOFI", "PFE"))
+
+    def test_recent_us_watchlist_ranks_sustained_fresh_ticks(self) -> None:
+        account = AccountSnapshot(
+            cash=0.0,
+            holdings=(),
+            cash_by_currency={"USD": 67.57},
+        )
+        now = datetime.now(timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "realtime.sqlite3"
+            import sqlite3
+
+            with closing(sqlite3.connect(database)) as connection:
+                connection.executescript(
+                    """
+                    create table realtime_ticks (
+                      record_id text primary key,
+                      symbol text,
+                      received_at text,
+                      price real,
+                      volume integer
+                    );
+                    create table realtime_orderbook (
+                      record_id text primary key,
+                      symbol text,
+                      received_at text,
+                      spread_bps real
+                    );
+                    """
+                )
+                for index in range(6):
+                    connection.execute(
+                        "insert into realtime_ticks values (?, ?, ?, ?, ?)",
+                        (
+                            f"active-{index}",
+                            "SOFI",
+                            (now - timedelta(seconds=20 + index)).isoformat(),
+                            12.0,
+                            100,
+                        ),
+                    )
+                connection.execute(
+                    "insert into realtime_ticks values (?, ?, ?, ?, ?)",
+                    ("one-off", "STHO", (now - timedelta(seconds=2)).isoformat(), 4.0, 1),
+                )
+                for index in range(3):
+                    connection.execute(
+                        "insert into realtime_orderbook values (?, ?, ?, ?)",
+                        (
+                            f"book-{index}",
+                            "SOFI",
+                            (now - timedelta(seconds=index)).isoformat(),
+                            8.0,
+                        ),
+                    )
+                connection.commit()
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "REALTIME_US_WATCHLIST_MIN_TICKS": "3",
+                    "REALTIME_US_WATCHLIST_MAX_TICK_AGE_SEC": "180",
+                },
+            ):
+                symbols = web_module._recent_affordable_us_watchlist(
+                    account,
+                    limit=2,
+                    database=database,
+                )
+
+        self.assertEqual(symbols, ("SOFI",))
 
     def test_us_learning_fast_poll_keeps_holdings_ahead_of_warm_symbols(self) -> None:
         with (
@@ -1708,6 +1855,29 @@ class RealtimeModesTest(unittest.TestCase):
             web_module._kis_realtime_collector_stop.clear()
             with web_module._live_lock:
                 web_module._live_state["collection_log"] = previous_log
+
+    def test_overseas_appkey_conflict_is_waiting_not_generic_error(self) -> None:
+        status, message = web_module._classify_kis_overseas_collector_cycle(
+            {
+                "subscriptions_accepted": 0,
+                "subscriptions_rejected": 1,
+                "appkey_already_in_use": 1,
+                "subscription_errors_by_code": {"OPSP8996": 1},
+            }
+        )
+        self.assertEqual(status, "waiting")
+        self.assertIn("AppKey", message)
+
+    def test_overseas_subscription_rejection_exposes_kis_code(self) -> None:
+        status, message = web_module._classify_kis_overseas_collector_cycle(
+            {
+                "subscriptions_accepted": 0,
+                "subscriptions_rejected": 2,
+                "subscription_errors_by_code": {"OPSP9999": 2},
+            }
+        )
+        self.assertEqual(status, "error")
+        self.assertIn("OPSP9999=2", message)
 
     def test_kis_complete_subscription_symbol_feeds_fast_feature_sampler(self) -> None:
         with web_module._live_lock:

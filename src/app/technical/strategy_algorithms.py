@@ -38,6 +38,7 @@ from typing import Any, Mapping
 
 from app.technical import reason_codes as rc
 from app.technical.signals import TechnicalFeatureSet
+from app.strategy.catalog import STRATEGY_IDS
 
 DEFAULT_CONFIG_PATH = "config/strategy_algorithms.yaml"
 
@@ -70,6 +71,19 @@ class ElectionContext:
     gap_submode: str | None = None
     session_open_price: float | None = None
     previous_close_price: float | None = None
+    # rvgi_box_breakout (all frozen at election)
+    rvgi: float | None = None
+    rvgi_signal: float | None = None
+    rvgi_diff: float | None = None
+    rvgi_bullish_cross: bool | None = None
+    box_high: float | None = None
+    box_low: float | None = None
+    box_mid: float | None = None
+    box_width_pct: float | None = None
+    box_position: float | None = None
+    box_context_timestamp: str | None = None
+    box_previous_close: float | None = None
+    volume_confirmed: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +98,18 @@ class ElectionContext:
             "sector_candidate_count": self.sector_candidate_count,
             "gap_rate": self.gap_rate,
             "gap_submode": self.gap_submode,
+            "rvgi": self.rvgi,
+            "rvgi_signal": self.rvgi_signal,
+            "rvgi_diff": self.rvgi_diff,
+            "rvgi_bullish_cross": self.rvgi_bullish_cross,
+            "box_high": self.box_high,
+            "box_low": self.box_low,
+            "box_mid": self.box_mid,
+            "box_width_pct": self.box_width_pct,
+            "box_position": self.box_position,
+            "box_context_timestamp": self.box_context_timestamp,
+            "box_previous_close": self.box_previous_close,
+            "volume_confirmed": self.volume_confirmed,
         }
 
 
@@ -236,6 +262,28 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "fill_capture_fraction": 0.5,
         "stop_buffer_bps": 10.0,
         "trailing_bps": 16.0,
+    },
+    "rvgi_box_breakout": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "rvgi_period": 10.0,
+        "box_lookback": 20.0,
+        "cross_confirm_bars": 3.0,
+        "entry_buffer_bps": 3.0,
+        "max_extension_bps": 35.0,
+        "min_volume_spike_ratio": 1.5,
+        "min_aggressor_imbalance": 0.05,
+        "min_box_width_pct": 0.002,
+        "max_box_width_pct": 0.04,
+        "target_capture_fraction": 0.5,
+        "max_target_return": 0.012,
+        "stop_buffer_bps": 10.0,
+        "stop_atr_multiple": 1.0,
+        "failure_tolerance_bps": 12.0,
+        "trailing_bps": 15.0,
+        "horizon_seconds": 300.0,
     },
 }
 
@@ -894,6 +942,133 @@ class GapContextAlgorithm(TradingAlgorithm):
         return tuple(codes)
 
 
+class RvgiBoxBreakoutAlgorithm(TradingAlgorithm):
+    strategy_id = "rvgi_box_breakout"
+    thesis = "bullish RVGI confirms acceptance above a frozen causal price box"
+
+    def _context_reasons(self, context: ElectionContext) -> tuple[str, ...]:
+        required = (
+            context.rvgi,
+            context.rvgi_signal,
+            context.box_high,
+            context.box_low,
+            context.box_mid,
+            context.box_width_pct,
+            context.box_previous_close,
+        )
+        if not _present(*required) or not context.box_context_timestamp:
+            return ("RVGI_BOX_CONTEXT_MISSING",)
+        if context.rvgi <= context.rvgi_signal or not context.rvgi_bullish_cross:
+            return ("RVGI_BOX_RVGI_NOT_CONFIRMED",)
+        if not context.volume_confirmed:
+            return ("RVGI_BOX_VOLUME_NOT_CONFIRMED",)
+        if not self.p("min_box_width_pct") <= context.box_width_pct <= self.p("max_box_width_pct"):
+            return ("RVGI_BOX_GEOMETRY_INVALID",)
+        return ()
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        context_reasons = self._context_reasons(context)
+        if context_reasons:
+            return self._reject(context_reasons)
+        ready, _ = self._tick_ready(f)
+        if not ready:
+            return self._reject(("RVGI_BOX_TICK_WINDOW_NOT_READY",))
+        assert context.box_high is not None
+        assert context.box_low is not None
+        assert context.box_previous_close is not None
+        price = f.price
+        if price is None or price <= 0:
+            return self._reject(("RVGI_BOX_CONTEXT_MISSING",))
+        trigger = context.box_high * (1.0 + self.p("entry_buffer_bps") / 10_000.0)
+        distance_bps = (price / context.box_high - 1.0) * 10_000.0
+        if price <= trigger:
+            return self._reject(
+                ("RVGI_BOX_NOT_ABOVE_FROZEN_HIGH",),
+                frozen_box_high=context.box_high,
+                breakout_distance_bps=distance_bps,
+            )
+        if context.box_previous_close > context.box_high:
+            return self._reject(("RVGI_BOX_BREAKOUT_NOT_FRESH",))
+        if distance_bps > self.p("max_extension_bps"):
+            return self._reject(("RVGI_BOX_OVEREXTENDED",), breakout_distance_bps=distance_bps)
+        if f.volume_spike_ratio is None or f.volume_spike_ratio < self.p("min_volume_spike_ratio"):
+            return self._reject(("RVGI_BOX_VOLUME_NOT_CONFIRMED",))
+        if (
+            f.aggressor_imbalance_5s is None
+            or f.aggressor_imbalance_5s < self.p("min_aggressor_imbalance")
+        ):
+            return self._reject(("RVGI_BOX_FLOW_NOT_CONFIRMED",))
+        if (f.return_1s or 0.0) < 0 and (f.return_5s or 0.0) < 0:
+            return self._reject(("RVGI_BOX_FALSE_BREAKOUT_RISK",))
+        box_height_return = max(0.0, (context.box_high - context.box_low) / price)
+        captured = min(
+            self.p("max_target_return"),
+            box_height_return * self.p("target_capture_fraction"),
+        )
+        edge_bps = captured * 10_000.0
+        if edge_bps <= 0:
+            return self._reject(("RVGI_BOX_EXPECTED_EDGE_TOO_LOW",))
+        score = _clamp(
+            0.35
+            + 0.25 * min(1.0, (f.volume_spike_ratio or 0.0) / 3.0)
+            + 0.2 * max(0.0, f.aggressor_imbalance_5s or 0.0)
+            + 0.2 * min(1.0, max(0.0, context.rvgi_diff or 0.0) * 10.0)
+        )
+        return self._fire(
+            score=score,
+            confidence=score,
+            edge_bps=edge_bps,
+            reasons=("RVGI_BOX_CONFIRMED_BREAKOUT_LONG",),
+            rvgi=context.rvgi,
+            rvgi_signal=context.rvgi_signal,
+            frozen_box_high=context.box_high,
+            frozen_box_low=context.box_low,
+            breakout_distance_bps=distance_bps,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        box_high = context.box_high or entry_price
+        box_low = context.box_low or box_high
+        bps_buffer = box_high * self.p("stop_buffer_bps") / 10_000.0
+        atr_buffer = entry_price * max(0.0, f.atr_pct or 0.0) * self.p("stop_atr_multiple")
+        stop = box_high - max(bps_buffer, atr_buffer)
+        height = max(0.0, box_high - box_low)
+        target_return = min(
+            self.p("max_target_return"),
+            (height / entry_price if entry_price > 0 else 0.0)
+            * self.p("target_capture_fraction"),
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=min(box_high, stop),
+            target_price=entry_price * (1.0 + target_return),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="frozen_box_high_minus_max_bps_or_atr_buffer",
+            target_basis="fraction_of_frozen_box_height",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        if context.box_high and f.price:
+            failure = context.box_high * (
+                1.0 - self.p("failure_tolerance_bps") / 10_000.0
+            )
+            if f.price < failure:
+                codes.append("RVGI_BOX_FALSE_BREAKOUT")
+        if f.rvgi_bearish_cross:
+            codes.append("RVGI_BEARISH_CROSS")
+        if (
+            f.volume_spike_ratio is not None
+            and f.volume_spike_ratio < 1.0
+            and context.box_high
+            and f.price
+            and f.price < context.box_high
+        ):
+            codes.append("RVGI_BOX_VOLUME_COLLAPSE_INSIDE_BOX")
+        return tuple(codes)
+
+
 # --------------------------------------------------------------------------- #
 # Registry                                                                     #
 # --------------------------------------------------------------------------- #
@@ -905,9 +1080,11 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     EventMomentumAlgorithm,
     CrossSectionalRelativeStrengthAlgorithm,
     GapContextAlgorithm,
+    RvgiBoxBreakoutAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
+assert ALGORITHM_IDS == STRATEGY_IDS
 
 # The macro ontology speaks a coarser vocabulary than these algorithm ids
 # (``app.graph.macro_micro_common.SelectedStrategy``). Permission checks must
@@ -915,11 +1092,12 @@ ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITH
 MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "intraday_momentum": ("momentum",),
     "event_momentum": ("momentum",),
-    "cross_sectional_relative_strength": ("momentum",),
+    "cross_sectional_relative_strength": ("relative_strength", "momentum"),
     "gap_context": ("momentum", "breakout"),
     "breakout_volume": ("breakout",),
     "vwap_mean_reversion": ("vwap_reversion", "mean_reversion"),
     "liquidity_shock_reversal": ("mean_reversion",),
+    "rvgi_box_breakout": ("breakout", "momentum_confirmation"),
 }
 
 
@@ -963,3 +1141,13 @@ def get_algorithm(
 ) -> TradingAlgorithm | None:
     source = registry if registry is not None else build_algorithm_registry()
     return source.get(str(strategy_id or "").strip().lower())
+
+
+def strategy_live_authorized(strategy_id: str) -> bool:
+    """Deployment flag only; model/ontology authorization remains separate."""
+    algorithm = get_algorithm(strategy_id)
+    if algorithm is None:
+        return False
+    if strategy_id != "rvgi_box_breakout":
+        return True
+    return algorithm.p("enabled") >= 1.0 and algorithm.p("live_authorized") >= 1.0

@@ -46,6 +46,10 @@ class RealtimeMarketDataStore:
                 );
                 create index if not exists idx_realtime_ticks_symbol_time
                     on realtime_ticks(symbol, exchange_timestamp);
+                create index if not exists idx_realtime_ticks_symbol_received
+                    on realtime_ticks(symbol, received_at);
+                create index if not exists idx_realtime_ticks_received
+                    on realtime_ticks(received_at);
 
                 create table if not exists realtime_orderbook (
                     record_id text primary key,
@@ -66,6 +70,8 @@ class RealtimeMarketDataStore:
                 );
                 create index if not exists idx_realtime_orderbook_symbol_time
                     on realtime_orderbook(symbol, exchange_timestamp);
+                create index if not exists idx_realtime_orderbook_symbol_received
+                    on realtime_orderbook(symbol, received_at);
 
                 create table if not exists realtime_minute_bars (
                     symbol text not null,
