@@ -141,9 +141,9 @@
   <text class="h" x="1240" y="854">Learned models</text>
   <text class="t" x="1240" y="877">Live short-horizon predictor</text>
   <text class="t" x="1240" y="896">(CPU or OpenVINO, auxiliary only)</text>
-  <text class="t" x="1240" y="915">and the strategy-utility R-GCN</text>
-  <text class="t" x="1240" y="934">running in shadow observation.</text>
-  <text class="m" x="1240" y="961">models.* · routing.shadow_intelligence — advisory</text>
+  <text class="t" x="1240" y="915">and strategy-utility R-GCN inside</text>
+  <text class="t" x="1240" y="934">the ontology mask + live trust gate.</text>
+  <text class="m" x="1240" y="961">models.* · routing.* — GNN selects; deterministic gates authorize orders</text>
   <path class="flow" d="M820,748 L820,778"/>
   <rect class="band" x="38" y="1025" width="1564" height="209" rx="18"/>
   <text class="lane" x="62" y="1051">5 · DECISION AUTHORITY — DETERMINISTIC, SELL BEFORE BUY</text>

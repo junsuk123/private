@@ -22,7 +22,7 @@ copy config\live_trading_safety.example.json config\live_trading_safety.json
 copy config\order_execution.example.json config\order_execution.json
 ```
 
-채워야 하는 값: KIS app key/secret, 계좌번호와 상품코드, HTS ID와 고객유형, 초기 원금과 보호 하한, **직접 확인한** KIS 수수료율과 국내 증권거래세율. 이 파일들은 커밋하지 않습니다.
+채워야 하는 값: KIS app key/secret, 계좌번호와 상품코드, HTS ID와 고객유형, 초기 원금과 보호 하한, **직접 확인한 제비용 정책**(위탁매매 비용, 유관기관 비용, 세금, 환전·시장별 비용). 이 파일들은 커밋하지 않습니다.
 
 ## 2. 점검
 
@@ -66,6 +66,11 @@ python .\run.py --host 127.0.0.1 --port 8010
 - AI/모델 검증 `http://127.0.0.1:8010/api/ai/validation`
 - live 학습 상태 `http://127.0.0.1:8010/api/live-training/status`
 - 전략 소유 경로 상태 `http://127.0.0.1:8010/api/refactor/dashboard`
+- GNN 실시간 신뢰도 `http://127.0.0.1:8010/api/gnn/realtime-trust`
+- 통합 시스템 진단 `http://127.0.0.1:8010/api/system-diagnostics`
+- 자동 운영모드 전환 `http://127.0.0.1:8010/api/auto-reliability/status`
+
+대형 실시간 스토어에서 feature/GNN 상태를 복원할 수 있으므로 `run.ps1`은 최대 180초 동안 준비 상태를 기다립니다. 서버 프로세스가 살아 있는 동안 60초를 넘겼다는 이유만으로 정상 부팅을 종료하지 않습니다.
 
 ## 4. 제출 게이트
 
@@ -110,8 +115,16 @@ BUY보다 먼저 평가됩니다. 승인 경로: 비용 차감 후 이익 목표
 | `LOW_LIQUIDITY` | 후보 유동성 부족 |
 | `FALLBACK_SCORE_BELOW_THRESHOLD` | 규칙/온톨로지 fallback 점수 미달 |
 | `INSUFFICIENT_CASH_FOR_ONE_SHARE` | 해당 통화 가용 현금이 1주 가격 + 버퍼 미만 |
+| `NO_POSITIVE_NET_GNN_EDGE` | 실행 순효율 하한을 넘는 온톨로지 허용 GNN 전략이 없음 |
+| `GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION` | 양수 GNN 후보는 있으나 해당 전략의 실시간 forward 성과가 아직 진입 권한 기준 미달 |
+| `GNN_TRUST_NO_POSITIVE_EDGE_VALIDATED_STRATEGY` | 모델 보정 전략은 있지만 실현 양수 비율·평균 순효율을 통과한 전략이 없음 |
+| `NET_EDGE_BELOW_EXECUTION_FLOOR:<strategy>` | 양수이지만 실주문 최소 순효율보다 작아 전략 활성화에서 제외 |
 
 `blocked=0`이고 `errors=0`이면 엔진은 정상 동작 중이며 저품질 거래를 의도적으로 거부하고 있는 것입니다.
+
+`/api/gnn/realtime-trust`를 읽을 때 `passed=true`는 **모델 보정 통과**입니다. 실제 신규 진입 가능 전략은 `trusted_strategy_ids`에 있어야 합니다. `calibrated_strategy_ids`만 채워져 있고 `trusted_strategy_ids=[]`라면 GNN을 판단에 쓰지 않는 것이 아니라, GNN의 음수 판단은 사용하면서 양수 예측의 실거래 권한만 forward 검증 결과에 따라 보류하는 상태입니다.
+
+forward 검증은 전략별 horizon 안에서 목표가/손절가 중 먼저 도달한 가격을 사용하고 제비용을 차감합니다. 같은 horizon 버킷에서 음수 스캔 뒤 양수 전략이 나온 경우 최초 양수 예측을 보존합니다.
 
 **모든 필드가 비어 있고 AUC가 얼어붙고 거래가 0이면 대개 원인은 하나입니다 — 장이 닫혀 ticks=0.** `MarketPhase` 분류기와 REST 스냅샷 fallback이 이 상태를 오류가 아니라 상태로 표시합니다.
 
@@ -189,6 +202,7 @@ Pi 권장 역할: KIS 계좌/주문 상태 모니터, kill-switch/disarm watchdo
 | `logs/live-orders.jsonl` | live 주문 저널 |
 | `logs/live-feature-frames.jsonl` | feature frame 저널 |
 | `logs/refactor-shadow-comparison.jsonl` | legacy/ontology/CPU/NPU 판단 비교 |
+| `data/models/strategy_utility/rgcn_shadow.json/.npz` | 8전략 R-GCN 모델 카드와 체크포인트 |
 | `data/store/account_dashboard.sqlite3` | 계좌 대시보드 스토어 |
 | `data/store/realtime_market_data.sqlite3` | 실시간 시장 스토어 |
 | `data/store/causal-order-journal.jsonl` | intent → verdict → order 인과 저널 |

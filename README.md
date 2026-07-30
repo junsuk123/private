@@ -2,13 +2,13 @@
 
 KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델, 결정론적 리스크 게이트를 묶은 개인용 자동 투자 분석/운영 시스템입니다. 대표 실행 경로는 Windows의 `run.ps1`이고, Raspberry Pi에서는 CPU-only 런타임과 LCD 키오스크 GUI를 별도로 제공합니다.
 
-> **핵심 원칙:** LLM, NPU, ML, 온톨로지, GNN은 분류·랭킹·설명·마스킹·보조 점수만 제공합니다. 실제 주문은 `RiskManager`와 비용/원금보호/신선도/중복주문/KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
+> **핵심 원칙:** 온톨로지는 허용 관계와 전략 집합을 정의하고, GNN은 그 관계의 데이터 기반 가중치와 전략 효용을 학습해 실제 전략 선택에 사용됩니다. 단, GNN의 모델 보정 신뢰도와 전략별 양수 순효율이 실시간 데이터로 검증되어야 진입 권한이 생깁니다. LLM/NPU는 주문 권한이 없고, 실제 주문은 제비용·원금보호·신선도·중복주문·KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
 
 ![Current runtime architecture](docs/diagrams/system_overview.png)
 
 ## 온톨로지와 GNN 레이어
 
-지식 표현(왼쪽)과 학습 기반 전략 효용 추정(오른쪽)이 어떻게 쌓여 있고, 어디서 결정론적 권한으로 넘어가는지를 보여줍니다. OWL은 open-world라 거래를 허가하지도 금지하지도 않고, closed-world 운영 게이트가 전략 허용 집합을 만들며, GNN은 그 마스크 안에서만 효용을 계산합니다.
+지식 표현(왼쪽)과 학습 기반 전략 효용 추정(오른쪽)이 하나의 판단 파이프라인으로 연결되는 구조입니다. OWL은 open-world 지식을 확장하고, closed-world 운영 게이트가 현재 사실로 허용 가능한 전략 집합을 만들며, GNN은 그 마스크 안에서 관계 가중치와 비용 차감 기대효용을 계산합니다. 모델 보정과 전략별 진입 권한은 별도 실시간 검증 단계입니다.
 
 ![Ontology and GNN layers](docs/diagrams/ontology_gnn_layers.svg)
 
@@ -29,6 +29,8 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 - KIS 실계좌 읽기, 잔고/현금/보유종목 스냅샷 갱신
 - KIS 실시간 체결가/호가 수집과 브로커 quote 갱신
 - 실시간 feature frame 생성과 live short-horizon 모델 주기 학습
+- 온톨로지 허용 전략 안에서 8개 strategy-utility R-GCN 후보 평가
+- 전략별 실시간 forward 검증과 `calibrated`/`entry_authorized` 권한 분리
 - 독립 실시간 자동거래 루프 시작
 - SELL/REDUCE 평가를 BUY보다 먼저 실행
 - 기존 미체결 SELL 주문은 의미 있는 가격 변화가 있을 때만 정정, 아니면 유지
@@ -74,7 +76,9 @@ GET  /api/account/asset-history?range=1D|1W|1M|3M  GET  /api/account/macro-micro
 GET  /api/realtime-trading/status                  GET  /api/refactor/dashboard
 GET  /api/refactor/market-view?symbol=005930       GET  /api/trade-explanations
 GET  /api/ontology/graph                           GET  /api/realtime/runtime
-GET  /api/npu/runtime                              POST /api/live-trading/terminate?shutdown=true
+GET  /api/npu/runtime                              GET  /api/gnn/realtime-trust
+GET  /api/system-diagnostics                       GET  /api/auto-reliability/status
+POST /api/live-trading/terminate?shutdown=true
 ```
 
 ## Raspberry Pi
@@ -94,7 +98,8 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 - LLM 또는 LLM-like 컴포넌트는 주문을 실행하지 않습니다.
 - NPU/OpenVINO 출력은 숫자 근거 점수일 뿐 주문 승인 권한이 아닙니다.
 - live short-horizon 모델은 기본 advisory-only입니다. `REALTIME_MODEL_AUXILIARY_ONLY=true`면 모델 단독 BUY는 거부됩니다.
-- strategy-utility R-GCN은 shadow 관측 전용이며 체크포인트 provenance가 맞지 않으면 fail-closed로 `NO_TRADE`를 냅니다.
+- strategy-utility R-GCN은 실제 전략 선택에 직접 참여합니다. 체크포인트 provenance, 온톨로지 허용 관계, 모델 보정 신뢰도, 전략별 실현 양수 순효율 검증 중 하나라도 실패하면 신규 진입 권한은 생기지 않습니다.
+- `GNN_REALTIME_MODEL_TRUST_PASSED`는 모델 보정 통과이고, `GNN_REALTIME_TRUST_PASSED`는 선택 전략의 실거래 진입 권한까지 통과했다는 뜻입니다.
 - synthetic/sample/hash 파생 데이터는 오프라인 fixture에서만 허용하고 paper/live 판단 근거로 쓰지 않습니다.
 - margin, leverage, derivatives, short selling, credit loan, leveraged ETF는 거부 대상입니다.
 - live 주문은 `LiveExecutionCoordinator`를 통해 limit order로만 제출합니다.
@@ -110,7 +115,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, 세션 판정 |
 | `src/app/features/`, `technical/` | 지표, live feature frame, 근거 기반 기술적 예측 레이어 |
 | `src/app/graph/`, `ontology/` | KnowledgeGraph, FactTable, RDF/OWL/SHACL, 거시–미시 추론, closed-world 게이트 |
-| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 라우터, 7개 전략 expert |
+| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, 8개 전략 expert |
 | `src/app/cost/`, `risk/`, `trading/` | ProfitabilityGate, 사이징, 원금보호, RiskManager, 동적 청산, 실시간 엔진 |
 | `src/app/execution/` | KIS adapter, 주문 가격 정책, 거래소 라우팅, live coordinator, 저널 |
 | `config/`, `packaging/raspberrypi/`, `scripts/` | 정책·프로파일 설정, Pi 패키지, 점검·학습·리플레이·벤치마크 스크립트 |

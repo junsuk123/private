@@ -103,6 +103,14 @@ required_min_net_return = max(
 
 매 BUY 판단마다(성공/거부 모두) `technical_prediction`, `technical_methodology`, `technical_regime`, `profitability_decision`이 진단에 남습니다.
 
+수익률 단위 계약은 엄격합니다.
+
+- `expected_net_return_bps` — 제비용 차감 후 순효율
+- `expected_gross_return` / `expected_gross_return_bps` — 예상 청산가가 뜻하는 총 가격 이동
+- `ProfitabilityGate` — 총 가격 이동에서 `TradingCostEngine`의 제비용을 한 번만 차감
+
+순효율을 총수익으로 넣으면 게이트가 제비용을 이중 차감하므로 금지합니다. net-only 모델을 게이트에 연결할 때는 동일 비용 엔진으로 추정한 제비용을 더해 총 기대수익/청산가로 복원합니다.
+
 ### 거부 사유 코드
 
 | 코드 | 의미 |
@@ -274,7 +282,7 @@ BUY는 신선한 호가를 요구하지만, **긴급 SELL은 호가가 없어도
 
 `LiveExecutionCoordinator`가 유일한 KIS 제출 경계입니다. 필수 조건은 [live_trading.md](live_trading.md)에 정리되어 있습니다.
 
-### 전략 소유 실행 경로 (shadow)
+### 전략 소유 실행 경로
 
 새 경로의 인과 순서:
 
@@ -289,7 +297,9 @@ StrategyInstance → OrderIntent 영속화 → RiskGate → RiskVerdict 영속�
 - intent가 없으면 risk verdict를 저장할 수 없습니다.
 - `LifecycleStore` 마이그레이션 v1/v2가 전략 인스턴스·포지션·TradePlan을 durable하게 저장합니다. 재시작 테스트가 소유자를 복원하고 원래 plan의 청산 로직을 실행합니다.
 
-이 경로는 아직 live 제출에 연결되어 있지 않습니다. 연결 전에 어댑터가 증명해야 하는 것: 승인 수량이 요청 수량과 각 컴포넌트 한도를 넘지 않을 것, 거부된 intent의 승인 수량이 0일 것, 하나의 idempotency 키가 최대 하나의 broker 주문만 만들 것, 정정/취소가 부모 intent와 소유자를 유지할 것, 애매한 timeout이 재시도 전에 broker 주문 상태를 조회할 것, 체결이 broker 확인 수량을 넘지 못할 것, 재동기화된 포지션이 `origin_strategy_id`/`strategy_instance_id`를 유지할 것.
+현재 live 런타임에서는 온톨로지 허용 집합과 실시간 trust를 통과한 GNN 전략이 `StrategySessionManager`에 의해 단일 종목·단일 전략 세션으로 잠긴 뒤 이 경로에 연결됩니다. `GNN_REALTIME_MODEL_TRUST_PASSED`만으로는 부족하며 선택 전략에 `GNN_REALTIME_TRUST_PASSED`가 있어야 합니다. 이후에도 승인 수량, idempotency, 신선한 호가, 수익성, 리스크, KIS 제출 게이트는 독립적으로 적용됩니다.
+
+`logs/refactor-shadow-comparison.jsonl`의 shadow는 legacy/ontology/GNN 판단을 비교 기록한다는 의미입니다. GNN이 항상 관측 전용이라는 뜻은 아닙니다.
 
 ### 복구 순서
 
@@ -313,7 +323,7 @@ legacy 저널과 idempotency 파일은 롤백/비교를 위해 손대지 않습�
 | 현금·보유·실현손익 | 포지션 사이징과 `INSUFFICIENT_CASH_FOR_ONE_SHARE`, 일일 손실 예산과 BUY 정지, 집중도/드로다운 축소 청산 |
 | 변동성·유동성 | BUY 최소 순수익 요구치, 익절/트레일링/소프트스톱 레벨, 고변동성 regime의 macro `BLOCK_BUY` |
 | 뉴스·공시 이벤트 | macro risk level과 시장 전체 BUY 차단, event-momentum 적격성과 TTL 만료, reasoning path의 semantic 리스크 근거 |
-| 모델·온톨로지 출력 | 기대 청산가(정직한 추정치 위로 부풀리지 않음), 전략 적격 마스크와 compatibility score, 이익 포지션에 대한 상한 있는 악화 페널티 |
+| 모델·온톨로지 출력 | 온톨로지 전략 적격 마스크, 학습된 관계 가중치와 조건부 기대 순효율, 전략별 실시간 진입 권한, 기대 청산가(정직한 추정치 위로 부풀리지 않음) |
 
 ## 8. Before / after
 

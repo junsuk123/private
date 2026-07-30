@@ -8,7 +8,8 @@
 
 시스템은 **확률적 추론**과 **결정론적 통제**를 분리합니다.
 
-- 분류기, semantic layer, 온톨로지, GNN, LLM은 분류·랭킹·설명·마스킹·보조 점수만 담당합니다.
+- 온톨로지는 도메인 관계와 허용 전략을 결정하고, strategy-utility GNN은 그 관계 가중치와 전략 효용을 학습하여 실제 전략 선택에 직접 참여합니다.
+- GNN 선택은 실시간 모델 보정과 전략별 양수 순효율 검증을 통과한 경우에만 신규 진입 권한을 얻습니다. LLM과 NPU 장치 자체에는 주문 권한이 없습니다.
 - 주문을 만들 수 있는 것은 `RiskManager`를 통과한 `FinalOrder`뿐이고, 실제 제출은 `LiveExecutionCoordinator`의 limit order 경로만 가능합니다.
 - OpenVINO/NPU는 숫자 evidence 가속일 뿐이며, 실패하면 동일 스키마로 CPU fallback합니다. NPU 출력은 주문 권한이 아닙니다.
 
@@ -54,6 +55,12 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
             → OntologyCoordinator → GlobalTradeArbiter (SELL/REDUCE를 BUY보다 먼저 랭킹)
   → [자문] RDF/RDFS/OWL semantic label + SHACL 검증 + SemanticPolicyScorer
   → [자문] live short-horizon 모델 (CPU/OpenVINO, auxiliary-only)
+  → ClosedWorldOntologyGate(허용 전략 마스크)
+  → strategy-utility R-GCN(조건부 승/패 기대값과 제비용 차감 순효율)
+  → GnnRealtimeTrustEvaluator
+        1) 모델 보정(calibrated) 검증
+        2) 전략별 forward 실현 순효율(entry_authorized) 검증
+  → StrategySessionManager(종목·전략 단일 소유권 잠금)
   → SharedLiveDecisionEngine
         1) SELL/REDUCE 평가
         2) BUY 평가 (현금·신선도·spread·유동성·근거 충족 시에만)
@@ -76,7 +83,7 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
 | `src/app/graph/` | custom KnowledgeGraph, FactTable, RDF/OWL/SHACL 레이어, 거시–미시 추론, theory vote, NPU evidence scorer |
 | `src/app/ontology/` | TTL 스키마와 closed-world 운영 게이트, trading domain reasoner |
 | `src/app/models/` | 라벨링, 학습 파이프라인, artifact registry, CPU/OpenVINO backend, strategy-utility R-GCN |
-| `src/app/strategy/`, `routing/` | 7개 전략 expert, 소유권 가드, strategy router, shadow intelligence/comparison |
+| `src/app/strategy/`, `routing/` | 8개 전략 expert, 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
 | `src/app/cost/`, `risk/` | TradingCostEngine, ProfitabilityGate, position sizing, principal protection, RiskManager |
 | `src/app/trading/` | realtime engine, shared decision engine, dynamic exit policy, execution policy, runtime guard |
 | `src/app/execution/` | KIS adapter(국내/해외), 주문 가격 정책, 거래소 라우팅, live coordinator, 저널, idempotency |
@@ -125,6 +132,9 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | `GET /api/ontology/graph`, `/api/ontology/runtime` | 그래프 payload, 온톨로지 런타임 상태 |
 | `GET /api/realtime/runtime`, `/api/npu/runtime` | 가속·모델·NPU 모듈 상태와 fallback 사유 |
 | `GET /api/ai/validation`, `/api/live-training/status` | 이벤트 LLM/모델/학습 검증 상태 |
+| `GET /api/gnn/realtime-trust` | GNN 전체/전략별 보정 점수, forward 표본, 진입 권한 |
+| `GET /api/system-diagnostics` | 서버·계좌·시장 데이터·온톨로지·학습·거래 엔진 통합 진단 |
+| `GET /api/auto-reliability/status` | `learning` ↔ `live_trading` 자동 전환 점수와 사유 |
 
 ## 7. 운영 모드
 
@@ -140,7 +150,7 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 
 모든 모드가 동일한 realtime store와 model root를 사용하며 synthetic 데이터는 입력으로 허용되지 않습니다.
 
-별도로 `config/refactor_profile.json`이 **전략 소유(strategy-owned) 경로**의 posture를 선언합니다. 현재 값은 `mode=shadow`, `broker_submission_enabled=false`이고, `websocket_market_data` / `local_chart_engine` / `ontology_router` / `gnn_shadow`만 켜져 있습니다. `research·replay·paper·shadow` 모드는 broker 제출이 구조적으로 불가능하고, `canary·live`는 명시적 notional 상한과 심볼 allowlist, `strategy_owned_execution`, `live_enabled`를 모두 요구합니다 (`app.config.refactor_profile`).
+별도로 `config/refactor_profile.json`이 비교/진단 경로의 posture를 선언합니다. 실행 시 실제 주문 가능 여부는 이 파일 하나가 아니라 `run.ps1`의 live 플래그, 자동 신뢰도 컨트롤러, GNN 전략별 진입 권한, 전략 세션, 최종 비용·리스크·KIS 게이트의 합성 결과로 결정됩니다. legacy/ontology/GNN 비교 로그는 계속 shadow comparison으로 남지만, 검증된 GNN 판단은 `StrategySessionManager`를 통해 실거래 전략 선택에 연결됩니다.
 
 런타임 플래그는 `RefactorFeatureFlags.from_env()`가 환경변수에서 읽습니다. 기본값은 legacy 경로만 활성이며, 잘못된 조합(예: ontology router 없이 GNN rerank)은 로드 시점에 실패합니다.
 
@@ -153,7 +163,7 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | 후보 evidence 스코어링 | NPU + CPU fallback | `OntologyNpuLinearScorer`, `trading_pipeline._rank_accepted_with_npu` |
 | theory vote / conflict / evidence cluster | NPU + CPU fallback | `graph/npu_*` 모듈, `/api/npu/runtime`에 상태 노출 |
 | short-horizon 예측 | CPU 기본, OpenVINO 선택 | 모델은 auxiliary-only |
-| strategy-utility R-GCN | OpenVINO CPU(검증) / NPU(미승격) | shadow 관측 전용 |
+| strategy-utility R-GCN | OpenVINO CPU(실시간 검증) / NPU(미승격) | 온톨로지 마스크 안에서 전략 선택; 진입 권한은 CPU 실시간 forward 검증 |
 | 그래프 탐색·설명·행동 선택 | CPU | 분기 많고 설명 가능성 필수 |
 | 비용·리스크·주문 게이트·브로커 제출 | CPU | 안전 임계 경로 |
 
@@ -175,8 +185,9 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
 
 1. `app.web`이 UI·orchestration·수집·계좌 접근·live 실행을 함께 들고 있어 latency 격리와 재시작 복구가 어렵습니다.
 2. 해외 종목은 REST polling(기본 12초)에 의존하므로 fast-path 불변식을 만족하지 않습니다.
-3. idempotency 기록이 broker ack 이후에 이뤄지는 legacy 경로가 남아 있습니다. 새 causal journal 경로는 제출 전 예약/fsync를 수행하지만 아직 live에 연결되어 있지 않습니다.
+3. legacy 저널과 causal strategy-owned 저널이 함께 남아 있어 복구 시 두 경로의 상태를 함께 대조해야 합니다.
 4. decision/feature JSONL 로그가 수백 MB 규모까지 자라며 문서화된 retention/compaction 정책이 없습니다.
 5. 소액 계좌 단타는 왕복 비용을 고려하면 구조적으로 기대값이 음수에 가깝습니다. 게이트는 엔지니어링 통제일 뿐 수익을 보장하지 않습니다.
+6. 이벤트·횡단면 상대강도·갭 전략은 해당 point-in-time 사실이 실시간 feature schema에 없으면 closed-world로 차단됩니다. 결측 사실을 합성해 0이 아닌 적합도를 만들지 않습니다.
 
 관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [validation.md](validation.md)

@@ -217,7 +217,7 @@ GNN_LAYERS = [
         [
             "X [B,T,N,F] · A [B,T,R,N,N] · node_mask [B,T,N] · strategy_mask [B,N,S]",
             "Topology is built on CPU and stays outside the model graph.",
-            "Shadow checkpoint B1 T1 N1 F12 R1 S7 · benchmark B1 T4 N16 F12 R4 S7",
+            "Current checkpoint B1 T1 N8 F36 R3 S8 · ontology mask built on CPU",
         ],
         "violet",
         "app.npu.tensor_schemas · routing.shadow_intelligence",
@@ -243,17 +243,17 @@ GNN_LAYERS = [
     (
         "G3 · Multi-task heads per stock × strategy",
         [
-            "p_success · gross_bps · cost_bps · MAE · MFE · p_fill · holding_s ·",
+            "p_success · cost_bps · conditional loss/win · p_fill · holding_s ·",
             "aleatoric uncertainty, plus a separate NoTrade head.",
         ],
         "violet",
-        "8 head channels × 7 strategies",
+        "8 head channels × 8 strategies",
     ),
     (
         "G4 · Cost-adjusted utility",
         [
-            "net = gross_bps − cost_bps",
-            "U = p_success·net − (1−p_success)·MAE − uncertainty + 0.1·p_fill·MFE",
+            "net = p_success·E[net win] − (1−p_success)·E[net loss]",
+            "U = net − uncertainty + 0.1·p_fill·E[net win]",
             "U = −∞ wherever the ontology mask or the node mask is 0.",
         ],
         "orange",
@@ -273,7 +273,7 @@ GNN_LAYERS = [
         [
             "OpenVINO CPU is the verified runtime. NPU compiles without fallback but",
             "measured slower (p50 1.14 ms vs 0.33 ms) and outside the utility tolerance.",
-            "Shadow inference only: rgcn_shadow.npz is scope-limited, never order authority.",
+            "CPU GNN feeds strategy selection; per-strategy live forward trust grants entry.",
         ],
         "slate",
         "models.strategy_utility.openvino_runtime · routing.shadow_comparison",
@@ -524,10 +524,10 @@ REASONING = [
         [
             "Live short-horizon predictor",
             "(CPU or OpenVINO, auxiliary only)",
-            "and the strategy-utility R-GCN",
-            "running in shadow observation.",
+            "and strategy-utility R-GCN inside",
+            "the ontology mask + live trust gate.",
         ],
-        "models.* · routing.shadow_intelligence — advisory",
+        "models.* · routing.* — GNN selects; deterministic gates authorize orders",
     ),
 ]
 

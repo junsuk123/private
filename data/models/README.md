@@ -14,6 +14,34 @@ uses it is `app.trading.shared_decision_engine.SharedLiveDecisionEngine.evaluate
 - `live_short_horizon_demo/` — deterministic demo fixture (never live-eligible).
 - `realtime_supervised/`, `hypothetical_testing/` — offline supervised timing models
   and hypothetical PnL reports; **not** on the live buy/sell path.
+- `strategy_utility/rgcn_shadow.npz` + `.json` — despite the historical filename,
+  this is the live trust-gated 8-strategy ontology/GNN checkpoint. The JSON model
+  card records schema, coverage, checkpoint hash, and authorization scope.
+
+## Strategy-utility ontology/GNN authority
+
+The ontology and R-GCN form one pipeline:
+
+1. the closed-world ontology gate creates the admissible strategy mask;
+2. the R-GCN learns relation weights and conditional win/loss utility inside it;
+3. `GnnRealtimeTrustEvaluator` validates model calibration on forward live data;
+4. only strategies in `trusted_strategy_ids` can own a new live entry;
+5. profitability, risk, execution quality, and KIS gates remain authoritative.
+
+`live_authorized=true` in the model card means the checkpoint schema and training
+coverage are valid for the runtime. It does **not** mean every strategy can trade.
+Use `GET /api/gnn/realtime-trust` to distinguish `calibrated_strategy_ids` from
+entry-authorized `trusted_strategy_ids`.
+
+The current output expectation is:
+
+```text
+net_bps = P(win) * E[net win] - P(loss) * E[net loss]
+gross_bps = net_bps + expected all-in costs
+```
+
+Forward validation uses the first strategy target/stop reached within the strategy
+horizon, then subtracts the same all-in cost engine used by live execution.
 
 ## Provider tiers (what actually drives a decision)
 

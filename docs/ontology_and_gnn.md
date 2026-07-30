@@ -125,7 +125,7 @@ macro 루프는 느리게(기본 60초), micro는 빠르게(기본 5초) 돕니�
 
 ## 3. 전략 효용 GNN
 
-7개 전략 expert(`app.strategy.experts`) 각각에 대해 **종목 × 전략** 단위의 비용 조정 기대효용을 추정하는 fixed-shape temporal R-GCN입니다.
+8개 전략 expert(`app.strategy.experts`) 각각에 대해 **종목 × 전략** 단위의 제비용 차감 기대효용을 추정하는 fixed-shape strategy-utility R-GCN입니다. 온톨로지와 GNN은 별도 후보 시스템이 아니라 하나의 파이프라인입니다. 온톨로지가 관계·허용 집합을 정의하고 GNN이 데이터로 관계 가중치와 효용을 학습합니다.
 
 | 전략 ID | 논지 |
 | --- | --- |
@@ -136,6 +136,7 @@ macro 루프는 느리게(기본 60초), micro는 빠르게(기본 5초) 돕니�
 | `event_momentum` | 신선하고 검증된 중대 정보의 과소반응 |
 | `cross_sectional_relative_strength` | 공통 요인 제거 후 섹터 내 최강 종목 |
 | `gap_context` | 갭의 지속/메움을 촉매·확인·유동성으로 구분 (한쪽 서브모드만 선택) |
+| `rvgi_box_breakout` | 인과적 박스 돌파 + RVGI 교차 + 거래량 수용 + false-breakout 위험 통제 |
 
 ### 텐서 계약
 
@@ -146,7 +147,7 @@ node_mask    [B, T, N_max]
 strategy_mask[B, N_max, S]
 ```
 
-토폴로지 구성(스파스화, top-k 이웃, 엣지 히스테리시스)은 CPU에서 이뤄지고 모델 그래프 밖에 남습니다. 그래프는 바뀌어도 **텐서 rank/shape은 바뀌지 않습니다.** 런타임 shadow 체크포인트는 `B1 T1 N1 F12 R1 S7`, OpenVINO 벤치마크 형상은 `B1 T4 N16 F12 R4 S7`입니다.
+토폴로지 구성과 closed-world 마스크는 CPU에서 이뤄지고 모델 그래프 밖에 남습니다. 그래프 사실은 바뀌어도 **텐서 rank/shape은 바뀌지 않습니다.** 현재 체크포인트 계약은 `B1 T1 N8 F36 R3 S8`이며, 28개 causal context feature와 8개 strategy identity feature를 사용합니다.
 
 ### 순전파
 
@@ -161,51 +162,63 @@ raw = Z · strategy_heads            → [B, N, S, 8]
 ### 헤드와 효용
 
 ```text
-p_success  = sigmoid(raw0)          gross_bps = raw1 × 25
-cost_bps   = softplus(raw2) × 10    MAE_bps   = softplus(raw3) × 15
-MFE_bps    = softplus(raw4) × 20    p_fill    = sigmoid(raw5)
+p_success  = sigmoid(raw0)
+cost_bps   = softplus(raw2) × 10
+loss_bps   = softplus(raw3) × 15    # 실패 조건부 손실 크기
+win_bps    = softplus(raw4) × 20    # 성공 조건부 순이익 크기
+p_fill     = sigmoid(raw5)
 holding_s  = softplus(raw6) × 60    uncertainty = softplus(raw7)
 
-net       = gross_bps − cost_bps
-utility   = p_success·net − (1 − p_success)·MAE − uncertainty + 0.1·p_fill·MFE
+net_bps   = p_success·win_bps − (1 − p_success)·loss_bps
+gross_bps = cost_bps + net_bps
+utility   = net_bps − uncertainty + 0.1·p_fill·win_bps
 utility   = −∞  where (node_mask ∧ strategy_mask) = 0
 no_trade  = sigmoid(no_trade_head · Z),  마스킹된 노드는 1.0
 ```
 
-`NoTrade`는 오류나 결측 예측이 아니라 **일급 행동이자 학습 라벨**입니다.
+성공/실패 크기를 하나의 평균 gross 회귀로 뭉개지 않고 hurdle expectation으로 계산합니다. 희소한 수익 구간이 다수 손실 구간에 묻혀 모든 후보가 음수가 되던 문제를 피하되, 성공확률과 조건부 손익은 실현 데이터로 각각 검증합니다. `NoTrade`는 오류나 결측 예측이 아니라 **일급 행동이자 학습 라벨**입니다.
 
 ### 라우팅
 
-`app.routing.strategy_router.StrategyRouter`가 허용 전략 중 효용 최대를 고르고, 그렇지 않으면 `NO_TRADE`를 반환합니다. 출력은 `StrategyUtilityEvidence`로, ontology snapshot id·feature snapshot id·model version·explanation path를 포함합니다.
+`app.routing.strategy_router.StrategyRouter`가 허용 전략 중 실행 순효율 하한과 불확실성 제한을 통과한 효용 최대 전략을 고르고, 그렇지 않으면 `NO_TRADE`를 반환합니다. 출력은 `StrategyUtilityEvidence`로, ontology snapshot id·feature snapshot id·model version·explanation path를 포함합니다.
 
-`app.routing.orchestrator.StrategyOrchestrator`는 선택된 전략만 활성화하고, 열린 포지션이 있는 심볼에는 새 인스턴스를 만들지 않습니다(`OwnershipGuard`). 포지션은 진입부터 청산까지 `origin_strategy_id`/`strategy_instance_id`가 durable하게 소유합니다.
+`GnnRealtimeTrustEvaluator`는 권한을 둘로 나눕니다.
+
+- `calibrated_strategy_ids` — Brier score, 불확실성, 순효율 부호 정확도, MAE, 최소 표본을 통과한 모델 보정 상태
+- `trusted_strategy_ids` — 양수로 예측한 forward 표본이 최소 개수를 채우고, 실현 양수 비율과 평균 실현 순효율까지 통과한 신규 진입 권한
+
+검증은 전략별 20~60분 horizon을 사용하며, 마지막 가격만 비교하지 않고 실거래와 같은 목표가/손절가 중 먼저 도달한 가격을 청산가로 사용합니다. 동일 horizon 버킷에서는 최초의 실행 가능한 양수 예측을 보존하고, 양수 예측이 없으면 최초 음수 예측을 보정 표본으로 남깁니다.
+
+`StrategySessionManager`는 선택된 종목과 전략을 잠그고, 열린 포지션에는 새 소유자를 만들지 않습니다. 포지션은 진입부터 청산까지 `origin_strategy_id`/`strategy_instance_id`가 durable하게 소유합니다.
 
 ### Shadow 서비스
 
 `app.routing.shadow_intelligence.ShadowIntelligenceService`가 슬로우 경로를 묶습니다.
 
-1. 이벤트 파이프라인의 in-memory 상태에서 12차원 microstructure 스냅샷을 만듭니다 (`realtime_microstructure_v1`).
+1. 실시간 체결·호가·분봉에서 28차원 causal microstructure context를 만듭니다.
 2. `ClosedWorldOntologyGate`로 허용 전략을 계산합니다 (`data_fresh`, `tradable`, `allow:<strategy>` 요구).
 3. OpenVINO CPU(그리고 선택적으로 NPU)로 효용을 추론합니다.
-4. legacy / ontology-only / cpu_gnn / npu_gnn 판단을 `logs/refactor-shadow-comparison.jsonl`에 비교 기록합니다.
+4. 모든 허용 전략 예측은 forward 검증 후보로, legacy / ontology-only / cpu_gnn 판단은 비교 로그로 기록합니다.
+5. CPU GNN 모델 보정과 선택 전략의 실시간 진입 권한이 모두 통과하면 `StrategySessionManager`의 실거래 전략 소유권으로 연결합니다.
 
 체크포인트 provenance 검사가 fail-closed입니다. `input_feature_schema`가 현재 프레임 스키마와 다르거나 `live_authorized`가 아니면 `MODEL_INPUT_SCHEMA_MISMATCH` / `UTILITY_MODEL_NOT_LIVE_AUTHORIZED`로 `NO_TRADE`를 내고 모델 출력을 쓰지 않습니다.
 
-`app.data.event_runtime`은 이 서비스를 WebSocket 수집 루프에 붙이되, 별도 큐와 스레드에서 돌려 콜백을 막지 않습니다. `REFACTOR_ONTOLOGY_ROUTER` 또는 `REFACTOR_GNN_SHADOW`가 켜져 있을 때만 생성됩니다.
+`app.data.event_runtime`은 이 서비스를 WebSocket 수집 루프에 붙이되, 별도 큐와 스레드에서 돌려 콜백을 막지 않습니다. 비교 기록은 shadow라는 이름을 유지하지만, 신뢰도 통과 결과는 실거래 판단에 직접 사용됩니다.
 
 ### 현재 체크포인트 상태
 
 `data/models/strategy_utility/rgcn_shadow.json` 기준:
 
 ```text
-method              causal_feature_encoder_plus_ridge_calibrated_heads
-input_feature_schema realtime_microstructure_v1
-rows / snapshots     38,668 / 5,524   (7개 전략 각 5,524)
-config               B1 T1 N1 F12 R1 S7, hidden 16, seed 17
-authorization_scope  shadow_inference_only
+method               ontology_strategy_graph_rgcn_joint_gradient_calibration
+input_feature_schema realtime_strategy_graph_v4_market
+rows / snapshots     11,696 / 1,462   (8개 전략 각 1,462)
+config               B1 T1 N8 F36 R3 S8, hidden 16, seed 17
+authorization_scope  ontology_gnn_realtime_trust_gated_execution
+checkpoint_hash      9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dcef80b
 ```
 
-관측 전용입니다. 이 체크포인트는 주문 권한을 부여하지 않으며, 실거래 승격에는 [validation.md](validation.md)의 조건이 필요합니다.
+`live_authorized=true`는 체크포인트 형식과 학습 커버리지가 런타임 사용 요건을 만족한다는 뜻이지, 모든 전략에 주문 권한이 있다는 뜻은 아닙니다. 실제 진입 권한은 `/api/gnn/realtime-trust`의 `trusted_strategy_ids`가 전략별 실시간 성과를 통과할 때만 부여됩니다.
 
 ## 4. NPU / CPU 경계
 
@@ -219,7 +232,7 @@ authorization_scope  shadow_inference_only
 | conflict penalty | NPU + CPU fallback | 라벨은 CPU에 남음 |
 | short-horizon 예측 | NPU + CPU fallback | 단기 수익·순양수 확률·불확실성 |
 | execution edge 스코어링 | NPU + CPU fallback | 체결/슬리피지/역선택 배치 추정 |
-| strategy-utility R-GCN | OpenVINO CPU 검증 / NPU 미승격 | shadow 전용 |
+| strategy-utility R-GCN | OpenVINO CPU 실시간 판단·검증 / NPU 미승격 | 온톨로지 마스크 + 전략별 trust gate |
 | 그래프 탐색·설명 | CPU | 분기 많음, 설명 가능성 필수 |
 | 최종 행동 결정·브로커 실행 | CPU | 안전 임계 |
 
@@ -239,6 +252,10 @@ authorization_scope  shadow_inference_only
 | `SHORT_HORIZON_PREDICTOR_ENABLED` / `_DEVICE` | 선택적 short-horizon evidence provider |
 | `ONTOLOGY_GRAPH_SCOPE` | `candidate_only`, `candidate_and_holdings`, `full_debug` |
 | `REFACTOR_GNN_CHECKPOINT` | strategy-utility 체크포인트 경로 |
+| `GNN_TRUST_HORIZON_SECONDS` | 알 수 없는 전략의 기본 forward 검증 horizon (`run.ps1`: 1800초) |
+| `GNN_TRUST_MIN_SAMPLES_PER_STRATEGY` | 전략별 모델 보정 최소 표본 |
+| `GNN_TRUST_MIN_POSITIVE_PREDICTION_SAMPLES` | 전략 진입 권한에 필요한 양수 예측 최소 표본 |
+| `GNN_ROUTER_MIN_NET_EDGE_BPS` | GNN 전략 활성화 최소 순효율; 미지정 시 US 실거래 순효율 하한과 정렬 |
 
 ### Fallback 보고
 

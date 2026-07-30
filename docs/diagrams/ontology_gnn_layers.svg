@@ -76,7 +76,7 @@
   <text class="h" x="994" y="188">G0 · Fixed-shape tensor projection</text>
   <text class="t" x="994" y="211">X [B,T,N,F] · A [B,T,R,N,N] · node_mask [B,T,N] · strategy_mask [B,N,S]</text>
   <text class="t" x="994" y="230">Topology is built on CPU and stays outside the model graph.</text>
-  <text class="t" x="994" y="249">Shadow checkpoint B1 T1 N1 F12 R1 S7 · benchmark B1 T4 N16 F12 R4 S7</text>
+  <text class="t" x="994" y="249">Current checkpoint B1 T1 N8 F36 R3 S8 · ontology mask built on CPU</text>
   <text class="m" x="994" y="276">app.npu.tensor_schemas · routing.shadow_intelligence</text>
   <rect x="974" y="310" width="604" height="113" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
   <text class="h" x="994" y="342">G1 · Relational message passing (R-GCN)</text>
@@ -91,14 +91,14 @@
   <path class="flow" d="M1276,423 L1276,441"/>
   <rect x="974" y="566" width="604" height="113" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="1.8"/>
   <text class="h" x="994" y="598">G3 · Multi-task heads per stock × strategy</text>
-  <text class="t" x="994" y="621">p_success · gross_bps · cost_bps · MAE · MFE · p_fill · holding_s ·</text>
+  <text class="t" x="994" y="621">p_success · cost_bps · conditional loss/win · p_fill · holding_s ·</text>
   <text class="t" x="994" y="640">aleatoric uncertainty, plus a separate NoTrade head.</text>
-  <text class="m" x="994" y="667">8 head channels × 7 strategies</text>
+  <text class="m" x="994" y="667">8 head channels × 8 strategies</text>
   <path class="flow" d="M1276,544 L1276,562"/>
   <rect x="974" y="701" width="604" height="132" rx="12" fill="#fff7ed" stroke="#f97316" stroke-width="1.8"/>
   <text class="h" x="994" y="733">G4 · Cost-adjusted utility</text>
-  <text class="t" x="994" y="756">net = gross_bps − cost_bps</text>
-  <text class="t" x="994" y="775">U = p_success·net − (1−p_success)·MAE − uncertainty + 0.1·p_fill·MFE</text>
+  <text class="t" x="994" y="756">net = p_success·E[net win] − (1−p_success)·E[net loss]</text>
+  <text class="t" x="994" y="775">U = net − uncertainty + 0.1·p_fill·E[net win]</text>
   <text class="t" x="994" y="794">U = −∞ wherever the ontology mask or the node mask is 0.</text>
   <text class="m" x="994" y="821">rgcn.output_from_raw</text>
   <path class="flow" d="M1276,679 L1276,697"/>
@@ -112,7 +112,7 @@
   <text class="h" x="994" y="1022">Runtime and promotion status</text>
   <text class="t" x="994" y="1045">OpenVINO CPU is the verified runtime. NPU compiles without fallback but</text>
   <text class="t" x="994" y="1064">measured slower (p50 1.14 ms vs 0.33 ms) and outside the utility tolerance.</text>
-  <text class="t" x="994" y="1083">Shadow inference only: rgcn_shadow.npz is scope-limited, never order authority.</text>
+  <text class="t" x="994" y="1083">CPU GNN feeds strategy selection; per-strategy live forward trust grants entry.</text>
   <text class="m" x="994" y="1110">models.strategy_utility.openvino_runtime · routing.shadow_comparison</text>
   <path class="flow" d="M1276,968 L1276,986"/>
   <path class="dash" d="M860,893 C987,893 847,196 974,196"/>

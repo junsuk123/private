@@ -7,9 +7,9 @@
 | 문서 | 내용 |
 | --- | --- |
 | [architecture.md](architecture.md) | 런타임 진입점, 모듈 지도, 저장소 레이아웃, API 표면, 운영 모드, 가속 경계, 알려진 한계 |
-| [ontology_and_gnn.md](ontology_and_gnn.md) | 온톨로지 L0–L6 계층, RDF/OWL/SHACL 경계, closed-world 전략 게이트, 거시–미시 추론, strategy-utility R-GCN, NPU/CPU 분할 |
-| [decision_and_risk.md](decision_and_risk.md) | 어떤 데이터가 어떤 판단에 쓰이는지, ProfitabilityGate, DynamicExitPolicy, 사이징·리스크, 실행과 복구, 거부 사유 코드 |
-| [live_trading.md](live_trading.md) | 설치, 점검, 시작, 제출 게이트, 조용한 사이클 진단, 종료/비상 정지, arming, 런타임 프로파일, 로그 |
+| [ontology_and_gnn.md](ontology_and_gnn.md) | 온톨로지 L0–L6 계층, closed-world 전략 마스크, 8전략 R-GCN 조건부 기대값, 실시간 모델 보정과 전략별 진입 권한 |
+| [decision_and_risk.md](decision_and_risk.md) | 데이터→판단, gross/net 단위 계약, 제비용 게이트, 전략 소유권, 동적 청산, 리스크와 복구 |
+| [live_trading.md](live_trading.md) | 설치, 점검, 자동 신뢰도 전환, GNN trust 진단, 제출 게이트, 종료/비상 정지, 로그 |
 | [raspberry_pi_deployment.md](raspberry_pi_deployment.md) | Pi CPU-only 설치/실행/서비스/키오스크 |
 | [validation.md](validation.md) | 측정 결과, 벤치마크, 리플레이 지표, 승격 판정과 거부 사유 |
 
@@ -41,6 +41,6 @@ python scripts/gen_profitability_diagrams.py # profitability_* 4종
 ## 읽는 순서
 
 1. 처음이라면 [../README.md](../README.md) → [architecture.md](architecture.md)
-2. 왜 거래가 안 나가는지 알고 싶다면 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기" → [decision_and_risk.md](decision_and_risk.md)의 거부 사유 코드
+2. 왜 거래가 안 나가는지 알고 싶다면 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기" → `/api/gnn/realtime-trust` → [decision_and_risk.md](decision_and_risk.md)의 거부 사유 코드
 3. 추론 구조를 이해하려면 [ontology_and_gnn.md](ontology_and_gnn.md)
 4. 어떤 주장이 증거를 갖고 있는지 확인하려면 [validation.md](validation.md)

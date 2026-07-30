@@ -8,9 +8,10 @@
 | --- | --- | --- |
 | 순수익 게이트 / 동적 청산 리팩터 | 프로덕션 적용 | 아래 리플레이 지표, `tests/test_profitability_refactor_integration.py` |
 | 온톨로지 가속 (indexed graph + FactTable) | 프로덕션 적용, 동작 동일 | `scripts/benchmark_fact_table.py`, `tests/test_fact_table.py` |
-| 전략 소유 실행 경로 | 구현 완료, live 미연결 | `config/refactor_profile.json` = `shadow`, `broker_submission_enabled=false` |
-| 이벤트 시뮬레이터 + counterfactual 라벨 | 구현 완료, 성능 승격 거부 | `data/reports/refactor_counterfactual_evaluation.json` |
-| strategy-utility R-GCN | shadow 추론 전용 | `data/models/strategy_utility/rgcn_shadow.json`, `authorization_scope=shadow_inference_only` |
+| 전략 소유 실행 경로 | live 연결, 모든 게이트 필수 | `StrategySessionManager`, causal journal, `tests/test_strategy_session.py` |
+| 이벤트 시뮬레이터 + counterfactual 라벨 | 학습 적용, 표본 품질 필터 활성 | 연속 시계열·활동성·미래봉 검사, 전략별 목표/손절 |
+| strategy-utility R-GCN | CPU live trust-gated 실행 | `authorization_scope=ontology_gnn_realtime_trust_gated_execution` |
+| GNN 실시간 진입 권한 | 전략별 조건부 | `/api/gnn/realtime-trust`의 `trusted_strategy_ids`; 모델 보정과 진입 권한 분리 |
 | NPU 추론 | 컴파일 성공, **승격 거부** | `data/reports/strategy_utility_openvino.json`, `promotion_eligible=false` |
 | legacy vs ontology vs tabular vs R-GCN 비교 | **미완** | 필요한 point-in-time 데이터 부재 |
 
@@ -90,7 +91,7 @@ python scripts/benchmark_realtime_pipeline.py --device CPU --output data/reports
 .\.venv\Scripts\python.exe scripts\benchmark_strategy_utility_openvino.py --iterations 30
 ```
 
-고정 형상 `B=1, T=4, N=16, F=12, R=4, S=7`, FP32, 30 iterations.
+아래 값은 이전 `S=7` 체크포인트로 수행한 **역사적 NPU 승격 실험**입니다. 현재 `B1 T1 N8 F36 R3 S8` live 체크포인트의 NPU 승격 근거로 재사용하지 않습니다. 당시 고정 형상은 `B=1, T=4, N=16, F=12, R=4, S=7`, FP32, 30 iterations였습니다.
 
 | device | 실제 컴파일 장치 | compile ms | p50 ms | p95 ms | p99 ms | throughput/s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -115,47 +116,47 @@ python scripts/build_refactor_counterfactual_report.py
 
 `data/store/realtime_market_data.sqlite3`를 평가해 `data/reports/refactor_counterfactual_evaluation.json`에 재현 가능한 결과를 씁니다.
 
-**커버리지** (2026-06-29 ~ 2026-07-27):
+현재 학습 모델 카드 기준:
 
 ```text
-bars 27,884 · symbols 429 · distinct UTC dates 12 · 100봉 이상 symbols 22
-snapshots 4,991 · strategy labels 34,937
-configuration: US / NASD / overseas_stock, history 30봉, horizon 15봉, stride 5봉
+snapshots 1,462 · strategy labels 11,696 · 8개 전략
+configuration: history 30봉, horizon 60봉, stride 5봉
+markets: 심볼에서 KRX/US 실행 비용 정책을 구분
 ```
 
-**누수 통제:** rolling quantile은 직전 slice만 사용, feature cutoff가 라벨 구간에 선행, purging과 embargo 활성, walk-forward split 2개.
+**누수·표본 품질 통제:** rolling quantile은 직전 slice만 사용, feature cutoff가 라벨 구간에 선행, purging과 embargo 활성. 120초보다 큰 봉 간격, 활동성이 10% 미만인 history, 연속 미래봉 5개 미만인 표본은 제외합니다. 전략이 실제로 발화하지 않은 상태는 분류 음성 표본으로만 쓰고 가상 체결 손실로 회귀 헤드에 넣지 않습니다.
 
-**전략별 결과** (triggered 기준 체결):
+**전략별 결과** (`rgcn_shadow.json`, triggered 기준 체결):
 
-| 전략 | triggered | filled | fill rate | 평균 net bps | positive net rate |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| liquidity_shock_reversal | 3,768 | 3,617 | 0.960 | −72.23 | 0.0 |
-| intraday_momentum | 3,059 | 2,913 | 0.952 | −72.20 | 0.0 |
-| breakout_volume | 2,654 | 2,559 | 0.964 | −71.47 | 0.0 |
-| vwap_mean_reversion | 199 | 153 | 0.769 | −72.73 | 0.0 |
-| cross_sectional_relative_strength | 0 | — | — | — | — |
-| event_momentum | 0 | — | — | — | — |
-| gap_context | 0 | — | — | — | — |
+| 전략 | triggered | filled | 평균 net bps | positive net rate |
+| --- | ---: | ---: | ---: | ---: |
+| intraday_momentum | 337 | 295 | −62.84 | 5.42% |
+| breakout_volume | 216 | 187 | −66.89 | 4.81% |
+| vwap_mean_reversion | 53 | 44 | −54.56 | 6.82% |
+| liquidity_shock_reversal | 232 | 211 | −62.84 | 2.84% |
+| rvgi_box_breakout | 5 | 5 | −101.86 | 0.0% |
+| event_momentum | 0 | 0 | — | — |
+| cross_sectional_relative_strength | 0 | 0 | — | — |
+| gap_context | 0 | 0 | — | — |
 
-**Tabular walk-forward baseline:** 학습 구간 전략 평균으로 양(+)의 기대 순효용만 선택하는 정책은 1,996개 test 관측에서 **0건**을 선택했습니다. 즉 일급 `NoTrade`를 올바르게 반환했습니다.
+전체 trigger 평균이 음수라는 사실은 모델을 무조건 막는 단일 판정이 아닙니다. GNN은 point-in-time feature에서 희소한 양수 하위 구간을 학습하되, 그 양수 예측은 다시 실시간 forward 결과로 검증합니다. 현재 VWAP 필터에 거래량·유동성 확인을 추가하면서 체결 표본은 90개에서 44개로 줄고 양수 비율은 약 3.3%에서 6.8%로 개선됐습니다.
 
 **필수 시스템 비교 상태:**
 
 ```text
-legacy            UNAVAILABLE  (해당 스냅샷에 대한 legacy 판단이 저널링되지 않음)
-ontology_only     NoTrade      (필수 event/sector/session 사실이 fail-closed)
-tabular_baseline  평가됨
-temporal_rgcn_cpu UNAVAILABLE_UNTRAINED
-temporal_rgcn_npu UNAVAILABLE_UNTRAINED_AND_NPU_BENCHMARK_REJECTED
+legacy            비교 기록
+ontology_only     closed-world 허용/차단
+strategy_rgcn_cpu 실시간 판단 + 전략별 trust gate
+strategy_rgcn_npu 미승격, CPU fallback
 ```
 
 **한계 (리포트에 명시됨):**
 
 - 로컬 분봉 스토어가 소수 US 세션에 집중되어 있고, 목표 시장인 KRX/NXT가 아닙니다.
 - 분봉 OHLC로는 tick 수준 큐 포지션이나 봉 내부 barrier 순서를 복원할 수 없습니다.
-- point-in-time 이벤트, 섹터 그래프, 권위 있는 세션 캘린더, 과거 legacy 판단이 없어 7개 전략 전체 비교가 불가능합니다.
+- point-in-time 이벤트, 섹터 그래프, 권위 있는 세션 캘린더, 과거 legacy 판단이 없어 8개 전략 전체 비교가 불가능합니다.
 
-`promotion_eligible=false`, `status=NOT_PROMOTED`. 리포트는 label-data / configuration / evaluation-code SHA-256 해시를 포함합니다. 유리해 보이는 합성 PnL을 만드는 것으로는 이 게이트를 통과할 수 없습니다.
+오프라인 모델 카드의 `live_authorized=true`와 전략별 실거래 권한은 다릅니다. 전자는 스키마·커버리지·체크포인트 검사를 뜻하고, 후자는 실시간 검증의 `trusted_strategy_ids`로만 부여됩니다.
 
 ## 7. Strategy-utility 모델 카드
 
@@ -166,21 +167,22 @@ python scripts/train_strategy_utility_rgcn.py
 `data/models/strategy_utility/rgcn_shadow.json` 현재 상태:
 
 ```text
-method                causal_feature_encoder_plus_ridge_calibrated_heads
-input_feature_schema  realtime_microstructure_v1
+method                ontology_strategy_graph_rgcn_joint_gradient_calibration
+input_feature_schema  realtime_strategy_graph_v4_market
 feature_provenance    causal_minute_bar_microstructure_proxy_v1
-rows                  38,668        snapshots 5,524
-strategies            7개 각 5,524
-config                B1 T1 N1 F12 R1 S7, hidden 16, seed 17
-authorization_scope   shadow_inference_only
+rows                  11,696        snapshots 1,462
+strategies            8개 각 1,462
+config                B1 T1 N8 F36 R3 S8, hidden 16, seed 17
+authorization_scope   ontology_gnn_realtime_trust_gated_execution
+checkpoint_hash       9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dcef80b
 authorization_checks  row/snapshot/strategy 커버리지 및 런타임 스키마 일치 통과
 ```
 
 런타임 그래프 연산은 고정 Gather, MatMul, Add, ReLU, Multiply, Concat, Squeeze입니다. 동적 sparse/scatter 연산은 없습니다. 하드 온톨로지 마스크는 학습 그래프 **밖에서** 적용되며 모델이 덮어쓸 수 없습니다.
 
-출력은 종목×전략별 success, gross return, cost, MAE, MFE, fill probability, holding time, uncertainty, utility, NoTrade probability입니다.
+출력은 종목×전략별 success, 제비용, 실패 조건부 손실, 성공 조건부 순이익, fill probability, holding time, uncertainty, utility, NoTrade probability입니다. 순효율은 `P(win)×E(net win) − P(loss)×E(net loss)`로 계산합니다.
 
-**out-of-sample alpha, 교정 품질, tabular baseline 대비 우월성은 주장하지 않습니다.** 실거래 승격에 여전히 필요한 것: 대표성 있는 KRX/NXT 커버리지, calibration curve, regime/symbol별 결과, block-bootstrap 신뢰구간, 다중검정 보정(Deflated Sharpe 또는 동등물).
+체크포인트는 모델 보정 신뢰도만으로 주문하지 않습니다. `GnnRealtimeTrustEvaluator`가 전략별 최소 표본, Brier score, 불확실성, 순효율 부호 정확도, MAE를 먼저 검증하고, 양수 예측 표본의 실현 양수 비율과 평균 순효율까지 통과한 전략에만 `entry_authorized=true`를 부여합니다.
 
 체크포인트 provenance는 런타임에서 fail-closed입니다. `input_feature_schema`가 현재 프레임과 다르거나 `live_authorized`가 아니면 shadow 서비스가 `MODEL_INPUT_SCHEMA_MISMATCH` / `UTILITY_MODEL_NOT_LIVE_AUTHORIZED`로 `NO_TRADE`를 내고 출력을 쓰지 않습니다.
 
@@ -209,7 +211,7 @@ authorization_checks  row/snapshot/strategy 커버리지 및 런타임 스키마
 ## 10. 테스트 표면
 
 ```powershell
-python -m pytest              # 949 tests collected
+python -m pytest
 ```
 
 `live` 주문을 제출하는 테스트는 없습니다. 모든 broker E2E는 mock, 기록된 이벤트, broker 시뮬레이션을 씁니다. 남아 있는 deprecation 경고는 기존 FastAPI `on_event`와 RDFLib `default_context` 관련입니다.
@@ -221,10 +223,11 @@ python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py te
 python -m pytest tests/test_refactor_contracts.py tests/test_causal_order_journal.py tests/test_refactor_flags.py
 ```
 
-## 11. 승격하지 않은 것 (명시)
+## 11. 아직 승격하지 않은 것 (명시)
 
-- `REFACTOR_LIVE_ENABLED`, `strategy_owned_execution`, `gnn_rerank`, `npu_inference`는 비활성입니다.
-- legacy 프로덕션 경로는 shadow/paper 수용 증거가 생길 때까지 유지됩니다. legacy 은퇴를 주장하지 않습니다.
-- 새 historical/paper 증거 없이 canary/live를 켜는 것은 이 문서의 운영 규칙 위반입니다.
+- strategy-utility NPU 추론은 CPU 대비 지연과 golden tolerance 문제로 미승격입니다.
+- 이벤트 모멘텀·횡단면 상대강도·갭 전략은 필요한 point-in-time 사실이 없으면 closed-world로 차단됩니다.
+- `calibrated_strategy_ids`에 있다는 사실만으로 실거래 진입 권한을 주지 않습니다.
+- 대표성 있는 시장·regime별 out-of-sample alpha와 다중검정 보정 우월성은 아직 주장하지 않습니다.
 
-이것들은 구현 누락이 아니라 **승격 판정 결과**입니다.
+CPU GNN은 실시간 판단에 연결되어 있지만, 각 전략의 신규 진입 권한은 live forward 증거에 따라 자동으로 부여되거나 회수됩니다.
