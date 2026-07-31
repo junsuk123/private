@@ -1373,8 +1373,16 @@ class RealtimeModesTest(unittest.TestCase):
             ):
                 symbols = web_module._kis_realtime_collector_symbols()
 
-            self.assertEqual(symbols[:5], ("006880", "279570", "232680", "012210", "005930"))
-            self.assertIn("279570", symbols)
+            # A HELD position must always come first: without a live feed it cannot
+            # be priced to exit, so it outranks every research subscription.
+            self.assertEqual(symbols[0], "006880")
+            # Session anchors sit above the rotating pool (they must survive the
+            # 300s rotation for session-structure strategies) but below held names.
+            self.assertIn("005930", symbols)
+            # Context / affordable KRX candidates are still subscribed.
+            for expected in ("279570", "232680", "012210"):
+                self.assertIn(expected, symbols)
+            # The domestic websocket speaks domestic TR_IDs only.
             self.assertNotIn("AAPL", symbols)
             self.assertNotIn("MSFT", symbols)
         finally:
@@ -2365,6 +2373,55 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(connection["cash_by_currency"]["USD"], 0.49)
         self.assertAlmostEqual(connection["positions"][0]["market_value_krw"], 1565.0, delta=5.0)
         self.assertLess(connection["invested_value"], 5000.0)
+
+    def test_live_probe_reconciles_orderable_krw_with_kis_authority(self) -> None:
+        class FakeKisClient:
+            class Endpoints:
+                base_url = "https://openapi.koreainvestment.com:9443"
+
+            class Credentials:
+                account_no = "12345678"
+
+            endpoints = Endpoints()
+            credentials = Credentials()
+            token_source = "cache"
+
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def issue_access_token(self) -> str:
+                return "token"
+
+            def get_portfolio(self):
+                return SimpleNamespace(
+                    account=AccountSnapshot(
+                        cash=0.0,
+                        holdings=(),
+                        cash_by_currency={"KRW": 0.0, "USD": 67.57},
+                        orderable_cash_by_currency={"KRW": 0.0, "USD": 67.57},
+                        cash_equivalent_krw=197_377.0,
+                    )
+                )
+
+            def _get_domestic_orderable_cash(self) -> float:
+                return 99_504.0
+
+        with (
+            patch("app.web.KisDevelopersApiClient", FakeKisClient),
+            patch("app.web.audit.record") as record,
+        ):
+            connection = web_module._kis_connection_probe(paper=False, include_account=True)
+
+        self.assertEqual(connection["orderable_cash_by_currency"]["KRW"], 99_504.0)
+        self.assertTrue(connection["orderable_cash_reconciliation"]["mismatch"])
+        self.assertEqual(
+            connection["orderable_cash_reconciliation"]["authoritative_krw"],
+            99_504.0,
+        )
+        record.assert_any_call(
+            "kis_orderable_cash_mismatch",
+            connection["orderable_cash_reconciliation"],
+        )
 
     def test_live_execution_reports_market_closed_when_no_trading_session_is_open(self) -> None:
         context = SimpleNamespace(

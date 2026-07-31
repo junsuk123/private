@@ -100,6 +100,12 @@ class TechnicalFeatureSet:
     spread_bps: float | None = None
     orderbook_imbalance: float | None = None
     expected_slippage_bps: float | None = None
+    # Book depth. Present in the live feature frame all along but never mapped
+    # through, so no strategy could see whether the bid side was being replenished
+    # or the ask side depleted.
+    bid_depth: float | None = None
+    ask_depth: float | None = None
+    depth_ratio: float | None = None
     # Tick / sub-second window (live feed only; ``None`` for bar-only callers).
     # These are what the mechanical entry triggers in
     # ``app.technical.strategy_algorithms`` actually fire on — the bar columns
@@ -121,6 +127,47 @@ class TechnicalFeatureSet:
     def tick_data_ready(self) -> bool:
         """True when the sub-second window is populated enough to trigger on."""
         return bool(self.second_data_ready and self.second_data_ready >= 1.0)
+
+    @property
+    def microprice_edge_bps(self) -> float | None:
+        """Depth-weighted microprice minus mid, in bps. ``None`` when unknown.
+
+        For a two-sided book the size-weighted microprice satisfies
+
+            microprice - mid = (spread / 2) * (bid_size - ask_size)/(bid_size + ask_size)
+
+        and ``orderbook_imbalance`` is exactly that depth ratio, so this is an
+        identity rather than an approximation — except that the imbalance is
+        computed over ALL book levels, making this a depth-weighted microprice
+        tilt rather than the strict best-bid/best-ask microprice. Positive means
+        the book leans bid, i.e. the fair price sits above the mid.
+        """
+        if self.spread_bps is None or self.orderbook_imbalance is None:
+            return None
+        if self.spread_bps < 0:
+            return None
+        return 0.5 * float(self.spread_bps) * float(self.orderbook_imbalance)
+
+    @property
+    def residual_volatility_bps(self) -> float | None:
+        """Best available per-observation volatility in bps, for normalisation."""
+        for candidate in (self.realized_volatility, self.realized_volatility_10s):
+            if candidate is not None and candidate > 0:
+                return float(candidate) * 10_000.0
+        return None
+
+    @property
+    def vwap_zscore(self) -> float | None:
+        """VWAP displacement normalised by intraday volatility.
+
+        A fixed 25bps VWAP band is noise in a tape moving 4-10% a day and a wall
+        in a quiet one. Dividing the displacement by realised volatility makes the
+        same threshold mean the same thing in both.
+        """
+        volatility_bps = self.residual_volatility_bps
+        if self.vwap_distance_bps is None or not volatility_bps:
+            return None
+        return float(self.vwap_distance_bps) / volatility_bps
 
     def to_regime_input(self) -> RegimeInput:
         return RegimeInput(

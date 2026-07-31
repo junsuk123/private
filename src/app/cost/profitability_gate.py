@@ -39,6 +39,12 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from app.cost.cost_coverage import (
+    REASON_COST_COVERAGE_INSUFFICIENT,
+    CostCoverageAssessment,
+    CostCoverageThresholds,
+    evaluate_cost_coverage,
+)
 from app.cost.trading_cost_engine import CostBreakdown, TradingCostEngine
 
 logger = logging.getLogger(__name__)
@@ -57,6 +63,8 @@ REASON_SPREAD_ALPHA = "SPREAD_CONSUMES_ALPHA"
 REASON_LIQUIDITY = "LIQUIDITY_TOO_LOW"
 REASON_SLIPPAGE = "SLIPPAGE_RISK_HIGH"
 REASON_INVALID = "INVALID_ORDER_SIZE_OR_PRICE"
+REASON_COST_COVERAGE = REASON_COST_COVERAGE_INSUFFICIENT
+REASON_COST_COVERAGE_THIN_WARNING = "COST_COVERAGE_THIN"
 
 
 DEFAULT_PROFITABILITY_POLICY: dict[str, Any] = {
@@ -69,6 +77,13 @@ DEFAULT_PROFITABILITY_POLICY: dict[str, Any] = {
     "max_slippage_rate": 0.003,        # expected entry slippage as a fraction of notional
     "max_spread_alpha_ratio": 0.35,    # spread may not eat > this fraction of gross alpha
     "max_cost_to_alpha_ratio": 0.5,
+    # Predicted gross edge must be at least this multiple of the all-in cost.
+    # The built-in default (1.0 == "edge merely covers cost") is deliberately the
+    # permissive end so that omitting the key changes no behaviour; the live
+    # policy in config/profitability_policy.yaml raises it into the band where
+    # the margin actually survives estimation error.
+    "min_cost_coverage_ratio": 1.0,
+    "cost_coverage": {"covered": 1.0, "live": 1.3, "comfortable": 1.7},
     "min_liquidity_score": 0.3,
     # Dynamic required-net-return buffers.
     "volatility_buffer_k": 0.5,        # required += k * realized_volatility_horizon
@@ -95,6 +110,10 @@ class ProfitabilityPolicy:
     liquidity_buffer_max: float
     small_account_equity_krw: float
     small_account_extra_net: float
+    min_cost_coverage_ratio: float = 1.0
+    cost_coverage_thresholds: CostCoverageThresholds = field(
+        default_factory=CostCoverageThresholds
+    )
 
     def min_net_for_market(self, market: str) -> float:
         key = _market_key(market)
@@ -178,6 +197,8 @@ class ProfitabilityDecision:
     data_quality_flags: tuple[str, ...] = ()
     breakdown: ProfitabilityBreakdown | None = None
     policy_version: str = ""
+    cost_coverage_ratio: float | None = None
+    cost_coverage_band: str = "UNKNOWN"
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -197,6 +218,8 @@ class ProfitabilityDecision:
             "market_impact_rate": self.market_impact_rate,
             "liquidity_score": self.liquidity_score,
             "cost_to_alpha_ratio": self.cost_to_alpha_ratio,
+            "cost_coverage_ratio": self.cost_coverage_ratio,
+            "cost_coverage_band": self.cost_coverage_band,
             "rejection_reasons": list(self.rejection_reasons),
             "warnings": list(self.warnings),
             "data_quality_flags": list(self.data_quality_flags),
@@ -327,6 +350,21 @@ class ProfitabilityGate:
         # 3. Cost must not dominate the alpha.
         if cost.cost_to_alpha_ratio > self.policy.max_cost_to_alpha_ratio + _EPSILON:
             reasons.append(REASON_COST_BURDEN)
+        # 3b. Same question, stated as coverage, with an explicit safety margin:
+        #     the predicted gross edge must be a MULTIPLE of the all-in cost, not
+        #     merely equal to it. Both terms are estimates; equality is a loss.
+        coverage = evaluate_cost_coverage(
+            cost.gross_expected_return * 10_000.0,
+            cost.total_cost_rate * 10_000.0,
+            thresholds=self.policy.cost_coverage_thresholds,
+        )
+        if (
+            coverage.ratio is not None
+            and coverage.ratio < self.policy.min_cost_coverage_ratio - _EPSILON
+        ):
+            reasons.append(REASON_COST_COVERAGE)
+        elif coverage.shadow_only:
+            warnings.append(REASON_COST_COVERAGE_THIN_WARNING)
         # 4. Absolute spread ceiling.
         if spread_rate > self.policy.max_spread_rate + _EPSILON:
             reasons.append(REASON_SPREAD)
@@ -383,6 +421,24 @@ class ProfitabilityGate:
             warnings=tuple(dict.fromkeys(warnings)),
             data_quality_flags=tuple(dict.fromkeys(flags)),
             breakdown=breakdown,
+            cost_coverage_ratio=coverage.ratio,
+            cost_coverage_band=coverage.band.value,
+        )
+
+    def assess_cost_coverage(
+        self,
+        predicted_gross_edge_bps: float | None,
+        expected_all_in_cost_bps: float | None,
+    ) -> CostCoverageAssessment:
+        """Coverage verdict for callers that have bps figures but no full order.
+
+        Used by the strategy election path, which must decide whether an edge is
+        worth arming before an order exists.
+        """
+        return evaluate_cost_coverage(
+            predicted_gross_edge_bps,
+            expected_all_in_cost_bps,
+            thresholds=self.policy.cost_coverage_thresholds,
         )
 
     # -- helpers ------------------------------------------------------------------
@@ -499,6 +555,11 @@ def load_policy(config_path: Path | str = "config/profitability_policy.yaml") ->
     min_net.setdefault("default", min_net.get("KR", 0.008))
 
     account = merged.get("account_buffer", {}) or {}
+    coverage_thresholds = CostCoverageThresholds.from_env(merged.get("cost_coverage") or {})
+    min_coverage = _env_float(
+        "REALTIME_MIN_COST_COVERAGE_RATIO",
+        float(merged.get("min_cost_coverage_ratio", 1.0)),
+    )
     policy = ProfitabilityPolicy(
         min_required_net_return={k: float(v) for k, v in min_net.items()},
         min_net_profit_buffer_rate=_env_float(
@@ -515,6 +576,8 @@ def load_policy(config_path: Path | str = "config/profitability_policy.yaml") ->
         small_account_extra_net=_env_float(
             "REALTIME_SMALL_ACCOUNT_EXTRA_NET", float(account.get("small_account_extra_net", 0.002))
         ),
+        min_cost_coverage_ratio=max(0.0, min_coverage),
+        cost_coverage_thresholds=coverage_thresholds,
     )
     if not _POLICY_LOGGED:
         logger.info("ProfitabilityGate resolved policy: %s", policy.as_dict())

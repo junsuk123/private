@@ -10,9 +10,33 @@ macro:
   loop_interval_seconds: 60          # macro regime changes slower than tick timing
   candidate_limit: 30
   minimum_macro_confidence: 0.5
-  block_buy_on_high_volatility: true
   block_buy_on_news_shock: true
   block_buy_on_low_liquidity_market: true
+  # Applies only when the sub-regime classifier cannot tell WHICH kind of high
+  # volatility this is (HIGH_VOLATILITY_RISK). The four classified sub-regimes
+  # carry their own permissions below.
+  block_buy_on_high_volatility: true
+
+  # --- High-volatility sub-regime classification --------------------------------
+  # A single HIGH_VOLATILITY_RISK state banned every new buy on every violent day,
+  # which in July 2026 meant the system was structurally unable to trade the only
+  # sessions that had any range. Volatility magnitude says HOW MUCH the market is
+  # moving; these thresholds say WHY, which is what decides whether a long thesis
+  # can still be valid. Set classify_high_volatility_subregimes: false to restore
+  # the previous single-state behaviour.
+  classify_high_volatility_subregimes: true
+  high_vol_trend_threshold: 0.004      # |index trend| above this == directional
+  high_vol_weak_breadth: 0.35          # one-sided down tape
+  high_vol_recovery_breadth: 0.55      # broad participation
+  # Any ONE of these makes the market DISLOCATED (blanket buy block): the book has
+  # stopped functioning, or a structural break has been detected, so no measured
+  # edge can be assumed to survive.
+  dislocation_spread_percentile: 0.9
+  dislocation_correlation: 0.85        # everything trading as one name
+  dislocation_change_point_probability: 0.5
+  block_buy_on_change_point: true
+  foreign_outflow_zscore: -1.5
+  foreign_recovery_zscore: 0.0
 
 micro:
   enabled: true
@@ -35,9 +59,28 @@ strategy_permissions:
   RANGE_BOUND:
     allow: [mean_reversion, vwap_reversion]
     block: [late_breakout_chasing]
+  # Unclassifiable high volatility keeps the blanket ban.
   HIGH_VOLATILITY_RISK:
     allow: [sell, reduce_risk, hold]
     block: [new_buy]
+  # Violent but directional: relative strength and confirmed momentum can still be
+  # valid; buying dips into a one-sided move cannot.
+  HIGH_VOL_TRENDING:
+    allow: [sell, reduce_risk, hold, relative_strength, momentum]
+    block: [mean_reversion, vwap_reversion, aggressive_countertrend_reversion, late_breakout_chasing]
+  # Violent overshoot with a functioning book: normalised reversion belongs here,
+  # momentum does not (it buys the top of the bounce).
+  HIGH_VOL_MEAN_REVERTING:
+    allow: [sell, reduce_risk, hold, mean_reversion, vwap_reversion]
+    block: [momentum, breakout, late_breakout_chasing]
+  # The market itself is impaired. This is the honest NO_TRADE.
+  HIGH_VOL_DISLOCATED:
+    allow: [sell, reduce_risk, hold]
+    block: [new_buy]
+  # Index bouncing with widening participation and flow no longer bleeding.
+  HIGH_VOL_RECOVERY:
+    allow: [sell, reduce_risk, hold, relative_strength, vwap_reversion, mean_reversion]
+    block: [late_breakout_chasing, low_volume_momentum_buy]
 
 diagnostics:
   persist_macro_micro_snapshots: true

@@ -16,6 +16,28 @@
 # spread) is roughly 25-30 bps, so any strategy whose expected edge sits below
 # that will be — correctly — rejected downstream by the ProfitabilityGate.
 
+# Market intraday momentum: 하루 1회 왕복. KRX 왕복비용 27.8bps 중 20bps가 법정
+# 거래세이고 이는 왕복마다 부과되므로, 전략의 왕복 횟수가 엣지만큼 중요하다.
+# 변동성 게이트는 논문의 최강 조건이면서 동시에 비용 조건이다 — 조용한 날의
+# 마지막 30분은 33bps를 움직이지 않는다. 15:20 종가 단일가 전에 반드시 청산.
+market_intraday_momentum:
+  min_first_half_hour_return_bps: 15.0
+  min_first_half_hour_volatility_percentile: 0.6
+  max_change_point_probability: 0.5
+  trailing_bps: 30.0
+  horizon_seconds: 1500.0
+
+# Opening-range breakout, restricted to stocks in play by relative volume.
+# The RVOL gate carries the published edge; loosening it below ~1.5 turns this
+# into the unrestricted breakout, which the same research finds unprofitable.
+opening_range_breakout:
+  min_relative_volume: 1.5
+  min_breakout_excess_bps: 3.0
+  min_aggressor_imbalance: 0.05
+  stop_buffer_bps: 8.0
+  trailing_bps: 30.0
+  horizon_seconds: 7200.0
+
 shared:
   # Fraction of the volatility-implied move we expect to actually capture.
   # Never raise above 1.0; there is deliberately no fabricated alpha floor.
@@ -117,3 +139,74 @@ rvgi_box_breakout:
   failure_tolerance_bps: 12.0
   trailing_bps: 15.0
   horizon_seconds: 300
+
+# --- Added for the current high-volatility, flow-driven tape -----------------
+# All three start with live_authorized: false. They run in shadow so the strategy
+# performance store accumulates per-regime realized outcomes; the conservative
+# bandit cannot give an arm a positive lower bound without those samples, so
+# flipping live_authorized early would only produce a NO_TRADE anyway.
+
+# Market/sector-neutral leadership. Requires residual returns and an investor-flow
+# z-score from the electing layer; without them it fails closed rather than
+# reverting to raw return (which is what made the non-residual version a market
+# beta ranking in an index-dominated tape).
+residual_relative_strength:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  min_residual_short_bps: 5.0
+  min_residual_long_bps: 0.0
+  max_sector_rank: 3.0
+  min_relative_volume: 1.2
+  min_aggressor_imbalance: 0.05
+  min_microprice_edge_bps: 0.0
+  require_flow_confirmation: true
+  min_flow_zscore: 0.0
+  max_change_point_probability: 0.5
+  horizon_seconds: 420.0
+  stop_volatility_multiple: 2.0
+  trailing_bps: 20.0
+
+# VWAP reversion on a volatility-normalised z-score instead of a fixed 25bps band,
+# with an upper z bound: past it the move is a repricing, not a displacement, and
+# there is no mean left to revert to.
+adaptive_anchored_vwap_reversion:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  min_entry_zscore: 2.0
+  max_entry_zscore: 6.0
+  min_displacement_bps: 15.0
+  max_spread_change_5s: 0.0
+  min_microprice_edge_bps: 0.0
+  max_change_point_probability: 0.4
+  target_capture_fraction: 0.6
+  max_target_bps: 150.0
+  stop_zscore_multiple: 1.5
+  trailing_bps: 16.0
+  horizon_seconds: 300.0
+
+# Exhaustion reversal triggered by the BOOK turning (OFI slope, depth recovery,
+# microprice above mid), not by the price having fallen. Shortest holding window
+# in the catalogue: either liquidity returns within minutes or it was not
+# exhaustion.
+ofi_microprice_exhaustion_reversal:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  shock_return_10s_bps: -35.0
+  min_depth_ratio: 1.1
+  min_orderbook_imbalance: 0.05
+  min_ofi_slope: 0.0
+  min_microprice_edge_bps: 0.2
+  max_spread_change_5s: 0.0
+  min_aggressor_imbalance: -0.25
+  max_flow_toxicity: 0.7
+  max_change_point_probability: 0.4
+  retrace_fraction: 0.35
+  stop_buffer_bps: 6.0
+  trailing_bps: 14.0
+  horizon_seconds: 150.0

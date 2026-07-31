@@ -104,7 +104,20 @@ BUY보다 먼저 평가됩니다. 승인 경로: 비용 차감 후 이익 목표
 
 ## 5. 조용한 사이클 읽기
 
-조용한 사이클이 곧 고장은 아닙니다. `/api/realtime-trading/status`를 보세요.
+**먼저 `/account` 상단 ENTRY BLOCKADE 패널을 보세요** (또는 `GET /api/realtime-trading/entry-blockade`).
+아래의 사유 코드 표는 개별 계층의 어휘이고, 그 코드 하나만으로는 원인을 잘못 짚기 쉽습니다.
+실제로 2026-07-30에 11,614 사이클 · 체결 0건이었을 때 표시된 사유는 `NO_POSITIVE_NET_GNN_EDGE`
+였지만, 진짜 원인은 **스캔 대상 시장이 정규장이 아니었던 것**이었습니다
+([decision_and_risk.md](decision_and_risk.md) §10).
+
+```text
+엔진 실행 → 라이브 무장 → 시장 세션 → 매수 후보 → 마이크로 전략 → 전략 선택 → 포지션
+```
+
+처음 막힌 단계가 답이며, 그 뒤 단계는 "실패"가 아니라 "도달하지 않음"입니다. 여러 단계가 동시에
+막혀 있을 수 있으므로, 앞 단계를 고친 뒤 다시 확인해야 다음 원인이 드러납니다.
+
+그다음 `/api/realtime-trading/status`의 계층별 사유 코드를 보세요.
 
 | 신호 | 의미 |
 | --- | --- |
@@ -115,7 +128,11 @@ BUY보다 먼저 평가됩니다. 승인 경로: 비용 차감 후 이익 목표
 | `LOW_LIQUIDITY` | 후보 유동성 부족 |
 | `FALLBACK_SCORE_BELOW_THRESHOLD` | 규칙/온톨로지 fallback 점수 미달 |
 | `INSUFFICIENT_CASH_FOR_ONE_SHARE` | 해당 통화 가용 현금이 1주 가격 + 버퍼 미만 |
-| `NO_POSITIVE_NET_GNN_EDGE` | 실행 순효율 하한을 넘는 온톨로지 허용 GNN 전략이 없음 |
+| `NO_POSITIVE_NET_GNN_EDGE` | 실행 순효율 하한을 넘는 온톨로지 허용 GNN 전략이 없음. **주의:** 상위 계층(시장 세션·마이크로 전략)이 먼저 막혀 있어도 이 코드가 표시될 수 있습니다 — 반드시 ENTRY BLOCKADE 체인으로 확인하세요 |
+| `NEW_ENTRY_OUTSIDE_REGULAR_SESSION:<그룹>=<위상>` | 스캔 중인 시장이 정규장이 아님. 시간외 호가(예: 미국 애프터마켓 분당 2주·스프레드 33bp)로는 신규 진입하지 않습니다. **청산은 계속 동작합니다.** `TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true`로 이전 동작 복원 |
+| `BANDIT_NO_TRADE_NO_POSITIVE_CONSERVATIVE_EDGE` | 후보는 있었으나 불확실성 차감 후 순엣지 하단이 양수인 전략이 없음. **정상적인 출력이며 고장이 아닙니다** |
+| `NO_CANDIDATE_SYMBOLS` + ENTRY BLOCKADE "주문가능 현금 부족" | 스트리밍·워밍업·세션이 모두 정상인데 **해당 통화 주문가능 현금이 최저가 후보 1주 값에 미달**. 실측 예: KRW 주문가능 2,626원 vs 최저가 073240 7,180원 (USD 67.57은 보유했으나 미국장 마감). 자금 문제이므로 코드로 풀 수 없습니다 |
+| `BANDIT_CHANGE_POINT_STAND_DOWN` | 구조적 레짐 변화가 감지되어 신규 진입 중단(모델·누적 이력의 조건이 깨진 상태) |
 | `GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION` | 양수 GNN 후보는 있으나 해당 전략의 실시간 forward 성과가 아직 진입 권한 기준 미달 |
 | `GNN_TRUST_NO_POSITIVE_EDGE_VALIDATED_STRATEGY` | 모델 보정 전략은 있지만 실현 양수 비율·평균 순효율을 통과한 전략이 없음 |
 | `NET_EDGE_BELOW_EXECUTION_FLOOR:<strategy>` | 양수이지만 실주문 최소 순효율보다 작아 전략 활성화에서 제외 |

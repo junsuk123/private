@@ -276,6 +276,7 @@ class ShadowIntelligenceService:
                 "data/store/realtime_market_data.sqlite3",
             ),
             checkpoint_metadata_path=checkpoint_path.with_suffix(".json"),
+            stale_while_refresh=True,
         )
         self.cost_engine = TradingCostEngine()
         self.gate = ClosedWorldOntologyGate()

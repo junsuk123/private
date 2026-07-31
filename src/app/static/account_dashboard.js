@@ -39,12 +39,120 @@ async function refreshDashboard() {
   } catch (_) {
     refactor = null;
   }
+  let blockade = null;
+  try {
+    blockade = await fetchJson('/api/realtime-trading/entry-blockade');
+  } catch (_) {
+    blockade = null;
+  }
   state.dashboard = data;
   state.runtime = runtime;
   state.refactor = refactor;
+  state.blockade = blockade;
   renderDashboard(data, trading, runtime);
   renderRefactorDashboard(refactor);
+  renderEntryBlockade(blockade);
   await refreshHistory();
+}
+
+// Ordered "why is nothing trading" chain. The FIRST unmet link is the answer;
+// everything after it is unreachable, so it is rendered muted rather than as an
+// additional failure. Showing every layer's verdict at once is the point: the old
+// dashboard surfaced one reason code from whichever layer failed last, which named
+// the GNN for 11,614 consecutive cycles while the market session was the blocker.
+const BLOCKADE_STAGE_LABELS = {
+  engine_running: '엔진 실행',
+  live_armed: '라이브 무장',
+  market_session: '시장 세션',
+  buy_candidates: '매수 후보',
+  micro_buy_intents: '마이크로 전략',
+  strategy_election: '전략 선택',
+  position: '포지션',
+};
+
+function renderEntryBlockade(payload) {
+  const list = document.getElementById('blockade-chain');
+  const headline = document.getElementById('blockade-headline');
+  const verdict = document.getElementById('blockade-verdict');
+  if (!list || !headline || !verdict) return;
+  if (!payload || payload.ok === false) {
+    headline.textContent = '진단을 불러오지 못했습니다.';
+    verdict.textContent = '-';
+    verdict.className = 'badge neutral';
+    list.innerHTML = '';
+    return;
+  }
+  const chain = Array.isArray(payload.chain) ? payload.chain : [];
+  const blockedAt = chain.findIndex((link) => !link.ok);
+  if (payload.trading_possible) {
+    verdict.textContent = '진입 가능';
+    verdict.className = 'badge';
+    headline.textContent = '모든 단계 통과 — 진입을 막는 요인이 없습니다.';
+  } else {
+    const label = BLOCKADE_STAGE_LABELS[payload.blocking_stage] || payload.blocking_stage || '알 수 없음';
+    verdict.textContent = `차단: ${label}`;
+    verdict.className = 'badge blocked';
+    headline.textContent = payload.blocking_detail || '';
+  }
+  list.innerHTML = '';
+  chain.forEach((link, index) => {
+    const item = document.createElement('li');
+    const unreachable = blockedAt >= 0 && index > blockedAt;
+    item.className = `blockade-step ${link.ok ? 'pass' : 'fail'}${unreachable ? ' unreachable' : ''}`;
+    const mark = document.createElement('span');
+    mark.className = 'blockade-mark';
+    mark.textContent = unreachable ? '·' : link.ok ? '✓' : '✕';
+    const body = document.createElement('div');
+    const title = document.createElement('p');
+    title.className = 'blockade-stage';
+    title.textContent = BLOCKADE_STAGE_LABELS[link.stage] || link.stage;
+    const detail = document.createElement('p');
+    detail.className = 'blockade-detail';
+    detail.textContent = unreachable ? '앞 단계에서 막혀 평가되지 않음' : (link.detail || '');
+    body.appendChild(title);
+    body.appendChild(detail);
+    const extra = blockadeExtra(link);
+    if (extra) body.appendChild(extra);
+    item.appendChild(mark);
+    item.appendChild(body);
+    list.appendChild(item);
+  });
+}
+
+function blockadeExtra(link) {
+  const data = link.data || {};
+  const parts = [];
+  if (link.stage === 'market_session' && data.scanned_groups) {
+    Object.entries(data.scanned_groups).forEach(([group, info]) => {
+      parts.push(`${group}: ${info.phase}${info.allows_new_entry ? ' (진입 가능)' : ''}`);
+    });
+    if (data.extended_hours_entry_enabled) parts.push('시간외 진입 허용됨');
+  }
+  if (link.stage === 'buy_candidates' && Array.isArray(data.sample) && data.sample.length) {
+    parts.push(data.sample.join(', '));
+  }
+  if (link.stage === 'micro_buy_intents' && Array.isArray(data.blocking_reason_codes)) {
+    parts.push(...data.blocking_reason_codes);
+  }
+  if (link.stage === 'strategy_election') {
+    if (typeof data.conservative_edge_bps === 'number') {
+      parts.push(`보수적 엣지 ${data.conservative_edge_bps.toFixed(1)}bp`);
+    }
+    if (data.is_exploration) parts.push('탐색 진입(최소 비중)');
+    (data.reason_codes || []).forEach((code) => parts.push(code));
+    if (data.session_last_reason) parts.push(data.session_last_reason);
+  }
+  if (link.stage === 'position' && data.last_reason) parts.push(data.last_reason);
+  if (!parts.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'blockade-tags';
+  parts.slice(0, 10).forEach((text) => {
+    const tag = document.createElement('span');
+    tag.className = 'blockade-tag';
+    tag.textContent = text;
+    wrap.appendChild(tag);
+  });
+  return wrap;
 }
 
 async function refreshHistory() {

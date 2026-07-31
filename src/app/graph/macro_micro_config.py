@@ -107,6 +107,69 @@ def load_macro_micro_policy(path: str | Path | None = None) -> MacroMicroPolicy:
         block_buy_on_high_volatility=_as_bool(macro_raw.get("block_buy_on_high_volatility"), True),
         block_buy_on_news_shock=_as_bool(macro_raw.get("block_buy_on_news_shock"), True),
         block_buy_on_low_liquidity_market=_as_bool(macro_raw.get("block_buy_on_low_liquidity_market"), True),
+        # High-volatility sub-regime classification. Without these being rebuilt
+        # here, YAML/env overrides would silently revert to the class defaults —
+        # the same bug the three fields above were fixed for.
+        classify_high_volatility_subregimes=_as_bool(
+            macro_raw.get("classify_high_volatility_subregimes"),
+            macro_env.classify_high_volatility_subregimes,
+        ),
+        high_vol_trend_threshold=_float(
+            macro_raw.get("high_vol_trend_threshold", macro_env.high_vol_trend_threshold),
+            macro_env.high_vol_trend_threshold,
+            fallbacks=fallbacks,
+            name="high_vol_trend_threshold",
+        ),
+        high_vol_weak_breadth=_float(
+            macro_raw.get("high_vol_weak_breadth", macro_env.high_vol_weak_breadth),
+            macro_env.high_vol_weak_breadth,
+            fallbacks=fallbacks,
+            name="high_vol_weak_breadth",
+        ),
+        high_vol_recovery_breadth=_float(
+            macro_raw.get("high_vol_recovery_breadth", macro_env.high_vol_recovery_breadth),
+            macro_env.high_vol_recovery_breadth,
+            fallbacks=fallbacks,
+            name="high_vol_recovery_breadth",
+        ),
+        dislocation_spread_percentile=_float(
+            macro_raw.get(
+                "dislocation_spread_percentile", macro_env.dislocation_spread_percentile
+            ),
+            macro_env.dislocation_spread_percentile,
+            fallbacks=fallbacks,
+            name="dislocation_spread_percentile",
+        ),
+        dislocation_correlation=_float(
+            macro_raw.get("dislocation_correlation", macro_env.dislocation_correlation),
+            macro_env.dislocation_correlation,
+            fallbacks=fallbacks,
+            name="dislocation_correlation",
+        ),
+        dislocation_change_point_probability=_float(
+            macro_raw.get(
+                "dislocation_change_point_probability",
+                macro_env.dislocation_change_point_probability,
+            ),
+            macro_env.dislocation_change_point_probability,
+            fallbacks=fallbacks,
+            name="dislocation_change_point_probability",
+        ),
+        foreign_outflow_zscore=_float(
+            macro_raw.get("foreign_outflow_zscore", macro_env.foreign_outflow_zscore),
+            macro_env.foreign_outflow_zscore,
+            fallbacks=fallbacks,
+            name="foreign_outflow_zscore",
+        ),
+        foreign_recovery_zscore=_float(
+            macro_raw.get("foreign_recovery_zscore", macro_env.foreign_recovery_zscore),
+            macro_env.foreign_recovery_zscore,
+            fallbacks=fallbacks,
+            name="foreign_recovery_zscore",
+        ),
+        block_buy_on_change_point=_as_bool(
+            macro_raw.get("block_buy_on_change_point"), macro_env.block_buy_on_change_point
+        ),
         strategy_permissions=perms,
     )
 

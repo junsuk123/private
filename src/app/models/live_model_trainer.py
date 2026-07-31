@@ -77,7 +77,17 @@ def train_live_short_horizon_model(
     rows = sorted(rows, key=lambda row: str(row.get("as_of") or ""))
     x = [[float(row["features"][name]) for name in feature_names] for row in rows]
     y = [int(row["label"]) for row in rows]
-    returns = [_clip_return(float(row.get("forward_net_return_bps", 0.0))) for row in rows]
+    # Winsorize before the fixed clip. A handful of extreme moves (a circuit-breaker
+    # session produces several) otherwise dominate a squared-error regression and
+    # drag the expected-net-return head with them; the fixed +/-500bps clip alone
+    # does not help when the outliers sit inside it. Percentile bounds are computed
+    # from the data, so a genuinely wide distribution is not artificially narrowed.
+    returns = [
+        _clip_return(value)
+        for value in _winsorize(
+            [float(row.get("forward_net_return_bps", 0.0)) for row in rows]
+        )
+    ]
     incremental = bool(warm_start_artifact and update_rows is not None)
     update_keys = {
         _observation_key(row)
@@ -495,6 +505,28 @@ def _clip_return(value: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return max(-limit, min(limit, value))
+
+
+def _winsorize(values: list[float]) -> list[float]:
+    """Clamp the tails to data-derived percentiles (identity when disabled).
+
+    Distribution-aware rather than a fixed band: with the default 2% tails, a calm
+    session is barely touched while a repricing session's handful of extreme moves
+    stop dictating the regression slope.
+    """
+    fraction = min(0.2, max(0.0, _env_float("LIVE_MODEL_WINSORIZE_FRACTION", 0.02)))
+    finite = [value for value in values if math.isfinite(value)]
+    if fraction <= 0.0 or len(finite) < 20:
+        return [value if math.isfinite(value) else 0.0 for value in values]
+    ordered = sorted(finite)
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * fraction)))
+    low = ordered[index]
+    high = ordered[len(ordered) - 1 - index]
+    if low > high:
+        low, high = high, low
+    return [
+        max(low, min(high, value)) if math.isfinite(value) else 0.0 for value in values
+    ]
 
 
 def _top_k_count(row_count: int) -> int:

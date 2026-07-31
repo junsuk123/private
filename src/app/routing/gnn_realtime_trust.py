@@ -7,34 +7,13 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
 from typing import Any
 
 from app.cost import TradingCostEngine
 from app.routing.actions import is_actionable_strategy_route
-
-_STRATEGY_HORIZON_SECONDS = {
-    "intraday_momentum": 1800,
-    "breakout_volume": 2700,
-    "vwap_mean_reversion": 1800,
-    "liquidity_shock_reversal": 1200,
-    "event_momentum": 3600,
-    "cross_sectional_relative_strength": 3600,
-    "gap_context": 2700,
-    "rvgi_box_breakout": 1800,
-}
-_STRATEGY_VALIDATION_EXIT_BPS = {
-    # (stop loss, configured gross target). Keep aligned with the executable
-    # strategy session. The target is made cost-aware below.
-    "intraday_momentum": (22.0, 100.0),
-    "breakout_volume": (25.0, 120.0),
-    "vwap_mean_reversion": (18.0, 100.0),
-    "liquidity_shock_reversal": (30.0, 100.0),
-    "event_momentum": (35.0, 140.0),
-    "cross_sectional_relative_strength": (28.0, 120.0),
-    "gap_context": (32.0, 130.0),
-    "rvgi_box_breakout": (20.0, 120.0),
-}
+from app.strategy.exit_geometry import exit_geometry
 
 
 @dataclass(frozen=True)
@@ -83,6 +62,7 @@ class GnnRealtimeTrustEvaluator:
         window_samples: int | None = None,
         cache_seconds: float | None = None,
         allow_checkpoint_history: bool | None = None,
+        stale_while_refresh: bool = False,
     ) -> None:
         self.comparison_path = Path(comparison_path)
         self.database_path = Path(database_path)
@@ -116,6 +96,7 @@ class GnnRealtimeTrustEvaluator:
             if allow_checkpoint_history is None
             else bool(allow_checkpoint_history)
         )
+        self.stale_while_refresh = bool(stale_while_refresh)
         self.minimum_strategy_samples = max(
             8,
             int(
@@ -128,6 +109,9 @@ class GnnRealtimeTrustEvaluator:
         self.cost_engine = TradingCostEngine()
         self._cached_at = 0.0
         self._cached: GnnRealtimeTrust | None = None
+        self._evaluation_lock = threading.Lock()
+        self._refresh_state_lock = threading.Lock()
+        self._refreshing = False
 
     def evaluate(self, now: datetime | None = None) -> GnnRealtimeTrust:
         current = now or datetime.now(timezone.utc)
@@ -137,10 +121,55 @@ class GnnRealtimeTrustEvaluator:
             and monotonic_now - self._cached_at < self.cache_seconds
         ):
             return self._cached
-        result = self._evaluate_uncached(current)
-        self._cached = result
-        self._cached_at = monotonic_now
-        return result
+        if self.stale_while_refresh:
+            self._start_background_refresh(current)
+            return self._cached or self._empty(
+                current,
+                ("GNN_TRUST_REFRESH_PENDING",),
+            )
+        # Engine routing, the operations dashboard and the trust endpoint can
+        # all arrive as the cache expires. Without single-flight protection each
+        # caller independently scans the large tick database, starving the API
+        # for tens of seconds. One caller refreshes; all others reuse its result.
+        with self._evaluation_lock:
+            monotonic_now = time.monotonic()
+            if (
+                self._cached is not None
+                and monotonic_now - self._cached_at < self.cache_seconds
+            ):
+                return self._cached
+            result = self._evaluate_uncached(current)
+            self._cached = result
+            self._cached_at = time.monotonic()
+            return result
+
+    def _start_background_refresh(self, current: datetime) -> None:
+        with self._refresh_state_lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+        threading.Thread(
+            target=self._refresh_in_background,
+            args=(current,),
+            name="gnn-realtime-trust-refresh",
+            daemon=True,
+        ).start()
+
+    def _refresh_in_background(self, current: datetime) -> None:
+        try:
+            with self._evaluation_lock:
+                try:
+                    result = self._evaluate_uncached(current)
+                except Exception:  # noqa: BLE001 - refresh must not kill its daemon.
+                    result = self._empty(
+                        current,
+                        ("GNN_TRUST_BACKGROUND_REFRESH_FAILED",),
+                    )
+                self._cached = result
+                self._cached_at = time.monotonic()
+        finally:
+            with self._refresh_state_lock:
+                self._refreshing = False
 
     def _evaluate_uncached(self, now: datetime) -> GnnRealtimeTrust:
         reasons: list[str] = []
@@ -291,10 +320,45 @@ class GnnRealtimeTrustEvaluator:
         self, evaluation_time: datetime
     ) -> list[dict[str, Any]]:
         active_checkpoint_hash = self._active_checkpoint_hash()
-        rows = _tail_text_lines(
-            self.comparison_path,
-            max_lines=max(2000, self.window_samples * 20),
+        scan_lines = max(2000, self.window_samples * 20)
+        max_scan_lines = max(
+            scan_lines,
+            int(
+                os.getenv(
+                    "GNN_TRUST_MAX_SCAN_LINES",
+                    str(max(20_000, self.window_samples * 200)),
+                )
+            ),
         )
+        while True:
+            rows = _tail_text_lines(
+                self.comparison_path,
+                max_lines=scan_lines,
+            )
+            candidates = self._prediction_candidates_from_rows(
+                rows,
+                evaluation_time=evaluation_time,
+                active_checkpoint_hash=active_checkpoint_hash,
+            )
+            # Raw comparison rows are not trust samples. A mismatched checkpoint
+            # can emit thousands of NO_TRADE rows with no validation candidate
+            # and push every valid forecast out of a fixed physical-line tail.
+            # Expand only until the bounded *valid* sample window is filled.
+            if (
+                len(candidates) >= self.window_samples
+                or len(rows) < scan_lines
+                or scan_lines >= max_scan_lines
+            ):
+                return candidates[-self.window_samples :]
+            scan_lines = min(max_scan_lines, scan_lines * 2)
+
+    def _prediction_candidates_from_rows(
+        self,
+        rows: deque[str],
+        *,
+        evaluation_time: datetime,
+        active_checkpoint_hash: str | None,
+    ) -> list[dict[str, Any]]:
         deduplicated: dict[tuple[str, str, int], dict[str, Any]] = {}
         for raw in rows:
             try:
@@ -380,20 +444,12 @@ class GnnRealtimeTrustEvaluator:
         return sorted(
             deduplicated.values(),
             key=lambda item: item["as_of"],
-        )[-self.window_samples :]
+        )
 
     def _strategy_horizon(self, strategy_id: str) -> int:
         if not self.use_strategy_horizons:
             return self.horizon_seconds
-        return max(
-            30,
-            int(
-                _STRATEGY_HORIZON_SECONDS.get(
-                    str(strategy_id or ""),
-                    self.horizon_seconds,
-                )
-            ),
-        )
+        return max(30, exit_geometry(strategy_id).max_holding_seconds)
 
     def _active_checkpoint_hash(self) -> str | None:
         try:
@@ -477,10 +533,9 @@ class GnnRealtimeTrustEvaluator:
             ).total_cost_rate
             * 10_000.0
         )
-        stop_bps, configured_target_bps = _STRATEGY_VALIDATION_EXIT_BPS.get(
-            str(item.get("strategy_id") or ""),
-            (25.0, 100.0),
-        )
+        geometry = exit_geometry(str(item.get("strategy_id") or ""))
+        stop_bps = geometry.stop_loss_bps
+        configured_target_bps = geometry.take_profit_bps
         target_bps = max(
             configured_target_bps,
             baseline_cost_bps + max(25.0, baseline_cost_bps),

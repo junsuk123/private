@@ -29,6 +29,7 @@ python scripts/gen_profitability_diagrams.py # profitability_* 4종
 | `data_to_decision_flow.svg` | 최상위 README, architecture.md, decision_and_risk.md |
 | `ontology_layered_architecture.*`, `ontology_reasoning_boundary.*` | ontology_and_gnn.md, `src/app/ontology/README.md` |
 | `profitability_architecture.svg`, `profitability_decision_flow.svg`, `profitability_dynamic_exit.svg`, `profitability_before_after.svg` | decision_and_risk.md, validation.md |
+| `entry_blockade_chain.svg` | decision_and_risk.md §10 (`scripts/gen_entry_blockade_diagram.py`) |
 
 ## 코드 옆에 사는 문서
 
@@ -41,6 +42,6 @@ python scripts/gen_profitability_diagrams.py # profitability_* 4종
 ## 읽는 순서
 
 1. 처음이라면 [../README.md](../README.md) → [architecture.md](architecture.md)
-2. 왜 거래가 안 나가는지 알고 싶다면 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기" → `/api/gnn/realtime-trust` → [decision_and_risk.md](decision_and_risk.md)의 거부 사유 코드
+2. 왜 거래가 안 나가는지 알고 싶다면 **`/account` 상단 ENTRY BLOCKADE 패널** (또는 `GET /api/realtime-trading/entry-blockade`)을 먼저 보세요. 처음 막힌 단계가 원인입니다 → 배경은 [decision_and_risk.md](decision_and_risk.md) §10 → 세부는 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기"
 3. 추론 구조를 이해하려면 [ontology_and_gnn.md](ontology_and_gnn.md)
 4. 어떤 주장이 증거를 갖고 있는지 확인하려면 [validation.md](validation.md)

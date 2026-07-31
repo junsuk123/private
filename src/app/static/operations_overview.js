@@ -289,14 +289,16 @@ async function refreshOperationsOverview() {
   if (operationsOverviewState.busy) return;
   operationsOverviewState.busy = true;
   try {
-    const [diag, reliability, trading, gnn, mode] = await Promise.all([
+    const [diag, reliability, trading, gnn, mode, blockade] = await Promise.all([
       opsFetchJson('/api/system-diagnostics'),
       opsFetchJson('/api/auto-reliability/status'),
       opsFetchJson('/api/realtime-trading/status'),
       opsFetchJson('/api/gnn/realtime-trust'),
       opsFetchJson('/api/operation-mode/status'),
+      opsFetchJson('/api/realtime-trading/entry-blockade'),
     ]);
     renderOperationsOverview({ diag, reliability, trading, gnn, mode });
+    renderEntryBlockade(blockade);
   } catch (error) {
     renderOperationsOverviewError(error);
   } finally {
@@ -309,3 +311,119 @@ window.addEventListener('DOMContentLoaded', () => {
   refreshOperationsOverview();
   operationsOverviewState.timer = window.setInterval(refreshOperationsOverview, 5000);
 });
+
+
+// --- Entry blockade -------------------------------------------------------
+// Ordered "why is nothing trading" chain. The FIRST unmet link is the answer;
+// links after it are dimmed because they were never reached, which is a
+// different statement from having failed.
+//
+// This exists because the terminal used to surface one reason code from
+// whichever layer failed last. For 11,614 consecutive cycles that read
+// NO_POSITIVE_NET_GNN_EDGE — naming the GNN, while the actual constraint was
+// that no scanned market was in its regular session and every candidate was
+// failing on after-hours book liquidity.
+const BLOCKADE_STAGE_LABELS = {
+  engine_running: '엔진 실행',
+  live_armed: '라이브 무장',
+  market_session: '시장 세션',
+  buy_candidates: '매수 후보',
+  micro_buy_intents: '마이크로 전략',
+  strategy_election: '전략 선택',
+  position: '포지션',
+};
+
+function blockadeTags(link) {
+  const data = link.data || {};
+  const parts = [];
+  if (link.stage === 'market_session' && data.scanned_groups) {
+    Object.entries(data.scanned_groups).forEach(([group, info]) => {
+      parts.push(`${group} ${info.phase}${info.allows_new_entry ? ' · 진입가능' : ''}`);
+    });
+    if (data.extended_hours_entry_enabled) parts.push('시간외 진입 허용');
+  }
+  if (link.stage === 'buy_candidates') {
+    if (data.warming_up) {
+      parts.push(`분봉 ${data.best_bars}/${data.required_bars} (${data.best_symbol})`);
+      parts.push(`약 ${data.eta_minutes}분 후 충족`);
+    }
+    if (data.unaffordable) {
+      parts.push(`주문가능 KRW ${Math.round(data.krw_orderable).toLocaleString()}원`);
+      parts.push(`최저가 ${data.cheapest_candidate} ${Math.round(data.cheapest_ask).toLocaleString()}원`);
+    }
+    if (Array.isArray(data.sample)) parts.push(...data.sample.slice(0, 6));
+  }
+  if (link.stage === 'micro_buy_intents' && Array.isArray(data.blocking_reason_codes)) {
+    parts.push(...data.blocking_reason_codes.slice(0, 6));
+  }
+  if (link.stage === 'strategy_election') {
+    if (typeof data.conservative_edge_bps === 'number') {
+      parts.push(`보수적 엣지 ${data.conservative_edge_bps.toFixed(1)}bp`);
+    }
+    if (data.is_exploration) parts.push('탐색 진입(최소 비중)');
+    (data.reason_codes || []).slice(0, 4).forEach((code) => parts.push(code));
+    if (data.session_last_reason) parts.push(data.session_last_reason);
+  }
+  if (link.stage === 'position' && data.last_reason) parts.push(data.last_reason);
+  if (!parts.length) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'blockade-tags';
+  parts.slice(0, 8).forEach((text) => {
+    const tag = document.createElement('span');
+    tag.className = 'blockade-tag';
+    tag.textContent = text;
+    wrap.appendChild(tag);
+  });
+  return wrap;
+}
+
+function renderEntryBlockade(payload) {
+  const list = document.getElementById('blockade-chain');
+  const headline = document.getElementById('blockade-headline');
+  const verdict = document.getElementById('blockade-verdict');
+  if (!list || !headline || !verdict) return;
+  if (!payload || payload.ok === false) {
+    headline.textContent = '진단을 불러오지 못했습니다.';
+    verdict.textContent = '확인 불가';
+    verdict.className = 'status-chip waiting';
+    list.innerHTML = '';
+    return;
+  }
+  const chain = Array.isArray(payload.chain) ? payload.chain : [];
+  const blockedAt = chain.findIndex((link) => !link.ok);
+  if (payload.trading_possible) {
+    verdict.textContent = '진입 가능';
+    verdict.className = 'status-chip';
+    headline.textContent = '모든 단계 통과 — 신규 진입을 막는 요인이 없습니다.';
+  } else {
+    const label = BLOCKADE_STAGE_LABELS[payload.blocking_stage] || payload.blocking_stage || '알 수 없음';
+    verdict.textContent = `차단 · ${label}`;
+    verdict.className = 'status-chip blocked';
+    headline.textContent = payload.blocking_detail || '';
+  }
+  list.innerHTML = '';
+  chain.forEach((link, index) => {
+    const unreachable = blockedAt >= 0 && index > blockedAt;
+    const item = document.createElement('li');
+    item.className = `blockade-step ${link.ok ? 'pass' : 'fail'}${unreachable ? ' unreachable' : ''}`;
+    const mark = document.createElement('span');
+    mark.className = 'blockade-mark';
+    mark.textContent = unreachable ? '·' : link.ok ? '✓' : '✕';
+    const body = document.createElement('div');
+    const title = document.createElement('p');
+    title.className = 'blockade-stage';
+    title.textContent = BLOCKADE_STAGE_LABELS[link.stage] || link.stage;
+    const detail = document.createElement('p');
+    detail.className = 'blockade-detail';
+    detail.textContent = unreachable ? '앞 단계에서 막혀 평가되지 않음' : (link.detail || '');
+    body.appendChild(title);
+    body.appendChild(detail);
+    const tags = unreachable ? null : blockadeTags(link);
+    if (tags) body.appendChild(tags);
+    item.appendChild(mark);
+    item.appendChild(body);
+    list.appendChild(item);
+  });
+}
+
+window.renderEntryBlockade = renderEntryBlockade;

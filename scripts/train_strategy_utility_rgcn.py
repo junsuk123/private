@@ -4,7 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
-from app.evaluation.stored_counterfactual import EvaluationConfig, build_labels, load_minute_bars
+from app.data.investor_flow_store import InvestorFlowStore
+from app.evaluation.stored_counterfactual import (
+    EvaluationConfig,
+    build_labels,
+    load_minute_bars,
+    load_minute_microstructure,
+    load_news_sentiment,
+)
 from app.models.strategy_utility.training import train_counterfactual_checkpoint
 
 
@@ -20,6 +27,9 @@ def main() -> None:
     labels = build_labels(
         load_minute_bars(args.database),
         EvaluationConfig(feature_schema_name="realtime_strategy_graph_v4_market"),
+        microstructure_by_symbol=load_minute_microstructure(args.database),
+        investor_flow_by_symbol=InvestorFlowStore().load_all(),
+        news_by_ticker=load_news_sentiment(),
     )
     report = train_counterfactual_checkpoint(
         labels,

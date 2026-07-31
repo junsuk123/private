@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
+import threading
+import time
 
 from app.routing.gnn_realtime_trust import GnnRealtimeTrustEvaluator
+from app.strategy.exit_geometry import exit_geometry
 
 
 def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
@@ -181,6 +185,71 @@ def test_realtime_trust_fails_closed_before_enough_mature_samples(tmp_path) -> N
     assert "GNN_TRUST_LOG_MISSING" in result.reason_codes
 
 
+def test_realtime_trust_refresh_is_single_flight_across_callers(tmp_path) -> None:
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=tmp_path / "unused.jsonl",
+        database_path=tmp_path / "unused.sqlite3",
+        cache_seconds=30,
+    )
+    calls = 0
+
+    def evaluate_once(now):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.05)
+        return evaluator._empty(now, ("TEST_RESULT",))
+
+    evaluator._evaluate_uncached = evaluate_once
+    now = datetime.now(timezone.utc)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: evaluator.evaluate(now), range(8)))
+
+    assert calls == 1
+    assert all(result.reason_codes == ("TEST_RESULT",) for result in results)
+
+
+def test_realtime_trust_can_return_stale_while_refreshing_in_background(
+    tmp_path,
+) -> None:
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=tmp_path / "unused.jsonl",
+        database_path=tmp_path / "unused.sqlite3",
+        cache_seconds=30,
+        stale_while_refresh=True,
+    )
+    refreshed = threading.Event()
+
+    def evaluate_once(now):
+        time.sleep(0.05)
+        refreshed.set()
+        return evaluator._empty(now, ("REFRESHED",))
+
+    evaluator._evaluate_uncached = evaluate_once
+    now = datetime.now(timezone.utc)
+
+    pending = evaluator.evaluate(now)
+
+    assert pending.reason_codes == ("GNN_TRUST_REFRESH_PENDING",)
+    assert refreshed.wait(timeout=1.0)
+    deadline = time.monotonic() + 1.0
+    while evaluator._cached is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert evaluator.evaluate(now).reason_codes == ("REFRESHED",)
+
+
+def test_realtime_trust_uses_executable_exit_geometry_for_new_strategies(
+    tmp_path,
+) -> None:
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=tmp_path / "unused.jsonl",
+        database_path=tmp_path / "unused.sqlite3",
+    )
+
+    assert evaluator._strategy_horizon(
+        "ofi_microprice_exhaustion_reversal"
+    ) == exit_geometry("ofi_microprice_exhaustion_reversal").max_holding_seconds
+
+
 def test_validation_only_negative_forecast_is_retained_as_calibration_sample(
     tmp_path,
 ) -> None:
@@ -231,6 +300,76 @@ def test_validation_only_negative_forecast_is_retained_as_calibration_sample(
     assert len(candidates) == 1
     assert candidates[0]["strategy_id"] == "vwap_mean_reversion"
     assert candidates[0]["expected_net_return_bps"] == -12.0
+
+
+def test_valid_samples_are_not_evicted_by_invalid_raw_log_tail(tmp_path) -> None:
+    log_path = tmp_path / "shadow.jsonl"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "active-checkpoint"}),
+        encoding="utf-8",
+    )
+    base = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    payloads = []
+    for index in range(10):
+        observed = base + timedelta(seconds=index * 31)
+        payloads.append(
+            {
+                "as_of": observed.isoformat(),
+                "symbol": f"KR{index}",
+                "validation_candidates": [
+                    {
+                        "path": "cpu_gnn_validation",
+                        "action": "VALIDATE_ONLY",
+                        "strategy_id": "intraday_momentum",
+                        "validation_strategy_id": "intraday_momentum",
+                        "probability_success": 0.7,
+                        "expected_net_return_bps": 12.0,
+                        "expected_cost_bps": 2.0,
+                        "total_uncertainty": 0.2,
+                        "ontology_compatibility": 0.8,
+                        "checkpoint_hash": "active-checkpoint",
+                    }
+                ],
+            }
+        )
+    # More than the evaluator's initial 2,000-line physical tail. These rows
+    # model a catalog-mismatched checkpoint flooding NO_TRADE diagnostics.
+    for index in range(2_500):
+        payloads.append(
+            {
+                "as_of": (base + timedelta(hours=1, seconds=index)).isoformat(),
+                "symbol": "NO_VALIDATION",
+                "decisions": [
+                    {
+                        "path": "cpu_gnn",
+                        "action": "NO_TRADE",
+                        "reason_codes": ["GNN_STRATEGY_CATALOG_MISMATCH"],
+                    }
+                ],
+            }
+        )
+    log_path.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads),
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=tmp_path / "unused.sqlite3",
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+        window_samples=20,
+    )
+
+    candidates = evaluator._prediction_candidates(
+        base + timedelta(hours=2)
+    )
+
+    assert len(candidates) == 10
+    assert {candidate["symbol"] for candidate in candidates} == {
+        f"KR{index}" for index in range(10)
+    }
 
 
 def test_horizon_bucket_retains_first_actionable_positive_forecast(

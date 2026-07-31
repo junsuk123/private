@@ -17,6 +17,7 @@ from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnaps
 from app.trading.auto_tuning_engine import AutoTuningEngine, MarketStateSnapshot
 from app.trading.decision_logger import DecisionLogger
 from app.trading.dynamic_exit_policy import DynamicExitPolicy
+from app.trading.strategy_performance_store import default_store as _strategy_performance_store
 from app.strategy.rule_based import _holding_exit_adjustment, _ontology_flow_adjustment
 from app.ontology.trading_reasoner import TradingDomainReasoner
 from app.ontology.trading_fact_builder import build_trading_facts
@@ -400,6 +401,65 @@ class SharedLiveDecisionEngine:
         # Per-symbol peak net (after-cost) PnL rate, used by the profit-giveback
         # trailing lock so realized gains are not given back on a stall.
         self._peak_net_pnl: dict[str, float] = {}
+        # Realized per-strategy outcomes. Both the tuner's `recent_performance`
+        # and the sizer's `recent_same_strategy_loss` were hard-coded constants
+        # (0.0 / False), so a strategy that had just lost five times in a row got
+        # no penalty on the sixth selection and one that was working got no
+        # credit. This store is that missing feedback channel.
+        try:
+            self.performance_store = _strategy_performance_store()
+        except Exception:  # noqa: BLE001 - feedback is an enhancer, never fatal.
+            self.performance_store = None
+
+    def _recent_performance(
+        self,
+        *,
+        symbol: str,
+        strategy_id: str | None = None,
+        regime: str | None = None,
+    ) -> float:
+        """Realized recent net performance as a rate in [-1, 1].
+
+        Scoped as narrowly as the data allows: this strategy in this market and
+        regime first, then the market as a whole. Returns 0.0 (neutral) when there
+        is no history — "unknown" must not be reported as either good or bad.
+        """
+        store = self.performance_store
+        if store is None:
+            return 0.0
+        try:
+            market = _market_for_symbol(symbol)
+            if strategy_id:
+                scoped = store.recent_performance_rate(
+                    strategy_id, market=market, regime=regime
+                )
+                if scoped:
+                    return scoped
+            return store.recent_performance_rate(market=market, regime=regime)
+        except Exception:  # noqa: BLE001 - feedback must never break a decision.
+            return 0.0
+
+    def _recent_same_strategy_loss(
+        self,
+        *,
+        symbol: str,
+        strategy_id: str | None,
+        regime: str | None = None,
+    ) -> bool:
+        """Did this strategy's last closed trade lose money?
+
+        Drives the sizer's recent-loss multiplier, which was previously wired to a
+        literal ``False`` and therefore never fired.
+        """
+        store = self.performance_store
+        if store is None or not strategy_id:
+            return False
+        try:
+            return store.had_recent_loss(
+                strategy_id, market=_market_for_symbol(symbol), regime=regime
+            )
+        except Exception:  # noqa: BLE001
+            return False
 
     def _technical_exit_deterioration(self, frame, symbol) -> tuple[tuple[str, ...], float]:
         """Advisory technical deterioration codes + a bounded ontology penalty.
@@ -498,6 +558,17 @@ class SharedLiveDecisionEngine:
         except Exception as exc:  # noqa: BLE001 - model failure can fall back to ontology and rules.
             prediction_error = exc
         strategy_locked = bool(str(selected_strategy or "").strip())
+        # Realized feedback, scoped to this strategy/market/regime where possible.
+        # Both consumers below used to receive literal constants, so the whole
+        # online-performance channel was dead.
+        election_regime = (
+            str((election_context or {}).get("macro_regime") or "").strip() or None
+        )
+        recent_performance = self._recent_performance(
+            symbol=symbol,
+            strategy_id=selected_strategy,
+            regime=election_regime,
+        )
         technical_prediction = (
             self._owned_strategy_prediction(
                 frame, symbol, selected_strategy, election_context
@@ -728,7 +799,7 @@ class SharedLiveDecisionEngine:
             liquidity_score=liquidity_score,
             spread_bps=spread_bps,
             volatility=float(getattr(market, "volatility_20d", 0.0) or 0.0),
-            recent_performance=0.0,
+            recent_performance=recent_performance,
         )
         model_ok = bool(prediction is not None and prediction.approved)
         if strategy_locked and technical_prediction is not None:
@@ -757,7 +828,7 @@ class SharedLiveDecisionEngine:
             spread_bps=spread_bps,
             orderbook_available=orderbook is not None,
             volume_ratio=volume_ratio,
-            recent_performance=0.0,
+            recent_performance=recent_performance,
             fallback_score=fallback_score,
             symbol_volatility=self._symbol_realtime_volatility(symbol, decision_time),
             market_volatility=self._market_realtime_volatility(decision_time),
@@ -1105,7 +1176,11 @@ class SharedLiveDecisionEngine:
                 confidence_score=confidence,
                 liquidity_score=liquidity_score,
                 account_drawdown_rate=domestic_drawdown_rate,
-                recent_same_strategy_loss=False,
+                recent_same_strategy_loss=self._recent_same_strategy_loss(
+                    symbol=symbol,
+                    strategy_id=selected_strategy,
+                    regime=election_regime,
+                ),
             )
         )
         if sizing.position_weight > 0.0:
@@ -1396,7 +1471,7 @@ class SharedLiveDecisionEngine:
             spread_bps=float(getattr(orderbook, "spread_bps", 0.0) or 0.0),
             orderbook_available=orderbook is not None,
             volume_ratio=volume_ratio,
-            recent_performance=0.0,
+            recent_performance=self._recent_performance(symbol=symbol),
             fallback_score=max(0.0, ontology_score + max(-0.5, min(0.5, pnl_rate))),
             symbol_volatility=self._symbol_realtime_volatility(symbol, decision_time),
             market_volatility=self._market_realtime_volatility(decision_time),

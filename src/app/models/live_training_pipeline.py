@@ -25,14 +25,21 @@ DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH = Path("data/store/account_dashboard.sqlite
 DEFAULT_TRAINING_ROW_STORE_PATH = Path("data/store/live_training_rows.sqlite3")
 DEFAULT_NEWS_TRUST_PATH = Path("data/store/news_trust.json")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
-# Triple-barrier 라벨 기본값: 전략 청산 기준과 정렬(TP=take_profit 25bps, SL=stop_loss 100bps,
-# 지평=장중 보유창 10분). "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에 압도돼
-# 모델이 붕괴했다. 경로가 TP/SL 중 무엇을 먼저 터치하는지로 라벨링하면 신호가 살아난다.
-# 지평은 실데이터 시간기반 홀드아웃 스윕으로 선정: 600s에서 AUC 0.563/상위픽 +51bps로 적격,
-# 900s 이상에서는 노이즈가 커져 부적격이 됐다.
+# Triple-barrier 라벨 기본값. "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에
+# 압도돼 모델이 붕괴했다. 경로가 TP/SL 중 무엇을 먼저 터치하는지로 라벨링하면 신호가 살아난다.
+#
+# 아래 값은 "레거시" 기하다(TP 25bps / SL 100bps / 600s). 이 조합은 실제 실행 규칙과
+# 방향이 반대였다: 실거래는 -18~-35bps에서 손절하고 +100~140bps를 목표로 하는데, 라벨은
+# +25bps만 먼저 닿으면 성공, -100bps까지는 실패가 아니라고 가르쳤다. 즉 모델은
+# "25bps 반등 후 하락"을 성공으로 학습했고, 실행기는 바로 그 패턴에서 손절당한다.
+#
+# 기본 동작은 이제 실행 기하와 정렬된 전략별 라벨(_strategy_label_geometry)이며,
+# LIVE_LABEL_STRATEGY=legacy 로 예전 동작을 복원할 수 있다.
 DEFAULT_LABEL_HORIZON_SECONDS = 600.0
 DEFAULT_LABEL_TAKE_PROFIT_BPS = 25.0
 DEFAULT_LABEL_STOP_LOSS_BPS = 100.0
+# 라벨을 어느 전략의 청산 규칙에 맞출지. "legacy" 는 위 상수를 그대로 쓴다.
+DEFAULT_LABEL_STRATEGY = "intraday_momentum"
 # The prediction path still consumes every live tick. Only labelled training
 # observations are thinned: with a 600-second label horizon, sub-15-second rows
 # overlap almost completely and let one bursty symbol dominate the fit.
@@ -78,6 +85,62 @@ def _label_stop_loss_bps() -> float:
         return abs(float(os.getenv("LIVE_LABEL_STOP_LOSS_BPS", str(DEFAULT_LABEL_STOP_LOSS_BPS))))
     except (TypeError, ValueError):
         return DEFAULT_LABEL_STOP_LOSS_BPS
+
+
+def _label_strategy_id() -> str:
+    return str(os.getenv("LIVE_LABEL_STRATEGY", DEFAULT_LABEL_STRATEGY) or "").strip().lower()
+
+
+def _label_barriers() -> tuple[float, float, float, str]:
+    """``(take_profit_bps, stop_loss_bps, horizon_seconds, basis)`` for the label.
+
+    Aligned by default with a real strategy's exit geometry, so a training success
+    is a trade the executor would actually have held to target. Explicit
+    ``LIVE_LABEL_*`` environment overrides still win, and
+    ``LIVE_LABEL_STRATEGY=legacy`` restores the pre-alignment constants.
+    """
+    strategy_id = _label_strategy_id()
+    if strategy_id in {"", "legacy", "none"}:
+        return (
+            _label_take_profit_bps(),
+            _label_stop_loss_bps(),
+            _label_horizon_seconds(),
+            "legacy_constants",
+        )
+    from app.strategy.exit_geometry import exit_geometry
+
+    geometry = exit_geometry(strategy_id)
+    take_profit = (
+        abs(float(os.environ["LIVE_LABEL_TAKE_PROFIT_BPS"]))
+        if os.getenv("LIVE_LABEL_TAKE_PROFIT_BPS") not in (None, "")
+        else geometry.take_profit_bps
+    )
+    stop_loss = (
+        abs(float(os.environ["LIVE_LABEL_STOP_LOSS_BPS"]))
+        if os.getenv("LIVE_LABEL_STOP_LOSS_BPS") not in (None, "")
+        else geometry.stop_loss_bps
+    )
+    horizon = (
+        _label_horizon_seconds()
+        if os.getenv("LIVE_LABEL_HORIZON_SECONDS") not in (None, "")
+        else float(geometry.max_holding_seconds)
+    )
+    return take_profit, stop_loss, horizon, f"strategy_exit_geometry:{geometry.strategy_id}"
+
+
+def _per_strategy_labels_enabled() -> bool:
+    """Emit a label per strategy geometry alongside the primary label.
+
+    Off by default: it costs one extra forward scan per catalogued strategy per
+    row, and the periodic trainer shares its budget with the live tick loop. Turn
+    it on to train or evaluate strategy-specific heads.
+    """
+    return str(os.getenv("LIVE_LABEL_PER_STRATEGY", "false")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def collect_live_feature_frames_from_realtime_store(
@@ -200,6 +263,37 @@ def backfill_live_feature_frames_from_realtime_store(
     }
 
 
+def _current_macro_regime() -> str | None:
+    """The macro regime as last published by the live macro loop, if available."""
+    try:
+        from app.graph import macro_micro_feed
+
+        snapshot = macro_micro_feed.snapshot() or {}
+        macro = snapshot.get("macro_result") or {}
+        regime = macro.get("market_regime")
+        return str(regime) if regime else None
+    except Exception:  # noqa: BLE001 - provenance is best-effort, never fatal.
+        return None
+
+
+def _split_by_market_enabled() -> bool:
+    """Also fit a separate artifact per market.
+
+    KRX round-trip cost is ~28bps; the US population in the same journal measures
+    ~60-87bps. One regression over both fits an expected-net-return head to a
+    bimodal cost distribution and is wrong for each market separately. The combined
+    artifact is still produced (every existing consumer reads
+    ``data/models/live_short_horizon/latest.json``); the per-market ones are written
+    to ``<root>/<MARKET>/`` for a market-aware predictor to prefer.
+    """
+    return str(os.getenv("LIVE_MODEL_SPLIT_BY_MARKET", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def train_live_short_horizon_from_collected_features(
     *,
     journal_path: str | Path = DEFAULT_FEATURE_JOURNAL_PATH,
@@ -214,7 +308,7 @@ def train_live_short_horizon_from_collected_features(
     # duplicate challengers concurrently; the follower will then hit the dataset
     # fingerprint fast path.
     with _LIVE_TRAINING_LOCK:
-        return _train_live_short_horizon_from_collected_features_unlocked(
+        artifact = _train_live_short_horizon_from_collected_features_unlocked(
             journal_path=journal_path,
             registry=registry,
             minimum_examples=minimum_examples,
@@ -222,6 +316,62 @@ def train_live_short_horizon_from_collected_features(
             minimum_negative_labels=minimum_negative_labels,
             training_row_store_path=training_row_store_path,
         )
+        if _split_by_market_enabled():
+            artifact["per_market"] = _train_per_market_models(
+                journal_path=journal_path,
+                registry=registry,
+                minimum_examples=minimum_examples,
+                minimum_positive_labels=minimum_positive_labels,
+                minimum_negative_labels=minimum_negative_labels,
+                training_row_store_path=training_row_store_path,
+            )
+        return artifact
+
+
+def _train_per_market_models(
+    *,
+    journal_path: str | Path,
+    registry: ModelArtifactRegistry | None,
+    minimum_examples: int,
+    minimum_positive_labels: int,
+    minimum_negative_labels: int,
+    training_row_store_path: str | Path | None,
+) -> dict[str, Any]:
+    """Fit one artifact per market from the same materialized rows.
+
+    Best-effort: a market with too little data simply produces an ineligible
+    artifact with its own reason codes, exactly like the combined path.
+    """
+    summary: dict[str, Any] = {}
+    try:
+        base_root = (registry or ModelArtifactRegistry()).root
+        row_store_path = _training_row_store_path(journal_path, training_row_store_path)
+        rows = _thin_training_rows(_load_materialized_training_rows(row_store_path))
+        by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            by_market[str(row.get("market") or _row_market(str(row.get("ticker") or "")))].append(row)
+        for market, market_rows in sorted(by_market.items()):
+            market_registry = ModelArtifactRegistry(Path(base_root) / market)
+            artifact = train_live_short_horizon_model(
+                market_rows,
+                registry=market_registry,
+                minimum_examples=minimum_examples,
+                minimum_positive_labels=minimum_positive_labels,
+                minimum_negative_labels=minimum_negative_labels,
+                force_live_ineligible_reason=(
+                    None if market_rows else "NO_COLLECTED_LIVE_FEATURE_FRAMES"
+                ),
+            )
+            summary[market] = {
+                "artifact_id": artifact.get("artifact_id"),
+                "row_count": len(market_rows),
+                "live_eligible": artifact.get("live_eligible"),
+                "metrics": artifact.get("metrics"),
+                "root": str(market_registry.root),
+            }
+    except Exception as exc:  # noqa: BLE001 - the combined model must still ship.
+        summary["error"] = f"{type(exc).__name__}:{exc}"
+    return summary
 
 
 def _train_live_short_horizon_from_collected_features_unlocked(
@@ -323,6 +473,11 @@ def _train_live_short_horizon_from_collected_features_unlocked(
                 len(incremental_rows) if training_mode == "incremental" else len(rows)
             ),
             "cumulative_example_count": len(rows),
+            # The regime the fit was conditioned on. ``model_staleness`` compares it
+            # against the live regime and demotes the artifact on a mismatch, which
+            # is what stops a model fitted in a calm tape from serving a repricing.
+            "macro_regime": _current_macro_regime(),
+            "label_basis": _label_barriers()[3],
             "trained_observation_ids": [
                 _training_row_key(row) for row in rows
             ],
@@ -414,9 +569,13 @@ def build_live_training_rows_from_feature_journal(
             continue
         by_symbol[str(frame.get("symbol") or "")].append(frame)
 
-    horizon_seconds = _label_horizon_seconds()
-    take_profit_bps = _label_take_profit_bps()
-    stop_loss_bps = _label_stop_loss_bps()
+    take_profit_bps, stop_loss_bps, horizon_seconds, label_basis = _label_barriers()
+    per_strategy = _per_strategy_labels_enabled()
+    strategy_geometries: dict[str, Any] = {}
+    if per_strategy:
+        from app.strategy.exit_geometry import label_geometries
+
+        strategy_geometries = dict(label_geometries())
 
     rows: list[dict[str, Any]] = []
     for symbol, symbol_frames in by_symbol.items():
@@ -450,20 +609,79 @@ def build_live_training_rows_from_feature_journal(
             if labelled is None:
                 continue
             label, forward_net_return_bps, gross_forward_return_bps, label_source = labelled
-            rows.append(
-                {
-                    "features": features,
-                    "label": label,
-                    "forward_net_return_bps": forward_net_return_bps,
-                    "gross_forward_return_bps": gross_forward_return_bps,
-                    "label_source": label_source,
-                    "ticker": symbol,
-                    "as_of": str(current.get("decision_time") or ""),
-                    "source": str(journal_path),
-                    "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
-                }
-            )
+            row = {
+                "features": features,
+                "label": label,
+                "forward_net_return_bps": forward_net_return_bps,
+                "gross_forward_return_bps": gross_forward_return_bps,
+                "label_source": label_source,
+                "label_basis": label_basis,
+                "ticker": symbol,
+                # Market is recorded on every row so the trainer can fit KR and US
+                # separately. Mixing them puts a ~28bps-cost population and a
+                # ~60-87bps-cost population in one regression, which distorts the
+                # expected-net-return head for both.
+                "market": _row_market(symbol),
+                "as_of": str(current.get("decision_time") or ""),
+                "source": str(journal_path),
+                "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+            }
+            if strategy_geometries:
+                row["strategy_labels"] = _per_strategy_labels(
+                    ordered,
+                    times,
+                    prices,
+                    index,
+                    strategy_geometries,
+                )
+            rows.append(row)
     return _market_adjust_rows(rows)
+
+
+def _row_market(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    return "KR" if text.isdigit() and len(text) == 6 else "US"
+
+
+def _per_strategy_labels(
+    ordered: list[dict[str, Any]],
+    times: list[datetime | None],
+    prices: list[float | None],
+    index: int,
+    geometries: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """One triple-barrier label per strategy, using ITS OWN exit geometry.
+
+    This is the fix for the label/execution mismatch: ``intraday_momentum`` is
+    labelled against -22/+100bps over 1800s and ``ofi_microprice_exhaustion_reversal``
+    against -28/+90bps over 900s, because those are the rules that will actually
+    close the trade.
+    """
+    labels: dict[str, dict[str, Any]] = {}
+    for strategy_id, geometry in geometries.items():
+        barriers = geometry.as_label_barriers()
+        labelled = _triple_barrier_label(
+            ordered,
+            times,
+            prices,
+            index,
+            horizon_seconds=barriers["horizon_seconds"],
+            take_profit_bps=barriers["take_profit_bps"],
+            stop_loss_bps=barriers["stop_loss_bps"],
+        )
+        if labelled is None:
+            continue
+        label, net_bps, gross_bps, source = labelled
+        labels[strategy_id] = {
+            "label": label,
+            "forward_net_return_bps": net_bps,
+            "gross_forward_return_bps": gross_bps,
+            "label_source": source,
+            "take_profit_bps": barriers["take_profit_bps"],
+            "stop_loss_bps": barriers["stop_loss_bps"],
+            "horizon_seconds": barriers["horizon_seconds"],
+        }
+    return labels
 
 
 def _market_adjust_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

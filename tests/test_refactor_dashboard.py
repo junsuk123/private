@@ -13,6 +13,7 @@ from app.refactor_dashboard import (
     build_strategy_market_stream,
     build_strategy_market_view,
 )
+from app.strategy.catalog import STRATEGY_IDS
 from app.web_account_routes import create_account_router
 
 
@@ -327,7 +328,7 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
         "volume",
         "vwap_deviation",
     }
-    assert len(trace["algorithms"]) == 8
+    assert len(trace["algorithms"]) == len(STRATEGY_IDS)
     assert next(
         algorithm
         for algorithm in trace["algorithms"]

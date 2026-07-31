@@ -330,3 +330,146 @@ legacy 저널과 idempotency 파일은 롤백/비교를 위해 손대지 않습�
 ![Before/after net-profitability gate](diagrams/profitability_before_after.svg)
 
 리팩터 전에는 방향성 신호 강도만으로 BUY가 나갈 수 있었고, 비용 검사가 여러 곳에 흩어져 gross는 양수인데 net은 음수인 거래가 반복됐습니다. 리팩터 후에는 하나의 순수익 게이트와 하나의 청산 정책이 그 판단을 독점합니다. 리플레이 지표는 [validation.md](validation.md)에 있습니다.
+
+## 9. 레짐 변화 대응: 변화점 감지, 고변동성 세분화, 보수적 선택기
+
+2026년 7월 KOSPI 급락(하루 -10.84%, 장중 서킷브레이커)과 이후 반등 구간에서 드러난 문제는
+"전략 종류가 부족하다"가 아니라 **비용 차감 후 순수익 기대값이 거의 모든 전략에서 음수로
+측정되는데도 시스템이 그것을 표현할 수 없다**는 것이었습니다. 다음 다섯 가지가 그 표현 수단입니다.
+
+### 9.1 BOCPD 변화점 감지 — `app.graph.change_point`
+
+전략을 점수화하기 **전에** "지금 모델과 누적 성과 이력을 계속 믿어도 되는가"를 먼저 묻습니다.
+Adams & MacKay(2007) 방식의 온라인 베이즈 변화점 감지를 채널별로 돌립니다.
+
+* 채널을 원 스케일로 넣으면 사전분포가 데이터보다 수십 배 평평해 성장 분기가 항상 이겨
+  `P(run length = 0)`이 hazard에 고정됩니다(= 아무것도 감지하지 못함). 따라서 각 채널을
+  **인과적 z-score로 표준화**한 뒤 필터에 넣습니다.
+* 감지 통계량은 `P(run length = 0)`이 아니라 **`P(run length <= k)`** 입니다. 급변 직후
+  살아남는 확률질량은 run length 0이 아니라 1로 옮겨가므로, 전자로는 영원히 감지되지 않습니다.
+* 채널 결합은 뉴스 쇼크와 동일한 **corroboration 규칙**(기본 2개 채널)입니다. 최대값을 쓰면
+  노이즈 채널 하나가 전체 매수를 멈출 수 있고, 평균을 쓰면 단일 요인 급변이 보이지 않습니다.
+
+출력(`change_point_probability`, `regime_stability`, `current_regime_age_seconds`)은 macro
+sub-regime 분류, bandit의 이력 할인, 모델 만료 판정에 쓰입니다. 감지된 급변은 신규 진입을
+중단시키고, 새 레짐이 안정되면 자동으로 해제됩니다(영구 정지가 아님).
+
+### 9.2 고변동성 4분할 — `app.graph.macro_reasoner`
+
+기존에는 `HIGH_VOLATILITY_RISK` 하나가 모든 신규 매수를 차단했습니다. 변동성 **수준**만 보고
+**이유**를 보지 않았기 때문에, 유일하게 변동폭이 있던 세션마다 구조적으로 거래가 불가능했습니다.
+
+| sub-regime | 판정 근거 | 허용 |
+| --- | --- | --- |
+| `HIGH_VOL_DISLOCATED` | spread percentile ≥ 0.9 **또는** 평균 상관 ≥ 0.85 **또는** 변화점 확률 ≥ 0.5 | 매도/축소만 (`BLOCK_BUY`) |
+| `HIGH_VOL_RECOVERY` | 지수 상승 + 시장 폭 ≥ 0.55 + 외국인 수급 회복 | 상대강도·VWAP 회귀 (소규모 탐색) |
+| `HIGH_VOL_TRENDING` | \|지수 추세\| ≥ 0.004 + 일방적 시장 폭 | 상대강도·확인된 모멘텀 |
+| `HIGH_VOL_MEAN_REVERTING` | \|지수 추세\| < 0.004 + 호가 정상 | 정규화 회귀 계열 |
+| `HIGH_VOLATILITY_RISK` | 분류에 필요한 시장 맥락 부족 | 매도/축소만 (`BLOCK_BUY`) |
+
+분류 순서가 중요합니다. **dislocation을 먼저** 검사하므로, 호가가 사라진 시장이 지수가 평평하다는
+이유로 "좋은 평균회귀 기회"로 재분류되지 않습니다. `classify_high_volatility_subregimes: false`로
+이전 단일 상태 동작을 복원할 수 있습니다.
+
+### 9.3 보수적 contextual bandit — `app.trading.conservative_bandit`
+
+선택 규칙이 **평균이 아니라 하단 신뢰한계**로 바뀌었고, `no_trade`가 실제 arm입니다.
+
+```
+ConservativeEdge = posterior_expected_net_bps - uncertainty_penalty_bps
+admissible       = ConservativeEdge > 0
+```
+
+불확실성 페널티는 (1) 실현 표본 수·분산·연속 손실, (2) `change_point_probability`에 의한
+유효 표본 수 할인, (3) dislocation/저유동성/맥락 불명에 대한 명시적 가산으로 구성됩니다.
+
+**Cold-start 탐색이 반드시 필요합니다.** 비관만으로는 이력이 없을 때 모든 arm이 큰 페널티를
+받아 아무것도 선택되지 않고, 그래서 이력이 영원히 쌓이지 않는 교착이 발생합니다. 따라서 표본이
+`cold_start_max_sample_count` 이하이고 **연속 손실이 없는** arm은 전방 기대값만으로 선택될 수
+있으며, `is_exploration=True`로 표시되어 최소 비중으로 다뤄집니다. 결정적인 비대칭은
+**이미 음수로 측정된 arm은 탐색 대상이 아니라는 것**입니다 — 그 arm은 이미 답을 내놓았습니다.
+
+실현 결과는 포지션이 flat이 되는 순간 `app.trading.strategy_performance_store`에 기록됩니다.
+같은 저장소가 `SharedLiveDecisionEngine`의 `recent_performance` / `recent_same_strategy_loss`를
+공급합니다 — 두 값은 이전까지 각각 `0.0`과 `False` 리터럴이어서 온라인 피드백 경로가 죽어 있었습니다.
+
+### 9.4 CostCoverageRatio — `app.cost.cost_coverage`
+
+```
+CostCoverageRatio = predicted_gross_edge_bps / expected_all_in_cost_bps
+```
+
+`max_cost_to_alpha_ratio: 1.05`는 비용이 알파를 **초과**하는 거래까지 허용합니다. 두 항 모두
+추정치이므로 등호는 기대값 기준 손실입니다. 밴드: `<1.0` 미회수, `1.0~1.3` 오차범위 내(거래 안 함),
+`1.3~1.7` 얇음(shadow 또는 최소 비중), `>=1.7` 진입 후보. 라이브 정책은
+`min_cost_coverage_ratio: 1.3`을 하드 거부선으로 쓰고(`COST_COVERAGE_INSUFFICIENT`),
+내장 기본값은 1.0으로 두어 설정 없이는 동작이 바뀌지 않습니다.
+
+### 9.5 모델 만료 — `app.models.model_staleness`
+
+챌린저가 실패하면 이전 적격 모델이 계속 서빙되던 구조는 파일 안전에는 맞지만 레짐 변화에는
+틀립니다. 실제로 4개 종목·722 예제로 적합된 incumbent(AUC 0.84)가, 23개 종목·8,126 예제에서
+AUC 0.49 / 상위 25개 -54bp를 측정한 챌린저들이 반복 실패하는 동안 계속 라이브였습니다.
+
+이제 다음 중 하나라도 성립하면 `shadow_only`로 강등됩니다: 나이 초과, feature drift 초과,
+**최근 N개 챌린저가 모두 음수**, 학습 레짐과 현재 레짐 불일치, 생성 시각 불명(불명은 신선함이
+아닙니다). 아티팩트는 감사를 위해 디스크에 남고, `LIVE_MODEL_ENFORCE_STALENESS=false`로
+강제 해제할 수 있습니다.
+
+### 9.6 라벨과 실행 규칙 정렬 — `app.strategy.exit_geometry`
+
+공용 라벨은 `TP=25bps / SL=100bps / 600s`였고 실제 실행은 `-22bps / +100bps / 1800s`였습니다.
+**방향이 반대**입니다: "25bps 반등 후 하락"은 학습상 성공이고 실행상 손절입니다. 즉 모델은
+실행기가 손실을 내는 패턴을 찾도록 보상받고 있었습니다.
+
+이제 stop/target/trailing/보유시간 표가 하나(`exit_geometry`)이며, 세션·experts·학습 라벨이
+모두 그것을 읽습니다. 전략별 라벨은 `LIVE_LABEL_PER_STRATEGY=true`, 이전 동작은
+`LIVE_LABEL_STRATEGY=legacy`입니다. 학습 행에는 `market`이 기록되어 KR(왕복 ~28bp)과
+US(~60-87bp)를 분리 적합합니다(`LIVE_MODEL_SPLIT_BY_MARKET`).
+
+
+## 10. 진입 차단 지점 진단 (2026-07-31)
+
+![신규 진입 차단 체인](diagrams/entry_blockade_chain.svg)
+
+11,614 사이클 동안 체결이 0건이었고, 표시된 사유는 계속 `NO_POSITIVE_NET_GNN_EDGE`였습니다.
+실제로는 **서로 독립적인 세 가지**가 동시에 막혀 있었고, 마지막으로 실패한 계층의 코드 하나만
+노출되는 구조 때문에 원인이 GNN으로 잘못 지목되고 있었습니다.
+
+### 10.1 시장 세션 — `allows_new_entry`
+
+`is_market_fully_closed()`가 False라는 이유로 "거래 가능"으로 읽고 있었습니다. 그러나 측정값은:
+
+| 종목 | 분당 거래량 | 스프레드 | liquidity_score |
+|---|---:|---:|---:|
+| F (미국 애프터마켓 23:4x UTC) | 2주 | 33.6bp | 0.00002 |
+
+이 데이터에서 모든 후보가 `LOW_LIQUIDITY_TECHNICAL_BLOCK` / `hold`로 귀결됐고, 그 결과 선택
+계층에 **BUY intent가 하나도 도달하지 않았습니다.** `allows_new_entry()`는 신규 진입을
+**정규장으로 한정**하고, 막힌 이유를 `NEW_ENTRY_OUTSIDE_REGULAR_SESSION:US=after`처럼 위상과
+함께 보고합니다. 판정은 **스캔 중인 종목의 시장 기준**입니다 — 국내 장중에 미국 종목만 스캔하는
+상황에서 "장이 열렸다"는 말은 의미가 없기 때문입니다. 청산은 이 게이트의 영향을 받지 않습니다.
+`TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true`로 이전 동작을 복원할 수 있습니다.
+
+### 10.2 GNN 권한 순환 교착
+
+`/api/gnn/realtime-trust` 측정값: 모델 단위 신뢰는 통과(`score 0.83`, `sample_count 152`)하지만
+전 전략이 `entry_authorized: false`, 단계는 `CALIBRATED_AWAITING_POSITIVE_EDGE`였습니다.
+`breakout_volume`은 `minimum_positive_prediction_samples: 5`를 요구하는데 `trade_sample_count: 1`.
+
+**체결해야 권한이 생기고, 권한이 있어야 체결한다** — §9.3의 cold-start 교착과 같은 구조가
+GNN 권한 계층에도 있었습니다. 보수적 bandit이 `require_live_gnn`을 절대 거부권이 아니라
+불확실성 감점으로 바꾸면서 이 고리가 끊깁니다.
+
+### 10.3 진단 표면 — ENTRY BLOCKADE 체인
+
+`GET /api/realtime-trading/entry-blockade`가 순서 있는 체인을 반환하고 `/account` 상단 패널이
+이를 렌더링합니다.
+
+```text
+엔진 실행 → 라이브 무장 → 시장 세션 → 매수 후보 → 마이크로 전략 → 전략 선택 → 포지션
+```
+
+**처음 막힌 단계가 답**이며, 그 뒤 단계는 "실패"가 아니라 "도달하지 않음"으로 흐리게 표시됩니다.
+셋이 동시에 깨져 있었으므로 앞 단계를 고쳐야 다음 원인이 드러납니다 — 한 번에 하나씩만 보이는
+구조 자체가 이 진단 패널이 필요한 이유입니다.

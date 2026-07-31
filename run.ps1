@@ -1,5 +1,11 @@
 param(
-  [switch]$Headless
+  [switch]$Headless,
+  # Stop a running server even when it is holding a position. A restart discards
+  # the in-memory stop/target/trailing state for an open trade, so this is opt-in.
+  [switch]$ForceRestart,
+  # Skip the graceful request entirely and kill immediately (last resort, e.g. the
+  # server is hung and not answering HTTP).
+  [switch]$HardKill
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,8 +20,8 @@ function Set-RunEnv($Name, $Value) {
   [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
 }
 
-function Stop-ExistingLocalAppServers {
-  $processIdsToStop = New-Object 'System.Collections.Generic.HashSet[int]'
+function Get-LocalAppServerListeners {
+  $listeners = @()
   $connections = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
     Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") -and $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 }
   foreach ($connection in $connections) {
@@ -27,32 +33,138 @@ function Stop-ExistingLocalAppServers {
     $isPython = $command.Contains("python.exe") -or $command.Contains("python ")
     $isLocalApp = $command.Contains("run.py")
     if ($isPython -and $isLocalApp) {
-      Write-Host "Stopping existing local app server on port $($connection.LocalPort) (PID $ownerProcessId)"
-      [void]$processIdsToStop.Add([int]$ownerProcessId)
-      if ($process.ParentProcessId) {
-        $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)" -ErrorAction SilentlyContinue
-        if ($parent -and $parent.CommandLine) {
-          $parentCommand = $parent.CommandLine.ToLowerInvariant()
-          $parentIsPython = $parentCommand.Contains("python.exe") -or $parentCommand.Contains("python ")
-          $parentIsLocalApp = $parentCommand.Contains("run.py")
-          if ($parentIsPython -and $parentIsLocalApp) {
-            [void]$processIdsToStop.Add([int]$parent.ProcessId)
-          }
-        }
+      $listeners += [pscustomobject]@{
+        Port      = [int]$connection.LocalPort
+        ProcessId = [int]$ownerProcessId
+        ParentId  = if ($process.ParentProcessId) { [int]$process.ParentProcessId } else { 0 }
       }
     }
   }
+  return $listeners
+}
 
+function Test-PortRangeFree {
+  $stillListening = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+    Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") -and $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 }
+  return (-not $stillListening)
+}
+
+function Stop-LocalAppServerProcessTree {
+  param([pscustomobject]$Listener)
+
+  $processIdsToStop = New-Object 'System.Collections.Generic.HashSet[int]'
+  [void]$processIdsToStop.Add($Listener.ProcessId)
+  # run.py spawns a child that owns the socket; killing only one leaves an orphan
+  # holding the port, which then looks like "the new server failed to bind".
+  if ($Listener.ParentId) {
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($Listener.ParentId)" -ErrorAction SilentlyContinue
+    if ($parent -and $parent.CommandLine) {
+      $parentCommand = $parent.CommandLine.ToLowerInvariant()
+      $parentIsPython = $parentCommand.Contains("python.exe") -or $parentCommand.Contains("python ")
+      if ($parentIsPython -and $parentCommand.Contains("run.py")) {
+        [void]$processIdsToStop.Add([int]$parent.ProcessId)
+      }
+    }
+  }
   foreach ($processIdToStop in $processIdsToStop) {
     Stop-Process -Id $processIdToStop -Force -ErrorAction SilentlyContinue
   }
+}
 
-  for ($attempt = 0; $attempt -lt 20; $attempt++) {
-    $stillListening = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-      Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") -and $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 }
-    if (-not $stillListening) { return }
+function Stop-ExistingLocalAppServers {
+  <#
+    Replace a running server WITHOUT force-killing it.
+
+    A force kill terminates the realtime trading engine mid-cycle and the SQLite
+    writers mid-operation. Worse, it silently abandons the in-memory exit state of
+    an open position -- the armed stop, target, trailing high-watermark and holding
+    clock. The broker keeps the position; nothing is left managing it.
+
+    So: ask the server whether stopping is safe, ask it to stop itself, wait, and
+    only force-kill if it will not go. Force-kill remains available because a hung
+    server that cannot answer HTTP must still be replaceable.
+  #>
+  $listeners = Get-LocalAppServerListeners
+  if (-not $listeners) { return $true }
+
+  foreach ($listener in $listeners) {
+    $base = "http://127.0.0.1:$($listener.Port)"
+    Write-Host "Found existing local app server on port $($listener.Port) (PID $($listener.ProcessId))"
+
+    if ($HardKill) {
+      Write-Host "  -HardKill: skipping the graceful request and terminating now."
+      Stop-LocalAppServerProcessTree -Listener $listener
+      continue
+    }
+
+    # 1. Is stopping safe? The server fails this check closed, so an unreadable
+    #    account reports unsafe rather than "probably fine".
+    $safe = $false
+    $safetyKnown = $false
+    try {
+      $safety = Invoke-RestMethod -Uri "$base/api/system/restart-safety" -TimeoutSec 20
+      $safetyKnown = $true
+      $safe = [bool]$safety.safe
+      if (-not $safe) {
+        Write-Host "  Restart is NOT safe: $($safety.reasons -join ', ')"
+        if ($null -ne $safety.holdings_count) {
+          Write-Host "  Holdings: $($safety.holdings_count) $(if ($safety.positions) { '(' + ($safety.positions -join ', ') + ')' })"
+        }
+      }
+    } catch {
+      Write-Host "  Could not read restart safety ($($_.Exception.Message))."
+    }
+
+    if ($safetyKnown -and -not $safe -and -not $ForceRestart) {
+      Write-Host ""
+      Write-Host "ABORTING: the running server is holding managed state." -ForegroundColor Yellow
+      Write-Host "Restarting now would leave an open position with no stop, target or" -ForegroundColor Yellow
+      Write-Host "trailing logic watching it. Choose one:" -ForegroundColor Yellow
+      Write-Host "  * flatten first, then rerun .\run.ps1" -ForegroundColor Yellow
+      Write-Host "  * keep the current server running (it is already healthy)" -ForegroundColor Yellow
+      Write-Host "  * .\run.ps1 -ForceRestart   (accepts abandoning that state)" -ForegroundColor Yellow
+      return $false
+    }
+
+    # 2. Ask it to stop itself, so workers unwind in order.
+    $graceful = $false
+    try {
+      $query = if ($ForceRestart) { "?force=true" } else { "" }
+      $response = Invoke-RestMethod -Method Post -Uri "$base/api/system/graceful-shutdown$query" -TimeoutSec 30
+      if ($response.ok) {
+        Write-Host "  Graceful shutdown accepted; waiting for the process to exit."
+        $graceful = $true
+      } else {
+        Write-Host "  Graceful shutdown refused: $($response.message)"
+      }
+    } catch {
+      Write-Host "  Graceful shutdown request failed ($($_.Exception.Message))."
+    }
+
+    if ($graceful) {
+      $deadline = (Get-Date).AddSeconds(30)
+      while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Id $listener.ProcessId -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 400
+      }
+    }
+
+    # 3. Force-kill only what refused to leave.
+    if (Get-Process -Id $listener.ProcessId -ErrorAction SilentlyContinue) {
+      Write-Host "  Process did not exit in time; terminating it."
+      Stop-LocalAppServerProcessTree -Listener $listener
+    } else {
+      Write-Host "  Previous server stopped cleanly."
+    }
+  }
+
+  # 4. The port must actually be released before the new server tries to bind.
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    if (Test-PortRangeFree) { return $true }
     Start-Sleep -Milliseconds 250
   }
+  Write-Host "WARNING: a listener is still bound in 8000-8050 after waiting." -ForegroundColor Yellow
+  return $true
 }
 
 function Stop-ProcessTree {
@@ -144,7 +256,13 @@ function Test-ManagedBrowserProfileRunning {
   return [bool]$browserProcesses
 }
 
-Stop-ExistingLocalAppServers
+if (-not (Stop-ExistingLocalAppServers)) {
+  # The running server is holding managed state and -ForceRestart was not given.
+  # Leaving it alone is the safe outcome, so exit without starting a second one.
+  exit 2
+}
+# Safety net for a run.py that is not (yet) listening — mid-boot or hung — and so
+# was invisible to the graceful path above.
 Stop-WorkspaceRunPyProcesses
 
 Set-DefaultEnv "PYTHONPATH" "src"
@@ -222,6 +340,12 @@ Set-DefaultEnv "GNN_TRUST_HORIZON_SECONDS" "1800"
 Set-DefaultEnv "STRATEGY_SESSION_MIN_NET_TARGET_BPS" "25"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.0"
 Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"
+# 세션 앵커: 로테이션에서 제외하고 장 내내 유지하는 소수 종목.
+# 세션 구조 전략(market_intraday_momentum)은 같은 종목의 09:00-09:30과 14:50-15:20을
+# 동시에 필요로 하는데, 수집기는 300초마다 종목을 교체한다. 실측: 저장된 KRX
+# 360 심볼-일 중 두 구간을 모두 가진 것이 단 2건이어서 평가 자체가 불가능했다.
+Set-DefaultEnv "REALTIME_SESSION_ANCHOR_SYMBOLS" "005930,000660"
+Set-DefaultEnv "REALTIME_SESSION_ANCHOR_MAX" "2"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_LIMIT" "360"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC" "180"
 Set-DefaultEnv "REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE" "40"
@@ -321,6 +445,14 @@ Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
 Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "60"
+# 투자자별 매매동향(개인/외국인/기관 순매수) 일일 갱신. KIS는 이 값을 영업일 단위로만
+# 제공하고, residual_relative_strength는 이 정보를 필수 조건으로 쓴다. 갱신이 멈추면
+# 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
+# 6시간 주기인 이유: 당일 수치는 장중 계속 변하므로 24시간 주기면 정작 필요한
+# 당일 데이터가 하루 대부분 낡은 상태로 남는다. 읽기 전용 조회만 사용한다.
+Set-DefaultEnv "AUTO_START_INVESTOR_FLOW_REFRESH" "true"
+Set-DefaultEnv "INVESTOR_FLOW_REFRESH_SECONDS" "21600"
+Set-DefaultEnv "INVESTOR_FLOW_MINIMUM_BARS" "100"
 Set-DefaultEnv "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED" "true"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
@@ -342,6 +474,20 @@ Set-DefaultEnv "EXEC_REQUIRE_FRESH_ORDERBOOK_FOR_BUY" "true"
 Set-DefaultEnv "EXEC_MAX_ORDERBOOK_AGE_SEC" "3.0"
 Set-DefaultEnv "EXEC_UNKNOWN_SPREAD_PENALTY_RATE" "0.006"
 Set-DefaultEnv "EXEC_BUY_MAX_CHASE_BPS" "20"
+# --- 진입 체결 방식: 스프레드를 지불하지 않고 게시한다 -------------------------
+# 기존에는 매수를 best_ask에, 매도를 best_bid에 넣어 왕복 스프레드 전액을 지불했다.
+# 실측 KRX 스프레드는 13~50bps(005930 약 19bps)인데 비용 모델의 spread_rate는 0이고
+# 학습 라벨은 신호봉 종가 체결을 가정한다 — 즉 모델이 채점한 체결가를 실행이 한 번도
+# 시도하지 않고 있었다. 전략 플랜 자체도 passive_limit을 선언하고 있었다.
+#
+# 진입은 미체결이면 그냥 거래를 안 하는 것이므로 비용이 0이다. gross 엣지가 ~0인
+# 상황에서는 -19bps로 거래하는 것보다 거래하지 않는 편이 낫다. 그래서 기본 ON.
+Set-DefaultEnv "EXEC_PASSIVE_ENTRY" "true"
+Set-DefaultEnv "EXEC_PASSIVE_ENTRY_OFFSET_TICKS" "0"
+# 익절은 다르다. 미체결이면 계속 보유하는 것이고 열린 수익을 반납할 위험이 실재한다.
+# 그래서 기본 OFF이며, 켤 경우 트레일링/시간청산이 대기 리스크의 상한이 된다.
+Set-DefaultEnv "EXEC_PASSIVE_TAKE_PROFIT" "false"
+# 손절/하드스톱/긴급 매도는 절대 passive로 바뀌지 않는다(미체결 손절 = 무한 손실).
 # Urgent stops still exit without a book (discounted reference price); non-urgent
 # no-book sells are held.
 Set-DefaultEnv "EXEC_ALLOW_NO_ORDERBOOK_EMERGENCY_SELL" "true"
@@ -431,8 +577,32 @@ try {
     Stop-ProcessTree -RootProcessId ([int]$browser.Id)
   }
   if ($server -and -not $server.HasExited) {
-    Stop-ProcessTree -RootProcessId ([int]$server.Id)
+    # Our own server gets the same courtesy as one we are replacing: ask it to
+    # unwind its trading engine and feeds before the process dies. This path runs
+    # when the managed browser closes or on Ctrl+C, which is the ordinary way this
+    # server is stopped -- so it must not be the one path that kills it hard.
+    #
+    # force=true here on purpose: the operator has already decided to stop, and a
+    # refusal at this point would leave the process running after "Local app
+    # stopped." was printed, which is worse than an acknowledged unsafe stop.
+    try {
+      Invoke-RestMethod -Method Post -Uri "$url/api/system/graceful-shutdown?force=true" -TimeoutSec 20 | Out-Null
+      $deadline = (Get-Date).AddSeconds(25)
+      while ((Get-Date) -lt $deadline -and -not $server.HasExited) {
+        Start-Sleep -Milliseconds 400
+      }
+    } catch {
+      Write-Host "Graceful stop request failed ($($_.Exception.Message)); terminating."
+    }
+    if (-not $server.HasExited) {
+      Stop-ProcessTree -RootProcessId ([int]$server.Id)
+    }
   }
-  Stop-ExistingLocalAppServers
+  # Whatever is still bound after that is not ours to negotiate with.
+  if (-not (Test-PortRangeFree)) {
+    foreach ($listener in Get-LocalAppServerListeners) {
+      Stop-LocalAppServerProcessTree -Listener $listener
+    }
+  }
   Write-Host "Local app stopped."
 }

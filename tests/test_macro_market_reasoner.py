@@ -51,11 +51,120 @@ class TestRegimeClassification:
         assert "sell" in r.allowed_micro_strategies
         assert "weak_breakout_buy" in r.blocked_micro_strategies
 
-    def test_high_volatility_blocks_buy(self):
-        r = _reasoner().reason(_inp(market_volatility=0.05))
+    def test_unclassifiable_high_volatility_blocks_buy(self):
+        # No index trend and no breadth: volatility is high but nothing says WHY,
+        # so the conservative single-state behaviour is the honest answer.
+        r = _reasoner().reason(
+            _inp(market_volatility=0.05, index_snapshots={}, market_breadth=None)
+        )
         assert r.market_regime == MarketRegime.HIGH_VOLATILITY_RISK
         assert r.macro_risk_level == MacroRiskLevel.BLOCK_BUY
+        assert r.blocks_buy
         assert r.candidate_symbols == ()  # blocked-buy selects no new candidates
+
+    def test_high_volatility_subregime_classification_is_not_a_blanket_ban(self):
+        # High volatility is four different market states, not one. Only the
+        # dislocated (and unclassifiable) case bans every new buy; the others
+        # narrow the allow-list instead.
+        dislocated = _reasoner().reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": -0.02}},
+                market_breadth=0.1,
+                spread_percentile=0.95,
+            )
+        )
+        assert dislocated.market_regime == MarketRegime.HIGH_VOL_DISLOCATED
+        assert dislocated.blocks_buy
+        assert dislocated.candidate_symbols == ()
+
+        trending = _reasoner().reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": -0.02}},
+                market_breadth=0.2,
+                spread_percentile=0.4,
+                average_market_correlation=0.5,
+            )
+        )
+        assert trending.market_regime == MarketRegime.HIGH_VOL_TRENDING
+        assert not trending.blocks_buy
+        # A weak tape can still support stock-specific strength, never a dip buy.
+        assert "relative_strength" in trending.allowed_micro_strategies
+        assert "mean_reversion" in trending.blocked_micro_strategies
+
+        mean_reverting = _reasoner().reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": 0.0005}},
+                market_breadth=0.5,
+                spread_percentile=0.4,
+                average_market_correlation=0.5,
+            )
+        )
+        assert mean_reverting.market_regime == MarketRegime.HIGH_VOL_MEAN_REVERTING
+        assert "vwap_reversion" in mean_reverting.allowed_micro_strategies
+        assert "momentum" in mean_reverting.blocked_micro_strategies
+
+        recovery = _reasoner().reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": 0.01}},
+                market_breadth=0.7,
+                breadth_momentum=0.2,
+                spread_percentile=0.4,
+                average_market_correlation=0.5,
+            )
+        )
+        assert recovery.market_regime == MarketRegime.HIGH_VOL_RECOVERY
+        assert not recovery.blocks_buy
+        assert recovery.candidate_symbols  # exploratory long risk is permitted
+
+    def test_detected_change_point_blocks_entry_in_high_volatility(self):
+        r = _reasoner().reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": 0.0005}},
+                market_breadth=0.5,
+                change_point_probability=0.9,
+            )
+        )
+        assert r.market_regime == MarketRegime.HIGH_VOL_DISLOCATED
+        assert r.blocks_buy
+        assert "MACRO_CHANGE_POINT_BLOCKS_ENTRY" in r.reason_codes
+
+    def test_high_volatility_single_state_mode_is_restorable(self):
+        reasoner = MacroMarketReasoner(
+            MacroReasonerConfig(classify_high_volatility_subregimes=False)
+        )
+        r = reasoner.reason(
+            _inp(
+                market_volatility=0.05,
+                index_snapshots={"KOSPI": {"trend": 0.01}},
+                market_breadth=0.7,
+            )
+        )
+        assert r.market_regime == MarketRegime.HIGH_VOLATILITY_RISK
+        assert r.blocks_buy
+
+    def test_within_sector_rank_uses_residual_returns_not_global_rank(self):
+        r = _reasoner().reason(
+            _inp(
+                provenance={
+                    "sector_of": {"005930": "semi", "000660": "semi", "035720": "internet"}
+                },
+                symbol_residual_returns={"005930": 0.004, "000660": 0.001, "035720": 0.02},
+                symbol_long_residual_returns={"005930": 0.006, "000660": 0.002},
+            )
+        )
+        table = r.sector_rank_table
+        # Ranked WITHIN the sector by residual strength, not by any global ordering.
+        assert table.rank_for("005930") == (1, 2)
+        assert table.rank_for("000660") == (2, 2)
+        # A sector with a single tracked name cannot answer "strongest in sector",
+        # so it returns None and the consuming algorithm fails closed.
+        assert table.rank_for("035720") is None
+        assert table.long_residual_for("005930") == 0.006
 
     def test_news_shock_blocks_buy(self):
         r = _reasoner().reason(

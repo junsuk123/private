@@ -168,11 +168,34 @@ class ExecutionQualityEngine:
 
         execution_adjusted_net = float(request.net_expected_return) - expected_slippage_rate
 
-        # Side-aware limit price: a BUY caps at the ask (do not chase above it); a SELL
-        # posts at the bid (marketable to buyers). The authoritative executable price is
-        # produced by ExecutionPricingPolicy; this mirrors it for the assessment record.
+        # Side-aware limit price for the assessment RECORD. The authoritative price is
+        # produced by ExecutionPricingPolicy, and this must agree with it: entries now
+        # post passively at the bid, so recording the ask here would file a price the
+        # order never used. A diagnostic that disagrees with what executed is worse
+        # than no diagnostic — it is what made an earlier 40bps display look like a
+        # live target it never was.
         if side == "BUY":
             limit_price = ask if ask > 0 else ref
+            if bid > 0 and ask > 0:
+                from app.execution.order_pricing_policy import (
+                    ENTRY,
+                    ExecutionPricingPolicy,
+                    PricingContext,
+                )
+
+                priced = ExecutionPricingPolicy().price(
+                    PricingContext(
+                        symbol=request.symbol,
+                        side="BUY",
+                        action_reason=ENTRY,
+                        reference_price=ref,
+                        best_bid=bid,
+                        best_ask=ask,
+                        is_domestic=bool(getattr(request, "is_domestic", True)),
+                    )
+                )
+                if priced.priced and priced.limit_price > 0:
+                    limit_price = priced.limit_price
         else:
             limit_price = bid if bid > 0 else ref
 

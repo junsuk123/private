@@ -856,3 +856,88 @@ tbody tr:hover { background: #f8fbff; }
   .mm-ontology-header span { text-align: left; }
   .mm-micro-graph-grid { grid-template-columns: 1fr; }
 }
+
+/* --- Entry blockade panel -------------------------------------------------
+   Ordered diagnosis of why no new position is being opened. The first unmet
+   link is the answer; later links are dimmed because they were never reached,
+   which is different from having failed. */
+.entry-blockade .blockade-headline {
+  margin: 0 0 14px;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.entry-blockade .blockade-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.blockade-step {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-left: 3px solid transparent;
+  background: #f5f7fa;
+}
+.blockade-step.pass {
+  border-left-color: #12b76a;
+}
+.blockade-step.fail {
+  border-left-color: #f04438;
+  background: #fff4f2;
+}
+.blockade-step.unreachable {
+  opacity: 0.45;
+  border-left-color: #d5dce5;
+  background: #fafbfc;
+}
+.blockade-mark {
+  flex: 0 0 auto;
+  width: 20px;
+  text-align: center;
+  font-weight: 700;
+  line-height: 1.4;
+}
+.blockade-step.pass .blockade-mark { color: #12b76a; }
+.blockade-step.fail .blockade-mark { color: #b42318; }
+.blockade-stage {
+  margin: 0;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+.blockade-detail {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  opacity: 0.85;
+}
+.blockade-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.blockade-tag {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #e9eef5;
+  color: #3f5468;
+}
+.entry-blockade .blockade-note {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.75;
+}
+@media (max-width: 640px) {
+  .blockade-step { flex-direction: row; }
+  .blockade-tags { gap: 4px; }
+}

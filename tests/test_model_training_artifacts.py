@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -103,6 +104,9 @@ def _artifact(
     names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
     return {
         "artifact_id": artifact_id,
+        # A real artifact always carries this; without it the staleness check
+        # correctly refuses to serve the model (unknown age is not freshness).
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
         "feature_names": list(names),
         "classification": {"weights": [0.0] * len(names), "bias": 0.0},

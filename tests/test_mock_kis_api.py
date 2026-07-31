@@ -445,6 +445,55 @@ class MockKisApiTest(unittest.TestCase):
         self.assertEqual(portfolio.account.securities_market_value, 142_000)
         self.assertEqual(portfolio.account.equity, 1_142_000)
 
+    def test_kis_portfolio_keeps_orderable_krw_when_domestic_balance_fails(self) -> None:
+        class BalanceFailureTransport(RecordingKisTransport):
+            def request(self, method, url, headers, body=None, params=None, timeout=10.0):
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-balance"):
+                    self.calls.append(
+                        {
+                            "method": method,
+                            "url": url,
+                            "headers": dict(headers),
+                            "body": dict(body or {}),
+                            "params": dict(params or {}),
+                        }
+                    )
+                    return {"rt_cd": "1", "msg1": "domestic balance temporarily unavailable"}
+                if url.endswith("/uapi/domestic-stock/v1/trading/inquire-psbl-order"):
+                    self.calls.append(
+                        {
+                            "method": method,
+                            "url": url,
+                            "headers": dict(headers),
+                            "body": dict(body or {}),
+                            "params": dict(params or {}),
+                        }
+                    )
+                    return {
+                        "rt_cd": "0",
+                        "output": {
+                            "ord_psbl_cash": "100002",
+                            "nrcvb_buy_amt": "99504",
+                        },
+                    }
+                return super().request(method, url, headers, body, params, timeout)
+
+        broker = KisDevelopersApiClient(
+            app_key="live-app",
+            app_secret="live-secret",
+            account_no="12345678-01",
+            paper=False,
+            enabled=True,
+            transport=BalanceFailureTransport(),
+            access_token="token",
+        )
+
+        portfolio = broker.get_portfolio()
+
+        self.assertEqual(portfolio.account.cash, 0)
+        self.assertEqual(portfolio.account.cash_by_currency["KRW"], 0)
+        self.assertEqual(portfolio.account.orderable_cash_by_currency["KRW"], 99_504)
+
     def test_kis_portfolio_reads_domestic_balance_continuation_pages(self) -> None:
         class PagedDomesticBalanceTransport(RecordingKisTransport):
             def request(self, method, url, headers, body=None, params=None, timeout=10.0):

@@ -29,12 +29,14 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 - KIS 실계좌 읽기, 잔고/현금/보유종목 스냅샷 갱신
 - KIS 실시간 체결가/호가 수집과 브로커 quote 갱신
 - 실시간 feature frame 생성과 live short-horizon 모델 주기 학습
-- 온톨로지 허용 전략 안에서 8개 strategy-utility R-GCN 후보 평가
+- 온톨로지 허용 전략 안에서 11개 strategy-utility R-GCN 후보 평가
 - 전략별 실시간 forward 검증과 `calibrated`/`entry_authorized` 권한 분리
 - 독립 실시간 자동거래 루프 시작
 - SELL/REDUCE 평가를 BUY보다 먼저 실행
 - 기존 미체결 SELL 주문은 의미 있는 가격 변화가 있을 때만 정정, 아니면 유지
 - BUY는 현금, spread, 유동성, quote freshness, 온톨로지/런타임 근거, 순수익 게이트, 리스크 게이트를 모두 통과해야 제출
+- **신규 진입은 정규장에서만** — 시간외 호가(예: 미국 애프터마켓의 분당 2주 · 스프레드 33bp)로는 진입하지 않습니다. 청산은 시간외에도 계속 동작합니다.
+- **전략 선택은 보수적 하단값 기준** — `no_trade`가 실제 선택지이며, 측정된 순엣지 하단이 양수인 전략이 없으면 거래하지 않습니다.
 
 **Windows 기본값은 live-capable입니다.** `run.ps1`은 `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`, `AUTO_START_REALTIME_TRADING=true`를 프로세스 환경에 설정합니다. 안전성은 live flag를 끄는 방식이 아니라 계좌/시장 데이터 신뢰도와 최종 게이트에서 확보합니다. 끄는 방법은 [docs/live_trading.md](docs/live_trading.md)에 있습니다.
 
@@ -65,6 +67,7 @@ python scripts/live_readiness_check.py
 운영 중심 화면은 `/account`입니다. 루트 화면(`/`)에는 연구/진단/수동 실행 기능이 남아 있습니다.
 
 - `/account` — 온톨로지 전략 트레이딩 터미널. 온톨로지 후보와 선택 알고리즘, 실시간 1분봉·MA5·MA20·VWAP·거래량, 전략 stop/target, 호가 불균형을 표시합니다. 주문 흐름은 `Ontology → StrategyInstance → OrderIntent → RiskVerdict → KIS → Fill`을 인과 저널 기준으로 보여주고, 전략이 선택되지 않았거나 게이트가 차단하면 `NoTrade`를 그대로 표시합니다. 종료 버튼은 먼저 신규 BUY를 막고, 라이브 게이트를 통과하는 청산 SELL을 제출한 뒤 서버 종료를 예약합니다.
+- `/account` 상단 **ENTRY BLOCKADE 패널** — "왜 신규 진입이 없는가"를 순서 있는 체인(엔진 → 라이브 무장 → 시장 세션 → 매수 후보 → 마이크로 전략 → 전략 선택 → 포지션)으로 보여줍니다. **처음 막힌 단계가 실제 원인**이며, 그 뒤 단계는 도달하지 않았음을 나타내기 위해 흐리게 표시됩니다. 이전에는 마지막으로 실패한 계층의 사유 코드 하나만 노출되어, 실제 원인이 시장 세션인데 11,614 사이클 동안 `NO_POSITIVE_NET_GNN_EDGE`(GNN 탓)로 표시되는 문제가 있었습니다.
 - `/display/ontology` — 온톨로지 지식 그래프와 추론 상태 전체 화면
 - `/display` — Raspberry Pi LCD용 trade-reason 카드 보드
 
@@ -78,6 +81,7 @@ GET  /api/refactor/market-view?symbol=005930       GET  /api/trade-explanations
 GET  /api/ontology/graph                           GET  /api/realtime/runtime
 GET  /api/npu/runtime                              GET  /api/gnn/realtime-trust
 GET  /api/system-diagnostics                       GET  /api/auto-reliability/status
+GET  /api/realtime-trading/entry-blockade          # 진입 차단 지점 진단 체인
 POST /api/live-trading/terminate?shutdown=true
 ```
 
@@ -126,7 +130,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 런타임 구조, 모듈 지도, API, 운영 모드, 가속 경계, 알려진 한계 |
 | [docs/ontology_and_gnn.md](docs/ontology_and_gnn.md) | 온톨로지 계층과 전략 효용 GNN, NPU/CPU 분할 |
-| [docs/decision_and_risk.md](docs/decision_and_risk.md) | 데이터→판단 매핑, 순수익 게이트, 동적 청산, 리스크와 실행 |
+| [docs/decision_and_risk.md](docs/decision_and_risk.md) | 데이터→판단 매핑, 순수익 게이트, 동적 청산, 리스크와 실행, 레짐 변화 대응(§9), 진입 차단 진단(§10) |
 | [docs/live_trading.md](docs/live_trading.md) | 설치, 게이트, 운영, 비상 정지, arming, 런타임 프로파일 |
 | [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md) | Pi CPU-only 배포와 키오스크 |
 | [docs/validation.md](docs/validation.md) | 벤치마크, 리플레이 지표, 승격 판정 |

@@ -9,6 +9,7 @@ from app.evaluation.stored_counterfactual import (
     build_labels,
     causal_percentile,
 )
+from app.strategy.catalog import STRATEGY_IDS
 from app.trading.contracts import Bar
 
 
@@ -63,16 +64,7 @@ def test_stored_labels_have_strict_future_label_window() -> None:
     )
     assert labels
     assert all(label.label_end > label.as_of for label in labels)
-    assert {label.strategy_id for label in labels} == {
-        "intraday_momentum",
-        "breakout_volume",
-        "vwap_mean_reversion",
-        "liquidity_shock_reversal",
-        "event_momentum",
-        "cross_sectional_relative_strength",
-        "gap_context",
-        "rvgi_box_breakout",
-    }
+    assert {label.strategy_id for label in labels} == set(STRATEGY_IDS)
     not_triggered = [label for label in labels if not label.triggered]
     assert not_triggered
     assert all(not label.filled for label in not_triggered)

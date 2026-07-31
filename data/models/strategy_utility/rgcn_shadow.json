@@ -11,15 +11,15 @@
   },
   "authorization_scope": "ontology_gnn_realtime_trust_gated_execution",
   "checkpoint": "data\\models\\strategy_utility\\rgcn_shadow.npz",
-  "checkpoint_hash": "9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dcef80b",
+  "checkpoint_hash": "876354fe0300675845c837c31100acabaa33fc13ca8f4734d636ebc763a9befc",
   "config": {
     "batch_size": 1,
-    "feature_dim": 36,
+    "feature_dim": 41,
     "hidden_dim": 16,
-    "max_nodes": 8,
+    "max_nodes": 13,
     "relation_count": 3,
     "seed": 17,
-    "strategy_count": 8,
+    "strategy_count": 13,
     "time_steps": 1
   },
   "feature_names": [
@@ -58,157 +58,232 @@
     "strategy_identity:event_momentum",
     "strategy_identity:cross_sectional_relative_strength",
     "strategy_identity:gap_context",
-    "strategy_identity:rvgi_box_breakout"
+    "strategy_identity:rvgi_box_breakout",
+    "strategy_identity:residual_relative_strength",
+    "strategy_identity:adaptive_anchored_vwap_reversion",
+    "strategy_identity:ofi_microprice_exhaustion_reversal",
+    "strategy_identity:opening_range_breakout",
+    "strategy_identity:market_intraday_momentum"
   ],
   "feature_provenance": "causal_minute_bar_microstructure_proxy_v1",
   "input_feature_schema": "realtime_strategy_graph_v4_market",
   "label_outcomes": {
+    "adaptive_anchored_vwap_reversion": {
+      "filled": 4,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 66.88218389458352,
+      "mean_net_return_bps_when_filled": -49.15592832605575,
+      "positive_net": 1,
+      "positive_net_rate_when_filled": 0.25,
+      "simulated_filled": 4,
+      "triggered": 6
+    },
     "breakout_volume": {
-      "filled": 187,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": 61.50439046343003,
-      "mean_net_return_bps_when_filled": -66.89204657154312,
-      "positive_net": 9,
-      "positive_net_rate_when_filled": 0.0481283422459893,
-      "simulated_filled": 187,
-      "triggered": 216
+      "filled": 201,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 59.26276307406522,
+      "mean_net_return_bps_when_filled": -69.21562109709156,
+      "positive_net": 16,
+      "positive_net_rate_when_filled": 0.07960199004975124,
+      "simulated_filled": 201,
+      "triggered": 230
     },
     "cross_sectional_relative_strength": {
-      "filled": 0,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": null,
-      "mean_net_return_bps_when_filled": null,
-      "positive_net": 0,
-      "positive_net_rate_when_filled": null,
-      "simulated_filled": 0,
-      "triggered": 0
+      "filled": 182,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 57.958120470477866,
+      "mean_net_return_bps_when_filled": -60.89996901721738,
+      "positive_net": 20,
+      "positive_net_rate_when_filled": 0.10989010989010989,
+      "simulated_filled": 182,
+      "triggered": 214
     },
     "event_momentum": {
-      "filled": 0,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": null,
-      "mean_net_return_bps_when_filled": null,
-      "positive_net": 0,
-      "positive_net_rate_when_filled": null,
-      "simulated_filled": 0,
-      "triggered": 0
+      "filled": 24,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 27.87462420348451,
+      "mean_net_return_bps_when_filled": 2.0636025738748316,
+      "positive_net": 9,
+      "positive_net_rate_when_filled": 0.375,
+      "simulated_filled": 24,
+      "triggered": 26
     },
     "gap_context": {
-      "filled": 0,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": null,
-      "mean_net_return_bps_when_filled": null,
-      "positive_net": 0,
-      "positive_net_rate_when_filled": null,
-      "simulated_filled": 0,
-      "triggered": 0
+      "filled": 83,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 34.45529826618136,
+      "mean_net_return_bps_when_filled": -26.341046819263816,
+      "positive_net": 21,
+      "positive_net_rate_when_filled": 0.25301204819277107,
+      "simulated_filled": 83,
+      "triggered": 90
     },
     "intraday_momentum": {
-      "filled": 295,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": 64.43730841888795,
-      "mean_net_return_bps_when_filled": -62.8355659485976,
-      "positive_net": 16,
-      "positive_net_rate_when_filled": 0.05423728813559322,
-      "simulated_filled": 295,
-      "triggered": 337
+      "filled": 303,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 63.617761870963214,
+      "mean_net_return_bps_when_filled": -64.93377698238871,
+      "positive_net": 29,
+      "positive_net_rate_when_filled": 0.09570957095709572,
+      "simulated_filled": 303,
+      "triggered": 345
     },
     "liquidity_shock_reversal": {
       "filled": 211,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": 65.62383668325711,
-      "mean_net_return_bps_when_filled": -62.836735217308245,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 65.60629087661377,
+      "mean_net_return_bps_when_filled": -71.45004533879649,
       "positive_net": 6,
       "positive_net_rate_when_filled": 0.02843601895734597,
       "simulated_filled": 211,
       "triggered": 232
     },
-    "rvgi_box_breakout": {
-      "filled": 5,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": 87.29869204334412,
-      "mean_net_return_bps_when_filled": -101.85749686862587,
+    "market_intraday_momentum": {
+      "filled": 1,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 27.81054,
+      "mean_net_return_bps_when_filled": -27.806632417365005,
       "positive_net": 0,
       "positive_net_rate_when_filled": 0.0,
-      "simulated_filled": 5,
-      "triggered": 5
+      "simulated_filled": 1,
+      "triggered": 1
+    },
+    "ofi_microprice_exhaustion_reversal": {
+      "filled": 14,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 80.84911945510385,
+      "mean_net_return_bps_when_filled": -59.40199854638638,
+      "positive_net": 2,
+      "positive_net_rate_when_filled": 0.14285714285714285,
+      "simulated_filled": 14,
+      "triggered": 17
+    },
+    "opening_range_breakout": {
+      "filled": 34,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 39.348690973555755,
+      "mean_net_return_bps_when_filled": -17.652427629197746,
+      "positive_net": 7,
+      "positive_net_rate_when_filled": 0.20588235294117646,
+      "simulated_filled": 34,
+      "triggered": 39
+    },
+    "residual_relative_strength": {
+      "filled": 6,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 27.922917667500002,
+      "mean_net_return_bps_when_filled": 24.573629074126938,
+      "positive_net": 3,
+      "positive_net_rate_when_filled": 0.5,
+      "simulated_filled": 6,
+      "triggered": 6
+    },
+    "rvgi_box_breakout": {
+      "filled": 6,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 77.40157458328058,
+      "mean_net_return_bps_when_filled": -82.58407080330579,
+      "positive_net": 1,
+      "positive_net_rate_when_filled": 0.16666666666666666,
+      "simulated_filled": 6,
+      "triggered": 6
     },
     "vwap_mean_reversion": {
-      "filled": 44,
-      "labels": 1462,
-      "mean_cost_bps_when_filled": 66.97206666774838,
-      "mean_net_return_bps_when_filled": -54.55980514415693,
-      "positive_net": 3,
-      "positive_net_rate_when_filled": 0.06818181818181818,
-      "simulated_filled": 44,
-      "triggered": 53
+      "filled": 45,
+      "labels": 1568,
+      "mean_cost_bps_when_filled": 66.12481235510414,
+      "mean_net_return_bps_when_filled": -42.56186735880801,
+      "positive_net": 7,
+      "positive_net_rate_when_filled": 0.15555555555555556,
+      "simulated_filled": 45,
+      "triggered": 54
     }
   },
   "label_outcomes_by_market": {
     "KRX": {
+      "adaptive_anchored_vwap_reversion": {
+        "filled": 0,
+        "labels": 221,
+        "mean_cost_bps_when_filled": null,
+        "mean_net_return_bps_when_filled": null,
+        "positive_net": 0,
+        "positive_net_rate_when_filled": null,
+        "simulated_filled": 0,
+        "triggered": 0
+      },
       "breakout_volume": {
-        "filled": 19,
-        "labels": 144,
-        "mean_cost_bps_when_filled": 27.773362425789472,
-        "mean_net_return_bps_when_filled": -45.13544073034103,
-        "positive_net": 1,
-        "positive_net_rate_when_filled": 0.05263157894736842,
-        "simulated_filled": 19,
-        "triggered": 19
+        "filled": 32,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.740972872500002,
+        "mean_net_return_bps_when_filled": -60.232508578767195,
+        "positive_net": 4,
+        "positive_net_rate_when_filled": 0.125,
+        "simulated_filled": 32,
+        "triggered": 32
       },
       "cross_sectional_relative_strength": {
-        "filled": 0,
-        "labels": 144,
-        "mean_cost_bps_when_filled": null,
-        "mean_net_return_bps_when_filled": null,
-        "positive_net": 0,
-        "positive_net_rate_when_filled": null,
-        "simulated_filled": 0,
-        "triggered": 0
+        "filled": 30,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.76723803658279,
+        "mean_net_return_bps_when_filled": -47.990074709305794,
+        "positive_net": 6,
+        "positive_net_rate_when_filled": 0.2,
+        "simulated_filled": 30,
+        "triggered": 30
       },
       "event_momentum": {
-        "filled": 0,
-        "labels": 144,
-        "mean_cost_bps_when_filled": null,
-        "mean_net_return_bps_when_filled": null,
-        "positive_net": 0,
-        "positive_net_rate_when_filled": null,
-        "simulated_filled": 0,
-        "triggered": 0
+        "filled": 24,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.87462420348451,
+        "mean_net_return_bps_when_filled": 2.0636025738748316,
+        "positive_net": 9,
+        "positive_net_rate_when_filled": 0.375,
+        "simulated_filled": 24,
+        "triggered": 26
       },
       "gap_context": {
-        "filled": 0,
-        "labels": 144,
-        "mean_cost_bps_when_filled": null,
-        "mean_net_return_bps_when_filled": null,
-        "positive_net": 0,
-        "positive_net_rate_when_filled": null,
-        "simulated_filled": 0,
-        "triggered": 0
+        "filled": 63,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.837891178333333,
+        "mean_net_return_bps_when_filled": -15.057997345362391,
+        "positive_net": 21,
+        "positive_net_rate_when_filled": 0.3333333333333333,
+        "simulated_filled": 63,
+        "triggered": 66
       },
       "intraday_momentum": {
-        "filled": 18,
-        "labels": 144,
-        "mean_cost_bps_when_filled": 27.777956422333336,
-        "mean_net_return_bps_when_filled": -42.99413680749128,
-        "positive_net": 1,
-        "positive_net_rate_when_filled": 0.05555555555555555,
-        "simulated_filled": 18,
-        "triggered": 18
+        "filled": 24,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.721351375,
+        "mean_net_return_bps_when_filled": -69.37826852172634,
+        "positive_net": 2,
+        "positive_net_rate_when_filled": 0.08333333333333333,
+        "simulated_filled": 24,
+        "triggered": 24
       },
       "liquidity_shock_reversal": {
         "filled": 11,
-        "labels": 144,
-        "mean_cost_bps_when_filled": 27.74632419,
-        "mean_net_return_bps_when_filled": -57.73821041250497,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.671405745000005,
+        "mean_net_return_bps_when_filled": -92.6583847401672,
         "positive_net": 0,
         "positive_net_rate_when_filled": 0.0,
         "simulated_filled": 11,
         "triggered": 11
       },
-      "rvgi_box_breakout": {
+      "market_intraday_momentum": {
+        "filled": 1,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.81054,
+        "mean_net_return_bps_when_filled": -27.806632417365005,
+        "positive_net": 0,
+        "positive_net_rate_when_filled": 0.0,
+        "simulated_filled": 1,
+        "triggered": 1
+      },
+      "ofi_microprice_exhaustion_reversal": {
         "filled": 0,
-        "labels": 144,
+        "labels": 221,
         "mean_cost_bps_when_filled": null,
         "mean_net_return_bps_when_filled": null,
         "positive_net": 0,
@@ -216,41 +291,81 @@
         "simulated_filled": 0,
         "triggered": 0
       },
+      "opening_range_breakout": {
+        "filled": 15,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.901869152,
+        "mean_net_return_bps_when_filled": 14.762722953498187,
+        "positive_net": 7,
+        "positive_net_rate_when_filled": 0.4666666666666667,
+        "simulated_filled": 15,
+        "triggered": 15
+      },
+      "residual_relative_strength": {
+        "filled": 6,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.922917667500002,
+        "mean_net_return_bps_when_filled": 24.573629074126938,
+        "positive_net": 3,
+        "positive_net_rate_when_filled": 0.5,
+        "simulated_filled": 6,
+        "triggered": 6
+      },
+      "rvgi_box_breakout": {
+        "filled": 1,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 28.15302432,
+        "mean_net_return_bps_when_filled": 131.82845022337517,
+        "positive_net": 1,
+        "positive_net_rate_when_filled": 1.0,
+        "simulated_filled": 1,
+        "triggered": 1
+      },
       "vwap_mean_reversion": {
-        "filled": 3,
-        "labels": 144,
-        "mean_cost_bps_when_filled": 27.772010514,
-        "mean_net_return_bps_when_filled": -45.76557921444959,
-        "positive_net": 0,
-        "positive_net_rate_when_filled": 0.0,
-        "simulated_filled": 3,
-        "triggered": 3
+        "filled": 4,
+        "labels": 221,
+        "mean_cost_bps_when_filled": 27.799837365000002,
+        "mean_net_return_bps_when_filled": -32.79522874988915,
+        "positive_net": 1,
+        "positive_net_rate_when_filled": 0.25,
+        "simulated_filled": 4,
+        "triggered": 4
       }
     },
     "US": {
+      "adaptive_anchored_vwap_reversion": {
+        "filled": 4,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 66.88218389458352,
+        "mean_net_return_bps_when_filled": -49.15592832605575,
+        "positive_net": 1,
+        "positive_net_rate_when_filled": 0.25,
+        "simulated_filled": 4,
+        "triggered": 6
+      },
       "breakout_volume": {
-        "filled": 168,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": 65.31920911054415,
-        "mean_net_return_bps_when_filled": -69.35261508929811,
-        "positive_net": 8,
-        "positive_net_rate_when_filled": 0.047619047619047616,
-        "simulated_filled": 168,
-        "triggered": 197
+        "filled": 169,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 65.2313860708113,
+        "mean_net_return_bps_when_filled": -70.91656547925948,
+        "positive_net": 12,
+        "positive_net_rate_when_filled": 0.07100591715976332,
+        "simulated_filled": 169,
+        "triggered": 198
       },
       "cross_sectional_relative_strength": {
-        "filled": 0,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": null,
-        "mean_net_return_bps_when_filled": null,
-        "positive_net": 0,
-        "positive_net_rate_when_filled": null,
-        "simulated_filled": 0,
-        "triggered": 0
+        "filled": 152,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 63.91684726664137,
+        "mean_net_return_bps_when_filled": -63.447974472726244,
+        "positive_net": 14,
+        "positive_net_rate_when_filled": 0.09210526315789473,
+        "simulated_filled": 152,
+        "triggered": 184
       },
       "event_momentum": {
         "filled": 0,
-        "labels": 1318,
+        "labels": 1347,
         "mean_cost_bps_when_filled": null,
         "mean_net_return_bps_when_filled": null,
         "positive_net": 0,
@@ -259,8 +374,38 @@
         "triggered": 0
       },
       "gap_context": {
+        "filled": 20,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 55.30013059290267,
+        "mean_net_return_bps_when_filled": -61.88265266205332,
+        "positive_net": 0,
+        "positive_net_rate_when_filled": 0.0,
+        "simulated_filled": 20,
+        "triggered": 24
+      },
+      "intraday_momentum": {
+        "filled": 279,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 66.70562513943317,
+        "mean_net_return_bps_when_filled": -64.55145512954246,
+        "positive_net": 27,
+        "positive_net_rate_when_filled": 0.0967741935483871,
+        "simulated_filled": 279,
+        "triggered": 321
+      },
+      "liquidity_shock_reversal": {
+        "filled": 200,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 67.69270955885253,
+        "mean_net_return_bps_when_filled": -70.28358667172108,
+        "positive_net": 6,
+        "positive_net_rate_when_filled": 0.03,
+        "simulated_filled": 200,
+        "triggered": 221
+      },
+      "market_intraday_momentum": {
         "filled": 0,
-        "labels": 1318,
+        "labels": 1347,
         "mean_cost_bps_when_filled": null,
         "mean_net_return_bps_when_filled": null,
         "positive_net": 0,
@@ -268,31 +413,41 @@
         "simulated_filled": 0,
         "triggered": 0
       },
-      "intraday_momentum": {
-        "filled": 277,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": 66.81950457750884,
-        "mean_net_return_bps_when_filled": -64.12490069422905,
-        "positive_net": 15,
-        "positive_net_rate_when_filled": 0.05415162454873646,
-        "simulated_filled": 277,
-        "triggered": 319
+      "ofi_microprice_exhaustion_reversal": {
+        "filled": 14,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 80.84911945510385,
+        "mean_net_return_bps_when_filled": -59.40199854638638,
+        "positive_net": 2,
+        "positive_net_rate_when_filled": 0.14285714285714285,
+        "simulated_filled": 14,
+        "triggered": 17
       },
-      "liquidity_shock_reversal": {
-        "filled": 200,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": 67.70709987038624,
-        "mean_net_return_bps_when_filled": -63.11715408157242,
-        "positive_net": 6,
-        "positive_net_rate_when_filled": 0.03,
-        "simulated_filled": 200,
-        "triggered": 221
+      "opening_range_breakout": {
+        "filled": 19,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 48.38565556952082,
+        "mean_net_return_bps_when_filled": -43.24333598395769,
+        "positive_net": 0,
+        "positive_net_rate_when_filled": 0.0,
+        "simulated_filled": 19,
+        "triggered": 24
+      },
+      "residual_relative_strength": {
+        "filled": 0,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": null,
+        "mean_net_return_bps_when_filled": null,
+        "positive_net": 0,
+        "positive_net_rate_when_filled": null,
+        "simulated_filled": 0,
+        "triggered": 0
       },
       "rvgi_box_breakout": {
         "filled": 5,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": 87.29869204334412,
-        "mean_net_return_bps_when_filled": -101.85749686862587,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 87.2512846359367,
+        "mean_net_return_bps_when_filled": -125.46657500864198,
         "positive_net": 0,
         "positive_net_rate_when_filled": 0.0,
         "simulated_filled": 5,
@@ -300,11 +455,11 @@
       },
       "vwap_mean_reversion": {
         "filled": 41,
-        "labels": 1318,
-        "mean_cost_bps_when_filled": 69.84036345948607,
-        "mean_net_return_bps_when_filled": -55.20328509023308,
-        "positive_net": 3,
-        "positive_net_rate_when_filled": 0.07317073170731707,
+        "labels": 1347,
+        "mean_cost_bps_when_filled": 69.8638343053582,
+        "mean_net_return_bps_when_filled": -43.51471014992205,
+        "positive_net": 6,
+        "positive_net_rate_when_filled": 0.14634146341463414,
         "simulated_filled": 41,
         "triggered": 50
       }
@@ -317,19 +472,24 @@
     "confirming_methodology",
     "contrasting_methodology"
   ],
-  "rows": 11696,
-  "snapshots": 1462,
+  "rows": 20384,
+  "snapshots": 1568,
   "strategies": {
-    "breakout_volume": 1462,
-    "cross_sectional_relative_strength": 1462,
-    "event_momentum": 1462,
-    "gap_context": 1462,
-    "intraday_momentum": 1462,
-    "liquidity_shock_reversal": 1462,
-    "rvgi_box_breakout": 1462,
-    "vwap_mean_reversion": 1462
+    "adaptive_anchored_vwap_reversion": 1568,
+    "breakout_volume": 1568,
+    "cross_sectional_relative_strength": 1568,
+    "event_momentum": 1568,
+    "gap_context": 1568,
+    "intraday_momentum": 1568,
+    "liquidity_shock_reversal": 1568,
+    "market_intraday_momentum": 1568,
+    "ofi_microprice_exhaustion_reversal": 1568,
+    "opening_range_breakout": 1568,
+    "residual_relative_strength": 1568,
+    "rvgi_box_breakout": 1568,
+    "vwap_mean_reversion": 1568
   },
-  "strategy_count": 8,
+  "strategy_count": 13,
   "strategy_ids": [
     "intraday_momentum",
     "breakout_volume",
@@ -338,7 +498,12 @@
     "event_momentum",
     "cross_sectional_relative_strength",
     "gap_context",
-    "rvgi_box_breakout"
+    "rvgi_box_breakout",
+    "residual_relative_strength",
+    "adaptive_anchored_vwap_reversion",
+    "ofi_microprice_exhaustion_reversal",
+    "opening_range_breakout",
+    "market_intraday_momentum"
   ],
   "training_data_range": {
     "end": null,
@@ -347,14 +512,14 @@
   "training_method": "ontology_strategy_graph_rgcn_joint_gradient_calibration",
   "validation_metrics": {
     "epochs": 40,
-    "krx_success_direction_accuracy": 0.9660194174757282,
-    "krx_training_weight": 14.256097793579102,
-    "raw_head_mse": 3.2428176403045654,
-    "relation_weight_update_l2": 5.667829990386963,
-    "success_direction_accuracy": 0.9534982935153583,
-    "train_snapshots": 1169,
-    "us_success_direction_accuracy": 0.9467105263157894,
-    "us_training_weight": 0.5181737542152405,
-    "validation_snapshots": 293
+    "krx_success_direction_accuracy": 0.9380974055530269,
+    "krx_training_weight": 12.057692527770996,
+    "raw_head_mse": 4.1387200355529785,
+    "relation_weight_update_l2": 5.842533588409424,
+    "success_direction_accuracy": 0.932876041156296,
+    "train_snapshots": 1254,
+    "us_success_direction_accuracy": 0.926790450928382,
+    "us_training_weight": 0.5216306447982788,
+    "validation_snapshots": 314
   }
 }

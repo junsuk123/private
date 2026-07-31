@@ -225,3 +225,109 @@
   .ops-footer { grid-template-columns: 1fr; }
   .ops-footer-wide { grid-column: auto; }
 }
+
+/* --- Entry blockade -------------------------------------------------------
+   Ordered diagnosis of why no NEW position is being opened. The first unmet
+   link is the answer; later links are dimmed because they were never reached,
+   which is a different statement from having failed. */
+.status-chip.waiting {
+  border-color: rgba(240, 185, 11, .35);
+  background: rgba(240, 185, 11, .08);
+  color: var(--amber);
+}
+.entry-blockade {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(12, 18, 28, .45);
+}
+.blockade-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.blockade-head h3 { margin: 2px 0 0; font-size: 13px; }
+.blockade-headline {
+  margin: 0 0 10px;
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.55;
+}
+.blockade-chain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.blockade-step {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border-left: 2px solid transparent;
+  background: rgba(255, 255, 255, .022);
+}
+.blockade-step.pass { border-left-color: var(--green); }
+.blockade-step.fail {
+  border-left-color: var(--red);
+  background: rgba(255, 102, 120, .06);
+}
+.blockade-step.unreachable {
+  opacity: .42;
+  border-left-color: var(--line);
+}
+.blockade-mark {
+  flex: 0 0 auto;
+  width: 13px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.5;
+}
+.blockade-step.pass .blockade-mark { color: var(--green); }
+.blockade-step.fail .blockade-mark { color: var(--red); }
+.blockade-step.unreachable .blockade-mark { color: var(--muted); }
+.blockade-stage {
+  margin: 0;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.blockade-detail {
+  margin: 2px 0 0;
+  color: #a8b6c8;
+  font-size: 9px;
+  line-height: 1.55;
+}
+.blockade-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+.blockade-tag {
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, .03);
+  color: #93a4b8;
+  font: 8.5px/1.5 Consolas, monospace;
+  letter-spacing: .02em;
+}
+.blockade-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 8.5px;
+  line-height: 1.6;
+}
+.blockade-note strong { color: #a8b6c8; }
+@media (max-width: 720px) {
+  .blockade-head { flex-direction: column; align-items: stretch; }
+}

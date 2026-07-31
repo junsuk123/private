@@ -262,6 +262,9 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         liquidity_score=g("liquidity_score"),
         spread_bps=g("spread_bps"),
         orderbook_imbalance=g("orderbook_imbalance"),
+        bid_depth=g("bid_depth"),
+        ask_depth=g("ask_depth"),
+        depth_ratio=g("depth_ratio"),
         # Sub-second window. The live frame has always computed these; without
         # this mapping they never reached a strategy, so every "algorithm" was
         # effectively minute-bar only.

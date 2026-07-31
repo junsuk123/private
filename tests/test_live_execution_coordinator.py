@@ -183,6 +183,13 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
                 "KIS_PAPER_TRADING": "false",
                 "LIVE_ORDER_SUBMIT_ENABLED": "true",
                 "KILL_SWITCH_ENABLED": "false",
+                # Pin the session. Without this the route depends on wall-clock
+                # time: _is_us_daytime_order_session is true on weekdays
+                # 09:00-16:50 KST, so running the suite during Korean business
+                # hours sent this to /daytime-order and the assertion below
+                # failed with a bare StopIteration. Its daytime counterpart
+                # already pins "true"; this is the missing other half.
+                "KIS_FORCE_OVERSEAS_DAYTIME_ORDER": "false",
             }
             try:
                 with patch.dict("os.environ", env, clear=True):
@@ -358,6 +365,8 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
                 "KIS_PAPER_TRADING": "false",
                 "LIVE_ORDER_SUBMIT_ENABLED": "true",
                 "KILL_SWITCH_ENABLED": "false",
+                # Night-session route; see the note in the submission test.
+                "KIS_FORCE_OVERSEAS_DAYTIME_ORDER": "false",
             }
             try:
                 with patch.dict("os.environ", env, clear=True):

@@ -5,8 +5,16 @@ import math
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.models.model_staleness import (
+    ModelTrustLevel,
+    StalenessConfig,
+    StalenessVerdict,
+    evaluate_model_staleness,
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,12 @@ class ModelArtifact:
     thresholds: dict[str, float]
     metrics: dict[str, float]
     live_eligible: bool
+    created_at: str = ""
+    trust_level: str = ModelTrustLevel.LIVE.value
+
+    @property
+    def shadow_only(self) -> bool:
+        return self.trust_level == ModelTrustLevel.SHADOW_ONLY.value
 
 
 class ModelArtifactRegistry:
@@ -40,16 +54,30 @@ class ModelArtifactRegistry:
     def latest_path(self) -> Path:
         return self.root / "latest.json"
 
+    @property
+    def deployment_state_path(self) -> Path:
+        """Sidecar tracking challenger history across retrains.
+
+        Kept beside ``latest.json`` rather than inside it because the incumbent
+        payload is only rewritten on promotion — which is exactly the case where
+        the interesting history (repeated FAILED challengers) is being recorded.
+        """
+        return self.root / "deployment_state.json"
+
     def save(self, artifact: dict[str, Any]) -> Path:
         artifact_id = str(artifact["artifact_id"])
         path = self.root / f"{artifact_id}.json"
         incumbent = self._read_latest_payload()
         promoted, reason = _promotion_decision(artifact, incumbent)
+        deployment_state = self._record_challenger(artifact, promoted)
         artifact["deployment"] = {
             "promoted": promoted,
             "reason": reason,
             "incumbent_artifact_id": (
                 str(incumbent.get("artifact_id") or "") if incumbent else None
+            ),
+            "consecutive_negative_challengers": int(
+                deployment_state.get("consecutive_negative_challengers") or 0
             ),
         }
         payload = json.dumps(artifact, indent=2, sort_keys=True)
@@ -70,12 +98,103 @@ class ModelArtifactRegistry:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def load_latest_live_eligible(self) -> ModelArtifact:
+    def _record_challenger(self, artifact: dict[str, Any], promoted: bool) -> dict[str, Any]:
+        """Update the consecutive-negative-challenger counter.
+
+        A challenger measuring a non-positive top-K net return is a vote that the
+        current market has no edge for this model family. Three such votes in a row
+        expire the incumbent, however good its own historical metrics look — which
+        is the situation this whole mechanism exists for.
+        """
+        state = self._read_deployment_state()
+        metrics = artifact.get("metrics") or {}
+        top_k_return = _finite_metric(metrics, "avg_forward_net_return_bps_top_k")
+        eligible = artifact.get("live_eligible") is True
+        streak = int(state.get("consecutive_negative_challengers") or 0)
+        if eligible and top_k_return > 0.0:
+            streak = 0
+        else:
+            streak += 1
+        if promoted:
+            # A promoted challenger becomes the incumbent, so the history it was
+            # measured against no longer applies to the model now serving.
+            streak = 0
+        updated = {
+            "consecutive_negative_challengers": streak,
+            "last_challenger_artifact_id": str(artifact.get("artifact_id") or ""),
+            "last_challenger_at": datetime.now(timezone.utc).isoformat(),
+            "last_challenger_top_k_net_bps": top_k_return,
+            "last_challenger_live_eligible": eligible,
+            "last_challenger_promoted": bool(promoted),
+            "recent_challenger_top_k_net_bps": (
+                [top_k_return, *list(state.get("recent_challenger_top_k_net_bps") or ())][:10]
+            ),
+        }
+        try:
+            _atomic_write_text(
+                self.deployment_state_path,
+                json.dumps(updated, indent=2, sort_keys=True),
+            )
+        except OSError:
+            pass
+        return updated
+
+    def _read_deployment_state(self) -> dict[str, Any]:
+        if not self.deployment_state_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.deployment_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def staleness(
+        self,
+        *,
+        now: datetime | None = None,
+        config: StalenessConfig | None = None,
+        current_regime: str | None = None,
+        feature_drift_score: float | None = None,
+    ) -> StalenessVerdict:
+        """Expiry verdict for the currently deployed artifact."""
+        state = self._read_deployment_state()
+        return evaluate_model_staleness(
+            self._read_latest_payload(),
+            now=now,
+            config=config,
+            feature_drift_score=feature_drift_score,
+            consecutive_negative_challengers=int(
+                state.get("consecutive_negative_challengers") or 0
+            ),
+            current_regime=current_regime,
+        )
+
+    def load_latest_live_eligible(
+        self,
+        *,
+        current_regime: str | None = None,
+        enforce_staleness: bool | None = None,
+    ) -> ModelArtifact:
         if not self.latest_path.exists():
             raise RuntimeError("NO_LIVE_ELIGIBLE_MODEL_ARTIFACT")
         artifact = self._load_latest_cached()
         if not artifact.live_eligible:
             raise RuntimeError("LATEST_MODEL_NOT_LIVE_ELIGIBLE")
+        enforce = (
+            _env_bool("LIVE_MODEL_ENFORCE_STALENESS", True)
+            if enforce_staleness is None
+            else bool(enforce_staleness)
+        )
+        if not enforce:
+            return artifact
+        verdict = self.staleness(current_regime=current_regime)
+        if verdict.stale:
+            # The artifact stays on disk for audit; callers that treat a raise as
+            # "no trained model" then fall back to ontology / bandit / no_trade,
+            # which is the intended graded demotion.
+            raise RuntimeError(
+                "LATEST_MODEL_STALE:" + ",".join(verdict.reason_codes)
+            )
         return artifact
 
     def _load_latest_cached(self) -> ModelArtifact:
@@ -176,6 +295,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _artifact_from_payload(payload: dict[str, Any], path: Path) -> ModelArtifact:
     return ModelArtifact(
         artifact_id=str(payload["artifact_id"]),
@@ -189,4 +315,5 @@ def _artifact_from_payload(payload: dict[str, Any], path: Path) -> ModelArtifact
         thresholds={str(key): float(value) for key, value in payload["thresholds"].items()},
         metrics={str(key): float(value) for key, value in payload["metrics"].items()},
         live_eligible=bool(payload["live_eligible"]),
+        created_at=str(payload.get("created_at") or ""),
     )

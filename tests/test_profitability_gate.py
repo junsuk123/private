@@ -66,6 +66,11 @@ class ProfitabilityGateTest(unittest.TestCase):
             liquidity_buffer_max=0.0,
             min_liquidity_score=0.0,
             max_cost_to_alpha_ratio=10.0,
+            # This test isolates the min-net-return tolerance rule. The cost
+            # coverage rule is a separate constraint (and the live policy sets it
+            # to 1.3), so it is pinned out of the way here rather than silently
+            # deciding the outcome.
+            min_cost_coverage_ratio=0.0,
         )
         decision = gate.evaluate(
             ProfitabilityInput(

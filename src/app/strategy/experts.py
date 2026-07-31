@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.trading.contracts import IntentAction, OrderIntent, TradePlan
 from app.strategy.catalog import STRATEGY_IDS
+from app.strategy.exit_geometry import exit_geometry
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,25 @@ class ExpertConfig:
     max_holding_seconds: int = 300
     max_entry_slippage_bps: float = 5.0
     entry_ttl_seconds: int = 5
+
+
+def _geometry_config(strategy_id: str, **overrides: float) -> ExpertConfig:
+    """Expert config whose exits come from the ONE geometry table.
+
+    Previously each expert restated its own stop/target/holding numbers, which
+    then had to agree by hand with ``strategy_session`` and with the training
+    labels. They stopped agreeing, and a model trained on one geometry was scoring
+    trades executed under another. Now all three read
+    :mod:`app.strategy.exit_geometry`.
+    """
+    geometry = exit_geometry(strategy_id)
+    return ExpertConfig(
+        stop_bps=geometry.stop_loss_bps,
+        profit_bps=geometry.take_profit_bps,
+        trailing_bps=geometry.trailing_bps,
+        max_holding_seconds=geometry.max_holding_seconds,
+        **overrides,
+    )
 
 
 class StrategyExpert:
@@ -80,7 +100,7 @@ class StrategyExpert:
 class IntradayMomentumExpert(StrategyExpert):
     strategy_id = "intraday_momentum"
     thesis = "robust intraday return continuation with volume confirmation"
-    default_config = ExpertConfig(stop_bps=22, profit_bps=100, max_holding_seconds=1800)
+    default_config = _geometry_config("intraday_momentum")
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("return") >= self.config.entry_quantile and c.q(
@@ -91,7 +111,7 @@ class IntradayMomentumExpert(StrategyExpert):
 class BreakoutVolumeExpert(StrategyExpert):
     strategy_id = "breakout_volume"
     thesis = "causal range breakout confirmed by unusual volume"
-    default_config = ExpertConfig(stop_bps=25, profit_bps=120, max_holding_seconds=2700)
+    default_config = _geometry_config("breakout_volume")
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("breakout") >= self.config.entry_quantile and c.q(
@@ -102,7 +122,7 @@ class BreakoutVolumeExpert(StrategyExpert):
 class VwapMeanReversionExpert(StrategyExpert):
     strategy_id = "vwap_mean_reversion"
     thesis = "liquid downside displacement from VWAP with reversion confirmation"
-    default_config = ExpertConfig(stop_bps=18, profit_bps=100, max_holding_seconds=1800)
+    default_config = _geometry_config("vwap_mean_reversion")
 
     def admissible(self, c: ExpertContext) -> bool:
         return (
@@ -120,7 +140,7 @@ class VwapMeanReversionExpert(StrategyExpert):
 class LiquidityShockReversalExpert(StrategyExpert):
     strategy_id = "liquidity_shock_reversal"
     thesis = "temporary liquidity shock reversal after spread/depth normalization"
-    default_config = ExpertConfig(stop_bps=30, profit_bps=100, max_holding_seconds=1200)
+    default_config = _geometry_config("liquidity_shock_reversal")
 
     def admissible(self, c: ExpertContext) -> bool:
         return (
@@ -133,7 +153,7 @@ class LiquidityShockReversalExpert(StrategyExpert):
 class EventMomentumExpert(StrategyExpert):
     strategy_id = "event_momentum"
     thesis = "fresh high-relevance event continuation with market confirmation"
-    default_config = ExpertConfig(stop_bps=35, profit_bps=140, max_holding_seconds=3600)
+    default_config = _geometry_config("event_momentum")
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("event_relevance") >= self.config.entry_quantile and c.q(
@@ -144,7 +164,7 @@ class EventMomentumExpert(StrategyExpert):
 class CrossSectionalRelativeStrengthExpert(StrategyExpert):
     strategy_id = "cross_sectional_relative_strength"
     thesis = "sector-neutral relative strength with sufficient liquidity"
-    default_config = ExpertConfig(stop_bps=28, profit_bps=120, max_holding_seconds=3600)
+    default_config = _geometry_config("cross_sectional_relative_strength")
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("relative_strength") >= self.config.entry_quantile and c.q(
@@ -155,7 +175,7 @@ class CrossSectionalRelativeStrengthExpert(StrategyExpert):
 class GapContextExpert(StrategyExpert):
     strategy_id = "gap_context"
     thesis = "opening gap continuation only after price-discovery confirmation"
-    default_config = ExpertConfig(stop_bps=32, profit_bps=130, max_holding_seconds=2700)
+    default_config = _geometry_config("gap_context")
 
     def admissible(self, c: ExpertContext) -> bool:
         return c.q("gap") >= self.config.entry_quantile and c.q(
@@ -166,7 +186,7 @@ class GapContextExpert(StrategyExpert):
 class RvgiBoxBreakoutExpert(StrategyExpert):
     strategy_id = "rvgi_box_breakout"
     thesis = "RVGI-confirmed causal price-box breakout with volume acceptance"
-    default_config = ExpertConfig(stop_bps=20, profit_bps=120, max_holding_seconds=1800)
+    default_config = _geometry_config("rvgi_box_breakout")
 
     def admissible(self, c: ExpertContext) -> bool:
         return (
@@ -175,6 +195,100 @@ class RvgiBoxBreakoutExpert(StrategyExpert):
             and c.q("box_position") >= self.config.entry_quantile
             and c.q("volume") >= self.config.confirmation_quantile
             and c.q("false_breakout_risk") <= 1 - self.config.confirmation_quantile
+        )
+
+
+class ResidualRelativeStrengthExpert(StrategyExpert):
+    strategy_id = "residual_relative_strength"
+    thesis = "market/sector-neutral residual strength confirmed by informed flow"
+    default_config = _geometry_config("residual_relative_strength")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # Both residual horizons must be strong: one window alone cannot separate
+        # persistent idiosyncratic strength from a single-window bounce. Investor
+        # flow is required, not optional — residual strength with no informed flow
+        # behind it is usually a squeeze.
+        return (
+            c.q("residual_strength_short") >= self.config.entry_quantile
+            and c.q("residual_strength_long") >= self.config.confirmation_quantile
+            and c.q("investor_flow") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class AdaptiveAnchoredVwapReversionExpert(StrategyExpert):
+    strategy_id = "adaptive_anchored_vwap_reversion"
+    thesis = "volatility-normalised displacement below anchored VWAP with liquidity returning"
+    default_config = _geometry_config("adaptive_anchored_vwap_reversion")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            # Low quantile == deeply displaced below the anchor.
+            c.q("vwap_zscore") <= 1 - self.config.entry_quantile
+            and c.q("liquidity_recovery") >= self.config.confirmation_quantile
+            and c.q("microprice_edge") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class OfiMicropriceExhaustionReversalExpert(StrategyExpert):
+    strategy_id = "ofi_microprice_exhaustion_reversal"
+    thesis = "sell-side exhaustion confirmed by order flow, depth recovery and microprice"
+    default_config = _geometry_config("ofi_microprice_exhaustion_reversal")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            c.q("price_drop") >= self.config.entry_quantile
+            and c.q("ofi_slope") >= self.config.entry_quantile
+            and c.q("depth_recovery") >= self.config.confirmation_quantile
+            and c.q("microprice_edge") >= self.config.confirmation_quantile
+            # Flow toxicity is a risk statement: a toxic tape means the
+            # counterparty is better informed than this thesis is.
+            and c.q("flow_toxicity") <= 1 - self.config.confirmation_quantile
+        )
+
+
+class OpeningRangeBreakoutExpert(StrategyExpert):
+    strategy_id = "opening_range_breakout"
+    thesis = "opening-range breakout restricted to stocks in play by relative volume"
+    default_config = _geometry_config("opening_range_breakout")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # The relative-volume gate is load-bearing, not a filter bolted on for
+        # tidiness. In the published results the unrestricted opening-range
+        # breakout does not pay, and restricting it to the highest relative-volume
+        # names is what produces the edge; practitioner studies put the useful
+        # threshold at roughly 1.5-2x average volume. So RVOL is required at the
+        # same strength as the breakout itself.
+        return (
+            c.q("opening_range_breakout") >= self.config.entry_quantile
+            and c.q("relative_volume") >= self.config.entry_quantile
+            and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class MarketIntradayMomentumExpert(StrategyExpert):
+    strategy_id = "market_intraday_momentum"
+    thesis = "positive first half-hour return continues into the last half-hour"
+    default_config = _geometry_config("market_intraday_momentum")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # Long-only, so only the POSITIVE leg of the published effect is tradable:
+        # a negative first half-hour predicts a negative last half-hour, which this
+        # account cannot express (see the short-side analysis — retail KRX shorting
+        # needs 대주 and adds borrow cost to the one thing already binding).
+        return (
+            # >0.5 means the first half-hour return was positive.
+            c.q("intraday_momentum_signal") >= self.config.entry_quantile
+            # Only inside the last continuous half-hour; outside it there is nothing
+            # to trade, and after 15:20 KRX is in a closing auction.
+            and c.q("intraday_momentum_window") >= self.config.entry_quantile
+            # The effect is strongest on volatile days, and — independently — only a
+            # volatile day moves far enough to clear a ~33bps round trip. Both
+            # reasons point the same way, so this is a hard precondition.
+            and c.q("first_half_hour_volatility") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
         )
 
 
@@ -187,6 +301,11 @@ ALL_EXPERT_TYPES = (
     CrossSectionalRelativeStrengthExpert,
     GapContextExpert,
     RvgiBoxBreakoutExpert,
+    ResidualRelativeStrengthExpert,
+    AdaptiveAnchoredVwapReversionExpert,
+    OfiMicropriceExhaustionReversalExpert,
+    OpeningRangeBreakoutExpert,
+    MarketIntradayMomentumExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS

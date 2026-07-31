@@ -534,6 +534,7 @@ class KisDevelopersApiClient:
         account_asset_summary: dict[str, float] = {}
         cash_by_currency: dict[str, float] = {"KRW": 0.0}
         orderable_cash_by_currency: dict[str, float] = {"KRW": 0.0}
+        domestic_orderable_cash = 0.0
         try:
             responses = self._get_domestic_balance_pages()
             response = responses[0] if responses else {}
@@ -548,13 +549,7 @@ class KisDevelopersApiClient:
             summary = response.get("output2") or response.get("output3") or []
             summary_row = summary[0] if isinstance(summary, list) and summary else summary
             cash = _domestic_cash_from_balance_summary(summary_row, holdings)
-            try:
-                orderable_cash = self._get_domestic_orderable_cash()
-            except KisApiError:
-                orderable_cash = 0.0
             cash_by_currency = _cash_by_currency_from_summary(summary_row, cash)
-            orderable_cash_by_currency = dict(cash_by_currency)
-            orderable_cash_by_currency["KRW"] = orderable_cash if orderable_cash > 0 else cash
             domestic_total_assets_krw = _domestic_total_assets_from_balance_summary(summary_row)
             try:
                 account_asset_summary = self._get_account_asset_balance()
@@ -562,6 +557,20 @@ class KisDevelopersApiClient:
                 account_asset_summary = {}
         except KisApiError as exc:
             domestic_error = exc
+        # Buying power is served by a separate KIS endpoint and must remain
+        # available even when the domestic balance inquiry is temporarily
+        # rejected. Keeping this call inside the balance try-block silently
+        # converted a valid nrcvb_buy_amt into KRW=0 and starved affordability.
+        try:
+            domestic_orderable_cash = self._get_domestic_orderable_cash()
+        except KisApiError:
+            domestic_orderable_cash = 0.0
+        orderable_cash_by_currency = dict(cash_by_currency)
+        orderable_cash_by_currency["KRW"] = (
+            domestic_orderable_cash
+            if domestic_orderable_cash > 0
+            else max(0.0, float(cash_by_currency.get("KRW", cash) or 0.0))
+        )
         overseas_holdings: tuple[Holding, ...] = ()
         try:
             overseas_holdings = self._get_overseas_holdings()
@@ -780,6 +789,56 @@ class KisDevelopersApiClient:
             volatility_20d=max(0.005, min(0.20, volatility or 0.03)),
             source=_broker_quote_source(ticker, "domestic", now),
         )
+
+    def get_domestic_investor_flow(self, ticker: str) -> tuple[dict[str, Any], ...]:
+        """Daily net buying by investor type (개인/외국인/기관) for a KRX symbol.
+
+        ``inquire-investor`` (FHKST01010900) returns roughly the last 30 business
+        days in one call, newest first, which is why a single request per symbol is
+        enough to backfill a training window rather than needing months of
+        collection first.
+
+        Quantities are shares (``*_ntby_qty``) and values are in units of one
+        million KRW (``*_ntby_tr_pbmn``); both are signed, negative meaning net
+        selling. Returned as parsed rows in ascending date order — read-only, and
+        deliberately not cached, because the caller persists it.
+        """
+        symbol = str(ticker or "").strip()
+        if not (symbol.isdigit() and len(symbol) == 6):
+            return ()
+        response = self._get(
+            "/uapi/domestic-stock/v1/quotations/inquire-investor",
+            tr_id="FHKST01010900",
+            params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol},
+        )
+        self._ensure_success(response, "KIS investor-flow lookup failed")
+        raw = response.get("output") or response.get("output1") or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        rows: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            business_date = str(entry.get("stck_bsop_date") or "").strip()
+            if len(business_date) != 8 or not business_date.isdigit():
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "business_date": business_date,
+                    "close_price": _to_float(entry.get("stck_clpr")),
+                    "retail_net_buy_qty": _to_float(entry.get("prsn_ntby_qty")),
+                    "foreign_net_buy_qty": _to_float(entry.get("frgn_ntby_qty")),
+                    "institution_net_buy_qty": _to_float(entry.get("orgn_ntby_qty")),
+                    # Value fields are the ones worth comparing across symbols; a
+                    # share count means nothing next to a 1,700,000원 name.
+                    "retail_net_buy_value": _to_float(entry.get("prsn_ntby_tr_pbmn")),
+                    "foreign_net_buy_value": _to_float(entry.get("frgn_ntby_tr_pbmn")),
+                    "institution_net_buy_value": _to_float(entry.get("orgn_ntby_tr_pbmn")),
+                }
+            )
+        rows.sort(key=lambda row: row["business_date"])
+        return tuple(rows)
 
     def _get_overseas_market_snapshot(
         self,

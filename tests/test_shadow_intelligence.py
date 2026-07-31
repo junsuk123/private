@@ -215,7 +215,7 @@ def test_authorized_checkpoint_with_matching_schema_emits_live_shadow_evidence(
     )
 
     assert result is not None
-    assert len(result.cpu_evidence) == 8
+    assert len(result.cpu_evidence) == len(STRATEGY_IDS)
     assert result.comparison.decisions[-1].path == "cpu_gnn"
     assert "GNN_REALTIME_TRUST_NOT_READY" in result.comparison.decisions[-1].reason_codes
 

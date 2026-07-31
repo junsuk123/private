@@ -1,0 +1,308 @@
+"""Election-path behaviour introduced with the conservative bandit.
+
+Covers the three things the old first-admissible rule could not express:
+NO_TRADE as a real outcome, a real within-sector rank, and a realized-outcome
+feedback loop.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+from app.graph.macro_reasoner import build_sector_rank_table
+from app.schemas.domain import AccountSnapshot, Holding
+from app.strategy.exit_geometry import exit_geometry
+from app.trading.conservative_bandit import BanditConfig, ConservativeStrategyBandit
+from app.trading.strategy_performance_store import PosteriorConfig, StrategyPerformanceStore
+from app.trading.strategy_session import StrategySessionConfig, StrategySessionManager
+
+
+NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+
+
+def _store(tmp_path) -> StrategyPerformanceStore:
+    return StrategyPerformanceStore(
+        tmp_path / "perf.sqlite3",
+        posterior_config=PosteriorConfig(),
+        cache_ttl_seconds=0.0,
+    )
+
+
+def _manager(tmp_path, *, store=None, evidence=None, **config_overrides):
+    store = store if store is not None else _store(tmp_path)
+    values = {
+        "state_path": str(tmp_path / "session.json"),
+        "cooldown_seconds": 5,
+        "entry_timeout_seconds": 30,
+        "require_live_gnn": False,
+    }
+    values.update(config_overrides)
+    return StrategySessionManager(
+        config=StrategySessionConfig(**values),
+        selection_evidence_provider=(lambda symbols: evidence or {}),
+        performance_store=store,
+        bandit=ConservativeStrategyBandit(store=store, config=BanditConfig()),
+    )
+
+
+def _macro(**overrides):
+    base = dict(
+        market_regime=SimpleNamespace(value="HIGH_VOL_TRENDING"),
+        reason_codes=("MACRO_HIGH_VOL_TRENDING",),
+        explanation_paths=(),
+        allowed_micro_strategies=("relative_strength", "momentum"),
+        blocked_micro_strategies=(),
+        change_point_probability=0.0,
+        regime_stability=0.9,
+        volatility_percentile=0.8,
+        spread_percentile=0.4,
+        foreign_flow_zscore=0.2,
+        diagnostics={"market_breadth": 0.4},
+        sector_rank_table=build_sector_rank_table(sector_of={}, residual_returns={}),
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _bundle(*, symbol="005930", strategy="intraday_momentum", macro=None, exit_price=70_350.0):
+    intent = SimpleNamespace(
+        side="BUY",
+        symbol=symbol,
+        selected_strategy=strategy,
+        expected_entry_price=70_000.0,
+        expected_exit_price=exit_price,
+        score=82.0,
+        confidence=0.88,
+        macro_regime="HIGH_VOL_TRENDING",
+        micro_regime="MOMENTUM",
+        reason_codes=("POSITIVE_NET_EDGE",),
+        explanation_paths=({"from": "macro", "to": strategy},),
+        rank=1,
+    )
+    return SimpleNamespace(
+        ranked_trade_intents=(intent,),
+        buy_candidates=(symbol,),
+        sell_reduce_candidates=(),
+        blocked_candidates=(),
+        micro_results=(),
+        macro_result=macro if macro is not None else _macro(),
+    )
+
+
+def _account(*holdings):
+    return AccountSnapshot(cash=200_000.0, holdings=tuple(holdings), total_equity_krw=200_000.0)
+
+
+def test_measured_negative_expectancy_produces_no_trade(tmp_path):
+    """The headline requirement of the whole change."""
+    store = _store(tmp_path)
+    for index in range(25):
+        store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=-43.0,
+            recorded_at=NOW - timedelta(minutes=index),
+        )
+    manager = _manager(tmp_path, store=store)
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert state["phase"] == "SCANNING"
+    assert state["selected_strategy"] is None
+    assert state["last_reason"].startswith("BANDIT_NO_TRADE")
+    assert state["bandit_selected_arm"] == "no_trade"
+    # The refusal is auditable, not a silent nothing-happened.
+    assert state["bandit_evaluations"]
+    assert state["bandit_evaluations"][0]["conservative_edge_bps"] < 0.0
+
+
+def test_cold_arm_is_armed_as_a_flagged_exploration(tmp_path):
+    manager = _manager(tmp_path)
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert state["phase"] == "ARMED"
+    assert state["selected_strategy"] == "intraday_momentum"
+    assert state["cost_coverage_band"] in {"THIN", "SUFFICIENT", "INSUFFICIENT", "NOT_COVERED"}
+    # With no realized history the lower bound is negative, so the ONLY reason this
+    # armed is cold-start exploration — and that must be visible, otherwise a
+    # negative edge on an ARMED position is indistinguishable from a bug.
+    assert state["bandit_is_exploration"] is True
+    assert state["bandit_conservative_edge_bps"] is not None
+    assert state["bandit_conservative_edge_bps"] < 0.0
+    assert "BANDIT_EXPLORATION_ARM_SELECTED" in state["bandit_reason_codes"]
+
+
+def test_demonstrated_edge_is_armed_as_exploitation_not_exploration(tmp_path):
+    store = _store(tmp_path)
+    for index in range(40):
+        store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=70.0 + (index % 4),
+            recorded_at=NOW - timedelta(minutes=index),
+        )
+    manager = _manager(tmp_path, store=store)
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert state["phase"] == "ARMED"
+    assert state["bandit_is_exploration"] is False
+    assert state["bandit_conservative_edge_bps"] > 0.0
+
+
+def test_election_context_carries_a_real_within_sector_rank(tmp_path):
+    macro = _macro(
+        sector_rank_table=build_sector_rank_table(
+            sector_of={"005930": "semi", "000660": "semi"},
+            residual_returns={"005930": 0.004, "000660": 0.001},
+            long_residual_returns={"005930": 0.006, "000660": 0.002},
+            market_betas={"005930": 0.9},
+        )
+    )
+    manager = _manager(tmp_path)
+    state = manager.evaluate(_account(), ("005930",), _bundle(macro=macro), NOW)
+    context = state["election_context"]
+    assert context["sector_rank"] == 1
+    assert context["sector_candidate_count"] == 2
+    assert context["sector"] == "semi"
+    assert context["residual_return_short_bps"] == 40.0
+    assert context["residual_return_long_bps"] == 60.0
+    assert context["market_beta"] == 0.9
+
+
+def test_election_context_omits_the_rank_when_the_sector_is_unknown(tmp_path):
+    """An unanswerable rank must be absent, not faked from a global ordering."""
+    manager = _manager(tmp_path)
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    context = state["election_context"]
+    assert "sector_rank" not in context
+    assert "sector_candidate_count" not in context
+
+
+def test_change_point_stand_down_prevents_election(tmp_path):
+    manager = _manager(tmp_path)
+    macro = _macro(change_point_probability=0.85)
+    state = manager.evaluate(_account(), ("005930",), _bundle(macro=macro), NOW)
+    assert state["phase"] == "SCANNING"
+    assert state["change_point_probability"] == 0.85
+    assert "BANDIT_CHANGE_POINT_STAND_DOWN" in state["bandit_reason_codes"]
+
+
+def test_closed_position_records_a_realized_outcome(tmp_path):
+    store = _store(tmp_path)
+    manager = _manager(tmp_path, store=store)
+    armed = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert armed["phase"] == "ARMED"
+    manager.mark_entry_submitted("005930", NOW)
+    holding = Holding(
+        ticker="005930",
+        market="KR",
+        company_name="Samsung",
+        sector="Technology",
+        quantity=1,
+        average_price=70_000.0,
+        last_price=70_100.0,
+        opened_at=NOW,
+    )
+    manager.evaluate(_account(holding), (), _bundle(), NOW + timedelta(seconds=1))
+    # Derived from the live geometry rather than hardcoded: a fixed +1.43% used to
+    # clear a 100bps target and silently stopped clearing it when the target moved.
+    target_bps = exit_geometry("intraday_momentum").take_profit_bps
+    exit_price = 70_000.0 * (1.0 + (target_bps + 25.0) / 10_000.0)
+    target = Holding(**{**holding.__dict__, "last_price": exit_price})
+    exiting = manager.evaluate(_account(target), (), _bundle(), NOW + timedelta(seconds=2))
+    assert exiting["phase"] == "EXITING"
+    flat = manager.evaluate(_account(), (), _bundle(), NOW + timedelta(seconds=3))
+    assert flat["phase"] == "COOLDOWN"
+
+    outcomes = store.recent_outcomes("intraday_momentum", market="KR")
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    # Gross must clear the target it was triggered by, and the round trip on top.
+    assert outcome.realized_gross_bps > target_bps
+    assert outcome.realized_net_bps == outcome.realized_gross_bps - 28.0
+    assert outcome.regime == "HIGH_VOL_TRENDING"
+    assert outcome.exit_reason == "STRATEGY_PROFIT_TARGET"
+
+
+def test_outcome_is_recorded_once_only(tmp_path):
+    store = _store(tmp_path)
+    manager = _manager(tmp_path, store=store)
+    manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    manager.mark_entry_submitted("005930", NOW)
+    holding = Holding(
+        ticker="005930",
+        market="KR",
+        company_name="Samsung",
+        sector="Technology",
+        quantity=1,
+        average_price=70_000.0,
+        last_price=71_000.0,
+        opened_at=NOW,
+    )
+    manager.evaluate(_account(holding), (), _bundle(), NOW + timedelta(seconds=1))
+    for offset in (2, 3, 4):
+        manager.evaluate(_account(), (), _bundle(), NOW + timedelta(seconds=offset))
+    assert len(store.recent_outcomes("intraday_momentum", market="KR")) == 1
+
+
+def test_bandit_can_be_disabled_to_restore_first_admissible_election(tmp_path):
+    store = _store(tmp_path)
+    for index in range(25):
+        store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=-43.0,
+            recorded_at=NOW - timedelta(minutes=index),
+        )
+    manager = _manager(tmp_path, store=store, bandit_enabled=False)
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert state["phase"] == "ARMED"
+    assert state["bandit_selected_arm"] is None
+
+
+def test_new_entry_is_refused_outside_the_regular_session(tmp_path):
+    """The measured production failure: 11,614 cycles, 0 buys, misleading reason.
+
+    Outside the regular session every candidate failed individually on thin-book
+    liquidity, so the surviving reason blamed the GNN (NO_POSITIVE_NET_GNN_EDGE)
+    while the actual constraint was that no scanned market was open for trading.
+    """
+    manager = _manager(tmp_path)
+    # 23:45 UTC — KRX pre-market (08:45 KST), US after-hours. US candidates only.
+    after_hours = datetime(2026, 7, 30, 23, 45, tzinfo=timezone.utc)
+    state = manager.evaluate(
+        _account(), ("F", "BAC"), _bundle(symbol="F"), after_hours
+    )
+    assert state["phase"] == "SCANNING"
+    assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+    assert state["session_phases"]["US"] == "after"
+    # The reason names the phase, so no clock correlation is needed.
+    assert "US=after" in state["last_reason"]
+
+
+def test_regular_session_candidates_still_elect(tmp_path):
+    manager = _manager(tmp_path)
+    # 01:00 UTC — 10:00 KST, KRX regular session, KR candidate.
+    state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    assert state["phase"] == "ARMED"
+    assert state["session_phases"]["KRX"] == "regular"
+
+
+def test_extended_hours_entry_can_be_re_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRADING_ALLOW_EXTENDED_HOURS_ENTRY", "true")
+    manager = _manager(tmp_path)
+    after_hours = datetime(2026, 7, 30, 23, 45, tzinfo=timezone.utc)
+    state = manager.evaluate(_account(), ("F",), _bundle(symbol="F"), after_hours)
+    assert not state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+
+
+def test_session_gate_is_scoped_to_the_scanned_market(tmp_path):
+    """A universe of US names during the KR session is not "market open"."""
+    manager = _manager(tmp_path)
+    # 01:00 UTC: KRX regular, but US is fully closed and the universe is US-only.
+    state = manager.evaluate(_account(), ("F",), _bundle(symbol="F"), NOW)
+    assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+    assert state["session_phases"] == {"US": "closed"}

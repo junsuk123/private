@@ -5,12 +5,13 @@ import json
 import sqlite3
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import fmean
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from app.backtesting.event_simulator import EventDrivenFillSimulator
+from app.data.investor_flow_store import business_date_for
 from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
 from app.trading.contracts import Bar
@@ -65,6 +66,178 @@ def causal_percentile(value: float, history: Sequence[float]) -> float:
     return sum(item <= value for item in history) / len(history)
 
 
+@dataclass(frozen=True)
+class BarMicrostructure:
+    """Per-bar microstructure already persisted alongside the OHLCV columns.
+
+    ``realtime_minute_bars`` carries ``vwap``, ``spread_bps``,
+    ``orderbook_imbalance``, ``liquidity_score``, ``volatility`` and
+    ``trade_count``, but :func:`load_minute_bars` selected only OHLCV and dropped
+    them. Six of eleven strategies need exactly these inputs, so dropping them
+    silently reduced the training catalogue by more than half -- see
+    :func:`build_labels` for the quantiles this now makes derivable.
+    """
+
+    vwap: float | None
+    spread_bps: float | None
+    orderbook_imbalance: float | None
+    liquidity_score: float | None
+    volatility: float | None
+    trade_count: float | None
+
+
+def load_minute_microstructure(
+    database: Path,
+) -> dict[str, dict[datetime, BarMicrostructure]]:
+    """Microstructure columns keyed by ``(symbol, minute_start)``.
+
+    Keyed by timestamp rather than positional index on purpose: ``build_labels``
+    filters bars for contiguity and activity, so a positional pairing would
+    silently misalign a symbol's features with another bar's outcome.
+    """
+    by_symbol: dict[str, dict[datetime, BarMicrostructure]] = defaultdict(dict)
+    connection = sqlite3.connect(database)
+    try:
+        rows = connection.execute(
+            """
+            SELECT symbol, minute_start, vwap, spread_bps, orderbook_imbalance,
+                   liquidity_score, volatility, trade_count
+            FROM realtime_minute_bars
+            ORDER BY symbol, minute_start
+            """
+        )
+        for (
+            symbol,
+            start,
+            vwap,
+            spread_bps,
+            imbalance,
+            liquidity,
+            volatility,
+            trade_count,
+        ) in rows:
+            by_symbol[symbol][datetime.fromisoformat(start)] = BarMicrostructure(
+                vwap=_optional_float(vwap),
+                spread_bps=_optional_float(spread_bps),
+                orderbook_imbalance=_optional_float(imbalance),
+                liquidity_score=_optional_float(liquidity),
+                volatility=_optional_float(volatility),
+                trade_count=_optional_float(trade_count),
+            )
+    except sqlite3.Error:
+        # An older store without these columns must degrade to the previous
+        # behaviour (features absent -> those strategies simply do not fire),
+        # never to a crash in the training path.
+        return {}
+    finally:
+        connection.close()
+    return {symbol: dict(values) for symbol, values in by_symbol.items()}
+
+
+DEFAULT_NEWS_SENTIMENT_PATH = "data/store/news_sentiment.sqlite3"
+
+
+def load_news_sentiment(
+    path: str | Path = DEFAULT_NEWS_SENTIMENT_PATH,
+) -> dict[str, tuple[tuple[datetime, float], ...]]:
+    """Point-in-time news sentiment per ticker, ascending by observation time.
+
+    Read from the separate ``news_sentiment`` store the event-LLM pipeline writes.
+    Its score is effectively BINARY in practice — measured over 180,699 rows,
+    96.4% are exactly +1.0 and 3.6% are exactly -1.0 — so the absolute level is
+    close to uninformative and only intensity and the rare negative carry signal.
+    :func:`_event_quantiles` is built around that measurement rather than pretending
+    the score is a graded sentiment.
+    """
+    store = Path(path)
+    if not store.exists():
+        return {}
+    by_ticker: dict[str, list[tuple[datetime, float]]] = defaultdict(list)
+    connection = sqlite3.connect(store)
+    try:
+        rows = connection.execute(
+            "SELECT ticker, observed_at, score FROM news_sentiment ORDER BY ticker, observed_at"
+        )
+        for ticker, observed_at, score in rows:
+            try:
+                moment = datetime.fromisoformat(str(observed_at))
+            except (TypeError, ValueError):
+                continue
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            value = _optional_float(score)
+            if value is None:
+                continue
+            # KIS-style suffixed duplicates ("005930.KS") describe the same issuer.
+            key = str(ticker or "").upper().split(".", 1)[0].strip()
+            if key:
+                by_ticker[key].append((moment, value))
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+    return {ticker: tuple(values) for ticker, values in by_ticker.items()}
+
+
+def _event_quantiles(
+    series: Sequence[tuple[datetime, float]],
+    as_of: datetime,
+    *,
+    window_seconds: float = 900.0,
+    baseline_seconds: float = 21_600.0,
+) -> dict[str, float]:
+    """Event relevance and direction from a saturated sentiment feed.
+
+    ``relevance`` is news INTENSITY against the ticker's own recent baseline: a
+    burst of coverage is evidence that something happened, and unlike the score
+    itself it is not saturated.
+
+    ``direction`` is the absence of negative coverage in the window. With 96.4% of
+    scores pinned at +1.0, a "positive mean" is true almost always and would gate
+    nothing; the 3.6% negatives are the only discriminating observations, so a
+    window containing one must not read as bullish confirmation.
+
+    Strictly causal: only observations at or before ``as_of`` are consulted.
+    """
+    if not series:
+        return {"event_relevance": 0.0, "event_direction": 0.0}
+    window_start = as_of - timedelta(seconds=window_seconds)
+    baseline_start = as_of - timedelta(seconds=baseline_seconds)
+    window: list[float] = []
+    baseline_count = 0
+    for moment, score in series:
+        if moment > as_of:
+            break  # ascending: nothing later can qualify
+        if moment >= baseline_start:
+            baseline_count += 1
+        if moment >= window_start:
+            window.append(score)
+    if not window:
+        return {"event_relevance": 0.0, "event_direction": 0.0}
+
+    # Expected count in a window of this length if coverage were uniform across
+    # the baseline. Above 1.0 means unusually heavy coverage right now.
+    expected = baseline_count * (window_seconds / baseline_seconds)
+    intensity = len(window) / expected if expected > 0 else 0.0
+    negatives = sum(1 for score in window if score < 0)
+    return {
+        # Saturates at 3x normal coverage, so a genuine burst reaches the 0.8
+        # entry quantile while routine background coverage does not.
+        "event_relevance": max(0.0, min(1.0, intensity / 3.0)),
+        "event_direction": max(0.0, 1.0 - negatives / len(window)),
+    }
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        if value is None:
+            return None
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None  # drop NaN
+
+
 def load_minute_bars(database: Path) -> dict[str, tuple[Bar, ...]]:
     by_symbol: dict[str, list[Bar]] = defaultdict(list)
     connection = sqlite3.connect(database)
@@ -103,13 +276,433 @@ def load_minute_bars(database: Path) -> dict[str, tuple[Bar, ...]]:
     return {symbol: tuple(bars) for symbol, bars in by_symbol.items()}
 
 
+def _market_return_index(
+    bars_by_symbol: dict[str, tuple[Bar, ...]],
+) -> dict[datetime, float]:
+    """Equal-weighted cross-sectional mean 1-bar return at each timestamp.
+
+    This is the benchmark that turns a raw return into *relative* strength and a
+    market-neutral residual. It is a mean across whatever symbols traded in that
+    minute, which is the honest closed-world answer for this store -- there is no
+    index series and no sector membership in it.
+    """
+    sums: dict[datetime, float] = defaultdict(float)
+    counts: dict[datetime, int] = defaultdict(int)
+    for bars in bars_by_symbol.values():
+        for position in range(1, len(bars)):
+            previous, current = bars[position - 1], bars[position]
+            if previous.close <= 0:
+                continue
+            sums[current.start_time] += current.close / previous.close - 1
+            counts[current.start_time] += 1
+    return {
+        moment: sums[moment] / counts[moment]
+        for moment in sums
+        if counts[moment] >= 2  # one symbol is not a cross-section
+    }
+
+
+def _relative_volume(current_volume: float, history: Sequence[float]) -> float:
+    """RVOL: current volume over its own recent average.
+
+    The day-trading literature treats this as the primary selection filter --
+    "stocks in play". Zarattini/Barbon/Aziz restrict an opening-range breakout to
+    the top names by opening relative volume and report a Sharpe of 2.81 where the
+    unrestricted version is unprofitable, and practitioner studies put the useful
+    threshold around 1.5-2.0x. It is returned as a raw ratio; the caller maps it
+    to a quantile so it stays comparable with every other feature.
+    """
+    usable = [value for value in history if value > 0]
+    if not usable:
+        return 1.0
+    average = fmean(usable)
+    if average <= 0:
+        return 1.0
+    return max(0.0, current_volume / average)
+
+
+def _session_date_changed(previous: Bar | None, current: Bar) -> bool:
+    """Did a new trading session start at ``current``?
+
+    Derived from the bar timestamps rather than an exchange calendar: the store
+    holds no session metadata, and a UTC date change is a sound proxy for both
+    venues here because neither KRX nor US regular hours straddle UTC midnight.
+    """
+    if previous is None:
+        return True
+    return previous.start_time.date() != current.start_time.date()
+
+
+def _slope(values: Sequence[float]) -> float:
+    """Least-squares slope over evenly spaced samples; 0.0 when undefined."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean_x = (n - 1) / 2.0
+    mean_y = fmean(values)
+    denominator = sum((index - mean_x) ** 2 for index in range(n))
+    if denominator <= 0:
+        return 0.0
+    numerator = sum((index - mean_x) * (value - mean_y) for index, value in enumerate(values))
+    return numerator / denominator
+
+
+def _gap_quantile(bars: Sequence[Bar], index: int, session_start: int) -> float:
+    """Overnight gap, as a percentile of this symbol's own recent gaps."""
+    if session_start <= 0 or session_start >= len(bars):
+        return 0.0
+    previous_close = bars[session_start - 1].close
+    if previous_close <= 0:
+        return 0.0
+    gap = bars[session_start].open / previous_close - 1
+    history = []
+    for position in range(1, min(session_start, len(bars))):
+        prior = bars[position - 1].close
+        if prior > 0:
+            history.append(bars[position].open / prior - 1)
+    if not history:
+        # A single observed gap cannot be ranked; a neutral 0.5 would falsely
+        # satisfy nothing and a 1.0 would fire on no evidence.
+        return 0.0
+    return causal_percentile(gap, history)
+
+
+def _opening_confirmation_quantile(
+    bars: Sequence[Bar], index: int, session_start: int
+) -> float:
+    """Has price held the gap's direction since the session opened?
+
+    The gap_context thesis is explicitly "continuation only after price-discovery
+    confirmation", so an unconfirmed gap must not fire.
+    """
+    if session_start <= 0 or index <= session_start:
+        return 0.0
+    open_price = bars[session_start].open
+    if open_price <= 0:
+        return 0.0
+    previous_close = bars[session_start - 1].close
+    if previous_close <= 0:
+        return 0.0
+    gap_up = bars[session_start].open >= previous_close
+    drift = bars[index].close / open_price - 1
+    # Confirmation is directional agreement with the gap, scaled so that a drift
+    # of one half-percent in the gap's direction is full confirmation.
+    aligned = drift if gap_up else -drift
+    return max(0.0, min(1.0, 0.5 + aligned / 0.01))
+
+
+def _opening_range_breakout_quantile(
+    bars: Sequence[Bar], index: int, session_start: int, range_bars: int = 5
+) -> float:
+    """Position of price relative to the session's opening range.
+
+    The published ORB rule (Zarattini/Barbon/Aziz) buys when price clears the
+    first N minutes' range, and its profitability rests on pairing that with a
+    relative-volume selection filter rather than on the breakout alone. Returned
+    as 0..1 where >0.5 means "above the opening range high".
+    """
+    if index < session_start + range_bars:
+        return 0.0
+    window = bars[session_start : session_start + range_bars]
+    high = max(bar.high for bar in window)
+    low = min(bar.low for bar in window)
+    span = high - low
+    if span <= 0 or high <= 0:
+        return 0.0
+    excess = (bars[index].close - high) / span
+    # The published trigger is clearing the opening range at all, not clearing it
+    # by some margin, so any positive excess must land in admissible territory
+    # (>= the 0.8 entry quantile) and deeper excess merely ranks higher. Inside
+    # the range stays below the threshold.
+    if excess > 0:
+        return min(1.0, 0.8 + excess)
+    return max(0.0, 0.4 + excess)
+
+
+# KRX session geometry, in minutes past midnight Korea time. Continuous trading ends
+# at 15:20 and 15:20-15:30 is a closing single-price auction, so the tradable "last
+# half-hour" is 14:50-15:20 — NOT 15:00-15:30. Entering into the auction would price
+# against a mechanism this system does not model.
+_KST = timezone(timedelta(hours=9))
+_FIRST_HALF_HOUR = (9 * 60, 9 * 60 + 30)
+_PENULTIMATE_HALF_HOUR = (14 * 60 + 20, 14 * 60 + 50)
+_LAST_CONTINUOUS_HALF_HOUR = (14 * 60 + 50, 15 * 60 + 20)
+
+
+def _kst_minute_of_day(moment: datetime) -> int:
+    local = moment.astimezone(_KST)
+    return local.hour * 60 + local.minute
+
+
+def _intraday_momentum_quantiles(
+    bars: Sequence[Bar],
+    index: int,
+    session_start: int,
+) -> dict[str, float]:
+    """Market-intraday-momentum features for the bar at ``index``.
+
+    The published effect is that the FIRST half-hour return (measured from the
+    previous close, so it includes the overnight gap) predicts the LAST half-hour
+    return, with the relationship strongest on high-volatility days. Reported R² is
+    1.6%, rising to 3.3% on high first-half-hour-volatility days.
+
+    Three features are produced, all strictly causal:
+
+    ``intraday_momentum_signal``
+        0..1, above 0.5 when the first half-hour return was positive. Magnitude is
+        scaled so a 1% first half-hour move saturates.
+    ``intraday_momentum_window``
+        1.0 only inside 14:50-15:20 Korea time — the last half-hour of CONTINUOUS
+        trading. Zero elsewhere, so the strategy cannot fire at any other time.
+    ``first_half_hour_volatility``
+        0..1 percentile of the day's first-half-hour realised volatility against the
+        same measure on previous days. This is the paper's strongest condition and is
+        independently the cost condition: only a volatile day travels far enough to
+        clear a ~33bps round trip.
+    """
+    absent = {
+        "intraday_momentum_signal": 0.0,
+        "intraday_momentum_window": 0.0,
+        "first_half_hour_volatility": 0.0,
+    }
+    if session_start <= 0 or index <= session_start:
+        return absent
+    current = bars[index]
+    minute = _kst_minute_of_day(current.end_time)
+    in_window = _LAST_CONTINUOUS_HALF_HOUR[0] <= minute < _LAST_CONTINUOUS_HALF_HOUR[1]
+    if not in_window:
+        # Cheap exit: outside the entry window nothing else matters.
+        return absent
+
+    previous_close = bars[session_start - 1].close
+    if previous_close <= 0:
+        return absent
+
+    # --- first half-hour of THIS session -----------------------------------
+    first_bars = [
+        bar
+        for bar in bars[session_start : index + 1]
+        if _FIRST_HALF_HOUR[0] <= _kst_minute_of_day(bar.end_time) < _FIRST_HALF_HOUR[1]
+    ]
+    if len(first_bars) < 5:
+        # Without the opening window there is no signal. Reporting 0 (never fires) is
+        # the honest answer; inventing one from a partial window is how a feature
+        # starts meaning something other than its name.
+        return absent
+    first_close = first_bars[-1].close
+    r1 = first_close / previous_close - 1.0
+    if r1 <= 0:
+        # Long-only: a negative first half-hour predicts a negative last half-hour,
+        # which is not expressible here.
+        return {**absent, "intraday_momentum_window": 1.0}
+
+    highs = [bar.high for bar in first_bars]
+    lows = [bar.low for bar in first_bars]
+    closes = [bar.close for bar in first_bars if bar.close > 0]
+    realised = (
+        (max(highs) - min(lows)) / fmean(closes) if closes and fmean(closes) > 0 else 0.0
+    )
+
+    # Same measure on earlier sessions, for a like-for-like percentile.
+    prior_vols = _prior_session_opening_volatility(bars, session_start)
+    volatility_q = (
+        causal_percentile(realised, prior_vols) if len(prior_vols) >= 3 else 0.0
+    )
+
+    return {
+        "intraday_momentum_signal": max(0.0, min(1.0, 0.5 + r1 / 0.02)),
+        "intraday_momentum_window": 1.0,
+        "first_half_hour_volatility": volatility_q,
+    }
+
+
+def _prior_session_opening_volatility(
+    bars: Sequence[Bar], session_start: int
+) -> list[float]:
+    """First-half-hour range/price for every session strictly before this one."""
+    by_day: dict[int, list[Bar]] = defaultdict(list)
+    for position in range(session_start):
+        bar = bars[position]
+        minute = _kst_minute_of_day(bar.end_time)
+        if _FIRST_HALF_HOUR[0] <= minute < _FIRST_HALF_HOUR[1]:
+            by_day[bar.start_time.astimezone(_KST).date().toordinal()].append(bar)
+    values: list[float] = []
+    for day in sorted(by_day):
+        window = by_day[day]
+        if len(window) < 5:
+            continue
+        closes = [bar.close for bar in window if bar.close > 0]
+        if not closes:
+            continue
+        mean_close = fmean(closes)
+        if mean_close <= 0:
+            continue
+        values.append(
+            (max(bar.high for bar in window) - min(bar.low for bar in window)) / mean_close
+        )
+    return values
+
+
+def _microstructure_quantiles(
+    *,
+    bars: Sequence[Bar],
+    index: int,
+    history_start: int,
+    micro_by_time: dict[datetime, BarMicrostructure],
+    spreads: Sequence[float],
+    spread_history: Sequence[float],
+) -> dict[str, float]:
+    """Order-flow features from the persisted per-bar microstructure columns.
+
+    Order-flow imbalance is the best-documented short-horizon predictor in the
+    microstructure literature -- near-linear in contemporaneous price change, with
+    order-book imbalance explaining the majority of short-interval moves and the
+    signal strongest under ~3 minutes. The store keeps ``orderbook_imbalance`` per
+    bar, so its level and slope are recoverable here.
+
+    When the columns are absent (older store) every value falls back to the
+    never-fire constant the previous implementation used, so a missing column
+    degrades to "this strategy is untrainable" rather than to a fabricated signal.
+    """
+    absent = {
+        "vwap_zscore": 1.0,
+        "liquidity_recovery": 0.0,
+        "microprice_edge": 0.0,
+        "ofi_slope": 0.0,
+        "depth_recovery": 0.0,
+        "flow_toxicity": 1.0,
+        "liquidity_micro": 0.0,
+    }
+    current_micro = micro_by_time.get(bars[index].start_time)
+    if current_micro is None:
+        return absent
+
+    window = [
+        micro_by_time.get(bars[position].start_time)
+        for position in range(history_start, index + 1)
+    ]
+    imbalances = [m.orderbook_imbalance for m in window if m and m.orderbook_imbalance is not None]
+    spread_values = [m.spread_bps for m in window if m and m.spread_bps is not None]
+    liquidity_values = [m.liquidity_score for m in window if m and m.liquidity_score is not None]
+
+    result = dict(absent)
+
+    # --- Anchored-VWAP displacement, volatility-normalised ------------------
+    # Uses the bar's own recorded VWAP rather than the close-weighted proxy.
+    vwaps = [m.vwap for m in window if m and m.vwap is not None and m.vwap > 0]
+    if vwaps and current_micro.vwap and current_micro.vwap > 0:
+        anchor = fmean(vwaps)
+        volatility = current_micro.volatility or 0.0
+        displacement = bars[index].close / anchor - 1
+        scale = volatility if volatility > 0 else 0.005
+        zscore = displacement / scale
+        # 0..1 with LOW meaning deeply displaced below the anchor, matching the
+        # expert's ``vwap_zscore <= 1 - entry_quantile`` test.
+        result["vwap_zscore"] = max(0.0, min(1.0, 0.5 + zscore / 6.0))
+
+    # --- Order-flow imbalance level and slope -------------------------------
+    if len(imbalances) >= 3:
+        result["ofi_slope"] = causal_percentile(
+            _slope(imbalances[-5:]), [_slope(imbalances[max(0, j - 5) : j]) for j in range(3, len(imbalances))]
+        )
+        # Microprice tilt: a bid-heavy book prices the true mid above the midpoint.
+        result["microprice_edge"] = max(0.0, min(1.0, 0.5 + imbalances[-1] / 2.0))
+
+    # --- Depth / liquidity recovery -----------------------------------------
+    if len(liquidity_values) >= 3:
+        recovering = liquidity_values[-1] - fmean(liquidity_values[:-1])
+        result["depth_recovery"] = max(0.0, min(1.0, 0.5 + recovering * 50.0))
+        result["liquidity_micro"] = causal_percentile(
+            liquidity_values[-1], liquidity_values[:-1]
+        )
+
+    # --- Spread normalisation and flow toxicity -----------------------------
+    if len(spread_values) >= 3:
+        baseline = fmean(spread_values[:-1])
+        latest = spread_values[-1]
+        # Spread back to or below its baseline == liquidity has returned.
+        result["liquidity_recovery"] = (
+            max(0.0, min(1.0, 1.0 - (latest / baseline))) if baseline > 0 else 0.0
+        )
+        # Toxicity: a spread blowing out relative to baseline means the
+        # counterparty is better informed than a reversion thesis assumes.
+        result["flow_toxicity"] = (
+            max(0.0, min(1.0, (latest / baseline) / 3.0)) if baseline > 0 else 1.0
+        )
+    return result
+
+
+def _rolling_mean_percentile(
+    series: Sequence[float],
+    index: int,
+    history_start: int,
+    window: int,
+) -> float:
+    """Percentile of a ``window``-bar mean against prior ``window``-bar MEANS.
+
+    Ranking a mean against a distribution of single observations is invalid and
+    silently one-sided: averaging shrinks variance, so a window mean lands near the
+    centre of the singles distribution almost always and its percentile clusters
+    around 0.5. Measured consequence — ``residual_strength_long`` could then never
+    reach its 0.65 confirmation threshold, so ``residual_relative_strength`` never
+    fired even with every other input satisfied. Compare like with like.
+    """
+    if window < 1 or index < history_start + window:
+        return 0.0
+    current = fmean(series[index - window + 1 : index + 1])
+    history = [
+        fmean(series[position - window + 1 : position + 1])
+        for position in range(history_start + window - 1, index)
+        if position - window + 1 >= 0
+    ]
+    if len(history) < 3:
+        return 0.0
+    return causal_percentile(current, history)
+
+
+def _investor_flow_quantile(
+    history: Mapping[str, Any] | None,
+    business_date: str,
+) -> float:
+    """Informed net buying on this business day, ranked against prior days.
+
+    Ranked rather than thresholded because net-buy value is denominated in KRW and
+    is not comparable across symbols: 3.6bn won into Samsung is routine, the same
+    number into a mid-cap is not. A percentile of the symbol's own history is.
+
+    Strictly causal: only business days strictly BEFORE the current one form the
+    comparison set, so a day never ranks against its own future.
+    """
+    if not history:
+        return 0.0
+    prior = [
+        day.informed_net_buy_value
+        for date_key, day in history.items()
+        if date_key < business_date
+    ]
+    today = history.get(business_date)
+    if today is None or len(prior) < 3:
+        return 0.0
+    return causal_percentile(today.informed_net_buy_value, prior)
+
+
 def build_labels(
     bars_by_symbol: dict[str, tuple[Bar, ...]],
     config: EvaluationConfig,
+    microstructure_by_symbol: dict[str, dict[datetime, BarMicrostructure]] | None = None,
+    investor_flow_by_symbol: Mapping[str, Mapping[str, Any]] | None = None,
+    news_by_ticker: Mapping[str, Sequence[tuple[datetime, float]]] | None = None,
 ) -> tuple[CounterfactualLabel, ...]:
     simulator = EventDrivenFillSimulator()
     labels: list[CounterfactualLabel] = []
     experts = tuple(expert_type() for expert_type in ALL_EXPERT_TYPES)
+    microstructure_by_symbol = microstructure_by_symbol or {}
+    investor_flow_by_symbol = investor_flow_by_symbol or {}
+    news_by_ticker = news_by_ticker or {}
+    # Cross-sectional context: each symbol's return over a common window, so
+    # relative strength is measured against the actual universe rather than
+    # against a hardcoded 0.0. Built once, keyed by bar timestamp.
+    market_returns_by_time = _market_return_index(bars_by_symbol)
     for symbol, bars in sorted(bars_by_symbol.items()):
         if len(bars) < config.minimum_symbol_bars:
             continue
@@ -121,6 +714,23 @@ def build_labels(
         returns.extend(bars[i].close / bars[i - 1].close - 1 for i in range(1, len(bars)))
         volumes = [bar.volume for bar in bars]
         spreads = [max(0.0, (bar.high - bar.low) / bar.close) for bar in bars]
+        micro_by_time = microstructure_by_symbol.get(symbol) or {}
+        flow_history = investor_flow_by_symbol.get(symbol) or {}
+        news_series = news_by_ticker.get(str(symbol).upper().split(".", 1)[0]) or ()
+        # Residual return = own return minus the cross-sectional mean. This is the
+        # market-neutral component the residual/relative-strength experts score.
+        residuals = [
+            returns[position]
+            - market_returns_by_time.get(bars[position].start_time, 0.0)
+            for position in range(len(bars))
+        ]
+        # Session-open reference for the gap / opening-range features.
+        session_open_index: list[int] = []
+        current_session_start = 0
+        for position, bar in enumerate(bars):
+            if _session_date_changed(bars[position - 1] if position else None, bar):
+                current_session_start = position
+            session_open_index.append(current_session_start)
         for index in range(
             config.history_bars,
             len(bars) - config.horizon_bars,
@@ -201,14 +811,36 @@ def build_labels(
                 "price_drop": causal_percentile(-current_return, [-item for item in return_history]),
                 "recovery": causal_percentile(current_return, return_history),
                 "liquidity": causal_percentile(current.volume, volume_history),
-                # No point-in-time event, sector membership, or exchange-session
-                # calendar is present in this store. Closed-world evaluation must
-                # not manufacture these features.
-                "event_relevance": 0.0,
-                "event_direction": 0.0,
-                "relative_strength": 0.0,
-                "gap": 0.0,
-                "opening_confirmation": 0.0,
+                # Event features come from the separate news-sentiment store the
+                # event-LLM pipeline writes. Absent (no coverage for this ticker at
+                # this moment) still yields 0.0 -> the strategy does not fire.
+                **_event_quantiles(news_series, current.end_time),
+                # Relative strength IS derivable: the store holds every symbol, so
+                # the cross-sectional mean return is a real benchmark. Previously
+                # hardcoded to 0.0, which made this strategy untrainable.
+                "relative_strength": causal_percentile(
+                    residuals[index], residuals[history_start:index]
+                ),
+                # Gap and opening confirmation come from the session-open bar,
+                # located from bar timestamps rather than an exchange calendar.
+                "gap": _gap_quantile(bars, index, session_open_index[index]),
+                "opening_confirmation": _opening_confirmation_quantile(
+                    bars, index, session_open_index[index]
+                ),
+                # Relative volume -- the "stocks in play" filter. Not consumed by
+                # the legacy experts, but the opening-range expert requires it and
+                # the model gets it as a feature either way.
+                "relative_volume": causal_percentile(
+                    _relative_volume(current.volume, volume_history),
+                    [
+                        _relative_volume(volumes[j], volumes[max(0, j - 20) : j])
+                        for j in range(max(20, history_start), index)
+                    ],
+                ),
+                "opening_range_breakout": _opening_range_breakout_quantile(
+                    bars, index, session_open_index[index]
+                ),
+                **_intraday_momentum_quantiles(bars, index, session_open_index[index]),
                 "rvgi_diff": (
                     max(0.0, min(1.0, 0.5 + rvgi_diff * 5.0))
                     if rvgi_diff is not None
@@ -218,6 +850,31 @@ def build_labels(
                 "box_position": float(box.position or 0.0) if box.ok else 0.0,
                 "false_breakout_risk": (
                     0.0 if box_breakout and volume_confirmed else 1.0
+                ),
+                # Residual strength over two horizons, both market-neutral. Each is
+                # ranked against prior means of the SAME window length; see
+                # _rolling_mean_percentile for why the naive comparison is invalid.
+                "residual_strength_short": _rolling_mean_percentile(
+                    residuals, index, history_start, 5
+                ),
+                "residual_strength_long": _rolling_mean_percentile(
+                    residuals, index, history_start, 15
+                ),
+                # Real broker investor-type data (외국인/기관 net buying), fetched
+                # from KIS and persisted per business day. An orderbook imbalance is
+                # NOT a substitute — it describes resting quotes over seconds, not
+                # who accumulated over a day — so this reads the actual series and
+                # falls back to 0.0 (does not fire) when a symbol is uncollected.
+                "investor_flow": _investor_flow_quantile(
+                    flow_history, business_date_for(current.end_time)
+                ),
+                **_microstructure_quantiles(
+                    bars=bars,
+                    index=index,
+                    history_start=history_start,
+                    micro_by_time=micro_by_time,
+                    spreads=spreads,
+                    spread_history=spread_history,
                 ),
             }
             as_of = current.end_time

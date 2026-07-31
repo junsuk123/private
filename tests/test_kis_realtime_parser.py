@@ -195,11 +195,31 @@ class KisRealtimeParserTest(unittest.TestCase):
         self.assertTrue(str(book.sequence_key).startswith("us-kis-ws:F:"))
 
     def test_overseas_subscription_key_uses_listed_exchange(self) -> None:
+        """Both sessions, with the clock pinned.
+
+        This used to assert only the night key without pinning ``now``, so it
+        failed whenever the suite ran inside the KIS daytime quote window
+        (10:00-16:00 KST) and returned the correct daytime key ``RBAYF``. The
+        session-dependence was the thing worth testing, so both are asserted.
+        """
+        night = datetime(2026, 7, 31, 0, 0, tzinfo=timezone.utc)  # 09:00 KST, Fri
+        daytime = datetime(2026, 7, 31, 3, 0, tzinfo=timezone.utc)  # 12:00 KST, Fri
         with patch(
             "app.trading.us_realtime_bridge._exchange_code",
             return_value="NYS",
+        ), patch.dict(
+            # The env override outranks ``now``; blank it so the pinned clock wins
+            # regardless of what the operator's shell exported.
+            "os.environ",
+            {"KIS_FORCE_US_DAYTIME_QUOTES": ""},
         ):
-            self.assertEqual(overseas_realtime_subscription_key("F"), "DNYSF")
+            self.assertEqual(
+                overseas_realtime_subscription_key("F", now=night), "DNYSF"
+            )
+            # Daytime uses a different exchange code, not merely a prefix swap.
+            self.assertEqual(
+                overseas_realtime_subscription_key("F", now=daytime), "RBAYF"
+            )
 
     def test_subscription_manager_persists_ticks_orderbooks_and_bar(self) -> None:
         messages = (

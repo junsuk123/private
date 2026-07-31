@@ -172,7 +172,9 @@ def _ensure_starlette_router_event_compatibility() -> None:
 _ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
-_gnn_realtime_trust_evaluator = GnnRealtimeTrustEvaluator()
+_gnn_realtime_trust_evaluator = GnnRealtimeTrustEvaluator(
+    stale_while_refresh=True,
+)
 _live_shadow_lock = threading.RLock()
 _live_shadow_service: Any | None = None
 _live_shadow_state: dict[str, Any] = {
@@ -228,6 +230,11 @@ _live_training_history_cache: dict[str, Any] = {
 # change over time, so a background worker rebuilds data/universe/us_exchange_map.csv
 # whenever it is missing or older than US_EXCHANGE_MAP_MAX_AGE_DAYS.
 AUTO_START_US_EXCHANGE_MAP_REFRESH = os.getenv("AUTO_START_US_EXCHANGE_MAP_REFRESH", "true").lower() not in {"0", "false", "no", "off"}
+# Daily investor-flow (개인/외국인/기관 순매수) top-up. KIS reports this per business
+# day and residual_relative_strength treats informed flow as mandatory, so without
+# a scheduled refresh that strategy silently stops being evaluable as the stored
+# 30-day window ages out.
+AUTO_START_INVESTOR_FLOW_REFRESH = os.getenv("AUTO_START_INVESTOR_FLOW_REFRESH", "true").lower() not in {"0", "false", "no", "off"}
 _auto_live_readiness_started = False
 # Background total-asset sampler: periodically persist a dashboard snapshot so the
 # asset-history curve accumulates continuously even when no browser is open (the Pi
@@ -958,6 +965,9 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "cash_equivalent_krw": cash_equivalent_krw,
       "cash_by_currency": cash_by_currency,
       "orderable_cash_by_currency": orderable_cash_by_currency,
+      "orderable_cash_reconciliation": dict(
+          connection.get("orderable_cash_reconciliation") or {}
+      ),
       "foreign_cash_by_currency": _foreign_cash_by_currency(cash_by_currency),
       "base_currency": "KRW",
       "equity": equity,
@@ -1094,6 +1104,10 @@ def _connection_with_account_basis(connection: dict[str, Any], basis: dict[str, 
   merged["foreign_cash_krw"] = basis.get("foreign_cash_krw", merged.get("foreign_cash_krw"))
   merged["cash_by_currency"] = basis.get("cash_by_currency", merged.get("cash_by_currency"))
   merged["orderable_cash_by_currency"] = basis.get("orderable_cash_by_currency", merged.get("orderable_cash_by_currency"))
+  merged["orderable_cash_reconciliation"] = basis.get(
+      "orderable_cash_reconciliation",
+      merged.get("orderable_cash_reconciliation"),
+  )
   merged["foreign_cash_by_currency"] = basis.get("foreign_cash_by_currency", merged.get("foreign_cash_by_currency"))
   merged["actual_equity"] = basis.get("equity", merged.get("actual_equity"))
   merged["invested_value"] = basis.get("invested_value", merged.get("invested_value"))
@@ -2176,6 +2190,8 @@ def _startup_live_worker() -> None:
       _start_kis_overseas_realtime_collector()
     if AUTO_START_US_EXCHANGE_MAP_REFRESH:
       _start_us_exchange_map_refresher()
+    if AUTO_START_INVESTOR_FLOW_REFRESH:
+      _start_investor_flow_refresher()
     if AUTO_START_LIVE_WORKER:
       _start_live_worker("learning")
     if AUTO_START_LIVE_READINESS:
@@ -2189,16 +2205,46 @@ def _startup_live_worker() -> None:
     _start_auto_reliability_controller()
 
 
+def _graceful_teardown() -> list[str]:
+    """Stop every background worker in dependency order. Returns what was stopped.
+
+    The ONE teardown path. It used to exist only as a FastAPI shutdown handler,
+    which meant it ran on a clean uvicorn stop and never on the two exits that
+    actually happen in practice: ``run.ps1`` force-killing the process, and
+    ``_schedule_app_process_shutdown`` calling ``os._exit(0)``. Both skipped it, so
+    the realtime trading engine was terminated mid-cycle with in-flight state.
+
+    Trading stops FIRST and market-data collectors after it, never the reverse: an
+    engine still evaluating while its price feed disappears is exactly the
+    stale-data condition every gate in this codebase exists to prevent.
+    """
+    stopped: list[str] = []
+    for name, stop in (
+        # Trading first — nothing else matters if orders can still be submitted.
+        ("realtime_trading_engine", _stop_realtime_trading_engine),
+        ("auto_reliability_controller", _stop_auto_reliability_controller),
+        ("live_training_worker", _stop_live_training_worker),
+        ("krx_feature_frame_worker", _stop_krx_feature_frame_worker),
+        # Feeds last, so exits could still price correctly on the way down.
+        ("kis_overseas_realtime_collector", _stop_kis_overseas_realtime_collector),
+        ("kis_realtime_collector", _stop_kis_realtime_collector),
+        ("asset_history_sampler", _stop_asset_history_sampler),
+        ("live_worker", _stop_live_worker),
+    ):
+        try:
+            stop()
+            stopped.append(name)
+        except Exception as exc:  # noqa: BLE001 - one stuck worker must not block the rest
+            audit.record(
+                "graceful_teardown_worker_failed",
+                {"worker": name, "error": str(exc) or exc.__class__.__name__},
+            )
+    return stopped
+
+
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
-    _stop_auto_reliability_controller()
-    _stop_asset_history_sampler()
-    _stop_realtime_trading_engine()
-    _stop_kis_overseas_realtime_collector()
-    _stop_kis_realtime_collector()
-    _stop_krx_feature_frame_worker()
-    _stop_live_training_worker()
-    _stop_live_worker()
+    _graceful_teardown()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2835,6 +2881,10 @@ def status() -> JSONResponse:
         "foreign_cash_krw": live_basis["foreign_cash_krw"],
         "cash_by_currency": live_basis["cash_by_currency"],
         "orderable_cash_by_currency": live_basis.get("orderable_cash_by_currency", live_basis["cash_by_currency"]),
+        "orderable_cash_reconciliation": live_basis.get(
+            "orderable_cash_reconciliation",
+            {},
+        ),
         "foreign_cash_by_currency": live_basis["foreign_cash_by_currency"],
         "base_currency": live_basis["base_currency"],
         "equity": live_basis["equity"],
@@ -3717,6 +3767,46 @@ def _kis_connection_probe(paper: bool, include_account: bool = False) -> dict[st
             portfolio.account.cash,
             getattr(portfolio.account, "base_currency", "KRW"),
         )
+        portfolio_orderable_krw = _number_or_zero(
+            orderable_cash_by_currency.get("KRW")
+        )
+        authoritative_orderable_krw: float | None = None
+        reconciliation_error: str | None = None
+        accessor = getattr(client, "_get_domestic_orderable_cash", None)
+        if callable(accessor):
+          try:
+            authoritative_orderable_krw = max(
+                0.0,
+                _number_or_zero(accessor()),
+            )
+          except Exception as exc:  # noqa: BLE001 - account probe remains usable.
+            reconciliation_error = str(exc)
+        mismatch = bool(
+            authoritative_orderable_krw is not None
+            and authoritative_orderable_krw > 0.0
+            and abs(authoritative_orderable_krw - portfolio_orderable_krw) > 1.0
+        )
+        if authoritative_orderable_krw is not None and authoritative_orderable_krw > 0.0:
+          # Reuse the KIS adapter's single nrcvb_buy_amt authority. The
+          # connection payload must never substitute settled deposit cash.
+          orderable_cash_by_currency["KRW"] = authoritative_orderable_krw
+        result["orderable_cash_reconciliation"] = {
+            "portfolio_krw": portfolio_orderable_krw,
+            "authoritative_krw": authoritative_orderable_krw,
+            "difference_krw": (
+                round(authoritative_orderable_krw - portfolio_orderable_krw, 4)
+                if authoritative_orderable_krw is not None
+                else None
+            ),
+            "mismatch": mismatch,
+            "tolerance_krw": 1.0,
+            "error": reconciliation_error,
+        }
+        if mismatch:
+          audit.record(
+              "kis_orderable_cash_mismatch",
+              result["orderable_cash_reconciliation"],
+          )
         krw_cash = cash_by_currency.get("KRW", portfolio.account.cash)
         usd_cash = _number_or_zero(cash_by_currency.get("USD", 0.0))
         fx_by_currency = dict(getattr(portfolio.account, "fx_rate_by_currency", {}) or {})
@@ -5662,12 +5752,375 @@ def realtime_trading_status() -> JSONResponse:
   )
 
 
+def _buy_candidate_warmup_detail() -> dict:
+  """How close is the best streaming symbol to the minute-bar requirement?
+
+  ``_candidate_has_strategy_feature_history`` needs N completed bars. After a
+  restart, or in the first minutes of a session, every streaming symbol fails it
+  while looking perfectly healthy at the tick level — 005930 was rejected with
+  32,013 ticks in ten minutes because only 13 of the required 20 bars existed.
+  Reporting the shortfall and an ETA turns that from a mystery into a wait.
+  """
+  try:
+    required = max(
+        10, _auto_reliability_int("REALTIME_STRATEGY_MINUTE_HISTORY_BARS", 20, 10)
+    )
+    store = RealtimeMarketDataStore()
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(seconds=120)
+    best_symbol, best_bars = "", 0
+    for symbol in tuple(store.active_symbols(since, limit=32)):
+      try:
+        bars = store.recent_minute_bars(
+            symbol, now - timedelta(minutes=max(120, required * 3)), limit=max(120, required)
+        )
+      except Exception:  # noqa: BLE001 - one unreadable symbol must not hide the rest.
+        continue
+      if len(bars) > best_bars:
+        best_symbol, best_bars = str(symbol), len(bars)
+    # Affordability is checked alongside warm-up because it is the other reason a
+    # perfectly healthy, fully warmed-up universe still yields zero candidates —
+    # and the two are indistinguishable from a bare "0 candidates". Measured case:
+    # KRW orderable 0원 with 073240 at 7,220원, while the only funded currency
+    # (USD 67.57) belonged to a closed market.
+    cheapest_symbol, cheapest_ask = "", 0.0
+    for symbol in tuple(store.active_symbols(since, limit=32)):
+      try:
+        book = store.latest_orderbook(symbol)
+      except Exception:  # noqa: BLE001
+        continue
+      ask = float(getattr(book, "best_ask", 0.0) or 0.0) if book is not None else 0.0
+      if ask > 0 and (cheapest_ask <= 0 or ask < cheapest_ask):
+        cheapest_symbol, cheapest_ask = str(symbol), ask
+    # The engine's own account view, so the panel reports the same number the
+    # affordability filter actually applied.
+    try:
+      account = _realtime_engine_account_snapshot()
+      krw_orderable = _account_available_cash(account, "KRW") if account else 0.0
+    except Exception:  # noqa: BLE001 - cash lookup is diagnostic only.
+      krw_orderable = 0.0
+    unaffordable = bool(cheapest_ask > 0 and krw_orderable < cheapest_ask)
+    return {
+        "warming_up": best_bars < required,
+        "best_symbol": best_symbol,
+        "best_bars": best_bars,
+        "required_bars": required,
+        "eta_minutes": max(0, required - best_bars),
+        "krw_orderable": krw_orderable,
+        "cheapest_candidate": cheapest_symbol,
+        "cheapest_ask": cheapest_ask,
+        "unaffordable": unaffordable,
+    }
+  except Exception:  # noqa: BLE001 - diagnostics must never raise.
+    return {}
+
+
+def _entry_blockade_chain() -> list[dict]:
+  """Ordered "why is nothing trading" chain, first unmet link wins.
+
+  Built because the operator-visible answer used to be a single reason code from
+  whichever layer happened to fail last — for 11,614 consecutive cycles that was
+  ``NO_POSITIVE_NET_GNN_EDGE``, which named the GNN while the actual constraint
+  was that no scanned market was in its regular session. Each link reports its own
+  verdict so the real blocker is identifiable at a glance.
+  """
+  from app.data.market_session import new_entry_session_report
+
+  chain: list[dict] = []
+
+  def _link(stage: str, ok: bool, detail: str, data: dict | None = None) -> None:
+    chain.append({"stage": stage, "ok": bool(ok), "detail": detail, "data": data or {}})
+
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+    running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+  _link("engine_running", running, "실시간 엔진 스레드" if running else "엔진이 실행 중이 아님")
+
+  status = engine.get_status() if engine is not None else {}
+  summary = (status or {}).get("last_summary") or {}
+  session = summary.get("strategy_session") or {}
+
+  armed = bool(summary.get("live_armed"))
+  _link("live_armed", armed, "라이브 제출 무장됨" if armed else "라이브 제출이 무장되지 않음")
+
+  sessions = new_entry_session_report()
+  candidates = tuple(summary.get("buy_candidate_sample") or ())
+  groups = {"KRX" if str(s).isdigit() and len(str(s)) == 6 else "US" for s in candidates}
+  scanned = {g: sessions["groups"].get(g, {}) for g in groups} or sessions["groups"]
+  session_ok = any(item.get("allows_new_entry") for item in scanned.values())
+  _link(
+    "market_session",
+    session_ok,
+    "정규장 진행 중"
+    if session_ok
+    else "스캔 중인 시장이 정규장이 아님 — 신규 진입 보류(청산은 계속 동작)",
+    {"scanned_groups": scanned, "all_groups": sessions["groups"],
+     "extended_hours_entry_enabled": sessions["extended_hours_entry_enabled"]},
+  )
+
+  count = int(summary.get("buy_candidate_count") or 0)
+  # A bare "0 candidates" is not actionable. The overwhelmingly common cause is
+  # minute-bar warm-up: a candidate needs REALTIME_STRATEGY_MINUTE_HISTORY_BARS
+  # completed bars, which after a restart (or right after the open) simply have
+  # not accrued yet. Distinguishing "warming up" from "nothing qualifies" is the
+  # difference between waiting and debugging.
+  warmup = _buy_candidate_warmup_detail() if count == 0 else {}
+  detail = f"매수 후보 {count}개"
+  if count == 0 and warmup.get("warming_up"):
+    detail = (
+      f"후보 0개 — 분봉 워밍업 중 "
+      f"({warmup['best_symbol']} {warmup['best_bars']}/{warmup['required_bars']}개, "
+      f"약 {warmup['eta_minutes']}분 후 충족 예상)"
+    )
+  elif count == 0 and warmup.get("unaffordable"):
+    detail = (
+      f"후보 0개 — 주문가능 현금 부족 "
+      f"(KRW {warmup['krw_orderable']:,.0f} < 최저가 {warmup['cheapest_candidate']} "
+      f"{warmup['cheapest_ask']:,.0f})"
+    )
+  elif count == 0:
+    detail = "후보 0개 — 스트리밍 종목 없음 또는 전 종목이 후보 필터에서 제외됨"
+  _link("buy_candidates", count > 0, detail, {"sample": list(candidates), **warmup})
+
+  diagnostics = list(session.get("candidate_diagnostics") or ())
+  actionable = [
+    item for item in diagnostics
+    if str(item.get("selected_strategy") or "").lower() not in {"", "hold", "sell", "reduce_risk"}
+  ]
+  _link(
+    "micro_buy_intents",
+    bool(actionable),
+    f"실행 가능한 마이크로 전략 {len(actionable)}/{len(diagnostics)}"
+    if diagnostics
+    else "마이크로 결과 없음",
+    {"blocking_reason_codes": sorted(
+      {code for item in diagnostics for code in (item.get("reason_codes") or ())}
+    )[:12]},
+  )
+
+  # The bandit fields exist only on the post-refactor build; their absence is
+  # itself the answer (the process is serving older code).
+  bandit_present = "bandit_selected_arm" in session
+  if bandit_present:
+    arm = session.get("bandit_selected_arm")
+    picked = bool(arm) and arm != "no_trade"
+    _link(
+      "strategy_election",
+      picked,
+      f"선택된 arm: {arm}" if picked else "보수적 하단값이 양수인 전략 없음 → NO_TRADE",
+      {"conservative_edge_bps": session.get("bandit_conservative_edge_bps"),
+       "is_exploration": session.get("bandit_is_exploration"),
+       "reason_codes": session.get("bandit_reason_codes"),
+       "evaluations": session.get("bandit_evaluations")},
+    )
+  else:
+    _link(
+      "strategy_election",
+      False,
+      "구 코드가 실행 중입니다(보수적 bandit 필드 없음) — 서버 재시작 필요",
+      {"session_last_reason": session.get("last_reason")},
+    )
+
+  phase = str(session.get("phase") or "")
+  _link(
+    "position",
+    phase in {"ARMED", "ENTERING", "OWNED", "EXITING"},
+    f"세션 단계 {phase or 'UNKNOWN'}",
+    {"last_reason": session.get("last_reason"),
+     "session_phases": session.get("session_phases")},
+  )
+
+  return chain
+
+
+@app.get("/api/investor-flow/status")
+def investor_flow_status() -> JSONResponse:
+  """Coverage and last-refresh state of the daily investor-flow store.
+
+  Exposed because a quietly stalled refresher is indistinguishable from a working
+  one until ``residual_relative_strength`` has silently stopped being evaluable —
+  the exact failure mode this whole feature was added to fix.
+  """
+  from app.data.investor_flow_store import InvestorFlowStore
+
+  try:
+    coverage = InvestorFlowStore().coverage()
+  except Exception as exc:  # noqa: BLE001 - diagnostics must never 500.
+    coverage = {"error": f"{type(exc).__name__}: {exc}"}
+  with _live_lock:
+    status = dict(_investor_flow_refresh_status)
+  return _json(
+    {
+      "ok": True,
+      "enabled": AUTO_START_INVESTOR_FLOW_REFRESH,
+      "refresh_interval_seconds": _env_float_web(
+        "INVESTOR_FLOW_REFRESH_SECONDS", 21_600.0
+      ),
+      "coverage": coverage,
+      **status,
+    }
+  )
+
+
+@app.post("/api/investor-flow/refresh")
+def investor_flow_refresh() -> JSONResponse:
+  """Run the investor-flow refresh now (read-only against the broker)."""
+  try:
+    payload = _refresh_investor_flow_once()
+  except Exception as exc:  # noqa: BLE001 - report the failure, never 500 the UI.
+    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+  return _json({"ok": True, "result": payload})
+
+
+@app.get("/api/realtime-trading/entry-blockade")
+def realtime_trading_entry_blockade() -> JSONResponse:
+  """Single-call answer to "왜 아직 거래가 없나"."""
+  try:
+    chain = _entry_blockade_chain()
+  except Exception as exc:  # noqa: BLE001 - diagnostics must never 500 the dashboard.
+    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}", "chain": []})
+  blocker = next((link for link in chain if not link["ok"]), None)
+  return _json(
+    {
+      "ok": True,
+      "trading_possible": blocker is None,
+      "blocking_stage": blocker["stage"] if blocker else None,
+      "blocking_detail": blocker["detail"] if blocker else None,
+      "chain": chain,
+    }
+  )
+
+
 def _schedule_app_process_shutdown(delay_seconds: float = 1.5) -> None:
+    """Exit the process, stopping the trading engine and feeds on the way out.
+
+    ``os._exit`` skips atexit handlers AND the FastAPI shutdown event, so the
+    previous version killed the process with the realtime engine still running.
+    The teardown is therefore invoked explicitly here rather than relying on an
+    exit hook that this code path never reaches.
+    """
+
     def _shutdown_later() -> None:
         time.sleep(max(0.2, delay_seconds))
+        try:
+            stopped = _graceful_teardown()
+            audit.record("app_process_shutdown", {"stopped": stopped})
+        except Exception as exc:  # noqa: BLE001 - never block the exit itself
+            audit.record(
+                "app_process_shutdown_teardown_failed",
+                {"error": str(exc) or exc.__class__.__name__},
+            )
         os._exit(0)
 
     threading.Thread(target=_shutdown_later, name="ui-requested-shutdown", daemon=True).start()
+
+
+def _restart_safety_report() -> dict[str, Any]:
+    """Is it safe to stop this process right now?
+
+    A restart discards in-memory exit state: the armed stop, target, trailing
+    high-watermark and holding clock for an open position. The broker keeps the
+    position but nothing is left watching it, so restarting while holding is how a
+    managed trade silently becomes an unmanaged one.
+
+    Fails CLOSED. If the account cannot be read, the answer is "unsafe", not
+    "probably fine" — an unreadable account is exactly when you least want to
+    assume there is no position.
+    """
+    reasons: list[str] = []
+    holdings_count: int | None = None
+    positions: list[str] = []
+    try:
+        account = _realtime_engine_account_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        account = None
+        reasons.append(f"ACCOUNT_SNAPSHOT_UNAVAILABLE:{type(exc).__name__}")
+    if account is None:
+        if "ACCOUNT_SNAPSHOT_UNAVAILABLE" not in " ".join(reasons):
+            reasons.append("ACCOUNT_SNAPSHOT_UNAVAILABLE")
+    else:
+        holdings = tuple(getattr(account, "holdings", ()) or ())
+        holdings_count = len(holdings)
+        positions = [
+            str(getattr(holding, "ticker", "") or "").strip() for holding in holdings
+        ]
+        if holdings_count:
+            reasons.append(f"OPEN_POSITIONS:{holdings_count}")
+
+    session_phase: str | None = None
+    engine_running = False
+    try:
+        with _realtime_trading_lock:
+            engine = _realtime_trading_engine
+        if engine is not None:
+            engine_running = True
+            status = engine.get_status() if hasattr(engine, "get_status") else {}
+            session = (status or {}).get("strategy_session") or {}
+            session_phase = str(session.get("phase") or "") or None
+            # ARMED/EXITING mean an order is in flight or an exit is being worked.
+            if session_phase in {"ARMED", "ENTERING", "EXITING"}:
+                reasons.append(f"SESSION_PHASE_IN_FLIGHT:{session_phase}")
+    except Exception as exc:  # noqa: BLE001
+        reasons.append(f"ENGINE_STATUS_UNAVAILABLE:{type(exc).__name__}")
+
+    return {
+        "safe": not reasons,
+        "reasons": reasons,
+        "holdings_count": holdings_count,
+        "positions": positions,
+        "engine_running": engine_running,
+        "session_phase": session_phase,
+    }
+
+
+@app.get("/api/system/restart-safety")
+def system_restart_safety() -> JSONResponse:
+    """Read-only: would stopping this process abandon managed state?"""
+    try:
+        report = _restart_safety_report()
+    except Exception as exc:  # noqa: BLE001 - a broken check must read as unsafe.
+        return _json(
+            {
+                "ok": True,
+                "safe": False,
+                "reasons": [f"SAFETY_CHECK_FAILED:{type(exc).__name__}"],
+            }
+        )
+    return _json({"ok": True, **report})
+
+
+@app.post("/api/system/graceful-shutdown")
+def system_graceful_shutdown(force: bool = False) -> JSONResponse:
+    """Stop background workers, then exit. Refuses unsafe stops unless forced.
+
+    Used by ``run.ps1`` so a relaunch replaces the server instead of killing it:
+    a force-kill leaves the trading engine's in-flight state and the SQLite
+    writers to be terminated mid-operation.
+    """
+    report = _restart_safety_report()
+    if not report["safe"] and not force:
+        audit.record("graceful_shutdown_refused", report)
+        return _json(
+            {
+                "ok": False,
+                "status": "refused",
+                "message": (
+                    "Refusing to stop: restarting now would abandon in-memory exit "
+                    "state. Re-send with force=true to override."
+                ),
+                **report,
+            }
+        )
+    audit.record("graceful_shutdown_accepted", {**report, "forced": bool(force)})
+    _schedule_app_process_shutdown()
+    return _json(
+        {
+            "ok": True,
+            "status": "shutting_down",
+            "forced": bool(force),
+            **report,
+        }
+    )
 
 
 def _is_domestic_holding(holding: Holding) -> bool:
@@ -6915,6 +7368,72 @@ def _start_us_exchange_map_refresher() -> None:
   threading.Thread(target=worker, name="us-exchange-map-refresher", daemon=True).start()
 
 
+_investor_flow_refresh_status: dict[str, Any] = {
+    "last_run_at": None,
+    "last_result": None,
+    "last_error": None,
+    "runs": 0,
+}
+
+
+def _refresh_investor_flow_once() -> dict[str, Any]:
+  """Refresh the daily investor-flow store (개인/외국인/기관 순매수).
+
+  ``residual_relative_strength`` requires informed-flow evidence, and KIS reports
+  it per business day, so the store needs a daily top-up rather than a tick feed.
+  A single call per symbol returns ~30 business days, which is why this is cheap
+  enough to run on a schedule and still self-heals a gap after downtime.
+  """
+  from app.data.investor_flow_collector import refresh_investor_flow
+
+  result = refresh_investor_flow(
+      minimum_bars=_auto_reliability_int("INVESTOR_FLOW_MINIMUM_BARS", 100),
+      delay_seconds=max(0.0, _env_float_web("INVESTOR_FLOW_REQUEST_DELAY_SEC", 0.3)),
+  )
+  payload = result.as_dict()
+  with _live_lock:
+    _investor_flow_refresh_status["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    _investor_flow_refresh_status["last_result"] = payload
+    _investor_flow_refresh_status["last_error"] = None
+    _investor_flow_refresh_status["runs"] = int(
+        _investor_flow_refresh_status.get("runs") or 0
+    ) + 1
+  audit.record("investor_flow_refreshed", payload)
+  return payload
+
+
+def _start_investor_flow_refresher() -> None:
+  """Daily background refresh of the investor-flow store.
+
+  Runs once shortly after boot so a fresh install backfills without an operator
+  step, then on ``INVESTOR_FLOW_REFRESH_SECONDS`` (default 6h). Six hours rather
+  than exactly 24 because the CURRENT business day's figures keep changing while
+  the session runs, so a once-a-day read would leave today's flow stale for most
+  of the day it is needed.
+  """
+
+  def worker() -> None:
+    # Let the KIS client, token and bar store settle before the first call; a
+    # refresh racing startup would fail on a half-initialised client and look
+    # like a broker error.
+    startup_delay = max(0.0, _env_float_web("INVESTOR_FLOW_STARTUP_DELAY_SEC", 45.0))
+    if _live_training_stop.wait(startup_delay):
+      return
+    interval = max(600.0, _env_float_web("INVESTOR_FLOW_REFRESH_SECONDS", 21_600.0))
+    while True:
+      try:
+        _refresh_investor_flow_once()
+      except Exception as exc:  # noqa: BLE001 - refresher must never kill the process.
+        message = str(exc) or exc.__class__.__name__
+        with _live_lock:
+          _investor_flow_refresh_status["last_error"] = message
+        audit.record("investor_flow_refresh_failed", {"error": message})
+      if _live_training_stop.wait(interval):
+        return
+
+  threading.Thread(target=worker, name="investor-flow-refresher", daemon=True).start()
+
+
 def _stop_kis_realtime_collector() -> None:
   worker: threading.Thread | None
   _kis_realtime_collector_stop.set()
@@ -7996,6 +8515,28 @@ def _build_macro_micro_observer(decision_engine):
         if store is not None:
             frame = macro_feature_frame_from_store(store, universe, now=decision_time, sector_of=sector_of)
             macro_kwargs = frame.as_macro_kwargs()
+            # Per-symbol residuals feed the REAL within-sector ranking (which
+            # replaced the arbiter's global BUY rank) and the residual
+            # relative-strength thesis.
+            macro_kwargs["symbol_residual_returns"] = dict(frame.per_symbol_residual_return)
+            macro_kwargs["symbol_long_residual_returns"] = dict(
+                frame.per_symbol_residual_return_long
+            )
+            macro_kwargs["symbol_market_betas"] = dict(frame.per_symbol_market_beta)
+            # Change-point detection runs BEFORE any strategy is scored: it decides
+            # whether the models and the accumulated per-strategy history may still
+            # be believed at all. A detected break narrows the macro regime to
+            # DISLOCATED and widens every bandit uncertainty penalty.
+            try:
+                from app.graph.change_point import default_detector
+
+                verdict = default_detector().update(
+                    frame.as_change_point_channels(), timestamp=decision_time
+                )
+                macro_kwargs["change_point_probability"] = verdict.change_point_probability
+                macro_kwargs["regime_stability"] = verdict.regime_stability
+            except Exception:  # noqa: BLE001 - detection is advisory; never fatal.
+                pass
     except Exception:  # noqa: BLE001 - macro features are best-effort.
         macro_kwargs = {}
     candidate_markets = {
@@ -9769,18 +10310,51 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
       )
       offset = int(time.time() // rotation_seconds) % len(candidate_pool)
       candidate_pool = candidate_pool[offset:] + candidate_pool[:offset]
-  # Affordable/pending candidates get the scarce complete quote+trade pairs
-  # before static blue chips that the account may not be able to buy.
+  # Session anchors are never rotated or displaced. Session-structure strategies
+  # need the SAME symbol at BOTH ends of one session — market intraday momentum
+  # compares the 09:00-09:30 window with 14:50-15:20 — and the rotation above
+  # reshuffles the pool every KIS_REALTIME_SYMBOL_ROTATION_SECONDS (default 300s).
+  # Measured consequence of not pinning: of 360 stored KRX symbol-days, exactly 2
+  # carried both windows, so no session-structure strategy could be evaluated at all.
+  anchors = _realtime_session_anchor_symbols()
+  # Priority order matters and is deliberate:
+  #   1. HELD positions — a position with no live feed cannot be priced to exit. This
+  #      outranks everything, including the anchors; a research feature must never
+  #      displace the data an open trade needs.
+  #   2. dashboard watch — the operator is looking at it right now.
+  #   3. session anchors — placed ABOVE the rotating pool so they survive rotation,
+  #      but below the two above so they can never starve them.
+  #   4. affordable/pending candidates, which get the remaining scarce quote+trade
+  #      pairs before static blue chips the account may not be able to buy.
   merged = list(
       dict.fromkeys(
           [
               *held_domestic,
               *dashboard_watch,
+              *anchors,
               *candidate_pool,
           ]
       )
   )
   return tuple(merged[:max_syms])
+
+
+def _realtime_session_anchor_symbols() -> tuple[str, ...]:
+  """KRX symbols kept subscribed for a whole session, whatever else rotates.
+
+  Deliberately a SMALL set: each anchor consumes one of the scarce quote+trade
+  subscription pairs that candidate discovery also needs. Two liquid names are
+  enough to produce one session-structure observation per day each, which is what
+  turns an unmeasurable strategy into a measurable one.
+  """
+  raw = os.getenv("REALTIME_SESSION_ANCHOR_SYMBOLS", "005930,000660")
+  symbols = [token.strip() for token in raw.split(",")]
+  anchors = [s for s in symbols if s.isdigit() and len(s) == 6]
+  try:
+    limit = max(0, int(os.getenv("REALTIME_SESSION_ANCHOR_MAX", "2")))
+  except (TypeError, ValueError):
+    limit = 2
+  return tuple(dict.fromkeys(anchors))[:limit]
 
 
 def _kis_realtime_training_candidate_viable(

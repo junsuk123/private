@@ -22,6 +22,7 @@ Boundaries intentionally mirror the extended-session windows already used by
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, time, timezone
 from enum import Enum
 from zoneinfo import ZoneInfo
@@ -158,3 +159,66 @@ def streaming_phase(
 def market_has_live_session(group: str, now_utc: datetime | None = None) -> bool:
     """True when the group is in any tradeable/quotable session (pre/regular/after)."""
     return not is_market_fully_closed(group, now_utc)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def allows_new_entry(group: str, now_utc: datetime | None = None) -> bool:
+    """May a NEW position be opened in this group right now?
+
+    Deliberately narrower than :func:`market_has_live_session`. "Not fully closed"
+    was being read as "tradeable", and those are very different things:
+
+        US after-hours, 2026-07-30 23:4x UTC — F quoting 2 shares/minute at a
+        33bps spread, liquidity_score 2e-05.
+
+    Every candidate correctly resolved to ``hold`` /
+    ``LOW_LIQUIDITY_TECHNICAL_BLOCK`` on that data, so election received ZERO buy
+    intents — while the operator-visible reason blamed the GNN instead. Requiring
+    the regular session for new entries makes the real constraint explicit rather
+    than surfacing it as a per-symbol liquidity failure.
+
+    Exits are NOT gated by this: a position must always be closable, and the exit
+    path has its own pricing guards for thin books.
+
+    ``TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true`` restores the previous behaviour.
+    """
+    if _env_flag("TRADING_ALLOW_EXTENDED_HOURS_ENTRY", False):
+        return market_has_live_session(group, now_utc)
+    return market_phase(group, now_utc) is MarketPhase.REGULAR
+
+
+def new_entry_session_report(
+    groups: tuple[str, ...] = ("KRX", "US"),
+    now_utc: datetime | None = None,
+) -> dict:
+    """Per-group phase plus new-entry permission, for the dashboard.
+
+    The GUI needs this to answer "why has nothing traded" without an operator
+    correlating timestamps by hand.
+    """
+    current = _as_utc(now_utc)
+    per_group = {
+        _normalize_group(group): {
+            "phase": market_phase(group, current).value,
+            "streaming_phase": streaming_phase(group, current).value,
+            "allows_new_entry": allows_new_entry(group, current),
+            "fully_closed": is_market_fully_closed(group, current),
+        }
+        for group in groups
+    }
+    return {
+        "as_of": current.isoformat(),
+        "extended_hours_entry_enabled": _env_flag(
+            "TRADING_ALLOW_EXTENDED_HOURS_ENTRY", False
+        ),
+        "any_group_allows_new_entry": any(
+            item["allows_new_entry"] for item in per_group.values()
+        ),
+        "groups": per_group,
+    }

@@ -146,6 +146,26 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="profitability-note" id="profitability-note"></div>
     </section>
 
+    <!-- Why is nothing trading? The chain is ordered and the FIRST unmet link is
+         the answer. Before this panel the dashboard surfaced a single reason code
+         from whichever layer failed last, which named the GNN for 11,614 straight
+         cycles while the real constraint was the market session. -->
+    <section class="dashboard-frame entry-blockade" id="entry-blockade">
+      <div class="frame-title">
+        <div>
+          <p class="eyebrow">ENTRY BLOCKADE · 진입 차단 지점</p>
+          <h2>왜 거래가 안 되는가</h2>
+        </div>
+        <span id="blockade-verdict" class="badge">-</span>
+      </div>
+      <p class="blockade-headline" id="blockade-headline">불러오는 중…</p>
+      <ol class="blockade-chain" id="blockade-chain"></ol>
+      <p class="blockade-note">
+        체인은 순서대로 평가되며 <strong>처음 막힌 단계</strong>가 실제 원인입니다.
+        신규 진입만 정규장으로 제한되고, 보유 포지션 청산은 시간외에도 계속 동작합니다.
+      </p>
+    </section>
+
     <section class="dashboard-frame refactor-console" id="refactor-console">
       <div class="frame-title refactor-title">
         <div>
@@ -329,7 +349,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
   <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260730-ops-overview-1" />
-  <link rel="stylesheet" href="/static/operations_overview.css?v=20260730-ops-overview-1" />
+  <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
 </head>
 <body>
   <main class="terminal-shell">
@@ -366,6 +386,23 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <span>현재 핵심 상태</span>
         <strong id="ops-alert-title">상태 확인 중</strong>
         <p id="ops-alert-detail">각 운영 게이트의 최신 값을 확인하고 있습니다.</p>
+      </div>
+
+      <!-- Why is nothing trading? Ordered chain; the FIRST unmet link is the
+           answer. Before this, the terminal surfaced a single reason code from
+           whichever layer failed last, which named the GNN for 11,614 straight
+           cycles while the actual constraint was the market session. -->
+      <div class="entry-blockade" id="entry-blockade">
+        <div class="blockade-head">
+          <div>
+            <p class="panel-kicker">ENTRY BLOCKADE</p>
+            <h3>왜 신규 진입이 없는가</h3>
+          </div>
+          <span class="status-chip waiting" id="blockade-verdict">확인 중</span>
+        </div>
+        <p class="blockade-headline" id="blockade-headline">진단을 불러오는 중…</p>
+        <ol class="blockade-chain" id="blockade-chain"></ol>
+        <p class="blockade-note">체인은 순서대로 평가되며 <strong>처음 막힌 단계</strong>가 실제 원인입니다. 신규 진입만 정규장으로 제한되며, 보유 포지션 청산은 시간외에도 계속 동작합니다.</p>
       </div>
 
       <div class="ops-gate-grid" id="ops-gate-grid">

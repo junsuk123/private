@@ -84,6 +84,41 @@ class ElectionContext:
     box_context_timestamp: str | None = None
     box_previous_close: float | None = None
     volume_confirmed: bool | None = None
+    # residual_relative_strength. Residuals are cross-sectional, so only the
+    # electing layer can compute them; an algorithm cannot invent them from one
+    # symbol's ticks. Absent -> the strategy fails closed.
+    residual_return_short_bps: float | None = None
+    residual_return_long_bps: float | None = None
+    market_beta: float | None = None
+    sector_beta: float | None = None
+    foreign_flow_zscore: float | None = None
+    institution_flow_zscore: float | None = None
+    # adaptive_anchored_vwap_reversion. When the electing layer can resolve a
+    # meaningful anchor (session open, volatility-spike time, news time) it passes
+    # it here; otherwise the algorithm uses the session VWAP and says so.
+    anchored_vwap: float | None = None
+    anchor_basis: str | None = None
+    # Shared regime guard: no thesis in this module is valid across a structural
+    # break, so every new algorithm reads it rather than each re-deriving one.
+    change_point_probability: float | None = None
+    # ofi_microprice_exhaustion_reversal adverse-selection guard.
+    flow_toxicity: float | None = None
+    spread_percentile: float | None = None
+    # opening_range_breakout. The opening range is session structure, so only the
+    # electing layer can resolve it; an algorithm cannot recover it from the
+    # sub-second window. Absent -> the strategy fails closed.
+    opening_range_high: float | None = None
+    opening_range_low: float | None = None
+    opening_range_minutes: float | None = None
+    relative_volume: float | None = None
+    # market_intraday_momentum. The first half-hour return is measured from the
+    # PREVIOUS close (it includes the overnight gap), and the entry window is session
+    # structure — neither is recoverable from the sub-second tick window, so the
+    # electing layer supplies them and the algorithm fails closed without them.
+    first_half_hour_return_bps: float | None = None
+    first_half_hour_volatility_percentile: float | None = None
+    in_last_continuous_half_hour: bool | None = None
+    minutes_to_continuous_close: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -110,6 +145,25 @@ class ElectionContext:
             "box_context_timestamp": self.box_context_timestamp,
             "box_previous_close": self.box_previous_close,
             "volume_confirmed": self.volume_confirmed,
+            "residual_return_short_bps": self.residual_return_short_bps,
+            "residual_return_long_bps": self.residual_return_long_bps,
+            "market_beta": self.market_beta,
+            "sector_beta": self.sector_beta,
+            "foreign_flow_zscore": self.foreign_flow_zscore,
+            "institution_flow_zscore": self.institution_flow_zscore,
+            "anchored_vwap": self.anchored_vwap,
+            "anchor_basis": self.anchor_basis,
+            "change_point_probability": self.change_point_probability,
+            "flow_toxicity": self.flow_toxicity,
+            "spread_percentile": self.spread_percentile,
+            "opening_range_high": self.opening_range_high,
+            "opening_range_low": self.opening_range_low,
+            "opening_range_minutes": self.opening_range_minutes,
+            "relative_volume": self.relative_volume,
+            "first_half_hour_return_bps": self.first_half_hour_return_bps,
+            "first_half_hour_volatility_percentile": self.first_half_hour_volatility_percentile,
+            "in_last_continuous_half_hour": self.in_last_continuous_half_hour,
+            "minutes_to_continuous_close": self.minutes_to_continuous_close,
         }
 
 
@@ -284,6 +338,114 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "failure_tolerance_bps": 12.0,
         "trailing_bps": 15.0,
         "horizon_seconds": 300.0,
+    },
+    # --- Added for the current high-volatility, flow-driven tape --------------
+    # All three ship with live_authorized = 0: they run in shadow until each has
+    # accumulated enough per-regime samples in the strategy performance store for
+    # the conservative bandit to give them a positive lower bound.
+    "residual_relative_strength": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_residual_short_bps": 5.0,
+        "min_residual_long_bps": 0.0,
+        "max_sector_rank": 3.0,
+        "min_relative_volume": 1.2,
+        "min_aggressor_imbalance": 0.05,
+        "min_microprice_edge_bps": 0.0,
+        "require_flow_confirmation": 1.0,
+        "min_flow_zscore": 0.0,
+        "max_change_point_probability": 0.5,
+        "horizon_seconds": 420.0,
+        "stop_volatility_multiple": 2.0,
+        "trailing_bps": 20.0,
+    },
+    "adaptive_anchored_vwap_reversion": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_entry_zscore": 2.0,
+        "max_entry_zscore": 6.0,
+        "min_displacement_bps": 15.0,
+        "max_spread_change_5s": 0.0,
+        "min_microprice_edge_bps": 0.0,
+        "max_change_point_probability": 0.4,
+        "target_capture_fraction": 0.6,
+        "max_target_bps": 150.0,
+        "stop_zscore_multiple": 1.5,
+        "trailing_bps": 16.0,
+        "horizon_seconds": 300.0,
+    },
+    "ofi_microprice_exhaustion_reversal": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "shock_return_10s_bps": -35.0,
+        "min_depth_ratio": 1.1,
+        "min_orderbook_imbalance": 0.05,
+        "min_ofi_slope": 0.0,
+        "min_microprice_edge_bps": 0.2,
+        "max_spread_change_5s": 0.0,
+        "min_aggressor_imbalance": -0.25,
+        "max_flow_toxicity": 0.7,
+        "max_change_point_probability": 0.4,
+        "retrace_fraction": 0.35,
+        "stop_buffer_bps": 6.0,
+        "trailing_bps": 14.0,
+        "horizon_seconds": 150.0,
+    },
+    "market_intraday_momentum": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        # Unvalidated locally: only 2 of 360 stored symbol-days carry BOTH the first
+        # and the last continuous half-hour, so this cannot yet be measured here. It
+        # starts shadow-only and must earn promotion from realized outcomes, like
+        # every other new algorithm in this module.
+        "live_authorized": 0.0,
+        # Minimum first half-hour return to call the day "up". Below this the signal
+        # is noise, and the published slope is estimated on meaningful moves.
+        "min_first_half_hour_return_bps": 15.0,
+        # The effect concentrates on volatile days, and only a volatile day travels
+        # far enough to clear a ~33bps KRX round trip. Percentile of the symbol's own
+        # first-half-hour range history.
+        "min_first_half_hour_volatility_percentile": 0.6,
+        "min_aggressor_imbalance": 0.0,
+        "max_change_point_probability": 0.5,
+        "stop_buffer_bps": 8.0,
+        "trailing_bps": 30.0,
+        # 14:50 -> 15:15, flat before the 15:20 closing auction.
+        "horizon_seconds": 1500.0,
+    },
+    "opening_range_breakout": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        # Live authorisation is withheld until this strategy has its own realized
+        # history, exactly like every other newly added algorithm here.
+        "live_authorized": 0.0,
+        # "Stocks in play": relative volume is the load-bearing filter in the
+        # published result, not a nicety. Practitioner studies place the useful
+        # threshold at 1.5-2.0x average volume; 1.5 is the permissive end.
+        "min_relative_volume": 1.5,
+        # How far past the opening-range high counts as a real break rather than a
+        # wick, expressed in bps of the range width.
+        "min_breakout_excess_bps": 3.0,
+        # Order flow must agree with the break; a breakout into selling is the
+        # classic false break.
+        "min_aggressor_imbalance": 0.05,
+        # A break with a widening spread is being sold into.
+        "max_spread_change_5s": 0.0,
+        "max_change_point_probability": 0.4,
+        # Stop sits below the opening-range LOW (the published rule uses the
+        # opposite end of the range), with a small buffer for noise.
+        "stop_buffer_bps": 8.0,
+        "trailing_bps": 30.0,
+        # A day-long thesis, not a scalp.
+        "horizon_seconds": 7200.0,
     },
 }
 
@@ -1070,6 +1232,608 @@ class RvgiBoxBreakoutAlgorithm(TradingAlgorithm):
 
 
 # --------------------------------------------------------------------------- #
+# 9. Residual relative strength — market/sector-neutral idiosyncratic leadership #
+# --------------------------------------------------------------------------- #
+class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
+    """Buys the name that is strong AFTER removing market and sector beta.
+
+    ``cross_sectional_relative_strength`` ranks on raw return, which in a tape
+    dominated by the index and a handful of semiconductor megacaps is mostly a
+    ranking of market beta — i.e. it buys the index with extra steps. This
+    algorithm consumes the residual
+
+        ResidualReturn = Return - beta_market * MarketReturn - beta_sector * SectorReturn
+
+    resolved by the electing layer, so what it buys is the stock-specific bid.
+    Because the residual is cross-sectional it cannot be recomputed from one
+    symbol's ticks: absent residuals fail closed rather than degrade to raw
+    return, which would silently reproduce the defect.
+    """
+
+    strategy_id = "residual_relative_strength"
+    thesis = "idiosyncratic strength net of market and sector beta persists while flow confirms it"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        short_residual = context.residual_return_short_bps
+        long_residual = context.residual_return_long_bps
+        if not _present(short_residual, long_residual):
+            return self._reject(("RESIDUAL_STRENGTH_CONTEXT_ABSENT",))
+        rank = context.sector_rank
+        universe = context.sector_candidate_count
+        if rank is None or universe is None or universe <= 1:
+            return self._reject(("RESIDUAL_SECTOR_RANK_ABSENT",))
+        change_point = context.change_point_probability
+        if (
+            change_point is not None
+            and change_point > self.p("max_change_point_probability")
+        ):
+            return self._reject(
+                ("RESIDUAL_STRENGTH_REGIME_UNSTABLE",), change_point_probability=change_point
+            )
+        if short_residual < self.p("min_residual_short_bps"):
+            return self._reject(
+                ("RESIDUAL_SHORT_HORIZON_NOT_POSITIVE",), residual_return_short_bps=short_residual
+            )
+        if long_residual < self.p("min_residual_long_bps"):
+            return self._reject(
+                ("RESIDUAL_LONG_HORIZON_NOT_POSITIVE",), residual_return_long_bps=long_residual
+            )
+        if rank > int(self.p("max_sector_rank")):
+            return self._reject(("RESIDUAL_SECTOR_RANK_TOO_LOW",), sector_rank=rank, universe=universe)
+        relative_volume = f.relative_volume
+        if relative_volume is None or relative_volume < self.p("min_relative_volume"):
+            return self._reject(
+                (rc.VOLUME_CONFIRMATION_MISSING, "RESIDUAL_VOLUME_NOT_CONFIRMED"),
+                relative_volume=relative_volume,
+            )
+        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+            return self._reject(("RESIDUAL_FLOW_NOT_CONFIRMED",))
+        microprice_edge = f.microprice_edge_bps
+        if microprice_edge is None:
+            return self._reject(("RESIDUAL_MICROPRICE_UNAVAILABLE",))
+        if microprice_edge < self.p("min_microprice_edge_bps"):
+            return self._reject(
+                ("RESIDUAL_MICROPRICE_NOT_SUPPORTIVE",), microprice_edge_bps=microprice_edge
+            )
+        # Investor-flow corroboration. Required by default, because idiosyncratic
+        # strength with no informed flow behind it is usually a squeeze.
+        flow_scores = [
+            value
+            for value in (context.foreign_flow_zscore, context.institution_flow_zscore)
+            if value is not None
+        ]
+        if self.p("require_flow_confirmation") >= 1.0:
+            if not flow_scores:
+                return self._reject(("RESIDUAL_INVESTOR_FLOW_ABSENT",))
+            if max(flow_scores) < self.p("min_flow_zscore"):
+                return self._reject(
+                    ("RESIDUAL_INVESTOR_FLOW_NEGATIVE",), flow_zscores=flow_scores
+                )
+
+        edge = self._volatility_edge(f)
+        rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
+        residual_score = _clamp(short_residual / 30.0)
+        return self._fire(
+            score=_clamp(0.45 * rank_score + 0.35 * residual_score + 0.2 * _clamp(microprice_edge)),
+            confidence=_clamp(0.3 + 0.4 * rank_score + 0.2 * residual_score),
+            edge_bps=edge,
+            reasons=("RESIDUAL_STRENGTH_CONFIRMED", "MARKET_AND_SECTOR_NEUTRAL_LEADER"),
+            residual_return_short_bps=round(short_residual, 3),
+            residual_return_long_bps=round(long_residual, 3),
+            sector_rank=rank,
+            sector_candidate_count=universe,
+            microprice_edge_bps=round(microprice_edge, 4),
+            market_beta=context.market_beta,
+            sector_beta=context.sector_beta,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
+            target_price=entry_price * (1.0 + self._volatility_edge(f) / 10_000.0),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="tick_volatility_multiple",
+            target_basis="tick_volatility_expected_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        rank = context.sector_rank
+        if rank is not None and rank > int(self.p("max_sector_rank")) + 1:
+            codes.append("RESIDUAL_SECTOR_RANK_DECAYED")
+        if (f.short_return or 0.0) < 0 and (f.aggressor_imbalance_5s or 0.0) < 0:
+            codes.append("RESIDUAL_STRENGTH_LOST")
+        edge = f.microprice_edge_bps
+        if edge is not None and edge < 0 and (f.return_5s or 0.0) < 0:
+            codes.append("RESIDUAL_MICROPRICE_TURNED_OFFERED")
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
+# 10. Adaptive anchored VWAP reversion — volatility-normalised displacement     #
+# --------------------------------------------------------------------------- #
+class AdaptiveAnchoredVwapReversionAlgorithm(TradingAlgorithm):
+    """VWAP reversion on a z-score, not on a fixed basis-point band.
+
+    ``vwap_mean_reversion`` fires at a fixed 25bps displacement. On a day the
+    index moves 4-10%, 25bps is inside the noise, so the strategy buys constantly
+    and reverts rarely. Normalising by intraday realised volatility
+
+        VWAP_Z = (price - anchoredVWAP) / intradayResidualVolatility
+
+    makes one threshold mean the same thing in a calm and a violent tape. Entry
+    additionally requires evidence that liquidity is coming BACK (spread
+    contracting, book tilting bid, drop stopped) rather than simply that the price
+    is low — buying oversold without that is how a mean-reversion book gets run
+    over in a repricing.
+    """
+
+    strategy_id = "adaptive_anchored_vwap_reversion"
+    thesis = "a volatility-normalised displacement below anchored VWAP reverts once liquidity returns"
+
+    def _anchor(self, f: TechnicalFeatureSet, context: ElectionContext) -> tuple[float | None, str]:
+        if context.anchored_vwap and context.anchored_vwap > 0:
+            return float(context.anchored_vwap), str(context.anchor_basis or "election_anchor")
+        if f.vwap and f.vwap > 0:
+            return float(f.vwap), "session_vwap"
+        return None, "unavailable"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        anchor, anchor_basis = self._anchor(f, context)
+        price = f.price
+        if anchor is None or price is None or price <= 0:
+            return self._reject(("ADAPTIVE_VWAP_ANCHOR_UNAVAILABLE",))
+        volatility_bps = f.residual_volatility_bps
+        if not volatility_bps:
+            # Without a volatility scale the z-score is undefined. Falling back to
+            # a fixed band here is exactly the defect this algorithm exists to fix.
+            return self._reject(("ADAPTIVE_VWAP_VOLATILITY_UNAVAILABLE",))
+        displacement_bps = (price / anchor - 1.0) * 10_000.0
+        zscore = displacement_bps / volatility_bps
+        change_point = context.change_point_probability
+        if (
+            change_point is not None
+            and change_point > self.p("max_change_point_probability")
+        ):
+            return self._reject(
+                ("ADAPTIVE_VWAP_REGIME_UNSTABLE",), change_point_probability=change_point
+            )
+        if zscore > -self.p("min_entry_zscore"):
+            return self._reject(
+                ("ADAPTIVE_VWAP_DISPLACEMENT_TOO_SMALL",),
+                vwap_zscore=round(zscore, 4),
+                displacement_bps=round(displacement_bps, 3),
+            )
+        if zscore < -self.p("max_entry_zscore"):
+            # Beyond this the move is no longer a displacement around a mean; it is
+            # a repricing, and there is no mean left to revert to.
+            return self._reject(
+                ("ADAPTIVE_VWAP_DISLOCATION_NOT_REVERSION",), vwap_zscore=round(zscore, 4)
+            )
+        if abs(displacement_bps) < self.p("min_displacement_bps"):
+            return self._reject(
+                ("ADAPTIVE_VWAP_DISPLACEMENT_BELOW_FLOOR",),
+                displacement_bps=round(displacement_bps, 3),
+            )
+        if (f.return_1s or 0.0) < 0:
+            return self._reject(("ADAPTIVE_VWAP_STILL_FALLING",))
+        if (f.orderbook_imbalance_change_5s or 0.0) <= 0:
+            return self._reject(("ADAPTIVE_VWAP_OFI_NOT_TURNING",))
+        if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
+            return self._reject(("ADAPTIVE_VWAP_SPREAD_STILL_WIDENING",))
+        microprice_edge = f.microprice_edge_bps
+        if microprice_edge is None:
+            return self._reject(("ADAPTIVE_VWAP_MICROPRICE_UNAVAILABLE",))
+        if microprice_edge < self.p("min_microprice_edge_bps"):
+            return self._reject(
+                ("ADAPTIVE_VWAP_MICROPRICE_BELOW_MID",), microprice_edge_bps=microprice_edge
+            )
+
+        edge = min(
+            self.p("max_target_bps"),
+            abs(displacement_bps) * self.p("target_capture_fraction"),
+        )
+        score = _clamp(abs(zscore) / (2.0 * self.p("min_entry_zscore")))
+        return self._fire(
+            score=score,
+            confidence=_clamp(0.3 + 0.45 * score),
+            edge_bps=edge,
+            reasons=(
+                rc.MEAN_REVERSION_CANDIDATE,
+                "ADAPTIVE_VWAP_DISPLACEMENT_CONFIRMED",
+                "LIQUIDITY_RECOVERY_CONFIRMED",
+            ),
+            anchored_vwap=anchor,
+            anchor_basis=anchor_basis,
+            vwap_zscore=round(zscore, 4),
+            displacement_bps=round(displacement_bps, 3),
+            residual_volatility_bps=round(volatility_bps, 3),
+            microprice_edge_bps=round(microprice_edge, 4),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        anchor, _basis = self._anchor(f, context)
+        capture = self.p("target_capture_fraction")
+        target = (
+            min(
+                entry_price + capture * (anchor - entry_price),
+                entry_price * (1.0 + self.p("max_target_bps") / 10_000.0),
+            )
+            if anchor and anchor > entry_price
+            else None
+        )
+        volatility_bps = f.residual_volatility_bps
+        stop = (
+            entry_price
+            * (1.0 - self.p("stop_zscore_multiple") * volatility_bps / 10_000.0)
+            if volatility_bps and entry_price > 0
+            else None
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=stop,
+            target_price=target,
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="volatility_zscore_multiple",
+            target_basis="partial_reversion_to_anchored_vwap",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        zscore = f.vwap_zscore
+        if (
+            zscore is not None
+            and zscore < -self.p("max_entry_zscore")
+        ):
+            codes.append("ADAPTIVE_VWAP_DISPLACEMENT_BECAME_DISLOCATION")
+        if (f.return_5s or 0.0) < 0 and (f.orderbook_imbalance_change_5s or 0.0) < 0:
+            codes.append("ADAPTIVE_VWAP_REVERSION_FAILED_NEW_LOW")
+        if (f.spread_change_5s or 0.0) > 0 and (f.return_1s or 0.0) < 0:
+            codes.append("ADAPTIVE_VWAP_LIQUIDITY_RECOVERY_REVERSED")
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
+# 11. OFI / microprice exhaustion reversal — order-flow confirmed, not price     #
+# --------------------------------------------------------------------------- #
+class OfiMicropriceExhaustionReversalAlgorithm(TradingAlgorithm):
+    """Buys a sell-side exhaustion confirmed by the book, not by the tape.
+
+    Distinct from ``liquidity_shock_reversal``, which keys on the price drop and
+    a contracting spread. Here the drop is only the precondition; the trigger is
+    that the *book* has turned: order-flow imbalance slope positive, bid depth
+    restored relative to ask, and the depth-weighted microprice above the mid.
+
+    Deliberately not a stock-selection signal. Published evidence on order-flow
+    imbalance is consistent — statistically predictive, and routinely eaten by
+    transaction costs when traded standalone — so it is used here for entry timing
+    and adverse-selection avoidance inside a thesis that already exists, with the
+    shortest holding window of any strategy in the catalogue.
+    """
+
+    strategy_id = "ofi_microprice_exhaustion_reversal"
+    thesis = "sell-side exhaustion retraces once order flow, depth and microprice all turn"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        if not _present(f.return_10s, f.spread_change_5s, f.orderbook_imbalance):
+            return self._reject(("OFI_EXHAUSTION_TICK_INPUTS_MISSING",))
+        change_point = context.change_point_probability
+        if (
+            change_point is not None
+            and change_point > self.p("max_change_point_probability")
+        ):
+            return self._reject(
+                ("OFI_EXHAUSTION_REGIME_UNSTABLE",), change_point_probability=change_point
+            )
+        toxicity = context.flow_toxicity
+        if toxicity is not None and toxicity > self.p("max_flow_toxicity"):
+            # Flow toxicity is a risk statement, never a buy reason: a toxic tape
+            # means the counterparty is better informed than this thesis is.
+            return self._reject(("OFI_EXHAUSTION_FLOW_TOXIC",), flow_toxicity=toxicity)
+        shock_bps = (f.return_10s or 0.0) * 10_000.0
+        if shock_bps > self.p("shock_return_10s_bps"):
+            return self._reject(("OFI_EXHAUSTION_NO_SELLOFF",), return_10s_bps=round(shock_bps, 3))
+        ofi_slope = f.orderbook_imbalance_change_5s
+        if ofi_slope is None or ofi_slope <= self.p("min_ofi_slope"):
+            return self._reject(("OFI_SLOPE_NOT_POSITIVE",), ofi_slope=ofi_slope)
+        if (f.orderbook_imbalance or -1.0) < self.p("min_orderbook_imbalance"):
+            return self._reject(
+                ("OFI_BID_SIDE_NOT_RESTORED",), orderbook_imbalance=f.orderbook_imbalance
+            )
+        depth_ratio = f.depth_ratio
+        if depth_ratio is None:
+            return self._reject(("OFI_DEPTH_UNAVAILABLE",))
+        if depth_ratio < self.p("min_depth_ratio"):
+            return self._reject(("OFI_ASK_NOT_DEPLETED",), depth_ratio=depth_ratio)
+        if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
+            return self._reject(("OFI_SPREAD_STILL_WIDENING",), spread_change_5s=f.spread_change_5s)
+        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+            return self._reject(("OFI_SELL_AGGRESSION_NOT_EASING",))
+        microprice_edge = f.microprice_edge_bps
+        if microprice_edge is None:
+            return self._reject(("OFI_MICROPRICE_UNAVAILABLE",))
+        if microprice_edge < self.p("min_microprice_edge_bps"):
+            return self._reject(
+                ("OFI_MICROPRICE_NOT_ABOVE_MID",), microprice_edge_bps=microprice_edge
+            )
+
+        edge = abs(shock_bps) * self.p("retrace_fraction")
+        score = _clamp(abs(shock_bps) / (2.0 * abs(self.p("shock_return_10s_bps"))))
+        return self._fire(
+            score=score,
+            confidence=_clamp(0.25 + 0.4 * score + 0.2 * _clamp(ofi_slope)),
+            edge_bps=edge,
+            reasons=("OFI_EXHAUSTION_CONFIRMED", "MICROPRICE_ABOVE_MID", "DEPTH_RECOVERING"),
+            return_10s_bps=round(shock_bps, 3),
+            ofi_slope=round(ofi_slope, 5),
+            depth_ratio=round(depth_ratio, 4),
+            microprice_edge_bps=round(microprice_edge, 4),
+            spread_change_5s=f.spread_change_5s,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        shock_bps = abs((f.return_10s or 0.0) * 10_000.0)
+        shock_low = entry_price * (1.0 - shock_bps / 10_000.0) if shock_bps else None
+        stop = (
+            shock_low * (1.0 - self.p("stop_buffer_bps") / 10_000.0)
+            if shock_low
+            else self._volatility_stop(entry_price, f, 2.0)
+        )
+        target = (
+            entry_price * (1.0 + (shock_bps * self.p("retrace_fraction")) / 10_000.0)
+            if shock_bps
+            else None
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=stop,
+            target_price=target,
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="selloff_low_minus_buffer",
+            target_basis="partial_retracement_of_selloff",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        if (f.orderbook_imbalance_change_5s or 0.0) < 0 and (f.return_5s or 0.0) < 0:
+            codes.append("OFI_SLOPE_REVERSED")
+        edge = f.microprice_edge_bps
+        if edge is not None and edge < 0:
+            codes.append("OFI_MICROPRICE_BACK_BELOW_MID")
+        if (f.spread_change_5s or 0.0) > 0 and (f.return_5s or 0.0) < 0:
+            codes.append("OFI_EXHAUSTION_FAILED_SPREAD_REEXPANDING")
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
+# 12. Opening-range breakout — gated on relative volume ("stocks in play")      #
+# --------------------------------------------------------------------------- #
+class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
+    """Break of the session's opening range, taken only on stocks in play.
+
+    The published day-trading result this implements is explicit that the
+    breakout alone does not pay: the profitability comes from restricting it to
+    the names with the highest opening relative volume. So relative volume is a
+    hard precondition here, not a score contribution — firing without it would be
+    implementing a different, unprofitable strategy under the same name.
+    """
+
+    strategy_id = "opening_range_breakout"
+    thesis = "price clears the session opening range on unusually high relative volume"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+
+        high = context.opening_range_high
+        low = context.opening_range_low
+        if high is None or low is None or high <= low or high <= 0:
+            return self._reject(("ORB_OPENING_RANGE_ABSENT",))
+        price = f.price
+        if not price or price <= 0:
+            return self._reject(("ORB_PRICE_ABSENT",))
+
+        # Relative volume: prefer the electing layer's figure, fall back to the
+        # tick-window volume spike. Absent entirely -> fail closed, because this
+        # gate is the thesis.
+        relative_volume = context.relative_volume
+        if relative_volume is None:
+            relative_volume = f.volume_spike_ratio
+        if relative_volume is None:
+            return self._reject(("ORB_RELATIVE_VOLUME_ABSENT",))
+        if relative_volume < self.p("min_relative_volume"):
+            return self._reject(
+                ("ORB_NOT_IN_PLAY",),
+                relative_volume=relative_volume,
+                minimum=self.p("min_relative_volume"),
+            )
+
+        span = high - low
+        excess_bps = (price - high) / span * 10_000.0
+        if excess_bps < self.p("min_breakout_excess_bps"):
+            return self._reject(
+                ("ORB_RANGE_NOT_CLEARED",),
+                excess_bps=round(excess_bps, 3),
+                opening_range_high=high,
+            )
+        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+            return self._reject(("ORB_FLOW_NOT_CONFIRMED",))
+        if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
+            return self._reject(("ORB_SPREAD_WIDENING_INTO_BREAK",))
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(
+                ("ORB_STRUCTURAL_BREAK",), change_point_probability=change_point
+            )
+
+        edge = self._volatility_edge(f)
+        # A wider opening range is a stronger in-play signal, but it also means a
+        # wider stop; the score reflects flow agreement and RVOL, not range width.
+        return self._fire(
+            score=_clamp(
+                0.5 * _clamp(relative_volume / 3.0)
+                + 0.5 * _clamp((f.aggressor_imbalance_5s or 0.0) + 0.5)
+            ),
+            confidence=_clamp(0.3 + 0.4 * _clamp(relative_volume / 3.0)),
+            edge_bps=edge,
+            reasons=("ORB_RANGE_CLEARED_IN_PLAY",),
+            relative_volume=relative_volume,
+            excess_bps=round(excess_bps, 3),
+            opening_range_high=high,
+            opening_range_low=low,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        # The published rule stops at the opposite end of the opening range.
+        low = context.opening_range_low
+        stop = (
+            low * (1.0 - self.p("stop_buffer_bps") / 10_000.0)
+            if low
+            else self._volatility_stop(entry_price, f, 2.0)
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=stop,
+            target_price=entry_price * (1.0 + self._volatility_edge(f) / 10_000.0),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis=(
+                "opening_range_low_minus_buffer" if low else "tick_volatility_multiple"
+            ),
+            target_basis="tick_volatility_expected_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        high = context.opening_range_high
+        # Falling back inside the range is the definition of a failed break.
+        if high and f.price and f.price < high:
+            codes.append("ORB_FELL_BACK_INTO_RANGE")
+        if (f.aggressor_imbalance_5s or 0.0) < 0 and (f.return_5s or 0.0) < 0:
+            codes.append("ORB_FLOW_REVERSED")
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
+# 13. Market intraday momentum — one round trip per day                         #
+# --------------------------------------------------------------------------- #
+class MarketIntradayMomentumAlgorithm(TradingAlgorithm):
+    """The first half-hour return continues into the last half-hour.
+
+    Chosen for this account on cost grounds as much as edge grounds. 20bps of the
+    27.8bps KRX round-trip cost is statutory securities tax, charged per ROUND TRIP,
+    so a strategy's trip count is as decisive as its signal: twelve scalps a day pay
+    the tax twelve times against a measured gross edge of ~0bps. This takes ONE trip
+    per day.
+
+    Published effect: first half-hour return (from the previous close, so including
+    the overnight gap) predicts the last half-hour return; R² 1.6%, rising to 3.3%
+    when first-half-hour volatility is high; present in 12 of 16 developed markets.
+
+    Long-only, so only the positive leg is tradable. Flat before the 15:20 KRX
+    closing auction — the auction is a different matching mechanism and this system
+    does not model it.
+    """
+
+    strategy_id = "market_intraday_momentum"
+    thesis = "a positive first half-hour continues into the last continuous half-hour"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+
+        in_window = context.in_last_continuous_half_hour
+        if in_window is None:
+            return self._reject(("MIM_SESSION_CONTEXT_ABSENT",))
+        if not in_window:
+            return self._reject(("MIM_OUTSIDE_ENTRY_WINDOW",))
+
+        # Never open a position with too little continuous trading left to exit into.
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining < 5.0:
+            return self._reject(
+                ("MIM_TOO_CLOSE_TO_AUCTION",), minutes_to_continuous_close=remaining
+            )
+
+        r1 = context.first_half_hour_return_bps
+        if r1 is None:
+            return self._reject(("MIM_FIRST_HALF_HOUR_ABSENT",))
+        if r1 < self.p("min_first_half_hour_return_bps"):
+            return self._reject(("MIM_FIRST_HALF_HOUR_NOT_UP",), first_half_hour_return_bps=r1)
+
+        volatility_percentile = context.first_half_hour_volatility_percentile
+        if volatility_percentile is None:
+            return self._reject(("MIM_VOLATILITY_CONTEXT_ABSENT",))
+        if volatility_percentile < self.p("min_first_half_hour_volatility_percentile"):
+            # Both the published effect and the cost arithmetic require a volatile
+            # day; on a quiet day the last half-hour does not travel 33bps.
+            return self._reject(
+                ("MIM_DAY_NOT_VOLATILE_ENOUGH",),
+                first_half_hour_volatility_percentile=volatility_percentile,
+            )
+
+        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+            return self._reject(("MIM_FLOW_NOT_CONFIRMED",))
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(("MIM_STRUCTURAL_BREAK",), change_point_probability=change_point)
+
+        edge = self._volatility_edge(f)
+        return self._fire(
+            score=_clamp(0.5 * _clamp(r1 / 100.0) + 0.5 * _clamp(volatility_percentile)),
+            confidence=_clamp(0.3 + 0.4 * _clamp(volatility_percentile)),
+            edge_bps=edge,
+            reasons=("MIM_FIRST_HALF_HOUR_CONTINUATION",),
+            first_half_hour_return_bps=r1,
+            first_half_hour_volatility_percentile=volatility_percentile,
+            minutes_to_continuous_close=remaining,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        # The intended exit is TIME: be flat before the closing auction. The horizon
+        # is shortened to whatever continuous trading actually remains, so a late
+        # entry does not inherit a full 25-minute leash it cannot use.
+        remaining = context.minutes_to_continuous_close
+        horizon = self.horizon_seconds
+        if remaining is not None and remaining > 0:
+            horizon = int(min(horizon, max(60.0, (remaining - 2.0) * 60.0)))
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(entry_price, f, 2.0),
+            target_price=entry_price * (1.0 + self._volatility_edge(f) / 10_000.0),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=horizon,
+            stop_basis="tick_volatility_multiple",
+            target_basis="tick_volatility_expected_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining <= 2.0:
+            # Must not be carried into the auction.
+            codes.append("MIM_CONTINUOUS_CLOSE_IMMINENT")
+        if (f.aggressor_imbalance_5s or 0.0) < 0 and (f.return_5s or 0.0) < 0:
+            codes.append("MIM_MOMENTUM_REVERSED")
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
 # Registry                                                                     #
 # --------------------------------------------------------------------------- #
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
@@ -1081,6 +1845,11 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     CrossSectionalRelativeStrengthAlgorithm,
     GapContextAlgorithm,
     RvgiBoxBreakoutAlgorithm,
+    ResidualRelativeStrengthAlgorithm,
+    AdaptiveAnchoredVwapReversionAlgorithm,
+    OfiMicropriceExhaustionReversalAlgorithm,
+    OpeningRangeBreakoutAlgorithm,
+    MarketIntradayMomentumAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -1098,7 +1867,25 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "vwap_mean_reversion": ("vwap_reversion", "mean_reversion"),
     "liquidity_shock_reversal": ("mean_reversion",),
     "rvgi_box_breakout": ("breakout", "momentum_confirmation"),
+    # The residual variant is a relative-strength thesis, NOT directional
+    # momentum: it is precisely the family that stays valid in a falling index,
+    # which is why TREND_DOWN allows relative_strength but blocks momentum.
+    "residual_relative_strength": ("relative_strength",),
+    "adaptive_anchored_vwap_reversion": ("vwap_reversion", "mean_reversion"),
+    "ofi_microprice_exhaustion_reversal": ("mean_reversion",),
 }
+
+
+# Strategies whose deployment is gated by their own ``live_authorized`` knob.
+# Everything else is live by default; these must earn it with per-regime samples.
+_DEPLOYMENT_GATED_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "rvgi_box_breakout",
+        "residual_relative_strength",
+        "adaptive_anchored_vwap_reversion",
+        "ofi_microprice_exhaustion_reversal",
+    }
+)
 
 
 def macro_strategy_permitted(
@@ -1148,6 +1935,21 @@ def strategy_live_authorized(strategy_id: str) -> bool:
     algorithm = get_algorithm(strategy_id)
     if algorithm is None:
         return False
-    if strategy_id != "rvgi_box_breakout":
+    if strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:
         return True
     return algorithm.p("enabled") >= 1.0 and algorithm.p("live_authorized") >= 1.0
+
+
+def strategy_shadow_authorized(strategy_id: str) -> bool:
+    """May this strategy be evaluated and journaled without a live order?
+
+    A deployment-gated strategy that is not yet live-authorized is still expected
+    to run in shadow — that is how it accumulates the per-regime samples the
+    conservative bandit needs before it can ever be selected live.
+    """
+    algorithm = get_algorithm(strategy_id)
+    if algorithm is None:
+        return False
+    if strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:
+        return True
+    return algorithm.p("enabled") >= 1.0 and algorithm.p("shadow_enabled") >= 1.0

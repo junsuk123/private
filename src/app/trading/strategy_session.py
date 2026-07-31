@@ -17,29 +17,29 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+from app.cost.cost_coverage import evaluate_cost_coverage
 from app.routing.actions import is_actionable_strategy_route
 from app.strategy.catalog import is_known_strategy
+from app.strategy.exit_geometry import FALLBACK_GEOMETRY_KEY
+from app.strategy.exit_geometry import exit_bps as _strategy_exit_bps
+from app.strategy.exit_geometry import exit_geometry as _exit_geometry
+from app.strategy.exit_geometry import max_holding_seconds as _strategy_max_holding_seconds
+from app.trading.conservative_bandit import (
+    BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE,
+    ArmCandidate,
+    BanditContext,
+    ConservativeStrategyBandit,
+)
+from app.trading.strategy_performance_store import (
+    StrategyPerformanceStore,
+    default_store as _default_performance_store,
+    market_for_symbol,
+)
 
-_MAX_HOLDING_SECONDS = {
-    "intraday_momentum": 1800,
-    "breakout_volume": 2700,
-    "vwap_mean_reversion": 1800,
-    "liquidity_shock_reversal": 1200,
-    "event_momentum": 3600,
-    "cross_sectional_relative_strength": 3600,
-    "gap_context": 2700,
-    "rvgi_box_breakout": 1800,
-}
-_STRATEGY_EXIT_BPS = {
-    "intraday_momentum": (22.0, 100.0, 15.0),
-    "breakout_volume": (25.0, 120.0, 18.0),
-    "vwap_mean_reversion": (18.0, 100.0, 12.0),
-    "liquidity_shock_reversal": (30.0, 100.0, 18.0),
-    "event_momentum": (35.0, 140.0, 24.0),
-    "cross_sectional_relative_strength": (28.0, 120.0, 20.0),
-    "gap_context": (32.0, 130.0, 22.0),
-    "rvgi_box_breakout": (20.0, 120.0, 15.0),
-}
+
+def _fallback_exit_geometry():
+    """Geometry the executor applies to an unknown / not-yet-elected thesis."""
+    return _exit_geometry(FALLBACK_GEOMETRY_KEY)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -112,6 +112,124 @@ def _parse_time(value: Any) -> datetime | None:
         return None
 
 
+def _market_group_for(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    return "KRX" if text.isdigit() and len(text) == 6 else "US"
+
+
+def _new_entry_session_report(
+    candidates: tuple[str, ...], now: datetime
+) -> dict[str, Any]:
+    """May any candidate's market accept a NEW entry right now?
+
+    Answered per candidate market rather than globally: during the KR session the
+    universe may be entirely US symbols (and vice versa), and "the market is open"
+    is meaningless unless it is open for the symbols actually being scanned.
+    """
+    groups = tuple(dict.fromkeys(_market_group_for(symbol) for symbol in candidates))
+    if not groups:
+        return {
+            "allows_new_entry": False,
+            "reason": "NO_CANDIDATE_SYMBOLS",
+            "phases": {},
+        }
+    try:
+        from app.data.market_session import allows_new_entry, market_phase
+    except Exception:  # noqa: BLE001 - never let a session lookup break election.
+        return {"allows_new_entry": True, "reason": "", "phases": {}}
+    phases = {group: market_phase(group, now).value for group in groups}
+    open_groups = tuple(group for group in groups if allows_new_entry(group, now))
+    if open_groups:
+        return {"allows_new_entry": True, "reason": "", "phases": phases}
+    detail = ",".join(f"{group}={phase}" for group, phase in sorted(phases.items()))
+    return {
+        "allows_new_entry": False,
+        "reason": f"NEW_ENTRY_OUTSIDE_REGULAR_SESSION:{detail}",
+        "phases": phases,
+    }
+
+
+def _optional_float(value: Any) -> float | None:
+    """``None``-preserving float. Unknown must never become 0.0."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None  # NaN-safe
+
+
+@dataclass
+class _ElectionProposal:
+    """One admissible (symbol, strategy) candidate awaiting a selection verdict.
+
+    Extracted so both election paths produce the same shape and the conservative
+    bandit can compare them side by side. Previously each path armed directly, so
+    the two could never be weighed against each other or against NO_TRADE.
+    """
+
+    symbol: str
+    strategy_id: str
+    source: str
+    entry_price: float | None
+    target_return_rate: float
+    stop_loss_rate: float
+    trailing_stop_rate: float
+    max_holding_seconds: int
+    score: float
+    confidence: float
+    expected_net_return_bps: float | None
+    expected_cost_bps: float | None
+    gnn_actionable: bool
+    gnn_action: str
+    gnn_reason_codes: list[str]
+    ontology_reason_codes: list[str]
+    macro_regime: str
+    micro_regime: str
+    explanation_paths: list[dict[str, Any]]
+    intent: Any
+    candidate_count: int | None
+    micro_result: Any
+    evidence_row: Mapping[str, Any] | None
+    last_reason: str
+    conservative_edge_bps: float | None = None
+
+    def resolved_cost_bps(self, fallback_bps: float) -> float:
+        cost = self.expected_cost_bps
+        if cost is None or cost <= 0:
+            return max(0.0, float(fallback_bps))
+        return float(cost)
+
+    def predicted_net_edge_bps(
+        self, gnn_absence_penalty_bps: float, fallback_cost_bps: float
+    ) -> float | None:
+        """The caller's forward-looking net edge, docked when the GNN was absent.
+
+        Returning ``None`` (rather than 0.0) when the edge cannot be formed at all
+        is deliberate: the bandit then relies purely on realized history instead of
+        blending in a fabricated zero.
+        """
+        edge = self.expected_net_return_bps
+        if edge is None:
+            target_bps = self.target_return_rate * 10_000.0
+            if target_bps <= 0:
+                return None
+            edge = target_bps - self.resolved_cost_bps(fallback_cost_bps)
+        if not self.gnn_actionable:
+            edge -= max(0.0, float(gnn_absence_penalty_bps))
+        return edge
+
+    def predicted_gross_edge_bps(self, fallback_cost_bps: float = 0.0) -> float | None:
+        if self.expected_net_return_bps is not None:
+            return float(self.expected_net_return_bps) + self.resolved_cost_bps(
+                fallback_cost_bps
+            )
+        if self.target_return_rate > 0:
+            return self.target_return_rate * 10_000.0
+        return None
+
+
 @dataclass(frozen=True)
 class StrategySessionConfig:
     enabled: bool = field(
@@ -123,8 +241,17 @@ class StrategySessionConfig:
             "STRATEGY_SESSION_STATE_PATH", "data/store/strategy-session.json"
         )
     )
+    # Floor applied to an elected proposal's target before the per-strategy
+    # geometry is maxed in. Defaulted from the fallback geometry rather than a
+    # literal so it cannot drift below the table it is meant to backstop.
     fallback_target_return_rate: float = field(
-        default_factory=lambda: max(0.001, _env_float("STRATEGY_SESSION_TARGET_RETURN_RATE", 0.004))
+        default_factory=lambda: max(
+            0.001,
+            _env_float(
+                "STRATEGY_SESSION_TARGET_RETURN_RATE",
+                _fallback_exit_geometry().take_profit_bps / 10_000.0,
+            ),
+        )
     )
     cooldown_seconds: int = field(
         default_factory=lambda: max(5, _env_int("STRATEGY_SESSION_RESELECT_COOLDOWN_SEC", 30))
@@ -151,6 +278,35 @@ class StrategySessionConfig:
             _env_int("STRATEGY_SESSION_EVIDENCE_MAX_AGE_SEC", 120),
         )
     )
+    # Conservative bandit. When enabled, election no longer means "arm the first
+    # admissible candidate": every candidate is scored on a pessimistic net-edge
+    # lower bound and NO_TRADE is a real, selectable outcome. This is what stops a
+    # tape in which every strategy has negative expectancy from being traded with
+    # the least-bad negative expectancy.
+    bandit_enabled: bool = field(
+        default_factory=lambda: os.getenv("STRATEGY_SESSION_BANDIT_ENABLED", "true").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    # When the bandit is enabled, an unavailable / untrusted GNN downgrades a
+    # candidate instead of vetoing election outright: the GNN is one estimator
+    # among several, and treating its absence as a refusal made the whole session
+    # dark whenever the checkpoint went stale (which adding a strategy does).
+    gnn_absence_penalty_bps: float = field(
+        default_factory=lambda: max(0.0, _env_float("STRATEGY_SESSION_GNN_ABSENCE_PENALTY_BPS", 15.0))
+    )
+    # Record realized outcomes so the bandit has something to learn from.
+    record_outcomes: bool = field(
+        default_factory=lambda: os.getenv("STRATEGY_SESSION_RECORD_OUTCOMES", "true").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    # Round-trip cost assumed when the election evidence carried no estimate.
+    # KRX round trip (sell tax + fees + spread) is ~25-30bps; 28 is the measured
+    # per-strategy average in the R-GCN model card.
+    fallback_round_trip_cost_bps: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("STRATEGY_SESSION_FALLBACK_COST_BPS", 28.0)
+        )
+    )
 
 
 @dataclass
@@ -169,12 +325,28 @@ class StrategySessionState:
     entry_price: float | None = None
     target_price: float | None = None
     stop_price: float | None = None
-    target_return_rate: float = 0.004
+    # Idle placeholders, shown on every dashboard while the session is SCANNING.
+    # They were once hardcoded to 0.004 / 0.0022 / 0.0015 / 600s, which stopped
+    # matching the exit-geometry table and then actively misled: an operator
+    # reading the panel saw a 40bps target against a ~28bps round-trip cost and
+    # concluded the target could not clear costs, when the real target binds from
+    # ``exit_geometry`` at election time. A displayed number that no code path
+    # ever uses is worse than no number, so these now derive from the same
+    # fallback geometry the executor would actually apply to an unknown thesis.
+    target_return_rate: float = field(
+        default_factory=lambda: _fallback_exit_geometry().take_profit_bps / 10_000.0
+    )
     target_profit_amount: float | None = None
-    stop_loss_rate: float = 0.0022
-    trailing_stop_rate: float = 0.0015
+    stop_loss_rate: float = field(
+        default_factory=lambda: _fallback_exit_geometry().stop_loss_bps / 10_000.0
+    )
+    trailing_stop_rate: float = field(
+        default_factory=lambda: _fallback_exit_geometry().trailing_bps / 10_000.0
+    )
     high_watermark_price: float | None = None
-    max_holding_seconds: int = 600
+    max_holding_seconds: int = field(
+        default_factory=lambda: _fallback_exit_geometry().max_holding_seconds
+    )
     exit_requested_at: str | None = None
     exit_reason: str | None = None
     cooldown_until: str | None = None
@@ -194,6 +366,30 @@ class StrategySessionState:
     election_context: dict[str, Any] = field(default_factory=dict)
     halt_level: str = "NONE"
     halt_reason_codes: list[str] = field(default_factory=list)
+    # --- Conservative-bandit election audit ------------------------------------
+    # Why this arm and not NO_TRADE, in the numbers that decided it.
+    bandit_selected_arm: str | None = None
+    bandit_conservative_edge_bps: float | None = None
+    # True when the arm was chosen to LEARN rather than because it has a
+    # demonstrated edge. Without this an operator reading a NEGATIVE
+    # conservative_edge_bps on an ARMED position has no way to tell a deliberate
+    # minimum-size probe from a selection bug.
+    bandit_is_exploration: bool = False
+    bandit_reason_codes: list[str] = field(default_factory=list)
+    bandit_evaluations: list[dict[str, Any]] = field(default_factory=list)
+    bandit_shadow_arms: list[str] = field(default_factory=list)
+    cost_coverage_ratio: float | None = None
+    cost_coverage_band: str | None = None
+    change_point_probability: float | None = None
+    # Per-candidate-market session phase at the last evaluation. Makes
+    # "nothing traded because no scanned market was in its regular session"
+    # readable without cross-referencing clocks.
+    session_phases: dict[str, str] = field(default_factory=dict)
+    # --- Realized-outcome bookkeeping ------------------------------------------
+    expected_cost_bps: float | None = None
+    expected_net_return_bps: float | None = None
+    exit_price: float | None = None
+    outcome_recorded: bool = False
 
 
 class StrategySessionManager:
@@ -204,9 +400,15 @@ class StrategySessionManager:
         *,
         config: StrategySessionConfig | None = None,
         selection_evidence_provider: Callable[[tuple[str, ...]], Mapping[str, Any]] | None = None,
+        performance_store: StrategyPerformanceStore | None = None,
+        bandit: ConservativeStrategyBandit | None = None,
     ) -> None:
         self.config = config or StrategySessionConfig()
         self.selection_evidence_provider = selection_evidence_provider
+        self.performance_store = (
+            performance_store if performance_store is not None else _default_performance_store()
+        )
+        self.bandit = bandit or ConservativeStrategyBandit(store=self.performance_store)
         self._lock = threading.RLock()
         self._state = self._load()
 
@@ -364,6 +566,7 @@ class StrategySessionManager:
             payload["enabled"] = self.config.enabled
             payload["single_position_enforced"] = self.config.enabled
             payload["require_live_gnn"] = self.config.require_live_gnn
+            payload["bandit_enabled"] = self.config.bandit_enabled
             return payload
 
     def _reconcile_position(
@@ -393,10 +596,56 @@ class StrategySessionManager:
             return
 
         if state.position_seen and state.phase in {"OWNED", "EXITING"}:
+            # The position just went flat, so this is the one moment the trade's
+            # realized outcome is knowable. Record it before the state is reset:
+            # without this the conservative bandit has no history to learn from and
+            # every arm stays permanently cold.
+            self._record_outcome(now)
             state.phase = "COOLDOWN"
             state.cooldown_until = _iso(now + timedelta(seconds=self.config.cooldown_seconds))
             state.last_reason = "POSITION_FLAT_RESELECTION_COOLDOWN"
             state.exit_requested_at = state.exit_requested_at or _iso(now)
+
+    def _record_outcome(self, now: datetime) -> None:
+        """Persist the realized net outcome of the closed position.
+
+        Uses the last observed mark as the exit reference and subtracts the same
+        round-trip cost estimate the election used, so ``realized_net_bps`` is
+        directly comparable with the ``expected_net_bps`` that armed the trade —
+        which is what makes the stored prediction error meaningful.
+        """
+        state = self._state
+        if not self.config.record_outcomes or state.outcome_recorded:
+            return
+        strategy = state.selected_strategy
+        symbol = state.selected_symbol
+        entry = state.entry_price
+        exit_price = state.exit_price or state.high_watermark_price
+        if not strategy or not symbol or not entry or entry <= 0 or not exit_price:
+            return
+        gross_bps = (float(exit_price) / float(entry) - 1.0) * 10_000.0
+        cost_bps = (
+            state.expected_cost_bps
+            if state.expected_cost_bps is not None
+            else self.config.fallback_round_trip_cost_bps
+        )
+        opened = _parse_time(state.position_opened_at)
+        holding_seconds = (
+            max(0.0, (now - opened).total_seconds()) if opened is not None else None
+        )
+        recorded = self.performance_store.record(
+            strategy_id=strategy,
+            symbol=symbol,
+            market=market_for_symbol(symbol),
+            regime=state.macro_regime or "UNKNOWN",
+            realized_net_bps=gross_bps - float(cost_bps),
+            realized_gross_bps=gross_bps,
+            expected_net_bps=state.expected_net_return_bps,
+            holding_seconds=holding_seconds,
+            exit_reason=state.exit_reason or "",
+            recorded_at=now,
+        )
+        state.outcome_recorded = bool(recorded)
 
     def _evaluate_exit(self, holding: Any, bundle: Any, now: datetime) -> None:
         state = self._state
@@ -456,10 +705,34 @@ class StrategySessionManager:
             state.exit_reason = reason
             state.exit_requested_at = _iso(now)
             state.last_reason = reason
+            # Freeze the exit reference now: once the broker reports flat the mark
+            # is gone, and a realized outcome reconstructed from a stale watermark
+            # would flatter every stop-out.
+            if last_price > 0:
+                state.exit_price = last_price
         elif pnl or state.position_seen:
             state.last_reason = "POSITION_OWNED_STRATEGY_MONITORING"
+            if last_price > 0:
+                state.exit_price = last_price
 
     def _select(self, candidates: tuple[str, ...], bundle: Any, now: datetime) -> None:
+        """Elect one (symbol, strategy) — or deliberately elect nothing.
+
+        Two-phase by design:
+
+        1. Collect every *admissible* proposal from both election paths (ranked
+           macro/micro BUY intents, then fresh shadow-evidence rows). Admissibility
+           is the same closed-world question it always was: known strategy, macro
+           permits the family, deployment authorised, evidence fresh.
+        2. Score all proposals together on a pessimistic net-edge lower bound and
+           arm the winner, or arm nothing.
+
+        Phase 2 is the change. Previously phase 1 armed the FIRST admissible
+        proposal, which has no way to express "all of these are admissible and all
+        of them lose money". With the conservative bandit, ``no_trade`` is a real
+        arm and wins by default, so a tape with no positive-expectancy strategy
+        produces no position instead of the least-bad negative one.
+        """
         if bundle is None:
             self._state.last_reason = "WAITING_FOR_MACRO_MICRO_BUNDLE"
             return
@@ -492,6 +765,10 @@ class StrategySessionManager:
             }
             for result in tuple(getattr(bundle, "micro_results", ()) or ())[:8]
         ]
+        change_point_probability = _optional_float(
+            getattr(macro, "change_point_probability", None)
+        )
+        self._state.change_point_probability = change_point_probability
         evidence: Mapping[str, Any] = {}
         if self.selection_evidence_provider is not None:
             try:
@@ -506,6 +783,41 @@ class StrategySessionManager:
             and str(getattr(item, "symbol", "") or "").upper() in set(candidates)
         ]
 
+        # Session phase FIRST. Diagnosing "why has nothing traded" used to require
+        # correlating timestamps by hand, because outside the regular session every
+        # candidate failed individually on thin-book liquidity and the surviving
+        # reason blamed the GNN. State the actual constraint instead.
+        session_report = _new_entry_session_report(candidates, now)
+        self._state.session_phases = dict(session_report.get("phases") or {})
+        if not session_report["allows_new_entry"]:
+            self._state.last_reason = session_report["reason"]
+            return
+
+        proposals: list[_ElectionProposal] = []
+        proposals.extend(self._intent_proposals(intents, evidence, bundle, now))
+        proposals.extend(self._evidence_proposals(candidates, evidence, bundle, now))
+
+        if proposals and self.config.bandit_enabled:
+            selected = self._bandit_choice(proposals, macro, now)
+            if selected is not None:
+                self._arm(selected, now, macro)
+            return
+        if proposals:
+            # Bandit disabled: preserve the historical first-admissible behaviour.
+            self._arm(proposals[0], now, macro)
+            return
+
+        self._state.last_reason = self._no_election_reason(evidence, intents)
+
+    # -- proposal construction --------------------------------------------- #
+    def _intent_proposals(
+        self,
+        intents: list[Any],
+        evidence: Mapping[str, Any],
+        bundle: Any,
+        now: datetime,
+    ) -> list["_ElectionProposal"]:
+        proposals: list[_ElectionProposal] = []
         for intent in intents:
             symbol = str(getattr(intent, "symbol", "") or "").upper()
             ontology_strategy = str(getattr(intent, "selected_strategy", "") or "")
@@ -522,16 +834,18 @@ class StrategySessionManager:
                 and is_known_strategy(gnn_strategy)
                 and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
             )
-            if self.config.require_live_gnn and not gnn_actionable:
+            # An untrusted GNN is a MISSING estimator, not a refusal. With the
+            # bandit on, the candidate survives and pays an explicit uncertainty
+            # penalty; with the bandit off, the historical hard veto is kept.
+            if not gnn_actionable and (
+                self.config.require_live_gnn and not self.config.bandit_enabled
+            ):
                 continue
             entry_price = float(getattr(intent, "expected_entry_price", 0.0) or 0.0)
             expected_exit = float(getattr(intent, "expected_exit_price", 0.0) or 0.0)
             target_rate = self.config.fallback_target_return_rate
             if entry_price > 0 and expected_exit > entry_price:
                 target_rate = max(target_rate, expected_exit / entry_price - 1.0)
-            target_price = (
-                max(expected_exit, entry_price * (1.0 + target_rate)) if entry_price > 0 else None
-            )
             rvgi_context = (
                 row.get("rvgi_box_context")
                 if isinstance(row, Mapping)
@@ -545,76 +859,85 @@ class StrategySessionManager:
                 and rvgi_context.get("ontology_eligible") is True
             ):
                 selected_strategy = "rvgi_box_breakout"
-            if selected_strategy == "rvgi_box_breakout":
-                from app.technical.strategy_algorithms import strategy_live_authorized
-
-                if not strategy_live_authorized(selected_strategy):
-                    self._state.last_reason = "RVGI_BOX_NOT_LIVE_AUTHORIZED"
-                    continue
-            stop_bps, profit_bps, trailing_bps = _STRATEGY_EXIT_BPS.get(
-                selected_strategy,
-                (25.0, 40.0, 15.0),
-            )
+            authorized, authorization_reason = self._deployment_authorized(selected_strategy)
+            if not authorized:
+                self._state.last_reason = authorization_reason
+                continue
+            if _macro_permits(bundle, selected_strategy) is False:
+                self._state.last_reason = (
+                    f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
+                )
+                continue
+            stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(selected_strategy)
             profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
             target_rate = max(target_rate, profit_bps / 10_000.0)
-            target_price = (
-                entry_price * (1.0 + target_rate) if entry_price > 0 else None
-            )
-            self._state = StrategySessionState(
-                session_id=f"session-{uuid4().hex}",
-                phase="ARMED",
-                selected_symbol=symbol,
-                selected_strategy=selected_strategy,
-                selection_source=(
-                    "ONTOLOGY_GNN_AGREEMENT"
-                    if gnn_actionable and gnn_strategy == ontology_strategy
-                    else (
-                        "GNN_STRATEGY_ELECTION"
-                        if gnn_actionable
-                        else "ONTOLOGY_WITH_GNN_GUARD"
-                    )
+            micro_result = next(
+                (
+                    result
+                    for result in tuple(getattr(bundle, "micro_results", ()) or ())
+                    if str(getattr(result, "symbol", "") or "").upper() == symbol
                 ),
-                selection_score=float(getattr(intent, "score", 0.0) or 0.0),
-                selection_confidence=float(getattr(intent, "confidence", 0.0) or 0.0),
-                selected_at=_iso(now),
-                entry_price=entry_price or None,
-                target_price=target_price,
-                target_return_rate=target_rate,
-                stop_loss_rate=stop_bps / 10_000.0,
-                trailing_stop_rate=trailing_bps / 10_000.0,
-                max_holding_seconds=_MAX_HOLDING_SECONDS.get(selected_strategy, 600),
-                last_evaluated_at=_iso(now),
-                last_reason="SINGLE_SYMBOL_STRATEGY_ARMED",
-                macro_regime=str(getattr(intent, "macro_regime", "") or ""),
-                micro_regime=str(getattr(intent, "micro_regime", "") or ""),
-                ontology_reason_codes=list(getattr(intent, "reason_codes", ()) or ()),
-                gnn_action=gnn_action,
-                gnn_reason_codes=gnn_reason_codes,
-                explanation_paths=list(getattr(intent, "explanation_paths", ()) or ()),
-                candidate_diagnostics=list(self._state.candidate_diagnostics),
-                election_context=self._election_context(
-                    selected_strategy,
-                    now,
+                None,
+            )
+            proposals.append(
+                _ElectionProposal(
+                    symbol=symbol,
+                    strategy_id=selected_strategy,
+                    source=(
+                        "ONTOLOGY_GNN_AGREEMENT"
+                        if gnn_actionable and gnn_strategy == ontology_strategy
+                        else (
+                            "GNN_STRATEGY_ELECTION"
+                            if gnn_actionable
+                            else "ONTOLOGY_WITH_GNN_GUARD"
+                        )
+                    ),
+                    entry_price=entry_price or None,
+                    target_return_rate=target_rate,
+                    stop_loss_rate=stop_bps / 10_000.0,
+                    trailing_stop_rate=trailing_bps / 10_000.0,
+                    max_holding_seconds=_strategy_max_holding_seconds(selected_strategy),
+                    score=float(getattr(intent, "score", 0.0) or 0.0),
+                    confidence=float(getattr(intent, "confidence", 0.0) or 0.0),
+                    expected_net_return_bps=_optional_float(
+                        getattr(intent, "expected_net_return_bps", None)
+                    ),
+                    expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
+                    gnn_actionable=gnn_actionable,
+                    gnn_action=gnn_action,
+                    gnn_reason_codes=gnn_reason_codes,
+                    ontology_reason_codes=list(getattr(intent, "reason_codes", ()) or ()),
+                    macro_regime=str(getattr(intent, "macro_regime", "") or ""),
+                    micro_regime=str(getattr(intent, "micro_regime", "") or ""),
+                    explanation_paths=list(getattr(intent, "explanation_paths", ()) or ()),
                     intent=intent,
                     candidate_count=len(intents),
-                    micro_result=next(
-                        (
-                            result
-                            for result in tuple(getattr(bundle, "micro_results", ()) or ())
-                            if str(getattr(result, "symbol", "") or "").upper() == symbol
-                        ),
-                        None,
-                    ),
-                    evidence_row=row,
-                ),
+                    micro_result=micro_result,
+                    evidence_row=row if isinstance(row, Mapping) else None,
+                    last_reason="SINGLE_SYMBOL_STRATEGY_ARMED",
+                )
             )
-            return
-        # Election and entry timing are separate responsibilities.  A fresh
-        # ontology/GNN admissibility decision may arm a strategy even when its
-        # tick-level entry trigger is not ready yet; the owned strategy executor
-        # will wait in ARMED without placing an order.
+        return proposals
+
+    def _evidence_proposals(
+        self,
+        candidates: tuple[str, ...],
+        evidence: Mapping[str, Any],
+        bundle: Any,
+        now: datetime,
+    ) -> list["_ElectionProposal"]:
+        """Shadow-evidence path: an explicit ACTIVATE_STRATEGY or a trusted GNN.
+
+        Election and entry timing stay separate responsibilities. A fresh
+        admissibility decision may arm a strategy whose tick trigger is not ready;
+        the owned strategy executor then waits in ARMED without placing an order.
+        """
+        proposals: list[_ElectionProposal] = []
+        claimed = set()
         for symbol in candidates:
             normalized = str(symbol or "").upper()
+            if normalized in claimed:
+                continue
             row = evidence.get(normalized) if isinstance(evidence, Mapping) else None
             if not isinstance(row, Mapping) or not self._fresh_evidence(row, now):
                 continue
@@ -650,7 +973,9 @@ class StrategySessionManager:
                 and is_known_strategy(gnn_strategy)
                 and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
             )
-            if self.config.require_live_gnn and not gnn_actionable:
+            if not gnn_actionable and (
+                self.config.require_live_gnn and not self.config.bandit_enabled
+            ):
                 continue
             if not gnn_actionable and not ontology_actionable:
                 continue
@@ -659,12 +984,10 @@ class StrategySessionManager:
             )
             if not selected_strategy:
                 continue
-            if selected_strategy == "rvgi_box_breakout":
-                from app.technical.strategy_algorithms import strategy_live_authorized
-
-                if not strategy_live_authorized(selected_strategy):
-                    self._state.last_reason = "RVGI_BOX_NOT_LIVE_AUTHORIZED"
-                    continue
+            authorized, authorization_reason = self._deployment_authorized(selected_strategy)
+            if not authorized:
+                self._state.last_reason = authorization_reason
+                continue
             # The shadow evidence path does not know the macro regime, so it
             # would happily arm a strategy family the macro layer has blocked.
             # The supervisor would then flag it every cycle; refuse it here.
@@ -673,48 +996,208 @@ class StrategySessionManager:
                     f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
                 )
                 continue
-            stop_bps, profit_bps, trailing_bps = _STRATEGY_EXIT_BPS.get(
-                selected_strategy,
-                (25.0, 40.0, 15.0),
-            )
+            stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(selected_strategy)
             profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
-            self._state = StrategySessionState(
-                session_id=f"session-{uuid4().hex}",
-                phase="ARMED",
-                selected_symbol=normalized,
-                selected_strategy=selected_strategy,
-                selection_source=(
-                    "GNN_STRATEGY_ELECTION"
-                    if gnn_actionable
-                    else "ONTOLOGY_STRATEGY_ELECTION"
-                ),
-                selected_at=_iso(now),
-                target_return_rate=max(
-                    self.config.fallback_target_return_rate,
-                    profit_bps / 10_000.0,
-                ),
-                stop_loss_rate=stop_bps / 10_000.0,
-                trailing_stop_rate=trailing_bps / 10_000.0,
-                max_holding_seconds=_MAX_HOLDING_SECONDS.get(
-                    selected_strategy,
-                    600,
-                ),
-                last_evaluated_at=_iso(now),
-                last_reason="STRATEGY_ELECTED_WAITING_FOR_ENTRY_TRIGGER",
-                macro_regime=self._state.macro_regime,
-                ontology_reason_codes=list(
-                    ontology.get("reason_codes") or ()
-                ),
-                gnn_action=gnn_action,
-                gnn_reason_codes=gnn_reason_codes,
-                candidate_diagnostics=list(self._state.candidate_diagnostics),
-                election_context=self._election_context(
-                    selected_strategy,
-                    now,
+            claimed.add(normalized)
+            proposals.append(
+                _ElectionProposal(
+                    symbol=normalized,
+                    strategy_id=selected_strategy,
+                    source=(
+                        "GNN_STRATEGY_ELECTION"
+                        if gnn_actionable
+                        else "ONTOLOGY_STRATEGY_ELECTION"
+                    ),
+                    entry_price=None,
+                    target_return_rate=max(
+                        self.config.fallback_target_return_rate,
+                        profit_bps / 10_000.0,
+                    ),
+                    stop_loss_rate=stop_bps / 10_000.0,
+                    trailing_stop_rate=trailing_bps / 10_000.0,
+                    max_holding_seconds=_strategy_max_holding_seconds(selected_strategy),
+                    score=0.0,
+                    confidence=0.0,
+                    expected_net_return_bps=_optional_float(gnn.get("expected_net_return_bps")),
+                    expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
+                    gnn_actionable=gnn_actionable,
+                    gnn_action=gnn_action,
+                    gnn_reason_codes=gnn_reason_codes,
+                    ontology_reason_codes=list(ontology.get("reason_codes") or ()),
+                    macro_regime=self._state.macro_regime or "",
+                    micro_regime="",
+                    explanation_paths=[],
+                    intent=None,
+                    candidate_count=None,
+                    micro_result=None,
                     evidence_row=row,
+                    last_reason="STRATEGY_ELECTED_WAITING_FOR_ENTRY_TRIGGER",
+                )
+            )
+        return proposals
+
+    @staticmethod
+    def _deployment_authorized(strategy_id: str) -> tuple[bool, str]:
+        """Is this strategy authorised for LIVE deployment (not just enabled)?
+
+        Deployment-gated strategies (RVGI box breakout and the three added for the
+        current tape) ship shadow-only until they have per-regime samples.
+        """
+        try:
+            from app.technical.strategy_algorithms import strategy_live_authorized
+
+            if strategy_live_authorized(strategy_id):
+                return True, ""
+        except Exception:  # noqa: BLE001 - a lookup failure must fail closed.
+            return False, f"STRATEGY_AUTHORIZATION_UNAVAILABLE:{strategy_id}"
+        return False, f"STRATEGY_NOT_LIVE_AUTHORIZED:{strategy_id}"
+
+    # -- bandit scoring ---------------------------------------------------- #
+    def _bandit_choice(
+        self,
+        proposals: list["_ElectionProposal"],
+        macro: Any,
+        now: datetime,
+    ) -> "_ElectionProposal | None":
+        """Score every proposal on a pessimistic lower bound; may choose nothing."""
+        context = BanditContext(
+            market=market_for_symbol(proposals[0].symbol),
+            macro_regime=self._state.macro_regime or "UNKNOWN",
+            change_point_probability=self._state.change_point_probability or 0.0,
+            regime_stability=_optional_float(getattr(macro, "regime_stability", None)),
+            volatility_percentile=_optional_float(
+                getattr(macro, "volatility_percentile", None)
+            ),
+            market_breadth=_optional_float(
+                (getattr(macro, "diagnostics", None) or {}).get("market_breadth")
+                if isinstance(getattr(macro, "diagnostics", None), Mapping)
+                else None
+            ),
+            foreign_flow_zscore=_optional_float(getattr(macro, "foreign_flow_zscore", None)),
+            spread_percentile=_optional_float(getattr(macro, "spread_percentile", None)),
+            time_of_day_bucket=f"h{now.astimezone(timezone.utc).hour:02d}",
+        )
+        arms = [
+            ArmCandidate(
+                arm=proposal.strategy_id,
+                symbol=proposal.symbol,
+                predicted_net_edge_bps=proposal.predicted_net_edge_bps(
+                    self.config.gnn_absence_penalty_bps,
+                    self.config.fallback_round_trip_cost_bps,
+                ),
+                predicted_gross_edge_bps=proposal.predicted_gross_edge_bps(
+                    self.config.fallback_round_trip_cost_bps
+                ),
+                expected_cost_bps=proposal.resolved_cost_bps(
+                    self.config.fallback_round_trip_cost_bps
+                ),
+                confidence=proposal.confidence,
+                live_authorized=True,
+                reason_codes=(
+                    ()
+                    if proposal.gnn_actionable
+                    else ("BANDIT_GNN_ESTIMATE_UNAVAILABLE",)
                 ),
             )
-            return
+            for proposal in proposals
+        ]
+        selection = self.bandit.select(arms, context, now=now)
+        self._state.bandit_selected_arm = selection.selected_arm
+        self._state.bandit_conservative_edge_bps = selection.conservative_edge_bps
+        self._state.bandit_is_exploration = selection.is_exploration
+        self._state.bandit_reason_codes = list(selection.reason_codes)
+        self._state.bandit_evaluations = [item.as_dict() for item in selection.evaluations][:12]
+        self._state.bandit_shadow_arms = list(selection.shadow_arms)
+        if selection.is_no_trade:
+            # This is a successful outcome, not a failure: no candidate cleared a
+            # positive lower bound after costs and uncertainty.
+            self._state.last_reason = (
+                "BANDIT_NO_TRADE_NO_POSITIVE_CONSERVATIVE_EDGE"
+                if BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE in selection.reason_codes
+                else f"BANDIT_NO_TRADE:{','.join(selection.reason_codes) or 'UNSPECIFIED'}"
+            )
+            return None
+        winner = next(
+            (
+                proposal
+                for proposal in proposals
+                if proposal.strategy_id == selection.selected_arm
+                and proposal.symbol == selection.selected_symbol
+            ),
+            None,
+        )
+        if winner is None:
+            self._state.last_reason = "BANDIT_SELECTION_UNRESOLVABLE"
+            return None
+        winner.conservative_edge_bps = selection.conservative_edge_bps
+        return winner
+
+    def _arm(self, proposal: "_ElectionProposal", now: datetime, macro: Any = None) -> None:
+        """Commit one proposal to ARMED, preserving the audit trail."""
+        coverage = evaluate_cost_coverage(
+            proposal.predicted_gross_edge_bps(self.config.fallback_round_trip_cost_bps),
+            proposal.resolved_cost_bps(self.config.fallback_round_trip_cost_bps),
+        )
+        entry_price = proposal.entry_price
+        target_price = (
+            entry_price * (1.0 + proposal.target_return_rate)
+            if entry_price and entry_price > 0
+            else None
+        )
+        self._state = StrategySessionState(
+            session_id=f"session-{uuid4().hex}",
+            phase="ARMED",
+            selected_symbol=proposal.symbol,
+            selected_strategy=proposal.strategy_id,
+            selection_source=proposal.source,
+            selection_score=proposal.score,
+            selection_confidence=proposal.confidence,
+            selected_at=_iso(now),
+            entry_price=entry_price,
+            target_price=target_price,
+            target_return_rate=proposal.target_return_rate,
+            stop_loss_rate=proposal.stop_loss_rate,
+            trailing_stop_rate=proposal.trailing_stop_rate,
+            max_holding_seconds=proposal.max_holding_seconds,
+            last_evaluated_at=_iso(now),
+            last_reason=proposal.last_reason,
+            macro_regime=proposal.macro_regime or self._state.macro_regime,
+            micro_regime=proposal.micro_regime or None,
+            ontology_reason_codes=list(proposal.ontology_reason_codes),
+            gnn_action=proposal.gnn_action,
+            gnn_reason_codes=list(proposal.gnn_reason_codes),
+            explanation_paths=list(proposal.explanation_paths),
+            candidate_diagnostics=list(self._state.candidate_diagnostics),
+            bandit_selected_arm=self._state.bandit_selected_arm,
+            bandit_conservative_edge_bps=proposal.conservative_edge_bps,
+            bandit_is_exploration=self._state.bandit_is_exploration,
+            bandit_reason_codes=list(self._state.bandit_reason_codes),
+            bandit_evaluations=list(self._state.bandit_evaluations),
+            bandit_shadow_arms=list(self._state.bandit_shadow_arms),
+            cost_coverage_ratio=coverage.ratio,
+            cost_coverage_band=coverage.band.value,
+            change_point_probability=self._state.change_point_probability,
+            session_phases=dict(self._state.session_phases),
+            expected_cost_bps=proposal.resolved_cost_bps(
+                self.config.fallback_round_trip_cost_bps
+            ),
+            expected_net_return_bps=proposal.expected_net_return_bps,
+            election_context=self._election_context(
+                proposal.strategy_id,
+                now,
+                intent=proposal.intent,
+                candidate_count=proposal.candidate_count,
+                micro_result=proposal.micro_result,
+                evidence_row=proposal.evidence_row,
+                macro=macro,
+                symbol=proposal.symbol,
+                change_point_probability=self._state.change_point_probability,
+            ),
+        )
+
+    def _no_election_reason(
+        self, evidence: Mapping[str, Any], intents: list[Any]
+    ) -> str:
         model_trust_ready = any(
             "GNN_REALTIME_MODEL_TRUST_PASSED"
             in tuple(decision.get("reason_codes") or ())
@@ -744,24 +1227,19 @@ class StrategySessionManager:
             if isinstance(decision, Mapping)
             and decision.get("path") == "cpu_gnn"
         )
-        self._state.last_reason = (
-            (
-                (
-                    "GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION"
-                    if positive_edge_awaiting_validation
-                    else (
-                        "NO_POSITIVE_NET_GNN_EDGE"
-                        if model_trust_ready
-                        else "GNN_NOT_LIVE_AUTHORIZED"
-                    )
-                )
+        # When the operator asked for a live GNN, its state is the most informative
+        # thing to report — that stays true with the bandit on, where an untrusted
+        # GNN is a penalty rather than a veto but is still why nothing was elected.
+        if self.config.require_live_gnn:
+            if positive_edge_awaiting_validation:
+                return "GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION"
+            return (
+                "NO_POSITIVE_NET_GNN_EDGE" if model_trust_ready else "GNN_NOT_LIVE_AUTHORIZED"
             )
-            if self.config.require_live_gnn
-            else (
-                "NO_FRESH_STRATEGY_ELECTION"
-                if not intents
-                else "ONTOLOGY_GNN_STRATEGY_DISAGREEMENT"
-            )
+        return (
+            "NO_FRESH_STRATEGY_ELECTION"
+            if not intents
+            else "NO_ADMISSIBLE_STRATEGY_PROPOSAL"
         )
 
     @staticmethod
@@ -773,6 +1251,9 @@ class StrategySessionManager:
         candidate_count: int | None = None,
         micro_result: Any = None,
         evidence_row: Mapping[str, Any] | None = None,
+        macro: Any = None,
+        symbol: str = "",
+        change_point_probability: float | None = None,
     ) -> dict[str, Any]:
         """Freeze the slow context the algorithm will consume.
 
@@ -785,6 +1266,8 @@ class StrategySessionManager:
             "strategy_id": strategy_id,
             "elected_at": _iso(now),
         }
+        if change_point_probability is not None:
+            context["change_point_probability"] = float(change_point_probability)
         if intent is not None:
             entry = float(getattr(intent, "expected_entry_price", 0.0) or 0.0)
             if entry > 0:
@@ -792,12 +1275,50 @@ class StrategySessionManager:
             net_bps = getattr(intent, "expected_net_return_bps", None)
             if net_bps is not None:
                 context["expected_net_return_bps"] = float(net_bps)
-            # The arbiter orders BUY candidates by expected net return, which is
-            # the cross-sectional ranking this system actually has.
-            rank = getattr(intent, "rank", None)
-            if rank is not None and candidate_count:
-                context["sector_rank"] = int(rank)
-                context["sector_candidate_count"] = int(candidate_count)
+        # Real WITHIN-SECTOR rank on residual (market/sector-neutral) return.
+        #
+        # This used to be the arbiter's global BUY rank ordered by expected net
+        # return, which is not a sector rank at all: a name could be "rank 1" while
+        # being the weakest stock in its own sector, so the relative-strength
+        # thesis was never actually tested. When the macro layer cannot resolve a
+        # sector (or the sector has one tracked name) the rank stays ABSENT and the
+        # consuming algorithm fails closed, which is the honest outcome.
+        table = getattr(macro, "sector_rank_table", None)
+        normalized_symbol = str(symbol or "").upper()
+        if table is not None and normalized_symbol:
+            try:
+                ranked = table.rank_for(normalized_symbol)
+            except Exception:  # noqa: BLE001 - a ranking lookup must never crash election.
+                ranked = None
+            if ranked is not None:
+                context["sector_rank"] = int(ranked[0])
+                context["sector_candidate_count"] = int(ranked[1])
+                sector = dict(getattr(table, "sector_of", {}) or {}).get(normalized_symbol)
+                if sector:
+                    context["sector"] = str(sector)
+            residual = None
+            long_residual = None
+            beta = None
+            try:
+                residual = table.residual_for(normalized_symbol)
+                long_residual = table.long_residual_for(normalized_symbol)
+                beta = table.beta_for(normalized_symbol)
+            except Exception:  # noqa: BLE001
+                residual = long_residual = beta = None
+            # Residuals are rates over the macro trend windows; algorithms consume
+            # bps. Each is written only when actually measured, so a strategy that
+            # needs both horizons fails closed on a short data window instead of
+            # seeing one window twice.
+            if residual is not None:
+                context["residual_return_short_bps"] = float(residual) * 10_000.0
+            if long_residual is not None:
+                context["residual_return_long_bps"] = float(long_residual) * 10_000.0
+            if beta is not None:
+                context["market_beta"] = float(beta)
+        if macro is not None:
+            spread_percentile = getattr(macro, "spread_percentile", None)
+            if spread_percentile is not None:
+                context["spread_percentile"] = float(spread_percentile)
         diagnostics = getattr(micro_result, "diagnostics", None)
         if isinstance(diagnostics, Mapping):
             age = diagnostics.get("event_age_seconds")
@@ -893,10 +1414,7 @@ class StrategySessionManager:
                 break
         average = float(getattr(holding, "average_price", 0.0) or 0.0)
         opened = getattr(holding, "opened_at", None) or now
-        stop_bps, profit_bps, trailing_bps = _STRATEGY_EXIT_BPS.get(
-            strategy,
-            (25.0, 40.0, 15.0),
-        )
+        stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(strategy)
         target_rate = max(
             self.config.fallback_target_return_rate,
             profit_bps / 10_000.0,
@@ -919,7 +1437,7 @@ class StrategySessionManager:
                 average,
                 float(getattr(holding, "last_price", 0.0) or 0.0),
             ) or None,
-            max_holding_seconds=_MAX_HOLDING_SECONDS.get(strategy, 600),
+            max_holding_seconds=_strategy_max_holding_seconds(strategy),
             last_evaluated_at=_iso(now),
             last_reason=(
                 "EXISTING_MULTIPLE_HOLDINGS_BUYS_BLOCKED"
@@ -940,9 +1458,33 @@ class StrategySessionManager:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             allowed = StrategySessionState.__dataclass_fields__.keys()
-            return StrategySessionState(**{key: value for key, value in raw.items() if key in allowed})
+            restored = StrategySessionState(
+                **{key: value for key, value in raw.items() if key in allowed}
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return StrategySessionState(target_return_rate=self.config.fallback_target_return_rate)
+        return self._refresh_idle_exit_geometry(restored)
+
+    @staticmethod
+    def _refresh_idle_exit_geometry(state: StrategySessionState) -> StrategySessionState:
+        """Re-derive the exit geometry when no thesis is active.
+
+        With a position open these four fields are real state -- the geometry the
+        live trade was actually armed with -- and must survive a restart exactly
+        as persisted. With nothing selected they are only placeholders, and
+        restoring them from disk made the state file outrank the geometry table:
+        after the table moved to 60/160, a months-old file kept every dashboard
+        reporting 22/40 across restarts, which is precisely the stale number that
+        caused a target to be misread as unable to clear costs.
+        """
+        if state.selected_strategy:
+            return state
+        geometry = _fallback_exit_geometry()
+        state.target_return_rate = geometry.take_profit_bps / 10_000.0
+        state.stop_loss_rate = geometry.stop_loss_bps / 10_000.0
+        state.trailing_stop_rate = geometry.trailing_bps / 10_000.0
+        state.max_holding_seconds = geometry.max_holding_seconds
+        return state
 
     def _persist(self) -> None:
         path = Path(self.config.state_path)

@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760" role="img" aria-label="신규 진입 차단 체인 진단">
+<rect width="1180" height="760" fill="#0d1420"/>
+<text x="40" y="48" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="22" fill="#e6edf6" font-weight="700" text-anchor="start">왜 신규 진입이 없는가 — ENTRY BLOCKADE 체인</text>
+<text x="40" y="74" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="12" fill="#8195ad" font-weight="400" text-anchor="start">체인은 순서대로 평가되며, 처음 막힌 단계가 실제 원인입니다. 그 뒤 단계는 도달하지 않았을 뿐 통과한 것이 아닙니다.</text>
+<text x="40" y="96" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="11" fill="#8195ad" font-weight="400" text-anchor="start">측정 시점: 2026-07-30T23:4x UTC · 누적 11,614 사이클 · 체결 0건</text>
+<g opacity="1">
+<rect x="40" y="128" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="128" width="4" height="42" rx="2" fill="#42d392"/>
+<text x="62" y="155" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#42d392" font-weight="700" text-anchor="start">✓</text>
+<text x="86" y="147" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">엔진 실행</text>
+<text x="86" y="162" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">11,614 사이클 정상 동작</text>
+</g>
+<line x1="52" y1="170" x2="52" y2="180" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="1">
+<rect x="40" y="180" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="180" width="4" height="42" rx="2" fill="#42d392"/>
+<text x="62" y="207" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#42d392" font-weight="700" text-anchor="start">✓</text>
+<text x="86" y="199" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">라이브 무장</text>
+<text x="86" y="214" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">live_armed=true, 일일 손실 예산 잔여</text>
+</g>
+<line x1="52" y1="222" x2="52" y2="232" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="1">
+<rect x="40" y="232" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="232" width="4" height="42" rx="2" fill="#ff6678"/>
+<text x="62" y="259" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#ff6678" font-weight="700" text-anchor="start">✕</text>
+<text x="86" y="251" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">시장 세션</text>
+<text x="86" y="266" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">US=after / KRX=pre — 스캔 대상 시장이 정규장 아님</text>
+</g>
+<line x1="52" y1="274" x2="52" y2="284" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="0.45">
+<rect x="40" y="284" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="284" width="4" height="42" rx="2" fill="#22304a"/>
+<text x="62" y="311" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#22304a" font-weight="700" text-anchor="start">·</text>
+<text x="86" y="303" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">매수 후보</text>
+<text x="86" y="318" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">앞 단계에서 막혀 평가되지 않음</text>
+</g>
+<line x1="52" y1="326" x2="52" y2="336" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="0.45">
+<rect x="40" y="336" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="336" width="4" height="42" rx="2" fill="#22304a"/>
+<text x="62" y="363" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#22304a" font-weight="700" text-anchor="start">·</text>
+<text x="86" y="355" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">마이크로 전략</text>
+<text x="86" y="370" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">앞 단계에서 막혀 평가되지 않음</text>
+</g>
+<line x1="52" y1="378" x2="52" y2="388" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="0.45">
+<rect x="40" y="388" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="388" width="4" height="42" rx="2" fill="#22304a"/>
+<text x="62" y="415" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#22304a" font-weight="700" text-anchor="start">·</text>
+<text x="86" y="407" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">전략 선택</text>
+<text x="86" y="422" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">앞 단계에서 막혀 평가되지 않음</text>
+</g>
+<line x1="52" y1="430" x2="52" y2="440" stroke="#22304a" stroke-width="1.5"/>
+<g opacity="0.45">
+<rect x="40" y="440" width="640" height="42" rx="8" fill="#131c2b" stroke="#22304a"/>
+<rect x="40" y="440" width="4" height="42" rx="2" fill="#22304a"/>
+<text x="62" y="467" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="14" fill="#22304a" font-weight="700" text-anchor="start">·</text>
+<text x="86" y="459" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">포지션</text>
+<text x="86" y="474" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10.5" fill="#8195ad" font-weight="400" text-anchor="start">앞 단계에서 막혀 평가되지 않음</text>
+</g>
+<path d="M 690 253 L 716 253" stroke="#ff6678" stroke-width="2" marker-end="url(#arrow-red)"/>
+<text x="724" y="249" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="12" fill="#ff6678" font-weight="700" text-anchor="start">실제 원인</text>
+<text x="724" y="265" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">(체인이 없으면 보이지 않음)</text>
+<path d="M 690 409 L 716 409" stroke="#f0b90b" stroke-width="2" marker-end="url(#arrow-amber)"/>
+<text x="724" y="405" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="12" fill="#f0b90b" font-weight="700" text-anchor="start">기존에 표시되던 사유</text>
+<text x="724" y="421" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">NO_POSITIVE_NET_GNN_EDGE</text>
+<text x="724" y="440" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">이 단계도 독립적으로 막혀 있습니다.</text>
+<text x="724" y="454" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">앞 단계를 고쳐야 비로소 드러납니다.</text>
+<text x="40" y="522" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="15" fill="#e6edf6" font-weight="700" text-anchor="start">독립적으로 깨져 있던 세 가지 원인과 조치</text>
+<rect x="40" y="538" width="358" height="152" rx="10" fill="#131c2b" stroke="#22304a"/>
+<text x="56" y="564" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">① 시장 세션</text>
+<text x="56" y="583" font-family="Consolas,monospace" font-size="10" fill="#f0b90b" font-weight="400" text-anchor="start">시간외 호가로 평가</text>
+<text x="56" y="606" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">F: 분당 2주 · 스프레드 33bp · liquidity_score 2e-05.</text>
+<text x="56" y="621" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">"완전 마감 아님"을 "거래 가능"으로 읽고 있었음.</text>
+<line x1="56" y1="646" x2="382" y2="646" stroke="#22304a"/>
+<text x="56" y="665" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="9.5" fill="#8195ad" font-weight="700" text-anchor="start">조치</text>
+<text x="56" y="679" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#42d392" font-weight="400" text-anchor="start">allows_new_entry() — 정규장에서만 신규 진입</text>
+<rect x="418" y="538" width="358" height="152" rx="10" fill="#131c2b" stroke="#22304a"/>
+<text x="434" y="564" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">② GNN 권한 교착</text>
+<text x="434" y="583" font-family="Consolas,monospace" font-size="10" fill="#f0b90b" font-weight="400" text-anchor="start">CALIBRATED_AWAITING_POSITIVE_EDGE</text>
+<text x="434" y="606" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">entry_authorized 에는 실현 체결 5건 필요, 보유 1건.</text>
+<text x="434" y="621" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">체결하려면 권한이 필요하고 권한은 체결을 요구함.</text>
+<line x1="434" y1="646" x2="760" y2="646" stroke="#22304a"/>
+<text x="434" y="665" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="9.5" fill="#8195ad" font-weight="700" text-anchor="start">조치</text>
+<text x="434" y="679" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#42d392" font-weight="400" text-anchor="start">보수적 bandit — require_live_gnn 을 거부권이 아닌 감점으로</text>
+<rect x="796" y="538" width="358" height="152" rx="10" fill="#131c2b" stroke="#22304a"/>
+<text x="812" y="564" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="13" fill="#e6edf6" font-weight="700" text-anchor="start">③ 진단 오표시</text>
+<text x="812" y="583" font-family="Consolas,monospace" font-size="10" fill="#f0b90b" font-weight="400" text-anchor="start">NO_POSITIVE_NET_GNN_EDGE</text>
+<text x="812" y="606" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">마지막으로 실패한 계층의 코드 하나만 노출되어</text>
+<text x="812" y="621" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#8195ad" font-weight="400" text-anchor="start">실제 원인(세션)이 가려짐.</text>
+<line x1="812" y1="646" x2="1138" y2="646" stroke="#22304a"/>
+<text x="812" y="665" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="9.5" fill="#8195ad" font-weight="700" text-anchor="start">조치</text>
+<text x="812" y="679" font-family="'Segoe UI','Malgun Gothic',sans-serif" font-size="10" fill="#42d392" font-weight="400" text-anchor="start">ENTRY BLOCKADE 체인 — 계층별 판정을 모두 노출</text>
+<defs><marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#ff6678"/></marker><marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#f0b90b"/></marker></defs>
+</svg>

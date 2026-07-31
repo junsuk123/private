@@ -30,11 +30,35 @@ class LiveSignalPrediction:
 class LiveSignalPredictor:
     def __init__(self, registry: ModelArtifactRegistry | None = None) -> None:
         self.registry = registry or ModelArtifactRegistry()
+        self._market_registries: dict[str, ModelArtifactRegistry] = {}
+
+    def _registry_for(self, symbol: str) -> ModelArtifactRegistry:
+        """Prefer the market-specific artifact, fall back to the combined one.
+
+        KR and US differ by 2-3x in round-trip cost, so one expected-net-return
+        head fitted across both is wrong for each. A market artifact is used only
+        when it exists and is live-eligible; otherwise the combined model serves,
+        so enabling the split never opens a coverage gap.
+        """
+        if not _market_split_enabled():
+            return self.registry
+        market = "KR" if str(symbol or "").strip().isdigit() and len(str(symbol).strip()) == 6 else "US"
+        cached = self._market_registries.get(market)
+        if cached is None:
+            cached = ModelArtifactRegistry(self.registry.root / market)
+            self._market_registries[market] = cached
+        return cached
 
     def predict(self, frame: LiveFeatureFrame) -> LiveSignalPrediction:
         if not live_signal_model_inference_enabled():
             raise RuntimeError("LIVE_SIGNAL_MODEL_INFERENCE_DISABLED")
-        artifact = self.registry.load_latest_live_eligible()
+        market_registry = self._registry_for(getattr(frame, "symbol", ""))
+        try:
+            artifact = market_registry.load_latest_live_eligible()
+        except RuntimeError:
+            if market_registry is self.registry:
+                raise
+            artifact = self.registry.load_latest_live_eligible()
         if artifact.feature_schema_hash != frame.feature_schema_hash:
             raise RuntimeError("MODEL_FEATURE_SCHEMA_MISMATCH")
         if artifact.feature_names != frame.schema.feature_names:
@@ -62,6 +86,15 @@ class LiveSignalPredictor:
             provider="trained_model",
             is_fallback=False,
         )
+
+
+def _market_split_enabled() -> bool:
+    return str(os.getenv("LIVE_MODEL_SPLIT_BY_MARKET", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _dot(values: tuple[float, ...], weights: tuple[float, ...]) -> float:

@@ -173,16 +173,41 @@ class SellPricingTest(unittest.TestCase):
 
 
 class BuyPricingTest(unittest.TestCase):
+    """Entry pricing. Crossing at the ask is now OPT-IN, not the default.
+
+    Entries post passively at the bid so a round trip stops paying the full spread —
+    13-50bps on the live KRX tape against a 27.8bps modelled cost, a spread the cost
+    model never charged. See tests/test_passive_entry_pricing.py for that contract;
+    this class keeps the crossing path covered because it is still reachable.
+    """
+
     def setUp(self) -> None:
         self.policy = ExecutionPricingPolicy()
 
-    def test_buy_uses_best_ask(self) -> None:
+    def test_buy_crosses_at_best_ask_when_passive_entry_disabled(self) -> None:
+        previous = os.environ.get("EXEC_PASSIVE_ENTRY")
+        os.environ["EXEC_PASSIVE_ENTRY"] = "false"
+        try:
+            policy = ExecutionPricingPolicy()
+            d = policy.price(
+                PricingContext("005930", "BUY", ENTRY, 10_000.0, best_bid=9_990.0, best_ask=10_010.0, is_domestic=True)
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("EXEC_PASSIVE_ENTRY", None)
+            else:
+                os.environ["EXEC_PASSIVE_ENTRY"] = previous
+        self.assertTrue(d.priced)
+        self.assertEqual(d.pricing_policy, "BUY_BEST_ASK")
+        self.assertEqual(d.limit_price, 10_010.0)
+
+    def test_buy_posts_passively_by_default(self) -> None:
         d = self.policy.price(
             PricingContext("005930", "BUY", ENTRY, 10_000.0, best_bid=9_990.0, best_ask=10_010.0, is_domestic=True)
         )
         self.assertTrue(d.priced)
-        self.assertEqual(d.pricing_policy, "BUY_BEST_ASK")
-        self.assertEqual(d.limit_price, 10_010.0)
+        self.assertEqual(d.pricing_policy, "BUY_PASSIVE_BID")
+        self.assertLess(d.limit_price, 10_010.0)
 
     def test_buy_no_orderbook_not_priced(self) -> None:
         d = self.policy.price(PricingContext("005930", "BUY", ENTRY, 10_000.0, best_bid=0.0, best_ask=0.0))

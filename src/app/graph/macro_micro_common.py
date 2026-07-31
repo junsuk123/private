@@ -18,10 +18,30 @@ class MarketRegime(str, Enum):
     TREND_DOWN = "TREND_DOWN"
     RANGE_BOUND = "RANGE_BOUND"
     BREAKOUT_MARKET = "BREAKOUT_MARKET"
+    # Retained as the conservative catch-all for "volatile and unclassifiable".
+    # High volatility is no longer a single state: the four sub-regimes below
+    # separate a volatile tape that still has a tradeable structure from one that
+    # has genuinely stopped functioning. Treating them identically is what made
+    # every 2026-07 high-volatility session a blanket buy ban.
     HIGH_VOLATILITY_RISK = "HIGH_VOLATILITY_RISK"
+    HIGH_VOL_TRENDING = "HIGH_VOL_TRENDING"
+    HIGH_VOL_MEAN_REVERTING = "HIGH_VOL_MEAN_REVERTING"
+    HIGH_VOL_DISLOCATED = "HIGH_VOL_DISLOCATED"
+    HIGH_VOL_RECOVERY = "HIGH_VOL_RECOVERY"
     LOW_LIQUIDITY_MARKET = "LOW_LIQUIDITY_MARKET"
     NEWS_SHOCK = "NEWS_SHOCK"
     NO_TRADE_MARKET = "NO_TRADE_MARKET"
+
+
+HIGH_VOLATILITY_REGIMES: frozenset[MarketRegime] = frozenset(
+    {
+        MarketRegime.HIGH_VOLATILITY_RISK,
+        MarketRegime.HIGH_VOL_TRENDING,
+        MarketRegime.HIGH_VOL_MEAN_REVERTING,
+        MarketRegime.HIGH_VOL_DISLOCATED,
+        MarketRegime.HIGH_VOL_RECOVERY,
+    }
+)
 
 
 class MacroRiskLevel(str, Enum):
@@ -105,6 +125,18 @@ MACRO_INSUFFICIENT_DATA = "MACRO_INSUFFICIENT_DATA"
 MACRO_CANDIDATE_SELECTED = "MACRO_CANDIDATE_SELECTED"
 MACRO_SECTOR_STRONG = "MACRO_SECTOR_STRONG"
 MACRO_SECTOR_WEAK = "MACRO_SECTOR_WEAK"
+# High-volatility sub-regime codes. Which one fires says WHY volatility is high,
+# which is what decides whether any long thesis can still be valid.
+MACRO_HIGH_VOL_TRENDING = "MACRO_HIGH_VOL_TRENDING"
+MACRO_HIGH_VOL_MEAN_REVERTING = "MACRO_HIGH_VOL_MEAN_REVERTING"
+MACRO_HIGH_VOL_DISLOCATED = "MACRO_HIGH_VOL_DISLOCATED"
+MACRO_HIGH_VOL_RECOVERY = "MACRO_HIGH_VOL_RECOVERY"
+MACRO_HIGH_VOL_UNCLASSIFIED = "MACRO_HIGH_VOL_UNCLASSIFIED"
+MACRO_CORRELATION_SPIKE = "MACRO_CORRELATION_SPIKE"
+MACRO_BREADTH_IMPROVING = "MACRO_BREADTH_IMPROVING"
+MACRO_BREADTH_DETERIORATING = "MACRO_BREADTH_DETERIORATING"
+MACRO_FOREIGN_OUTFLOW_SHOCK = "MACRO_FOREIGN_OUTFLOW_SHOCK"
+MACRO_CHANGE_POINT_BLOCKS_ENTRY = "MACRO_CHANGE_POINT_BLOCKS_ENTRY"
 
 # Micro reason codes.
 MICRO_MOMENTUM_CONFIRMED = "MICRO_MOMENTUM_CONFIRMED"

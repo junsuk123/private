@@ -1,0 +1,127 @@
+{
+  "task_id": "orderable-krw-lost-in-connection-basis",
+  "created_at": "2026-07-31T01:05:00Z",
+  "repo": "c:\\Users\\Owner\\OneDrive - Sejong University\\바탕 화면\\private",
+  "priority": "high",
+  "severity_note": "This is the MONEY path. A wrong value here does not merely block trades — it can cause OVER-ordering. A half-applied fix is worse than no fix.",
+
+  "objective": "Orderable KRW is correct at the KIS adapter but arrives as 0.0 in the engine's cached account basis. Because of that, the affordability filter rejects every KR candidate, buy_candidate_count stays 0, and the system never trades despite having ~100,000 KRW of genuinely orderable cash. Find where the value is lost between the KIS connection payload and the account basis, fix it, and verify against the raw KIS fields.",
+
+  "symptom": {
+    "user_visible": "10만원을 입금했는데도 거래가 발생하지 않음. ENTRY BLOCKADE 패널의 buy_candidates 단계에서 후보 0개.",
+    "engine": "buy_candidate_count=0, buy_evaluated=0, strategy_session.last_reason=NO_CANDIDATE_SYMBOLS",
+    "duration": "Observed frozen for 4.5+ minutes across repeated polls, so this is NOT cache latency."
+  },
+
+  "verified_measurements": {
+    "captured_at": "2026-07-31T00:52-01:00Z (all within a few minutes of each other)",
+    "note": "Every row below was measured directly, not inferred.",
+    "rows": [
+      { "source": "KIS /uapi/domestic-stock/v1/trading/inquire-psbl-order -> output.ord_psbl_cash", "krw_orderable": 100002, "verdict": "correct" },
+      { "source": "KIS /uapi/domestic-stock/v1/trading/inquire-psbl-order -> output.nrcvb_buy_amt", "krw_orderable": 99504, "verdict": "correct" },
+      { "source": "kis_real.py KisDevelopersApiClient._get_domestic_orderable_cash()", "krw_orderable": 99504, "verdict": "correct" },
+      { "source": "client.get_portfolio().account.orderable_cash_by_currency['KRW']", "krw_orderable": 99504, "verdict": "correct" },
+      { "source": "GET /api/status -> orderable_cash_by_currency['KRW']", "krw_orderable": 0.0, "verdict": "WRONG — value lost here" },
+      { "source": "same snapshot: account.cash", "krw_orderable": 2626.87, "verdict": "settled-deposit-only figure; not the orderable number" }
+    ],
+    "corroborating": {
+      "cash_equivalent_krw": 197377.0,
+      "arithmetic": "197377 = 97375 (USD) + 100002 (KRW). The deposit IS visible in the total; only the ORDERABLE KRW field is zeroed.",
+      "cheapest_streaming_candidate": { "symbol": "073240", "best_ask": 7180.0 },
+      "consequence": "affordability compares against 0 (or 2626) instead of 99504, so even a 7,180원 candidate is judged unaffordable."
+    }
+  },
+
+  "do_not_touch": [
+    {
+      "path": "src/app/market_affordability.py",
+      "symbol": "cash_available_for_market",
+      "reason": "ALREADY CORRECT. It prefers account.orderable_cash_by_currency over account.cash (lines ~34-44). Verified by reading. The bug is upstream of it — do not 'fix' affordability."
+    },
+    {
+      "path": "src/app/execution/kis_real.py",
+      "symbol": "_get_domestic_orderable_cash",
+      "reason": "ALREADY CORRECT. Returns nrcvb_buy_amt (미수없는매수금액) in preference to ord_psbl_cash, and its comment records a previous incident of exactly this class. Verified live: returns 99504.0."
+    }
+  ],
+
+  "suspected_defect": {
+    "path": "src/app/web.py",
+    "symbol": "_account_basis_from_kis_connection",
+    "approximate_line": 914,
+    "code": [
+      "krw_cash = _number_or_zero(connection.get('krw_cash') or connection.get('actual_deposit') or 0)   # measured: 0",
+      "orderable_cash_by_currency = _cash_by_currency_payload(connection.get('orderable_cash_by_currency'), krw_cash)   # -> {'KRW': 0.0}"
+    ],
+    "hypothesis": "The `connection` dict (the cached KIS connection-check payload) is a DIFFERENT code path from client.get_portfolio(). It appears to be built from a settled-only deposit figure, so it never received the nrcvb_buy_amt fix that kis_real.py already has. _cash_by_currency_payload then faithfully copies KRW=0.",
+    "confidence": "high for the location, UNCONFIRMED for the producer — the agent must still identify which function populates connection['orderable_cash_by_currency'] and connection['krw_cash'].",
+    "next_grep": [
+      "grep -rn \"orderable_cash_by_currency\" --include=*.py src",
+      "grep -rn \"account_checked\" --include=*.py src   # the connection payload's marker field",
+      "Follow the producer of the dict passed to _account_basis_from_kis_connection."
+    ]
+  },
+
+  "investigation_steps": [
+    "1. Identify the producer of connection['orderable_cash_by_currency'] and connection['krw_cash']. Confirm (do not assume) that it uses a settled-only deposit field such as dnca_tot_amt instead of nrcvb_buy_amt / ord_psbl_cash.",
+    "2. Decide the correct single authority for 'orderable KRW'. kis_real.py already treats nrcvb_buy_amt as authoritative ('how much you can buy without margin'). Prefer reusing that existing accessor over duplicating field-precedence logic in a second place — a second copy is how this drifted apart in the first place.",
+    "3. Apply the fix so the connection basis carries the same orderable KRW that get_portfolio() reports.",
+    "4. Make the discrepancy detectable in future: if the two paths ever disagree by more than a small tolerance, surface it (log or diagnostic field) rather than silently preferring one.",
+    "5. Restart the server and confirm end-to-end (see acceptance_criteria)."
+  ],
+
+  "acceptance_criteria": [
+    "GET /api/status -> orderable_cash_by_currency['KRW'] matches the live KIS nrcvb_buy_amt within rounding (currently ~99,504, not 0).",
+    "GET /api/realtime-trading/entry-blockade -> the 'buy_candidates' link passes (count > 0) during the KRX regular session.",
+    "The engine reports buy_candidate_count > 0 and buy_evaluated > 0.",
+    "No regression: python -m pytest tests -q. Baseline is 1168 passed / 5 failed. Those 5 (test_dynamic_exit_policy::test_loss_exit_disabled_by_default and 4 in test_realtime_exit_decision) are PRE-EXISTING order-dependent failures — verified by stashing all changes and re-running. Do not attempt to fix them as part of this task, but do not add any new failures."
+  ],
+
+  "verification_commands": {
+    "raw_kis_truth": "python -c \"import sys;sys.path.insert(0,'src');from app.execution.kis_real import KisDevelopersApiClient as K;c=K(paper=False,enabled=True);r=c._get('/uapi/domestic-stock/v1/trading/inquire-psbl-order',tr_id=c.endpoints.orderable_cash_tr_id,params=c._domestic_orderable_cash_params());o=r.get('output') or {};print({k:o.get(k) for k in ('ord_psbl_cash','nrcvb_buy_amt')});print('adapter=',c._get_domestic_orderable_cash())\"",
+    "portfolio_path": "python -c \"import sys;sys.path.insert(0,'src');from app.execution.kis_real import KisDevelopersApiClient as K;a=K(paper=False,enabled=True).get_portfolio().account;print('cash',a.cash);print('orderable',a.orderable_cash_by_currency)\"",
+    "web_status_path": "curl -s http://127.0.0.1:8010/api/status | python -c \"import json,sys;d=json.load(sys.stdin);print(d.get('krw_cash'),d.get('orderable_cash_by_currency'),d.get('cash_equivalent_krw'))\"",
+    "entry_blockade": "curl -s http://127.0.0.1:8010/api/realtime-trading/entry-blockade",
+    "tests": "python -m pytest tests -q"
+  },
+
+  "safety_constraints": [
+    "The server on port 8010 runs with REQUIRE_MANUAL_ARMING=false and AUTO_START_REALTIME_TRADING=true — it submits REAL orders to a live KIS account. This is not a read-only environment.",
+    "All KIS queries above are read-only (inquire-*). Do not call order-submission endpoints while testing.",
+    "Before restarting, check holdings and session phase. If a position is open, a restart abandons its in-memory exit state. Last restart was safe only because holdings were 0 and phase was SCANNING.",
+    "/api/live-trading/terminate does NOT schedule a shutdown — it switches the engine into sell-only full-liquidation mode and keeps running. It is not a restart command. With open positions it will try to LIQUIDATE them.",
+    "Canonical launcher is run.ps1 (port 8010). Restart = stop the run.py PID, then relaunch run.ps1.",
+    "Raising an orderable-cash number without verifying it against nrcvb_buy_amt risks margin/미수 orders. Verify, do not assume."
+  ],
+
+  "already_fixed_this_session_do_not_redo": {
+    "market_session_gate": "market_session.allows_new_entry() restricts NEW entries to the regular session (exits unaffected). Reason code NEW_ENTRY_OUTSIDE_REGULAR_SESSION:<group>=<phase>. Env escape hatch TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true.",
+    "entry_blockade_diagnostics": "GET /api/realtime-trading/entry-blockade + the ENTRY BLOCKADE panel on /account render an ordered chain (engine -> live_armed -> market_session -> buy_candidates -> micro_buy_intents -> strategy_election -> position). The FIRST unmet link is the answer. This is what exposed the current bug.",
+    "buy_candidates_detail": "web.py::_buy_candidate_warmup_detail distinguishes three causes of '0 candidates': minute-bar warm-up (n/20 + ETA), insufficient orderable cash, and everything-filtered. NOTE: its affordability read currently uses account.cash, so once the basis is fixed this helper should be re-checked to make sure it reports the SAME number the filter uses.",
+    "conservative_bandit": "Strategy election now selects on a pessimistic net-edge lower bound with no_trade as a real arm, plus flagged cold-start exploration. require_live_gnn became a penalty rather than a veto.",
+    "note": "Full background in docs/decision_and_risk.md sections 9 and 10."
+  },
+
+  "known_downstream_blockers_after_this_fix": [
+    "GNN checkpoint is catalog-mismatched: STRATEGY_IDS grew 8 -> 11, so data/models/strategy_utility/rgcn_shadow.json fails closed with GNN_STRATEGY_CATALOG_MISMATCH until retrained via `python scripts/train_strategy_utility_rgcn.py`. The bandit path keeps election working meanwhile.",
+    "The live model is currently demoted: LATEST_MODEL_STALE:MODEL_AGE_EXCEEDED. This is the new staleness gate working as designed, not a fault.",
+    "Once candidates flow, strategy_election may still return BANDIT_NO_TRADE. That is a correct output meaning 'no measured positive edge after costs and uncertainty', not a failure to fix."
+  ],
+
+  "reference_files": [
+    "src/app/web.py  (_account_basis_from_kis_connection, _cash_by_currency_payload, _realtime_engine_buy_candidates, _entry_blockade_chain, _buy_candidate_warmup_detail)",
+    "src/app/execution/kis_real.py  (_get_domestic_orderable_cash, _domestic_cash_from_balance_summary)",
+    "src/app/market_affordability.py  (cash_available_for_market)",
+    "src/app/account_dashboard.py  (_cash_rows — builds the display-only KRW_SETTLEMENT bucket with orderable hardcoded to 0.0; it is a derived residual, not a KIS field)",
+    "docs/decision_and_risk.md sections 9-10",
+    "docs/live_trading.md section 5 (reason-code table)"
+  ],
+
+  "red_herrings_already_ruled_out": [
+    "NOT the GNN. It was the reported reason (NO_POSITIVE_NET_GNN_EDGE) for 11,614 cycles and was never the actual constraint.",
+    "NOT minute-bar warm-up. Bars reached 30/20 and candidates were still 0.",
+    "NOT orderbook staleness. Measured: the book is fresh 93% of wall-clock time for 005930 (median inter-arrival 0.01s). An earlier single sample landed in one of 6 rare >15s gaps and was misleading.",
+    "NOT genuinely insufficient funds. KIS reports 100,002 orderable. An earlier conclusion of 'insufficient cash' was based on the zeroed value and was WRONG.",
+    "NOT the KRW_SETTLEMENT display bucket. It is a derived residual in account_dashboard.py with orderable hardcoded to 0.0 by design; it is a symptom of where the money landed, not the cause."
+  ]
+}
