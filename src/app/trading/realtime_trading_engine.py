@@ -792,8 +792,165 @@ class RealtimeTradingEngine:
         summary["sell_submitted"] = sell_submitted
         if skipped_market_closed_symbols:
             summary["skipped_market_closed_symbols"] = skipped_market_closed_symbols
+        # Short-side bookkeeping. Runs AFTER every order decision so it can never
+        # influence one, and swallows its own errors so a shadow-accounting fault
+        # cannot stop live LONG trading.
+        self._run_short_cycle(summary, cycle_buy_candidates, decision_time)
         self._finish_cycle(summary)
         return summary
+
+    # ------------------------------------------------------------------ #
+    # Short-side cycle (no orders, no gating)                             #
+    # ------------------------------------------------------------------ #
+    def _run_short_cycle(
+        self,
+        summary: dict[str, Any],
+        candidates: tuple[str, ...],
+        decision_time: datetime,
+    ) -> None:
+        """Keeps the short deployment ladder fed and moving.
+
+        Four jobs, none of which can create an order:
+
+        1. poll 대주 availability for short-eligible candidates, so a locate EXISTS
+           when a short signal fires (without this the store stays empty and every
+           short candidate is dropped before it becomes a proposal);
+        2. hand newly journaled shadow plans to the evaluation service;
+        3. walk those plans against the current book and persist resolved outcomes;
+        4. re-evaluate deployment states on the configured interval.
+
+        Entirely wrapped in try/except: this is bookkeeping for a subsystem that
+        submits nothing, and it must not be able to break the live LONG path.
+        """
+        if not _env_bool("SHORT_STRATEGY_CYCLE_ENABLED", True):
+            return
+        try:
+            from app.trading.borrow_polling import default_borrow_poller
+            from app.trading.shadow_evaluation_service import (
+                default_shadow_evaluation_service,
+            )
+
+            poller = default_borrow_poller()
+            service = default_shadow_evaluation_service()
+        except Exception as exc:  # noqa: BLE001
+            summary["short_cycle"] = {"error": f"{type(exc).__name__}: {exc}"}
+            return
+
+        short_summary: dict[str, Any] = {}
+        try:
+            # Demand-driven: only the symbols a short could actually elect this cycle.
+            poller.track(candidates)
+            short_summary["borrow_poll"] = poller.poll_once(now=decision_time).as_dict()
+        except Exception as exc:  # noqa: BLE001
+            short_summary["borrow_poll_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            plans = (
+                self.strategy_session_manager.drain_shadow_plans()
+                if self.strategy_session_manager is not None
+                else ()
+            )
+            quotes = self._short_cycle_quotes(candidates, decision_time)
+            short_summary["evaluation"] = service.evaluate_tick(
+                quotes, now=decision_time, new_plans=plans
+            ).as_dict()
+            # The LONG/SHORT/NO_TRADE comparison from this cycle's election feeds
+            # ``short_rescue_rate`` — the gate that asks whether adding shorts bought
+            # anything at all, rather than only adding exposure.
+            session = summary.get("strategy_session")
+            if isinstance(session, dict):
+                service.record_directional_comparison(
+                    session.get("directional_comparison")
+                )
+            short_summary["short_rescue_rate"] = service.short_rescue_rate
+        except Exception as exc:  # noqa: BLE001
+            short_summary["evaluation_error"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            decisions = self._maybe_evaluate_promotions(service, decision_time)
+            if decisions is not None:
+                short_summary["promotion"] = decisions
+        except Exception as exc:  # noqa: BLE001
+            short_summary["promotion_error"] = f"{type(exc).__name__}: {exc}"
+        summary["short_cycle"] = short_summary
+
+    def _short_cycle_quotes(
+        self, candidates: tuple[str, ...], decision_time: datetime
+    ) -> dict[str, dict[str, Any]]:
+        """Current bid/ask per candidate, for walking shadow barriers.
+
+        Reuses the book the engine already holds — shadow evaluation must not add a
+        market-data fetch. A symbol whose book is missing or crossed is simply omitted:
+        the simulator would refuse the quote anyway, and stamping a synthetic one is
+        how a fabricated price path gets in.
+
+        ``observed_at`` is the BOOK's own timestamp where available, not
+        ``decision_time``. That distinction is the temporal leak defence — using the
+        cycle clock for a book received earlier would let a plan signalled this cycle
+        treat an older book as post-signal data.
+        """
+        quotes: dict[str, dict[str, Any]] = {}
+        for symbol in candidates:
+            # Reuses the engine's own book accessor, so shadow evaluation sees exactly
+            # the book the order path would have seen — a second lookup could disagree
+            # and make shadow results unreproducible live.
+            orderbook = self._latest_orderbook(symbol)
+            if orderbook is None:
+                continue
+            bid = float(getattr(orderbook, "best_bid", 0.0) or 0.0)
+            ask = float(getattr(orderbook, "best_ask", 0.0) or 0.0)
+            if bid <= 0 or ask < bid:
+                continue
+            received_at = getattr(orderbook, "received_at", None)
+            observed_at = (
+                received_at
+                if isinstance(received_at, datetime)
+                else decision_time
+            )
+            if observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
+            quotes[str(symbol).upper()] = {
+                "bid_price": bid,
+                "ask_price": ask,
+                "observed_at": observed_at,
+            }
+        return quotes
+
+    def _maybe_evaluate_promotions(
+        self, service: Any, decision_time: datetime
+    ) -> list[dict[str, Any]] | None:
+        """Re-evaluate deployment states, at most once per configured interval.
+
+        Rate-limited because it is a multi-table read per arm and the trading loop runs
+        every second, while the ladder's own config asks for 300s. Returns ``None`` when
+        the interval has not elapsed.
+        """
+        from app.trading.short_strategy_promotion import default_promotion_controller
+
+        controller = default_promotion_controller()
+        interval = max(30, int(controller.config.evaluation_interval_seconds))
+        last = getattr(self, "_last_promotion_eval_at", None)
+        if last is not None and (decision_time - last).total_seconds() < interval:
+            return None
+        self._last_promotion_eval_at = decision_time
+        from app.trading.short_strategy_promotion import RuntimeHealth
+
+        health = RuntimeHealth(
+            # Model calibration is a SEPARATE precondition and is not asserted here;
+            # it stays False until the directional GNN head exists, which keeps every
+            # arm blocked at the MODEL_NOT_CALIBRATED gate. That is the honest state.
+            model_calibrated=False,
+            short_rescue_rate=service.short_rescue_rate,
+            change_point_probability=float(
+                getattr(self, "_last_change_point_probability", 0.0) or 0.0
+            ),
+        )
+        decisions = controller.evaluate_all(health=health, now=decision_time)
+        return [
+            item.as_dict()
+            for item in decisions
+            if item.changed or item.failed_gates
+        ][:8]
 
     def _in_cooldown(self, symbol: str) -> bool:
         now = time.monotonic()

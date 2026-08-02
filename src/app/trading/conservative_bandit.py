@@ -46,10 +46,17 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
+from app.trading.directional import (
+    DirectionalStrategyKey,
+    ExecutionProduct,
+    PositionDirection,
+    ShortReasonCodes,
+    StrategyDeploymentState,
+)
 from app.trading.strategy_performance_store import (
     NO_TRADE_ARM,
     StrategyPerformanceStore,
@@ -59,6 +66,17 @@ from app.trading.strategy_performance_store import (
     normalize_market,
     normalize_regime,
 )
+
+# Macro regimes in which a directional SHORT is fighting the tape. Kept as a small
+# explicit set rather than a substring test so a new regime name is a deliberate
+# addition instead of an accidental match.
+_SHORT_UNFAVOURABLE_REGIMES: frozenset[str] = frozenset(
+    {"TREND_UP", "STRONG_TREND_UP", "HIGH_VOL_TRENDING_UP", "RISK_ON", "BULL"}
+)
+
+
+def _regime_opposes_short(macro_regime: str | None) -> bool:
+    return normalize_regime(macro_regime) in _SHORT_UNFAVOURABLE_REGIMES
 
 # --- Reason codes ----------------------------------------------------------- #
 BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE = "BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE"
@@ -75,6 +93,9 @@ BANDIT_ARM_MEASURED_NEGATIVE_EDGE = "BANDIT_ARM_MEASURED_NEGATIVE_EDGE"
 BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS = (
     "BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS"
 )
+BANDIT_SHORT_DIRECTION_PENALTY_APPLIED = "BANDIT_SHORT_DIRECTION_PENALTY_APPLIED"
+BANDIT_SHORT_AGAINST_REGIME_PENALTY = "BANDIT_SHORT_AGAINST_REGIME_PENALTY"
+BANDIT_BOTH_DIRECTIONS_NEGATIVE = ShortReasonCodes.BOTH_DIRECTIONS_NEGATIVE
 
 
 def _env_float(name: str, default: float) -> float:
@@ -134,7 +155,14 @@ class BanditContext:
 
 @dataclass(frozen=True)
 class ArmCandidate:
-    """One strategy the electing layer considers admissible on other grounds."""
+    """One strategy the electing layer considers admissible on other grounds.
+
+    ``arm`` remains the plain strategy id for backward compatibility, but the
+    posterior is looked up by :attr:`key` — the full
+    :class:`~app.trading.directional.DirectionalStrategyKey`. LONG and SHORT arms of
+    the same strategy therefore compete against each other, and against
+    ``no_trade``, from SEPARATE realized histories.
+    """
 
     arm: str
     symbol: str = ""
@@ -147,6 +175,55 @@ class ArmCandidate:
     live_authorized: bool = True
     reason_codes: tuple[str, ...] = ()
     payload: Mapping[str, Any] = field(default_factory=dict)
+    # --- Direction ---------------------------------------------------------- #
+    direction: PositionDirection = PositionDirection.LONG
+    execution_product: ExecutionProduct = ExecutionProduct.CASH
+    # Committed deployment state of this arm. SHADOW means the arm may be RANKED and
+    # reported but never becomes an executable candidate — it appears in
+    # ``shadow_arms``, not as the selection.
+    #
+    # ``None`` resolves per DIRECTION in ``__post_init__``, and that asymmetry is the
+    # point. A flat SHADOW default would have silently made every existing LONG caller
+    # (which does not pass this field) unselectable — the long path's gate has always
+    # been ``live_authorized``, and it still is. A flat LIVE_FULL default would have
+    # made an unevaluated SHORT tradable. So: LONG defaults open and keeps its
+    # existing gate, SHORT defaults closed.
+    deployment_state: StrategyDeploymentState | None = None
+    # Borrow verdict for a SHORT candidate, resolved by the caller from a fresh
+    # snapshot. ``None`` on a short arm means "not established", which is refused.
+    borrow_available: bool | None = None
+    borrow_fee_bps_annualised: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.deployment_state is None:
+            object.__setattr__(
+                self,
+                "deployment_state",
+                StrategyDeploymentState.SHADOW
+                if self.direction is PositionDirection.SHORT
+                else StrategyDeploymentState.LIVE_FULL,
+            )
+
+    @property
+    def is_short(self) -> bool:
+        return self.direction is PositionDirection.SHORT
+
+    def directional_key(self, market: str) -> DirectionalStrategyKey:
+        return DirectionalStrategyKey(
+            strategy_id=self.arm,
+            direction=self.direction,
+            market=market,
+            execution_product=self.execution_product,
+        )
+
+    @property
+    def display_arm(self) -> str:
+        """``strategy_id:DIRECTION`` for a short, bare id for a long.
+
+        Longs keep their historical label so existing dashboards, reason strings and
+        stored session state are unaffected by the addition of shorts.
+        """
+        return self.arm if self.direction is PositionDirection.LONG else f"{self.arm}:SHORT"
 
 
 @dataclass(frozen=True)
@@ -166,12 +243,20 @@ class ArmEvaluation:
     shadow_only: bool
     reason_codes: tuple[str, ...]
     exploration: bool = False
+    direction: str = "LONG"
+    execution_product: str = "CASH"
+    deployment_state: str = "SHADOW"
+    borrow_available: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "arm": self.arm,
             "exploration": self.exploration,
             "symbol": self.symbol,
+            "direction": self.direction,
+            "execution_product": self.execution_product,
+            "deployment_state": self.deployment_state,
+            "borrow_available": self.borrow_available,
             "conservative_edge_bps": round(self.conservative_edge_bps, 3),
             "posterior_mean_net_bps": round(self.posterior_mean_net_bps, 3),
             "uncertainty_penalty_bps": round(self.uncertainty_penalty_bps, 3),
@@ -201,20 +286,73 @@ class BanditSelection:
     # True when the winning arm was selected to LEARN, not because it has a
     # demonstrated edge. Sizing should treat it as a minimum-size probe.
     is_exploration: bool = False
+    selected_direction: str = "LONG"
+
+    # --- LONG vs SHORT vs NO_TRADE ------------------------------------------- #
+    # Recorded on every selection, whether or not a short was selectable. Without
+    # this the question "would a short have helped here?" is unanswerable after the
+    # fact, and it is the question the whole short programme has to justify itself
+    # against: adding arms that only ever fire alongside a better long buys nothing
+    # but exposure. It also supplies ``short_rescue_rate`` to the promotion gates.
+    @property
+    def best_long_edge_bps(self) -> float | None:
+        return _best_edge(self.evaluations, "LONG")
+
+    @property
+    def best_short_edge_bps(self) -> float | None:
+        return _best_edge(self.evaluations, "SHORT")
+
+    @property
+    def short_rescued(self) -> bool:
+        """No long had a positive edge, but a short did."""
+        long_edge = self.best_long_edge_bps
+        short_edge = self.best_short_edge_bps
+        if short_edge is None or short_edge <= 0.0:
+            return False
+        return long_edge is None or long_edge <= 0.0
+
+    @property
+    def both_directions_negative(self) -> bool:
+        long_edge = self.best_long_edge_bps
+        short_edge = self.best_short_edge_bps
+        return (long_edge is None or long_edge <= 0.0) and (
+            short_edge is None or short_edge <= 0.0
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "timestamp": self.timestamp.isoformat(),
             "selected_arm": self.selected_arm,
             "selected_symbol": self.selected_symbol,
+            "selected_direction": self.selected_direction,
             "conservative_edge_bps": round(self.conservative_edge_bps, 3),
             "is_no_trade": self.is_no_trade,
             "is_exploration": self.is_exploration,
             "shadow_arms": list(self.shadow_arms),
             "context": self.context.as_dict(),
             "reason_codes": list(self.reason_codes),
+            "directional_comparison": {
+                "best_long_conservative_edge_bps": self.best_long_edge_bps,
+                "best_short_conservative_edge_bps": self.best_short_edge_bps,
+                "short_rescued": self.short_rescued,
+                "both_directions_negative": self.both_directions_negative,
+            },
             "evaluations": [item.as_dict() for item in self.evaluations],
         }
+
+
+def _best_edge(evaluations: Sequence[ArmEvaluation], direction: str) -> float | None:
+    """Highest conservative edge among arms of one direction, or ``None``.
+
+    Deliberately ignores admissibility. The question is "did this direction have an
+    edge", not "was it tradable" — a short that was blocked only by its deployment
+    state still shows what shorting WOULD have offered, which is exactly the
+    evidence the promotion ladder needs in order to ever unblock it.
+    """
+    edges = [
+        item.conservative_edge_bps for item in evaluations if item.direction == direction
+    ]
+    return max(edges) if edges else None
 
 
 @dataclass(frozen=True)
@@ -254,6 +392,17 @@ class BanditConfig:
     cold_start_exploration_enabled: bool = True
     cold_start_max_sample_count: int = 3
     cold_start_min_predicted_edge_bps: float = 5.0
+    # --- Direction penalties (bps) ---------------------------------------------
+    # Charged to SHORT arms on top of the statistical and context penalties, to
+    # cover the asymmetry the realized posterior cannot see: an unbounded and
+    # ACCELERATING downside (the position grows as it moves against you), and the
+    # possibility of a forced cover on recall. Expressed as pessimism rather than as
+    # cost so the cost engine cannot double-count it as a fee.
+    short_direction_penalty_bps: float = 10.0
+    # Additional charge for shorting into a rising broad market. A penalty and not a
+    # veto: a beta-neutral thesis is legitimately valid in an up tape, and a hard
+    # block would remove precisely the short worth keeping.
+    short_against_regime_penalty_bps: float = 15.0
 
     @classmethod
     def from_env(cls) -> "BanditConfig":
@@ -301,6 +450,19 @@ class BanditConfig:
             cold_start_min_predicted_edge_bps=_env_float(
                 "BANDIT_COLD_START_MIN_PREDICTED_EDGE_BPS",
                 cls.cold_start_min_predicted_edge_bps,
+            ),
+            short_direction_penalty_bps=max(
+                0.0,
+                _env_float(
+                    "BANDIT_SHORT_DIRECTION_PENALTY_BPS", cls.short_direction_penalty_bps
+                ),
+            ),
+            short_against_regime_penalty_bps=max(
+                0.0,
+                _env_float(
+                    "BANDIT_SHORT_AGAINST_REGIME_PENALTY_BPS",
+                    cls.short_against_regime_penalty_bps,
+                ),
             ),
         )
 
@@ -374,7 +536,7 @@ class ConservativeStrategyBandit:
         shadow = tuple(item.arm for item in evaluations if item.shadow_only)
         if best is None:
             reasons.append(BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE)
-            return BanditSelection(
+            no_trade = BanditSelection(
                 selected_arm=NO_TRADE_ARM,
                 selected_symbol="",
                 conservative_edge_bps=0.0,
@@ -385,12 +547,20 @@ class ConservativeStrategyBandit:
                 reason_codes=tuple(dict.fromkeys(reasons)),
                 timestamp=moment,
             )
+            if no_trade.both_directions_negative:
+                # Distinguishes "we looked both ways and neither paid" from "we only
+                # had one direction to look". The first is a finding; the second is a
+                # coverage gap.
+                reasons.append(BANDIT_BOTH_DIRECTIONS_NEGATIVE)
+                return replace(no_trade, reason_codes=tuple(dict.fromkeys(reasons)))
+            return no_trade
         reasons.append(BANDIT_ARM_SELECTED)
         if best.exploration:
             reasons.append(BANDIT_EXPLORATION_ARM_SELECTED)
         return BanditSelection(
             selected_arm=best.arm,
             selected_symbol=best.symbol,
+            selected_direction=best.direction,
             conservative_edge_bps=best.conservative_edge_bps,
             is_no_trade=False,
             is_exploration=best.exploration,
@@ -422,11 +592,17 @@ class ConservativeStrategyBandit:
             else normalize_market(context.market)
         )
         regime = normalize_regime(context.macro_regime)
+        # Posterior is looked up per DIRECTION. Pooling the two would mean a strategy
+        # pair making 60bps long and losing 60bps short reads as break-even — and
+        # therefore as permanently untradable in both directions — while a genuine
+        # one-sided edge is diluted into invisibility.
         posterior: StrategyPosterior = self.store.posterior(
             candidate.arm,
             market=market,
             regime=regime,
             change_point_probability=change_point,
+            direction=str(candidate.direction),
+            execution_product=str(candidate.execution_product),
         )
         reasons.extend(posterior.reason_codes)
 
@@ -470,6 +646,22 @@ class ConservativeStrategyBandit:
             reasons.append(BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS)
 
         penalty = posterior.uncertainty_penalty_bps + context_penalty
+        # A short pays an accruing borrow fee and a wider expected exit slippage than
+        # a long, and neither is in the realized posterior of a SHADOW arm whose
+        # simulated fills already deducted them once. The directional penalty covers
+        # the residual asymmetry the posterior cannot see: an unbounded, accelerating
+        # downside, and recall risk. Charged as pessimism rather than as cost so it
+        # cannot be mistaken for a fee and double-counted by the cost engine.
+        if candidate.is_short:
+            penalty += cfg.short_direction_penalty_bps
+            reasons.append(BANDIT_SHORT_DIRECTION_PENALTY_APPLIED)
+            # Shorting into a rising, broad market is fighting the tape. Charged
+            # here rather than vetoed, because a beta-neutral short thesis
+            # (residual_relative_weakness) is legitimately valid in an up market and
+            # a hard block would remove exactly the arm worth keeping.
+            if _regime_opposes_short(context.macro_regime):
+                penalty += cfg.short_against_regime_penalty_bps
+                reasons.append(BANDIT_SHORT_AGAINST_REGIME_PENALTY)
         conservative = blended_mean - penalty
 
         # An arm is "cold" while its realized history is too short to have
@@ -488,6 +680,33 @@ class ConservativeStrategyBandit:
 
         admissible = True
         shadow_only = False
+        # --- Deployment authorisation ---------------------------------------- #
+        # Checked BEFORE anything about edge, and it is not a penalty. An arm that is
+        # not deployment-authorised is not a worse trade, it is not a candidate: the
+        # whole point of the SHADOW rung is that the arm keeps being evaluated and
+        # journaled while being structurally incapable of producing an order. Setting
+        # ``exploration = False`` alongside matters — cold-start exploration exists to
+        # let an unproven arm be tried at minimum size, and a SHADOW short must not
+        # be reachable through that door either.
+        if not candidate.deployment_state.submits_orders:
+            admissible = False
+            exploration_blocked = True
+            shadow_only = True
+            reasons.append(
+                ShortReasonCodes.DEPLOYMENT_SUSPENDED
+                if candidate.deployment_state is StrategyDeploymentState.SUSPENDED
+                else ShortReasonCodes.SHADOW_ONLY
+            )
+        else:
+            exploration_blocked = False
+        # A short with no established locate cannot be executed regardless of edge.
+        # ``None`` (nobody asked) is treated exactly like False, because at order time
+        # the two are the same thing.
+        if candidate.is_short and candidate.borrow_available is not True:
+            admissible = False
+            exploration_blocked = True
+            shadow_only = True
+            reasons.append(ShortReasonCodes.BORROW_UNAVAILABLE)
         if candidate.macro_permitted is False:
             admissible = False
             reasons.append(BANDIT_ARM_NOT_MACRO_PERMITTED)
@@ -521,9 +740,13 @@ class ConservativeStrategyBandit:
             exploration = False
 
         return ArmEvaluation(
-            arm=candidate.arm,
+            arm=candidate.display_arm,
             symbol=candidate.symbol,
             conservative_edge_bps=conservative,
+            direction=str(candidate.direction),
+            execution_product=str(candidate.execution_product),
+            deployment_state=str(candidate.deployment_state),
+            borrow_available=candidate.borrow_available,
             posterior_mean_net_bps=blended_mean,
             uncertainty_penalty_bps=posterior.uncertainty_penalty_bps,
             context_penalty_bps=context_penalty,
@@ -535,7 +758,7 @@ class ConservativeStrategyBandit:
             admissible=admissible,
             shadow_only=shadow_only and not admissible,
             reason_codes=tuple(dict.fromkeys(reasons)),
-            exploration=exploration and admissible,
+            exploration=exploration and admissible and not exploration_blocked,
         )
 
     def _context_penalty(self, context: BanditContext) -> float:

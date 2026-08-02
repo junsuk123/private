@@ -51,6 +51,56 @@ class CounterfactualLabel:
     cost_bps: float
     exit_reason: str
     features: tuple[float, ...] = ()
+    # --- Direction and borrow --------------------------------------------- #
+    # ``net_return_bps`` is direction-SIGNED (see ``directional.gross_return_bps``),
+    # so a short whose price fell carries a positive label. The sign is applied once,
+    # at label construction; nothing downstream re-applies it.
+    #
+    # A short label is NEVER produced by negating a long label. The two differ by more
+    # than a sign: a short pays an accruing borrow fee, sells the bid and covers the
+    # ask (not the reverse), and can be recalled mid-horizon. Negation would train the
+    # model on a cost structure that does not exist.
+    direction: str = "LONG"
+    execution_product: str = "CASH"
+    borrow_available: bool | None = None
+    borrow_quantity: int | None = None
+    borrow_fee_bps_annualised: float | None = None
+    borrow_cost_bps: float = 0.0
+    # False when 대주 was unavailable at signal time. Such rows are kept for
+    # signal-quality analysis and EXCLUDED from training and promotion: a strategy may
+    # not be judged on trades it could not have taken.
+    short_restriction_passed: bool = True
+    # Both timestamps are stored because the gap between them IS the leak surface. A
+    # borrow observed after the feature snapshot is future information relative to the
+    # decision, and a label built on it is unachievable live.
+    borrow_observed_at: datetime | None = None
+    feature_snapshot_at: datetime | None = None
+    # Partial fills. A label whose fill ratio is below 1 describes a smaller position
+    # than the strategy asked for, and the unfilled remainder earns nothing.
+    fill_ratio: float = 1.0
+
+    @property
+    def is_short(self) -> bool:
+        return str(self.direction or "LONG").upper() == "SHORT"
+
+    @property
+    def usable_for_training(self) -> bool:
+        """Executable AND leak-free.
+
+        A label is dropped when the borrow observation post-dates the feature
+        snapshot: that ordering means the label knows something the live decision
+        could not have known.
+        """
+        if not self.short_restriction_passed:
+            return False
+        if self.borrow_observed_at is not None and self.feature_snapshot_at is not None:
+            if self.borrow_observed_at > self.feature_snapshot_at:
+                return False
+        return True
+
+    @property
+    def all_in_cost_bps(self) -> float:
+        return float(self.cost_bps) + float(self.borrow_cost_bps)
 
 
 @dataclass(frozen=True)

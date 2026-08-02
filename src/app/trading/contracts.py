@@ -209,11 +209,35 @@ class TradePlan:
     expires_at: datetime
     feature_snapshot_id: str
     utility_evidence_id: str
+    # ``side`` is retained as the broker-facing BUY/SELL, but it is no longer the
+    # plan's meaning: direction and effect are. Kept rather than replaced so
+    # existing readers of ``side`` keep working, and validated below so the two
+    # can never disagree — a plan whose ``side`` contradicts its
+    # (direction, effect) pair is the ambiguity this split exists to remove.
+    position_direction: str = "LONG"
+    position_effect: str = "OPEN"
+    execution_product: str = "CASH"
+    # Deployment state of the owning arm at the moment the plan was formed. A plan
+    # carrying SHADOW must never reach an order submitter; the submitter re-reads
+    # the authoritative state anyway, so this is an audit record of what the
+    # planner believed, not the permission itself.
+    deployment_state: str = "SHADOW"
 
     def __post_init__(self) -> None:
         _require_aware(self.expires_at, "expires_at")
         if self.proposed_quantity <= 0 or self.max_holding_seconds <= 0:
             raise ValueError("trade plan quantity and holding period must be positive")
+        from app.trading.directional import broker_side, parse_direction, parse_effect
+
+        expected = broker_side(
+            parse_direction(self.position_direction), parse_effect(self.position_effect)
+        )
+        actual = str(self.side or "").strip().upper()
+        if actual and actual != expected:
+            raise ValueError(
+                f"trade plan side {actual} contradicts "
+                f"{self.position_direction}/{self.position_effect} (expected {expected})"
+            )
 
 
 class IntentAction(StrEnum):
@@ -293,6 +317,14 @@ class BrokerOrder:
     quantity: int
     submitted_at: datetime
     status: str
+    position_direction: str = "LONG"
+    position_effect: str = "OPEN"
+    execution_product: str = "CASH"
+    # What the BROKER said the credit classification was. Reconciliation compares
+    # this against the internal contract; a mismatch means the order we believe we
+    # placed is not the order that exists, which suspends the strategy.
+    broker_credit_type: str | None = None
+    loan_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -317,6 +349,14 @@ class Fill:
     event_time: datetime
     fees: float = 0.0
     taxes: float = 0.0
+    position_direction: str = "LONG"
+    position_effect: str = "OPEN"
+    execution_product: str = "CASH"
+    loan_date: str | None = None
+    # Borrow fee accrued on this leg, in currency. Separate from ``fees`` because
+    # it is time-dependent rather than per-execution, and the promotion evaluator
+    # has to attribute it to the holding period.
+    borrow_fee: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -329,6 +369,23 @@ class Position:
     strategy_instance_id: str
     opened_at: datetime
     realized_pnl: float = 0.0
+    direction: str = "LONG"
+    execution_product: str = "CASH"
+    # One lot per (symbol, loan_date). The broker treats borrows opened on
+    # different dates as distinct positions with distinct repayment obligations, so
+    # netting them internally would produce a buy-to-cover the broker rejects.
+    loan_date: str | None = None
+    borrow_fee_rate: float | None = None
+    return_deadline: datetime | None = None
+
+    @property
+    def is_short(self) -> bool:
+        return str(self.direction or "LONG").upper() == "SHORT"
+
+    @property
+    def lot_key(self) -> tuple[str, str, str]:
+        """Identity used for reconciliation against broker state."""
+        return (self.symbol, str(self.direction or "LONG").upper(), self.loan_date or "")
 
 
 class StrategyLifecycleStatus(StrEnum):

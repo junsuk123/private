@@ -357,18 +357,21 @@ def test_ofi_exhaustion_needs_an_actual_selloff():
     assert "OFI_EXHAUSTION_NO_SELLOFF" in decision.reason_codes
 
 
-def test_ofi_exhaustion_has_the_shortest_thesis_driven_holding_window():
-    """Shortest among theses whose horizon is set by the THESIS.
+# Horizons set by SESSION STRUCTURE rather than by how long the edge persists.
+# Both legs of the market-intraday-momentum thesis are entered in the last continuous
+# half-hour and must be flat before the 15:20 KRX closing auction, so their 1500s is a
+# deadline, not a claim about decay speed.
+_SESSION_BOXED_STRATEGIES = frozenset(
+    {"market_intraday_momentum", "market_intraday_momentum_short"}
+)
 
-    ``market_intraday_momentum`` is excluded because its horizon is set by session
-    structure, not by how long its edge persists: it is entered in the last
-    continuous half-hour and must be flat before the 15:20 KRX closing auction, so
-    1500s is a deadline rather than a claim about decay speed.
-    """
+
+def test_ofi_exhaustion_has_the_shortest_thesis_driven_holding_window():
+    """Shortest among theses whose horizon is set by the THESIS."""
     holding = {
         strategy_id: max_holding_seconds(strategy_id)
         for strategy_id in STRATEGY_IDS
-        if strategy_id != "market_intraday_momentum"
+        if strategy_id not in _SESSION_BOXED_STRATEGIES
     }
     assert holding["ofi_microprice_exhaustion_reversal"] == min(holding.values())
 

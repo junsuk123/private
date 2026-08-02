@@ -65,7 +65,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from app.strategy.catalog import STRATEGY_IDS
+from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
 
 # Fallback used for an unknown / adopted-position "strategy". Deliberately tight:
 # an unidentified thesis gets the least rope, not the most.
@@ -75,6 +75,18 @@ FALLBACK_GEOMETRY_KEY = "__fallback__"
 # (KRX). Measured from the shadow checkpoint's simulated fills, where it is a
 # flat per-fill constant. US fills model at 67bps; see the module docstring.
 REFERENCE_ROUND_TRIP_COST_BPS = 28.0
+
+# Reference all-in cost of a SHORT round trip on the same venue: the 28bps cash
+# round trip plus the borrow fee accrued over an intraday hold. The borrow
+# component is the reference used for *geometry sizing only* — the authoritative
+# per-order figure comes from the live borrow snapshot via
+# ``app.cost.trading_cost_engine`` and is never replaced by this constant.
+#
+# 8bps covers a KIS 대주 rate in the high single digits annualised held for a few
+# hours (10%/yr ~= 4bps/day), with room for the borrow-uncertainty buffer. A short
+# whose expected move cannot clear this is not a trade.
+SHORT_BORROW_REFERENCE_BPS = 8.0
+SHORT_REFERENCE_ROUND_TRIP_COST_BPS = REFERENCE_ROUND_TRIP_COST_BPS + SHORT_BORROW_REFERENCE_BPS
 
 # Target reward:risk measured *after* cost is paid on both sides.
 TARGET_NET_REWARD_RISK = 1.5
@@ -169,6 +181,38 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     # the table's standard 60/160 so the net reward:risk invariant still holds if the
     # move arrives early, but the time stop is the intended exit.
     "market_intraday_momentum": (60.0, 160.0, 30.0, 1500),
+    # --- SHORT theses -------------------------------------------------------- #
+    # The asymmetry here runs the OPPOSITE way to intuition, and it is worth
+    # stating plainly because the first draft of this table got it backwards.
+    #
+    # "A short is riskier, so give it a tighter target" is wrong arithmetic. Cost
+    # is additive against BOTH barriers (see ``net_reward_risk_ratio``), and a
+    # short's all-in cost is strictly higher than a long's: the same 28bps KRX
+    # round trip PLUS an accruing borrow fee. Shrinking the target while the cost
+    # rises compresses net reward:risk from both ends — a 130bps target at 60bps
+    # stop nets 1.16, below the 1.5 the whole table is built on. The risk would
+    # have been paid for with a *worse* payoff.
+    #
+    # The correct response to a higher cost floor is a LARGER target, so each
+    # short target is sized against ``SHORT_REFERENCE_ROUND_TRIP_COST_BPS``
+    # (= KRX round trip + intraday borrow) rather than the long reference. Stops
+    # stay at the 60bps floor: going tighter would be stopped out by bid-ask
+    # bounce, which is the exact mistake the long table already made once.
+    #
+    # What *does* tighten for a short is TIME. A long's loss is bounded at -100%;
+    # a short's is unbounded and accelerates, because the position grows as it
+    # moves against you. Borrow fee accrues for as long as it is held, and the
+    # lender can recall without notice. So holding time is a cost and a hazard
+    # rather than a free option, and every horizon below is shorter than its long
+    # counterpart's. None of them may be carried overnight — that is enforced in
+    # ``config/short_risk_policy.yaml``, not here.
+    #
+    # market_intraday_momentum_short keeps its counterpart's 1500s because the
+    # horizon is session structure (last continuous half-hour, flat before the
+    # 15:20 auction), not a free parameter.
+    "market_intraday_momentum_short": (60.0, 180.0, 30.0, 1500),
+    "opening_range_breakdown": (60.0, 180.0, 30.0, 3600),
+    "residual_relative_weakness": (65.0, 190.0, 32.0, 2700),
     # Unknown / adopted position. It gets the tightest admissible stop and the
     # shortest leash — but its target must still clear cost, which the previous
     # 40bps value did not: it was below the 28bps round trip plus any spread.
@@ -202,6 +246,18 @@ def exit_geometry(strategy_id: str | None) -> StrategyExitGeometry:
             30, int(_override(resolved_key, "max_holding_seconds", float(holding)))
         ),
     )
+
+
+def reference_round_trip_cost_bps(strategy_id: str | None) -> float:
+    """All-in round-trip cost this strategy's geometry was sized against.
+
+    Short theses carry the borrow leg, so asserting the net reward:risk invariant
+    at the long reference would understate their cost and let a target through
+    that does not actually compound.
+    """
+    if is_short_strategy(str(strategy_id or "").strip().lower()):
+        return SHORT_REFERENCE_ROUND_TRIP_COST_BPS
+    return REFERENCE_ROUND_TRIP_COST_BPS
 
 
 def exit_bps(strategy_id: str | None) -> tuple[float, float, float]:

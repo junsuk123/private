@@ -395,6 +395,73 @@ class FredMacroCollector:
             source=source,
         )
 
+    def collect_history(
+        self, series_id: str, name: str, *, limit: int = 120
+    ) -> tuple[MacroMetricRecord, ...]:
+        """Every recent observation, not just the newest one.
+
+        ``collect_latest`` fetches a batch and then returns the FIRST valid row, so
+        each collection cycle persisted exactly one point per series. Measured
+        consequence: the whole macro store held 12 rows across 6 series, which
+        cannot express a trend or a weekend change — two observations is the minimum
+        for a delta and several series had one.
+
+        Records are keyed by ``name:observed_at`` downstream, so replaying history is
+        idempotent and safe to run repeatedly.
+        """
+        rows: list[tuple[str, str]] = []
+        if self.api_key:
+            payload = self.client.get_json(
+                "https://api.stlouisfed.org/fred/series/observations",
+                {
+                    "series_id": series_id,
+                    "api_key": self.api_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": max(1, int(limit)),
+                },
+            )
+            rows = [
+                (str(item.get("date") or ""), str(item.get("value") or ""))
+                for item in payload.get("observations", [])
+            ]
+            raw_url = "https://api.stlouisfed.org/fred/series/observations"
+            source_name = "fred"
+        else:
+            csv_rows = self.client.get_csv_rows(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv",
+                {"id": series_id},
+            )
+            rows = [
+                (
+                    str(item.get("observation_date") or item.get("DATE") or ""),
+                    str(item.get(series_id) or ""),
+                )
+                for item in reversed(csv_rows)
+            ][: max(1, int(limit))]
+            raw_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+            source_name = "fred_public_csv"
+
+        source = source_now(source_name, raw_url, f"fred:{series_id}")
+        records: list[MacroMetricRecord] = []
+        for candidate_date, candidate_value in rows:
+            if not candidate_date or candidate_value in {"", "."}:
+                continue
+            try:
+                observed_at = datetime.fromisoformat(candidate_date).replace(
+                    tzinfo=timezone.utc
+                )
+                value = float(candidate_value)
+            except (TypeError, ValueError):
+                continue
+            records.append(
+                MacroMetricRecord(
+                    name=name, value=value, observed_at=observed_at, source=source
+                )
+            )
+        records.sort(key=lambda record: record.observed_at)
+        return tuple(records)
+
 
 class EcosMacroCollector:
     def __init__(self, api_key: str | None = None, client: HttpClient | None = None) -> None:

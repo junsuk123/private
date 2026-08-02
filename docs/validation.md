@@ -14,6 +14,15 @@
 | GNN 실시간 진입 권한 | 전략별 조건부 | `/api/gnn/realtime-trust`의 `trusted_strategy_ids`; 모델 보정과 진입 권한 분리 |
 | NPU 추론 | 컴파일 성공, **승격 거부** | `data/reports/strategy_utility_openvino.json`, `promotion_eligible=false` |
 | legacy vs ontology vs tabular vs R-GCN 비교 | **미완** | 필요한 point-in-time 데이터 부재 |
+| 숏 전략 3개 (방향 계약·대주 회계·shadow 평가) | 코드 적용, **전량 `SHADOW`** | `tests/test_directional_short_ladder.py` (76건), 실주문 권한 0개 |
+| 숏 배포 사다리 (자동 승격/강등 상태 머신) | 프로덕션 적용, 아직 승격 사례 없음 | `data/store/strategy-deployment.sqlite3`, `promotion_audit` |
+| 숏 forward 성과 | **미측정** | forward 표본 0. 최소 20 거래일 필요 |
+| KIS 대주 조회 TR | **실계좌 검증 완료 — 추측한 3개 전부 오류** | 융자 응답 / 없는 TR / 404. `BorrowDataSource`로 교체 |
+| 대주 잔고 조회 | **검증된 경로로 이전** | 프로덕션이 이미 쓰는 `inquire-balance` 재사용 |
+| GNN 대주 채널 (8→11) | 구현, **미학습** | 라벨이 forward 표본에서 나와야 함 |
+| 스퀴즈 필터 | **비활성** | 공매도 잔고 소스 없음. 대주 게이트가 fail-closed 담당 |
+| KIS 대주 주문 경로 | mock transport 검증만 | 실주문 미제출 |
+| GNN 방향별 utility head | **미구현** | 숏 arm은 realized posterior + 규칙 신호로만 평가 |
 
 ## 2. 수익성 리팩터 리플레이
 
@@ -221,7 +230,22 @@ python -m pytest
 ```powershell
 python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
 python -m pytest tests/test_refactor_contracts.py tests/test_causal_order_journal.py tests/test_refactor_flags.py
+python -m pytest tests/test_directional_short_ladder.py
 ```
+
+### 숏 사다리 안전 속성 (`tests/test_directional_short_ladder.py`, 76건)
+
+각 테스트는 위반 시 **미검증 숏에 실자금이 들어가는** 규칙을 고정합니다.
+
+| 그룹 | 고정하는 것 |
+| --- | --- |
+| 방향 산술 | 숏 목표는 진입가 **아래**, 손절은 **위**. barrier 비교 부호. 워터마크는 최저가. 숏 목표가 롱보다 **크다**(비용이 높으므로) |
+| 주문 의미 | 롱 청산과 숏 진입이 둘 다 SELL이지만 다른 주문. `TradePlan`이 모순된 side 거부. `position_effect` 추론이 롱 청산을 진입으로 재분류하지 않음 |
+| 배포 게이팅 | 롱/숏 posterior 미합산. 이력 없는 숏이 롱 이력을 빌리지 않음. 실행 불가 신호가 승격 통계에 미포함. `SHADOW` arm은 +300bps 엣지에도 선택 불가 |
+| 전이 합법성 | `SHADOW→LIVE_FULL` 등 9개 금지 전이 도달 불가. 승격은 정확히 한 칸. `SUSPENDED`는 `SHADOW`로만 복구. YAML `initial_state` clamp. 저장 경계에서 재검사 |
+| 승격/강등 비대칭 | 연속 사이클 전량 필요. 실패 1회가 카운터 **리셋**(감소 아님). hard gate 하나로 차단. 강등은 첫 실패에 즉시. 즉시 중단 8종 |
+| 누수 방어 | `signal_at` 이하 quote 거부. bid 진입/ask 청산. 양 barrier 동시 통과 시 **손절**. 미래 timestamp snapshot 거부. 대주 안분이 연율 |
+| 회귀 | 숏은 append(인덱스 안정). `NO_TRADE` arm 유지. 롱 수익성 판정 불변. **롱 청산과 숏 상환 모두 게이트되지 않음** |
 
 ## 11. 아직 승격하지 않은 것 (명시)
 
@@ -229,5 +253,31 @@ python -m pytest tests/test_refactor_contracts.py tests/test_causal_order_journa
 - 이벤트 모멘텀·횡단면 상대강도·갭 전략은 필요한 point-in-time 사실이 없으면 closed-world로 차단됩니다.
 - `calibrated_strategy_ids`에 있다는 사실만으로 실거래 진입 권한을 주지 않습니다.
 - 대표성 있는 시장·regime별 out-of-sample alpha와 다중검정 보정 우월성은 아직 주장하지 않습니다.
+- **숏 전략 3개의 수익성은 어떤 형태로도 측정되지 않았습니다.** forward 표본이 0이며, 이것이
+  정상 상태입니다. `SHADOW → LIVE_PROBE`는 실행 가능 신호 120건 / 체결 60건 / 거래일 20일 /
+  종목 10개 / confidence 0.72 / 보수적 순엣지 8bps / cost coverage 1.7배 / holdout 3구간 /
+  연속 5사이클을 요구하므로 최소 한 달 이상 걸립니다.
+- 숏 백테스트 결과는 **의도적으로 만들지 않았습니다.** 과거 시점 대주 가능 여부 데이터가 없어
+  백테스트는 당시 대주 불가였던 종목을 숏 친 것으로 계산하는데, 대주 불가 종목은 정확히 가장 많이
+  하락하는 종목군이므로 편향이 크고 항상 유리한 방향입니다. 롱 결과의 부호 반전도 같은 이유로
+  금지입니다(비용 비대칭).
+- **추측한 KIS 대주 엔드포인트 3개를 실계좌 read-only로 전부 검증했고, 전부 틀렸습니다**
+  (2026-08-02): `TTTC8909R`은 융자 매수가능금액(질문이 다름), `CTSC0271R`은 없는 TR,
+  `CTRP6504R`은 404. 네 번째 추측 대신 가용성 조회를 `BorrowDataSource` 인터페이스 뒤로
+  옮겼고 기본값은 명시적 "소스 없음"입니다. **따라서 대주 저널이 비어 있어 숏은 shadow 표본을
+  쌓지 못합니다** — 사다리는 끝까지 배선되어 있으나 가동 중지 상태입니다.
+  `get_borrow_balance`는 프로덕션이 이미 쓰는 `inquire-balance`로 이전해 검증되었습니다.
+- **GNN 대주 채널(8→11)은 구현되었으나 학습되지 않았습니다.** 새 채널의 라벨(실현 대주 비용,
+  실현 locate 성공률)이 forward 표본에서 나와야 하는데 그 표본이 0입니다.
+  `model_calibrated=False`가 고정되어 모든 arm이 그 게이트에서 막힙니다.
+- **스퀴즈 필터가 비활성입니다.** KRX 공매도 잔고를 수집하는 곳이 없고, 저장소 내 유일한
+  `short_net_change`는 합성 데모 파이프라인 값이라 리스크 측정에 쓸 수 없습니다.
+  `max_days_to_cover` / `max_short_interest_ratio` 게이트는 무조건 통과하며, 이 방어 심도
+  감소는 `/api/short-strategies/status`의 `indicator_gaps`로 보고됩니다.
+- `short_rescue_rate`는 `RealtimeTradingEngine._run_short_cycle`에서 집계·주입되도록 배선을
+  완료했습니다. 값이 없으면 `None`이 되어 **승격을 차단**하므로 실패 방향은 안전합니다.
+- 숏 보조 지표 중 `spread_bps` / `liquidity_score` / `market_alignment`는
+  `app.features.short_indicators`가 계산합니다. `short_interest_ratio` / `days_to_cover`는
+  소스가 없어 미측정이며, 그 사실이 명시적으로 보고됩니다.
 
-CPU GNN은 실시간 판단에 연결되어 있지만, 각 전략의 신규 진입 권한은 live forward 증거에 따라 자동으로 부여되거나 회수됩니다.
+CPU GNN은 실시간 판단에 연결되어 있지만, 각 전략의 신규 진입 권한은 live forward 증거에 따라 자동으로 부여되거나 회수됩니다. 숏 arm의 권한은 이와 **별도로** arm별 배포 상태에서 관리됩니다 — 상세는 [short_selling_deployment.md](short_selling_deployment.md).

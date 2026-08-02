@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from app.cost.cost_coverage import evaluate_cost_coverage
 from app.routing.actions import is_actionable_strategy_route
-from app.strategy.catalog import is_known_strategy
+from app.strategy.catalog import is_known_strategy, is_short_strategy, resolve_strategy_id
 from app.strategy.exit_geometry import FALLBACK_GEOMETRY_KEY
 from app.strategy.exit_geometry import exit_bps as _strategy_exit_bps
 from app.strategy.exit_geometry import exit_geometry as _exit_geometry
@@ -30,7 +30,29 @@ from app.trading.conservative_bandit import (
     BanditContext,
     ConservativeStrategyBandit,
 )
+from app.trading.directional import (
+    DirectionalStrategyKey,
+    ExecutionProduct,
+    PositionDirection,
+    PositionEffect,
+    ShortReasonCodes,
+    StrategyDeploymentState,
+    default_product,
+    favourable_watermark,
+    parse_state,
+    gross_return_bps as _directional_gross_bps,
+    parse_direction,
+    stop_breached,
+    stop_price as _directional_stop_price,
+    target_price as _directional_target_price,
+    target_reached,
+    trailing_breached,
+    trailing_price as _directional_trailing_price,
+)
 from app.trading.strategy_performance_store import (
+    EVALUATION_SOURCE_LIVE,
+    EVALUATION_SOURCE_LIVE_PROBE,
+    EVALUATION_SOURCE_SHADOW,
     StrategyPerformanceStore,
     default_store as _default_performance_store,
     market_for_symbol,
@@ -79,6 +101,35 @@ def _cost_aware_profit_bps(
 
 def _iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat() if value is not None else None
+
+
+_KST = timezone(timedelta(hours=9))
+# KRX continuous trading ends at 15:20; 15:20-15:30 is a closing single-price
+# auction with different matching, which this system does not model.
+_KRX_CONTINUOUS_CLOSE_MINUTE = 15 * 60 + 20
+_KRX_LAST_CONTINUOUS_HALF_HOUR_START = _KRX_CONTINUOUS_CLOSE_MINUTE - 30
+
+
+def _session_structure_context(now: datetime) -> dict[str, Any]:
+    """Clock-derived KRX session structure the session-boxed strategies need.
+
+    Only the parts the clock can answer. ``in_last_continuous_half_hour`` and
+    ``minutes_to_continuous_close`` are pure calendar facts, so withholding them
+    would leave the strategies fail-closed for no reason; the price-derived fields
+    (opening range, first-half-hour return) still require a producer and stay absent
+    until one supplies them.
+    """
+    local = now.astimezone(_KST)
+    minute_of_day = local.hour * 60 + local.minute
+    remaining = (_KRX_CONTINUOUS_CLOSE_MINUTE - minute_of_day) - local.second / 60.0
+    return {
+        "in_last_continuous_half_hour": bool(
+            _KRX_LAST_CONTINUOUS_HALF_HOUR_START <= minute_of_day < _KRX_CONTINUOUS_CLOSE_MINUTE
+        ),
+        # Negative after the continuous close, which reads as "no time left" to every
+        # consumer rather than wrapping around to a large positive number.
+        "minutes_to_continuous_close": round(remaining, 3),
+    }
 
 
 def _macro_permits(bundle: Any, strategy_id: str) -> bool | None:
@@ -149,6 +200,129 @@ def _new_entry_session_report(
     }
 
 
+def _short_election_context(
+    *,
+    symbol: str,
+    borrow_snapshot: Any,
+    macro: Any,
+    micro_diagnostics: Any,
+    table: Any,
+    now: datetime,
+    orderbook: Any = None,
+    average_daily_trading_value: Any = None,
+    symbol_return: Any = None,
+    market_return: Any = None,
+) -> dict[str, Any]:
+    """Point-in-time short facts, frozen at election.
+
+    Every value comes from an observation that already existed at ``now``; nothing is
+    re-derived later. Fields that cannot be resolved are OMITTED rather than defaulted,
+    so the consuming algorithm fails closed — which for a borrow fact is the difference
+    between a skipped trade and a rejected or force-closed position.
+    """
+    context: dict[str, Any] = {}
+
+    # Borrow, straight off the frozen snapshot. ``short_sale_permitted`` is implied by
+    # having a usable locate: ``_borrow_context`` only returns a snapshot when the
+    # shared ``evaluate_borrow`` rule passed, and that rule already requires the broker
+    # to have offered stock.
+    if borrow_snapshot is not None:
+        context["borrow_available"] = bool(getattr(borrow_snapshot, "available", False))
+        context["short_sale_permitted"] = True
+        quantity = getattr(borrow_snapshot, "available_quantity", None)
+        if quantity is not None:
+            context["borrow_available_quantity"] = int(quantity)
+        fee = getattr(borrow_snapshot, "borrow_fee_bps_annualised", None)
+        if fee is not None:
+            context["borrow_fee_bps_annualised"] = float(fee)
+        observed_at = getattr(borrow_snapshot, "observed_at", None)
+        if observed_at is not None:
+            context["borrow_observed_at"] = _iso(observed_at)
+        deadline = getattr(borrow_snapshot, "return_deadline", None)
+        if deadline is not None:
+            context["return_deadline"] = _iso(deadline)
+
+    # Market context. A directional short is fighting the tape when breadth is strong,
+    # so the algorithms read it as an exclusion.
+    if macro is not None:
+        breadth = _optional_float(
+            (getattr(macro, "diagnostics", None) or {}).get("market_breadth")
+            if isinstance(getattr(macro, "diagnostics", None), Mapping)
+            else None
+        )
+        if breadth is not None:
+            context["market_breadth"] = breadth
+        regime = getattr(getattr(macro, "market_regime", None), "value", None)
+        if regime:
+            context["market_trend"] = str(regime)
+
+    # Weak-end sector rank. Derived from the SAME ranking the long side uses
+    # (``size - rank + 1``) rather than a separately-built weak ranking, which could
+    # disagree after a tie-break change and make a symbol simultaneously the strongest
+    # and the weakest in its sector.
+    if table is not None and symbol:
+        try:
+            ranked = table.weakness_rank_for(symbol)
+        except Exception:  # noqa: BLE001 - a ranking lookup must never crash election.
+            ranked = None
+        if ranked is not None:
+            context["sector_rank"] = int(ranked[0])
+            context["sector_candidate_count"] = int(ranked[1])
+        # The residual measurements themselves are shared with the long side — they are
+        # the same market/sector-neutral quantity — but they are surfaced under the
+        # SHORT field names so the weakness algorithm cannot accidentally consume the
+        # strength thesis's field and inherit its sign convention.
+        try:
+            residual = table.residual_for(symbol)
+            long_residual = table.long_residual_for(symbol)
+        except Exception:  # noqa: BLE001
+            residual = long_residual = None
+        if residual is not None:
+            context["residual_short_bps"] = float(residual) * 10_000.0
+        if long_residual is not None:
+            context["residual_long_bps"] = float(long_residual) * 10_000.0
+
+    # Execution quality and crowding. The micro layer is consulted first; anything it
+    # did not resolve is computed from the raw inputs by
+    # ``app.features.short_indicators``.
+    #
+    # ``short_interest_ratio`` / ``days_to_cover`` have NO source in this repository —
+    # KRX publishes 공매도 잔고 but nothing collects it, and the only in-repo
+    # ``short_net_change`` comes from the synthetic demo pipeline. They are therefore
+    # absent, the squeeze gates pass vacuously, and the fail-closed burden falls on the
+    # borrow gates. That reduction in defence-in-depth is reported by
+    # ``short_indicator_gaps`` rather than left to be inferred from a missing key.
+    if isinstance(micro_diagnostics, Mapping):
+        for key in (
+            "liquidity_score",
+            "spread_bps",
+            "aggressor_imbalance",
+            "short_interest_ratio",
+            "days_to_cover",
+            "breakdown_excess_bps",
+            "market_alignment",
+        ):
+            value = micro_diagnostics.get(key)
+            if value is not None:
+                context[key] = value
+    try:
+        from app.features.short_indicators import compute_short_indicators
+
+        computed = compute_short_indicators(
+            orderbook=orderbook,
+            average_daily_trading_value=average_daily_trading_value,
+            symbol_return=symbol_return,
+            market_return=market_return,
+        ).as_context()
+        # Micro-layer values win: they are closer to the decision and may incorporate
+        # inputs this fallback cannot see.
+        for key, value in computed.items():
+            context.setdefault(key, value)
+    except Exception:  # noqa: BLE001 - an indicator failure must not break election.
+        pass
+    return context
+
+
 def _optional_float(value: Any) -> float | None:
     """``None``-preserving float. Unknown must never become 0.0."""
     if value is None:
@@ -194,6 +368,36 @@ class _ElectionProposal:
     evidence_row: Mapping[str, Any] | None
     last_reason: str
     conservative_edge_bps: float | None = None
+    # --- Direction ---------------------------------------------------------- #
+    # A proposal is now "open THIS direction", not implicitly "buy". ``effect`` is
+    # always OPEN here (the session only elects entries; exits belong to the owned
+    # position's own algorithm), but it is carried explicitly so the order contract
+    # can be built without re-deriving it.
+    direction: PositionDirection = PositionDirection.LONG
+    position_effect: PositionEffect = PositionEffect.OPEN
+    execution_product: ExecutionProduct = ExecutionProduct.CASH
+    # Committed deployment state of this arm, read from the promotion controller at
+    # proposal time. SHADOW means a shadow plan is journaled and NO entry intent is
+    # produced.
+    deployment_state: StrategyDeploymentState = StrategyDeploymentState.LIVE_FULL
+    borrow_snapshot: Any = None
+    borrow_reason_codes: tuple[str, ...] = ()
+
+    @property
+    def is_short(self) -> bool:
+        return self.direction is PositionDirection.SHORT
+
+    @property
+    def submits_orders(self) -> bool:
+        return self.deployment_state.submits_orders
+
+    def directional_key(self, market: str) -> DirectionalStrategyKey:
+        return DirectionalStrategyKey(
+            strategy_id=self.strategy_id,
+            direction=self.direction,
+            market=market,
+            execution_product=self.execution_product,
+        )
 
     def resolved_cost_bps(self, fallback_bps: float) -> float:
         cost = self.expected_cost_bps
@@ -315,6 +519,11 @@ class StrategySessionState:
     phase: str = "SCANNING"
     selected_symbol: str | None = None
     selected_strategy: str | None = None
+    # Which way the elected exposure points. Defaults to LONG so a session state file
+    # written before shorts existed restores with its original meaning intact.
+    selected_direction: str = "LONG"
+    selected_execution_product: str = "CASH"
+    selected_deployment_state: str = "LIVE_FULL"
     selection_source: str | None = None
     selection_score: float | None = None
     selection_confidence: float | None = None
@@ -344,6 +553,11 @@ class StrategySessionState:
         default_factory=lambda: _fallback_exit_geometry().trailing_bps / 10_000.0
     )
     high_watermark_price: float | None = None
+    # Favourable extreme for a SHORT: the LOWEST price seen since entry. Tracked as a
+    # separate field rather than overloading ``high_watermark_price`` so a persisted
+    # long session restored after a restart cannot be reinterpreted as a short one,
+    # and so a dashboard reading either field always knows which it has.
+    low_watermark_price: float | None = None
     max_holding_seconds: int = field(
         default_factory=lambda: _fallback_exit_geometry().max_holding_seconds
     )
@@ -390,6 +604,19 @@ class StrategySessionState:
     expected_net_return_bps: float | None = None
     exit_price: float | None = None
     outcome_recorded: bool = False
+    # --- Short / borrow bookkeeping ------------------------------------------ #
+    # ``loan_date`` is what a buy-to-cover needs to identify WHICH borrow lot it
+    # repays. Its absence on an owned short is a fail-closed condition, not a
+    # cosmetic gap, so it lives in persisted session state and survives a restart.
+    loan_date: str | None = None
+    borrow_fee_bps_annualised: float | None = None
+    borrow_reference: str | None = None
+    return_deadline: str | None = None
+    # Shadow arms observed this cycle: arms that produced a valid signal but were not
+    # order-authorised. Recorded so the dashboard can show "the short fired, and here
+    # is why it did not trade" rather than showing nothing at all.
+    shadow_plan_ids: list[str] = field(default_factory=list)
+    directional_comparison: dict[str, Any] = field(default_factory=dict)
 
 
 class StrategySessionManager:
@@ -411,6 +638,10 @@ class StrategySessionManager:
         self.bandit = bandit or ConservativeStrategyBandit(store=self.performance_store)
         self._lock = threading.RLock()
         self._state = self._load()
+        # Shadow plans journaled this cycle, awaiting adoption by
+        # ``ShadowEvaluationService``. Drained rather than accumulated so a cycle whose
+        # plans nobody collects cannot grow without bound.
+        self._pending_shadow_plans: list[Any] = []
 
     def evaluate(
         self,
@@ -465,7 +696,19 @@ class StrategySessionManager:
             self._persist()
             return self.snapshot()
 
-    def allowed_buy_candidates(self, candidates: tuple[str, ...], account: Any) -> tuple[str, ...]:
+    def allowed_entry_candidates(
+        self, candidates: tuple[str, ...], account: Any
+    ) -> tuple[str, ...]:
+        """Symbols the session authorises a NEW ENTRY on, in either direction.
+
+        Renamed from ``allowed_buy_candidates`` because "buy" is no longer synonymous
+        with "enter": for a short thesis the entry order is a SELL. The old name is
+        retained as an alias so existing callers keep working with identical
+        behaviour.
+
+        A SHADOW-state election never reaches here — it produces no ARMED phase — so
+        an unvalidated short cannot appear in this list.
+        """
         with self._lock:
             if not self.config.enabled:
                 return candidates
@@ -473,10 +716,63 @@ class StrategySessionManager:
                 return ()
             if self._state.phase != "ARMED" or not self._state.selected_symbol:
                 return ()
+            # Defence in depth. The election path already refuses to ARM a
+            # non-order-authorised arm; asserting it again here means a future change
+            # to that path cannot quietly make a SHADOW short enterable.
+            if not parse_state(self._state.selected_deployment_state).submits_orders:
+                return ()
             # Ownership is locked for the complete ARMED entry window.  A
             # discovery list changing on the next cycle must not silently drop
             # the elected symbol before its strategy can evaluate the trigger.
             return (self._state.selected_symbol,)
+
+    # Backward-compatible alias: entries were BUY-only before short support.
+    allowed_buy_candidates = allowed_entry_candidates
+
+    def selected_direction_for(self, symbol: str) -> str | None:
+        """Direction of the elected (or owned) position on ``symbol``."""
+        with self._lock:
+            if self._state.selected_symbol != str(symbol or "").upper():
+                return None
+            return self._state.selected_direction
+
+    def order_contract_for(self, symbol: str, *, closing: bool = False) -> dict[str, Any] | None:
+        """The (direction, effect, product, loan_date) contract for an order.
+
+        The single place the execution layer should ask "what kind of order is this",
+        so a caller cannot infer it from ``side`` and get the SELL ambiguity wrong.
+        Returns ``None`` when this session does not own the symbol.
+        """
+        with self._lock:
+            state = self._state
+            if state.selected_symbol != str(symbol or "").upper():
+                return None
+            direction = parse_direction(state.selected_direction)
+            effect = PositionEffect.CLOSE if closing else PositionEffect.OPEN
+            return {
+                "position_direction": str(direction),
+                "position_effect": str(effect),
+                "execution_product": state.selected_execution_product,
+                "credit_type": "05" if direction is PositionDirection.SHORT else None,
+                # Required on a SHORT CLOSE. Deliberately passed through as-is
+                # (possibly None) so the execution layer's own check fails closed
+                # rather than this method inventing a plausible date.
+                "loan_date": state.loan_date if effect is PositionEffect.CLOSE else None,
+                "deployment_state": state.selected_deployment_state,
+            }
+
+    def record_broker_loan_date(self, symbol: str, loan_date: str | None) -> None:
+        """Store the broker-authoritative 대출일 for an owned short.
+
+        Called after a short entry fills and after each reconciliation. Without it the
+        buy-to-cover has no lot to repay, which the promotion controller treats as an
+        immediate suspension condition rather than something to work around.
+        """
+        with self._lock:
+            if self._state.selected_symbol != str(symbol or "").upper():
+                return
+            self._state.loan_date = str(loan_date).strip() if loan_date else None
+            self._persist()
 
     def exit_reason_for(self, holding: Any) -> str | None:
         with self._lock:
@@ -560,6 +856,19 @@ class StrategySessionManager:
                 self._state.last_reason = "EXIT_ORDER_SUBMITTED_AWAITING_FLAT"
                 self._persist()
 
+    def drain_shadow_plans(self) -> tuple[Any, ...]:
+        """Take the shadow plans journaled since the last drain.
+
+        Returns the plan OBJECTS, with their frozen borrow snapshots intact. Handing
+        back ids instead would force the consumer to re-read the journal and
+        re-resolve the locate, which is precisely where a fresher borrow observation
+        could contaminate a point-in-time evaluation.
+        """
+        with self._lock:
+            plans = tuple(self._pending_shadow_plans)
+            self._pending_shadow_plans = []
+            return plans
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             payload = asdict(self._state)
@@ -585,12 +894,29 @@ class StrategySessionManager:
                     or now
                 )
                 state.entry_price = float(getattr(holding, "average_price", 0.0) or 0.0)
+                # Adopt the BROKER's direction and loan date, not our own belief. The
+                # broker is authoritative on what the position actually is, and a
+                # disagreement here is precisely the condition the promotion
+                # controller suspends on rather than trades through.
+                broker_direction = str(getattr(holding, "direction", "") or "").upper()
+                if broker_direction in {"LONG", "SHORT"}:
+                    state.selected_direction = broker_direction
+                broker_loan_date = getattr(holding, "loan_date", None)
+                if broker_loan_date:
+                    state.loan_date = str(broker_loan_date)
+                direction = parse_direction(state.selected_direction)
                 if state.entry_price:
                     self._apply_owned_exit_geometry(state.entry_price)
-                    state.high_watermark_price = max(
-                        state.entry_price,
-                        float(getattr(holding, "last_price", 0.0) or 0.0),
-                    )
+                    last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
+                    if direction is PositionDirection.LONG:
+                        state.high_watermark_price = max(state.entry_price, last_price)
+                    else:
+                        # Favourable extreme for a short is the LOW. Seeding this from
+                        # a high watermark would arm a trailing stop that is already
+                        # triggered.
+                        state.low_watermark_price = favourable_watermark(
+                            state.entry_price, last_price or state.entry_price, direction
+                        )
                 state.last_reason = "POSITION_OWNED_MONITORING"
             self._evaluate_exit(holding, bundle, now)
             return
@@ -606,6 +932,20 @@ class StrategySessionManager:
             state.last_reason = "POSITION_FLAT_RESELECTION_COOLDOWN"
             state.exit_requested_at = state.exit_requested_at or _iso(now)
 
+    def _recall_imminent(self, now: datetime) -> bool:
+        """Is the borrow's return deadline close enough to force a cover?
+
+        Absent deadline == not imminent. A borrow with no stated deadline is the
+        normal case (open-ended loan), and treating "no deadline" as "due now" would
+        close every short immediately.
+        """
+        deadline = _parse_time(self._state.return_deadline)
+        if deadline is None:
+            return False
+        return (deadline - now).total_seconds() <= _env_float(
+            "SHORT_RECALL_EXIT_LEAD_SECONDS", 1800.0
+        )
+
     def _record_outcome(self, now: datetime) -> None:
         """Persist the realized net outcome of the closed position.
 
@@ -613,6 +953,10 @@ class StrategySessionManager:
         round-trip cost estimate the election used, so ``realized_net_bps`` is
         directly comparable with the ``expected_net_bps`` that armed the trade —
         which is what makes the stored prediction error meaningful.
+
+        The gross return is direction-signed exactly once, in
+        :func:`app.trading.directional.gross_return_bps`. A short that covered lower
+        records a POSITIVE net.
         """
         state = self._state
         if not self.config.record_outcomes or state.outcome_recorded:
@@ -620,10 +964,19 @@ class StrategySessionManager:
         strategy = state.selected_strategy
         symbol = state.selected_symbol
         entry = state.entry_price
-        exit_price = state.exit_price or state.high_watermark_price
+        direction = parse_direction(state.selected_direction)
+        # Fall back to the FAVOURABLE extreme for this direction, so a short with no
+        # frozen exit mark is not reconstructed from a high watermark that, for a
+        # short, is its worst price.
+        fallback_mark = (
+            state.high_watermark_price
+            if direction is PositionDirection.LONG
+            else state.low_watermark_price
+        )
+        exit_price = state.exit_price or fallback_mark
         if not strategy or not symbol or not entry or entry <= 0 or not exit_price:
             return
-        gross_bps = (float(exit_price) / float(entry) - 1.0) * 10_000.0
+        gross_bps = _directional_gross_bps(float(entry), float(exit_price), direction)
         cost_bps = (
             state.expected_cost_bps
             if state.expected_cost_bps is not None
@@ -633,17 +986,47 @@ class StrategySessionManager:
         holding_seconds = (
             max(0.0, (now - opened).total_seconds()) if opened is not None else None
         )
+        # Borrow accrues over the holding period and is NOT in ``expected_cost_bps``
+        # (which is the round trip). Deducted here so the recorded net is the number
+        # the promotion gates should actually judge.
+        borrow_bps = 0.0
+        if direction is PositionDirection.SHORT and holding_seconds is not None:
+            from app.trading.borrow import borrow_cost_bps
+
+            borrow_bps = borrow_cost_bps(
+                state.borrow_fee_bps_annualised, holding_seconds
+            ) or 0.0
+        state_enum = StrategyDeploymentState(
+            state.selected_deployment_state
+            if state.selected_deployment_state in set(StrategyDeploymentState)
+            else "LIVE_FULL"
+        )
         recorded = self.performance_store.record(
             strategy_id=strategy,
             symbol=symbol,
             market=market_for_symbol(symbol),
             regime=state.macro_regime or "UNKNOWN",
-            realized_net_bps=gross_bps - float(cost_bps),
+            realized_net_bps=gross_bps - float(cost_bps) - borrow_bps,
             realized_gross_bps=gross_bps,
             expected_net_bps=state.expected_net_return_bps,
             holding_seconds=holding_seconds,
             exit_reason=state.exit_reason or "",
             recorded_at=now,
+            direction=str(direction),
+            execution_product=state.selected_execution_product,
+            deployment_state=str(state_enum),
+            # A real fill under LIVE_PROBE is distinguished from a full-size live
+            # fill, because the promotion gates weight them differently.
+            evaluation_source=(
+                EVALUATION_SOURCE_LIVE_PROBE
+                if state_enum is StrategyDeploymentState.LIVE_PROBE
+                else EVALUATION_SOURCE_LIVE
+            ),
+            borrow_available=(
+                True if direction is PositionDirection.SHORT else None
+            ),
+            borrow_fee_bps=state.borrow_fee_bps_annualised,
+            signal_executable=True,
         )
         state.outcome_recorded = bool(recorded)
 
@@ -652,44 +1035,67 @@ class StrategySessionManager:
         if state.phase == "EXITING":
             return
         symbol = state.selected_symbol or ""
+        direction = parse_direction(state.selected_direction)
         last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
         average_price = float(getattr(holding, "average_price", 0.0) or 0.0)
         quantity = max(0, int(getattr(holding, "quantity", 0) or 0))
-        pnl = quantity * (last_price - average_price)
+        # Direction-signed: a short's PnL is positive when the price has FALLEN below
+        # the entry, so the unsigned (last - average) would report every winning short
+        # as a loss and drive the wrong exit decisions downstream.
+        pnl = direction.sign * quantity * (last_price - average_price)
         state.target_profit_amount = (
-            quantity * max(0.0, float(state.target_price or 0.0) - average_price)
-            if average_price > 0
+            quantity
+            * max(
+                0.0,
+                direction.sign * (float(state.target_price or 0.0) - average_price),
+            )
+            if average_price > 0 and state.target_price
             else None
         )
 
-        state.high_watermark_price = max(
-            float(state.high_watermark_price or 0.0),
-            last_price,
-            average_price,
-        )
-        stop_price = (
+        # Track the FAVOURABLE extreme for this direction: the high for a long, the
+        # low for a short. Both fields are maintained so a restored session and the
+        # dashboard always read the one that matches the position.
+        if direction is PositionDirection.LONG:
+            state.high_watermark_price = max(
+                float(state.high_watermark_price or 0.0), last_price, average_price
+            )
+            watermark = state.high_watermark_price
+        else:
+            state.low_watermark_price = favourable_watermark(
+                state.low_watermark_price
+                if state.low_watermark_price
+                else average_price or None,
+                last_price,
+                direction,
+            )
+            watermark = state.low_watermark_price
+
+        resolved_stop = (
             float(state.stop_price)
             if state.stop_price
-            else average_price * (1.0 - state.stop_loss_rate)
+            else _directional_stop_price(average_price, state.stop_loss_rate, direction)
             if average_price > 0
             else 0.0
         )
-        trailing_price = (
-            state.high_watermark_price * (1.0 - state.trailing_stop_rate)
-            if state.high_watermark_price
+        resolved_trailing = (
+            _directional_trailing_price(watermark, state.trailing_stop_rate, direction)
+            if watermark
             else 0.0
         )
 
         reason: str | None = None
-        if state.target_price and last_price >= state.target_price:
+        if target_reached(last_price, state.target_price, direction):
             reason = "STRATEGY_PROFIT_TARGET"
-        elif stop_price > 0 and last_price <= stop_price:
+        elif stop_breached(last_price, resolved_stop, direction):
             reason = "STRATEGY_STOP_LOSS"
-        elif (
-            trailing_price > average_price
-            and last_price <= trailing_price
-        ):
+        elif trailing_breached(last_price, resolved_trailing, average_price, direction):
             reason = "STRATEGY_TRAILING_STOP"
+        # A borrow recall is an exit reason with no long-side analogue: the position
+        # must be covered whether or not the price thesis still holds, and waiting for
+        # a price barrier would hand the timing to the lender.
+        elif direction is PositionDirection.SHORT and self._recall_imminent(now):
+            reason = "STRATEGY_SHORT_BORROW_RECALL"
 
         opened = _parse_time(state.position_opened_at) or getattr(holding, "opened_at", None)
         if (
@@ -797,14 +1203,32 @@ class StrategySessionManager:
         proposals.extend(self._intent_proposals(intents, evidence, bundle, now))
         proposals.extend(self._evidence_proposals(candidates, evidence, bundle, now))
 
+        # Journal every SHADOW-state proposal before selection runs. This is how a
+        # short accumulates the forward evidence it needs: the signal fired, the
+        # borrow world at that instant is frozen into a plan, and the plan will be
+        # scored from data that has not arrived yet. No order is involved.
+        self._journal_shadow_proposals(proposals, now)
+
+        # Only order-authorised proposals are selectable. Filtering here rather than
+        # inside the bandit keeps SHADOW arms visible in the evaluation list (so the
+        # dashboard can show what they WOULD have done) while making them structurally
+        # unable to win.
+        executable = [proposal for proposal in proposals if proposal.submits_orders]
         if proposals and self.config.bandit_enabled:
             selected = self._bandit_choice(proposals, macro, now)
             if selected is not None:
                 self._arm(selected, now, macro)
             return
+        if executable:
+            # Bandit disabled: preserve the historical first-admissible behaviour,
+            # over the order-authorised subset only.
+            self._arm(executable[0], now, macro)
+            return
         if proposals:
-            # Bandit disabled: preserve the historical first-admissible behaviour.
-            self._arm(proposals[0], now, macro)
+            self._state.last_reason = (
+                f"{ShortReasonCodes.SHADOW_ONLY}:"
+                f"{','.join(sorted({p.strategy_id for p in proposals}))}"
+            )
             return
 
         self._state.last_reason = self._no_election_reason(evidence, intents)
@@ -844,30 +1268,74 @@ class StrategySessionManager:
             entry_price = float(getattr(intent, "expected_entry_price", 0.0) or 0.0)
             expected_exit = float(getattr(intent, "expected_exit_price", 0.0) or 0.0)
             target_rate = self.config.fallback_target_return_rate
-            if entry_price > 0 and expected_exit > entry_price:
-                target_rate = max(target_rate, expected_exit / entry_price - 1.0)
             rvgi_context = (
                 row.get("rvgi_box_context")
                 if isinstance(row, Mapping)
                 else None
             )
-            selected_strategy = gnn_strategy if gnn_actionable else ontology_strategy
+            # Translate the micro layer's METHODOLOGY name into a catalogued
+            # strategy id. Without this the ontology path elected names like
+            # "momentum", which resolve to no algorithm and were rejected as
+            # STRATEGY_NOT_LIVE_AUTHORIZED — 0 of 13 strategies were reachable.
+            selected_strategy = (
+                gnn_strategy
+                if gnn_actionable
+                else (resolve_strategy_id(ontology_strategy) or "")
+            )
+            if not selected_strategy:
+                # A non-tradable verdict (hold/sell/reduce_risk) or an unmappable
+                # name is not a candidate. Skipping is the honest outcome.
+                continue
             if (
                 not gnn_actionable
-                and ontology_strategy in {"breakout", "rvgi_box_breakout"}
+                and selected_strategy in {"breakout_volume", "rvgi_box_breakout"}
                 and isinstance(rvgi_context, Mapping)
                 and rvgi_context.get("ontology_eligible") is True
             ):
                 selected_strategy = "rvgi_box_breakout"
-            authorized, authorization_reason = self._deployment_authorized(selected_strategy)
-            if not authorized:
-                self._state.last_reason = authorization_reason
+            direction, product, deployment_state, borrow_snapshot, borrow_reasons = (
+                self._resolve_direction_context(selected_strategy, symbol, now)
+            )
+            if deployment_state is StrategyDeploymentState.DISABLED:
+                self._state.last_reason = (
+                    f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
+                )
                 continue
+            if direction is PositionDirection.SHORT and borrow_snapshot is None:
+                # No locate: not a candidate in ANY state. Even a SHADOW plan is
+                # journaled as signal-valid-but-unexecutable rather than as a trade,
+                # so it cannot contribute to the promotion statistics.
+                self._state.last_reason = ",".join(borrow_reasons) or (
+                    ShortReasonCodes.BORROW_UNAVAILABLE
+                )
+                continue
+            if direction is PositionDirection.LONG:
+                authorized, authorization_reason = self._deployment_authorized(
+                    selected_strategy
+                )
+                if not authorized:
+                    self._state.last_reason = authorization_reason
+                    continue
             if _macro_permits(bundle, selected_strategy) is False:
                 self._state.last_reason = (
                     f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
                 )
                 continue
+            # Model-supplied target, folded in only once the direction is known.
+            # ``target_rate`` is always a positive MAGNITUDE — direction is applied
+            # when the price is computed — so the test is whether the expected exit
+            # lies on this direction's FAVOURABLE side: above entry for a long, below
+            # it for a short. A single ``expected_exit > entry_price`` test would
+            # silently discard every short's model target and fall back to the
+            # geometry floor.
+            if entry_price > 0 and expected_exit > 0:
+                favourable = (
+                    expected_exit > entry_price
+                    if direction is PositionDirection.LONG
+                    else expected_exit < entry_price
+                )
+                if favourable:
+                    target_rate = max(target_rate, abs(expected_exit / entry_price - 1.0))
             stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(selected_strategy)
             profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
             target_rate = max(target_rate, profit_bps / 10_000.0)
@@ -915,6 +1383,12 @@ class StrategySessionManager:
                     micro_result=micro_result,
                     evidence_row=row if isinstance(row, Mapping) else None,
                     last_reason="SINGLE_SYMBOL_STRATEGY_ARMED",
+                    direction=direction,
+                    position_effect=PositionEffect.OPEN,
+                    execution_product=product,
+                    deployment_state=deployment_state,
+                    borrow_snapshot=borrow_snapshot,
+                    borrow_reason_codes=borrow_reasons,
                 )
             )
         return proposals
@@ -984,10 +1458,26 @@ class StrategySessionManager:
             )
             if not selected_strategy:
                 continue
-            authorized, authorization_reason = self._deployment_authorized(selected_strategy)
-            if not authorized:
-                self._state.last_reason = authorization_reason
+            direction, product, deployment_state, borrow_snapshot, borrow_reasons = (
+                self._resolve_direction_context(selected_strategy, normalized, now)
+            )
+            if deployment_state is StrategyDeploymentState.DISABLED:
+                self._state.last_reason = (
+                    f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
+                )
                 continue
+            if direction is PositionDirection.SHORT and borrow_snapshot is None:
+                self._state.last_reason = ",".join(borrow_reasons) or (
+                    ShortReasonCodes.BORROW_UNAVAILABLE
+                )
+                continue
+            if direction is PositionDirection.LONG:
+                authorized, authorization_reason = self._deployment_authorized(
+                    selected_strategy
+                )
+                if not authorized:
+                    self._state.last_reason = authorization_reason
+                    continue
             # The shadow evidence path does not know the macro regime, so it
             # would happily arm a strategy family the macro layer has blocked.
             # The supervisor would then flag it every cycle; refuse it here.
@@ -1032,6 +1522,12 @@ class StrategySessionManager:
                     micro_result=None,
                     evidence_row=row,
                     last_reason="STRATEGY_ELECTED_WAITING_FOR_ENTRY_TRIGGER",
+                    direction=direction,
+                    position_effect=PositionEffect.OPEN,
+                    execution_product=product,
+                    deployment_state=deployment_state,
+                    borrow_snapshot=borrow_snapshot,
+                    borrow_reason_codes=borrow_reasons,
                 )
             )
         return proposals
@@ -1042,6 +1538,12 @@ class StrategySessionManager:
 
         Deployment-gated strategies (RVGI box breakout and the three added for the
         current tape) ship shadow-only until they have per-regime samples.
+
+        This is the LONG-side gate and remains a plain per-strategy flag. Short arms
+        go through :meth:`_directional_deployment_state` instead, which reads the
+        committed per-arm state from the promotion controller — a strategy-level
+        boolean is not enough for a short, because the same strategy id can be at
+        different rungs in different markets.
         """
         try:
             from app.technical.strategy_algorithms import strategy_live_authorized
@@ -1051,6 +1553,155 @@ class StrategySessionManager:
         except Exception:  # noqa: BLE001 - a lookup failure must fail closed.
             return False, f"STRATEGY_AUTHORIZATION_UNAVAILABLE:{strategy_id}"
         return False, f"STRATEGY_NOT_LIVE_AUTHORIZED:{strategy_id}"
+
+    def _directional_deployment_state(
+        self, strategy_id: str, direction: PositionDirection, market: str
+    ) -> StrategyDeploymentState:
+        """Committed deployment state for one arm.
+
+        LONG arms keep the pre-existing behaviour exactly: the per-strategy
+        ``live_authorized`` flag maps to LIVE_FULL or SHADOW, so nothing about the
+        long path changes. SHORT arms are looked up per-arm in the promotion store.
+
+        Any failure resolves to SHADOW. An unreadable deployment state must never
+        authorise an order, and for a short that is the difference between a journal
+        entry and a borrowed position.
+        """
+        if direction is PositionDirection.LONG:
+            authorized, _ = self._deployment_authorized(strategy_id)
+            return (
+                StrategyDeploymentState.LIVE_FULL
+                if authorized
+                else StrategyDeploymentState.SHADOW
+            )
+        try:
+            from app.trading.short_strategy_promotion import default_promotion_controller
+
+            key = DirectionalStrategyKey.for_short(strategy_id, market)
+            return default_promotion_controller().authorized_state(key)
+        except Exception:  # noqa: BLE001 - fail closed to SHADOW.
+            return StrategyDeploymentState.SHADOW
+
+    def _resolve_direction_context(
+        self, strategy_id: str, symbol: str, now: datetime
+    ) -> tuple[
+        PositionDirection, ExecutionProduct, StrategyDeploymentState, Any, tuple[str, ...]
+    ]:
+        """Direction, product, deployment state and borrow locate for one candidate.
+
+        Collected in one place so both election paths agree. Direction comes from the
+        STRATEGY (each thesis is one-directional); the product follows from the
+        direction; the deployment state is per-arm; the borrow locate is only fetched
+        for shorts, because a long has no borrow leg to fail on.
+        """
+        from app.technical.strategy_algorithms import strategy_direction
+
+        direction = parse_direction(strategy_direction(strategy_id))
+        product = default_product(direction)
+        market = market_for_symbol(symbol)
+        deployment_state = self._directional_deployment_state(strategy_id, direction, market)
+        if direction is PositionDirection.LONG:
+            return direction, product, deployment_state, None, ()
+        snapshot, reasons = self._borrow_context(symbol, now)
+        return direction, product, deployment_state, snapshot, reasons
+
+    def _borrow_context(
+        self, symbol: str, now: datetime
+    ) -> tuple[Any, tuple[str, ...]]:
+        """Latest borrow observation for ``symbol``, plus any blocking reasons.
+
+        Returns ``(None, reasons)`` whenever a locate cannot be established. The
+        caller must treat that as "not a short candidate" — never as "probably fine".
+        """
+        try:
+            from app.trading.borrow import default_borrow_store, evaluate_borrow
+
+            snapshot = default_borrow_store().latest(symbol, as_of=now)
+            verdict = evaluate_borrow(snapshot, quantity=1, now=now)
+            return (snapshot if verdict.allowed else None), verdict.reason_codes
+        except Exception:  # noqa: BLE001 - a lookup failure is a no-locate.
+            return None, (ShortReasonCodes.BORROW_LOOKUP_FAILED,)
+
+    # -- shadow journaling -------------------------------------------------- #
+    def _journal_shadow_proposals(
+        self, proposals: list["_ElectionProposal"], now: datetime
+    ) -> None:
+        """Write a :class:`ShadowTradePlan` for every non-order-authorised proposal.
+
+        This is the mechanism by which a SHADOW short earns its way to LIVE_PROBE, and
+        the reason a SHADOW arm is evaluated at all rather than skipped. Three
+        properties are load-bearing:
+
+        * The plan is written NOW, with the entry reference, barriers and borrow
+          observation frozen. Scoring happens later, from later data only.
+        * The borrow snapshot is embedded by value, so a scoring pass physically
+          cannot consult a fresher locate — which would be the leak that makes shadow
+          results unachievable live.
+        * No order is created and none can be: this method has no path to the
+          execution layer.
+
+        Failures are swallowed. A journal write is bookkeeping; losing one costs a
+        sample, while raising here would break the live LONG election path.
+        """
+        if not proposals:
+            return
+        try:
+            from app.trading.directional_shadow import ShadowTradePlan, default_shadow_store
+
+            store = default_shadow_store()
+        except Exception:  # noqa: BLE001 - journaling must never break election.
+            return
+        recorded: list[str] = []
+        pending: list[Any] = []
+        for proposal in proposals:
+            if proposal.submits_orders:
+                continue
+            entry_reference = proposal.entry_price
+            if not entry_reference or entry_reference <= 0:
+                # Without a point-in-time entry reference there is nothing to measure
+                # a return against, and inventing one from a later quote is the leak
+                # this whole module exists to prevent.
+                continue
+            try:
+                plan = ShadowTradePlan(
+                    plan_id="",
+                    key=proposal.directional_key(market_for_symbol(proposal.symbol)),
+                    symbol=proposal.symbol,
+                    signal_at=now,
+                    entry_reference_price=float(entry_reference),
+                    target_rate=proposal.target_return_rate,
+                    stop_rate=proposal.stop_loss_rate,
+                    max_holding_seconds=proposal.max_holding_seconds,
+                    expected_trading_cost_bps=proposal.resolved_cost_bps(
+                        self.config.fallback_round_trip_cost_bps
+                    ),
+                    predicted_gross_edge_bps=proposal.predicted_gross_edge_bps(
+                        self.config.fallback_round_trip_cost_bps
+                    ),
+                    predicted_net_edge_bps=proposal.predicted_net_edge_bps(
+                        self.config.gnn_absence_penalty_bps,
+                        self.config.fallback_round_trip_cost_bps,
+                    ),
+                    predicted_success_probability=proposal.confidence or None,
+                    regime=self._state.macro_regime or "UNKNOWN",
+                    signal_reason_codes=tuple(proposal.ontology_reason_codes),
+                    borrow_snapshot=proposal.borrow_snapshot,
+                    borrow_reason_codes=proposal.borrow_reason_codes,
+                    deployment_state=str(proposal.deployment_state),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if store.record_plan(plan):
+                recorded.append(plan.plan_id)
+                pending.append(plan)
+        if recorded:
+            self._state.shadow_plan_ids = recorded[:16]
+        # Hand the plan objects to the evaluation service so its barrier walk starts on
+        # the NEXT quote. Passing objects rather than ids keeps the frozen borrow
+        # snapshot intact — a re-read from the journal would have to re-resolve it, and
+        # that is the one place a fresher locate could sneak in.
+        if pending:
+            self._pending_shadow_plans = pending
 
     # -- bandit scoring ---------------------------------------------------- #
     def _bandit_choice(
@@ -1093,6 +1744,21 @@ class StrategySessionManager:
                 ),
                 confidence=proposal.confidence,
                 live_authorized=True,
+                direction=proposal.direction,
+                execution_product=proposal.execution_product,
+                # The bandit re-applies the deployment gate itself. Passing the state
+                # rather than a pre-computed boolean lets it distinguish SHADOW (rank
+                # and report) from SUSPENDED (rank and flag the fault), which the
+                # dashboard needs to tell "still learning" from "something broke".
+                deployment_state=proposal.deployment_state,
+                # A snapshot only survives ``_borrow_context`` when the shared
+                # ``evaluate_borrow`` rule passed, so its presence IS the locate.
+                # ``None`` (not False) when absent, so the bandit records "not
+                # established" rather than "broker refused".
+                borrow_available=True if proposal.borrow_snapshot is not None else None,
+                borrow_fee_bps_annualised=getattr(
+                    proposal.borrow_snapshot, "borrow_fee_bps_annualised", None
+                ),
                 reason_codes=(
                     ()
                     if proposal.gnn_actionable
@@ -1108,6 +1774,12 @@ class StrategySessionManager:
         self._state.bandit_reason_codes = list(selection.reason_codes)
         self._state.bandit_evaluations = [item.as_dict() for item in selection.evaluations][:12]
         self._state.bandit_shadow_arms = list(selection.shadow_arms)
+        # LONG vs SHORT vs NO_TRADE, recorded on every cycle whether or not a short
+        # was selectable. This is the evidence ``short_rescue_rate`` is built from, and
+        # the only way to answer after the fact whether short support bought anything.
+        self._state.directional_comparison = selection.as_dict().get(
+            "directional_comparison", {}
+        )
         if selection.is_no_trade:
             # This is a successful outcome, not a failure: no candidate cleared a
             # positive lower bound after costs and uncertainty.
@@ -1117,17 +1789,31 @@ class StrategySessionManager:
                 else f"BANDIT_NO_TRADE:{','.join(selection.reason_codes) or 'UNSPECIFIED'}"
             )
             return None
+        # Matched on (strategy, symbol, DIRECTION). The bandit labels a short arm
+        # ``strategy:SHORT``, and matching on strategy id alone would resolve a
+        # selected short to the long proposal of the same strategy on the same symbol
+        # — arming the opposite position to the one that was chosen.
+        selected_direction = parse_direction(selection.selected_direction)
         winner = next(
             (
                 proposal
                 for proposal in proposals
-                if proposal.strategy_id == selection.selected_arm
+                if proposal.strategy_id == selection.selected_arm.split(":", 1)[0]
                 and proposal.symbol == selection.selected_symbol
+                and proposal.direction is selected_direction
             ),
             None,
         )
         if winner is None:
             self._state.last_reason = "BANDIT_SELECTION_UNRESOLVABLE"
+            return None
+        # Last line of defence before ARMED. The bandit already refuses to select a
+        # non-order-authorised arm, so reaching here means the two disagree, which is
+        # a bug — refuse the trade and say so rather than resolving it optimistically.
+        if not winner.submits_orders:
+            self._state.last_reason = (
+                f"{ShortReasonCodes.SHADOW_ONLY}:{winner.strategy_id}"
+            )
             return None
         winner.conservative_edge_bps = selection.conservative_edge_bps
         return winner
@@ -1139,8 +1825,13 @@ class StrategySessionManager:
             proposal.resolved_cost_bps(self.config.fallback_round_trip_cost_bps),
         )
         entry_price = proposal.entry_price
+        # Direction-aware: a short's target sits BELOW the entry. The previous
+        # unconditional ``* (1 + rate)`` would have armed a short whose "target" was
+        # above its entry — i.e. a position that takes profit only when losing.
         target_price = (
-            entry_price * (1.0 + proposal.target_return_rate)
+            _directional_target_price(
+                entry_price, proposal.target_return_rate, proposal.direction
+            )
             if entry_price and entry_price > 0
             else None
         )
@@ -1149,6 +1840,26 @@ class StrategySessionManager:
             phase="ARMED",
             selected_symbol=proposal.symbol,
             selected_strategy=proposal.strategy_id,
+            selected_direction=str(proposal.direction),
+            selected_execution_product=str(proposal.execution_product),
+            selected_deployment_state=str(proposal.deployment_state),
+            loan_date=None,
+            borrow_fee_bps_annualised=(
+                getattr(proposal.borrow_snapshot, "borrow_fee_bps_annualised", None)
+                if proposal.borrow_snapshot is not None
+                else None
+            ),
+            borrow_reference=(
+                getattr(proposal.borrow_snapshot, "snapshot_id", None)
+                if proposal.borrow_snapshot is not None
+                else None
+            ),
+            return_deadline=_iso(
+                getattr(proposal.borrow_snapshot, "return_deadline", None)
+                if proposal.borrow_snapshot is not None
+                else None
+            ),
+            directional_comparison=dict(self._state.directional_comparison),
             selection_source=proposal.source,
             selection_score=proposal.score,
             selection_confidence=proposal.confidence,
@@ -1192,6 +1903,7 @@ class StrategySessionManager:
                 macro=macro,
                 symbol=proposal.symbol,
                 change_point_probability=self._state.change_point_probability,
+                borrow_snapshot=proposal.borrow_snapshot,
             ),
         )
 
@@ -1254,6 +1966,7 @@ class StrategySessionManager:
         macro: Any = None,
         symbol: str = "",
         change_point_probability: float | None = None,
+        borrow_snapshot: Any = None,
     ) -> dict[str, Any]:
         """Freeze the slow context the algorithm will consume.
 
@@ -1354,13 +2067,71 @@ class StrategySessionManager:
                 value = rvgi_context.get(key)
                 if value is not None:
                     context[key] = value
+        # Session structure for the two session-boxed strategies. Without this they
+        # declared their context fields and nothing ever populated them, so both
+        # rejected every tick with *_CONTEXT_ABSENT — implemented, registered, and
+        # permanently inert. The clock is authoritative here; only the price-derived
+        # parts need a producer, and those stay absent when unavailable.
+        if strategy_id in {
+            "market_intraday_momentum",
+            "opening_range_breakout",
+            # Both legs of each session-boxed thesis read the same clock facts.
+            "market_intraday_momentum_short",
+            "opening_range_breakdown",
+        }:
+            context.update(_session_structure_context(now))
+            if isinstance(diagnostics, Mapping):
+                for key in (
+                    "opening_range_high",
+                    "opening_range_low",
+                    "opening_range_minutes",
+                    "relative_volume",
+                    "first_half_hour_return_bps",
+                    "first_half_hour_volatility_percentile",
+                ):
+                    value = diagnostics.get(key)
+                    if value is not None:
+                        context[key] = value
+
+        # --- SHORT context ---------------------------------------------------- #
+        # Without this block every short algorithm fails closed on its borrow
+        # preconditions and can never fire — the strategies would be registered,
+        # evaluated, and permanently inert, which is the exact defect the long
+        # session-boxed strategies already hit once (declared context fields that
+        # nothing populated).
+        if is_short_strategy(strategy_id):
+            context.update(
+                _short_election_context(
+                    symbol=normalized_symbol,
+                    borrow_snapshot=borrow_snapshot,
+                    macro=macro,
+                    micro_diagnostics=diagnostics,
+                    table=table,
+                    now=now,
+                )
+            )
         return context
 
     def _apply_owned_exit_geometry(self, entry_price: float) -> None:
-        """Resolve the elected algorithm's structural exit rule at fill time."""
+        """Resolve the elected algorithm's structural exit rule at fill time.
+
+        Applies to EVERY elected strategy. It used to special-case
+        ``rvgi_box_breakout`` and give everything else a flat percentage target,
+        which silently discarded each algorithm's own stop/target structure — the
+        docstring already claimed the general behaviour the code did not implement.
+
+        The concrete hazard that exposed it: ``market_intraday_momentum`` shrinks its
+        holding horizon toward the KRX continuous close so the position is flat
+        before the 15:20 single-price auction. With the rule uncalled, that horizon
+        never reached the session state and the position could be carried into the
+        auction — the exact outcome its unit tests forbid.
+        """
         state = self._state
-        if state.selected_strategy != "rvgi_box_breakout" or entry_price <= 0:
-            state.target_price = entry_price * (1.0 + state.target_return_rate)
+        direction = parse_direction(state.selected_direction)
+        if not state.selected_strategy or entry_price <= 0:
+            state.target_price = _directional_target_price(
+                entry_price, state.target_return_rate, direction
+            )
             return
         try:
             from app.technical.signals import TechnicalFeatureSet
@@ -1381,21 +2152,46 @@ class StrategySessionManager:
                 TechnicalFeatureSet(symbol=state.selected_symbol or "", price=entry_price),
                 ElectionContext(**payload),
             )
-            state.stop_price = rule.stop_price
-            algorithm_target_rate = (
-                rule.target_price / entry_price - 1.0
-                if rule.target_price and rule.target_price > entry_price
-                else 0.0
-            )
+            # Only ADOPT values the rule actually resolved. The rule is built from a
+            # bare feature set (no realized volatility at fill time), so a
+            # volatility-derived stop comes back as None for most algorithms —
+            # assigning it blindly would DELETE the stop and leave the position
+            # unprotected. The exit-geometry table stays authoritative unless the
+            # algorithm produced something better.
+            if rule.stop_price and rule.stop_price > 0:
+                state.stop_price = rule.stop_price
+            # The algorithm's target is on its own direction's favourable side, and
+            # ``target_return_rate`` is a positive magnitude. Comparing
+            # ``rule.target_price > entry_price`` for a short would read its correct
+            # (lower) target as "no target" and fall back to the geometry floor.
+            algorithm_target_rate = 0.0
+            if rule.target_price and rule.target_price > 0:
+                favourable = (
+                    rule.target_price > entry_price
+                    if direction is PositionDirection.LONG
+                    else rule.target_price < entry_price
+                )
+                if favourable:
+                    algorithm_target_rate = abs(rule.target_price / entry_price - 1.0)
             state.target_return_rate = max(
                 state.target_return_rate,
                 algorithm_target_rate,
             )
-            state.target_price = entry_price * (1.0 + state.target_return_rate)
-            state.trailing_stop_rate = float(rule.trailing_bps or 0.0) / 10_000.0
-            state.max_holding_seconds = int(rule.max_holding_seconds)
+            state.target_price = _directional_target_price(
+                entry_price, state.target_return_rate, direction
+            )
+            if rule.trailing_bps and float(rule.trailing_bps) > 0:
+                state.trailing_stop_rate = float(rule.trailing_bps) / 10_000.0
+            # A horizon may only be SHORTENED here. Lengthening it would let an
+            # algorithm quietly overrule the table's holding limit; shortening is how
+            # a session-boxed thesis (flat before the 15:20 auction) is enforced.
+            rule_holding = int(rule.max_holding_seconds or 0)
+            if 0 < rule_holding < int(state.max_holding_seconds or rule_holding):
+                state.max_holding_seconds = rule_holding
         except Exception:  # noqa: BLE001 - persisted fallback exits remain authoritative.
-            state.target_price = entry_price * (1.0 + state.target_return_rate)
+            state.target_price = _directional_target_price(
+                entry_price, state.target_return_rate, direction
+            )
 
     def _fresh_evidence(self, row: Mapping[str, Any], now: datetime) -> bool:
         observed = _parse_time(row.get("as_of"))
@@ -1419,30 +2215,63 @@ class StrategySessionManager:
             self.config.fallback_target_return_rate,
             profit_bps / 10_000.0,
         )
+        # Direction comes from the BROKER. An adopted short misread as a long would be
+        # managed with an inverted stop and target — exiting on the winning side and
+        # running on the losing one, with an unbounded downside.
+        direction = parse_direction(getattr(holding, "direction", None))
+        last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
+        loan_date = getattr(holding, "loan_date", None)
         self._state = StrategySessionState(
             session_id=f"session-{uuid4().hex}",
             phase="OWNED",
             selected_symbol=symbol,
             selected_strategy=strategy,
+            selected_direction=str(direction),
+            selected_execution_product=str(
+                getattr(holding, "execution_product", None) or default_product(direction)
+            ),
             selection_source="BROKER_POSITION_RECONCILIATION",
             selected_at=_iso(now),
             position_opened_at=_iso(opened),
             position_seen=True,
             entry_price=average or None,
-            target_price=average * (1.0 + target_rate) if average else None,
+            target_price=(
+                _directional_target_price(average, target_rate, direction)
+                if average
+                else None
+            ),
             target_return_rate=target_rate,
             stop_loss_rate=stop_bps / 10_000.0,
             trailing_stop_rate=trailing_bps / 10_000.0,
-            high_watermark_price=max(
-                average,
-                float(getattr(holding, "last_price", 0.0) or 0.0),
-            ) or None,
+            high_watermark_price=(
+                (max(average, last_price) or None)
+                if direction is PositionDirection.LONG
+                else None
+            ),
+            low_watermark_price=(
+                None
+                if direction is PositionDirection.LONG
+                else (favourable_watermark(average or None, last_price or average, direction) or None)
+            ),
+            loan_date=str(loan_date) if loan_date else None,
+            borrow_fee_bps_annualised=_optional_float(
+                getattr(holding, "borrow_fee_rate", None)
+            ),
+            return_deadline=_iso(getattr(holding, "return_deadline", None)),
             max_holding_seconds=_strategy_max_holding_seconds(strategy),
             last_evaluated_at=_iso(now),
             last_reason=(
                 "EXISTING_MULTIPLE_HOLDINGS_BUYS_BLOCKED"
                 if len(holdings) > 1
-                else "EXISTING_POSITION_ADOPTED"
+                # An adopted SHORT with no loan date cannot be covered through the
+                # 매수상환 contract. Flagged in the reason so the operator and the
+                # promotion controller both see it, rather than discovering it when
+                # the exit order is rejected.
+                else (
+                    "EXISTING_SHORT_ADOPTED_WITHOUT_LOAN_DATE"
+                    if direction is PositionDirection.SHORT and not loan_date
+                    else "EXISTING_POSITION_ADOPTED"
+                )
             ),
         )
 

@@ -45,14 +45,180 @@ async function refreshDashboard() {
   } catch (_) {
     blockade = null;
   }
+  let shortLadder = null;
+  try {
+    shortLadder = await fetchJson('/api/short-strategies/status');
+  } catch (_) {
+    shortLadder = null;
+  }
+  let directional = null;
+  try {
+    directional = await fetchJson('/api/directional-bandit/evaluations');
+  } catch (_) {
+    directional = null;
+  }
   state.dashboard = data;
   state.runtime = runtime;
   state.refactor = refactor;
   state.blockade = blockade;
+  state.shortLadder = shortLadder;
+  state.directional = directional;
   renderDashboard(data, trading, runtime);
   renderRefactorDashboard(refactor);
   renderEntryBlockade(blockade);
+  renderShortLadder(shortLadder, directional);
   await refreshHistory();
+}
+
+// Deployment states, weakest first. The ladder is rendered as a fixed track rather
+// than just the current label, so an operator can see BOTH where an arm is and how
+// far it still has to go — a bare "SHADOW" badge reads as a failure when it is in
+// fact the correct starting state.
+const SHORT_LADDER_STATES = ['SHADOW', 'LIVE_PROBE', 'LIVE_LIMITED', 'LIVE_FULL'];
+const SHORT_STATE_LABELS = {
+  DISABLED: '비활성',
+  SHADOW: '섀도우',
+  LIVE_PROBE: '실거래 탐침',
+  LIVE_LIMITED: '실거래 제한',
+  LIVE_FULL: '실거래 정상',
+  SUSPENDED: '중단',
+};
+// Only the codes an operator can act on differently. Everything else falls through
+// to the raw code, which is better than a wrong friendly name.
+const SHORT_REASON_LABELS = {
+  SHORT_PROMOTION_SAMPLE_INSUFFICIENT: '표본 부족',
+  SHORT_PROMOTION_TRADING_DAYS_INSUFFICIENT: '거래일 부족',
+  SHORT_PROMOTION_SYMBOL_BREADTH_INSUFFICIENT: '종목 수 부족',
+  SHORT_CONFIDENCE_BELOW_THRESHOLD: '신뢰도 미달',
+  SHORT_CONSERVATIVE_EDGE_NON_POSITIVE: '보수적 엣지 미달',
+  SHORT_COST_COVERAGE_INSUFFICIENT: '비용 대비 엣지 부족',
+  SHORT_BORROW_AVAILABILITY_RATE_LOW: '대주 가용률 낮음',
+  SHORT_RESCUE_RATE_INSUFFICIENT: '숏 기여도 부족',
+  SHORT_PROMOTION_HOLDOUT_NOT_PASSED: 'holdout 미통과',
+  SHORT_MODEL_NOT_CALIBRATED: '모델 보정 미완',
+  SHORT_CALIBRATION_ERROR_HIGH: '예측 오차 큼',
+  SHORT_SLIPPAGE_ERROR_HIGH: '슬리피지 오차 큼',
+  SHORT_PROFIT_FACTOR_INSUFFICIENT: 'profit factor 미달',
+  SHORT_DRAWDOWN_EXCEEDED: '낙폭 초과',
+  SHORT_LOSS_STREAK_EXCEEDED: '연속 손실 초과',
+  SHORT_DEPLOYMENT_SUSPENDED: '중단됨',
+  SHORT_STRATEGY_SHADOW_ONLY: '섀도우 전용',
+};
+
+function shortReasonLabel(code) {
+  return SHORT_REASON_LABELS[code] || code;
+}
+
+function renderShortLadder(payload, directional) {
+  const grid = document.getElementById('short-ladder-arms');
+  const headline = document.getElementById('short-ladder-headline');
+  const verdict = document.getElementById('short-ladder-verdict');
+  if (!grid || !headline || !verdict) return;
+  if (!payload || payload.ok === false) {
+    headline.textContent = '숏 배포 상태를 불러오지 못했습니다.';
+    verdict.textContent = '-';
+    verdict.className = 'badge neutral';
+    grid.innerHTML = '';
+    return;
+  }
+  const arms = Array.isArray(payload.arms) ? payload.arms : [];
+  const authorized = arms.filter((arm) => arm.submits_orders);
+  if (!arms.length) {
+    verdict.textContent = '숏 없음';
+    verdict.className = 'badge neutral';
+    headline.textContent = '활성화된 숏 전략이 없습니다.';
+  } else if (authorized.length) {
+    // Deliberately styled as a WARNING, not a success. A live short is the state that
+    // deserves attention, not the state that deserves a green tick.
+    verdict.textContent = `실주문 ${authorized.length}개`;
+    verdict.className = 'badge blocked';
+    headline.textContent = `${authorized.length}개 arm이 실주문 권한을 가지고 있습니다.`;
+  } else {
+    verdict.textContent = '실주문 0개';
+    verdict.className = 'badge';
+    headline.textContent = `${arms.length}개 arm 전부 섀도우 — 실주문 권한이 없습니다. 이것이 정상 상태입니다.`;
+  }
+
+  grid.innerHTML = '';
+  arms.forEach((arm) => {
+    const card = document.createElement('div');
+    card.className = `short-arm ${arm.submits_orders ? 'live' : 'shadow'}`;
+
+    const name = document.createElement('p');
+    name.className = 'short-arm-name';
+    name.textContent = arm.strategy_id || arm.strategy_key || '-';
+    card.appendChild(name);
+
+    const track = document.createElement('div');
+    track.className = 'short-arm-track';
+    const current = String(arm.state || 'SHADOW');
+    const currentIndex = SHORT_LADDER_STATES.indexOf(current);
+    if (current === 'SUSPENDED') {
+      const step = document.createElement('span');
+      step.className = 'short-step suspended';
+      step.textContent = SHORT_STATE_LABELS.SUSPENDED;
+      track.appendChild(step);
+    } else {
+      SHORT_LADDER_STATES.forEach((stateName, index) => {
+        const step = document.createElement('span');
+        const reached = currentIndex >= 0 && index <= currentIndex;
+        step.className = `short-step${reached ? ' reached' : ''}${
+          index === currentIndex ? ' current' : ''
+        }`;
+        step.textContent = SHORT_STATE_LABELS[stateName] || stateName;
+        track.appendChild(step);
+      });
+    }
+    card.appendChild(track);
+
+    const meta = document.createElement('p');
+    meta.className = 'short-arm-meta';
+    const score = typeof arm.confidence_score === 'number' ? arm.confidence_score.toFixed(3) : '-';
+    const passes = arm.consecutive_passes ?? 0;
+    const required = arm.required_consecutive_cycles ?? '-';
+    meta.textContent = `신뢰도 ${score} · 연속통과 ${passes}/${required}`;
+    card.appendChild(meta);
+
+    const remaining = Array.isArray(arm.remaining_conditions) ? arm.remaining_conditions : [];
+    if (remaining.length) {
+      const list = document.createElement('p');
+      list.className = 'short-arm-blockers';
+      // Cap the list: a brand-new arm fails every gate, and rendering fifteen chips
+      // makes the panel unreadable without telling the operator anything more.
+      const shown = remaining.slice(0, 4).map(shortReasonLabel).join(' · ');
+      const extra = remaining.length > 4 ? ` 외 ${remaining.length - 4}건` : '';
+      list.textContent = `남은 조건: ${shown}${extra}`;
+      card.appendChild(list);
+    }
+    grid.appendChild(card);
+  });
+
+  const health = document.getElementById('short-borrow-health');
+  if (health) {
+    const borrow = payload.borrow_health || {};
+    const lookups = borrow.lookup_count ?? 0;
+    if (!lookups) {
+      // "We asked nothing" must not read as "nothing was available".
+      health.textContent = '대주 데스크: 최근 조회 없음 (가용률 미측정)';
+    } else {
+      const rate = typeof borrow.availability_rate === 'number'
+        ? `${(borrow.availability_rate * 100).toFixed(0)}%`
+        : '-';
+      health.textContent = `대주 데스크: 조회 ${lookups}건 · 가용률 ${rate} · 종목 ${borrow.distinct_symbols ?? 0}개`;
+    }
+  }
+
+  const compare = document.getElementById('short-direction-compare');
+  if (compare) {
+    const cmp = (directional && directional.directional_comparison) || {};
+    const long = cmp.best_long_conservative_edge_bps;
+    const short = cmp.best_short_conservative_edge_bps;
+    const fmt = (value) => (typeof value === 'number' ? `${value.toFixed(1)}bps` : '-');
+    let note = `방향 비교: LONG ${fmt(long)} · SHORT ${fmt(short)}`;
+    if (cmp.short_rescued) note += ' · 숏이 NO_TRADE를 구제했을 상황';
+    else if (cmp.both_directions_negative) note += ' · 양방향 모두 음수';
+    compare.textContent = note;
+  }
 }
 
 // Ordered "why is nothing trading" chain. The FIRST unmet link is the answer;

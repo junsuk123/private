@@ -29,7 +29,7 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 - KIS 실계좌 읽기, 잔고/현금/보유종목 스냅샷 갱신
 - KIS 실시간 체결가/호가 수집과 브로커 quote 갱신
 - 실시간 feature frame 생성과 live short-horizon 모델 주기 학습
-- 온톨로지 허용 전략 안에서 11개 strategy-utility R-GCN 후보 평가
+- 온톨로지 허용 전략 안에서 strategy-utility R-GCN 후보 평가 (롱 13 + 숏 3, 숏은 shadow 평가만)
 - 전략별 실시간 forward 검증과 `calibrated`/`entry_authorized` 권한 분리
 - 독립 실시간 자동거래 루프 시작
 - SELL/REDUCE 평가를 BUY보다 먼저 실행
@@ -37,6 +37,8 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 - BUY는 현금, spread, 유동성, quote freshness, 온톨로지/런타임 근거, 순수익 게이트, 리스크 게이트를 모두 통과해야 제출
 - **신규 진입은 정규장에서만** — 시간외 호가(예: 미국 애프터마켓의 분당 2주 · 스프레드 33bp)로는 진입하지 않습니다. 청산은 시간외에도 계속 동작합니다.
 - **전략 선택은 보수적 하단값 기준** — `no_trade`가 실제 선택지이며, 측정된 순엣지 하단이 양수인 전략이 없으면 거래하지 않습니다.
+- **LONG / SHORT / NO_TRADE를 같은 선택 공간에서 비교**하되, 숏 arm은 배포 상태가 live 칸이 아니면
+  순위만 매겨지고 실행 후보가 되지 않습니다. 롱과 숏 posterior는 절대 합산하지 않습니다.
 
 **Windows 기본값은 live-capable입니다.** `run.ps1`은 `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`, `AUTO_START_REALTIME_TRADING=true`를 프로세스 환경에 설정합니다. 안전성은 live flag를 끄는 방식이 아니라 계좌/시장 데이터 신뢰도와 최종 게이트에서 확보합니다. 끄는 방법은 [docs/live_trading.md](docs/live_trading.md)에 있습니다.
 
@@ -105,7 +107,16 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 - strategy-utility R-GCN은 실제 전략 선택에 직접 참여합니다. 체크포인트 provenance, 온톨로지 허용 관계, 모델 보정 신뢰도, 전략별 실현 양수 순효율 검증 중 하나라도 실패하면 신규 진입 권한은 생기지 않습니다.
 - `GNN_REALTIME_MODEL_TRUST_PASSED`는 모델 보정 통과이고, `GNN_REALTIME_TRUST_PASSED`는 선택 전략의 실거래 진입 권한까지 통과했다는 뜻입니다.
 - synthetic/sample/hash 파생 데이터는 오프라인 fixture에서만 허용하고 paper/live 판단 근거로 쓰지 않습니다.
-- margin, leverage, derivatives, short selling, credit loan, leveraged ETF는 거부 대상입니다.
+- margin, derivatives, leveraged ETF는 실행 경로가 없어 전면 거부 대상입니다.
+- **short selling / credit loan은 실행 경로가 생겼지만 기본 거부입니다.** `RiskRules`의
+  `short_selling_allowed` / `credit_loan_allowed`는 기본 `False`이며, 켜더라도 해당 arm의
+  **배포 상태가 live 칸**이어야 주문이 만들어집니다. 두 조건은 독립이고, 하나만으로는 부족합니다.
+- 숏 전략 3개(`market_intraday_momentum_short`, `opening_range_breakdown`,
+  `residual_relative_weakness`)는 카탈로그에 있으나 **전량 `SHADOW`이며 실주문 권한이 0개**입니다.
+  `SHADOW → LIVE_FULL` 직행 전이는 어떤 환경변수·설정·수동 조작으로도 존재하지 않습니다
+  ([docs/short_selling_deployment.md](docs/short_selling_deployment.md)).
+- 숏 **청산**은 계좌 플래그나 리스크 한도로 막지 않습니다. 손실 중인 숏의 상환을 거부하면 무제한
+  손실 포지션이 갇힙니다.
 - live 주문은 `LiveExecutionCoordinator`를 통해 limit order로만 제출합니다.
 - audit log는 credential, token, 계좌번호, broker secret을 재귀적으로 마스킹합니다.
 
@@ -119,8 +130,9 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, 세션 판정 |
 | `src/app/features/`, `technical/` | 지표, live feature frame, 근거 기반 기술적 예측 레이어 |
 | `src/app/graph/`, `ontology/` | KnowledgeGraph, FactTable, RDF/OWL/SHACL, 거시–미시 추론, closed-world 게이트 |
-| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, 8개 전략 expert |
+| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, 전략 expert(롱 13 + 숏 3) |
 | `src/app/cost/`, `risk/`, `trading/` | ProfitabilityGate, 사이징, 원금보호, RiskManager, 동적 청산, 실시간 엔진 |
+| `src/app/trading/directional.py`, `borrow.py`, `directional_shadow.py`, `short_strategy_promotion.py` | 방향 계약, 대주 point-in-time 저널, forward shadow 평가, 배포 사다리 authority |
 | `src/app/execution/` | KIS adapter, 주문 가격 정책, 거래소 라우팅, live coordinator, 저널 |
 | `config/`, `packaging/raspberrypi/`, `scripts/` | 정책·프로파일 설정, Pi 패키지, 점검·학습·리플레이·벤치마크 스크립트 |
 
@@ -132,6 +144,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | [docs/ontology_and_gnn.md](docs/ontology_and_gnn.md) | 온톨로지 계층과 전략 효용 GNN, NPU/CPU 분할 |
 | [docs/decision_and_risk.md](docs/decision_and_risk.md) | 데이터→판단 매핑, 순수익 게이트, 동적 청산, 리스크와 실행, 레짐 변화 대응(§9), 진입 차단 진단(§10) |
 | [docs/live_trading.md](docs/live_trading.md) | 설치, 게이트, 운영, 비상 정지, arming, 런타임 프로파일 |
+| [docs/short_selling_deployment.md](docs/short_selling_deployment.md) | 숏 배포 사다리: 자동 승격/강등, 대주 fail-closed 규칙, forward shadow 누수 방어 |
 | [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md) | Pi CPU-only 배포와 키오스크 |
 | [docs/validation.md](docs/validation.md) | 벤치마크, 리플레이 지표, 승격 판정 |
 
@@ -140,6 +153,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 ```powershell
 python -m pytest
 python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
+python -m pytest tests/test_directional_short_ladder.py   # 숏 사다리 안전 속성
 ```
 
 live 주문을 제출하는 테스트는 없습니다. 환경에 따라 OpenVINO/NPU, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 secrets 상태의 영향을 받습니다.

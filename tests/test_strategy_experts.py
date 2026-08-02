@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from app.strategy.catalog import STRATEGY_IDS
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext, OwnedStrategyLifecycle
 from app.trading.contracts import IntentAction
+from app.trading.directional import PositionDirection
 
 
 NOW = datetime(2026, 7, 27, 1, 0, tzinfo=timezone.utc)
@@ -52,21 +53,121 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
         "intraday_momentum_window": 1.0,
         "first_half_hour_volatility": 0.9,
     }
-    context = ExpertContext(
-        symbol="005930",
-        as_of=NOW,
-        price=80000,
-        proposed_quantity=2,
-        feature_snapshot_id="features-1",
-        utility_evidence_id="utility-1",
-        quantiles=quantiles,
+    # A single "all inputs strong" fixture cannot make both directions fire, and it
+    # should not: the inputs that make a long thesis strong are precisely the ones that
+    # make its short counterpart wrong. So each direction gets the fixture that is
+    # maximally favourable TO IT, and the assertion below is that every catalogued
+    # expert proposes under its own favourable conditions.
+    #
+    # For shorts the directional signals are mirrored (low == weak == strong short
+    # case) and two inputs with no long-side analogue are supplied: ``borrow_available``
+    # (a hard precondition — no locate, no trade) and ``squeeze_risk``.
+    short_quantiles = {
+        **quantiles,
+        "intraday_momentum_signal": 0.1,
+        "opening_range_breakdown": 0.9,
+        "aggressor_imbalance": 0.1,
+        "residual_strength_short": 0.1,
+        "residual_strength_long": 0.1,
+        "investor_flow": 0.1,
+        "squeeze_risk": 0.1,
+        "borrow_available": 0.95,
+    }
+
+    def _context(values: dict[str, float]) -> ExpertContext:
+        return ExpertContext(
+            symbol="005930",
+            as_of=NOW,
+            price=80000,
+            proposed_quantity=2,
+            feature_snapshot_id="features-1",
+            utility_evidence_id="utility-1",
+            quantiles=values,
+        )
+
+    plans = tuple(
+        expert_type().propose(
+            _context(
+                short_quantiles
+                if expert_type.direction is PositionDirection.SHORT
+                else quantiles
+            )
+        )
+        for expert_type in ALL_EXPERT_TYPES
     )
-    plans = tuple(expert_type().propose(context) for expert_type in ALL_EXPERT_TYPES)
     expected = len(STRATEGY_IDS)
     assert len(plans) == expected
     assert all(plan is not None for plan in plans)
     assert len({plan.strategy_id for plan in plans if plan}) == expected
     assert len({plan.strategy_instance_id for plan in plans if plan}) == expected
+    # Each plan's broker side must match its declared direction/effect: an OPEN LONG is
+    # a BUY, an OPEN SHORT is a SELL. TradePlan validates this itself, so a mismatch
+    # would have raised — this pins that the experts actually produce both.
+    sides = {
+        (plan.position_direction, plan.side) for plan in plans if plan is not None
+    }
+    assert ("LONG", "BUY") in sides
+    assert ("SHORT", "SELL") in sides
+    # Every short plan ships SHADOW. A proposal is not an authorisation, and nothing in
+    # the expert layer may hand out a live short.
+    assert all(
+        plan.deployment_state == "SHADOW"
+        for plan in plans
+        if plan is not None and plan.position_direction == "SHORT"
+    )
+
+
+def test_short_experts_refuse_without_a_borrow_locate() -> None:
+    """No locate, no trade — regardless of how good the price thesis looks.
+
+    ``ExpertContext.q`` defaults an absent quantile to 0.5, which is below the entry
+    bar, so "we never asked about borrow" reads as "not available". That is the
+    fail-closed direction, and it is the one input whose absence cannot be recovered
+    from at execution time.
+    """
+    from app.strategy.experts import ShortStrategyExpert
+
+    short_types = [
+        kind for kind in ALL_EXPERT_TYPES if kind.direction is PositionDirection.SHORT
+    ]
+    assert short_types, "expected at least one catalogued short expert"
+    ideal = {
+        "intraday_momentum_signal": 0.1,
+        "intraday_momentum_window": 1.0,
+        "first_half_hour_volatility": 0.9,
+        "opening_range_breakdown": 0.9,
+        "relative_volume": 0.9,
+        "aggressor_imbalance": 0.1,
+        "residual_strength_short": 0.1,
+        "residual_strength_long": 0.1,
+        "investor_flow": 0.1,
+        "squeeze_risk": 0.1,
+        "liquidity": 0.9,
+        "volume": 0.9,
+    }
+    for kind in short_types:
+        assert issubclass(kind, ShortStrategyExpert), kind
+        # Borrow present -> proposes. Borrow absent -> refuses, same thesis inputs.
+        with_borrow = ExpertContext(
+            symbol="005930",
+            as_of=NOW,
+            price=80000,
+            proposed_quantity=2,
+            feature_snapshot_id="features-1",
+            utility_evidence_id="utility-1",
+            quantiles={**ideal, "borrow_available": 0.95},
+        )
+        without_borrow = ExpertContext(
+            symbol="005930",
+            as_of=NOW,
+            price=80000,
+            proposed_quantity=2,
+            feature_snapshot_id="features-1",
+            utility_evidence_id="utility-1",
+            quantiles=dict(ideal),
+        )
+        assert kind().propose(with_borrow) is not None, kind.strategy_id
+        assert kind().propose(without_borrow) is None, kind.strategy_id
 
 
 def test_opening_range_breakout_requires_stocks_in_play() -> None:

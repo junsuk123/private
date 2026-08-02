@@ -53,7 +53,22 @@ from uuid import uuid4
 DEFAULT_STORE_PATH = "data/store/strategy-performance.sqlite3"
 NO_TRADE_ARM = "no_trade"
 
-_SCHEMA_VERSION = 1
+# v2 adds the directional columns. Rows written before it are backfilled to
+# ('LONG', 'CASH', 'live'), which is factually what they were: the only positions
+# the system could open were cash longs.
+_SCHEMA_VERSION = 2
+
+# Where an outcome came from. The distinction is load-bearing for promotion: a
+# SHADOW outcome is a simulated fill and a LIVE outcome is a real one, and treating
+# them as interchangeable evidence is how a strategy gets promoted on the strength
+# of its own simulator.
+EVALUATION_SOURCE_SHADOW = "shadow"
+EVALUATION_SOURCE_LIVE_PROBE = "live_probe"
+EVALUATION_SOURCE_LIVE = "live"
+
+_LIVE_SOURCES: frozenset[str] = frozenset(
+    {EVALUATION_SOURCE_LIVE_PROBE, EVALUATION_SOURCE_LIVE}
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -91,9 +106,26 @@ def normalize_regime(regime: str | None) -> str:
     return str(regime or "").strip().upper() or "UNKNOWN"
 
 
+def normalize_direction(direction: Any) -> str:
+    """``LONG`` / ``SHORT``, defaulting to ``LONG``.
+
+    ``LONG`` is the safe default because it is what every pre-short row and every
+    caller that has not been made direction-aware actually means. Defaulting to
+    ``SHORT`` would silently reclassify the entire existing history.
+    """
+    name = str(direction or "").strip().upper()
+    return "SHORT" if name == "SHORT" else "LONG"
+
+
 @dataclass(frozen=True)
 class StrategyOutcome:
-    """One closed strategy trade, as realized (never as expected)."""
+    """One closed strategy trade, as realized (never as expected).
+
+    ``realized_net_bps`` is already direction-signed: a short that covered lower
+    made a POSITIVE net. The sign is applied once, at
+    ``app.trading.directional.gross_return_bps``, so nothing downstream has to know
+    which way the position pointed to read the number.
+    """
 
     strategy_id: str
     symbol: str
@@ -108,10 +140,27 @@ class StrategyOutcome:
     max_adverse_excursion_bps: float | None = None
     exit_reason: str = ""
     source: str = "live"
+    # --- Directional / borrow attribution ----------------------------------- #
+    direction: str = "LONG"
+    execution_product: str = "CASH"
+    deployment_state: str = "SHADOW"
+    evaluation_source: str = EVALUATION_SOURCE_LIVE
+    borrow_available: bool | None = None
+    borrow_fee_bps: float | None = None
+    borrow_quantity: int | None = None
+    # False for a signal that was valid but could not have been executed (no
+    # locate). These rows are kept for signal-quality analysis and EXCLUDED from
+    # every promotion statistic — a strategy cannot be promoted on trades it could
+    # not have taken.
+    signal_executable: bool = True
 
     @property
     def is_loss(self) -> bool:
         return self.realized_net_bps < 0.0
+
+    @property
+    def is_live(self) -> bool:
+        return self.evaluation_source in _LIVE_SOURCES
 
 
 @dataclass(frozen=True)
@@ -136,6 +185,9 @@ class StrategyPosterior:
     loss_streak: int
     mean_slippage_error_bps: float
     mean_prediction_error_bps: float
+    # ``"ALL"`` means the query was not direction-partitioned, which for a short arm
+    # is a bug rather than a wider view — see :meth:`StrategyPerformanceStore.posterior`.
+    direction: str = "ALL"
     reason_codes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
@@ -143,6 +195,7 @@ class StrategyPosterior:
             "strategy_id": self.strategy_id,
             "market": self.market,
             "regime": self.regime,
+            "direction": self.direction,
             "sample_count": self.sample_count,
             "effective_sample_count": round(self.effective_sample_count, 3),
             "observed_mean_net_bps": round(self.observed_mean_net_bps, 3),
@@ -241,8 +294,22 @@ class StrategyPerformanceStore:
         exit_reason: str = "",
         source: str = "live",
         recorded_at: datetime | None = None,
+        direction: str = "LONG",
+        execution_product: str | None = None,
+        deployment_state: str = "SHADOW",
+        evaluation_source: str | None = None,
+        borrow_available: bool | None = None,
+        borrow_fee_bps: float | None = None,
+        borrow_quantity: int | None = None,
+        signal_executable: bool = True,
     ) -> bool:
-        """Persist one closed outcome. Returns False when the store is unusable."""
+        """Persist one closed outcome. Returns False when the store is unusable.
+
+        ``realized_net_bps`` must already be direction-signed by the caller (via
+        :func:`app.trading.directional.gross_return_bps`). This store does not
+        re-apply the sign: doing it in two places is how a short's realized loss
+        becomes a recorded gain.
+        """
         if not self._available:
             return False
         strategy = str(strategy_id or "").strip()
@@ -253,6 +320,16 @@ class StrategyPerformanceStore:
             return False
         moment = _aware(recorded_at or datetime.now(timezone.utc))
         resolved_market = normalize_market(market or market_for_symbol(symbol))
+        resolved_direction = normalize_direction(direction)
+        resolved_product = (
+            str(execution_product).strip().upper()
+            if execution_product
+            # A short is settled on borrowed stock; a long in cash. Derived rather
+            # than defaulted to CASH so a caller that supplies direction but forgets
+            # product cannot record a short as a cash trade.
+            else ("CREDIT_BORROW" if resolved_direction == "SHORT" else "CASH")
+        )
+        resolved_evaluation = str(evaluation_source or source or EVALUATION_SOURCE_LIVE).strip().lower()
         row = (
             f"outcome-{uuid4().hex}",
             moment.isoformat(),
@@ -268,6 +345,14 @@ class StrategyPerformanceStore:
             _finite(max_adverse_excursion_bps),
             str(exit_reason or ""),
             str(source or "live"),
+            resolved_direction,
+            resolved_product,
+            str(deployment_state or "SHADOW").strip().upper(),
+            resolved_evaluation,
+            None if borrow_available is None else int(bool(borrow_available)),
+            _finite(borrow_fee_bps),
+            None if borrow_quantity is None else int(borrow_quantity),
+            int(bool(signal_executable)),
         )
         try:
             with self._lock, closing(self._connect()) as conn:
@@ -277,8 +362,10 @@ class StrategyPerformanceStore:
                         outcome_id, recorded_at, strategy_id, market, regime, symbol,
                         realized_net_bps, realized_gross_bps, expected_net_bps,
                         holding_seconds, slippage_error_bps, max_adverse_excursion_bps,
-                        exit_reason, source
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        exit_reason, source,
+                        direction, execution_product, deployment_state, evaluation_source,
+                        borrow_available, borrow_fee_bps, borrow_quantity, signal_executable
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     row,
                 )
@@ -288,6 +375,31 @@ class StrategyPerformanceStore:
             return False
         return True
 
+    def record_directional(
+        self,
+        key: Any,
+        *,
+        symbol: str,
+        realized_net_bps: float,
+        regime: str | None = None,
+        **kwargs: Any,
+    ) -> bool:
+        """``record`` keyed by a :class:`DirectionalStrategyKey`.
+
+        The preferred entry point for anything direction-aware: it cannot forget to
+        pass ``direction``/``execution_product``, because they come from the key.
+        """
+        return self.record(
+            strategy_id=key.strategy_id,
+            symbol=symbol,
+            realized_net_bps=realized_net_bps,
+            market=key.market,
+            regime=regime,
+            direction=str(key.direction),
+            execution_product=str(key.execution_product),
+            **kwargs,
+        )
+
     # -- reads -------------------------------------------------------------- #
     def recent_outcomes(
         self,
@@ -296,10 +408,40 @@ class StrategyPerformanceStore:
         market: str | None = None,
         regime: str | None = None,
         limit: int | None = None,
+        direction: str | None = None,
+        execution_product: str | None = None,
+        evaluation_sources: Sequence[str] | None = None,
+        executable_only: bool = True,
     ) -> tuple[StrategyOutcome, ...]:
+        """Most recent closed outcomes for one arm.
+
+        ``direction`` is a genuine filter, not a convenience. Omitting it pools LONG
+        and SHORT history into one series, and a strategy pair that makes 60bps long
+        while losing 60bps short would then read as break-even — permanently
+        untradable in both directions, while a real one-sided edge is diluted into
+        invisibility.
+
+        ``executable_only`` defaults True so signals that fired without a locatable
+        borrow never contribute to a posterior. They are recorded (for signal-quality
+        analysis) but a strategy may not be judged on trades it could not have taken.
+        """
         window = max(1, int(limit or self.posterior_config.window))
-        key = ("outcomes", str(strategy_id), normalize_market(market) if market else None,
-               normalize_regime(regime) if regime else None, window)
+        sources = (
+            tuple(sorted({str(item).strip().lower() for item in evaluation_sources}))
+            if evaluation_sources
+            else None
+        )
+        key = (
+            "outcomes",
+            str(strategy_id),
+            normalize_market(market) if market else None,
+            normalize_regime(regime) if regime else None,
+            window,
+            normalize_direction(direction) if direction else None,
+            str(execution_product).strip().upper() if execution_product else None,
+            sources,
+            bool(executable_only),
+        )
         cached = self._cached(key)
         if cached is not None:
             return cached
@@ -311,11 +453,27 @@ class StrategyPerformanceStore:
         if regime:
             clauses.append("regime = ?")
             params.append(normalize_regime(regime))
+        if direction:
+            clauses.append("direction = ?")
+            params.append(normalize_direction(direction))
+        if execution_product:
+            clauses.append("execution_product = ?")
+            params.append(str(execution_product).strip().upper())
+        if sources:
+            clauses.append(f"evaluation_source in ({','.join('?' * len(sources))})")
+            params.extend(sources)
+        if executable_only:
+            # ``is not 0`` rather than ``= 1``: pre-migration rows are backfilled to
+            # 1, but a NULL from a partially applied migration must not be silently
+            # dropped from a LONG posterior that predates the column.
+            clauses.append("(signal_executable is null or signal_executable != 0)")
         params.append(window)
         sql = (
             "select recorded_at, strategy_id, market, regime, symbol, realized_net_bps, "
             "realized_gross_bps, expected_net_bps, holding_seconds, slippage_error_bps, "
-            "max_adverse_excursion_bps, exit_reason, source from strategy_outcomes "
+            "max_adverse_excursion_bps, exit_reason, source, direction, execution_product, "
+            "deployment_state, evaluation_source, borrow_available, borrow_fee_bps, "
+            "borrow_quantity, signal_executable from strategy_outcomes "
             f"where {' and '.join(clauses)} order by recorded_at desc, rowid desc limit ?"
         )
         rows: Sequence[Any] = ()
@@ -339,11 +497,38 @@ class StrategyPerformanceStore:
                 max_adverse_excursion_bps=_finite(row[10]),
                 exit_reason=str(row[11] or ""),
                 source=str(row[12] or ""),
+                direction=normalize_direction(row[13]),
+                execution_product=str(row[14] or "CASH").upper(),
+                deployment_state=str(row[15] or "SHADOW").upper(),
+                evaluation_source=str(row[16] or EVALUATION_SOURCE_LIVE).lower(),
+                borrow_available=None if row[17] is None else bool(row[17]),
+                borrow_fee_bps=_finite(row[18]),
+                borrow_quantity=None if row[19] is None else int(row[19]),
+                signal_executable=True if row[20] is None else bool(row[20]),
             )
             for row in rows
         )
         self._store(key, outcomes)
         return outcomes
+
+    def outcomes_for_key(
+        self,
+        key: Any,
+        *,
+        regime: str | None = None,
+        limit: int | None = None,
+        evaluation_sources: Sequence[str] | None = None,
+    ) -> tuple[StrategyOutcome, ...]:
+        """Outcomes for one :class:`DirectionalStrategyKey`."""
+        return self.recent_outcomes(
+            key.strategy_id,
+            market=key.market,
+            regime=regime,
+            limit=limit,
+            direction=str(key.direction),
+            execution_product=str(key.execution_product),
+            evaluation_sources=evaluation_sources,
+        )
 
     def recent_net_bps(
         self,
@@ -352,12 +537,13 @@ class StrategyPerformanceStore:
         market: str | None = None,
         regime: str | None = None,
         limit: int | None = None,
+        direction: str | None = None,
     ) -> tuple[float, ...]:
         """Most recent first."""
         return tuple(
             outcome.realized_net_bps
             for outcome in self.recent_outcomes(
-                strategy_id, market=market, regime=regime, limit=limit
+                strategy_id, market=market, regime=regime, limit=limit, direction=direction
             )
         )
 
@@ -367,9 +553,12 @@ class StrategyPerformanceStore:
         *,
         market: str | None = None,
         regime: str | None = None,
+        direction: str | None = None,
     ) -> int:
         streak = 0
-        for value in self.recent_net_bps(strategy_id, market=market, regime=regime):
+        for value in self.recent_net_bps(
+            strategy_id, market=market, regime=regime, direction=direction
+        ):
             if value >= 0.0:
                 break
             streak += 1
@@ -381,9 +570,12 @@ class StrategyPerformanceStore:
         *,
         market: str | None = None,
         regime: str | None = None,
+        direction: str | None = None,
     ) -> bool:
         """Did the last closed trade of this strategy lose money?"""
-        recent = self.recent_net_bps(strategy_id, market=market, regime=regime, limit=1)
+        recent = self.recent_net_bps(
+            strategy_id, market=market, regime=regime, limit=1, direction=direction
+        )
         return bool(recent) and recent[0] < 0.0
 
     def recent_performance_rate(
@@ -453,26 +645,47 @@ class StrategyPerformanceStore:
         regime: str | None = None,
         change_point_probability: float = 0.0,
         limit: int | None = None,
+        direction: str | None = None,
+        execution_product: str | None = None,
     ) -> StrategyPosterior:
         """Shrunk posterior with an explicit pessimistic lower bound.
 
         ``change_point_probability`` discounts the effective sample count: a
         regime break does not make the history wrong, it makes it *less
         relevant*, and that is exactly an uncertainty statement.
+
+        ``direction`` partitions the history. It is widened to market-wide on a
+        regime miss (the pre-existing fallback), but it is NEVER widened across
+        direction: a short arm with no history must fall back to its prior, not to
+        the long arm's realized series. Borrowing the long side's evidence is
+        precisely how an unvalidated short would inherit a positive lower bound it
+        has not earned.
         """
         cfg = self.posterior_config
         resolved_market = normalize_market(market) if market else None
         resolved_regime = normalize_regime(regime) if regime else None
+        resolved_direction = normalize_direction(direction) if direction else None
         reasons: list[str] = []
 
         outcomes = self.recent_outcomes(
-            strategy_id, market=resolved_market, regime=resolved_regime, limit=limit
+            strategy_id,
+            market=resolved_market,
+            regime=resolved_regime,
+            limit=limit,
+            direction=resolved_direction,
+            execution_product=execution_product,
         )
         if not outcomes and resolved_regime:
             # Regime-conditioned history is the ideal; market-wide history is the
-            # honest fallback, flagged so the caller can see it was widened.
+            # honest fallback, flagged so the caller can see it was widened. The
+            # direction filter is deliberately preserved here.
             outcomes = self.recent_outcomes(
-                strategy_id, market=resolved_market, regime=None, limit=limit
+                strategy_id,
+                market=resolved_market,
+                regime=None,
+                limit=limit,
+                direction=resolved_direction,
+                execution_product=execution_product,
             )
             if outcomes:
                 reasons.append(POSTERIOR_REGIME_FALLBACK)
@@ -545,20 +758,47 @@ class StrategyPerformanceStore:
             mean_prediction_error_bps=(
                 sum(prediction_errors) / len(prediction_errors) if prediction_errors else 0.0
             ),
+            direction=resolved_direction or "ALL",
             reason_codes=tuple(dict.fromkeys(reasons)),
         )
 
+    def posterior_for_key(
+        self,
+        key: Any,
+        *,
+        regime: str | None = None,
+        change_point_probability: float = 0.0,
+        limit: int | None = None,
+    ) -> StrategyPosterior:
+        """Posterior for one :class:`DirectionalStrategyKey`."""
+        return self.posterior(
+            key.strategy_id,
+            market=key.market,
+            regime=regime,
+            change_point_probability=change_point_probability,
+            limit=limit,
+            direction=str(key.direction),
+            execution_product=str(key.execution_product),
+        )
+
     def summary(self, *, limit: int = 200) -> dict[str, Any]:
-        """Dashboard view: per-strategy realized net edge, newest first."""
+        """Dashboard view: per-arm realized net edge, newest first.
+
+        Grouped by direction and execution product as well as strategy and market,
+        so a strategy running both legs shows two rows rather than one averaged row
+        that describes neither.
+        """
         try:
             with self._lock, closing(self._connect()) as conn:
                 rows = conn.execute(
                     """
-                    select strategy_id, market, count(*), avg(realized_net_bps),
+                    select strategy_id, market, direction, execution_product,
+                           evaluation_source, count(*), avg(realized_net_bps),
                            sum(case when realized_net_bps > 0 then 1 else 0 end),
                            max(recorded_at)
                     from strategy_outcomes
-                    group by strategy_id, market
+                    where signal_executable is null or signal_executable != 0
+                    group by strategy_id, market, direction, execution_product, evaluation_source
                     order by max(recorded_at) desc
                     limit ?
                     """,
@@ -573,13 +813,133 @@ class StrategyPerformanceStore:
                 {
                     "strategy_id": str(row[0]),
                     "market": str(row[1]),
-                    "sample_count": int(row[2] or 0),
-                    "mean_net_bps": round(float(row[3] or 0.0), 3),
-                    "win_rate": round(float(row[4] or 0) / max(1, int(row[2] or 1)), 4),
-                    "last_recorded_at": row[5],
+                    "direction": normalize_direction(row[2]),
+                    "execution_product": str(row[3] or "CASH").upper(),
+                    "evaluation_source": str(row[4] or EVALUATION_SOURCE_LIVE).lower(),
+                    "sample_count": int(row[5] or 0),
+                    "mean_net_bps": round(float(row[6] or 0.0), 3),
+                    "win_rate": round(float(row[7] or 0) / max(1, int(row[5] or 1)), 4),
+                    "last_recorded_at": row[8],
                 }
                 for row in rows
             ],
+        }
+
+    def directional_metrics(
+        self,
+        key: Any,
+        *,
+        evaluation_sources: Sequence[str] | None = None,
+        limit: int = 500,
+        since: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate promotion statistics for one arm.
+
+        Everything the promotion controller needs that cannot be derived from a
+        posterior alone: distinct trading days and symbols (a strategy measured on
+        one day across one name has one observation, not sixty), drawdown, expected
+        shortfall, profit factor, borrow availability rate, and the fill/slippage
+        error series.
+
+        Only EXECUTABLE outcomes are counted. A short signal that fired with no
+        locatable borrow is real evidence about the *signal* and no evidence at all
+        about the *strategy's tradability*, so including it would let a strategy be
+        promoted on trades it could never have taken.
+        """
+        outcomes = self.recent_outcomes(
+            key.strategy_id,
+            market=key.market,
+            regime=None,
+            limit=limit,
+            direction=str(key.direction),
+            execution_product=str(key.execution_product),
+            evaluation_sources=evaluation_sources,
+        )
+        if since is not None:
+            cutoff = _aware(since)
+            outcomes = tuple(item for item in outcomes if item.recorded_at >= cutoff)
+        # Signal-quality denominator: every stored signal for this arm, executable
+        # or not. ``borrow_availability_rate`` is meaningless without it.
+        all_signals = self.recent_outcomes(
+            key.strategy_id,
+            market=key.market,
+            regime=None,
+            limit=limit,
+            direction=str(key.direction),
+            execution_product=str(key.execution_product),
+            evaluation_sources=evaluation_sources,
+            executable_only=False,
+        )
+        if since is not None:
+            cutoff = _aware(since)
+            all_signals = tuple(item for item in all_signals if item.recorded_at >= cutoff)
+
+        nets = [item.realized_net_bps for item in outcomes]
+        count = len(nets)
+        wins = [value for value in nets if value > 0.0]
+        losses = [value for value in nets if value < 0.0]
+        gross_profit = sum(wins)
+        gross_loss = -sum(losses)
+        # Newest-first, so the drawdown walk is over the reversed series.
+        equity = 0.0
+        peak = 0.0
+        max_drawdown = 0.0
+        for value in reversed(nets):
+            equity += value
+            peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, peak - equity)
+        streak = 0
+        for value in nets:
+            if value >= 0.0:
+                break
+            streak += 1
+        # ES95: mean of the worst 5% of outcomes, with a floor of one observation so
+        # a small sample still reports its worst trade rather than 0.0 (which would
+        # read as "no tail risk").
+        tail_size = max(1, int(round(count * 0.05))) if count else 0
+        tail = sorted(nets)[:tail_size] if tail_size else []
+        slippage_errors = [
+            item.slippage_error_bps for item in outcomes if item.slippage_error_bps is not None
+        ]
+        borrow_answered = [
+            item for item in all_signals if item.borrow_available is not None
+        ]
+        borrow_available = [item for item in borrow_answered if item.borrow_available]
+        borrow_fees = [
+            item.borrow_fee_bps for item in outcomes if item.borrow_fee_bps is not None
+        ]
+        return {
+            "strategy_key": key.as_text(),
+            **key.as_dict(),
+            "filled_trade_count": count,
+            "executable_signal_count": len(all_signals),
+            "distinct_trading_days": len(
+                {item.recorded_at.date().isoformat() for item in outcomes}
+            ),
+            "distinct_symbols": len({item.symbol for item in outcomes}),
+            "distinct_regimes": len({item.regime for item in outcomes}),
+            "mean_net_return_bps": (sum(nets) / count) if count else 0.0,
+            "median_net_return_bps": _median(nets),
+            "win_rate": (len(wins) / count) if count else 0.0,
+            # An arm with wins and NO losses has an undefined profit factor. Reported
+            # as None rather than as infinity, so a hard gate reads "not yet
+            # measurable" instead of "passes spectacularly" on a 3-trade sample.
+            "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else None,
+            "maximum_drawdown_bps": max_drawdown,
+            "expected_shortfall_95_bps": (-sum(tail) / len(tail)) if tail else 0.0,
+            "loss_streak": streak,
+            "mean_slippage_error_bps": (
+                sum(abs(value) for value in slippage_errors) / len(slippage_errors)
+                if slippage_errors
+                else None
+            ),
+            "borrow_availability_rate": (
+                len(borrow_available) / len(borrow_answered) if borrow_answered else None
+            ),
+            "mean_borrow_fee_bps": (sum(borrow_fees) / len(borrow_fees)) if borrow_fees else None,
+            "last_recorded_at": (
+                outcomes[0].recorded_at.isoformat() if outcomes else None
+            ),
         }
 
     def prune(self, *, keep_rows: int = 20_000) -> int:
@@ -659,6 +1019,7 @@ class StrategyPerformanceStore:
                     );
                     """
                 )
+                self._migrate_directional_columns(conn)
                 conn.execute(
                     "insert or ignore into schema_version(version) values (?)", (_SCHEMA_VERSION,)
                 )
@@ -668,6 +1029,44 @@ class StrategyPerformanceStore:
             # then returns empty and every posterior falls back to its prior,
             # which is the conservative direction.
             self._available = False
+
+    @staticmethod
+    def _migrate_directional_columns(conn: sqlite3.Connection) -> None:
+        """v1 -> v2: add the directional / borrow columns, in place.
+
+        Additive ``alter table`` with NOT NULL defaults, so a store written by the
+        previous version keeps every row and gains the correct values: the only
+        positions the system could open were cash longs, so ``('LONG', 'CASH')`` is
+        a factual backfill rather than an assumption.
+
+        Idempotent — the existing-column set is read first, so a repeated startup
+        (or a partially applied previous run) is a no-op rather than an error.
+        """
+        existing = {
+            str(row[1]) for row in conn.execute("pragma table_info(strategy_outcomes)").fetchall()
+        }
+        additions: tuple[tuple[str, str], ...] = (
+            ("direction", "text not null default 'LONG'"),
+            ("execution_product", "text not null default 'CASH'"),
+            ("deployment_state", "text not null default 'SHADOW'"),
+            # Pre-existing rows were real fills, so 'live' is the honest backfill.
+            ("evaluation_source", f"text not null default '{EVALUATION_SOURCE_LIVE}'"),
+            ("borrow_available", "integer"),
+            ("borrow_fee_bps", "real"),
+            ("borrow_quantity", "integer"),
+            ("signal_executable", "integer not null default 1"),
+        )
+        for column, definition in additions:
+            if column in existing:
+                continue
+            conn.execute(f"alter table strategy_outcomes add column {column} {definition}")
+        if "direction" not in existing:
+            # The directional index only makes sense once the column exists, and
+            # every posterior query now filters on direction.
+            conn.execute(
+                "create index if not exists idx_outcomes_directional on strategy_outcomes("
+                "strategy_id, direction, market, regime, recorded_at desc)"
+            )
 
 
 _DEFAULT_STORE: StrategyPerformanceStore | None = None
@@ -702,6 +1101,16 @@ def _finite(value: Any) -> float | None:
 
 def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _median(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
 def _parse_iso(value: Any) -> datetime | None:

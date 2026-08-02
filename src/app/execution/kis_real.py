@@ -238,6 +238,35 @@ class KisEndpointSet:
     def overseas_daytime_revise_cancel_tr_id(self) -> str:
         return "TTTS6038U"
 
+    # --- 신용/대주 (credit borrow) ------------------------------------------- #
+    # Separate TR ids from the cash path. Routing a short through ``order-cash``
+    # would place an ordinary SELL, which for an account holding none of the stock
+    # is a rejection at best; the dangerous case is the mirror — routing a
+    # buy-to-cover as a cash BUY, which *succeeds* and leaves the account long the
+    # stock while still owing the borrow.
+    def credit_tr_id_for_order(self, side: OrderSide) -> str:
+        """대주매도 신규 (SELL) / 융자·대주 상환 매수 (BUY)."""
+        return "TTTC0053U" if side == OrderSide.SELL else "TTTC0051U"
+
+    @property
+    def credit_order_revise_cancel_tr_id(self) -> str:
+        return "TTTC0083U"
+
+    @property
+    def credit_borrowable_tr_id(self) -> str:
+        """대주 가능 종목 조회."""
+        return "CTSC0271R"
+
+    @property
+    def credit_borrow_quantity_tr_id(self) -> str:
+        """대주 가능 수량/이용료 조회."""
+        return "TTTC8909R"
+
+    @property
+    def credit_balance_tr_id(self) -> str:
+        """신용/대주 잔고 조회 (대출일 포함)."""
+        return "CTRP6504R"
+
     @property
     def order_status_tr_id(self) -> str:
         return "TTTC8001R"
@@ -348,6 +377,263 @@ class KisDevelopersApiClient:
             order=order,
             submitted_at=datetime.now(timezone.utc),
         )
+
+    # ------------------------------------------------------------------ #
+    # 대주 (credit borrow / short) — read-only surface                     #
+    # ------------------------------------------------------------------ #
+    # VERIFICATION STATUS, from read-only probes against the live account
+    # (2026-08-02). Three availability endpoints were tried and all three were wrong:
+    #
+    #   TTTC8909R  /trading/inquire-credit-psamount  -> "조회종목은 신용종목이
+    #       아닙니다.(융자신규매수)" — the TR exists but reports 융자 (margin BUY)
+    #       purchasing power, not 대주 (stock-loan) availability. Wrong question.
+    #   CTSC0271R  /quotations/credit-by-company     -> "잘못된 TR 코드 입니다"
+    #       — the TR id does not exist.
+    #   CTRP6504R  /trading/inquire-credit-balance   -> HTTP 404 — the path does
+    #       not exist.
+    #
+    # Those three were GUESSED, and guessing a fourth would repeat the mistake. So the
+    # availability query is no longer a KIS method at all: it lives behind
+    # ``app.trading.borrow_source.BorrowDataSource``, whose default reports "no source
+    # configured" and whose working implementation reads an operator-maintained file.
+    # For a retail account the 대주 list is checked on the broker's web UI anyway, so a
+    # file is an honest source rather than a stopgap.
+    #
+    # What IS verified is the balance read below. It reuses the SAME
+    # ``inquire-balance`` / TTTC8434R call the portfolio path already makes every cycle
+    # in production, so it introduces no new endpoint — 대주 lots are simply the rows
+    # carrying credit metadata.
+    def get_borrow_balance(self) -> tuple[dict[str, Any], ...]:
+        """Open 대주 positions as the BROKER sees them, one row per loan lot.
+
+        Reads the already-verified ``inquire-balance`` response rather than a separate
+        credit-balance endpoint — the 404 above showed that endpoint does not exist, and
+        the balance response already carries ``loan_dt`` on credit rows.
+
+        ``loan_date`` (대출일) is load-bearing: it identifies WHICH borrow lot a
+        buy-to-cover repays. A row without one is returned WITH the flag set rather than
+        dropped, because a position we cannot describe is exactly what has to reach the
+        reconciliation logic and trigger a suspension.
+        """
+        lots: list[dict[str, Any]] = []
+        for page in self._get_domestic_balance_pages():
+            for row in page.get("output1") or []:
+                if not isinstance(row, dict):
+                    continue
+                quantity = _to_int(row.get("hldg_qty") or row.get("cblc_qty"))
+                if quantity <= 0:
+                    continue
+                loan_date = str(row.get("loan_dt") or "").strip()
+                loan_amount = _to_float(row.get("loan_amt"))
+                credit_type = str(row.get("crdt_type") or "").strip()
+                # A plain cash holding has no loan date, no loan amount and no credit
+                # type. Only rows with credit metadata can be a 대주 lot.
+                if not loan_date and not loan_amount and not credit_type:
+                    continue
+                lots.append(
+                    {
+                        "symbol": str(row.get("pdno") or "").strip().upper(),
+                        "quantity": quantity,
+                        "average_price": _to_float(row.get("pchs_avg_pric")),
+                        "loan_date": loan_date or None,
+                        "loan_date_missing": not loan_date,
+                        "loan_amount": loan_amount,
+                        "credit_type": credit_type or None,
+                        # Only 05 (대주) is a SHORT. A 융자 row (01) is a LEVERAGED
+                        # LONG; counting it as short exposure would invert the
+                        # net-exposure calculation.
+                        "direction": "SHORT" if credit_type == "05" else "LONG",
+                    }
+                )
+        return tuple(lots)
+
+    def reconcile_credit_positions(
+        self, internal_lots: tuple[dict[str, Any], ...] = ()
+    ) -> dict[str, Any]:
+        """Compare broker 대주 state against internal state. Broker wins.
+
+        Returns a verdict the promotion controller reads as
+        :class:`~app.trading.short_strategy_promotion.RuntimeHealth` flags. The three
+        disagreements it can find, and why each is fail-closed:
+
+        * **orphan** — the broker holds a short we have no record of. We cannot manage
+          an exit for a position whose thesis we do not know, so new entries stop and
+          the position goes to close-only management.
+        * **phantom** — we believe we hold a short the broker does not. Our exit logic
+          would send a buy-to-cover for stock we do not owe, which OPENS a long.
+        * **missing loan date** — the lot exists but cannot be repaid through the
+          매수상환 contract, which requires 대출일.
+
+        A transport failure surfaces as ``broker_state_restored=False`` rather than as
+        "no discrepancies": an unanswered reconciliation is not a clean one.
+        """
+        try:
+            broker_lots = self.get_borrow_balance()
+            restored = True
+            error = ""
+        except (KisApiError, RuntimeError, ValueError) as exc:
+            broker_lots = ()
+            restored = False
+            error = str(exc)
+
+        broker_shorts = {
+            (lot["symbol"], lot.get("loan_date") or ""): lot
+            for lot in broker_lots
+            if lot.get("direction") == "SHORT"
+        }
+        internal_shorts = {
+            (
+                str(lot.get("symbol") or "").upper(),
+                str(lot.get("loan_date") or ""),
+            ): lot
+            for lot in internal_lots
+            if str(lot.get("direction") or "LONG").upper() == "SHORT"
+        }
+        orphans = [key for key in broker_shorts if key not in internal_shorts]
+        phantoms = [key for key in internal_shorts if key not in broker_shorts]
+        loan_date_missing = any(
+            lot.get("loan_date_missing") for lot in broker_shorts.values()
+        )
+        quantity_mismatch = [
+            key
+            for key in broker_shorts
+            if key in internal_shorts
+            and int(internal_shorts[key].get("quantity") or 0)
+            != int(broker_shorts[key].get("quantity") or 0)
+        ]
+        return {
+            "broker_state_restored": restored,
+            "error": error,
+            "broker_short_lot_count": len(broker_shorts),
+            "internal_short_lot_count": len(internal_shorts),
+            "orphan_lots": [{"symbol": s, "loan_date": d} for s, d in orphans],
+            "phantom_lots": [{"symbol": s, "loan_date": d} for s, d in phantoms],
+            "quantity_mismatch_lots": [
+                {"symbol": s, "loan_date": d} for s, d in quantity_mismatch
+            ],
+            "loan_date_missing": loan_date_missing,
+            # Any disagreement blocks new short entries. Existing shorts stay
+            # manageable so an orphan can still be closed.
+            "position_direction_mismatch": bool(
+                orphans or phantoms or quantity_mismatch
+            ),
+            "new_short_entries_blocked": bool(
+                not restored
+                or orphans
+                or phantoms
+                or quantity_mismatch
+                or loan_date_missing
+            ),
+            "close_only_mode": bool(orphans),
+            "broker_lots": list(broker_lots),
+        }
+
+    def place_credit_borrow_open_order(self, order: FinalOrder) -> MockKisOrderReceipt:
+        """대주매도 신규 — opens a SHORT. Real money.
+
+        Refuses anything whose contract does not say exactly that. The checks look
+        redundant against the caller's own gates, and they are deliberately
+        duplicated here: this is the last function before a live short exists, and
+        every one of these mismatches would otherwise place a *different* order than
+        the one intended.
+        """
+        self._ensure_enabled()
+        _require_credit_contract(order, direction="SHORT", effect="OPEN", side=OrderSide.SELL)
+        return self._place_credit_order(order, repay=False)
+
+    def place_credit_borrow_close_order(self, order: FinalOrder) -> MockKisOrderReceipt:
+        """대주 상환 매수 (buy-to-cover) — closes a SHORT. Real money.
+
+        ``loan_date`` is mandatory and there is no fallback. Submitting a cover
+        without it either fails, or — depending on the broker's defaulting — repays a
+        DIFFERENT loan lot than intended, leaving one lot doubled and another still
+        open. Both are worse than not sending the order.
+        """
+        self._ensure_enabled()
+        _require_credit_contract(order, direction="SHORT", effect="CLOSE", side=OrderSide.BUY)
+        if not str(order.loan_date or "").strip():
+            raise ValueError(
+                "credit-borrow close order requires loan_date (대출일); "
+                "refusing to guess which loan lot to repay"
+            )
+        return self._place_credit_order(order, repay=True)
+
+    def cancel_credit_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
+        self._ensure_enabled()
+        body = self._revise_cancel_body(order_id, order, revise=False)
+        body["CRDT_TYPE"] = order.credit_type or "05"
+        if order.loan_date:
+            body["LOAN_DT"] = str(order.loan_date)
+        response = self._post(
+            "/uapi/domestic-stock/v1/trading/order-resv-rvsecncl",
+            tr_id=self.endpoints.credit_order_revise_cancel_tr_id,
+            body=body,
+            include_hashkey=True,
+        )
+        self._ensure_success(response, "KIS credit cancel rejected")
+        return self._receipt_from_revise_cancel_response(response, order_id, order)
+
+    def _place_credit_order(self, order: FinalOrder, *, repay: bool) -> MockKisOrderReceipt:
+        body = self._credit_order_body(order, repay=repay)
+        response = self._post(
+            "/uapi/domestic-stock/v1/trading/order-credit",
+            tr_id=self.endpoints.credit_tr_id_for_order(order.side),
+            body=body,
+            include_hashkey=True,
+        )
+        self._ensure_success(response, "KIS credit order rejected")
+        output = response.get("output") or {}
+        # Cross-check what the broker says it booked against what we asked for. A
+        # credit classification we did not request means the order that exists is not
+        # the order we designed, and continuing to manage it as if it were is how an
+        # unhedged, mis-typed position accumulates.
+        booked_type = str(output.get("crdt_type") or output.get("CRDT_TYPE") or "").strip()
+        expected_type = body.get("CRDT_TYPE", "")
+        if booked_type and expected_type and booked_type != expected_type:
+            raise KisApiError(
+                f"KIS booked credit type {booked_type!r} but {expected_type!r} was requested "
+                f"for {order.ticker}; refusing to treat this as the intended position",
+                response,
+            )
+        order_id = str(output.get("ODNO") or output.get("odno") or "")
+        if not order_id:
+            order_id = f"KIS-CR-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        self._orders[order_id] = order
+        self._order_org_numbers[order_id] = str(
+            output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or ""
+        )
+        return MockKisOrderReceipt(
+            order_id=order_id,
+            accepted=True,
+            status="ACCEPTED",
+            message=str(response.get("msg1") or "KIS accepted the credit order."),
+            order=order,
+            submitted_at=datetime.now(timezone.utc),
+        )
+
+    def _credit_order_body(self, order: FinalOrder, *, repay: bool) -> dict[str, str]:
+        body = {
+            "CANO": self.credentials.account_no,
+            "ACNT_PRDT_CD": self.credentials.account_product_code,
+            "PDNO": order.ticker,
+            "CRDT_TYPE": order.credit_type or "05",
+            "ORD_DVSN": _domestic_order_division_code(),
+            "ORD_QTY": str(int(order.quantity)),
+            "ORD_UNPR": str(int(round(order.limit_price))),
+            "EXCG_ID_DVSN_CD": "KRX",
+            "LOAN_DT": "",
+            "RVSE_CNCL_DVSN_CD": "",
+            "CNDT_PRIC": "",
+        }
+        if repay:
+            # Identifies WHICH loan lot this cover repays. Validated non-empty by the
+            # caller; asserted again here because an empty LOAN_DT on a repayment is
+            # silently accepted by the API and applied to an arbitrary lot.
+            loan_date = str(order.loan_date or "").strip()
+            if not loan_date:
+                raise ValueError("credit repayment body requires LOAN_DT")
+            body["LOAN_DT"] = loan_date
+        return body
 
     def overseas_product_info(self, ticker: str, exchange_code: str) -> dict[str, Any]:
         """해외주식 상품기본정보 (CTPF1702R)."""
@@ -1720,6 +2006,93 @@ def _to_float(value: Any) -> float:
         return float(str(value).replace(",", ""))
     except ValueError:
         return 0.0
+
+
+def _to_float_value(value: Any) -> float:
+    """Alias kept explicit at the 대주 call sites (KIS returns comma-grouped text)."""
+    return _to_float(value)
+
+
+def _to_int(value: Any) -> int:
+    """KIS quantities arrive as comma-grouped strings; unparseable means zero.
+
+    Zero, not None: this feeds ``available_quantity``, and a quantity we cannot read
+    must behave as "no locate" rather than as "unknown but maybe fine".
+    """
+    try:
+        return int(float(str(value or "0").replace(",", "").strip() or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _to_optional_float(value: Any) -> float | None:
+    """``None``-preserving float. An unreadable borrow RATE must stay unknown.
+
+    Distinct from :func:`_to_float`, which returns 0.0. For a borrow fee, 0.0 means
+    "free to borrow" and would let an unpriced short pass its cost gate — so this
+    variant exists specifically so the fee can be absent rather than free.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        number = float(str(value).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None  # NaN-safe
+
+
+def _parse_kis_deadline(value: Any) -> datetime | None:
+    """Parse a KIS 'YYYYMMDD' repayment date into an aware datetime.
+
+    Resolved at 15:30 KST, the end of the KRX session: a borrow due "on" a date must
+    be repaid during that day's trading, not at midnight after it. Anchoring to
+    midnight would make the recall-deadline guard think there was a full extra
+    session available.
+    """
+    text = str(value or "").strip().replace("-", "")
+    if len(text) != 8 or not text.isdigit():
+        return None
+    try:
+        parsed = datetime.strptime(text, "%Y%m%d")
+    except ValueError:
+        return None
+    return parsed.replace(hour=15, minute=30, tzinfo=timezone(timedelta(hours=9)))
+
+
+def _require_credit_contract(
+    order: FinalOrder, *, direction: str, effect: str, side: OrderSide
+) -> None:
+    """Fail closed unless the order's contract is exactly the intended one.
+
+    Checks the direction, the effect, the execution product AND the broker side, all
+    four. Any single mismatch means the order about to be submitted is not the order
+    that was designed — most dangerously a SHORT/CLOSE contract carrying
+    ``side=SELL``, which would sell stock the account does not hold instead of
+    covering the borrow.
+    """
+    actual_direction = str(order.position_direction or "").strip().upper()
+    # Resolved, not raw: an order whose effect was left to inference is still a valid
+    # contract, and demanding the literal field would reject it for being implicit
+    # rather than for being wrong.
+    actual_effect = str(order.resolved_position_effect or "").strip().upper()
+    product = str(order.execution_product or "").strip().upper()
+    if actual_direction != direction or actual_effect != effect:
+        raise ValueError(
+            f"credit order contract mismatch for {order.ticker}: expected "
+            f"{direction}/{effect}, got {actual_direction or '?'}/{actual_effect or '?'}"
+        )
+    if product != "CREDIT_BORROW":
+        raise ValueError(
+            f"credit order for {order.ticker} must declare execution_product="
+            f"CREDIT_BORROW, got {product or '?'}"
+        )
+    if order.side != side:
+        raise ValueError(
+            f"credit order for {order.ticker} declares {direction}/{effect} but carries "
+            f"broker side {order.side}; expected {side}"
+        )
+    if order.quantity <= 0:
+        raise ValueError(f"credit order for {order.ticker} must have positive quantity")
 
 
 def _kis_yyyymmdd(value: Any) -> str:

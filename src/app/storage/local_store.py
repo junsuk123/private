@@ -74,6 +74,18 @@ class LocalResearchStore:
         self.save_typed_market_snapshots(tuple(result.market_snapshots))
         return saved
 
+    def save_macro_metrics(self, records: Any) -> int:
+        """Persist macro observations on their own, outside a full research run.
+
+        The weekend backfill replays FRED history so the store holds a series rather
+        than a single latest print. Deduplication is the same ``_macro_key`` used by
+        ``save_research_result``, so replaying an overlapping range is idempotent and
+        safe to repeat.
+        """
+        return self._insert_unique(
+            "macro_metrics", tuple(records), _macro_key, _macro_observed_at
+        )
+
     def save_graph_and_reasoning(
         self,
         triples: tuple[Triple, ...],

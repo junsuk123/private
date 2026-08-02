@@ -8,6 +8,23 @@ from uuid import uuid4
 from app.trading.contracts import IntentAction, OrderIntent, TradePlan
 from app.strategy.catalog import STRATEGY_IDS
 from app.strategy.exit_geometry import exit_geometry
+from app.trading.directional import (
+    PositionDirection,
+    PositionEffect,
+    StrategyDeploymentState,
+    broker_side,
+    default_product,
+    parse_direction,
+    stop_breached,
+    stop_price,
+    target_price,
+    target_reached,
+)
+
+
+def _intent_action(direction: PositionDirection, effect: PositionEffect) -> IntentAction:
+    """Broker-facing intent action for a (direction, effect) pair."""
+    return IntentAction(broker_side(direction, effect))
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,10 @@ def _geometry_config(strategy_id: str, **overrides: float) -> ExpertConfig:
 class StrategyExpert:
     strategy_id = "base"
     thesis = "base"
+    # LONG unless a subclass says otherwise. Direction is a class fact for an
+    # expert (each expresses one thesis in one direction) while the tradable ARM
+    # identity carries it explicitly — see DirectionalStrategyKey.
+    direction = PositionDirection.LONG
     default_config = ExpertConfig()
 
     def __init__(self, config: ExpertConfig | None = None) -> None:
@@ -70,30 +91,59 @@ class StrategyExpert:
         if context.price <= 0 or context.proposed_quantity <= 0 or not self.admissible(context):
             return None
         instance_id = f"{self.strategy_id}-{uuid4().hex}"
+        product = default_product(self.direction)
+        # Stop and target are placed by direction rather than by a hardcoded
+        # (1 - stop) / (1 + profit): for a short the profit target sits BELOW the
+        # entry and the stop ABOVE it. Getting this pair backwards would arm a
+        # position whose "stop" is its target, i.e. one that exits on the winning
+        # side and runs on the losing one.
         return TradePlan(
             strategy_id=self.strategy_id,
             strategy_instance_id=instance_id,
             symbol=context.symbol,
-            side="BUY",
+            side=broker_side(self.direction, PositionEffect.OPEN),
             thesis=self.thesis,
             entry_trigger={"kind": "robust_quantile", "as_of": context.as_of.isoformat()},
             entry_price_policy={"kind": "passive_limit", "reference": context.price},
             proposed_quantity=context.proposed_quantity,
             initial_stop={
-                "price": context.price * (1 - self.config.stop_bps / 10_000),
+                "price": stop_price(
+                    context.price, self.config.stop_bps / 10_000, self.direction
+                ),
                 "bps": self.config.stop_bps,
             },
             profit_policy={
-                "price": context.price * (1 + self.config.profit_bps / 10_000),
+                "price": target_price(
+                    context.price, self.config.profit_bps / 10_000, self.direction
+                ),
                 "bps": self.config.profit_bps,
             },
             trailing_policy={"bps": self.config.trailing_bps},
             max_holding_seconds=self.config.max_holding_seconds,
-            invalidation_conditions=("DATA_STALE", "ONTOLOGY_BLOCKED", "THESIS_INVALIDATED"),
+            invalidation_conditions=(
+                ("DATA_STALE", "ONTOLOGY_BLOCKED", "THESIS_INVALIDATED")
+                if self.direction is PositionDirection.LONG
+                # A borrow that disappears or is recalled invalidates a short thesis
+                # regardless of whether the price thesis still holds.
+                else (
+                    "DATA_STALE",
+                    "ONTOLOGY_BLOCKED",
+                    "THESIS_INVALIDATED",
+                    "BORROW_UNAVAILABLE",
+                    "BORROW_RECALLED",
+                )
+            ),
             max_entry_slippage_bps=self.config.max_entry_slippage_bps,
             expires_at=context.as_of + timedelta(seconds=self.config.entry_ttl_seconds),
             feature_snapshot_id=context.feature_snapshot_id,
             utility_evidence_id=context.utility_evidence_id,
+            position_direction=str(self.direction),
+            position_effect=str(PositionEffect.OPEN),
+            execution_product=str(product),
+            # A proposal is not an authorisation. Every plan leaves here marked
+            # SHADOW; the submitter reads the authoritative deployment state from
+            # the promotion controller and will refuse anything not cleared there.
+            deployment_state=str(StrategyDeploymentState.SHADOW),
         )
 
 
@@ -292,6 +342,97 @@ class MarketIntradayMomentumExpert(StrategyExpert):
         )
 
 
+# --------------------------------------------------------------------------- #
+# SHORT-side experts                                                           #
+# --------------------------------------------------------------------------- #
+# Every one of these adds a borrow precondition that has no long-side analogue.
+# ``borrow_available`` is not a score contribution and not a preference: a short
+# with no locatable borrow is not a worse trade, it is not a trade. Treating it as
+# a soft factor is how a signal becomes an order the broker rejects — or worse,
+# accepts and then forcibly closes.
+class ShortStrategyExpert(StrategyExpert):
+    """Base for short theses: enforces the borrow precondition uniformly."""
+
+    direction = PositionDirection.SHORT
+
+    def borrow_locatable(self, c: ExpertContext) -> bool:
+        # Deliberately a HIGH bar on a quantile that means "borrow comfortably
+        # available", and absent quantiles default to 0.5 in ``ExpertContext.q``,
+        # which is below the bar. So "we did not ask" reads as "not available"
+        # rather than as "available" — fail-closed on the one input whose absence
+        # is unrecoverable at execution time.
+        return c.q("borrow_available") >= self.config.entry_quantile
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return self.borrow_locatable(c) and self.thesis_admissible(c)
+
+    def thesis_admissible(self, c: ExpertContext) -> bool:
+        raise NotImplementedError
+
+
+class MarketIntradayMomentumShortExpert(ShortStrategyExpert):
+    strategy_id = "market_intraday_momentum_short"
+    thesis = "negative first half-hour return continues into the last half-hour"
+    default_config = _geometry_config("market_intraday_momentum_short")
+
+    def thesis_admissible(self, c: ExpertContext) -> bool:
+        # The NEGATIVE leg of the same published effect the long expert takes the
+        # positive leg of (Gao/Han/Li/Zhou). Both legs are in the paper; only the
+        # positive one was expressible before, because the negative one needs 대주.
+        #
+        # This is not "the long expert with the sign flipped": it is the other half
+        # of a two-sided finding, and it is evaluated on its own forward outcomes
+        # because the borrow cost falls only on this side.
+        return (
+            # Low quantile == the first half-hour return was strongly negative.
+            c.q("intraday_momentum_signal") <= 1 - self.config.entry_quantile
+            and c.q("intraday_momentum_window") >= self.config.entry_quantile
+            # Same volatility precondition, and it binds harder here: the move must
+            # clear a round trip PLUS borrow.
+            and c.q("first_half_hour_volatility") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class OpeningRangeBreakdownExpert(ShortStrategyExpert):
+    strategy_id = "opening_range_breakdown"
+    thesis = "opening-range breakdown on high relative volume with sell-side aggression"
+    default_config = _geometry_config("opening_range_breakdown")
+
+    def thesis_admissible(self, c: ExpertContext) -> bool:
+        # The relative-volume "stocks in play" restriction is load-bearing on this
+        # side too, for the same reason as the breakout: the unrestricted version
+        # does not pay. Sell-side aggression is required because a breakdown into
+        # buying is the mirror of the classic false break.
+        return (
+            c.q("opening_range_breakdown") >= self.config.entry_quantile
+            and c.q("relative_volume") >= self.config.entry_quantile
+            and c.q("aggressor_imbalance") <= 1 - self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+            # A breakdown in a name that has already been squeezed once is where
+            # short losses come from, so squeeze risk is a hard exclusion.
+            and c.q("squeeze_risk") <= 1 - self.config.confirmation_quantile
+        )
+
+
+class ResidualRelativeWeaknessExpert(ShortStrategyExpert):
+    strategy_id = "residual_relative_weakness"
+    thesis = "idiosyncratic weakness net of market and sector beta persists while flow confirms it"
+    default_config = _geometry_config("residual_relative_weakness")
+
+    def thesis_admissible(self, c: ExpertContext) -> bool:
+        # Beta-neutral by construction, which is the point: it is the one short
+        # thesis here that does not need the index to fall, so it stays valid in a
+        # rising market where a directional short is fighting the tape.
+        return (
+            c.q("residual_strength_short") <= 1 - self.config.entry_quantile
+            and c.q("residual_strength_long") <= 1 - self.config.confirmation_quantile
+            and c.q("investor_flow") <= 1 - self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+            and c.q("squeeze_risk") <= 1 - self.config.confirmation_quantile
+        )
+
+
 ALL_EXPERT_TYPES = (
     IntradayMomentumExpert,
     BreakoutVolumeExpert,
@@ -306,6 +447,9 @@ ALL_EXPERT_TYPES = (
     OfiMicropriceExhaustionReversalExpert,
     OpeningRangeBreakoutExpert,
     MarketIntradayMomentumExpert,
+    MarketIntradayMomentumShortExpert,
+    OpeningRangeBreakdownExpert,
+    ResidualRelativeWeaknessExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS
@@ -314,10 +458,13 @@ assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS
 class OwnedStrategyLifecycle:
     def __init__(self, plan: TradePlan) -> None:
         self.plan = plan
+        self.direction = parse_direction(plan.position_direction)
 
     def entry_intent(self, created_at: datetime) -> OrderIntent:
+        # OPEN, not "BUY". For a short thesis the opening order is a SELL, and
+        # hardcoding BUY here would have opened a long against a short plan.
         return self._intent(
-            action=IntentAction.BUY,
+            action=_intent_action(self.direction, PositionEffect.OPEN),
             quantity=self.plan.proposed_quantity,
             created_at=created_at,
             reason="PLAN_ENTRY",
@@ -342,16 +489,19 @@ class OwnedStrategyLifecycle:
             reason = "DATA_STALE_FAIL_SAFE"
         elif invalidated:
             reason = "THESIS_INVALIDATED"
-        elif price <= stop:
+        # Barrier comparisons are directional. ``price <= stop`` is a stop-out for a
+        # long and a PROFIT for a short; using the long comparison on a short plan
+        # would have exited every winner at its stop and held every loser.
+        elif stop_breached(price, stop, self.direction):
             reason = "INITIAL_STOP"
-        elif price >= target:
+        elif target_reached(price, target, self.direction):
             reason = "PROFIT_TARGET"
         elif (as_of - opened_at).total_seconds() >= self.plan.max_holding_seconds:
             reason = "MAX_HOLDING_TIME"
         if reason is None:
             return None
         return self._intent(
-            action=IntentAction.SELL,
+            action=_intent_action(self.direction, PositionEffect.CLOSE),
             quantity=quantity,
             created_at=as_of,
             reason=reason,
@@ -377,7 +527,11 @@ class OwnedStrategyLifecycle:
             action=action,
             quantity=quantity,
             limit_or_price_policy=self.plan.entry_price_policy,
-            urgency="HIGH" if action == IntentAction.SELL else "NORMAL",
+            # Urgency belongs to the EFFECT, not to the broker side: exiting is
+            # urgent, entering is not. Keyed off SELL, a short's buy-to-cover — the
+            # one exit whose loss is unbounded if it is slow — would have been sent
+            # at NORMAL urgency.
+            urgency="HIGH" if reason != "PLAN_ENTRY" else "NORMAL",
             reason_code=reason,
             created_at=created_at,
             expires_at=created_at + timedelta(seconds=5),

@@ -1,0 +1,149 @@
+# Per-arm deployment state machine for SHORT strategies.
+#
+# READ THIS BEFORE EDITING
+# ------------------------
+# Nothing in this file can put a short strategy straight into live trading.
+#
+#   * ``initial_state`` is CLAMPED to SHADOW. Writing LIVE_PROBE (or anything that
+#     submits orders) here logs a warning and resolves to SHADOW.
+#   * SHADOW -> LIVE_FULL is not in the transition whitelist
+#     (``app.trading.directional.ALLOWED_TRANSITIONS``), so no threshold value makes
+#     it reachable. An arm climbs one rung per evaluation cycle at most.
+#   * Lowering a threshold does not retroactively promote anything: the
+#     consecutive-pass counter resets on every failing cycle, so a relaxation still
+#     costs ``required_consecutive_cycles`` clean cycles.
+#
+# Thresholds here OVERRIDE the built-in defaults key by key. A block that names one
+# threshold leaves the others at their default rather than zeroing them.
+#
+# Units: *_bps are basis points of notional. Borrow fees are ANNUALISED bps and live
+# in config/borrow_cost_policy.yaml.
+
+enabled: true
+config_version: "short-deployment-v1"
+
+# How often the promotion controller re-evaluates every arm. 300s means a demotion
+# trigger acts within five minutes, which is the outer bound on how long a degraded
+# short strategy can keep its current position limits.
+evaluation_interval_seconds: 300
+
+# Applies to any arm whose strategy is enabled but has no persisted state yet.
+default_initial_state: SHADOW
+
+# Live evidence counts this many times a shadow observation when the two are
+# blended. A shadow fill is our own simulator agreeing with itself; a live fill is
+# the market disagreeing.
+live_evidence_weight: 3.0
+
+# Length of one promotion-holdout window, in days. Windows are disjoint and walked
+# backwards from now, so a single good week cannot satisfy several of them.
+holdout_window_days: 5
+
+strategies:
+  # An unlisted strategy is NOT enabled. Absence means off, so a half-finished edit
+  # cannot switch a short on by omission.
+  market_intraday_momentum_short:
+    enabled: true
+    initial_state: SHADOW
+  opening_range_breakdown:
+    enabled: true
+    initial_state: SHADOW
+  residual_relative_weakness:
+    enabled: true
+    initial_state: SHADOW
+
+promotion:
+  # SHADOW -> LIVE_PROBE is the expensive gate: it is the first time real money is
+  # at risk, and it is the only rung that can be cleared on simulated fills. Hence
+  # the sample requirements are the strictest on the ladder.
+  shadow_to_live_probe:
+    # 120 signals but only 60 filled trades: the gap is the borrow-locate failures
+    # and unfilled entries, and both are counted so a strategy that only "works"
+    # on unborrowable names cannot qualify.
+    minimum_executable_signals: 120
+    minimum_filled_trades: 60
+    # 20 trading days and 10 symbols. Sixty trades on one name over two days is one
+    # observation repeated, not sixty observations.
+    minimum_distinct_trading_days: 20
+    minimum_distinct_symbols: 10
+    minimum_confidence_score: 0.72
+    # Conservative edge is the pessimistic LOWER bound after cost, uncertainty and
+    # context penalties — not the mean. 8bps of it, on a ~36bps all-in short cost.
+    minimum_conservative_edge_bps: 8.0
+    minimum_lower_confidence_bound_net_bps: 3.0
+    minimum_profit_factor: 1.15
+    # Gross edge must be 1.7x all-in cost, not merely equal to it. Both terms are
+    # estimates and equality is a loss.
+    minimum_cost_coverage_ratio: 1.7
+    maximum_drawdown_bps: 250.0
+    maximum_expected_shortfall_95_bps: 120.0
+    maximum_loss_streak: 5
+    maximum_calibration_error: 0.08
+    maximum_mean_absolute_slippage_error_bps: 12.0
+    minimum_borrow_availability_rate: 0.7
+    minimum_data_freshness_pass_rate: 0.98
+    # The short must actually RESCUE something: at least 3% of evaluation snapshots
+    # where no long arm had a positive edge but this short did. Without this an arm
+    # can pass every other gate while only ever firing alongside a better long,
+    # in which case adding it bought nothing and only added exposure.
+    minimum_short_rescue_rate: 0.03
+    required_holdout_windows_passed: 3
+    required_consecutive_cycles: 5
+
+  # From here on, shadow evidence no longer counts. These rungs are judged on real
+  # fills only.
+  live_probe_to_live_limited:
+    minimum_live_probe_trades: 20
+    minimum_live_probe_days: 10
+    minimum_confidence_score: 0.78
+    minimum_live_realized_net_bps: 3.0
+    minimum_live_profit_factor: 1.1
+    maximum_live_drawdown_bps: 150.0
+    maximum_live_slippage_error_bps: 15.0
+    maximum_broker_rejection_rate: 0.03
+    required_consecutive_cycles: 5
+
+  live_limited_to_live_full:
+    minimum_total_live_trades: 60
+    minimum_total_live_days: 30
+    minimum_confidence_score: 0.84
+    minimum_conservative_edge_bps: 10.0
+    minimum_live_profit_factor: 1.2
+    maximum_live_drawdown_bps: 200.0
+    maximum_broker_rejection_rate: 0.02
+    minimum_borrow_availability_rate: 0.8
+    required_consecutive_cycles: 10
+
+demotion:
+  # Every value below is LOOSER than the promotion threshold at the same rung. The
+  # gap is deliberate hysteresis: an arm sitting exactly on its promotion boundary
+  # would otherwise oscillate every cycle, and each oscillation is a real change in
+  # live position limits.
+  #
+  # Note the asymmetry with promotion — demotion needs at most 2 consecutive
+  # failures and usually 1, against 5-10 passes to promote. Slow promotion costs a
+  # missed trade; slow demotion costs a compounding loss on an unbounded downside.
+  live_full_confidence: 0.80
+  live_full_conservative_edge_bps: 5.0
+  live_full_profit_factor: 1.05
+  live_full_slippage_error_bps: 15.0
+  live_full_borrow_availability_rate: 0.70
+  live_full_consecutive_failures: 2
+
+  live_limited_confidence: 0.72
+  live_limited_recent_net_mean_bps: 0.0
+  live_limited_loss_streak: 4
+  live_limited_drawdown_fraction_of_limit: 0.8
+
+  live_probe_to_shadow_confidence: 0.65
+  live_probe_profit_factor: 0.9
+  live_probe_conservative_edge_bps: 0.0
+  live_probe_broker_rejection_rate: 0.05
+
+  # Immediate suspension: no consecutive-failure grace. Each of these says internal
+  # state and broker state disagree, or the market is not in a condition this thesis
+  # was validated in. Averaging over cycles would mean trading on a position we
+  # cannot describe.
+  immediate_suspend_on_position_mismatch: true
+  immediate_suspend_on_missing_loan_date: true
+  immediate_suspend_change_point_probability: 0.7

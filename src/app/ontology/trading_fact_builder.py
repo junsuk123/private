@@ -19,6 +19,57 @@ class TradingFacts:
     symbol: str
     side: str = "BUY"                      # BUY / SELL
     is_domestic: bool = True
+    # --- direction contract -------------------------------------------------- #
+    # ``side`` remains the broker-facing BUY/SELL; these say what the order MEANS.
+    # Defaults describe a cash long open, so every existing construction site keeps
+    # its exact meaning.
+    position_direction: str = "LONG"
+    position_effect: str = "OPEN"
+    execution_product: str = "CASH"
+
+    # --- short (borrow) facts: CLOSED WORLD ---------------------------------- #
+    # Every one of these defaults to the REFUSING value, and that is the opposite
+    # convention to the long-side facts above (where ``orderbook_fresh`` defaults
+    # True and an unanswerable check must not read as a withdrawal).
+    #
+    # The asymmetry is deliberate. A missing long-side fact costs a skipped trade. A
+    # missing borrow fact costs an order the broker rejects, or accepts and then
+    # force-closes at a price it chooses. So "we did not establish this" and "this is
+    # false" are treated identically on the short side, and there is no path by which
+    # an unpopulated field permits new short exposure.
+    short_sale_permitted: bool = False
+    borrow_available: bool = False
+    borrow_available_quantity: int = 0
+    borrow_quantity_required: int = 0
+    # ANNUALISED bps, matching app.trading.borrow. ``None`` is NOT zero: an unpriced
+    # borrow cannot be shown to clear its own cost.
+    borrow_fee_bps_annualised: float | None = None
+    max_borrow_fee_bps_annualised: float = 1500.0
+    borrow_snapshot_age_seconds: float | None = None
+    hours_to_recall_deadline: float | None = None
+    short_interest_ratio: float | None = None
+    days_to_cover: float | None = None
+    short_squeeze_risk: bool = False
+    # Deployment authorization, per ARM. Never a single model-level flag.
+    short_strategy_shadow_validated: bool = False
+    short_strategy_live_probe_authorized: bool = False
+    short_strategy_live_authorized: bool = False
+    # Regime. Both directions are blocked for new entries in a dislocated market.
+    macro_regime: str = ""
+
+    @property
+    def is_short_entry(self) -> bool:
+        return (
+            str(self.position_direction or "").upper() == "SHORT"
+            and str(self.position_effect or "").upper() == "OPEN"
+        )
+
+    @property
+    def is_short_exit(self) -> bool:
+        return (
+            str(self.position_direction or "").upper() == "SHORT"
+            and str(self.position_effect or "").upper() == "CLOSE"
+        )
 
     # --- execution feasibility ---
     reference_price: float = 0.0           # decision reference (last_price) — NOT executable

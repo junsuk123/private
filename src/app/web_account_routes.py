@@ -166,6 +166,32 @@ _ACCOUNT_PAGE = """<!doctype html>
       </p>
     </section>
 
+    <!-- Short deployment ladder. Separate from the blockade panel because it answers a
+         different question: not "why is nothing trading right now" but "how far is each
+         short strategy from being allowed to trade at all". A short arm is invisible
+         until promoted, so this panel is the only view into a subsystem that is
+         deliberately doing nothing. -->
+    <section class="dashboard-frame short-ladder" id="short-ladder">
+      <div class="frame-title">
+        <div>
+          <p class="eyebrow">SHORT DEPLOYMENT · 숏 배포 사다리</p>
+          <h2>숏 전략은 어디까지 왔는가</h2>
+        </div>
+        <span id="short-ladder-verdict" class="badge">-</span>
+      </div>
+      <p class="blockade-headline" id="short-ladder-headline">불러오는 중…</p>
+      <div class="short-ladder-grid" id="short-ladder-arms"></div>
+      <div class="short-ladder-foot">
+        <p class="blockade-note" id="short-borrow-health">대주 데스크: -</p>
+        <p class="blockade-note" id="short-direction-compare">방향 비교: -</p>
+      </div>
+      <p class="blockade-note">
+        <strong>SHADOW = 정상 상태입니다.</strong> 숏 전략은 실시간 forward 검증으로
+        비용·대주·체결을 모두 반영한 보수적 순엣지를 증명한 뒤에만 한 칸씩 자동 승격되며,
+        <code>SHADOW → LIVE_FULL</code> 직행 경로는 존재하지 않습니다. 강등은 승격보다 항상 빠릅니다.
+      </p>
+    </section>
+
     <section class="dashboard-frame refactor-console" id="refactor-console">
       <div class="frame-title refactor-title">
         <div>

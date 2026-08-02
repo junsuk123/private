@@ -82,6 +82,58 @@ StrategyGateRule(strategy_id, required_true=(...), ...)
 
 **필수 사실이 없으면 그 전략은 hard block**입니다. stale, not-yet-valid, 낮은 confidence, boolean 요구 미충족은 각각 결정론적 사유 코드를 만듭니다.
 
+#### L5-S — 숏 closed world (`app.ontology.short_rules`)
+
+숏 arm에는 **반대 방향의** closed-world 규약이 적용됩니다. 롱 측 사실은 의도적으로 open-world인
+곳이 있습니다 — 답할 수 없는 권한 검사는 `None`을 반환하고 이를 거부로 읽지 않습니다. 숏은
+그 반대입니다: **미기재는 거짓**이며, 결측 필드 조합으로 실행 가능한 숏이 나오는 경로는 없습니다.
+
+비대칭의 근거: 결측 롱 사실의 비용은 **놓친 거래 한 번**이고, 결측 대주 사실의 비용은
+**브로커가 거부하거나 — 더 나쁘게 — 수락한 뒤 임의 가격에 강제 청산**하는 주문입니다.
+
+신규 숏 arm이 executable이 되려면 다음 전부가 **명시적으로 참**이어야 합니다.
+
+```text
+ShortSalePermitted                    공매도 규제/브로커 허용
+BorrowAvailable                       locate 존재 AND snapshot 신선 (30초)
+BorrowQuantitySufficient              수량 미상 = 불충분
+BorrowCostAcceptable                  이용료 미상 = 수용 불가 (0이 아님)
+RecallRiskAcceptable                  마감 여유 + 스퀴즈/days-to-cover
+ShortExecutionLiquiditySufficient     청산은 매수이므로 롱보다 엄격
+ShortStrategyShadowValidated          forward shadow 기준 통과
++ ShortStrategyLiveProbeAuthorized 또는 ShortStrategyLiveAuthorized
+```
+
+권한 사실을 **3개로 분리**한 것이 핵심입니다: 모델 보정 / shadow 검증 / live 권한. 하나의
+`authorized` boolean으로 합치면 모델 레벨 플래그가 모든 숏 전략을 한꺼번에 허가합니다. 잘 보정된
+모델이 대주 비용 차감 후 손실인 전략을 예측한다면, 그것은 **나쁜 거래에 대한 올바른 모델**입니다.
+
+#### 레짐별 방향 허용 마스크
+
+| regime | 허용 arm |
+| --- | --- |
+| `TREND_UP` | `intraday_momentum:LONG`, `opening_range_breakout:LONG`, `residual_relative_strength:LONG`, `market_intraday_momentum:LONG`, `residual_relative_weakness:SHORT` |
+| `TREND_DOWN` | `market_intraday_momentum_short:SHORT`, `opening_range_breakdown:SHORT`, `residual_relative_weakness:SHORT`, `vwap_mean_reversion:LONG` |
+| `HIGH_VOL_TRENDING_DOWN` | `market_intraday_momentum_short:SHORT`, `opening_range_breakdown:SHORT` |
+| `HIGH_VOL_DISLOCATED` | **없음** — `CLOSE_LONG` / `CLOSE_SHORT` / `NO_TRADE`만 |
+
+두 가지가 의도적입니다.
+
+- `TREND_DOWN`이 롱(`vwap_mean_reversion`)을 여전히 허용합니다. 지수 하락이 구조적 숏 전용의
+  근거는 아니며 — 평균회귀는 정확히 하락 추세에서 살아남는 롱 논지입니다 — 제거하면 방향 필터가
+  방향 베팅으로 변합니다.
+- `HIGH_VOL_DISLOCATED`는 **양방향** 신규 진입을 막고 청산만 허용합니다. 붕괴된 호가창은 숏
+  기회가 아니라 **가격이 정보가 아닌 시장**이고, "테이프를 읽을 수 없다"에 대한 올바른 대응은
+  "그러니 반대로 걸겠다"가 아닙니다.
+
+알 수 없는 레짐 이름은 **빈 집합**(fail closed)입니다. 레짐 분류기의 오타가 조용히 양방향 모든
+arm을 열면 안 됩니다.
+
+`residual_relative_weakness`는 `TREND_UP`에서도 허용되는 유일한 숏입니다 — 베타 중립이므로
+지수가 아니라 종목 고유 매도를 숏 치기 때문입니다.
+
+상세는 [short_selling_deployment.md](short_selling_deployment.md).
+
 ### L6 — 거시 → 미시 추론
 
 계층형 추론 레이어(`app.graph.*`)는 가격을 직접 예측하지 않습니다. 예측·리스크 신호를 **구조화**하고 **전략을 선택**합니다.
@@ -220,6 +272,42 @@ checkpoint_hash      9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dc
 
 `live_authorized=true`는 체크포인트 형식과 학습 커버리지가 런타임 사용 요건을 만족한다는 뜻이지, 모든 전략에 주문 권한이 있다는 뜻은 아닙니다. 실제 진입 권한은 `/api/gnn/realtime-trust`의 `trusted_strategy_ids`가 전략별 실시간 성과를 통과할 때만 부여됩니다.
 
+#### 숏 전략 추가와 체크포인트
+
+카탈로그에 숏 전략 3개가 **append**되어 `STRATEGY_IDS`가 13 → 16이 되었습니다. 모델 출력
+인덱스와 저장된 전략 마스크가 이 순서에 의존하므로 삽입이 아니라 추가이며
+(`test_short_strategy_algorithms_are_appended_never_inserted`), 전략 수 변경 자체가 기존
+체크포인트를 **fail-closed** 처리합니다.
+
+**방향별 head는 별도 축이 아니라 전략별 head 그 자체입니다.** 이 카탈로그에서 숏은 별개의
+`strategy_id`이므로(`opening_range_breakdown`은 `opening_range_breakout`의 방향이 아님),
+전략별 head가 곧 방향별 head입니다. 별도 방향 축을 추가하면 head가 2배가 되고 절반은 의미가
+없습니다 — 숏 전용 논지의 LONG head는 학습할 것이 없습니다.
+
+숏이 롱과 달리 실제로 필요한 것은 **대주 leg**이므로 head를 8채널 → **11채널**로 넓혔습니다.
+
+| 채널 | 내용 |
+| --- | --- |
+| 8 | `expected_borrow_cost_bps` |
+| 9 | `borrow_probability` (발동 시점에 locate가 존재할 확률) |
+| 10 | `epistemic_uncertainty` (모델의 무지 — aleatoric 시장 노이즈와 분리) |
+
+두 가지가 **구조적으로** 강제됩니다: (1) 롱 인덱스는 마스크가 카탈로그에서 생성되므로 어떤
+학습 데이터로도 대주 비용을 청구하거나 할인하도록 배울 수 없고, (2) utility에
+`borrow_probability`가 곱해집니다 — 빌릴 수 없는 종목에서만 존재하는 엣지는 엣지가 아닙니다.
+
+head 폭 변경은 기존 체크포인트를 **의도적으로 무효화**하며, 로더는 이를
+`GNN_HEAD_SCHEMA_MISMATCH`로 보고합니다(`GNN_CHECKPOINT_CORRUPT`가 아님 — 전자는 재학습,
+후자는 손상된 파일 수색을 뜻하므로 운영자를 다른 방향으로 보냅니다).
+
+**다만 새 채널은 아직 학습되지 않았습니다.** 라벨(실현 대주 비용, 실현 locate 성공률)이
+forward 표본에서 나와야 하는데 그 표본이 0입니다. `RuntimeHealth.model_calibrated`는 `False`로
+고정되어 모든 숏 arm이 `SHORT_MODEL_NOT_CALIBRATED` 게이트에서 막히며, 이것이 정직한 상태입니다.
+
+모델 카드의 단일 `live_authorized` 값으로 **모든 숏 전략을 허가하지 않습니다.** 권한은
+arm별(`DirectionalStrategyKey`)로 `data/store/strategy-deployment.sqlite3`에 기록되며, 모델
+보정과 전략 실거래 권한은 독립적인 주장입니다.
+
 ## 4. NPU / CPU 경계
 
 | 단계 | 장치 | 비고 |
@@ -285,6 +373,13 @@ python scripts/benchmark_fact_table.py
 3. closed-world/데이터 품질 검사는 OWL이 아니라 `trading_shapes.ttl`의 SHACL shape로 추가합니다.
 4. 수치 임계값·점수·거래 허가를 OWL에 인코딩하지 않습니다. 그것은 Python 정책 스코어러와 결정론적 엔진의 영역입니다.
 5. 새로 emit하는 predicate/object 문자열은 `app.graph.rdf_adapter`에 매핑하고 `tests/test_ontology_*.py`에 테스트를 추가합니다.
+6. **숏 측 사실을 추가할 때는 기본값이 거부 쪽인지 확인하세요.** `app.ontology.trading_fact_builder`의
+   숏 필드는 전부 fail-closed 기본값(`False` / `None` / `0`)을 가집니다. 새 필드에 유리한
+   기본값을 주면 결측 사실이 조용히 숏 실행을 허가하게 되고, 그것은 이 계층이 존재하는 이유를
+   무력화합니다.
+7. `IntentType`에 방향 의도를 추가할 때 기존 `SELL`을 재사용하지 마세요. `SELL`은 항상 "롱 청산"을
+   뜻했고, 여기에 "숏 진입"을 겹치면 SELL을 위험 축소로 취급하는 모든 기존 규칙이 조용히 신규 숏
+   노출을 허가합니다. `OPEN_SHORT` / `CLOSE_SHORT`는 별개 멤버입니다.
 
 TTL 파싱 점검:
 

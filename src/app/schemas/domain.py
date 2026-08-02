@@ -99,14 +99,50 @@ class Holding:
     last_price: float
     opened_at: datetime | None = None
     sellable_quantity: int | None = None
+    # --- Direction and borrow metadata -------------------------------------- #
+    # ``quantity`` stays a positive magnitude for both directions; direction is
+    # never encoded as a sign, because a negative quantity survives one refactor
+    # and then silently becomes a buy somewhere.
+    #
+    # Defaults describe the only kind of position that existed before shorts, so
+    # every existing construction site keeps its exact meaning (a cash long).
+    direction: str = "LONG"
+    execution_product: str = "CASH"
+    # Broker-authoritative borrow facts. A SHORT position that cannot produce a
+    # ``loan_date`` cannot be closed through the 매수상환 (buy-to-cover) contract,
+    # so its absence is a fail-closed condition rather than a missing nicety.
+    loan_date: str | None = None
+    borrow_reference: str | None = None
+    borrow_fee_rate: float | None = None
+    return_deadline: datetime | None = None
+
+    @property
+    def is_short(self) -> bool:
+        return str(self.direction or "LONG").upper() == "SHORT"
+
+    @property
+    def direction_sign(self) -> int:
+        return -1 if self.is_short else 1
 
     @property
     def market_value(self) -> float:
+        """Absolute market value of the exposure (always non-negative).
+
+        Kept unsigned so every existing consumer — portfolio weights, sector
+        concentration, affordability — keeps working unchanged. Signed exposure is
+        a separate question; ask :attr:`signed_exposure` for it.
+        """
         return self.quantity * self.last_price
 
     @property
+    def signed_exposure(self) -> float:
+        """Direction-signed exposure, for gross/net exposure limits."""
+        return self.direction_sign * self.quantity * self.last_price
+
+    @property
     def unrealized_pnl(self) -> float:
-        return self.quantity * (self.last_price - self.average_price)
+        """PnL of the exposure as held. A short gains when price falls."""
+        return self.direction_sign * self.quantity * (self.last_price - self.average_price)
 
 
 @dataclass(frozen=True)
@@ -347,6 +383,46 @@ class OrderIntent:
     ontology_tags: tuple[str, ...] = ()
     strategy_metadata: dict[str, Any] = field(default_factory=dict)
 
+    # --- Direction contract -------------------------------------------------- #
+    # ``action`` alone is ambiguous once shorts exist: a SELL is either "close the
+    # long I hold" or "open a new short", and those two differ in whether the
+    # account ends up flat or ends up owing shares. These three fields disambiguate
+    # it, and the execution layer refuses any order where they are not all resolved.
+    position_direction: str = "LONG"
+    # Empty means "infer from action and direction" — see
+    # ``app.risk.manager._parse_effect``. Deliberately NOT defaulted to "OPEN": every
+    # intent that predates shorts leaves this unset, and a hard "OPEN" default would
+    # have relabelled every existing long SELL/REDUCE exit as an ENTRY. That
+    # contradicts its own broker side, so the contract-consistency check would have
+    # rejected every de-risking order in the system.
+    position_effect: str = ""
+    execution_product: str = "CASH"
+
+    @property
+    def resolved_position_effect(self) -> str:
+        """OPEN / CLOSE, inferring from ``action`` when not stated.
+
+        Direction-aware: a BUY opens a LONG but CLOSES a short, and a SELL is the
+        mirror. Inferring "SELL == CLOSE" unconditionally is the exact ambiguity this
+        contract exists to remove.
+        """
+        stated = str(self.position_effect or "").strip().upper()
+        if stated in {"OPEN", "CLOSE"}:
+            return stated
+        opening = (
+            OrderAction.SELL
+            if str(self.position_direction or "").upper() == "SHORT"
+            else OrderAction.BUY
+        )
+        return "OPEN" if self.action == opening else "CLOSE"
+
+    @property
+    def is_short_entry(self) -> bool:
+        return (
+            str(self.position_direction or "").upper() == "SHORT"
+            and self.resolved_position_effect == "OPEN"
+        )
+
 
 @dataclass(frozen=True)
 class FinalOrder:
@@ -358,6 +434,40 @@ class FinalOrder:
     limit_price: float
     time_in_force: str = "DAY"
     manual_approval_required: bool = True
+    # --- Direction contract -------------------------------------------------- #
+    # ``side`` is what the BROKER sees; these say what the order MEANS. The four
+    # combinations are enumerated in ``app.trading.directional.broker_side``.
+    # Defaults reproduce the pre-short semantics exactly (cash long open/close),
+    # so every existing construction site is unchanged.
+    position_direction: str = "LONG"
+    # Empty == infer from ``side`` and ``position_direction``. Not defaulted to
+    # "OPEN" for the same reason as on ``OrderIntent``: every long exit order built by
+    # existing code leaves this unset, and labelling those as entries would make each
+    # one contradict its own SELL side.
+    position_effect: str = ""
+    execution_product: str = "CASH"
+    # 대주 (credit borrow) routing metadata. ``credit_type`` is the broker's
+    # 신용거래구분; ``loan_date`` (대출일) identifies WHICH borrow lot a buy-to-cover
+    # repays and is mandatory on a SHORT CLOSE — lots opened on different dates are
+    # separate positions to the broker and cannot be netted.
+    credit_type: str | None = None
+    loan_date: str | None = None
+
+    @property
+    def resolved_position_effect(self) -> str:
+        stated = str(self.position_effect or "").strip().upper()
+        if stated in {"OPEN", "CLOSE"}:
+            return stated
+        opening = (
+            OrderSide.SELL
+            if str(self.position_direction or "").upper() == "SHORT"
+            else OrderSide.BUY
+        )
+        return "OPEN" if self.side == opening else "CLOSE"
+
+    @property
+    def is_credit_borrow(self) -> bool:
+        return str(self.execution_product or "").upper() == "CREDIT_BORROW"
 
 
 @dataclass(frozen=True)
@@ -447,6 +557,31 @@ class RiskRules:
     max_model_uncertainty: float = 0.60
     synthetic_live_data_allowed: bool = False
     unknown_source_live_allowed: bool = False
+    # --- Short-side policy --------------------------------------------------- #
+    # ``short_selling_allowed`` / ``credit_loan_allowed`` above remain the account
+    # -level master switches and still default to False. These are the *additional*
+    # constraints that apply once an operator turns those on; they are never
+    # sufficient on their own, because a per-strategy deployment state (see
+    # ``app.trading.short_strategy_promotion``) still has to authorise the arm.
+    #
+    # Deliberately NOT one "shorts enabled" flag: a single flag is exactly how an
+    # unvalidated strategy reaches a live order.
+    max_open_short_positions: int = 1
+    max_single_short_weight: float = 0.01
+    max_total_short_weight: float = 0.05
+    max_gross_exposure: float = 1.0
+    max_net_short_exposure: float = 0.10
+    max_daily_short_entries: int = 1
+    max_short_holding_minutes: int = 30
+    overnight_short_allowed: bool = False
+    # A short's risk budget starts at half a long's, and 0.5 is a ceiling rather
+    # than a tuning target: the loss is unbounded above and accelerates.
+    short_risk_budget_ratio_of_long: float = 0.5
+    short_daily_loss_stop: float = 0.005
+    max_borrow_fee_bps: float = 40.0
+    min_borrow_snapshot_freshness_seconds: float = 30.0
+    min_hours_before_recall_deadline: float = 24.0
+    require_short_stop_order_capability: bool = True
     principal_protection: PrincipalProtectionConfig = field(default_factory=PrincipalProtectionConfig)
 
 

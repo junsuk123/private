@@ -32,13 +32,14 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from app.technical import reason_codes as rc
 from app.technical.signals import TechnicalFeatureSet
-from app.strategy.catalog import STRATEGY_IDS
+from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
+from app.trading.directional import ShortReasonCodes
 
 DEFAULT_CONFIG_PATH = "config/strategy_algorithms.yaml"
 
@@ -119,6 +120,47 @@ class ElectionContext:
     first_half_hour_volatility_percentile: float | None = None
     in_last_continuous_half_hour: bool | None = None
     minutes_to_continuous_close: float | None = None
+    # --- SHORT-side context -------------------------------------------------- #
+    # Borrow facts, frozen at signal time. Every one defaults to the FAIL-CLOSED
+    # value (``None`` / False), so a short algorithm asked to decide without them
+    # refuses rather than assuming stock can be located. That asymmetry is
+    # deliberate: an absent long-side feature costs a missed trade, an absent
+    # borrow fact costs a rejected or force-closed position.
+    #
+    # These are point-in-time observations, never re-read at evaluation. Using a
+    # later borrow lookup to score an earlier signal is the exact leak that would
+    # make shadow results unachievable live.
+    borrow_available: bool | None = None
+    borrow_available_quantity: int | None = None
+    # ANNUALISED bps, matching what the broker quotes and what
+    # ``app.trading.borrow`` stores. The name carries the unit because mixing it
+    # with a per-trade figure is a ~10,000x error: an annualised 800bps compared
+    # against a per-trade 40bps ceiling rejects every borrowable name (this
+    # actually happened during development, and every short silently reported
+    # SHORT_BORROW_COST_TOO_HIGH).
+    borrow_fee_bps_annualised: float | None = None
+    borrow_observed_at: str | None = None
+    short_sale_permitted: bool | None = None
+    return_deadline: str | None = None
+    # Squeeze pressure. A crowded short is where the unbounded loss actually
+    # happens, so this is an exclusion input rather than a score contribution.
+    short_interest_ratio: float | None = None
+    days_to_cover: float | None = None
+    # Mirror of the long residual fields. Stored separately rather than reusing the
+    # long ones with a flipped sign: a residual measured for the strength thesis is
+    # not the same measurement as one taken for the weakness thesis (different
+    # window, different universe filter), and reusing it would silently make the
+    # short label a function of the long label.
+    residual_short_bps: float | None = None
+    residual_long_bps: float | None = None
+    # opening_range_breakdown: how far BELOW the opening-range low price has gone.
+    breakdown_excess_bps: float | None = None
+    aggressor_imbalance: float | None = None
+    market_alignment: float | None = None
+    market_trend: str | None = None
+    market_breadth: float | None = None
+    liquidity_score: float | None = None
+    spread_bps: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +206,23 @@ class ElectionContext:
             "first_half_hour_volatility_percentile": self.first_half_hour_volatility_percentile,
             "in_last_continuous_half_hour": self.in_last_continuous_half_hour,
             "minutes_to_continuous_close": self.minutes_to_continuous_close,
+            "borrow_available": self.borrow_available,
+            "borrow_available_quantity": self.borrow_available_quantity,
+            "borrow_fee_bps_annualised": self.borrow_fee_bps_annualised,
+            "borrow_observed_at": self.borrow_observed_at,
+            "short_sale_permitted": self.short_sale_permitted,
+            "return_deadline": self.return_deadline,
+            "short_interest_ratio": self.short_interest_ratio,
+            "days_to_cover": self.days_to_cover,
+            "residual_short_bps": self.residual_short_bps,
+            "residual_long_bps": self.residual_long_bps,
+            "breakdown_excess_bps": self.breakdown_excess_bps,
+            "aggressor_imbalance": self.aggressor_imbalance,
+            "market_alignment": self.market_alignment,
+            "market_trend": self.market_trend,
+            "market_breadth": self.market_breadth,
+            "liquidity_score": self.liquidity_score,
+            "spread_bps": self.spread_bps,
         }
 
 
@@ -447,6 +506,93 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # A day-long thesis, not a scalp.
         "horizon_seconds": 7200.0,
     },
+    # --- SHORT theses -------------------------------------------------------- #
+    # All three carry ``live_authorized: 0.0``, which puts them in
+    # ``_DEPLOYMENT_GATED_STRATEGIES`` automatically. That flag is necessary but NOT
+    # sufficient for a short: even flipped to 1.0 by an operator, the per-arm
+    # deployment state in ``app.trading.short_strategy_promotion`` still has to have
+    # reached a live rung, and there is no environment variable that skips it. Two
+    # independent gates, because one flag is how an unvalidated short reaches a real
+    # order.
+    #
+    # Thresholds are the mirror of each long counterpart's, with the direction of
+    # every comparison reversed by the algorithm rather than by negating the number,
+    # so a reader can diff the two tables. Borrow-specific knobs have no long analogue.
+    "market_intraday_momentum_short": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        # Magnitude, applied to a NEGATIVE first half-hour return. Slightly wider
+        # than the long side's 15bps because the borrow leg raises the cost floor.
+        "min_first_half_hour_drop_bps": 20.0,
+        "min_first_half_hour_volatility_percentile": 0.6,
+        # Sell-side aggression required (negative imbalance).
+        "max_aggressor_imbalance": 0.0,
+        "max_change_point_probability": 0.5,
+        # Shorting into a rising broad market is fighting the tape; the market leg
+        # must at least not be strongly up.
+        "max_market_breadth": 0.55,
+        "max_borrow_fee_bps_annualised": 1500.0,
+        "min_borrow_quantity": 1.0,
+        "max_days_to_cover": 5.0,
+        "max_short_interest_ratio": 0.15,
+        "min_liquidity_score": 0.45,
+        "max_spread_bps": 40.0,
+        "stop_buffer_bps": 8.0,
+        "trailing_bps": 30.0,
+        "horizon_seconds": 1500.0,
+    },
+    "opening_range_breakdown": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_relative_volume": 1.5,
+        # Magnitude below the opening-range LOW, in bps of range width.
+        "min_breakdown_excess_bps": 3.0,
+        "max_aggressor_imbalance": -0.05,
+        # A breakdown with a widening spread is being bid, not sold.
+        "max_spread_change_5s": 0.0,
+        "max_change_point_probability": 0.4,
+        "max_market_breadth": 0.6,
+        "max_borrow_fee_bps_annualised": 1500.0,
+        "min_borrow_quantity": 1.0,
+        "max_days_to_cover": 5.0,
+        "max_short_interest_ratio": 0.15,
+        "min_liquidity_score": 0.45,
+        "max_spread_bps": 40.0,
+        "stop_buffer_bps": 8.0,
+        "trailing_bps": 30.0,
+        "horizon_seconds": 3600.0,
+    },
+    "residual_relative_weakness": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        # Magnitudes applied to NEGATIVE residuals.
+        "min_residual_short_weakness_bps": 5.0,
+        "min_residual_long_weakness_bps": 0.0,
+        # Rank counted from the WEAK end of the sector.
+        "max_sector_weakness_rank": 3.0,
+        "min_relative_volume": 1.2,
+        "max_aggressor_imbalance": -0.05,
+        "max_microprice_edge_bps": 0.0,
+        "require_flow_confirmation": 1.0,
+        # Distribution, not accumulation: flow must be NEGATIVE.
+        "max_flow_zscore": 0.0,
+        "max_change_point_probability": 0.5,
+        "max_borrow_fee_bps_annualised": 1500.0,
+        "min_borrow_quantity": 1.0,
+        "max_days_to_cover": 5.0,
+        "max_short_interest_ratio": 0.15,
+        "min_liquidity_score": 0.45,
+        "max_spread_bps": 40.0,
+        "horizon_seconds": 2700.0,
+        "stop_volatility_multiple": 2.0,
+        "trailing_bps": 32.0,
+    },
 }
 
 
@@ -511,6 +657,9 @@ class AlgorithmConfig:
 class TradingAlgorithm:
     strategy_id = "base"
     thesis = "base"
+    # Which way the exposure this algorithm opens points. LONG for everything that
+    # existed before shorts, so no subclass needs to restate it.
+    direction = "LONG"
 
     def __init__(self, config: AlgorithmConfig | None = None) -> None:
         self.config = config or AlgorithmConfig()
@@ -1834,6 +1983,476 @@ class MarketIntradayMomentumAlgorithm(TradingAlgorithm):
 
 
 # --------------------------------------------------------------------------- #
+# SHORT theses                                                                 #
+# --------------------------------------------------------------------------- #
+class ShortTradingAlgorithm(TradingAlgorithm):
+    """Base for short entries: the borrow and squeeze preconditions, once.
+
+    Every short thesis in this module has to answer four questions no long thesis
+    ever asks, and they are checked here so no individual algorithm can forget one:
+
+    1. Is short selling permitted on this name at all (규제/공매도 금지)?
+    2. Is stock actually locatable, in sufficient quantity, at an acceptable fee?
+    3. Is the borrow observation FRESH, or are we about to act on a stale locate?
+    4. Is the name crowded enough that covering could become the loss?
+
+    All four fail CLOSED on absent data. The asymmetry against the long path is
+    intentional: a missing long-side feature costs a missed trade, while a missing
+    borrow fact costs a rejected order, a forced buy-in, or an unbounded loss.
+    """
+
+    direction = "SHORT"
+
+    # Beyond this the locate is a memory, not a fact. Short thresholds are in
+    # seconds because borrow availability moves intraday, and the whole point of
+    # storing ``borrow_observed_at`` is to be able to refuse a stale one.
+    borrow_snapshot_max_age_seconds = 120.0
+
+    def _short_preconditions(
+        self, f: TechnicalFeatureSet, context: ElectionContext
+    ) -> tuple[str, ...]:
+        """Reason codes blocking a short entry; empty means clear."""
+        if context.short_sale_permitted is not True:
+            return (ShortReasonCodes.SHORT_SALE_NOT_PERMITTED,)
+        if context.borrow_available is not True:
+            return (ShortReasonCodes.BORROW_UNAVAILABLE,)
+        quantity = context.borrow_available_quantity
+        if quantity is None or quantity < int(self.p("min_borrow_quantity")):
+            return (ShortReasonCodes.BORROW_QUANTITY_INSUFFICIENT,)
+        fee_bps = context.borrow_fee_bps_annualised
+        if fee_bps is None:
+            # An unknown fee is not a zero fee. Pricing a short at zero borrow cost
+            # is how a negative-expectancy trade passes a cost gate.
+            return (ShortReasonCodes.BORROW_COST_TOO_HIGH,)
+        if fee_bps > self.p("max_borrow_fee_bps_annualised"):
+            return (ShortReasonCodes.BORROW_COST_TOO_HIGH,)
+        if not self._borrow_snapshot_fresh(context):
+            return (ShortReasonCodes.BORROW_SNAPSHOT_STALE,)
+        # Squeeze exclusion. Absent metrics do NOT block — unlike the borrow facts,
+        # these are supplementary risk colour rather than execution preconditions,
+        # and requiring them would make the strategies inert on every name without
+        # published short interest. The borrow gates above already carry the
+        # fail-closed weight.
+        days = context.days_to_cover
+        if days is not None and days > self.p("max_days_to_cover"):
+            return ("SHORT_CROWDED_DAYS_TO_COVER",)
+        ratio = context.short_interest_ratio
+        if ratio is not None and ratio > self.p("max_short_interest_ratio"):
+            return ("SHORT_CROWDED_SHORT_INTEREST",)
+        # Execution quality. A short exits by BUYING, so a thin or wide book is
+        # worse here than for a long: the covering trade is the one that must not
+        # slip, and it is the one taken under pressure.
+        liquidity = context.liquidity_score
+        if liquidity is not None and liquidity < self.p("min_liquidity_score"):
+            return ("SHORT_EXECUTION_LIQUIDITY_INSUFFICIENT",)
+        spread = context.spread_bps
+        if spread is not None and spread > self.p("max_spread_bps"):
+            return ("SHORT_SPREAD_TOO_WIDE",)
+        return ()
+
+    def _borrow_snapshot_fresh(self, context: ElectionContext) -> bool:
+        observed = context.borrow_observed_at
+        if not observed:
+            return False
+        elected = context.elected_at
+        if elected is None:
+            # Without a signal timestamp the age is unknowable, so it cannot be
+            # asserted fresh.
+            return False
+        try:
+            moment = datetime.fromisoformat(str(observed).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+        reference = elected if elected.tzinfo else elected.replace(tzinfo=timezone.utc)
+        age = (reference - moment).total_seconds()
+        # A NEGATIVE age means the borrow observation is timestamped after the
+        # signal — i.e. it is future information relative to the decision. That is a
+        # look-ahead leak, not freshness, and it is refused rather than clamped.
+        return 0.0 <= age <= self.borrow_snapshot_max_age_seconds
+
+    def _short_volatility_stop(
+        self, entry_price: float, f: TechnicalFeatureSet, multiple: float
+    ) -> float | None:
+        """Stop ABOVE entry. The long ``_volatility_stop`` subtracts; a short adds."""
+        volatility = f.realized_volatility_10s or f.realized_volatility
+        if not volatility or volatility <= 0 or entry_price <= 0:
+            return None
+        return entry_price * (1.0 + multiple * volatility)
+
+    def _short_target(self, entry_price: float, f: TechnicalFeatureSet) -> float | None:
+        """Target BELOW entry, floored at zero."""
+        if entry_price <= 0:
+            return None
+        return max(0.0, entry_price * (1.0 - self._volatility_edge(f) / 10_000.0))
+
+
+class MarketIntradayMomentumShortAlgorithm(ShortTradingAlgorithm):
+    """The NEGATIVE leg of the intraday-momentum effect.
+
+    Gao/Han/Li/Zhou (JFE 2018) is a two-sided finding: the first half-hour return
+    predicts the last half-hour return, in both signs. Only the positive leg was
+    expressible before, because the negative one requires 대주 — so
+    ``market_intraday_momentum`` documents itself as "long-only, so only the
+    positive leg is tradable". This is the other half.
+
+    It is NOT that algorithm with a flipped sign. The borrow fee falls only on this
+    side, the volatility precondition therefore binds harder, and the outcome series
+    is evaluated separately — pooling the two would let a profitable long leg carry
+    an unprofitable short one.
+    """
+
+    strategy_id = "market_intraday_momentum_short"
+    thesis = "a negative first half-hour continues into the last continuous half-hour"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        blocked = self._short_preconditions(f, context)
+        if blocked:
+            return self._reject(blocked)
+
+        in_window = context.in_last_continuous_half_hour
+        if in_window is None:
+            return self._reject(("MIMS_SESSION_CONTEXT_ABSENT",))
+        if not in_window:
+            return self._reject(("MIMS_OUTSIDE_ENTRY_WINDOW",))
+        # Never open with too little continuous trading left to COVER into. Tighter
+        # than the long side's 5 minutes: an unfilled buy-to-cover leaves a borrow
+        # position carried overnight, which policy forbids outright.
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining < 8.0:
+            return self._reject(
+                ("MIMS_TOO_CLOSE_TO_AUCTION",), minutes_to_continuous_close=remaining
+            )
+
+        r1 = context.first_half_hour_return_bps
+        if r1 is None:
+            return self._reject(("MIMS_FIRST_HALF_HOUR_ABSENT",))
+        drop_bps = -r1
+        if drop_bps < self.p("min_first_half_hour_drop_bps"):
+            return self._reject(("MIMS_FIRST_HALF_HOUR_NOT_DOWN",), first_half_hour_return_bps=r1)
+
+        volatility_percentile = context.first_half_hour_volatility_percentile
+        if volatility_percentile is None:
+            return self._reject(("MIMS_VOLATILITY_CONTEXT_ABSENT",))
+        if volatility_percentile < self.p("min_first_half_hour_volatility_percentile"):
+            return self._reject(
+                ("MIMS_DAY_NOT_VOLATILE_ENOUGH",),
+                first_half_hour_volatility_percentile=volatility_percentile,
+            )
+        # Sell-side aggression: +1.0 default so an ABSENT imbalance fails the test
+        # (mirrors the long side's -1.0 default doing the same).
+        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
+            "max_aggressor_imbalance"
+        ):
+            return self._reject(("MIMS_FLOW_NOT_SELL_SIDE",))
+        breadth = context.market_breadth
+        if breadth is not None and breadth > self.p("max_market_breadth"):
+            return self._reject(("MIMS_MARKET_BREADTH_TOO_STRONG",), market_breadth=breadth)
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(("MIMS_STRUCTURAL_BREAK",), change_point_probability=change_point)
+
+        edge = self._volatility_edge(f)
+        return self._fire(
+            score=_clamp(0.5 * _clamp(drop_bps / 100.0) + 0.5 * _clamp(volatility_percentile)),
+            confidence=_clamp(0.3 + 0.4 * _clamp(volatility_percentile)),
+            edge_bps=edge,
+            reasons=("MIMS_FIRST_HALF_HOUR_CONTINUATION_DOWN",),
+            first_half_hour_return_bps=r1,
+            first_half_hour_volatility_percentile=volatility_percentile,
+            minutes_to_continuous_close=remaining,
+            borrow_fee_bps_annualised=context.borrow_fee_bps_annualised,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        remaining = context.minutes_to_continuous_close
+        horizon = self.horizon_seconds
+        if remaining is not None and remaining > 0:
+            # 4 minutes of slack rather than the long side's 2: a buy-to-cover that
+            # does not fill cannot be left open, so the covering window is wider.
+            horizon = int(min(horizon, max(60.0, (remaining - 4.0) * 60.0)))
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._short_volatility_stop(entry_price, f, 2.0),
+            target_price=self._short_target(entry_price, f),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=horizon,
+            stop_basis="tick_volatility_multiple_above_entry",
+            target_basis="tick_volatility_expected_move_below_entry",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining <= 4.0:
+            codes.append("MIMS_CONTINUOUS_CLOSE_IMMINENT")
+        if (f.aggressor_imbalance_5s or 0.0) > 0 and (f.return_5s or 0.0) > 0:
+            codes.append("MIMS_MOMENTUM_REVERSED")
+        # Borrow withdrawal invalidates the position regardless of the price thesis.
+        if context.borrow_available is False:
+            codes.append(ShortReasonCodes.BORROW_UNAVAILABLE)
+        return tuple(codes)
+
+
+class OpeningRangeBreakdownAlgorithm(ShortTradingAlgorithm):
+    """Break BELOW the session's opening range, on stocks in play.
+
+    Mirror of ``opening_range_breakout`` in structure, and the relative-volume
+    restriction is load-bearing for the same reason: the unrestricted break does
+    not pay, and confining it to the highest-RVOL names is what carries the result.
+    """
+
+    strategy_id = "opening_range_breakdown"
+    thesis = "price loses the session opening range on high relative volume and sell-side aggression"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        blocked = self._short_preconditions(f, context)
+        if blocked:
+            return self._reject(blocked)
+
+        high = context.opening_range_high
+        low = context.opening_range_low
+        if high is None or low is None or high <= low or low <= 0:
+            return self._reject(("ORBD_OPENING_RANGE_ABSENT",))
+        price = f.price
+        if not price or price <= 0:
+            return self._reject(("ORBD_PRICE_ABSENT",))
+
+        relative_volume = context.relative_volume
+        if relative_volume is None:
+            relative_volume = f.volume_spike_ratio
+        if relative_volume is None:
+            return self._reject(("ORBD_RELATIVE_VOLUME_ABSENT",))
+        if relative_volume < self.p("min_relative_volume"):
+            return self._reject(
+                ("ORBD_NOT_IN_PLAY",),
+                relative_volume=relative_volume,
+                minimum=self.p("min_relative_volume"),
+            )
+
+        span = high - low
+        # Positive when price is BELOW the range low, in bps of range width — the
+        # mirror of the breakout's ``(price - high) / span``.
+        excess_bps = (low - price) / span * 10_000.0
+        if excess_bps < self.p("min_breakdown_excess_bps"):
+            return self._reject(
+                ("ORBD_RANGE_NOT_LOST",),
+                excess_bps=round(excess_bps, 3),
+                opening_range_low=low,
+            )
+        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
+            "max_aggressor_imbalance"
+        ):
+            return self._reject(("ORBD_FLOW_NOT_SELL_SIDE",))
+        if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
+            return self._reject(("ORBD_SPREAD_WIDENING_INTO_BREAK",))
+        breadth = context.market_breadth
+        if breadth is not None and breadth > self.p("max_market_breadth"):
+            return self._reject(("ORBD_MARKET_BREADTH_TOO_STRONG",), market_breadth=breadth)
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(("ORBD_STRUCTURAL_BREAK",), change_point_probability=change_point)
+
+        edge = self._volatility_edge(f)
+        return self._fire(
+            score=_clamp(
+                0.5 * _clamp(relative_volume / 3.0)
+                + 0.5 * _clamp(0.5 - (f.aggressor_imbalance_5s or 0.0))
+            ),
+            confidence=_clamp(0.3 + 0.4 * _clamp(relative_volume / 3.0)),
+            edge_bps=edge,
+            reasons=("ORBD_RANGE_LOST_IN_PLAY",),
+            relative_volume=relative_volume,
+            excess_bps=round(excess_bps, 3),
+            opening_range_high=high,
+            opening_range_low=low,
+            borrow_fee_bps_annualised=context.borrow_fee_bps_annualised,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        # Mirror of the published rule: stop at the OPPOSITE end of the opening
+        # range, which for a breakdown is the range HIGH.
+        high = context.opening_range_high
+        stop = (
+            high * (1.0 + self.p("stop_buffer_bps") / 10_000.0)
+            if high
+            else self._short_volatility_stop(entry_price, f, 2.0)
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=stop,
+            target_price=self._short_target(entry_price, f),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis=(
+                "opening_range_high_plus_buffer" if high else "tick_volatility_multiple_above_entry"
+            ),
+            target_basis="tick_volatility_expected_move_below_entry",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        low = context.opening_range_low
+        # Recovering back INTO the range is the definition of a failed breakdown.
+        if low and f.price and f.price > low:
+            codes.append("ORBD_RECOVERED_INTO_RANGE")
+        if (f.aggressor_imbalance_5s or 0.0) > 0 and (f.return_5s or 0.0) > 0:
+            codes.append("ORBD_FLOW_REVERSED")
+        if context.borrow_available is False:
+            codes.append(ShortReasonCodes.BORROW_UNAVAILABLE)
+        return tuple(codes)
+
+
+class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
+    """Shorts the name that is weak AFTER removing market and sector beta.
+
+    The one short thesis here that does not need the index to fall. Shorting on raw
+    return in a rising tape mostly shorts low beta — i.e. it shorts the market with
+    extra steps, from the wrong side. Consuming the residual
+
+        ResidualReturn = Return - beta_market * MarketReturn - beta_sector * SectorReturn
+
+    isolates the stock-specific offer, which is what stays valid when the index is
+    up. Residuals are cross-sectional, so an absent residual fails closed rather
+    than degrading to raw return — degrading would silently reproduce the defect.
+
+    Note the residual fields are ``residual_short_bps`` / ``residual_long_bps``,
+    NOT the long strategy's ``residual_return_*_bps`` with a flipped sign. Reusing
+    the long measurement would make this thesis's label a deterministic function of
+    the other one's, and the two would then never disagree — which is the whole
+    reason for running them as separate arms.
+    """
+
+    strategy_id = "residual_relative_weakness"
+    thesis = "idiosyncratic weakness net of market and sector beta persists while distribution confirms it"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+        blocked = self._short_preconditions(f, context)
+        if blocked:
+            return self._reject(blocked)
+
+        short_residual = context.residual_short_bps
+        long_residual = context.residual_long_bps
+        if not _present(short_residual, long_residual):
+            return self._reject(("RESIDUAL_WEAKNESS_CONTEXT_ABSENT",))
+        rank = context.sector_rank
+        universe = context.sector_candidate_count
+        if rank is None or universe is None or universe <= 1:
+            return self._reject(("RESIDUAL_WEAKNESS_SECTOR_RANK_ABSENT",))
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(
+                ("RESIDUAL_WEAKNESS_REGIME_UNSTABLE",), change_point_probability=change_point
+            )
+        # Magnitudes of NEGATIVE residuals, so both horizons must be weak. One
+        # window alone cannot separate persistent idiosyncratic weakness from a
+        # single-window dip.
+        if -short_residual < self.p("min_residual_short_weakness_bps"):
+            return self._reject(
+                ("RESIDUAL_SHORT_HORIZON_NOT_NEGATIVE",), residual_short_bps=short_residual
+            )
+        if -long_residual < self.p("min_residual_long_weakness_bps"):
+            return self._reject(
+                ("RESIDUAL_LONG_HORIZON_NOT_NEGATIVE",), residual_long_bps=long_residual
+            )
+        # Rank is counted from the WEAK end here (rank 1 == weakest residual in the
+        # sector), which is why the same comparison reads correctly.
+        if rank > int(self.p("max_sector_weakness_rank")):
+            return self._reject(
+                ("RESIDUAL_WEAKNESS_SECTOR_RANK_TOO_HIGH",), sector_rank=rank, universe=universe
+            )
+        relative_volume = f.relative_volume
+        if relative_volume is None or relative_volume < self.p("min_relative_volume"):
+            return self._reject(
+                (rc.VOLUME_CONFIRMATION_MISSING, "RESIDUAL_WEAKNESS_VOLUME_NOT_CONFIRMED"),
+                relative_volume=relative_volume,
+            )
+        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
+            "max_aggressor_imbalance"
+        ):
+            return self._reject(("RESIDUAL_WEAKNESS_FLOW_NOT_CONFIRMED",))
+        microprice_edge = f.microprice_edge_bps
+        if microprice_edge is None:
+            return self._reject(("RESIDUAL_WEAKNESS_MICROPRICE_UNAVAILABLE",))
+        if microprice_edge > self.p("max_microprice_edge_bps"):
+            return self._reject(
+                ("RESIDUAL_WEAKNESS_MICROPRICE_NOT_SUPPORTIVE",),
+                microprice_edge_bps=microprice_edge,
+            )
+        # Distribution corroboration. Required by default: idiosyncratic weakness
+        # with no informed selling behind it is usually just a dip, and shorting a
+        # dip is where the squeeze comes from.
+        flow_scores = [
+            value
+            for value in (context.foreign_flow_zscore, context.institution_flow_zscore)
+            if value is not None
+        ]
+        if self.p("require_flow_confirmation") >= 1.0:
+            if not flow_scores:
+                return self._reject(("RESIDUAL_WEAKNESS_INVESTOR_FLOW_ABSENT",))
+            if min(flow_scores) > self.p("max_flow_zscore"):
+                return self._reject(
+                    ("RESIDUAL_WEAKNESS_INVESTOR_FLOW_POSITIVE",), flow_zscores=flow_scores
+                )
+
+        edge = self._volatility_edge(f)
+        rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
+        residual_score = _clamp(-short_residual / 30.0)
+        return self._fire(
+            score=_clamp(
+                0.45 * rank_score + 0.35 * residual_score + 0.2 * _clamp(-microprice_edge)
+            ),
+            confidence=_clamp(0.3 + 0.4 * rank_score + 0.2 * residual_score),
+            edge_bps=edge,
+            reasons=("RESIDUAL_WEAKNESS_CONFIRMED", "MARKET_AND_SECTOR_NEUTRAL_LAGGARD"),
+            residual_short_bps=round(short_residual, 3),
+            residual_long_bps=round(long_residual, 3),
+            sector_rank=rank,
+            sector_candidate_count=universe,
+            microprice_edge_bps=round(microprice_edge, 4),
+            market_beta=context.market_beta,
+            sector_beta=context.sector_beta,
+            borrow_fee_bps_annualised=context.borrow_fee_bps_annualised,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._short_volatility_stop(
+                entry_price, f, self.p("stop_volatility_multiple")
+            ),
+            target_price=self._short_target(entry_price, f),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="tick_volatility_multiple_above_entry",
+            target_basis="tick_volatility_expected_move_below_entry",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        codes: list[str] = []
+        rank = context.sector_rank
+        if rank is not None and rank > int(self.p("max_sector_weakness_rank")) + 1:
+            codes.append("RESIDUAL_WEAKNESS_SECTOR_RANK_DECAYED")
+        if (f.short_return or 0.0) > 0 and (f.aggressor_imbalance_5s or 0.0) > 0:
+            codes.append("RESIDUAL_WEAKNESS_LOST")
+        edge = f.microprice_edge_bps
+        if edge is not None and edge > 0 and (f.return_5s or 0.0) > 0:
+            codes.append("RESIDUAL_WEAKNESS_MICROPRICE_TURNED_BID")
+        if context.borrow_available is False:
+            codes.append(ShortReasonCodes.BORROW_UNAVAILABLE)
+        return tuple(codes)
+
+
+# --------------------------------------------------------------------------- #
 # Registry                                                                     #
 # --------------------------------------------------------------------------- #
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
@@ -1850,6 +2469,9 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     OfiMicropriceExhaustionReversalAlgorithm,
     OpeningRangeBreakoutAlgorithm,
     MarketIntradayMomentumAlgorithm,
+    MarketIntradayMomentumShortAlgorithm,
+    OpeningRangeBreakdownAlgorithm,
+    ResidualRelativeWeaknessAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -1873,18 +2495,37 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "residual_relative_strength": ("relative_strength",),
     "adaptive_anchored_vwap_reversion": ("vwap_reversion", "mean_reversion"),
     "ofi_microprice_exhaustion_reversal": ("mean_reversion",),
+    # --- SHORT theses -------------------------------------------------------- #
+    # Mapped to SHORT-side families so the macro allow/block lists can permit a
+    # falling-tape short without simultaneously permitting a long momentum entry.
+    # Reusing the long families would have made TREND_DOWN's "block momentum" also
+    # block the short momentum leg — the one thing TREND_DOWN most wants to allow.
+    "market_intraday_momentum_short": ("momentum_short", "short"),
+    "opening_range_breakdown": ("breakdown", "short"),
+    # Beta-neutral, so it belongs to the relative family rather than to directional
+    # shorting: it is the short thesis that survives a RISING index.
+    "residual_relative_weakness": ("relative_weakness", "short"),
 }
+
+
+def strategy_direction(strategy_id: str) -> str:
+    """``"LONG"`` or ``"SHORT"`` for a catalogued strategy id."""
+    return "SHORT" if is_short_strategy(str(strategy_id or "").strip().lower()) else "LONG"
 
 
 # Strategies whose deployment is gated by their own ``live_authorized`` knob.
 # Everything else is live by default; these must earn it with per-regime samples.
+#
+# DERIVED from the defaults, never hand-listed. It used to be a literal set, and it
+# fell out of sync the moment strategies were added: ``opening_range_breakout`` and
+# ``market_intraday_momentum`` both declared ``live_authorized: 0.0`` and were both
+# missing from the set, so ``strategy_live_authorized`` returned True for them and
+# two deliberately shadow-only strategies were treated as live-tradable. Declaring
+# the knob IS the gate now, so the two can no longer disagree.
 _DEPLOYMENT_GATED_STRATEGIES: frozenset[str] = frozenset(
-    {
-        "rvgi_box_breakout",
-        "residual_relative_strength",
-        "adaptive_anchored_vwap_reversion",
-        "ofi_microprice_exhaustion_reversal",
-    }
+    strategy_id
+    for strategy_id, values in _DEFAULTS.items()
+    if strategy_id != "shared" and "live_authorized" in values
 )
 
 

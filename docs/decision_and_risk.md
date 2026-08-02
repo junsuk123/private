@@ -6,8 +6,13 @@
 
 핵심 규칙 두 가지:
 
-- **모든 BUY는 단 하나의 순수익 게이트(`ProfitabilityGate`)로 판단합니다.**
+- **모든 신규 진입은 단 하나의 순수익 게이트(`ProfitabilityGate`)로 판단합니다.**
 - **모든 청산은 단 하나의 동적 청산 정책(`DynamicExitPolicy`)으로 판단합니다.**
+
+두 규칙은 이제 **effect 기준**이며 broker side 기준이 아닙니다. 숏이 추가된 뒤 `action != "BUY"`로
+게이트 여부를 판정하면 양방향으로 위험합니다 — 숏 진입(side=SELL)은 게이트를 **건너뛰어** 음의
+기대값으로 열릴 수 있고, 숏 청산(side=BUY)은 진입으로 오인되어 **차단**될 수 있습니다. 손실 중인
+숏의 상환을 막는 것은 이 시스템에서 절대 허용되지 않는 결과입니다.
 
 ![Profitability architecture](diagrams/profitability_architecture.svg)
 
@@ -393,6 +398,31 @@ admissible       = ConservativeEdge > 0
 같은 저장소가 `SharedLiveDecisionEngine`의 `recent_performance` / `recent_same_strategy_loss`를
 공급합니다 — 두 값은 이전까지 각각 `0.0`과 `False` 리터럴이어서 온라인 피드백 경로가 죽어 있었습니다.
 
+#### 9.3.1 arm은 전략이 아니라 (전략 x 방향 x 시장 x 상품)
+
+arm 식별자가 `strategy_id`에서 `DirectionalStrategyKey`
+(`opening_range_breakdown:SHORT:KR:CREDIT_BORROW`)로 바뀌었습니다. **롱과 숏 posterior를 절대
+합산하지 않습니다.** 합산하면 롱에서 +60bps, 숏에서 -60bps를 내는 전략 쌍이 break-even으로
+읽혀 **양방향 모두 영구 거래 불가**가 되고, 반대로 진짜 한쪽 우위는 희석되어 보이지 않게 됩니다.
+
+이력이 없는 숏 arm은 prior(0.0)로 후퇴하며 **롱 arm의 실현 시계열을 빌리지 않습니다.** 빌리면
+미검증 숏이 벌지 않은 양수 하단값을 물려받습니다.
+
+숏 arm에는 posterior가 볼 수 없는 비대칭에 대해 추가 페널티를 매깁니다 — 무제한이고 **가속하는**
+하방, 그리고 recall 가능성. 비용이 아니라 **비관**으로 부과해 cost engine이 수수료로 이중
+계상하지 않게 합니다. 상승장에서의 방향성 숏에는 추가 감점이 붙지만 **거부권은 아닙니다**:
+베타 중립 논지(`residual_relative_weakness`)는 상승장에서도 정당하게 유효하므로 하드 차단은
+남겨야 할 arm을 정확히 제거합니다.
+
+**배포 권한은 페널티가 아니라 전제조건입니다.** `SHADOW` arm은 순위가 매겨지고 보고되지만
+(`shadow_arms`) 실행 후보가 되지 않고, cold-start 탐색 경로로도 도달할 수 없습니다. 상세는
+[short_selling_deployment.md](short_selling_deployment.md).
+
+매 선택마다 `directional_comparison`(최고 롱 엣지 / 최고 숏 엣지 / `short_rescued`)이 기록되므로
+"숏이 있었으면 도움이 됐을까"를 사후에 답할 수 있고, 그것이 사다리를 올라갈 증거입니다.
+`BOTH_DIRECTIONS_NEGATIVE`는 "양방향을 봤고 둘 다 안 된다"는 발견이며 방향 하나만 있었던
+커버리지 공백과 구분됩니다.
+
 ### 9.4 CostCoverageRatio — `app.cost.cost_coverage`
 
 ```
@@ -467,9 +497,81 @@ GNN 권한 계층에도 있었습니다. 보수적 bandit이 `require_live_gnn`�
 이를 렌더링합니다.
 
 ```text
-엔진 실행 → 라이브 무장 → 시장 세션 → 매수 후보 → 마이크로 전략 → 전략 선택 → 포지션
+엔진 실행 → 라이브 무장 → 시장 세션 → 진입 후보 → 마이크로 전략 → 전략 선택 → 포지션
 ```
+
+숏 진입에는 별도 체인이 있습니다 (`GET /api/short-strategies/entry-blockade`):
+
+```text
+directional_candidates → short_signal → shadow_validation → deployment_authorization
+→ borrow_preflight → profitability → short_risk → credit_order_contract → broker_execution
+```
+
+순서가 진단을 가능하게 합니다: `deployment_authorization` 차단은 "아직 학습 중, 고칠 것 없음"이고
+승인된 arm의 `borrow_preflight` 차단은 운영 문제입니다. 마지막에 나온 이유를 보고하면 이 둘이
+뒤섞입니다.
 
 **처음 막힌 단계가 답**이며, 그 뒤 단계는 "실패"가 아니라 "도달하지 않음"으로 흐리게 표시됩니다.
 셋이 동시에 깨져 있었으므로 앞 단계를 고쳐야 다음 원인이 드러납니다 — 한 번에 하나씩만 보이는
 구조 자체가 이 진단 패널이 필요한 이유입니다.
+
+## 11. 방향 (LONG / SHORT / NO_TRADE)
+
+전략 선택 공간이 방향을 포함합니다. 요약만 두고 상세는
+[short_selling_deployment.md](short_selling_deployment.md)에 있습니다.
+
+### 11.1 SELL의 모호성
+
+`SELL`은 "보유 롱 청산" 또는 "신규 숏 진입" 둘 중 하나이고, 두 결과는 계좌가 flat이 되는지
+**주식을 빚지는지**로 갈립니다. 따라서 네 축을 분리합니다.
+
+| 의미 | direction | effect | product | broker side |
+| --- | --- | --- | --- | --- |
+| 롱 진입 | LONG | OPEN | CASH | BUY |
+| 롱 청산 | LONG | CLOSE | CASH | SELL |
+| 숏 진입 | SHORT | OPEN | CREDIT_BORROW | SELL |
+| 숏 청산 | SHORT | CLOSE | CREDIT_BORROW | BUY |
+
+수량은 항상 양의 절댓값이며 방향은 별도 필드입니다. 방향을 수량 부호로 넣으면 리팩터 한 번을
+살아남은 뒤 어딘가에서 조용히 매수로 바뀝니다.
+
+`position_effect`의 기본값은 `"OPEN"`이 아니라 **빈 문자열(추론)**입니다. `"OPEN"` 기본값은
+구현 중 실제로 회귀를 일으켰습니다 — shorts 이전에 만들어진 모든 롱 SELL/REDUCE 청산이 진입으로
+재분류되어 자기 broker side와 모순되고, 계약 일치 검사가 **모든 위험 축소 주문을 거부**했습니다.
+
+### 11.2 숏 비용은 롱 비용의 부호 반전이 아니다
+
+`ProfitabilityGate`는 숏 진입에 대해:
+
+- 예상 청산가가 **수익 방향**(진입가 아래)인지 검사. 아니면 자기 논지가 손실을 예측하는 거래이므로 거부
+- 대주 이용료를 **보유시간 비례 안분**해 all-in 비용에 포함. **미상 = 0이 아니라 거부**
+- borrow uncertainty / recall risk 버퍼를 요구수익이 아니라 **비용**으로 부과 —
+  `cost_coverage_ratio`가 승격 게이트가 읽는 지표이므로, 요구수익에 숨기면 그 비율이 거래를
+  미화합니다
+- `LIVE_PROBE`는 cost coverage **2.0**을 요구(정책 기본 1.7보다 높음). 자기 비용 모델에 대한
+  증거가 가장 적은 칸이 가장 넓은 마진을 요구하며, 신뢰가 쌓이면 요구가 **완화**됩니다
+
+숏 청산은 어떤 경우에도 게이트되지 않습니다.
+
+### 11.3 숏 리스크 검사 (롱에 대응물이 없는 것)
+
+`restricted_products_blocked` 단일 검사가 방향·상품별 독립 검사로 분해되었습니다. 기존 검사는
+"margin·short·derivatives·leverage ETF·credit **전부** 금지"를 모든 주문에 요구했으므로, 숏을
+켜면 파생상품과 레버리지 ETF까지 함께 허용되는 구조였습니다.
+
+추가된 검사: 대주 가용성/수량/비용/신선도, `loan_date` 정합성, 숏 포지션 수·단일/총 비중,
+gross/net 노출, 스퀴즈 위험, recall 마감, 숏 일일 손실(계좌 한도의 절반), 손절 주문 가능성,
+오버나이트 금지.
+
+사이징은 **네 독립 상한의 최소값**입니다.
+
+```
+min(position_sizer, borrow_available, state_limit, risk_budget)
+```
+
+최소값이므로 가장 타이트한 상한이 항상 이기고, 한 계산 오류가 포지션을 넓힐 수 없습니다.
+숏 거래당 위험예산은 롱의 **50% 이하에서 시작**하며, 연속 손실 2회부터 절반, 4회부터 신규 진입
+중단입니다(롱 경로보다 엄격).
+
+숏 **청산**은 리스크 한도로 막지 않습니다. 한도 위반을 이유로 상환을 거부하면 무제한 손실
+포지션이 갇히며, 그것은 어떤 한도 위반보다 나쁩니다.

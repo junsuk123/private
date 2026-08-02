@@ -83,9 +83,18 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
 | `src/app/graph/` | custom KnowledgeGraph, FactTable, RDF/OWL/SHACL 레이어, 거시–미시 추론, theory vote, NPU evidence scorer |
 | `src/app/ontology/` | TTL 스키마와 closed-world 운영 게이트, trading domain reasoner |
 | `src/app/models/` | 라벨링, 학습 파이프라인, artifact registry, CPU/OpenVINO backend, strategy-utility R-GCN |
-| `src/app/strategy/`, `routing/` | 8개 전략 expert, 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
+| `src/app/strategy/`, `routing/` | 카탈로그 전략 expert(롱 13 + 숏 3), 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
 | `src/app/cost/`, `risk/` | TradingCostEngine, ProfitabilityGate, position sizing, principal protection, RiskManager |
 | `src/app/trading/` | realtime engine, shared decision engine, dynamic exit policy, execution policy, runtime guard |
+| `src/app/trading/directional.py` | 방향 축 계약: `PositionDirection`/`PositionEffect`/`ExecutionProduct`/`StrategyDeploymentState`, `DirectionalStrategyKey`, 방향별 exit geometry, 전이 화이트리스트 |
+| `src/app/trading/borrow.py` | 대주 locate의 point-in-time 저널과 공유 admissibility 규칙(`evaluate_borrow`), 연율→거래별 안분 |
+| `src/app/trading/borrow_source.py` | 대주 가용성 소스 인터페이스. 기본값은 명시적 "소스 없음"; 파일/callable 구현 |
+| `src/app/trading/borrow_polling.py` | 수요 기반·예산 제한 폴링으로 저널을 채움 |
+| `src/app/trading/shadow_evaluation_service.py` | shadow plan을 심볼별로 채점해 승격 증거로 전환 |
+| `src/app/features/short_indicators.py` | 계산 가능한 숏 보조 지표 + 소스 없는 지표의 명시적 보고 |
+| `src/app/trading/directional_shadow.py` | forward shadow 평가: plan 동결, bid/ask 체결 시뮬레이터, 3중 누수 방어 |
+| `src/app/trading/short_strategy_promotion.py` | 배포 사다리 authority: confidence score, hard gate, 자동 승격/강등, 원자적 상태+audit 기록 |
+| `src/app/ontology/short_rules.py` | 숏 closed-world 사실 평가와 레짐별 방향 허용 마스크 |
 | `src/app/execution/` | KIS adapter(국내/해외), 주문 가격 정책, 거래소 라우팅, live coordinator, 저널, idempotency |
 | `src/app/backtesting/`, `evaluation/` | 이벤트 시뮬레이터, purged walk-forward, reality check, counterfactual 평가 |
 | `src/app/storage/` | local store, lifecycle store, model store, 마이그레이션 |
@@ -99,6 +108,10 @@ data/store/realtime_market_data.sqlite3   실시간 체결·호가·분봉
 data/store/research.sqlite3               정규화된 리서치 레코드
 data/store/account_dashboard.sqlite3      계좌/자산 히스토리
 data/store/trading-lifecycle.sqlite3      전략 인스턴스·포지션·TradePlan
+data/store/strategy-performance.sqlite3   실현 outcome (v2: direction/execution_product/evaluation_source 컬럼)
+data/store/strategy-deployment.sqlite3    arm별 배포 상태 + promotion_audit (한 트랜잭션)
+data/store/borrow-snapshots.sqlite3       대주 locate append-only 저널 (과거 시점 조회용)
+data/store/directional-shadow.sqlite3     shadow plan과 채점된 forward outcome
 data/store/causal-order-journal.jsonl     intent → verdict → order 인과 저널
 data/models/<family>/                     버전 artifact + <model>.latest.json
 data/reports/                             readiness, 벤치마크, counterfactual 리포트
@@ -135,6 +148,14 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | `GET /api/gnn/realtime-trust` | GNN 전체/전략별 보정 점수, forward 표본, 진입 권한 |
 | `GET /api/system-diagnostics` | 서버·계좌·시장 데이터·온톨로지·학습·거래 엔진 통합 진단 |
 | `GET /api/auto-reliability/status` | `learning` ↔ `live_trading` 자동 전환 점수와 사유 |
+| `GET /api/short-strategies/status` | 숏 arm별 배포 상태, 실주문 권한, confidence, 대주 건강도 |
+| `GET /api/short-strategies/{id}/validation` | 전체 지표·임계값과 **실패한 hard gate 전량** (승격까지 남은 조건) |
+| `GET /api/short-strategies/{id}/deployment-history` | 자동 승격/강등 audit 이력 (변경 당시 지표 포함) |
+| `GET /api/short-strategies/{id}/shadow-outcomes` | forward shadow outcome (실행 불가 신호 포함) |
+| `GET /api/short-strategies/entry-blockade` | 숏 진입을 **가장 먼저** 막은 단계 |
+| `GET /api/borrow/{symbol}/availability`, `/api/borrow/health` | 대주 locate와 데스크 건강도 |
+| `GET /api/directional-bandit/evaluations` | LONG vs SHORT vs NO_TRADE 보수적 엣지 비교 |
+| `POST /api/short-strategies/{id}/suspend` | 수동 중단. **승격 endpoint는 존재하지 않음** |
 
 ## 7. 운영 모드
 
@@ -189,5 +210,6 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
 4. decision/feature JSONL 로그가 수백 MB 규모까지 자라며 문서화된 retention/compaction 정책이 없습니다.
 5. 소액 계좌 단타는 왕복 비용을 고려하면 구조적으로 기대값이 음수에 가깝습니다. 게이트는 엔지니어링 통제일 뿐 수익을 보장하지 않습니다.
 6. 이벤트·횡단면 상대강도·갭 전략은 해당 point-in-time 사실이 실시간 feature schema에 없으면 closed-world로 차단됩니다. 결측 사실을 합성해 0이 아닌 적합도를 만들지 않습니다.
+7. 숏 전략 3개는 코드에 존재하지만 **전량 `SHADOW`이며 실주문 권한이 없습니다.** 승격에는 최소 20 거래일의 forward 표본이 필요하므로 정상 상태입니다. 또한 KIS 대주 조회 TR id와 응답 필드명은 실계좌 응답으로 검증되지 않았고(read-only 경로), GNN 방향별 utility head는 미구현입니다 — 숏 arm은 현재 realized posterior와 규칙 신호로만 평가됩니다. 상세는 [short_selling_deployment.md](short_selling_deployment.md) §15.
 
-관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [validation.md](validation.md)
+관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [short_selling_deployment.md](short_selling_deployment.md) · [validation.md](validation.md)

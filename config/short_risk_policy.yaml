@@ -1,0 +1,110 @@
+# Short-side risk limits, by deployment state.
+#
+# These are the SECOND gate. The first is the per-arm deployment state
+# (config/short_strategy_deployment.yaml); an arm still in SHADOW never reaches these
+# limits at all, because it never produces an order. Nothing here can authorise a
+# short — the limits only constrain one that is already authorised.
+#
+# The account-level master switches live in config/risk_rules.example.json
+# (``short_selling_allowed`` / ``credit_loan_allowed``) and both default to FALSE.
+# With them off, every short entry is rejected regardless of what this file says.
+
+# --- Master switches --------------------------------------------------------- #
+# Mirrored here for visibility. The authoritative values are the RiskRules fields.
+short_selling_allowed: false
+credit_loan_allowed: false
+
+# --- Per-state position limits ----------------------------------------------- #
+# Sizes grow only as forward evidence accumulates. Each rung exists to gather
+# evidence AT THAT SIZE, which is why the ladder cannot be skipped: LIVE_FULL sizing
+# has never been observed by a strategy that has only traded at LIVE_PROBE size.
+states:
+  SHADOW:
+    submit_orders: false
+    # Everything below is irrelevant while submit_orders is false, and is stated only
+    # so the progression is readable in one place.
+    max_open_short_positions: 0
+    max_quantity: 0
+
+  LIVE_PROBE:
+    submit_orders: true
+    # One share, one position, once a day. The purpose of this rung is to test the
+    # ORDER PATH — broker acceptance, fill quality, the 매수상환 contract, the borrow
+    # preflight — not to make money. Sizing it to matter would put real capital behind
+    # an unvalidated hypothesis.
+    max_open_short_positions: 1
+    max_quantity: 1
+    max_position_weight: 0.01
+    max_daily_short_entries: 1
+    max_holding_minutes: 30
+    overnight_short_allowed: false
+    # 2.0, not the policy default of 1.7. This is the rung with the least evidence
+    # about its own cost model, so it demands the widest margin — the requirement
+    # LOOSENS as confidence grows, which is the opposite of how a naive ramp would
+    # work.
+    minimum_cost_coverage_ratio: 2.0
+
+  LIVE_LIMITED:
+    submit_orders: true
+    max_open_short_positions: 1
+    max_position_weight: 0.025
+    max_total_short_weight: 0.05
+    max_daily_short_entries: 2
+    max_holding_minutes: 60
+    overnight_short_allowed: false
+    minimum_cost_coverage_ratio: 1.8
+
+  LIVE_FULL:
+    submit_orders: true
+    max_open_short_positions: 2
+    max_single_short_weight: 0.05
+    max_total_short_weight: 0.10
+    max_daily_short_entries: 3
+    # Still false at LIVE_FULL, and not a tuning knob. None of the three short theses
+    # has an overnight horizon in the exit-geometry table, borrow accrues over the
+    # weekend, and an overnight gap against a short is unbounded.
+    overnight_short_allowed: false
+    minimum_cost_coverage_ratio: 1.7
+
+# --- Sizing ------------------------------------------------------------------ #
+sizing:
+  # Size = min(position_sizer, borrow_available, state_limit, risk_budget).
+  # A MINIMUM, so the tightest bound always wins and no single miscalculation can
+  # widen the position.
+  rule: min_of_all_bounds
+  # A short's per-trade risk budget starts at half a long's. 0.5 is a ceiling rather
+  # than a target: the downside is unbounded and it ACCELERATES, because the position
+  # grows as it moves against you.
+  risk_budget_ratio_of_long: 0.5
+  # Stricter than the long path's streak scaling, for the same reason.
+  loss_streak_halve_at: 2
+  loss_streak_stop_at: 4
+
+# --- Exposure ---------------------------------------------------------------- #
+exposure:
+  # Gross counts both directions; net lets a long and a short in the same name offset.
+  # Both are needed: gross bounds total market contact, net bounds directional bet.
+  max_gross_exposure: 1.0
+  max_net_short_exposure: 0.10
+
+# --- Borrow guards ----------------------------------------------------------- #
+borrow:
+  # Beyond this age a locate is a memory, not a fact. Availability moves intraday and
+  # recall waves cluster exactly when these strategies want to be short.
+  max_snapshot_age_seconds: 30.0
+  # Hours of headroom required before a stated recall deadline. Below it the LENDER
+  # controls the exit timing rather than the strategy.
+  min_hours_before_recall_deadline: 24.0
+  # Refuse to short a crowded name: a squeeze is where the unbounded loss actually
+  # materialises.
+  max_days_to_cover: 5.0
+  max_short_interest_ratio: 0.15
+
+# --- Hard stops -------------------------------------------------------------- #
+hard_stops:
+  # Half the account-wide daily loss stop.
+  short_daily_loss_stop: 0.005
+  # A short whose protective stop cannot be placed is a short whose loss cannot be
+  # bounded. The capability must be demonstrated, not assumed — an unanswered
+  # capability check fails.
+  require_stop_order_capability: true

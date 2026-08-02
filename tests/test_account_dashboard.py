@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import sqlite3
 import gc
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -173,11 +174,23 @@ class AccountDashboardTest(unittest.TestCase):
         self.assertEqual(snapshot["foreign_cash_krw"], 0)
 
     def test_asset_history_rolls_up_to_one_point_per_minute(self) -> None:
+        # Timestamps are relative to now. They used to be hardcoded to 2026-07-01,
+        # which sat inside the "1M" lookback until the calendar rolled past 30 days
+        # and then silently fell out of the window — the test began failing on a
+        # date change rather than on a code change. The behaviour under test is the
+        # per-minute roll-up, not the window boundary.
+        base = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(
+            days=2
+        )
+
+        def _stamp(offset_seconds: int) -> str:
+            return (base + timedelta(seconds=offset_seconds)).isoformat()
+
         with tempfile.TemporaryDirectory() as tmp:
             store = AccountSnapshotStore(Path(tmp) / "account.sqlite3")
             first = {
                 "snapshot": {
-                    "created_at": "2026-07-01T00:00:05+00:00",
+                    "created_at": _stamp(5),
                     "source": "kis_live_account",
                     "total_asset_krw": 100_000,
                     "net_asset_krw": 100_000,
@@ -188,7 +201,7 @@ class AccountDashboardTest(unittest.TestCase):
             }
             second = {
                 "snapshot": {
-                    "created_at": "2026-07-01T00:00:55+00:00",
+                    "created_at": _stamp(55),
                     "source": "kis_live_account",
                     "total_asset_krw": 101_000,
                     "net_asset_krw": 101_000,
@@ -199,7 +212,7 @@ class AccountDashboardTest(unittest.TestCase):
             }
             third = {
                 "snapshot": {
-                    "created_at": "2026-07-01T00:01:01+00:00",
+                    "created_at": _stamp(61),
                     "source": "kis_live_account",
                     "total_asset_krw": 102_000,
                     "net_asset_krw": 102_000,

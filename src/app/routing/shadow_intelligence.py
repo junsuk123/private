@@ -201,8 +201,19 @@ class ShadowIntelligenceService:
         if checkpoint_path.exists():
             try:
                 checkpoint_model = FixedShapeStrategyUtilityModel.load_checkpoint(checkpoint_path)
-            except Exception:  # noqa: BLE001 - corrupt model must fail closed.
-                self.checkpoint_error = "GNN_CHECKPOINT_CORRUPT"
+            except Exception as exc:  # noqa: BLE001 - an unloadable model fails closed.
+                # A HEAD-SHAPE mismatch is a schema change, not corruption, and the two
+                # send an operator in different directions: "corrupt" means look for a
+                # damaged file, while "schema" means retrain against the current
+                # contract. The borrow channels widened the head from 8 to 11, so every
+                # pre-existing checkpoint lands here — reporting that as corruption
+                # would send everyone hunting a file that is perfectly intact.
+                message = str(exc)
+                self.checkpoint_error = (
+                    "GNN_HEAD_SCHEMA_MISMATCH"
+                    if "strategy_heads" in message or "no_trade_head" in message
+                    else "GNN_CHECKPOINT_CORRUPT"
+                )
         self.checkpoint_loaded = (
             checkpoint_model is not None and checkpoint_model.config == config
         )

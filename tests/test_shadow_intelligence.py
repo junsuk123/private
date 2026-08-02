@@ -84,7 +84,14 @@ def test_slow_intelligence_runs_order_free_comparison_and_throttles(tmp_path) ->
     result = service.evaluate(snapshot, legacy_action="BUY")
     assert result is not None
     assert result.cpu_evidence == ()
-    assert "GNN_FEATURE_SCHEMA_MISMATCH" in result.comparison.decisions[-1].reason_codes
+    # Fails closed on a SCHEMA reason. Which schema differs first is not the point of
+    # this test, and the shipped checkpoint now differs on two axes: it predates both
+    # this service's feature_dim and the head widening that added the borrow channels
+    # (8 -> 11). Either code is a correct, actionable answer; "corrupt" would not be,
+    # which is why the loader distinguishes them.
+    reason_codes = result.comparison.decisions[-1].reason_codes
+    assert {"GNN_FEATURE_SCHEMA_MISMATCH", "GNN_HEAD_SCHEMA_MISMATCH"} & set(reason_codes)
+    assert "GNN_CHECKPOINT_CORRUPT" not in reason_codes
     assert not result.npu_evidence
     assert result.comparison.decisions[0].path == "legacy"
     assert service.evaluate(snapshot, legacy_action="BUY") is None

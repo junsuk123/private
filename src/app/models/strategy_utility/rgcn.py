@@ -5,6 +5,34 @@ from pathlib import Path
 
 import numpy as np
 
+from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
+
+# Output channels per strategy head.
+#
+# Directional note: shorts are DISTINCT strategy ids in this catalogue
+# (``opening_range_breakdown`` is not a direction of ``opening_range_breakout``), so a
+# per-strategy head already IS a per-direction head. Adding a separate direction axis
+# would allocate 2x the heads and leave half of them meaningless — a LONG head for a
+# short-only thesis has nothing to learn.
+#
+# What a short genuinely needs that a long does not is the BORROW leg, so the head grew
+# from 8 channels to 11:
+#   8  expected borrow cost (bps, annualised-equivalent for the modelled hold)
+#   9  borrow probability   (will a locate exist when this fires?)
+#  10  epistemic uncertainty (model ignorance, distinct from aleatoric noise)
+#
+# Widening the head deliberately INVALIDATES every existing checkpoint: the tensor
+# shape no longer matches, ``load_checkpoint`` raises, and the runtime falls back to
+# no-GNN. That is the required fail-closed behaviour for a schema change.
+_HEAD_CHANNELS = 11
+
+# Strategy indices whose thesis is short. Their borrow channels are meaningful; for
+# every other index the decoder forces cost=0 and probability=1, because a cash long
+# has no borrow leg and a model must not be able to invent one.
+_SHORT_STRATEGY_INDICES: tuple[int, ...] = tuple(
+    index for index, name in enumerate(STRATEGY_IDS) if is_short_strategy(name)
+)
+
 
 @dataclass(frozen=True)
 class StrategyUtilityModelConfig:
@@ -30,6 +58,14 @@ class StrategyUtilityOutput:
     aleatoric_uncertainty: np.ndarray
     utility: np.ndarray
     no_trade_probability: np.ndarray
+    # Borrow leg. Zero / one for every LONG strategy by construction — see
+    # ``_short_channel_mask``.
+    borrow_cost_bps: np.ndarray | None = None
+    borrow_probability: np.ndarray | None = None
+    # Model ignorance, as opposed to irreducible noise. Kept separate because they
+    # justify different responses: aleatoric uncertainty means size smaller, epistemic
+    # means gather more evidence before trusting the estimate at all.
+    epistemic_uncertainty: np.ndarray | None = None
 
 
 class FixedShapeStrategyUtilityModel:
@@ -48,7 +84,7 @@ class FixedShapeStrategyUtilityModel:
         self.strategy_heads = rng.normal(
             0,
             1 / max(1, config.hidden_dim) ** 0.5,
-            (config.strategy_count, config.hidden_dim, 8),
+            (config.strategy_count, config.hidden_dim, _HEAD_CHANNELS),
         ).astype(np.float32)
         self.no_trade_head = rng.normal(
             0, 1 / max(1, config.hidden_dim) ** 0.5, (config.hidden_dim,)
@@ -198,9 +234,27 @@ def output_from_raw(
         fill = _sigmoid(raw[..., 5])
         holding = _softplus(raw[..., 6]) * 60
         uncertainty = _softplus(raw[..., 7])
+        # --- Borrow leg -------------------------------------------------------- #
+        # Masked to the short strategies. A LONG head's channels 8/9 are untrained
+        # noise, and letting them through would charge a cash long an invented borrow
+        # cost — or worse, let a model learn to discount one.
+        short_mask = _short_channel_mask(raw.shape)
+        borrow_cost = _softplus(raw[..., 8]) * 10 * short_mask
+        # Probability 1.0 for a long: there is nothing to locate.
+        borrow_probability = np.where(short_mask > 0, _sigmoid(raw[..., 9]), 1.0)
+        epistemic = _softplus(raw[..., 10])
+        # Net is charged the borrow cost, and the whole expectation is scaled by the
+        # probability that the trade is executable at all. An edge that only exists on
+        # names you cannot borrow is not an edge.
+        net = net - borrow_cost
+        gross = cost + borrow_cost + net
         utility = (
-            net
+            borrow_probability * net
             - uncertainty
+            # Epistemic uncertainty is charged on TOP of aleatoric. A model that does
+            # not know is not the same as a market that is noisy, and both reduce what
+            # this estimate is worth.
+            - epistemic
             + 0.1 * fill * mfe
         )
         valid = node_mask[:, -1, :, None] * strategy_mask
@@ -218,7 +272,24 @@ def output_from_raw(
             aleatoric_uncertainty=uncertainty,
             utility=utility,
             no_trade_probability=no_trade,
+            borrow_cost_bps=borrow_cost,
+            borrow_probability=borrow_probability,
+            epistemic_uncertainty=epistemic,
         )
+
+
+def _short_channel_mask(shape: tuple[int, ...]) -> np.ndarray:
+    """1.0 on short strategy indices, 0.0 elsewhere, broadcast over ``[B, N, S]``.
+
+    Built from the catalogue rather than learned, so a model cannot discover a borrow
+    cost for a cash long no matter what the training data looks like.
+    """
+    strategy_count = shape[2]
+    mask = np.zeros(strategy_count, dtype=np.float32)
+    for index in _SHORT_STRATEGY_INDICES:
+        if index < strategy_count:
+            mask[index] = 1.0
+    return mask[None, None, :]
 
 def _sigmoid(value: np.ndarray) -> np.ndarray:
     clipped = np.clip(value, -30, 30)

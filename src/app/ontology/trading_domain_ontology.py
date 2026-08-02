@@ -20,6 +20,22 @@ class IntentType(StrEnum):
     HOLD = "HOLD"
     WATCH = "WATCH"
     BLOCK = "BLOCK"
+    # --- Directional intents ------------------------------------------------- #
+    # Added as DISTINCT members rather than reusing SELL. ``SELL`` here has always
+    # meant "close a long", and overloading it with "open a short" would make every
+    # existing rule that treats SELL as de-risking silently permit new short
+    # exposure — the single most dangerous ambiguity available in this vocabulary.
+    OPEN_SHORT = "OPEN_SHORT"
+    CLOSE_SHORT = "CLOSE_SHORT"
+    NO_TRADE = "NO_TRADE"
+
+    @property
+    def opens_exposure(self) -> bool:
+        return self in {IntentType.BUY, IntentType.OPEN_SHORT}
+
+    @property
+    def is_short_side(self) -> bool:
+        return self in {IntentType.OPEN_SHORT, IntentType.CLOSE_SHORT}
 
 
 class ValidationState(StrEnum):
@@ -93,6 +109,60 @@ class ReasonCodes:
     SELL_HARD_STOP = "ONTO_SELL_HARD_STOP"
     SELL_TIME_STOP = "ONTO_SELL_TIME_STOP"
     SELL_MODEL_EXIT = "ONTO_SELL_MODEL_EXIT"
+    # --- short ontology ------------------------------------------------------ #
+    # The closed-world rule: a new short arm is executable ONLY when every one of
+    # ShortSalePermitted, BorrowAvailable, BorrowQuantitySufficient,
+    # BorrowCostAcceptable and the per-arm deployment authorization is EXPLICITLY
+    # true. Anything unstated is false. That is the inverse of how the long-side
+    # facts behave (where an unanswerable check must not be read as a refusal), and
+    # the asymmetry is deliberate: a missing long fact costs a skipped trade, while
+    # a missing borrow fact costs a rejected or force-closed position.
+    SHORT_SALE_NOT_PERMITTED = "ONTO_SHORT_SALE_NOT_PERMITTED"
+    SHORT_BORROW_UNAVAILABLE = "ONTO_SHORT_BORROW_UNAVAILABLE"
+    SHORT_BORROW_QUANTITY_INSUFFICIENT = "ONTO_SHORT_BORROW_QUANTITY_INSUFFICIENT"
+    SHORT_BORROW_COST_UNACCEPTABLE = "ONTO_SHORT_BORROW_COST_UNACCEPTABLE"
+    SHORT_RECALL_RISK_HIGH = "ONTO_SHORT_RECALL_RISK_HIGH"
+    SHORT_EXECUTION_LIQUIDITY_INSUFFICIENT = "ONTO_SHORT_EXEC_LIQUIDITY_INSUFFICIENT"
+    SHORT_NOT_SHADOW_VALIDATED = "ONTO_SHORT_NOT_SHADOW_VALIDATED"
+    SHORT_NOT_LIVE_PROBE_AUTHORIZED = "ONTO_SHORT_NOT_LIVE_PROBE_AUTHORIZED"
+    SHORT_NOT_LIVE_AUTHORIZED = "ONTO_SHORT_NOT_LIVE_AUTHORIZED"
+    SHORT_EXECUTABLE = "ONTO_SHORT_EXECUTABLE"
+    # Regime states in which NO new entry is permitted in EITHER direction. A
+    # dislocated book is not a short opportunity — it is a market whose prices are
+    # not information.
+    DISLOCATED_NO_NEW_ENTRY = "ONTO_MACRO_DISLOCATED_NO_NEW_ENTRY"
+
+
+# --------------------------------------------------------------------------- #
+# Short-side facts (closed world)                                              #
+# --------------------------------------------------------------------------- #
+# Each name is a fact that must be EXPLICITLY established before a new short arm is
+# executable. Kept as an ordered tuple so the reasoner reports them in the order an
+# operator would check them: permission, then supply, then price, then authorization.
+SHORT_REQUIRED_FACTS: tuple[str, ...] = (
+    "ShortSalePermitted",
+    "BorrowAvailable",
+    "BorrowQuantitySufficient",
+    "BorrowCostAcceptable",
+    "RecallRiskAcceptable",
+    "ShortExecutionLiquiditySufficient",
+    "ShortStrategyShadowValidated",
+)
+
+# Deployment-authorization facts. Separate from the list above because they answer a
+# different question — not "can this order be executed" but "has this STRATEGY earned
+# the right to try". Model calibration is separately tracked and is not a substitute:
+# a well-calibrated model predicting an unprofitable-after-borrow strategy is a
+# correct model of a bad trade.
+SHORT_AUTHORIZATION_FACTS: tuple[str, ...] = (
+    "ShortStrategyLiveProbeAuthorized",
+    "ShortStrategyLiveAuthorized",
+)
+
+# Regimes in which BOTH directions are blocked for new entries.
+NO_NEW_ENTRY_REGIMES: frozenset[str] = frozenset(
+    {"HIGH_VOL_DISLOCATED", "DISLOCATED", "NEWS_SHOCK", "HALTED"}
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +208,23 @@ ONTOLOGY_CLASSES: tuple[OntologyClass, ...] = (
     OntologyClass("LiveTradingResult", "validation"),
     OntologyClass("OverfittingRisk", "validation"),
     OntologyClass("NegativeNetExpectancy", "validation"),
+    # --- short (borrow) ------------------------------------------------------ #
+    OntologyClass(
+        "ShortSalePermitted", "short", ("TradingEntity",), "Regulator/broker permits 대주 on this name"
+    ),
+    OntologyClass("BorrowAvailable", "short", ("ExecutionRisk",), "A locate exists right now"),
+    OntologyClass("BorrowQuantitySufficient", "short", ("BorrowAvailable",)),
+    OntologyClass("BorrowCostAcceptable", "short", ("ExpectedNetReturn",)),
+    OntologyClass("RecallRiskAcceptable", "short", ("RiskState",), "Lender unlikely to force a cover"),
+    OntologyClass("ShortExecutionLiquiditySufficient", "short", ("ExecutionRisk",)),
+    # Three separate authorization facts, not one. Model calibration, shadow
+    # validation and live authorization are independent claims, and collapsing them
+    # into a single ``authorized`` boolean is exactly how a model-level flag would end
+    # up permitting every short strategy at once.
+    OntologyClass("ShortStrategyShadowValidated", "short", ("PaperTradingResult",)),
+    OntologyClass("ShortStrategyLiveProbeAuthorized", "short", ("LiveTradingResult",)),
+    OntologyClass("ShortStrategyLiveAuthorized", "short", ("LiveTradingResult",)),
+    OntologyClass("ShortSqueezeRisk", "short", ("RiskState",)),
 )
 
 

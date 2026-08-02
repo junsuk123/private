@@ -941,3 +941,79 @@ tbody tr:hover { background: #f8fbff; }
   .blockade-step { flex-direction: row; }
   .blockade-tags { gap: 4px; }
 }
+
+/* --- Short deployment ladder ------------------------------------------------ */
+/* A SHADOW arm is styled NEUTRAL, not as a failure: shadow is the correct starting
+   state and colouring it red would train the operator to ignore a real red. The
+   attention-grabbing style is reserved for `.live`, because a short with order
+   authority is what deserves a second look. */
+.short-ladder-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.short-arm {
+  border: 1px solid #dfe6ee;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fbfcfe;
+}
+.short-arm.live {
+  border-color: #f0b8a8;
+  background: #fff8f5;
+}
+.short-arm-name {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #22303c;
+}
+.short-arm-track {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 8px 0 6px;
+}
+.short-step {
+  flex: 1 1 auto;
+  text-align: center;
+  font-size: 10.5px;
+  padding: 3px 4px;
+  border-radius: 6px;
+  background: #eef2f7;
+  color: #8a99a8;
+  white-space: nowrap;
+}
+.short-step.reached {
+  background: #dfe9f5;
+  color: #3f5468;
+}
+.short-step.current {
+  background: #2f6fb5;
+  color: #fff;
+  font-weight: 600;
+}
+.short-step.suspended {
+  background: #fff0eb;
+  color: #b42318;
+  font-weight: 600;
+}
+.short-arm-meta {
+  margin: 0;
+  font-size: 12px;
+  color: #47586a;
+}
+.short-arm-blockers {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: #6a7a89;
+}
+.short-ladder-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 10px;
+}

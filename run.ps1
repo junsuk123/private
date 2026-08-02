@@ -450,6 +450,12 @@ Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "60"
 # 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
 # 6시간 주기인 이유: 당일 수치는 장중 계속 변하므로 24시간 주기면 정작 필요한
 # 당일 데이터가 하루 대부분 낡은 상태로 남는다. 읽기 전용 조회만 사용한다.
+# 주말 리서치: KRX 금요일 마감 ~ 월요일 개장 사이에는 양 시장 모두 정지하므로
+# 연산 여유가 있고 방해할 거래도 없다. 이 구간에 거시·이벤트를 집계해 월요일 개장
+# 갭에 대한 "검증 가능한 사전 예측"을 남기고, 개장 후 실제 갭과 대조해 채점한다.
+# 채점하지 않는 주말 분석은 틀린 분석과 구별되지 않는다.
+Set-DefaultEnv "AUTO_START_WEEKEND_BRIEF" "true"
+Set-DefaultEnv "WEEKEND_BRIEF_INTERVAL_SECONDS" "3600"
 Set-DefaultEnv "AUTO_START_INVESTOR_FLOW_REFRESH" "true"
 Set-DefaultEnv "INVESTOR_FLOW_REFRESH_SECONDS" "21600"
 Set-DefaultEnv "INVESTOR_FLOW_MINIMUM_BARS" "100"

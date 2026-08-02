@@ -252,7 +252,7 @@ class SectorRankTable:
     market_betas: Mapping[str, float] = field(default_factory=dict)
 
     def rank_for(self, symbol: str) -> tuple[int, int] | None:
-        """``(rank, sector_size)`` 1-based, or ``None`` when unanswerable."""
+        """``(rank, sector_size)`` 1-based from the STRONG end, or ``None``."""
         key = str(symbol or "").upper()
         rank = self.ranks.get(key)
         sector = self.sector_of.get(key)
@@ -262,6 +262,22 @@ class SectorRankTable:
         if size <= 1:
             return None
         return int(rank), size
+
+    def weakness_rank_for(self, symbol: str) -> tuple[int, int] | None:
+        """``(rank, sector_size)`` 1-based from the WEAK end.
+
+        ``residual_relative_weakness`` asks "is this the weakest name in its
+        sector?", which is rank 1 counted from the bottom. Deriving it as
+        ``size - rank + 1`` rather than storing a second ranking keeps the two
+        views provably consistent — a separately-built weak ranking could disagree
+        with the strong one after a tie-break change, and then a symbol could be
+        simultaneously the strongest and the weakest in its sector.
+        """
+        resolved = self.rank_for(symbol)
+        if resolved is None:
+            return None
+        rank, size = resolved
+        return size - rank + 1, size
 
     def residual_for(self, symbol: str) -> float | None:
         return self.residual_returns.get(str(symbol or "").upper())

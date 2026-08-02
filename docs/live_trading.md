@@ -96,7 +96,50 @@ python .\run.py --host 127.0.0.1 --port 8010
 
 자주 보이는 BUY 거부 코드: `MODEL_FEATURE_UNAVAILABLE:...`, `WIDE_SPREAD:x>ybps`, `LOW_LIQUIDITY`, `FALLBACK_SCORE_BELOW_THRESHOLD:x<y`, `ONTOLOGY_REQUIRED_FOR_MODEL_FALLBACK`, `MODEL_AUXILIARY_ONLY_NEEDS_CONFIRMATION`, `INSUFFICIENT_CASH_FOR_ONE_SHARE`. 순수익 게이트 코드는 [decision_and_risk.md](decision_and_risk.md)에 있습니다.
 
-### SELL / REDUCE
+### 숏 진입 (SHORT / OPEN) 추가 요건
+
+broker side가 SELL이지만 **롱 청산과 완전히 다른 경로**입니다. 위 게이트 전부에 더해:
+
+1. `RiskRules.short_selling_allowed` + `credit_loan_allowed` (계좌 레벨, **기본 False**)
+2. 해당 arm의 배포 상태가 live 칸 — `SHADOW`면 어떤 환경변수로도 주문이 생기지 않습니다
+3. 주문 직전 대주 재조회 + 수량·이용료 재검증 (`evaluate_borrow`, 30초 이내 snapshot)
+4. `ProfitabilityGate` 재실행 (대주 비용 포함, `LIVE_PROBE`는 cost coverage 2.0)
+5. 주문 계약 4축 일치: direction·effect·product·broker side
+6. 브로커 응답의 신용구분이 요청한 값과 일치 (불일치면 우리가 관리한다고 믿는 주문이 실제
+   존재하는 주문과 다르므로 예외)
+
+**두 개의 독립 조건**입니다: 계좌 레벨 정책 허용(운영자 결정)과 arm 배포 상태(증거 기반 자동
+결정). 하나만으로는 부족합니다.
+
+이 문서를 쓰는 시점에 숏 arm 3개는 전량 `SHADOW`이고 실주문 권한이 없습니다. 상세는
+[short_selling_deployment.md](short_selling_deployment.md).
+
+숏 진입 거부 코드: `SHORT_STRATEGY_SHADOW_ONLY`, `SHORT_BORROW_UNAVAILABLE`,
+`SHORT_BORROW_QUANTITY_INSUFFICIENT`, `SHORT_BORROW_COST_TOO_HIGH`,
+`SHORT_BORROW_SNAPSHOT_STALE`, `SHORT_RECALL_DEADLINE_NEAR`,
+`SHORT_SELLING_NOT_PERMITTED_BY_POLICY`, `CREDIT_BORROW_NOT_PERMITTED_BY_POLICY`,
+`SHORT_ORDER_CONTRACT_INCOMPLETE`, `SHORT_MAX_OPEN_POSITIONS_REACHED`,
+`SHORT_SINGLE_POSITION_WEIGHT_EXCEEDED`, `SHORT_TOTAL_WEIGHT_EXCEEDED`,
+`GROSS_EXPOSURE_LIMIT_EXCEEDED`, `NET_SHORT_EXPOSURE_LIMIT_EXCEEDED`,
+`SHORT_SQUEEZE_RISK_TOO_HIGH`, `SHORT_DAILY_LOSS_LIMIT_EXCEEDED`,
+`SHORT_STOP_ORDER_CAPABILITY_MISSING`, `OVERNIGHT_SHORT_NOT_PERMITTED`,
+`SHORT_SIZING_YIELDED_ZERO_QUANTITY`, `BORROW_COST_UNKNOWN`,
+`EXPECTED_EXIT_PRICE_WRONG_SIDE_FOR_DIRECTION`.
+
+### 숏 청산 (SHORT / CLOSE)
+
+`loan_date`(대출일)가 **필수이며 fallback이 없습니다**. 없이 매수상환을 보내면 실패하거나 —
+브로커 기본값에 따라 — 의도하지 않은 lot을 상환해 한 lot은 두 배가 되고 다른 lot은 열린 채
+남습니다. 둘 다 주문을 보내지 않는 것보다 나쁩니다.
+
+숏 청산은 `ProfitabilityGate`와 숏 리스크 한도로 **막지 않습니다.** 손실 중인 숏의 상환을
+거부하면 무제한 손실 포지션이 갇힙니다. 계좌 레벨 `short_selling_allowed`가 꺼져 있어도 청산은
+허용됩니다.
+
+재시작 후 broker-authoritative 대주 잔고와 `loan_date`를 복원하지 못하면 **신규 진입만 차단**되고
+기존 숏 청산은 계속 허용됩니다 (`reconcile_credit_positions` → `close_only_mode`).
+
+### SELL / REDUCE (롱 청산)
 
 BUY보다 먼저 평가됩니다. 승인 경로: 비용 차감 후 이익 목표 도달, `REALTIME_ALLOW_LOSS_EXIT=true`일 때 트레일링/손실 청산, 국내 드로다운 축소, 국내 긴급 청산, 국내 집중도 축소, 시간/시세 기반 청산 정책.
 
@@ -239,12 +282,25 @@ Pi 권장 역할: KIS 계좌/주문 상태 모니터, kill-switch/disarm watchdo
 
 이 저장소의 어떤 코드도 수익이나 자본 보전을 보장하지 않습니다. 통제 장치는 엔지니어링 게이트일 뿐입니다. 소액 계좌 단기 국내 단타는 왕복 비용을 고려하면 구조적으로 음의 기대값에 가깝습니다. 실현 손익으로 검증하세요 — [validation.md](validation.md).
 
+숏은 이 자세를 **더 강하게** 요구합니다. 롱의 손실은 -100%에서 유계이지만 숏의 손실은 무제한이고,
+포지션이 역방향으로 갈수록 커지므로 **가속**합니다. 여기에 대주 이용료 누적과 예고 없는 recall이
+더해집니다. 그래서 숏은 계좌 레벨 플래그와 arm별 배포 상태 **두 관문**을 모두 통과해야 하고,
+사다리에서 강등은 승격보다 항상 빠릅니다 — 승격이 느려서 잃는 것은 기회 한 번이고, 강등이 느려서
+잃는 것은 무제한 하방에서 복리로 커지는 손실입니다.
+
 ## 12. 테스트
 
 ```powershell
 python -m pytest
 python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
+python -m pytest tests/test_directional_short_ladder.py   # 숏 사다리 안전 속성 76건
 python scripts/run_live_trading_test_suite.py
 ```
 
-**live 주문 테스트는 금지입니다.** 모든 broker E2E 테스트는 mock, 기록된 이벤트, broker 시뮬레이션, 또는 명시적으로 설정된 paper 환경을 씁니다. 환경에 따라 OpenVINO/NPU, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 secrets 상태의 영향을 받습니다.
+**live 주문 테스트는 금지입니다.** 숏도 예외가 아닙니다 — 대주 조회(`get_shortable_symbols`,
+`get_borrow_availability`, `get_borrow_balance`, `reconcile_credit_positions`)는 read-only이므로
+실계좌에서 안전하게 확인할 수 있고 실제로 확인했습니다(2026-08-02). 결과: 인증·라우팅·파싱은
+정상이나 **TR 선택이 틀렸습니다** — `TTTC8909R`은 융자 매수가능금액이지 대주 가능 수량이
+아닙니다. 그래서 `BORROW_POLLING_ENABLED`는 기본 `false`입니다.
+`place_credit_borrow_open_order` / `place_credit_borrow_close_order`는 mock transport로만
+테스트되었고 실주문은 한 건도 제출되지 않았습니다. 모든 broker E2E 테스트는 mock, 기록된 이벤트, broker 시뮬레이션, 또는 명시적으로 설정된 paper 환경을 씁니다. 환경에 따라 OpenVINO/NPU, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 secrets 상태의 영향을 받습니다.

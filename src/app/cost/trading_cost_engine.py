@@ -204,6 +204,42 @@ class TradingCostEngine:
             reject_reason=reject_reason,
         )
 
+    def short_round_trip_cost_rate(
+        self,
+        *,
+        venue: str = "KRX",
+        instrument_type: str = "domestic_stock",
+        orderbook_snapshot: dict[str, Any] | None = None,
+    ) -> float:
+        """All-in round-trip rate for a SHORT, excluding the borrow fee.
+
+        A short's statutory sell tax falls on the OPENING leg (the short sale), not the
+        closing one. The totals are close to a long's — the same tax and two
+        commissions are paid either way — but they are not identical, because the tax
+        is levied on the opening notional rather than the (usually different) closing
+        notional.
+
+        Exposed separately rather than folded into ``estimate`` so the mirrored-price
+        trick in ``ProfitabilityGate`` stays a pure reuse of the long model: this gives
+        callers the exact figure when they need it, without a second, drifting cost
+        engine. See ``docs/short_selling_deployment.md`` §2.
+        """
+        policy = self.policy_for(
+            venue=venue,
+            instrument_type=instrument_type,
+            orderbook_snapshot=orderbook_snapshot,
+        )
+        # Sell fee + tax on the open, buy fee on the cover, plus the same execution
+        # frictions a long pays.
+        return (
+            policy.sell_fee_rate
+            + policy.sell_tax_rate
+            + policy.buy_fee_rate
+            + policy.slippage_rate
+            + policy.spread_rate
+            + policy.market_impact_rate
+        )
+
     def policy_for(
         self,
         *,

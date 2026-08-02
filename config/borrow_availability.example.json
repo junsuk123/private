@@ -1,0 +1,55 @@
+{
+  "_comment": [
+    "대주 (stock-loan) availability, maintained by the operator.",
+    "",
+    "WHY A FILE. Three KIS 대주 endpoints were guessed and all three disproven by",
+    "read-only probes against the live account on 2026-08-02:",
+    "  TTTC8909R /inquire-credit-psamount -> reports 융자 (margin BUY) power, wrong question",
+    "  CTSC0271R /credit-by-company       -> '잘못된 TR 코드 입니다', no such TR",
+    "  CTRP6504R /inquire-credit-balance  -> HTTP 404, no such path",
+    "Guessing a fourth would repeat the mistake, and a wrong-but-successful response",
+    "would be worse than a failure. For a retail account the 대주 list is checked on the",
+    "broker's web UI anyway, so this file is an honest primary source.",
+    "",
+    "TO USE: copy to config/borrow_availability.json and keep observed_at current.",
+    "",
+    "observed_at IS MANDATORY and applies to the whole file. It is what makes the normal",
+    "freshness rule work: a file left over from yesterday goes stale on the same clock a",
+    "live query would, instead of being trusted because it is local. A file without it is",
+    "refused outright — an undated locate cannot be point-in-time evaluated, and stamping",
+    "it 'now' is the same look-ahead leak the shadow evaluator exists to prevent.",
+    "",
+    "Default staleness ceiling is 30s (config/short_risk_policy.yaml ->",
+    "borrow.max_snapshot_age_seconds). A hand-maintained file will therefore go stale",
+    "almost immediately, which is CORRECT: it means a hand-maintained locate is not good",
+    "enough to place a real short against. Raise the ceiling deliberately if you accept",
+    "that trade-off for shadow evaluation, and understand that you are widening the",
+    "window in which the locate could have disappeared.",
+    "",
+    "A symbol absent from 'symbols' is UNANSWERED, not unavailable — no snapshot is",
+    "produced at all, which every consumer reads as no-locate.",
+    "",
+    "fee_bps_annualised is an ANNUALISED rate in basis points (8%/yr = 800), matching",
+    "what a broker quotes. The system pro-rates it over the actual holding period. A",
+    "missing fee is NOT free: it fails the cost gate."
+  ],
+  "observed_at": "2026-08-02T09:05:00+09:00",
+  "source": "kis-web-ui-manual",
+  "symbols": {
+    "005930": {
+      "available": true,
+      "quantity": 500,
+      "fee_bps_annualised": 800
+    },
+    "000660": {
+      "available": true,
+      "quantity": 120,
+      "fee_bps_annualised": 1200,
+      "return_deadline": "2026-09-30T15:30:00+09:00"
+    },
+    "035420": {
+      "available": false,
+      "reason": "no inventory"
+    }
+  }
+}

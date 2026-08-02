@@ -1,0 +1,78 @@
+# Borrow (대주) cost model and its uncertainty buffers.
+#
+# UNITS — read this first
+# ----------------------
+# Every fee in this file is ANNUALISED basis points, because that is what a broker
+# quotes (KIS 대주 rates are annual percentages). The system pro-rates them over the
+# actual holding period through ``app.trading.borrow.borrow_cost_bps``.
+#
+# Mixing the two units is not a rounding error, it is a factor of ~10,000 in either
+# direction:
+#
+#   * treating an annualised 800bps rate as a per-trade cost rejects every borrowable
+#     name — visible immediately, because nothing trades;
+#   * treating a per-trade figure as annualised prices an 8%/yr borrow at 0.0009bps,
+#     i.e. free — INVISIBLE, and it lets negative-expectancy shorts through the cost
+#     gate.
+#
+# The second failure is the dangerous one, which is why the field names carry the unit
+# (``borrow_fee_bps_annualised``) rather than relying on this comment.
+
+# --- Rate ceilings ----------------------------------------------------------- #
+# Above this a name is too expensive or too crowded to short at all. This is a RATE
+# question ("is this name shortable on acceptable terms"), distinct from whether a
+# specific trade clears its own pro-rated cost — that belongs to the ProfitabilityGate.
+max_borrow_fee_bps_annualised: 1500.0   # 15%/yr
+
+# Reference rate used only for GEOMETRY sizing (see
+# app.strategy.exit_geometry.SHORT_BORROW_REFERENCE_BPS). The authoritative per-order
+# figure always comes from the live borrow snapshot and is never replaced by this.
+reference_borrow_fee_bps_annualised: 800.0   # 8%/yr
+
+# Calendar days, not trading days: borrow accrues on days the market is shut, so a
+# Friday-afternoon short pays for the weekend.
+days_per_year: 365
+
+# --- Uncertainty buffers ----------------------------------------------------- #
+# Charged as COST rather than as a required-return buffer, deliberately. Cost coverage
+# (gross edge / all-in cost) is the ratio the promotion gates read; a buffer hidden in
+# the required-return term would leave that ratio flattering the trade.
+buffers:
+  # The hold may run longer than planned, and the quoted rate may move while the
+  # position is open.
+  borrow_uncertainty_bps: 3.0
+  # The lender may force a cover at a moment of its choosing — which, being correlated
+  # with the move the strategy is trying to capture, is usually the worst moment.
+  recall_risk_bps: 2.0
+  # Applied when the holding period is unknown: the accrual is charged as a FULL DAY.
+  # Conservative for an intraday strategy that is forbidden from holding overnight
+  # anyway, and it keeps the gate usable for callers that have not plumbed the horizon
+  # through yet.
+  unknown_holding_period_assumption_seconds: 86400
+
+# --- Snapshot journal -------------------------------------------------------- #
+snapshot:
+  # A locate older than this is refused rather than used.
+  max_age_seconds: 30.0
+  # An observation timestamped AFTER the decision moment is refused, not clamped to
+  # zero age. It is future information relative to the decision, and silently
+  # accepting it is how a look-ahead leak passes a freshness test.
+  reject_future_observations: true
+  # Rows kept in data/store/borrow-snapshots.sqlite3. The history IS the product:
+  # ``borrow_availability_rate`` over the promotion window and the point-in-time locate
+  # a forward evaluation must consult are both queries over it, so it is append-only
+  # rather than a cache.
+  keep_rows: 200000
+
+# --- Fail-closed rules ------------------------------------------------------- #
+# Stated as policy because each one is a decision, not an implementation detail.
+fail_closed:
+  # No observation is NOT "available".
+  missing_snapshot_blocks_short: true
+  # An unknown fee is NOT a zero fee.
+  unknown_fee_blocks_short: true
+  # "Available: yes, quantity: unknown" is not a locate you can size against.
+  unknown_quantity_blocks_short: true
+  # Availability is never estimated, interpolated, or carried over from a related
+  # symbol. There is no "probably borrowable".
+  allow_estimated_availability: false

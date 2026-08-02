@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette import routing as starlette_routing
 
 from app.web_account_routes import create_account_router
+from app.web_short_strategy_routes import create_short_strategy_router
 from app.account_dashboard import AccountDashboardService
 from app.refactor_dashboard import (
     build_refactor_dashboard,
@@ -235,6 +236,10 @@ AUTO_START_US_EXCHANGE_MAP_REFRESH = os.getenv("AUTO_START_US_EXCHANGE_MAP_REFRE
 # a scheduled refresh that strategy silently stops being evaluable as the stored
 # 30-day window ages out.
 AUTO_START_INVESTOR_FLOW_REFRESH = os.getenv("AUTO_START_INVESTOR_FLOW_REFRESH", "true").lower() not in {"0", "false", "no", "off"}
+# Weekend research. Both venues are shut from the KRX Friday close to the KRX Monday
+# open, which is the one window with spare compute and nothing to disturb. The loop
+# builds a committed Monday-gap prior across Sat/Sun and grades it after the open.
+AUTO_START_WEEKEND_BRIEF = os.getenv("AUTO_START_WEEKEND_BRIEF", "true").lower() not in {"0", "false", "no", "off"}
 _auto_live_readiness_started = False
 # Background total-asset sampler: periodically persist a dashboard snapshot so the
 # asset-history curve accumulates continuously even when no browser is open (the Pi
@@ -666,6 +671,34 @@ app.include_router(
         market_stream_observer=lambda symbol: _observe_dashboard_market_stream(symbol),
     )
 )
+# Short-strategy deployment ladder. Its own router rather than another block of
+# endpoints in this module, which is already 17k lines. Read-mostly: the single
+# mutating route SUSPENDS an arm, and there is deliberately no promote route —
+# promotion has to be earned from forward evidence, not requested over HTTP.
+app.include_router(
+    create_short_strategy_router(
+        session_snapshot_provider=lambda: _short_strategy_session_snapshot(),
+    )
+)
+
+
+def _short_strategy_session_snapshot() -> dict[str, Any]:
+    """Live strategy-session state for the directional-comparison endpoint.
+
+    Returns ``{}`` when the engine is not running, which the route renders as "no
+    election yet" rather than as an error. A short strategy is invisible until
+    promoted, so the dashboard is the only view into it; an exception here would
+    remove the only way to see why an arm is not trading.
+    """
+    try:
+        with _realtime_trading_lock:
+            engine = _realtime_trading_engine
+        if engine is None or not hasattr(engine, "get_status"):
+            return {}
+        status = engine.get_status() or {}
+        return dict(status.get("strategy_session") or {})
+    except Exception:  # noqa: BLE001 - diagnostics must never break the dashboard.
+        return {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -2192,6 +2225,8 @@ def _startup_live_worker() -> None:
       _start_us_exchange_map_refresher()
     if AUTO_START_INVESTOR_FLOW_REFRESH:
       _start_investor_flow_refresher()
+    if AUTO_START_WEEKEND_BRIEF:
+      _start_weekend_brief_worker()
     if AUTO_START_LIVE_WORKER:
       _start_live_worker("learning")
     if AUTO_START_LIVE_READINESS:
@@ -5972,6 +6007,46 @@ def investor_flow_refresh() -> JSONResponse:
   return _json({"ok": True, "result": payload})
 
 
+@app.get("/api/weekend-brief")
+def weekend_brief_status() -> JSONResponse:
+  """The current Monday-open prior and the prior's historical accuracy.
+
+  The track record is the point. A weekend analysis nobody grades is
+  indistinguishable from a wrong one, so accuracy is reported next to the claim.
+  """
+  from app.research.weekend_brief import WeekendBriefStore, weekend_window
+
+  try:
+    store = WeekendBriefStore()
+    latest = store.latest_prior()
+    record = store.track_record()
+  except Exception as exc:  # noqa: BLE001 - diagnostics must never 500.
+    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+  window = weekend_window(datetime.now(timezone.utc))
+  with _live_lock:
+    status = dict(_weekend_brief_status)
+  return _json(
+    {
+      "ok": True,
+      "enabled": AUTO_START_WEEKEND_BRIEF,
+      "in_weekend_window": window is not None,
+      "window_key": window.key if window else None,
+      "latest_prior": latest,
+      "track_record": record,
+      **status,
+    }
+  )
+
+
+@app.post("/api/weekend-brief/refresh")
+def weekend_brief_refresh() -> JSONResponse:
+  """Run the weekend research pass now (read-only against market data)."""
+  try:
+    return _json({"ok": True, "result": _run_weekend_brief_once()})
+  except Exception as exc:  # noqa: BLE001
+    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 @app.get("/api/realtime-trading/entry-blockade")
 def realtime_trading_entry_blockade() -> JSONResponse:
   """Single-call answer to "왜 아직 거래가 없나"."""
@@ -7432,6 +7507,224 @@ def _start_investor_flow_refresher() -> None:
         return
 
   threading.Thread(target=worker, name="investor-flow-refresher", daemon=True).start()
+
+
+_weekend_brief_status: dict[str, Any] = {
+    "last_run_at": None,
+    "last_action": None,
+    "last_error": None,
+    "runs": 0,
+}
+
+
+def _krx_reference_symbols() -> tuple[str, ...]:
+  """Liquid KRX names used as the market proxy for the Monday gap."""
+  return _realtime_session_anchor_symbols() or ("005930",)
+
+
+def _session_move_bps(symbols: tuple[str, ...], since: datetime, until: datetime) -> float | None:
+  """Average close-to-close move across ``symbols`` inside a window, in bps.
+
+  Returns ``None`` when no symbol has both ends — an unmeasurable move must not be
+  reported as 0.0, which would read as "flat" rather than "unknown".
+  """
+  moves: list[float] = []
+  try:
+    store = RealtimeMarketDataStore()
+  except Exception:  # noqa: BLE001
+    return None
+  for symbol in symbols:
+    try:
+      bars = store.recent_minute_bars(symbol, since, limit=2000)
+    except Exception:  # noqa: BLE001
+      continue
+    inside = [bar for bar in bars or () if since <= bar.minute_start < until]
+    if len(inside) < 2:
+      continue
+    first = float(getattr(inside[0], "open", 0.0) or getattr(inside[0], "close", 0.0) or 0.0)
+    last = float(getattr(inside[-1], "close", 0.0) or 0.0)
+    if first > 0 and last > 0:
+      moves.append((last / first - 1.0) * 10_000.0)
+  if not moves:
+    return None
+  return sum(moves) / len(moves)
+
+
+def _monday_open_gap_bps(window: Any) -> float | None:
+  """Realized KRX gap: Monday's opening print against Friday's closing print."""
+  symbols = _krx_reference_symbols()
+  gaps: list[float] = []
+  try:
+    store = RealtimeMarketDataStore()
+  except Exception:  # noqa: BLE001
+    return None
+  for symbol in symbols:
+    try:
+      bars = store.recent_minute_bars(
+          symbol, window.start - timedelta(hours=8), limit=4000
+      )
+    except Exception:  # noqa: BLE001
+      continue
+    before = [bar for bar in bars or () if bar.minute_start < window.start]
+    after = [bar for bar in bars or () if bar.minute_start >= window.end]
+    if not before or not after:
+      continue
+    friday_close = float(getattr(before[-1], "close", 0.0) or 0.0)
+    monday_open = float(getattr(after[0], "open", 0.0) or getattr(after[0], "close", 0.0) or 0.0)
+    if friday_close > 0 and monday_open > 0:
+      gaps.append((monday_open / friday_close - 1.0) * 10_000.0)
+  if not gaps:
+    return None
+  return sum(gaps) / len(gaps)
+
+
+def _run_weekend_brief_once() -> dict[str, Any]:
+  """Refresh the weekend prior, or score it once Monday has opened.
+
+  Both markets are shut from the KRX Friday close to the KRX Monday open, so this
+  is the one window with spare compute and no trading to disturb. The output is a
+  committed claim about the Monday gap that is graded afterwards — an unscored
+  weekend analysis is indistinguishable from a wrong one.
+  """
+  from app.research.weekend_brief import (
+      WeekendBriefStore,
+      build_monday_prior,
+      collect_weekend_signals,
+      weekend_window,
+  )
+
+  now = datetime.now(timezone.utc)
+  store = WeekendBriefStore()
+  window = weekend_window(now)
+
+  if window is None:
+    # Outside the closed window: the only outstanding work is grading the last
+    # prior once Monday's opening print exists.
+    latest = store.latest_prior()
+    if not latest or latest.get("scored_at"):
+      return {"action": "IDLE"}
+    from app.research.weekend_brief import weekend_window as _ww
+
+    reopened = _ww(datetime.fromisoformat(latest["computed_at"]))
+    if reopened is None:
+      return {"action": "IDLE"}
+    gap = _monday_open_gap_bps(reopened)
+    if gap is None:
+      return {"action": "AWAITING_OPEN_PRICE", "window_key": latest["window_key"]}
+    score = store.record_score(latest["window_key"], gap)
+    payload = {"action": "SCORED", "score": score, "track_record": store.track_record()}
+    audit.record("weekend_brief_scored", payload)
+    return payload
+
+  # Inside the window: deepen the inputs first, then (re)build the prior.
+  # Enrichment runs here because both venues are shut — the LLM pass is the
+  # heaviest thing this process does and must not compete with a trading session.
+  enrichment = _run_weekend_enrichment(window)
+
+  from app.research.weekend_brief import us_session_move_bps
+
+  us_move, proxy = us_session_move_bps(window)
+  signals = collect_weekend_signals(window, us_session_move_bps=us_move)
+  prior = build_monday_prior(signals, computed_at=now)
+  store.save_prior(prior)
+  payload = {
+      "action": "PRIOR_UPDATED",
+      "prior": prior.as_dict(),
+      "us_proxy": proxy,
+      "enrichment": enrichment,
+  }
+  audit.record("weekend_brief_updated", payload)
+  return payload
+
+
+def _run_weekend_enrichment(window: Any) -> dict[str, Any]:
+  """Deepen macro history and de-saturate event sentiment, weekend only.
+
+  Both are best-effort: the brief must still be produced if an external source is
+  unreachable, and a partial enrichment is reported rather than hidden.
+  """
+  from app.research.weekend_enrichment import (
+      backfill_macro_history,
+      load_saturated_events,
+      reclassify_events,
+  )
+
+  summary: dict[str, Any] = {}
+
+  # --- FRED history -------------------------------------------------------
+  try:
+    config = json.loads(DEFAULT_RESEARCH_CONFIG.read_text(encoding="utf-8"))
+    series = [
+        (str(item.get("series_id")), str(item.get("name")))
+        for item in (config.get("fred_series") or [])
+        if item.get("series_id") and item.get("name")
+    ]
+    if series:
+      from app.storage import LocalResearchStore
+
+      backfill = backfill_macro_history(
+          series=series,
+          store=LocalResearchStore(),
+          limit=max(10, _auto_reliability_int("WEEKEND_MACRO_HISTORY_LIMIT", 120, 10)),
+      )
+      summary["macro_backfill"] = backfill.as_dict()
+  except Exception as exc:  # noqa: BLE001 - enrichment must never break the brief
+    summary["macro_backfill_error"] = f"{type(exc).__name__}: {exc}"
+
+  # --- LLM re-classification ----------------------------------------------
+  try:
+    # Deliberately small per pass. qwen2.5:1.5b on CPU takes seconds per headline,
+    # so a 120-event batch ran past 10 minutes and made the manual endpoint appear
+    # hung. The worker fires hourly, so ~40 per pass still clears far more than a
+    # weekend's event volume across Sat-Sun while keeping any single pass bounded.
+    limit = max(5, _auto_reliability_int("WEEKEND_RECLASSIFY_LIMIT", 40, 5))
+    events = load_saturated_events(
+        since_iso=window.start.astimezone(timezone.utc).isoformat(),
+        until_iso=window.end.astimezone(timezone.utc).isoformat(),
+        limit=limit,
+    )
+    if events:
+      result = reclassify_events(events)
+      summary["reclassification"] = result.as_dict()
+  except Exception as exc:  # noqa: BLE001
+    summary["reclassification_error"] = f"{type(exc).__name__}: {exc}"
+
+  return summary
+
+
+def _start_weekend_brief_worker() -> None:
+  """Sat-Mon weekend research loop.
+
+  Runs on a plain interval rather than a cron: the interesting states (inside the
+  closed window / Monday open reached) are decided from the clock inside
+  ``_run_weekend_brief_once``, so a missed tick self-heals on the next one instead
+  of skipping a weekend entirely.
+  """
+
+  def worker() -> None:
+    startup_delay = max(0.0, _env_float_web("WEEKEND_BRIEF_STARTUP_DELAY_SEC", 60.0))
+    if _live_training_stop.wait(startup_delay):
+      return
+    interval = max(300.0, _env_float_web("WEEKEND_BRIEF_INTERVAL_SECONDS", 3600.0))
+    while True:
+      try:
+        result = _run_weekend_brief_once()
+        with _live_lock:
+          _weekend_brief_status["last_run_at"] = datetime.now(timezone.utc).isoformat()
+          _weekend_brief_status["last_action"] = result.get("action")
+          _weekend_brief_status["last_error"] = None
+          _weekend_brief_status["runs"] = int(
+              _weekend_brief_status.get("runs") or 0
+          ) + 1
+      except Exception as exc:  # noqa: BLE001 - research must never kill the process.
+        message = str(exc) or exc.__class__.__name__
+        with _live_lock:
+          _weekend_brief_status["last_error"] = message
+        audit.record("weekend_brief_failed", {"error": message})
+      if _live_training_stop.wait(interval):
+        return
+
+  threading.Thread(target=worker, name="weekend-brief", daemon=True).start()
 
 
 def _stop_kis_realtime_collector() -> None:
