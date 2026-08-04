@@ -170,7 +170,13 @@ def test_event_driven_collector_drains_async_persistence(monkeypatch) -> None:
     assert result["mode"] == "event_driven"
     assert result["event_runtime"]["fast_path_events"] == 2
     assert result["event_runtime"]["persistence_completed"] == 2
-    assert store.saved == 2
+    # tick 1건 + 호가 1건 + **진행 중인 분 bar** 1건 = 3.
+    #
+    # 진행 중 bar 를 함께 저장하는 것이 의도된 동작이다. 완료 bar 는 다음 분의 첫 체결이
+    # 와야 emit 되므로, 그것만 저장하면 현재 분이 저장소에 없고 조용해진 심볼의 마지막
+    # 분은 영구 결손이 된다. macro reasoner 는 연속 분 bar 를 요구하며, 결손 시
+    # MACRO_INSUFFICIENT_DATA → NO_TRADE_MARKET 으로 신규 매수가 전면 차단된다.
+    assert store.saved == 3
 
 
 def test_event_runtime_can_dispatch_slow_shadow_off_fast_path(monkeypatch, tmp_path) -> None:

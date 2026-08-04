@@ -115,8 +115,12 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     assert 'id="gnn-inference-live"' in page.text
     assert 'id="gnn-visualization-toggle"' in page.text
     assert 'aria-pressed="false"' in page.text
-    assert "gnn-visualization-toggle-1" in page.text
-    assert "gnn-3d-2" in page.text
+    # ONE cache-bust marker for the terminal bundle, bumped alongside the version
+    # in web_account_routes.py. The point is that the page cannot ship a stale
+    # strategy_terminal.js against a changed payload contract. There were two
+    # markers here from successive features; the older one only recorded which
+    # release last touched the file, and every bump broke it.
+    assert "20260804-gnn-activation-1" in page.text
 
 
 def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:
@@ -146,4 +150,11 @@ def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:
     assert state["state"] == "INFERENCE_RUNNING"
     assert state["active"] is True
     assert state["symbol"] == "AAPL"
-    assert state["phases"] == ["input", "message_passing", "strategy_election", "output_decode"]
+    # The old static ``phases`` list was what let the renderer sweep the four
+    # layers on a timer. It is replaced by measured activation: this record
+    # elected an arm without trading, and instruments no encoder or hidden layer.
+    activation = state["activation"]
+    assert activation["selected_strategy_id"] == "intraday_momentum"
+    assert activation["strategies"]["intraday_momentum"]["state"] == "ELECTED_NO_TRADE"
+    assert activation["layers"]["strategy_election"]["observed"] is True
+    assert activation["layers"]["input"]["observed"] is False

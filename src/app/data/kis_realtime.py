@@ -130,6 +130,15 @@ class KisRealtimeSubscriptionManager:
                 counts["ticks"] += len(ticks)
                 counts["orderbooks"] += len(orderbooks)
                 counts["events_published"] = counts.get("events_published", 0) + len(ticks) + len(orderbooks)
+                # sink 경로에서도 분 bar 를 만든다. 이 분기가 bar 를 만들지 않아서
+                # macro reasoner 가 연속 bar 를 얻지 못했다 (자세한 배경은
+                # ``_build_minute_bars_throttled`` 참조).
+                _build_minute_bars_throttled(
+                    self.store,
+                    {tick.symbol for tick in ticks}
+                    | {book.symbol for book in orderbooks},
+                    counts,
+                )
             else:
                 counts["ticks"] += self.store.save_ticks(ticks)
                 counts["orderbooks"] += self.store.save_orderbooks(orderbooks)
@@ -457,24 +466,39 @@ US_DAYTIME_EXCHANGE_CODES = {"NAS": "BAQ", "NYS": "BAY", "AMS": "BAA"}
 
 
 def is_us_daytime_quote_session(now: datetime | None = None) -> bool:
-    """True during the KIS US daytime quote window (10:00-16:00 KST, weekdays).
+    """True during the KIS US daytime QUOTE window (10:00-16:00 KST, weekdays).
 
-    Window per the HDFSCNT0 documentation. This is the *quote* window; the order
-    routing window in ``app.execution.kis_real`` is deliberately separate.
+    공식 문서는 두 창을 다르게 명시한다:
+
+    * 주문창  10:00~18:00 KST ("해외주식 미국주간주문")
+    * 시세창  10:00~16:00 KST ("해당 API로 미국주간거래(10:00~16:00) 시세 조회도 가능")
+
+    이 함수는 **시세창** 이다. 주문 route 창은 capability service 의 세션 창이며,
+    16:00-18:00 KST 구간은 "주문은 되지만 공식 시세 근거가 없는" 상태로
+    ``DAYTIME_QUOTE_WINDOW_ENDED`` 사유코드가 붙는다.
+
+    판정은 ``config/market_sessions.yaml`` 의 ``US_DAYTIME.data_window_end`` 를 읽는
+    canonical service 에 위임한다.
     """
     override = os.getenv("KIS_FORCE_US_DAYTIME_QUOTES", "").strip().lower()
     if override in {"1", "true", "yes", "on"}:
         return True
     if override in {"0", "false", "no", "off"}:
         return False
+    from app.data.market_capabilities import MarketGroup, SessionId, default_service
+
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local = current.astimezone(KIS_EXCHANGE_TIMEZONE)
-    if local.weekday() >= 5:
+    service = default_service()
+    window = service.window(SessionId.US_DAYTIME)
+    if window is None or not window.data_contains(current):
         return False
-    minutes = local.hour * 60 + local.minute
-    return 10 * 60 <= minutes < 16 * 60
+    # 주간거래는 한국시간 창이므로 요일 판정도 한국시간으로 해야 한다. 토요일 12:00 KST
+    # 는 뉴욕 기준 금요일 밤이지만 주간거래는 열리지 않는다.
+    if current.astimezone(window.zone).weekday() >= 5:
+        return False
+    return service.is_trading_day(MarketGroup.US, current)
 
 
 def overseas_realtime_subscription_key(
@@ -671,6 +695,23 @@ async def _process_kis_realtime_raw(
         counts["ticks"] += len(ticks)
         counts["orderbooks"] += len(orderbooks)
         counts["events_published"] = counts.get("events_published", 0) + len(ticks) + len(orderbooks)
+        # 분 bar 는 이 분기에서도 만들어야 한다.
+        #
+        # 이전에는 event_sink 경로가 여기서 바로 반환했고, 분 bar 를 만드는 곳은
+        # (a) sink 를 쓰지 않는 경로, (b) 미국 REST 브릿지, (c) 대시보드 차트
+        # 엔드포인트 뿐이었다. 라이브 서버는 sink 경로를 쓰므로 **웹소켓 체결로부터
+        # 분 bar 가 전혀 생성되지 않았고**, 누군가 UI 차트를 열 때만 산발적으로 생겼다.
+        #
+        # 그 결과 macro reasoner 가 rolling return 을 계산할 만큼의 연속 bar 를 얻지
+        # 못해 MACRO_INSUFFICIENT_DATA → NO_TRADE_MARKET 이 되고, NO_TRADE_MARKET 은
+        # new_buy 를 전면 차단한다. 즉 "전략 채택 불가"의 최상위 원인이었다.
+        #
+        # 분당 심볼당 한 번으로 제한한다 (메시지마다 DB 왕복을 하지 않는다).
+        _build_minute_bars_throttled(
+            store,
+            {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks},
+            counts,
+        )
         counts["messages"] += 1
         return False
     counts["ticks"] += store.save_ticks(ticks)
@@ -831,6 +872,196 @@ def _load_websockets() -> Any:
     return websockets
 
 
+# TR ID → 피드 identity. 값의 근거는 공식 문서이며
+# ``docs/kis_market_session_capability_matrix.md`` §1·§4 에 정리되어 있다.
+# (market_group, venue, feed_scope, exchange, currency, is_consolidated)
+_FEED_IDENTITY_BY_TR: dict[str, tuple[str, str, str, str, str, bool]] = {
+    "H0STCNT0": ("KR", "KRX", "VENUE_SPECIFIC", "KRX", "KRW", False),
+    "H0STASP0": ("KR", "KRX", "VENUE_SPECIFIC", "KRX", "KRW", False),
+    "H0STOUP0": ("KR", "KRX", "VENUE_SPECIFIC", "KRX", "KRW", False),
+    "H0STOAA0": ("KR", "KRX", "VENUE_SPECIFIC", "KRX", "KRW", False),
+    "H0STCNI0": ("KR", "KRX", "VENUE_SPECIFIC", "KRX", "KRW", False),
+    "H0NXCNT0": ("KR", "NXT", "VENUE_SPECIFIC", "NXT", "KRW", False),
+    "H0NXASP0": ("KR", "NXT", "VENUE_SPECIFIC", "NXT", "KRW", False),
+    # 통합(KRX+NXT) 피드는 consolidated 이며 주문 venue 가 될 수 없다 (DATA_ONLY).
+    "H0UNCNT0": ("KR", "KRX_NXT_UNIFIED", "UNIFIED", "KRX", "KRW", True),
+    "H0UNASP0": ("KR", "KRX_NXT_UNIFIED", "UNIFIED", "KRX", "KRW", True),
+    # 미국 무료 실시간. 나스닥 마켓센터 단일 시장 호가이므로 consolidated 가 아니다.
+    "HDFSCNT0": ("US", "NASDAQ", "FREE_REALTIME", "NASD", "USD", False),
+    "HDFSASP0": ("US", "NASDAQ", "FREE_REALTIME", "NASD", "USD", False),
+}
+
+#: 미국 subscription key 의 시장구분(3자리) → venue / OVRS_EXCG_CD.
+_US_FEED_CODE_TO_VENUE = {
+    "NAS": ("NASDAQ", "NASD"), "BAQ": ("NASDAQ", "NASD"),
+    "NYS": ("NYSE", "NYSE"), "BAY": ("NYSE", "NYSE"),
+    "AMS": ("AMEX", "AMEX"), "BAA": ("AMEX", "AMEX"),
+}
+#: ``R`` + ``BA*`` 는 주간거래 키다 (공식: BAY 뉴욕(주간), BAQ 나스닥(주간), BAA 아멕스(주간)).
+_US_DAYTIME_FEED_CODES = frozenset({"BAQ", "BAY", "BAA"})
+
+
+def feed_metadata_for_tr(
+    tr_id: str,
+    *,
+    subscription_key: str = "",
+    now: datetime | None = None,
+):
+    """이 TR/subscription key 로 들어온 이벤트의 :class:`FeedMetadata`.
+
+    세션과 ``is_tradeable`` 은 canonical capability service 에서 가져온다. 알 수 없으면
+    ``UNKNOWN`` 을 남기고, ``UNKNOWN`` 은 실시간 신규매수 적격을 통과하지 못한다.
+    """
+    from app.data.market_capabilities import (
+        FeedScope,
+        MarketGroup,
+        SessionId,
+        Venue,
+        default_service,
+    )
+    from app.data.realtime_types import FeedMetadata
+
+    identity = _FEED_IDENTITY_BY_TR.get(str(tr_id or "").upper().strip())
+    if identity is None:
+        return FeedMetadata(tr_id=str(tr_id or ""), subscription_key=str(subscription_key or ""))
+    group_name, venue_name, scope_name, exchange, currency, consolidated = identity
+    key = str(subscription_key or "").upper().strip()
+
+    # 미국은 subscription key 로 거래소와 주간/야간을 구별한다 (DNASAAPL vs RBAQAAPL).
+    daytime = False
+    if group_name == "US" and len(key) >= 4 and key[0] in {"D", "R"}:
+        code = key[1:4]
+        mapped = _US_FEED_CODE_TO_VENUE.get(code)
+        if mapped is not None:
+            venue_name, exchange = mapped
+        daytime = key[0] == "R" and code in _US_DAYTIME_FEED_CODES
+
+    group = MarketGroup(group_name)
+    venue = Venue(venue_name)
+    service = default_service()
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+
+    session = SessionId.UNKNOWN
+    is_tradeable = False
+    active = service.active_capabilities(group, current)
+    if group is MarketGroup.US:
+        wanted = SessionId.US_DAYTIME if daytime else None
+        for capability in active:
+            if wanted is not None and capability.session is not wanted:
+                continue
+            if wanted is None and capability.session is SessionId.US_DAYTIME:
+                continue
+            session = capability.session
+            is_tradeable = capability.trade_available
+            break
+        if daytime:
+            venue = Venue.US_DAYTIME_VENUE if session is SessionId.US_DAYTIME else venue
+    elif venue is Venue.KRX_NXT_UNIFIED:
+        # 통합 피드는 세션 라벨만 붙이고 주문 근거로는 쓰지 않는다.
+        unified = service.unified_feed_capability(current)
+        session = unified.session
+        is_tradeable = False
+    else:
+        for capability in active:
+            if capability.venue is venue:
+                session = capability.session
+                is_tradeable = capability.trade_available
+                break
+
+    return FeedMetadata(
+        market_group=group,
+        exchange=exchange,
+        venue=venue,
+        session=session,
+        currency=currency,
+        feed_scope=FeedScope(scope_name),
+        tr_id=str(tr_id or "").upper().strip(),
+        subscription_key=key,
+        is_consolidated=consolidated,
+        is_tradeable=is_tradeable,
+        metadata_inferred=False,
+    )
+
+
+def _apply_feed_metadata(
+    parsed: ParsedKisRealtimeMessage,
+    tr_id: str,
+    *,
+    subscription_key: str,
+    received_at: datetime,
+) -> ParsedKisRealtimeMessage:
+    """파싱된 이벤트에 출처 metadata 를 붙인다.
+
+    metadata 가 없으면 저장소에서 KRX 체결과 NXT 체결을 구분할 수 없고, 통합 피드와
+    venue 피드가 같은 분 bar 행을 다투게 된다. 그래서 파서 단계에서 바로 붙인다.
+    """
+    meta = feed_metadata_for_tr(
+        tr_id, subscription_key=subscription_key, now=received_at
+    )
+    return ParsedKisRealtimeMessage(
+        ticks=tuple(tick.with_meta(meta) for tick in parsed.ticks),
+        orderbooks=tuple(book.with_meta(meta) for book in parsed.orderbooks),
+        event_type=parsed.event_type,
+    )
+
+
+#: (symbol) -> 마지막으로 분 bar 를 만든 monotonic 시각. DB 왕복 제한용.
+_LAST_MINUTE_BAR_BUILT: dict[str, float] = {}
+
+
+def _minute_bar_rebuild_interval_seconds() -> float:
+    raw = os.getenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "2.0")
+    try:
+        return max(0.0, min(30.0, float(raw)))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _build_minute_bars_throttled(
+    store: RealtimeMarketDataStore,
+    symbols: set[str],
+    counts: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> None:
+    """관측된 심볼의 분 bar 를 만든다.
+
+    ``build_latest_minute_bar`` 은 **이번 분에 관측된 스트림별로** bar 를 만들므로
+    venue 별 bar 와 통합/REST bar 가 섞이지 않는다.
+
+    **분당 1회로 제한하면 안 된다.** bar 는 "이번 분에 지금까지 도착한 체결"의 집계이므로,
+    분이 시작될 때 한 번만 만들면 그 분의 첫 체결만 담긴 미완성 bar 로 굳는다 (실제로
+    그렇게 만들어 놓고 2~3개짜리 시계열을 얻었다). 기존 non-sink 경로는 메시지마다
+    다시 만들어 bar 가 수렴하게 했다. 여기서는 심볼당 최소 간격만 두어 DB 왕복을
+    제한하면서 같은 수렴 성질을 유지한다.
+    """
+    current = now or datetime.now(timezone.utc)
+    interval = _minute_bar_rebuild_interval_seconds()
+    stamp = time.monotonic()
+    for symbol in symbols:
+        previous = _LAST_MINUTE_BAR_BUILT.get(symbol)
+        if previous is not None and (stamp - previous) < interval:
+            continue
+        try:
+            store.build_latest_minute_bar(symbol, now=current)
+        except Exception as exc:  # noqa: BLE001 - bar 집계 실패가 수집을 멈추면 안 된다.
+            counts["minute_bar_errors"] = counts.get("minute_bar_errors", 0) + 1
+            counts["last_minute_bar_error"] = str(exc) or exc.__class__.__name__
+            continue
+        _LAST_MINUTE_BAR_BUILT[symbol] = stamp
+        counts["minute_bars_built"] = counts.get("minute_bars_built", 0) + 1
+    # 구독이 바뀌며 사라진 심볼의 항목이 무한히 쌓이지 않게 한다.
+    if len(_LAST_MINUTE_BAR_BUILT) > 512:
+        for stale in [
+            key
+            for key, value in _LAST_MINUTE_BAR_BUILT.items()
+            if (stamp - value) > 600.0
+        ]:
+            _LAST_MINUTE_BAR_BUILT.pop(stale, None)
+
+
 def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None) -> ParsedKisRealtimeMessage:
     received_at = received_at or datetime.now(timezone.utc)
     raw = raw.strip()
@@ -851,16 +1082,23 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
             )
             for payload in payloads
         )
-        return ParsedKisRealtimeMessage(ticks=ticks, event_type="overseas_trade")
+        return _apply_feed_metadata(
+            ParsedKisRealtimeMessage(ticks=ticks, event_type="overseas_trade"),
+            parts[1],
+            subscription_key=_subscription_key_from_payload(payloads[0] if payloads else ""),
+            received_at=received_at,
+        )
     if len(parts) >= 4 and parts[1] in OVERSEAS_ORDERBOOK_TR_IDS:
         orderbook = _parse_overseas_orderbook_payload(
             parts[-1],
             raw=f"{parts[0]}|{parts[1]}|{parts[2]}|{parts[-1]}",
             received_at=received_at,
         )
-        return ParsedKisRealtimeMessage(
-            orderbooks=(orderbook,),
-            event_type="overseas_orderbook",
+        return _apply_feed_metadata(
+            ParsedKisRealtimeMessage(orderbooks=(orderbook,), event_type="overseas_orderbook"),
+            parts[1],
+            subscription_key=_subscription_key_from_payload(parts[-1]),
+            received_at=received_at,
         )
     if len(parts) >= 4 and parts[1] in TRADE_TR_IDS:
         payloads = _split_kis_payload_records(
@@ -876,7 +1114,12 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
             )
             for payload in payloads
         )
-        return ParsedKisRealtimeMessage(ticks=ticks, event_type="trade")
+        return _apply_feed_metadata(
+            ParsedKisRealtimeMessage(ticks=ticks, event_type="trade"),
+            parts[1],
+            subscription_key=ticks[0].symbol if ticks else "",
+            received_at=received_at,
+        )
     if len(parts) >= 4 and parts[1] in ORDERBOOK_TR_IDS:
         payloads = _split_kis_payload_records(
             parts[-1],
@@ -891,10 +1134,25 @@ def parse_kis_realtime_message(raw: str, *, received_at: datetime | None = None)
             )
             for payload in payloads
         )
-        return ParsedKisRealtimeMessage(orderbooks=orderbooks, event_type="orderbook")
+        return _apply_feed_metadata(
+            ParsedKisRealtimeMessage(orderbooks=orderbooks, event_type="orderbook"),
+            parts[1],
+            subscription_key=orderbooks[0].symbol if orderbooks else "",
+            received_at=received_at,
+        )
     if raw.startswith("{"):
         return ParsedKisRealtimeMessage(event_type="json_control")
     raise ValueError("unsupported KIS realtime message format")
+
+
+def _subscription_key_from_payload(payload: str) -> str:
+    """해외 payload 첫 필드가 원래의 ``D``/``R`` + 시장구분 + 종목 키다.
+
+    이 값이 주간(``RBAQ*``)/야간(``DNAS*``) 세션과 거래소를 구별하는 유일한 단서이므로
+    정규화 전 원문을 metadata 로 보존한다.
+    """
+    head = str(payload or "").split("^", 1)[0].strip().upper()
+    return head
 
 
 def _normalize_overseas_realtime_symbol(value: str, fallback: str = "") -> str:

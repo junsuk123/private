@@ -587,12 +587,69 @@ def _fact(snapshot, name: str, value: bool | float | int | str) -> OperationalFa
     )
 
 
+# Why a strategy's compatibility is zero. A zero that means "this snapshot
+# cannot express the relation" is a DIFFERENT finding from a zero that means "the
+# relation evaluated to nothing", and collapsing the two is how eight of sixteen
+# strategies became permanently unreachable without anything reporting it: the
+# gate requires ``compatible:{id}``, ``compatibility.get(id, 0.0)`` returned the
+# default for any id missing from the map, and a missing key looked exactly like
+# a computed zero. These reasons are what the dashboard needs to separate
+# "measured no edge" from "never evaluated".
+COMPATIBILITY_UNAVAILABLE_REASONS: dict[str, str] = {
+    # Cross-sectional: a residual needs peer returns, and one symbol's tick
+    # window cannot produce them. The electing layer computes them and passes
+    # them in ElectionContext.residual_return_*; this snapshot has no slot.
+    "residual_relative_strength": "CONTEXT_UNAVAILABLE:PEER_RESIDUALS",
+    "residual_relative_weakness": "CONTEXT_UNAVAILABLE:PEER_RESIDUALS",
+    "cross_sectional_relative_strength": "CONTEXT_UNAVAILABLE:PEER_RANKING",
+    # Session structure: opening range and the first-half-hour return are
+    # measured from session boundaries, not from the sub-second window.
+    "opening_range_breakout": "CONTEXT_UNAVAILABLE:OPENING_RANGE",
+    "opening_range_breakdown": "CONTEXT_UNAVAILABLE:OPENING_RANGE",
+    "market_intraday_momentum": "CONTEXT_UNAVAILABLE:FIRST_HALF_HOUR",
+    "market_intraday_momentum_short": "CONTEXT_UNAVAILABLE:FIRST_HALF_HOUR",
+    "gap_context": "CONTEXT_UNAVAILABLE:SESSION_OPEN_GAP",
+    # Point-in-time news: an event relation needs the event and its age.
+    "event_momentum": "CONTEXT_UNAVAILABLE:EVENT_FACTS",
+    # A meaningful anchor (session open, volatility spike, news time) is what
+    # separates this from plain VWAP reversion; the snapshot carries only the
+    # rolling VWAP proxy.
+    "adaptive_anchored_vwap_reversion": "CONTEXT_UNAVAILABLE:VWAP_ANCHOR",
+    # The depth fields in this contract are neutral placeholders (the causal
+    # minute-bar proxy has no L2), so microprice OFI cannot be formed. Inventing
+    # one from bar range would be a fabricated relation, not a weak one.
+    "ofi_microprice_exhaustion_reversal": "CONTEXT_UNAVAILABLE:L2_MICROPRICE",
+}
+
+
+def compatibility_coverage() -> dict[str, str]:
+    """Per-strategy status of the relation map: computed, or why it cannot be.
+
+    Exists so the omission this map suffered cannot recur silently — a strategy
+    added to the catalogue with neither a relation nor a documented reason shows
+    up here as ``UNDECLARED`` and fails the contract test.
+    """
+    computed = set(_strategy_compatibility(tuple([0.0] * 28)))
+    coverage: dict[str, str] = {}
+    for strategy_id in STRATEGY_IDS:
+        if strategy_id in COMPATIBILITY_UNAVAILABLE_REASONS:
+            coverage[strategy_id] = COMPATIBILITY_UNAVAILABLE_REASONS[strategy_id]
+        elif strategy_id in computed:
+            coverage[strategy_id] = "COMPUTED"
+        else:
+            coverage[strategy_id] = "UNDECLARED"
+    return coverage
+
+
 def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
     """Domain priors encoded as soft ontology relations, never BUY signals.
 
     The GNN learns outcome utility; these values only describe how strongly the
-    current facts instantiate each strategy's domain relationship. Missing
-    event, cross-sectional, or session-open facts remain zero (closed world).
+    current facts instantiate each strategy's domain relationship. Every id in
+    ``STRATEGY_IDS`` appears in the result: the ones whose facts this snapshot
+    contract cannot supply are an explicit 0.0 carrying a reason in
+    ``COMPATIBILITY_UNAVAILABLE_REASONS``, so "unreachable" is a reported state
+    rather than a missing dictionary key.
     """
 
     def value(index: int, default: float = 0.0) -> float:
@@ -628,19 +685,19 @@ def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
         * box_available
         * unit(0.45 * rvgi_cross + 0.35 * box_position + 0.20 * breakout_pressure)
     )
-    return {
+    computed = {
         "intraday_momentum": trend_strength * spread_quality,
         "breakout_volume": breakout_pressure * spread_quality,
         "vwap_mean_reversion": mean_reversion_context,
         "liquidity_shock_reversal": volatility * unit(abs(order_imbalance)),
-        # No point-in-time event/cross-sectional/opening-gap relation is
-        # available in this snapshot contract, so closed-world compatibility
-        # is zero until those facts are explicitly supplied.
-        "event_momentum": 0.0,
-        "cross_sectional_relative_strength": 0.0,
-        "gap_context": 0.0,
         "rvgi_box_breakout": rvgi_box,
     }
+    # Closed world, stated explicitly: every remaining catalogue id is present
+    # with a 0.0 whose reason is declared, so a strategy is never silently
+    # excluded by absence from this dictionary.
+    for strategy_id in STRATEGY_IDS:
+        computed.setdefault(strategy_id, 0.0)
+    return computed
 
 
 def _shadow_route(

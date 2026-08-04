@@ -183,20 +183,45 @@ def _new_entry_session_report(
             "allows_new_entry": False,
             "reason": "NO_CANDIDATE_SYMBOLS",
             "phases": {},
+            "open_groups": (),
+            "eligible_symbols": (),
         }
     try:
         from app.data.market_session import allows_new_entry, market_phase
     except Exception:  # noqa: BLE001 - never let a session lookup break election.
-        return {"allows_new_entry": True, "reason": "", "phases": {}}
+        return {
+            "allows_new_entry": True,
+            "reason": "",
+            "phases": {},
+            "open_groups": groups,
+            "eligible_symbols": tuple(candidates),
+        }
     phases = {group: market_phase(group, now).value for group in groups}
     open_groups = tuple(group for group in groups if allows_new_entry(group, now))
-    if open_groups:
-        return {"allows_new_entry": True, "reason": "", "phases": phases}
+    # 후보를 **자기 시장이 열린 것만** 남긴다.
+    #
+    # 이전에는 "그룹 중 하나라도 열려 있으면" 게이트를 통과시키고, 그 다음 두 제안
+    # 경로가 후보 **전체** 를 순회했다. KR+US 혼합 유니버스에서 미국 정규장 시간이면
+    # 마감된 국내 종목도 제안 대상이 됐다는 뜻이다. 세션 판정을 집합 단위로 하면서
+    # 실행을 심볼 단위로 하는 불일치였다.
+    eligible = tuple(
+        symbol for symbol in candidates if _market_group_for(symbol) in set(open_groups)
+    )
+    if eligible:
+        return {
+            "allows_new_entry": True,
+            "reason": "",
+            "phases": phases,
+            "open_groups": open_groups,
+            "eligible_symbols": eligible,
+        }
     detail = ",".join(f"{group}={phase}" for group, phase in sorted(phases.items()))
     return {
         "allows_new_entry": False,
         "reason": f"NEW_ENTRY_OUTSIDE_REGULAR_SESSION:{detail}",
         "phases": phases,
+        "open_groups": (),
+        "eligible_symbols": (),
     }
 
 
@@ -599,6 +624,15 @@ class StrategySessionState:
     bandit_reason_codes: list[str] = field(default_factory=list)
     bandit_evaluations: list[dict[str, Any]] = field(default_factory=list)
     bandit_shadow_arms: list[str] = field(default_factory=list)
+    #: 이 bandit 진단값이 **언제** 계산됐는지. ``None`` 이면 이번 사이클에 bandit 이
+    #: 돌지 않았다는 뜻이다.
+    #:
+    #: 이 필드가 없어서 실제로 오진이 발생했다. proposals 가 비면 ``_bandit_choice`` 가
+    #: 호출되지 않는데 ``bandit_*`` 필드는 초기화되지 않아, 국내장 시간에 계산된
+    #: "rvgi_box_breakout / 069500 / conservative_edge -109bps" 가 미국 정규장 진단으로
+    #: 그대로 노출됐다. 운영자(그리고 사람)는 "미국 정규장인데 왜 마감된 국내 종목을
+    #: 평가하나"라는 존재하지 않는 결함을 추적하게 된다.
+    bandit_evaluated_at: str | None = None
     cost_coverage_ratio: float | None = None
     cost_coverage_band: str | None = None
     change_point_probability: float | None = None
@@ -1146,6 +1180,14 @@ class StrategySessionManager:
         arm and wins by default, so a tape with no positive-expectancy strategy
         produces no position instead of the least-bad negative one.
         """
+        # 매 선택 사이클마다 bandit 진단값을 먼저 비운다.
+        #
+        # 이 초기화가 없으면 proposals 가 빈 사이클에서 ``_bandit_choice`` 가 호출되지
+        # 않고, 몇 시간 전 다른 시장 세션에서 계산된 arm 평가가 현재 상태로 보고된다.
+        # 실제로 그것 때문에 "미국 정규장에 마감된 국내 종목 arm 을 평가한다"는 오진이
+        # 나왔다. 진단값은 계산된 사이클 안에서만 유효해야 한다.
+        self._reset_bandit_diagnostics()
+
         if bundle is None:
             self._state.last_reason = "WAITING_FOR_MACRO_MICRO_BUNDLE"
             return
@@ -1206,9 +1248,21 @@ class StrategySessionManager:
             self._state.last_reason = session_report["reason"]
             return
 
+        # 자기 시장이 열린 후보만 제안 대상이다. 세션 판정을 집합 단위로 하고 실행을
+        # 심볼 단위로 하면, 미국 정규장 시간에 마감된 국내 종목이 제안될 수 있다.
+        tradable_candidates = tuple(session_report.get("eligible_symbols") or candidates)
+        tradable_set = set(tradable_candidates)
+        intents = [
+            item
+            for item in intents
+            if str(getattr(item, "symbol", "") or "").upper() in tradable_set
+        ]
+
         proposals: list[_ElectionProposal] = []
         proposals.extend(self._intent_proposals(intents, evidence, bundle, now))
-        proposals.extend(self._evidence_proposals(candidates, evidence, bundle, now))
+        proposals.extend(
+            self._evidence_proposals(tradable_candidates, evidence, bundle, now)
+        )
 
         # Journal every SHADOW-state proposal before selection runs. This is how a
         # short accumulates the forward evidence it needs: the signal fired, the
@@ -1691,6 +1745,17 @@ class StrategySessionManager:
             self._pending_shadow_plans = pending
 
     # -- bandit scoring ---------------------------------------------------- #
+    def _reset_bandit_diagnostics(self) -> None:
+        """bandit 진단값을 "이번 사이클엔 아직 안 돌았음" 상태로 되돌린다."""
+        self._state.bandit_selected_arm = None
+        self._state.bandit_conservative_edge_bps = None
+        self._state.bandit_is_exploration = False
+        self._state.bandit_reason_codes = []
+        self._state.bandit_evaluations = []
+        self._state.bandit_shadow_arms = []
+        self._state.bandit_evaluated_at = None
+        self._state.directional_comparison = {}
+
     def _bandit_choice(
         self,
         proposals: list["_ElectionProposal"],
@@ -1698,8 +1763,17 @@ class StrategySessionManager:
         now: datetime,
     ) -> "_ElectionProposal | None":
         """Score every proposal on a pessimistic lower bound; may choose nothing."""
+        # 제안 집합이 여러 시장에 걸쳐 있으면 첫 제안의 시장으로 전체를 라벨링할 수 없다.
+        # (KR 비용 ~28bps vs US 60-87bps 처럼 시장별 비용·사후분포가 다르므로 잘못된
+        # 라벨은 잘못된 posterior 를 고른다.) 단일 시장이면 그 시장, 혼합이면 MIXED 로
+        # 명시해 사후분포가 시장별 이력과 섞이지 않게 한다.
+        proposal_markets = {market_for_symbol(item.symbol) for item in proposals}
         context = BanditContext(
-            market=market_for_symbol(proposals[0].symbol),
+            market=(
+                next(iter(proposal_markets))
+                if len(proposal_markets) == 1
+                else "MIXED"
+            ),
             macro_regime=self._state.macro_regime or "UNKNOWN",
             change_point_probability=self._state.change_point_probability or 0.0,
             regime_stability=_optional_float(getattr(macro, "regime_stability", None)),
@@ -1755,6 +1829,7 @@ class StrategySessionManager:
             for proposal in proposals
         ]
         selection = self.bandit.select(arms, context, now=now)
+        self._state.bandit_evaluated_at = _iso(now)
         self._state.bandit_selected_arm = selection.selected_arm
         self._state.bandit_conservative_edge_bps = selection.conservative_edge_bps
         self._state.bandit_is_exploration = selection.is_exploration
@@ -1872,6 +1947,7 @@ class StrategySessionManager:
             bandit_reason_codes=list(self._state.bandit_reason_codes),
             bandit_evaluations=list(self._state.bandit_evaluations),
             bandit_shadow_arms=list(self._state.bandit_shadow_arms),
+            bandit_evaluated_at=self._state.bandit_evaluated_at,
             cost_coverage_ratio=coverage.ratio,
             cost_coverage_band=coverage.band.value,
             change_point_probability=self._state.change_point_probability,

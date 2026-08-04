@@ -292,16 +292,34 @@ def test_new_entry_is_refused_outside_the_regular_session(tmp_path):
     while the actual constraint was that no scanned market was open for trading.
     """
     manager = _manager(tmp_path)
-    # 23:45 UTC — KRX pre-market (08:45 KST), US after-hours. US candidates only.
+    # 23:45 UTC — KRX pre-market (08:45 KST), 미국은 19:45 EDT.
+    #
+    # 이 시각의 미국 위상은 "after" 가 아니라 "closed" 다. KIS 공식 애프터마켓 주문 시간은
+    # 06:00~07:00 KST (Summer Time 05:00~07:00) = ET 16:00-17:00/18:00 이므로 19:45 ET 는
+    # 완전 마감이다. 이전 구현이 애프터마켓을 20:00 ET 까지로 잡고 있었고, 그 구간의
+    # 주문은 브로커에서 거부됐다.
+    # 근거: docs/kis_market_session_capability_matrix.md §5.1
     after_hours = datetime(2026, 7, 30, 23, 45, tzinfo=timezone.utc)
     state = manager.evaluate(
         _account(), ("F", "BAC"), _bundle(symbol="F"), after_hours
     )
     assert state["phase"] == "SCANNING"
     assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
-    assert state["session_phases"]["US"] == "after"
+    assert state["session_phases"]["US"] == "closed"
     # The reason names the phase, so no clock correlation is needed.
-    assert "US=after" in state["last_reason"]
+    assert "US=closed" in state["last_reason"]
+
+
+def test_new_entry_is_refused_during_a_real_us_after_hours_session(tmp_path):
+    """실제 애프터마켓(17:00 EDT) 에서도 신규 진입은 기본적으로 거부된다."""
+    manager = _manager(tmp_path)
+    # 21:00 UTC = 17:00 EDT — 공식 애프터마켓 창 안 (16:00-18:00 EDT).
+    after_hours = datetime(2026, 7, 30, 21, 0, tzinfo=timezone.utc)
+    state = manager.evaluate(
+        _account(), ("F", "BAC"), _bundle(symbol="F"), after_hours
+    )
+    assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+    assert state["session_phases"]["US"] == "after"
 
 
 def test_regular_session_candidates_still_elect(tmp_path):
@@ -313,11 +331,30 @@ def test_regular_session_candidates_still_elect(tmp_path):
 
 
 def test_extended_hours_entry_can_be_re_enabled(tmp_path, monkeypatch):
+    """전역 플래그는 backward-compatible alias 로 세션 게이트를 완화한다.
+
+    시각을 실제 애프터마켓 창(17:00 EDT) 으로 잡는다. 이전에는 19:45 EDT 를 썼는데,
+    공식 애프터마켓은 ET 18:00 에 끝나므로 그 시각은 완전 마감이고 "장외 진입 허용"이
+    적용될 여지가 없다 — 닫힌 시장을 여는 플래그는 존재하지 않아야 한다.
+
+    세션 게이트가 열려도 실주문은 세션별 ``live_order_authorized`` 가 추가로 필요하다
+    (라우터가 강제). 이 테스트는 세션 게이트만 검증한다.
+    """
     monkeypatch.setenv("TRADING_ALLOW_EXTENDED_HOURS_ENTRY", "true")
     manager = _manager(tmp_path)
-    after_hours = datetime(2026, 7, 30, 23, 45, tzinfo=timezone.utc)
+    after_hours = datetime(2026, 7, 30, 21, 0, tzinfo=timezone.utc)  # 17:00 EDT
     state = manager.evaluate(_account(), ("F",), _bundle(symbol="F"), after_hours)
     assert not state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+
+
+def test_extended_hours_flag_cannot_open_a_fully_closed_market(tmp_path, monkeypatch):
+    """장외 진입 플래그로 완전 마감된 시장을 열 수는 없다."""
+    monkeypatch.setenv("TRADING_ALLOW_EXTENDED_HOURS_ENTRY", "true")
+    manager = _manager(tmp_path)
+    closed = datetime(2026, 7, 30, 23, 45, tzinfo=timezone.utc)  # 19:45 EDT
+    state = manager.evaluate(_account(), ("F",), _bundle(symbol="F"), closed)
+    assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
+    assert state["session_phases"]["US"] == "closed"
 
 
 def test_session_gate_is_scoped_to_the_scanned_market(tmp_path):
@@ -327,3 +364,69 @@ def test_session_gate_is_scoped_to_the_scanned_market(tmp_path):
     state = manager.evaluate(_account(), ("F",), _bundle(symbol="F"), NOW)
     assert state["last_reason"].startswith("NEW_ENTRY_OUTSIDE_REGULAR_SESSION")
     assert state["session_phases"] == {"US": "closed"}
+
+
+def test_bandit_diagnostics_do_not_survive_into_a_cycle_that_did_not_run_them(tmp_path):
+    """bandit 진단값은 계산된 사이클 안에서만 유효해야 한다.
+
+    실제로 오진을 유발한 결함: ``proposals`` 가 비면 ``_bandit_choice`` 가 호출되지
+    않는데 ``bandit_*`` 필드는 초기화되지 않았다. 그래서 국내장 시간에 계산된
+    "rvgi_box_breakout / 069500 / conservative_edge -109bps" 가 미국 정규장 진단으로
+    그대로 노출됐고, "미국 정규장인데 왜 마감된 국내 종목 arm 을 평가하나"라는 존재하지
+    않는 결함을 추적하게 됐다.
+    """
+    # 측정된 음의 기대값 → bandit 이 no_trade 를 고르고 SCANNING 을 유지한다.
+    # (ARMED 가 되면 그 진단값은 무장 결정의 감사 기록이므로 지우면 안 된다.)
+    store = _store(tmp_path)
+    krx_regular = datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc)  # 10:00 KST
+    for index in range(25):
+        store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=-43.0,
+            recorded_at=krx_regular - timedelta(minutes=index),
+        )
+    manager = _manager(tmp_path, store=store)
+
+    # 1) bandit 이 실제로 도는 사이클.
+    first = manager.evaluate(_account(), ("005930",), _bundle(), krx_regular)
+    assert first["phase"] == "SCANNING"
+    assert first["bandit_evaluated_at"] == "2026-08-05T01:00:00+00:00"
+    assert first["bandit_evaluations"]
+    assert first["bandit_selected_arm"] == "no_trade"
+
+    # 2) 후보가 없어 제안이 만들어지지 않는 사이클 → 진단값이 비어 있어야 한다.
+    #    이 초기화가 없으면 위의 KR 평가가 이후 모든 사이클(다른 시장 세션 포함)의
+    #    현재 진단으로 계속 보고된다.
+    second = manager.evaluate(
+        _account(), (), _bundle(), krx_regular + timedelta(seconds=1)
+    )
+    assert second["bandit_evaluated_at"] is None
+    assert second["bandit_evaluations"] == []
+    assert second["bandit_selected_arm"] is None
+    assert second["bandit_reason_codes"] == []
+    assert second["directional_comparison"] == {}
+
+
+def test_closed_market_candidates_are_dropped_before_proposals(tmp_path):
+    """자기 시장이 마감된 후보는 제안 대상에서 제외된다.
+
+    이전에는 세션 게이트가 "후보 그룹 중 하나라도 열려 있으면" 통과시키고, 두 제안
+    경로가 후보 **전체** 를 순회했다. KR+US 혼합 유니버스에서 미국 정규장 시간이면
+    마감된 국내 종목까지 제안 대상이 됐다.
+    """
+    manager = _manager(tmp_path)
+    # 14:00 UTC = 10:00 ET (미국 정규장), 23:00 KST (국내 마감).
+    us_regular = datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc)
+    state = manager.evaluate(
+        _account(), ("005930", "AAPL"), _bundle(symbol="005930"), us_regular
+    )
+    # 국내 종목에 대한 의도였으므로 제안이 만들어지지 않고, 국내 종목이 선택되지 않는다.
+    assert state["selected_symbol"] != "005930"
+    assert state["phase"] == "SCANNING"
+    # 세션 위상 보고에는 두 시장이 모두 보인다 (관측은 되어야 한다).
+    assert set(state["session_phases"]) == {"KRX", "US"}
+    assert state["session_phases"]["US"] == "regular"
+    assert state["session_phases"]["KRX"] == "closed"

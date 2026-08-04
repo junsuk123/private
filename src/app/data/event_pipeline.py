@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TypeAlias
 
 from app.data.realtime_types import (
+    FeedMetadata,
     RealtimeMinuteBar,
     RealtimeOrderbookSnapshot,
     RealtimeTradeTick,
@@ -16,6 +19,14 @@ from app.data.realtime_types import (
 
 
 MarketEvent: TypeAlias = RealtimeTradeTick | RealtimeOrderbookSnapshot
+
+
+def _minute_bar_refresh_interval_seconds() -> float:
+    raw = os.getenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "2.0")
+    try:
+        return max(0.0, min(30.0, float(raw)))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 @dataclass(frozen=True)
@@ -254,8 +265,18 @@ class MarketState:
 
 @dataclass
 class IncrementalMinuteBarBuilder:
+    """한 (symbol, stream) 의 분 bar 를 증분 집계한다.
+
+    **스트림별로 하나씩** 두어야 한다. 분 bar 의 identity 는
+    ``(stream_id, symbol, minute_start)`` 이므로, 여러 피드(웹소켓 / REST 스냅샷 /
+    KRX+NXT 통합)의 체결을 한 builder 에 섞으면 서로 다른 시장의 체결이 한 bar 로
+    합산되고, 저장 시에는 metadata 없는 ``stream_id=''`` 행 하나로 뭉개진다.
+    """
+
     symbol: str
     _minute_start: datetime | None = None
+    #: 이 builder 가 집계 중인 체결의 출처. bar 에 그대로 실어 보낸다.
+    _meta: FeedMetadata = field(default_factory=FeedMetadata)
     _open: float = 0.0
     _high: float = 0.0
     _low: float = 0.0
@@ -299,10 +320,12 @@ class IncrementalMinuteBarBuilder:
             volatility=0.0,
             last_update_age_ms=0.0,
             source_record_ids=tuple(self._source_ids),
+            meta=self._meta,
         )
 
     def _reset(self, minute: datetime, tick: RealtimeTradeTick) -> None:
         self._minute_start = minute
+        self._meta = tick.meta
         self._open = self._high = self._low = self._close = tick.price
         self._volume = max(0, tick.volume)
         self._notional = tick.price * self._volume
@@ -342,6 +365,8 @@ class EventDrivenMarketRuntime:
         self._persistence_dropped = 0
         self._persistence_completed = 0
         self.last_processed_event: MarketEvent | None = None
+        #: (symbol, stream_id) -> 진행 중인 분 bar 를 마지막으로 내보낸 monotonic 시각.
+        self._minute_bar_flushed: dict[tuple[str, str], float] = {}
 
     async def process_one(self) -> bool:
         event = await self.bus.get()
@@ -353,10 +378,26 @@ class EventDrivenMarketRuntime:
             return False
         completed_bar = None
         if isinstance(event, RealtimeTradeTick):
+            # builder 는 (symbol, stream) 단위다. 스트림을 섞으면 venue 가 다른 체결이
+            # 한 bar 로 합산되고 거래량이 이중 계산된다.
             builder = self._bars.setdefault(
-                event.symbol, IncrementalMinuteBarBuilder(event.symbol)
+                (event.symbol, event.meta.stream_id),
+                IncrementalMinuteBarBuilder(event.symbol),
             )
             completed_bar = builder.update(event)
+            if completed_bar is None:
+                # 진행 중인 분도 주기적으로 저장한다.
+                #
+                # 완료 bar 는 **다음 분의 첫 체결**이 와야 emit 되므로, 그것만 저장하면
+                # (a) 현재 분이 저장소에 없고 (b) 조용해진 심볼의 마지막 분은 영구 결손이
+                # 된다. macro reasoner 는 연속 분 bar 를 요구하므로 그 결손이 곧
+                # MACRO_INSUFFICIENT_DATA → NO_TRADE_MARKET → new_buy 전면 차단이었다.
+                #
+                # 값은 **메모리 집계기**에서 가져온다. 저장소를 다시 읽어 재집계하면
+                # (초기 구현이 그랬다) 6GB 규모 DB 에서 심볼당 2초마다 조회+upsert 가
+                # 발생해 lock 경합으로 조용히 실패하고, 틱은 계속 쌓이는데 bar 만
+                # 사라지는 상태가 된다.
+                completed_bar = self._current_bar_if_due(event, builder)
         if self.store is not None:
             try:
                 self._persistence.put_nowait((event, completed_bar))
@@ -396,6 +437,26 @@ class EventDrivenMarketRuntime:
             persistence_dropped=self._persistence_dropped,
             persistence_completed=self._persistence_completed,
         )
+
+    def _current_bar_if_due(
+        self, event: RealtimeTradeTick, builder: "IncrementalMinuteBarBuilder"
+    ) -> RealtimeMinuteBar | None:
+        """진행 중인 분 bar 를 최소 간격마다 한 번씩 내보낸다 (메모리에서, DB 조회 없음)."""
+        key = (event.symbol, event.meta.stream_id)
+        interval = _minute_bar_refresh_interval_seconds()
+        stamp = time.monotonic()
+        previous = self._minute_bar_flushed.get(key)
+        if previous is not None and (stamp - previous) < interval:
+            return None
+        self._minute_bar_flushed[key] = stamp
+        if len(self._minute_bar_flushed) > 1024:
+            for stale in [
+                item
+                for item, value in self._minute_bar_flushed.items()
+                if (stamp - value) > 600.0
+            ]:
+                self._minute_bar_flushed.pop(stale, None)
+        return builder.current_bar()
 
     def _persist(
         self,

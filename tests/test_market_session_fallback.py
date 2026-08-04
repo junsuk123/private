@@ -64,8 +64,30 @@ class MarketPhaseTests(unittest.TestCase):
         self.assertIs(market_phase("US", _utc(2026, 7, 9, 9, 0)), MarketPhase.PRE)
 
     def test_us_after_market(self) -> None:
-        # 18:00 ET -> 22:00 UTC
-        self.assertIs(market_phase("US", _utc(2026, 7, 9, 22, 0)), MarketPhase.AFTER)
+        # 17:00 ET (EDT) -> 21:00 UTC. 애프터마켓 안.
+        self.assertIs(market_phase("US", _utc(2026, 7, 9, 21, 0)), MarketPhase.AFTER)
+
+    def test_us_after_market_ends_at_1800_et_in_dst(self) -> None:
+        """애프터마켓 종료는 ET 18:00 (EDT) 이며 20:00 이 아니다.
+
+        이전 구현은 16:00-20:00 ET 를 애프터마켓으로 보았지만, KIS 공식 문서는 미국
+        애프터마켓 주문 가능 시간을 "06:00~07:00 KST (Summer Time 05:00~07:00)" 로
+        명시한다 → EDT 로 환산하면 16:00-18:00 ET, EST 는 16:00-17:00 ET.
+        18:00-20:00 ET 구간의 주문은 브로커에서 거부되므로, 그 구간을 "거래 가능"으로
+        보고하던 기존 값이 결함이었다.
+        근거: docs/kis_market_session_capability_matrix.md §5.1
+        """
+        # 18:00 ET -> 22:00 UTC : 창 밖 (종료 경계는 배타적)
+        self.assertIs(market_phase("US", _utc(2026, 7, 9, 22, 0)), MarketPhase.CLOSED)
+        # 19:00 ET -> 23:00 UTC : 확실히 밖
+        self.assertIs(market_phase("US", _utc(2026, 7, 9, 23, 0)), MarketPhase.CLOSED)
+
+    def test_us_after_market_ends_at_1700_et_in_standard_time(self) -> None:
+        """EST 구간에서는 ET 17:00 에 끝난다 (06:00~07:00 KST)."""
+        # 2026-11-04 (수) 16:30 EST -> 21:30 UTC
+        self.assertIs(market_phase("US", _utc(2026, 11, 4, 21, 30)), MarketPhase.AFTER)
+        # 17:00 EST -> 22:00 UTC
+        self.assertIs(market_phase("US", _utc(2026, 11, 4, 22, 0)), MarketPhase.CLOSED)
 
     def test_us_fully_closed_overnight(self) -> None:
         # 01:00 ET -> 05:00 UTC

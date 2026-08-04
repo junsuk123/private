@@ -186,7 +186,7 @@ BUY보다 먼저 평가됩니다. 승인 경로: 비용 차감 후 이익 목표
 
 forward 검증은 전략별 horizon 안에서 목표가/손절가 중 먼저 도달한 가격을 사용하고 제비용을 차감합니다. 같은 horizon 버킷에서 음수 스캔 뒤 양수 전략이 나온 경우 최초 양수 예측을 보존합니다.
 
-**모든 필드가 비어 있고 AUC가 얼어붙고 거래가 0이면 대개 원인은 하나입니다 — 장이 닫혀 ticks=0.** `MarketPhase` 분류기와 REST 스냅샷 fallback이 이 상태를 오류가 아니라 상태로 표시합니다.
+**모든 필드가 비어 있고 AUC가 얼어붙고 거래가 0이면 대개 원인은 하나입니다 — 장이 닫혀 ticks=0.** `MarketSessionService` 와 REST 스냅샷 fallback이 이 상태를 오류가 아니라 상태로 표시합니다. 세분화된 세션·venue별 상태는 `GET /api/system-diagnostics` 의 `market_session_capabilities` 또는 `python scripts/check_market_session_readiness.py` 로 확인합니다. **데이터 수신 가능과 주문 가능은 서로 다른 값입니다** — 자세한 내용은 `docs/extended_hours_live_trading.md`.
 
 **"이벤트 LLM 대기/timeout"** 은 Ollama가 실행 중이 아니라는 뜻입니다. LLM 자동 감지는 기동 시 1회이므로 Ollama를 켠 뒤 앱을 재시작해야 합니다.
 
@@ -304,3 +304,26 @@ python scripts/run_live_trading_test_suite.py
 아닙니다. 그래서 `BORROW_POLLING_ENABLED`는 기본 `false`입니다.
 `place_credit_borrow_open_order` / `place_credit_borrow_close_order`는 mock transport로만
 테스트되었고 실주문은 한 건도 제출되지 않았습니다. 모든 broker E2E 테스트는 mock, 기록된 이벤트, broker 시뮬레이션, 또는 명시적으로 설정된 paper 환경을 씁니다. 환경에 따라 OpenVINO/NPU, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 secrets 상태의 영향을 받습니다.
+
+
+## 장외 세션 운영
+
+국내 KRX 시간외·NXT(08:00–20:00)와 미국 주간거래·프리마켓·애프터마켓 운영 절차, 단계적
+활성화, rollback, 사유코드 해설은 **`docs/extended_hours_live_trading.md`** 에 있습니다.
+
+실주문은 세 조건이 모두 참일 때만 나갑니다:
+
+1. 공식 route 검증 (코드, 설정으로 우회 불가)
+2. readiness 통과 (신선한 체결·호가, 스프레드, 계좌 동기화, 기존 리스크 게이트)
+3. 세션별 `live_order_authorized` (`config/market_sessions.yaml`)
+
+기본 설정에서 3번이 켜진 세션은 `KRX_REGULAR`, `KRX_CLOSING_AUCTION`, `US_REGULAR` 뿐이며
+장외 세션은 전부 fail-closed 상태로 출발합니다.
+
+read-only 점검 (실주문 없음):
+
+```bash
+python scripts/check_market_session_readiness.py
+python scripts/check_market_session_readiness.py --at 2026-08-05T02:00:00+00:00
+python scripts/check_market_session_readiness.py --with-kis   # KIS_READINESS_ALLOW_NETWORK=1 필요
+```

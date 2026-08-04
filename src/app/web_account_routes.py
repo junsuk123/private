@@ -409,7 +409,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260803-gnn-3d-2-visualization-toggle-1" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260804-gnn-activation-1" />
   <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
   <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
@@ -882,7 +882,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260803-gnn-visualization-toggle-1"></script>
+  <script src="/static/strategy_terminal.js?v=20260804-gnn-activation-1"></script>
   <script src="/static/operations_overview.js?v=20260730-entry-trust-v2"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->

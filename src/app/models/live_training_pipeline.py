@@ -214,33 +214,61 @@ def backfill_live_feature_frames_from_realtime_store(
     remaining_frames = maximum_frames - len(existing)
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, lookback_hours))).isoformat()
     candidates: list[tuple[str, str]] = []
+    distribution: dict[str, dict[str, int]] = {
+        "market_group": defaultdict(int),
+        "venue": defaultdict(int),
+        "session": defaultdict(int),
+        "feed_scope": defaultdict(int),
+    }
+    inferred_rows = 0
+    require_metadata = _env_flag_true("LIVE_TRAINING_REQUIRE_FEED_METADATA", False)
     with closing(sqlite3.connect(database)) as conn:
+        # 종목 코드 모양으로 시장을 추정하지 않는다.
+        #
+        # 이전 쿼리는 ``length(symbol) = 6 and symbol not glob '*[^0-9]*'`` 였다. 즉
+        # **국내 6자리 숫자 종목만** materialize 되고 미국 종목은 학습 데이터에 단 한 건도
+        # 들어가지 않았다. 시장 구분은 저장된 metadata (``market_group``) 로 한다.
+        #
+        # 휴장 REST 스냅샷은 ``source`` 로 이미 배제된다 (KIS_REST_SNAPSHOT_SOURCE 는
+        # 다른 문자열). ``feed_scope`` 조건을 한 번 더 두어 SQL 수준에서도 명시한다.
+        #
+        # ``metadata_inferred = 1`` 은 v1 스키마 시절에 쌓인 행이다. 기본적으로는
+        # 포함하되(그렇지 않으면 기존 이력 전체가 버려진다) 분포에 개수를 기록하고,
+        # ``LIVE_TRAINING_REQUIRE_FEED_METADATA=true`` 로 high-trust 표본만 쓸 수 있다.
+        metadata_filter = "and metadata_inferred = 0" if require_metadata else ""
         rows = conn.execute(
-            """
-            select symbol, received_at
+            f"""
+            select symbol, received_at, market_group, venue, session, feed_scope,
+                   metadata_inferred
             from realtime_orderbook
             where received_at >= ?
               and source = 'kis_realtime_websocket'
-              and length(symbol) = 6
-              and symbol not glob '*[^0-9]*'
+              and feed_scope != 'REST_SNAPSHOT'
+              {metadata_filter}
             order by received_at desc
             limit ?
             """,
             (cutoff, max(10_000, maximum_frames * max(3, stride_seconds))),
         ).fetchall()
     seen_buckets: set[tuple[str, int]] = set()
-    for symbol, raw_time in reversed(rows):
+    for row in reversed(rows):
+        symbol, raw_time = str(row[0]), row[1]
         moment = _parse_iso_time(str(raw_time))
         if moment is None:
             continue
         bucket = int(moment.timestamp() // max(1, stride_seconds))
-        key = (str(symbol), bucket)
+        key = (symbol, bucket)
         if key in seen_buckets:
             continue
         seen_buckets.add(key)
         decision_time = moment.isoformat()
-        if (str(symbol), decision_time) not in existing:
-            candidates.append((str(symbol), decision_time))
+        if (symbol, decision_time) not in existing:
+            candidates.append((symbol, decision_time))
+            distribution["market_group"][str(row[2] or "UNKNOWN")] += 1
+            distribution["venue"][str(row[3] or "UNKNOWN")] += 1
+            distribution["session"][str(row[4] or "UNKNOWN")] += 1
+            distribution["feed_scope"][str(row[5] or "UNKNOWN")] += 1
+            inferred_rows += int(row[6] or 0)
     candidates = candidates[-max(1, remaining_frames):]
     builder = LiveFeatureFrameBuilder(
         RealtimeMarketDataStore(database),
@@ -262,6 +290,11 @@ def backfill_live_feature_frames_from_realtime_store(
         "attempted": len(candidates),
         "symbols": tuple(sorted({symbol for symbol, _ in candidates})),
         "errors": dict(errors),
+        # market 만이 아니라 session/venue/feed 분포까지 보고한다. 어떤 세션 데이터로
+        # 학습했는지 사후에 확인할 수 없으면 세션별 성능 저하를 진단할 수 없다.
+        "distribution": {key: dict(value) for key, value in distribution.items()},
+        "metadata_inferred_rows": inferred_rows,
+        "requires_feed_metadata": require_metadata,
     }
 
 
@@ -1164,6 +1197,13 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _env_flag_true(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _frame_mark_price(frame: dict[str, Any], lookup: "_FramePriceLookup") -> float | None:

@@ -103,16 +103,53 @@ function renderGnnLiveState(state) {
   document.getElementById('gnn-inference-live-state').textContent = active
     ? 'INFERENCE RUNNING'
     : blocked ? 'INFERENCE BLOCKED' : state?.state === 'OFFLINE' ? 'INFERENCE OFFLINE' : 'INFERENCE IDLE';
-  const age = Number(state?.age_seconds);
+  // `Number(null)` is 0, so a missing age used to render as "마지막 추론 로그
+  // 0.0초 전" — an absent reading displayed as a perfectly fresh one.
+  const rawAge = state?.age_seconds;
+  const age = rawAge === null || rawAge === undefined ? NaN : Number(rawAge);
+  const activation = state?.activation || null;
+  const evaluated = Number(activation?.layers?.strategy_election?.evaluated || 0);
   document.getElementById('gnn-inference-live-detail').textContent = active
-    ? `${state.symbol || '-'} · ${state.path || 'GNN'} · 메시지 전파 중`
+    ? `${state.symbol || '-'} · ${state.path || 'GNN'} · ${evaluated}개 전략 평가`
     : Number.isFinite(age) ? `마지막 추론 로그 ${age < 60 ? `${age.toFixed(1)}초` : `${(age / 60).toFixed(1)}분`} 전` : '최근 추론 신호 없음';
-  if (!active) setGnnPhaseIndicator(null);
+  // Driven from the poll, not from the WebGL frame loop: these chips are DOM
+  // state derived from data, they must be right whichever renderer is up (the 2D
+  // fallback never entered the 3D loop, so they stayed blank there), and writing
+  // them at 60fps was a per-frame DOM touch for a value that changes on poll.
+  //
+  // The layers survive a stale record instead of blanking. The inference log is
+  // written per shadow cycle, so age crosses the freshness window between polls
+  // and clearing on !active made the chips blink on and off — reintroducing by
+  // accident exactly the pseudo-animation this panel was rid of. Stale is a
+  // styling state, not an absence of knowledge.
+  setGnnPhaseIndicator(activation?.layers || null, { stale: !active });
 }
 
-function setGnnPhaseIndicator(phase) {
+/*
+ * Layer chips show which layers the inference record actually measured, not
+ * which one a timer is currently on. Two of the four are never instrumented
+ * (the encoder input and the hidden message vector are not logged), and they now
+ * say so with a dedicated class instead of taking their turn in a sweep.
+ */
+function setGnnPhaseIndicator(layers, { stale = false } = {}) {
   document.querySelectorAll('[data-gnn-phase]').forEach((item) => {
-    item.classList.toggle('active', item.dataset.gnnPhase === phase);
+    const layer = layers ? layers[item.dataset.gnnPhase] : null;
+    const observed = Boolean(layer && layer.observed);
+    item.classList.toggle('active', observed && !stale);
+    item.classList.toggle('stale', observed && stale);
+    item.classList.toggle('uninstrumented', Boolean(layer) && !observed);
+    if (!layer) {
+      item.removeAttribute('title');
+      return;
+    }
+    // The count is the evidence: "16 arms evaluated", "4 channels decoded".
+    if (observed && Number.isFinite(Number(layer.evaluated))) {
+      item.title = `${layer.evaluated}개 전략 평가됨`;
+    } else if (observed && Number.isFinite(Number(layer.channels))) {
+      item.title = `${layer.channels}개 헤드 채널 디코딩됨`;
+    } else if (layer.reason) {
+      item.title = `계측되지 않음: ${layer.reason}`;
+    }
   });
 }
 
@@ -252,20 +289,35 @@ async function startGnn3d(data, signature) {
   scene.add(new THREE.Points(starsGeometry, new THREE.PointsMaterial({ color: 0x315597, size: 1.25, transparent: true, opacity: .5, depthWrite: false })));
 
   const nodeMap = new Map();
+  // id -> position in `meshes`. Resolving activation walks every edge, and
+  // meshes.indexOf() inside that loop would be 252 comparisons per edge — about
+  // 1.5M per pass on this graph.
+  const nodeIndex = new Map();
   const meshes = [];
   const labels = [];
+  // Two shared unit spheres instead of one geometry per node. The previous build
+  // allocated a SphereGeometry per node — 252 separate vertex buffers for a graph
+  // whose nodes differ only in radius, which mesh.scale already expresses.
+  const sharedSphere = {
+    detailed: new THREE.SphereGeometry(1, 18, 18),
+    simple: new THREE.SphereGeometry(1, 10, 10),
+  };
   (data.nodes || []).forEach((node) => {
     const position = gnn3dNodePosition(node);
     const color = new THREE.Color(gnn3dNodeColor(node));
     const radius = node.kind === 'strategy' ? 7.2 : node.kind === 'hidden' ? 4.1 : node.kind === 'feature' ? 2.8 : 2.4;
-    const segments = node.kind === 'strategy' ? 18 : 10;
     const material = new THREE.MeshStandardMaterial({
       color, emissive: color, emissiveIntensity: node.kind === 'strategy' ? .36 : .13,
       roughness: .32, metalness: .16,
     });
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, segments, segments), material);
+    const mesh = new THREE.Mesh(
+      node.kind === 'strategy' ? sharedSphere.detailed : sharedSphere.simple,
+      material,
+    );
+    mesh.scale.setScalar(radius);
     mesh.position.set(position.x, position.y, position.z);
     mesh.userData = { ...node, baseEmissive: material.emissiveIntensity, baseRadius: radius };
+    nodeIndex.set(node.id, meshes.length);
     root.add(mesh); meshes.push(mesh); nodeMap.set(node.id, mesh);
     if (node.kind === 'strategy') {
       const label = createGnn3dLabel(THREE, shortGnnLabel(node.label), color.getHex());
@@ -277,8 +329,20 @@ async function startGnn3d(data, signature) {
   const edgeLayer = new THREE.Group();
   const glowLayer = new THREE.Group();
   root.add(edgeLayer); root.add(glowLayer);
-  const phaseGroups = new Map();
   let visibleEdges = [];
+  // One glow mesh whose per-vertex alpha carries activation, replacing four
+  // full-graph LineSegments (one per pretend phase) that each duplicated every
+  // edge's positions and were switched on by a clock.
+  let glowLine = null;
+  let glowColors = null;
+  let activeEdgeIndexes = [];
+  // Declared here because rebuildEdges() runs before the animation block and
+  // marks activation stale; a `let` further down would still be in its TDZ.
+  let activationDirty = true;
+  let activationSignature = '';
+  const nodeIntensity = new Float32Array(meshes.length);
+  const glowColor = new THREE.Color();
+  const tooltipElement = document.getElementById('gnn-model-tooltip');
   function filteredLinks() {
     return (gnn3dState?.data?.links || data.links || []).filter((link) => {
       if (gnnGraphView.filter === 'all') return true;
@@ -293,39 +357,54 @@ async function startGnn3d(data, signature) {
     }
   }
   function rebuildEdges() {
-    clearGroup(edgeLayer); clearGroup(glowLayer); phaseGroups.clear();
+    clearGroup(edgeLayer); clearGroup(glowLayer);
+    glowLine = null; glowColors = null; activeEdgeIndexes = [];
     visibleEdges = filteredLinks().filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
-    const positions = [], colors = [];
-    visibleEdges.forEach((link) => {
-      const source = nodeMap.get(link.source).position, target = nodeMap.get(link.target).position;
-      positions.push(source.x, source.y, source.z, target.x, target.y, target.z);
-      const base = new THREE.Color(gnn3dEdgeColor(link));
-      const strength = .22 + Number(link.learned_strength || 0) * .78;
-      base.multiplyScalar(strength); colors.push(base.r, base.g, base.b, base.r, base.g, base.b);
+    // Positions are written once into a typed array sized exactly for the edge
+    // set, and the glow layer REUSES them: same buffer, second material.
+    const vertexCount = visibleEdges.length * 2;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
+    const reusable = new THREE.Color();
+    visibleEdges.forEach((link, index) => {
+      const source = nodeMap.get(link.source).position;
+      const target = nodeMap.get(link.target).position;
+      const offset = index * 6;
+      positions[offset] = source.x; positions[offset + 1] = source.y; positions[offset + 2] = source.z;
+      positions[offset + 3] = target.x; positions[offset + 4] = target.y; positions[offset + 5] = target.z;
+      reusable.set(gnn3dEdgeColor(link)).multiplyScalar(.22 + Number(link.learned_strength || 0) * .78);
+      colors[offset] = reusable.r; colors[offset + 1] = reusable.g; colors[offset + 2] = reusable.b;
+      colors[offset + 3] = reusable.r; colors[offset + 4] = reusable.g; colors[offset + 5] = reusable.b;
     });
+    const positionAttribute = new THREE.Float32BufferAttribute(positions, 3);
     const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('position', positionAttribute);
     geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    edgeLayer.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: .18, depthWrite: false })));
-    ['input', 'message_passing', 'strategy_election', 'output_decode'].forEach((phase) => {
-      const phaseEdges = visibleEdges.filter((link) => gnn3dEdgePhase(link) === phase);
-      const phasePositions = [];
-      phaseEdges.forEach((link) => {
-        const source = nodeMap.get(link.source).position, target = nodeMap.get(link.target).position;
-        phasePositions.push(source.x, source.y, source.z, target.x, target.y, target.z);
-      });
-      const phaseGeometry = new THREE.BufferGeometry();
-      phaseGeometry.setAttribute('position', new THREE.Float32BufferAttribute(phasePositions, 3));
-      const phaseLine = new THREE.LineSegments(phaseGeometry, new THREE.LineBasicMaterial({
-        color: gnn3dPhaseColor(phase), transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      }));
-      phaseLine.userData.edges = phaseEdges; glowLayer.add(phaseLine); phaseGroups.set(phase, phaseLine);
-    });
+    edgeLayer.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: .18, depthWrite: false,
+    })));
+
+    glowColors = new Float32Array(vertexCount * 3);
+    const glowGeometry = new THREE.BufferGeometry();
+    glowGeometry.setAttribute('position', positionAttribute);
+    glowGeometry.setAttribute('color', new THREE.BufferAttribute(glowColors, 3));
+    glowLine = new THREE.LineSegments(glowGeometry, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    glowLayer.add(glowLine);
+    activationDirty = true;
   }
 
-  const particleCount = 260;
+  const particleCount = 220;
   const particleArray = new Float32Array(particleCount * 3);
+  // Phase offsets are fixed per particle, so they are hashed ONCE. The previous
+  // loop rebuilt a string key and hashed it for every particle on every frame —
+  // ~13k string allocations a second whose result never changed.
+  const particleOffsets = new Float32Array(particleCount);
+  for (let index = 0; index < particleCount; index += 1) {
+    particleOffsets[index] = seededGraphUnit(`particle:${index}`);
+  }
   const particleGeometry = new THREE.BufferGeometry();
   particleGeometry.setAttribute('position', new THREE.BufferAttribute(particleArray, 3));
   const particles = new THREE.Points(particleGeometry, new THREE.PointsMaterial({
@@ -378,43 +457,137 @@ async function startGnn3d(data, signature) {
   gnn3dState = { signature, data, renderer, scene, root, stop: false, rebuildEdges, resetView, cleanup };
   rebuildEdges(); resize(); window.addEventListener('resize', resize, { passive: true });
 
+  /*
+   * Activation is RESOLVED, not sequenced. Every node's intensity comes from the
+   * inference record (which arms the router evaluated, which gates it shut, which
+   * head channels it decoded), so glow and pulse amplitude are a measurement.
+   * A node the pass never touched has intensity 0 and therefore does not move.
+   *
+   * What this replaces: a 3.6s wall-clock carousel that swept the four layers in
+   * order and lit whatever layer the clock was on. It read as staged inference
+   * while carrying exactly one bit of real information — whether the log was
+   * fresh — and it lit the input and hidden layers, which are not instrumented
+   * at all.
+   */
+  function resolveActivation() {
+    const state = terminalState.gnnInference || {};
+    const activation = state.activation || {};
+    const strategies = activation.strategies || {};
+    const channels = activation.channels || {};
+    const selected = activation.selected_strategy_id || null;
+    const live = Boolean(state.active);
+    let peak = 0;
+
+    for (let index = 0; index < meshes.length; index += 1) {
+      const node = meshes[index].userData;
+      let intensity = 0;
+      if (node.kind === 'strategy') {
+        intensity = Number(strategies[node.id]?.intensity || 0);
+      } else if (node.kind === 'output') {
+        // A decoded channel only describes the arm it was decoded for, so only
+        // that arm's output nodes light. Channels the record does not carry stay
+        // dark rather than borrowing a neighbour's value.
+        const value = channels[node.channel];
+        if (value !== undefined && node.strategy_id === selected) {
+          intensity = 0.35 + 0.65 * Math.min(1, Math.abs(Number(value)) / 2);
+        }
+      }
+      // feature and hidden nodes are deliberately 0: ENCODER_INPUT_NOT_LOGGED /
+      // HIDDEN_STATE_NOT_LOGGED. An un-instrumented layer must look it.
+      nodeIntensity[index] = live ? intensity : intensity * 0.25;
+      if (nodeIntensity[index] > peak) peak = nodeIntensity[index];
+    }
+
+    activeEdgeIndexes.length = 0;
+    if (glowColors) {
+      glowColors.fill(0);
+      visibleEdges.forEach((link, index) => {
+        const sourceIntensity = nodeIntensity[nodeIndex.get(link.source)] || 0;
+        const targetIntensity = nodeIntensity[nodeIndex.get(link.target)] || 0;
+        // An edge is only as active as the quieter end: a live strategy node does
+        // not make its whole upstream fan light up.
+        const edgeIntensity = Math.min(sourceIntensity, targetIntensity)
+          * (.35 + Number(link.learned_strength || 0) * .65);
+        if (edgeIntensity <= 0.02) return;
+        activeEdgeIndexes.push(index);
+        glowColor.set(gnn3dEdgeColor(link)).multiplyScalar(Math.min(1, edgeIntensity));
+        const offset = index * 6;
+        glowColors[offset] = glowColor.r; glowColors[offset + 1] = glowColor.g; glowColors[offset + 2] = glowColor.b;
+        glowColors[offset + 3] = glowColor.r; glowColors[offset + 4] = glowColor.g; glowColors[offset + 5] = glowColor.b;
+      });
+      glowLine.geometry.attributes.color.needsUpdate = true;
+    }
+    return { live, peak };
+  }
+
+  let resolved = { live: false, peak: 0 };
+  let frame = 0;
+
   function animate(now) {
     if (!gnn3dState || gnn3dState.stop) return;
     requestAnimationFrame(animate);
-    const live = Boolean(terminalState.gnnInference?.active);
-    const phases = ['input', 'message_passing', 'strategy_election', 'output_decode'];
-    const phaseIndex = live ? Math.floor((now % 3600) / 900) : -1;
-    const activePhase = phaseIndex >= 0 ? phases[phaseIndex] : null;
+    frame += 1;
+
+    const state = terminalState.gnnInference || {};
+    // Re-resolve only when the record actually changed. The signature is the
+    // record's identity, so a still market costs no work at all.
+    const signature = `${state.updated_at || ''}|${state.strategy_id || ''}|${state.action || ''}|${gnnGraphView.filter}`;
+    if (activationDirty || signature !== activationSignature) {
+      activationSignature = signature;
+      activationDirty = false;
+      resolved = resolveActivation();
+    }
+    const { live, peak } = resolved;
+
     if (!dragging) rotationY += live ? .0016 : .00045;
-    root.rotation.x += (rotationX - root.rotation.x) * .12; root.rotation.y += (rotationY - root.rotation.y) * .12;
+    root.rotation.x += (rotationX - root.rotation.x) * .12;
+    root.rotation.y += (rotationY - root.rotation.y) * .12;
     camera.position.z += (cameraTarget - camera.position.z) * .09;
-    const pulse = .55 + Math.sin(now / 115) * .45;
-    phaseGroups.forEach((line, phase) => { line.material.opacity = live && phase === activePhase ? .28 + pulse * .48 : 0; });
-    meshes.forEach((mesh) => {
-      const nodePhase = gnn3dNodePhase(mesh.userData);
-      const active = live && nodePhase === activePhase;
-      mesh.material.emissiveIntensity = active ? 1.25 + pulse * 1.2 : mesh.userData.baseEmissive;
-      mesh.scale.setScalar(active ? 1.08 + pulse * .32 : 1);
+
+    // One oscillator, scaled per node by that node's own intensity. The pulse is
+    // the carrier; the amplitude is the data.
+    const pulse = .5 + Math.sin(now / 480) * .5;
+    for (let index = 0; index < meshes.length; index += 1) {
+      const mesh = meshes[index];
+      const intensity = nodeIntensity[index];
+      if (intensity <= 0) {
+        mesh.material.emissiveIntensity = mesh.userData.baseEmissive;
+        mesh.scale.setScalar(mesh.userData.baseRadius);
+        continue;
+      }
+      mesh.material.emissiveIntensity = mesh.userData.baseEmissive + intensity * (1.1 + pulse * 1.3);
+      mesh.scale.setScalar(mesh.userData.baseRadius * (1 + intensity * (.06 + pulse * .16)));
+    }
+    if (glowLine) glowLine.material.opacity = activeEdgeIndexes.length ? .35 + pulse * .45 : 0;
+    labels.forEach((label) => {
+      const intensity = nodeIntensity[nodeIndex.get(label.userData.id)] || 0;
+      label.material.opacity = .55 + Math.min(.45, intensity * .45);
     });
-    labels.forEach((label) => { label.material.opacity = live && activePhase === 'strategy_election' ? 1 : .72; });
-    const activeEdges = activePhase ? (phaseGroups.get(activePhase)?.userData.edges || []) : [];
-    particles.material.opacity = live && activeEdges.length ? .5 + pulse * .45 : 0;
-    if (live && activeEdges.length) {
+
+    particles.material.opacity = activeEdgeIndexes.length ? .35 + pulse * .4 : 0;
+    if (activeEdgeIndexes.length) {
       for (let index = 0; index < particleCount; index += 1) {
-        const edge = activeEdges[index % activeEdges.length];
-        const source = nodeMap.get(edge.source).position, target = nodeMap.get(edge.target).position;
-        const t = (now * .00038 + seededGraphUnit(`particle:${index}`)) % 1;
-        particleArray[index * 3] = source.x + (target.x - source.x) * t;
-        particleArray[index * 3 + 1] = source.y + (target.y - source.y) * t;
-        particleArray[index * 3 + 2] = source.z + (target.z - source.z) * t;
+        const link = visibleEdges[activeEdgeIndexes[index % activeEdgeIndexes.length]];
+        const source = nodeMap.get(link.source).position;
+        const target = nodeMap.get(link.target).position;
+        const t = (now * .00038 + particleOffsets[index]) % 1;
+        const offset = index * 3;
+        particleArray[offset] = source.x + (target.x - source.x) * t;
+        particleArray[offset + 1] = source.y + (target.y - source.y) * t;
+        particleArray[offset + 2] = source.z + (target.z - source.z) * t;
       }
       particleGeometry.attributes.position.needsUpdate = true;
     }
-    setGnnPhaseIndicator(activePhase);
-    raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObjects(meshes, false)[0];
-    if (hit && !dragging) updateGnn3dTooltip(canvas, hit.object.userData, pointer); else document.getElementById('gnn-model-tooltip').hidden = true;
-    renderer.render(scene, camera);
+
+    // Picking every frame allocated an intersection array 60x a second for a
+    // pointer that moves far slower than that.
+    if (frame % 4 === 0) {
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(meshes, false)[0];
+      if (hit && !dragging) updateGnn3dTooltip(canvas, hit.object.userData, pointer);
+      else if (tooltipElement) tooltipElement.hidden = true;
+    }
+    if (peak > 0 || frame % 2 === 0) renderer.render(scene, camera);
   }
   requestAnimationFrame(animate);
 }
@@ -440,21 +613,6 @@ function gnn3dNodeColor(node) {
 function gnn3dEdgeColor(link) {
   const key = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
   return (gnnRelationStyle[key] || { color: '#7187a0' }).color;
-}
-function gnn3dEdgePhase(link) {
-  if (link.relation === 'strategy_head_weight') return 'output_decode';
-  if (link.relation === 'owns_output_head') return 'strategy_election';
-  if (!link.kind || link.kind === 'topology' || String(link.relation || '').startsWith('relation_encoder:')) return 'message_passing';
-  return 'input';
-}
-function gnn3dNodePhase(node) {
-  if (node.kind === 'feature') return 'input';
-  if (node.kind === 'hidden') return 'message_passing';
-  if (node.kind === 'strategy') return 'strategy_election';
-  return 'output_decode';
-}
-function gnn3dPhaseColor(phase) {
-  return { input: 0x9c7dff, message_passing: 0x2af7ff, strategy_election: 0xff4fd8, output_decode: 0x64ffb5 }[phase] || 0xffffff;
 }
 function createGnn3dLabel(THREE, text, color) {
   const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 72;

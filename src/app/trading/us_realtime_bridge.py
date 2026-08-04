@@ -449,6 +449,59 @@ def _construct_dataclass(cls: Any, candidates: dict[str, Any]) -> Any:
     raise TypeError(f"Unsupported realtime dataclass: {cls}")
 
 
+_US_BRIDGE_VENUES = {
+    "NAS": "NASDAQ", "BAQ": "NASDAQ",
+    "NYS": "NYSE", "BAY": "NYSE",
+    "AMS": "AMEX", "BAA": "AMEX",
+}
+
+
+def _rest_quote_metadata(exchange: str, now: datetime) -> Any:
+    """이 브릿지가 만드는 이벤트의 출처 metadata.
+
+    **이 경로는 KIS 해외 REST 시세다** (``sequence_key`` 가 ``us-kis-rest:`` 로 시작하고,
+    거래량이 세션 누적값이라 체결 단위가 아니다). 그래서 ``feed_scope`` 는
+    ``REST_SNAPSHOT`` 이다 — WebSocket 체결로 위장하지 않는다.
+
+    ``source`` 문자열은 여기서 바꾸지 않는다. 기존 live-buy 판정
+    (``live_feature_frame`` / ``market_data_health`` / ``realtime_trading_engine``) 이
+    ``source == KIS_REALTIME_SOURCE`` 를 직접 비교하고 있어서, 그 값을 지금 바꾸면 실거래
+    동작이 함께 바뀐다. metadata 는 그 사실을 **표현** 하고, 판정 전환은 별도 단계다.
+    ``docs/realtime_session_gap_analysis.md`` 의 남은 작업 참조.
+    """
+    from app.data.market_capabilities import (
+        FeedScope,
+        MarketGroup,
+        SessionId,
+        Venue,
+        default_service,
+    )
+    from app.data.realtime_types import FeedMetadata
+
+    code = str(exchange or "").upper().strip()
+    venue_name = _US_BRIDGE_VENUES.get(code)
+    venue = Venue(venue_name) if venue_name else Venue.UNKNOWN
+    service = default_service()
+    session = SessionId.UNKNOWN
+    for capability in service.active_capabilities(MarketGroup.US, now):
+        session = capability.session
+        break
+    return FeedMetadata(
+        market_group=MarketGroup.US,
+        exchange={"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}.get(venue_name or "", ""),
+        venue=venue,
+        session=session,
+        currency="USD",
+        feed_scope=FeedScope.REST_SNAPSHOT,
+        tr_id="",
+        subscription_key=code,
+        is_consolidated=False,
+        # REST 스냅샷은 실시간 신규매수 근거가 될 수 없다.
+        is_tradeable=False,
+        metadata_inferred=False,
+    )
+
+
 def _make_records(symbol: str, exchange: str, data: dict[str, float]) -> tuple[Any | None, Any]:
     now = datetime.now(timezone.utc)
     seq = f"us-kis-rest:{symbol}:{now.isoformat()}:{uuid.uuid4().hex[:8]}"
@@ -488,6 +541,7 @@ def _make_records(symbol: str, exchange: str, data: dict[str, float]) -> tuple[A
         "received_at": now,
         "source": KIS_REALTIME_SOURCE,
         "sequence_key": seq,
+        "meta": _rest_quote_metadata(exchange, now),
     }
 
     tick = (

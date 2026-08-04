@@ -280,7 +280,96 @@ def build_strategy_gnn_state(
         "path": decision.get("path"),
         "utility": _finite_or_none(decision.get("utility")),
         "reason_codes": list(decision.get("reason_codes") or ()),
-        "phases": ["input", "message_passing", "strategy_election", "output_decode"],
+        "activation": _activation_map(decision, active=active),
+    }
+
+
+# Per-strategy verdicts the router records for every evaluated arm. The reason
+# code carries the strategy id, which is what makes a real per-node activation
+# possible: ``ONTOLOGY_BLOCKED:vwap_mean_reversion`` says that node's gate was
+# shut on this pass, not that some animation frame came around.
+_BLOCKED_PREFIXES = ("ONTOLOGY_BLOCKED:", "STRATEGY_NOT_ALLOWED:", "COMPAT_ZERO:")
+_EVALUATED_PREFIXES = ("NON_POSITIVE_NET_EDGE:", "NEGATIVE_UTILITY:", "BELOW_THRESHOLD:")
+
+
+def _activation_map(decision: dict[str, Any], *, active: bool) -> dict[str, Any]:
+    """Real activation per graph node, or an explicit "not instrumented".
+
+    The UI used to sweep the four layers on a 3.6-second wall-clock carousel,
+    which looked like staged inference while carrying no information at all: the
+    only live input was one boolean. This returns what the inference record
+    actually knows, so a node's glow can be a measurement.
+
+    Layers the record does not carry (the input encoder and the hidden message
+    vector are not logged) are reported as ``observed: false`` rather than given
+    a synthesised value — an un-instrumented layer must look un-instrumented.
+    """
+
+    reason_codes = tuple(str(code) for code in (decision.get("reason_codes") or ()))
+    selected = str(decision.get("strategy_id") or "")
+    action = str(decision.get("action") or "")
+    strategies: dict[str, dict[str, Any]] = {}
+
+    def classify(strategy_id: str) -> tuple[str, float]:
+        if strategy_id and strategy_id == selected:
+            # A selected arm that still resolved to NO_TRADE is election-level
+            # activity, not an order, and is shown as evaluated rather than won.
+            if action and action != "NO_TRADE":
+                return "SELECTED", 1.0
+            return "ELECTED_NO_TRADE", 0.72
+        for code in reason_codes:
+            if not code.endswith(f":{strategy_id}"):
+                continue
+            if code.startswith(_BLOCKED_PREFIXES):
+                return "GATE_BLOCKED", 0.18
+            if code.startswith(_EVALUATED_PREFIXES):
+                return "EVALUATED_NON_POSITIVE", 0.45
+        return "UNEVALUATED", 0.0
+
+    for strategy_id in STRATEGY_IDS:
+        state, intensity = classify(strategy_id)
+        strategies[strategy_id] = {
+            "state": state,
+            # Intensity is what the renderer scales glow and pulse amplitude by.
+            # Zero means "do not animate this node", which is the honest state for
+            # an arm this pass never looked at.
+            "intensity": round(intensity if active else min(intensity, 0.12), 4),
+        }
+
+    # Head channels the record does carry, mapped onto the same names the graph
+    # payload gives its output nodes so the client needs no translation table.
+    channels = {
+        "probability_success": _finite_or_none(decision.get("probability_success")),
+        "cost_bps": _finite_or_none(decision.get("expected_cost_bps")),
+        "aleatoric_uncertainty": _finite_or_none(decision.get("total_uncertainty")),
+    }
+    net_bps = _finite_or_none(decision.get("expected_net_return_bps"))
+    cost_bps = channels["cost_bps"]
+    if net_bps is not None and cost_bps is not None:
+        channels["gross_return_bps"] = net_bps + cost_bps
+    # Drop the unmeasured ones BEFORE anything counts them: a NO_TRADE decision
+    # logs all three as null, and counting the keys rather than the values had the
+    # layer reporting "3 channels observed" with nothing in it.
+    measured = {key: value for key, value in channels.items() if value is not None}
+    return {
+        "strategies": strategies,
+        "channels": measured,
+        "selected_strategy_id": selected or None,
+        # Which layers carry measured values this pass. The renderer reads this
+        # instead of inventing a sequence.
+        "layers": {
+            "input": {"observed": False, "reason": "ENCODER_INPUT_NOT_LOGGED"},
+            "message_passing": {"observed": False, "reason": "HIDDEN_STATE_NOT_LOGGED"},
+            "strategy_election": {
+                "observed": bool(reason_codes) or bool(selected),
+                "evaluated": sum(
+                    1
+                    for item in strategies.values()
+                    if item["state"] != "UNEVALUATED"
+                ),
+            },
+            "output_decode": {"observed": bool(measured), "channels": len(measured)},
+        },
     }
 
 

@@ -18,7 +18,10 @@ from app.models.strategy_utility.strategy_graph import (
     STRATEGY_NODE_COUNT,
     strategy_relation_adjacency,
 )
-from app.routing.shadow_intelligence import STRATEGY_IDS
+from app.routing.shadow_intelligence import (
+    COMPATIBILITY_UNAVAILABLE_REASONS,
+    STRATEGY_IDS,
+)
 
 
 def train_counterfactual_checkpoint(
@@ -237,7 +240,19 @@ def _label_outcome_summary(
             else None
         )
         if not selected or not any(row.triggered for row in selected):
-            diagnosis = "NO_TRIGGERED_SAMPLES"
+            # "No samples" has two very different causes and they demand
+            # opposite responses: a strategy whose conditions merely never
+            # occurred is waiting for a market, while a strategy the routing
+            # layer cannot even instantiate is waiting for an ENGINEER. Eight of
+            # sixteen ids were in the second group with nothing saying so, and
+            # reading that as weak performance would retire strategies that were
+            # never evaluated.
+            unavailable = COMPATIBILITY_UNAVAILABLE_REASONS.get(strategy_id)
+            diagnosis = (
+                f"STRUCTURALLY_UNREACHABLE:{unavailable}"
+                if unavailable
+                else "NO_TRIGGERED_SAMPLES"
+            )
         elif len(filled) < 20:
             diagnosis = "INSUFFICIENT_FILLED_SAMPLES"
         elif mean_gross is not None and mean_gross <= 0:

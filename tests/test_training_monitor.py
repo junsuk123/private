@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -92,4 +93,13 @@ def test_strategy_terminal_includes_training_monitor() -> None:
     assert response.status_code == 200
     assert 'id="training-performance-chart"' in response.text
     assert 'id="training-data-chart"' in response.text
-    assert "20260803-gnn-3d-2-visualization-toggle-1" in response.text
+    # The terminal's CSS and JS must ship under the SAME cache-bust version, which
+    # is the property that actually matters: a page serving new JS against old CSS
+    # (or vice versa) is the stale-bundle bug this guarded. Asserting the literal
+    # version instead meant every asset bump broke this test in three separate
+    # files; test_gnn_visualization keeps one deliberate literal as the deploy
+    # marker, and this one checks the invariant.
+    css_version = re.search(r"strategy_terminal\.css\?v=([\w.-]+)", response.text)
+    js_version = re.search(r"strategy_terminal\.js\?v=([\w.-]+)", response.text)
+    assert css_version and js_version
+    assert css_version.group(1) == js_version.group(1)

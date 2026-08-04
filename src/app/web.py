@@ -4830,7 +4830,29 @@ def _system_diagnostics_payload() -> dict[str, Any]:
 
 @app.get("/api/system-diagnostics")
 def system_diagnostics() -> JSONResponse:
-  return _json(_cached_system_diagnostics_payload())
+  payload = _cached_system_diagnostics_payload()
+  payload["market_session_capabilities"] = _market_session_capability_payload()
+  return _json(payload)
+
+
+def _market_session_capability_payload() -> dict[str, Any]:
+  """전 세션 capability matrix + 미지원 route 목록.
+
+  운영 화면이 **데이터 수신 가능** 과 **주문 가능** 을 같은 상태로 표시하지 않게 하려면
+  두 값을 분리해 내려 줘야 한다. NXT 처럼 시세는 오지만 세션별 실주문 승인이 없는 경우는
+  ``is_data_only`` 로 구별된다.
+  """
+  try:
+    from app.data.market_capabilities import default_service
+
+    service = default_service()
+    return {
+        "ok": True,
+        "matrix": service.capability_matrix(),
+        "sessions": service.session_report(),
+    }
+  except Exception as exc:  # noqa: BLE001 - 진단 payload 는 절대 서버를 죽이지 않는다.
+    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _cached_system_diagnostics_payload() -> dict[str, Any]:
@@ -11795,103 +11817,64 @@ def _is_live_market_core_open(group: str, now_utc: Any | None = None) -> bool:
 
   This intentionally does not bypass stale quote/orderbook checks.
   It only prevents KRX symbols from being used while the US market is the active live session.
+
+  세션 경계는 계산하지 않고 ``app.data.market_capabilities`` 에 위임한다 — 이 함수가
+  자체 시각창을 갖고 있던 것이 세션 판정 중복의 원인이었다
+  (``docs/realtime_session_gap_analysis.md`` §3 항목 2).
   """
-  from datetime import datetime as _datetime
-  from datetime import time as _time
-  from datetime import timezone as _timezone
-  from zoneinfo import ZoneInfo
+  from app.data.market_session import MarketPhase, market_phase
 
-  current = now_utc or _datetime.now(_timezone.utc)
-  if getattr(current, "tzinfo", None) is None:
-    current = current.replace(tzinfo=_timezone.utc)
-
-  group = str(group or "").upper()
-  if group == "US":
-    local = current.astimezone(ZoneInfo("America/New_York"))
-    return local.weekday() < 5 and _time(9, 30) <= local.time() <= _time(16, 0)
-
-  if group == "KRX":
-    local = current.astimezone(ZoneInfo("Asia/Seoul"))
-    return local.weekday() < 5 and _time(9, 0) <= local.time() <= _time(15, 30)
-
-  return False
+  return market_phase(str(group or ""), _coerce_utc(now_utc)) is MarketPhase.REGULAR
 
 
 def _is_live_market_extended_open(group: str, now_utc: Any | None = None) -> bool:
   """Return True when KIS has a plausible cash-stock order route open.
 
   KRX supports pre/post after-hours order divisions on the domestic cash order
-  endpoint. US-listed stocks can use the normal overseas route during pre/core/
-  after-market hours, and KIS exposes a separate US daytime-order endpoint during
-  the Korean daytime session.
+  endpoint (``ORD_DVSN`` 05/06/07), NXT has its own verified route, and US-listed
+  stocks use the normal overseas route during pre/core/after-market hours plus a
+  separate ``daytime-order`` endpoint during the Korean daytime session.
+
+  "주문 route 가 존재하는가" 는 canonical capability 의 ``trade_available`` 과 같은
+  질문이므로 그대로 위임한다. **이것은 "신규 진입해도 되는가" 가 아니다** — 그 판정은
+  ``MarketSessionService.new_entry_allowed`` 이며 세션별 실주문 승인까지 요구한다.
   """
+  from app.data.market_capabilities import default_service, normalize_market_group
+
+  market = normalize_market_group(str(group or ""))
+  if market is None:
+    return False
+  return default_service().trade_available(market, _coerce_utc(now_utc))
+
+
+def _is_us_market_holiday(day: Any) -> bool:
+  """NYSE/Nasdaq 전일 휴장일 여부.
+
+  휴장일 집합은 버전이 기록된 ``config/market_sessions.yaml`` 캘린더 스냅샷에 있다.
+  이전에는 이 함수와 ``market_session.py`` 가 각각 사본을 갖고 있어 어긋날 수 있었다.
+  """
+  from datetime import date as _date
+
+  from app.data.market_capabilities import MarketGroup, default_service
+
+  if isinstance(day, _date):
+    target = day
+  else:
+    try:
+      target = _date.fromisoformat(str(day))
+    except (TypeError, ValueError):
+      return False
+  return default_service().calendar.is_holiday(MarketGroup.US, target)
+
+
+def _coerce_utc(now_utc: Any | None = None) -> Any:
   from datetime import datetime as _datetime
-  from datetime import time as _time
   from datetime import timezone as _timezone
-  from zoneinfo import ZoneInfo
 
   current = now_utc or _datetime.now(_timezone.utc)
   if getattr(current, "tzinfo", None) is None:
     current = current.replace(tzinfo=_timezone.utc)
-
-  group = str(group or "").upper()
-  if group == "US":
-    eastern = current.astimezone(ZoneInfo("America/New_York"))
-    if _is_us_market_holiday(eastern.date()):
-      return False
-    if eastern.weekday() < 5 and _time(4, 0) <= eastern.time() <= _time(20, 0):
-      return True
-    seoul = current.astimezone(ZoneInfo("Asia/Seoul"))
-    return seoul.weekday() < 5 and _time(9, 0) <= seoul.time() <= _time(16, 50)
-
-  if group == "KRX":
-    local = current.astimezone(ZoneInfo("Asia/Seoul"))
-    if local.weekday() >= 5:
-      return False
-    current_time = local.time()
-    return _time(8, 30) <= current_time <= _time(18, 0)
-
-  return False
-
-
-def _is_us_market_holiday(day: Any) -> bool:
-  try:
-    key = day.isoformat()
-  except Exception:
-    key = str(day)
-  # NYSE/Nasdaq full market holidays relevant to the local live-trading calendar.
-  # Keep this explicit and conservative: a missing date may allow evaluation, but
-  # a listed date prevents stale holiday quotes from being treated as tradable.
-  return key in {
-      "2026-01-01",
-      "2026-01-19",
-      "2026-02-16",
-      "2026-04-03",
-      "2026-05-25",
-      "2026-06-19",
-      "2026-07-03",
-      "2026-09-07",
-      "2026-11-26",
-      "2026-12-25",
-      "2027-01-01",
-      "2027-01-18",
-      "2027-02-15",
-      "2027-03-26",
-      "2027-05-31",
-      "2027-06-18",
-      "2027-07-05",
-      "2027-09-06",
-      "2027-11-25",
-      "2027-12-24",
-      "2028-01-17",
-      "2028-02-21",
-      "2028-04-14",
-      "2028-05-29",
-      "2028-07-04",
-      "2028-09-04",
-      "2028-11-23",
-      "2028-12-25",
-  }
+  return current
 
 
 def _active_live_market_groups(now_utc: Any | None = None) -> tuple[str, ...]:

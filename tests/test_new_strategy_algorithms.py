@@ -311,14 +311,38 @@ def _ofi_features(**overrides) -> TechnicalFeatureSet:
     return _features(**base)
 
 
-def test_ofi_exhaustion_fires_when_the_book_turns_not_when_price_falls():
+def test_ofi_exhaustion_detects_the_book_turning_not_the_price_falling():
     algorithm = get_algorithm("ofi_microprice_exhaustion_reversal")
     decision = algorithm.entry(
         _ofi_features(), _context("ofi_microprice_exhaustion_reversal")
     )
-    assert decision.triggered, decision.reason_codes
+
+    # The thesis conditions are what this test is about, and they are met.
+    assert "OFI_EXHAUSTION_CONFIRMED" in decision.reason_codes
     assert "MICROPRICE_ABOVE_MID" in decision.reason_codes
     assert "DEPTH_RECOVERING" in decision.reason_codes
+    # It does NOT fire, and that is the correct outcome at these parameters: a
+    # 35bp shock captured at 35% yields ~21bp, which cannot survive a 34bp KRX
+    # round trip. The trigger used to clear an 8bp constant floor and then die at
+    # the ProfitabilityGate, which is how a structurally negative-expectancy
+    # configuration looked like a working strategy.
+    assert decision.triggered is False
+    assert "EDGE_BELOW_COST_FLOOR" in decision.reason_codes
+    assert decision.diagnostics["expected_edge_bps"] < decision.diagnostics["minimum_edge_bps"]
+
+
+def test_ofi_exhaustion_fires_once_the_edge_clears_its_market_cost():
+    algorithm = get_algorithm("ofi_microprice_exhaustion_reversal")
+
+    # Same book turn, four times the dislocation: now the reversion is worth its
+    # costs and the algorithm fires.
+    decision = algorithm.entry(
+        _ofi_features(return_10s=-0.024),
+        _context("ofi_microprice_exhaustion_reversal"),
+    )
+
+    assert decision.triggered is True, decision.reason_codes
+    assert decision.expected_edge_bps >= algorithm.entry_floor_bps("005930")[0]
 
 
 def test_ofi_exhaustion_requires_more_than_a_price_drop():

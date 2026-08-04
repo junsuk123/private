@@ -754,4 +754,18 @@ def _strategy_metrics(
         "entry_authorized": entry_authorized,
         # Backward-compatible UI field: "passed" means model calibration.
         "passed": calibration_passed,
+        # WHAT these numbers measured. The outcome walk prices the first tick at
+        # or after the forecast as the entry and applies the strategy's generic
+        # exit_geometry barrier to a fixed horizon. It does NOT call the live
+        # algorithm's entry(), exit_rule() or invalidation(), so this score
+        # measures the FORECAST's calibration, not the tradable strategy's PnL.
+        # Publishing the method with the number is what stops "GNN trust 0.89"
+        # from being read as "the strategy earns money"; the two can only be the
+        # same once the replay runs the same policy the router executes.
+        "outcome_validation_method": "forecast_horizon_barrier_v1",
+        "outcome_validation_uses_live_algorithm": False,
+        "outcome_validation_caveat": (
+            "entry=first tick after forecast; exit=exit_geometry barrier at fixed "
+            "horizon; live entry()/exit_rule()/invalidation() not replayed"
+        ),
     }

@@ -307,13 +307,107 @@ def _present(*values: float | None) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Cost-derived entry floor                                                     #
+# --------------------------------------------------------------------------- #
+# The floor used to be a single constant, ``min_expected_edge_bps: 8``, applied
+# to every algorithm in every market. Round-trip cost is ~28bp on KRX and
+# ~51-70bp on US, so an 8bp floor let every algorithm fire on edges that the
+# ProfitabilityGate then had to reject — the measured result being strategies
+# with a POSITIVE gross edge and a deeply negative net one (gap_context: +12.1bp
+# gross, -15.8bp net). The two layers were answering different questions with
+# different arithmetic, and the algorithm layer's answer was structurally wrong.
+#
+# The floor is now derived from the same fee policy the gate charges:
+#
+#     required_edge = round_trip_cost * cost_multiple + min_net_buffer
+#
+# so a trigger means "this edge can survive its own costs" in whichever market
+# the symbol trades. ``absolute_floor_bps`` remains as a lower bound for the case
+# where the cost config is unreadable, which must not silently become "free".
+_KRX_SYMBOL_LENGTH = 6
+
+
+def _resolve_market(symbol: str) -> tuple[str, str]:
+    """Map a symbol to (venue, instrument_type) for cost lookup.
+
+    Same 6-digit rule the counterfactual evaluator and the account dashboard
+    use; keeping one rule means the floor a trigger is held to and the cost the
+    gate charges cannot disagree about which market a symbol is in.
+    """
+    normalized = str(symbol or "").upper().strip()
+    if normalized.isdigit() and len(normalized) == _KRX_SYMBOL_LENGTH:
+        return "KRX", "domestic_stock"
+    return "NASD", "overseas_stock"
+
+
+_cost_engine = None
+_round_trip_cache: dict[tuple[str, str], float] = {}
+
+
+def round_trip_cost_bps(symbol: str) -> float | None:
+    """Round-trip cost in bps for this symbol's market, or None if unresolvable.
+
+    Cached per market: the fee policy is a config read, and this runs inside the
+    per-tick entry path of every algorithm.
+    """
+    global _cost_engine
+    venue, instrument_type = _resolve_market(symbol)
+    cached = _round_trip_cache.get((venue, instrument_type))
+    if cached is not None:
+        return cached
+    try:
+        if _cost_engine is None:
+            from app.cost.trading_cost_engine import TradingCostEngine
+
+            _cost_engine = TradingCostEngine()
+        policy = _cost_engine.policy_for(venue=venue, instrument_type=instrument_type)
+    except Exception:  # noqa: BLE001 - an unreadable cost config must not crash entry.
+        return None
+    total_rate = (
+        policy.buy_fee_rate
+        + policy.sell_fee_rate
+        + policy.sell_tax_rate
+        # Slippage is paid on both legs; spread and impact are charged once each
+        # by the gate, so the floor charges them the same way.
+        + 2.0 * policy.slippage_rate
+        + policy.spread_rate
+        + policy.market_impact_rate
+        + policy.safety_margin_rate
+    )
+    cost_bps = max(0.0, total_rate * 10_000.0)
+    _round_trip_cache[(venue, instrument_type)] = cost_bps
+    return cost_bps
+
+
+def reset_cost_floor_cache() -> None:
+    """Drop the cached fee policies (tests, and config edits without a restart)."""
+    global _cost_engine
+    _cost_engine = None
+    _round_trip_cache.clear()
+
+
+# --------------------------------------------------------------------------- #
 # Configuration                                                                #
 # --------------------------------------------------------------------------- #
 _DEFAULTS: dict[str, dict[str, float]] = {
     "shared": {
         "capture_fraction": 0.5,
         "min_tick_count_5s": 3.0,
+        # Absolute lower bound only. The operative floor is cost-derived (see
+        # ``round_trip_cost_bps``); this value survives as the fallback for an
+        # unreadable cost config, where "no cost data" must not read as "free".
         "min_expected_edge_bps": 8.0,
+        # 1.0 = the edge must merely cover its own round trip. Above 1.0 demands
+        # the edge exceed cost by that multiple, which is the honest posture when
+        # both terms are estimates: equality is a loss once either is off.
+        "cost_floor_multiple": 1.0,
+        # Net bps that must remain after cost. This is what makes a trigger worth
+        # taking rather than merely break-even.
+        "min_net_buffer_bps": 10.0,
+        # Escape hatch for replaying historical configs: 0 restores the old
+        # constant floor. Not for making a strategy trade again — a strategy that
+        # only fires below its cost floor has no edge to recover.
+        "cost_aware_floor_enabled": 1.0,
     },
     "intraday_momentum": {
         "min_aggressor_imbalance": 0.15,
@@ -734,6 +828,31 @@ class TradingAlgorithm:
             diagnostics=diagnostics,
         )
 
+    def entry_floor_bps(self, symbol: str) -> tuple[float, dict[str, Any]]:
+        """Minimum expected edge this algorithm may fire on, and why.
+
+        Cost-derived rather than constant, so the same trigger is held to a
+        ~28bp bar on KRX and a ~51bp+ bar on US instead of 8bp on both.
+        """
+        absolute = self.config.shared("min_expected_edge_bps")
+        if self.config.shared("cost_aware_floor_enabled") <= 0.0:
+            return absolute, {"floor_basis": "absolute_only"}
+        cost_bps = round_trip_cost_bps(symbol)
+        if cost_bps is None:
+            return absolute, {"floor_basis": "cost_config_unreadable"}
+        multiple = max(0.0, self.config.shared("cost_floor_multiple"))
+        buffer_bps = max(0.0, self.config.shared("min_net_buffer_bps"))
+        required = cost_bps * multiple + buffer_bps
+        venue, instrument_type = _resolve_market(symbol)
+        return max(absolute, required), {
+            "floor_basis": "round_trip_cost",
+            "venue": venue,
+            "instrument_type": instrument_type,
+            "round_trip_cost_bps": round(cost_bps, 3),
+            "cost_floor_multiple": multiple,
+            "min_net_buffer_bps": buffer_bps,
+        }
+
     def _fire(
         self,
         *,
@@ -742,14 +861,25 @@ class TradingAlgorithm:
         edge_bps: float,
         reasons: tuple[str, ...],
         horizon_seconds: int | None = None,
+        symbol: str = "",
         **diagnostics: Any,
     ) -> AlgorithmDecision:
-        minimum = self.config.shared("min_expected_edge_bps")
+        minimum, floor_diagnostics = self.entry_floor_bps(symbol)
         if edge_bps < minimum:
+            # Distinct reason code from the old constant-floor rejection: an edge
+            # that cannot cover its market's costs is a different diagnosis from
+            # one below an arbitrary threshold, and the dashboard has to be able
+            # to tell an operator which of the two happened.
+            below_cost = floor_diagnostics.get("floor_basis") == "round_trip_cost"
             return self._reject(
-                (*reasons, rc.TECHNICAL_EDGE_NON_POSITIVE, "EDGE_BELOW_ALGORITHM_FLOOR"),
+                (
+                    *reasons,
+                    rc.TECHNICAL_EDGE_NON_POSITIVE,
+                    "EDGE_BELOW_COST_FLOOR" if below_cost else "EDGE_BELOW_ALGORITHM_FLOOR",
+                ),
                 expected_edge_bps=round(edge_bps, 3),
-                minimum_edge_bps=minimum,
+                minimum_edge_bps=round(minimum, 3),
+                **floor_diagnostics,
                 **diagnostics,
             )
         return AlgorithmDecision(
@@ -803,6 +933,7 @@ class IntradayMomentumAlgorithm(TradingAlgorithm):
         edge = self._volatility_edge(f)
         score = _clamp(0.5 * _clamp(aggressor) + 0.5 * _clamp(return_5s_bps / 20.0))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.4 + 0.6 * _clamp(aggressor)),
             edge_bps=edge,
@@ -860,6 +991,7 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
         edge = self._volatility_edge(f)
         score = _clamp(0.5 * _clamp(volume_ratio / 3.0) + 0.5 * _clamp(aggressor))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.35 + 0.4 * _clamp(volume_ratio / 3.0) + 0.25 * _clamp(aggressor)),
             edge_bps=edge,
@@ -926,6 +1058,7 @@ class VwapMeanReversionAlgorithm(TradingAlgorithm):
         edge = abs(deviation) * self.p("target_capture_fraction")
         score = _clamp(abs(deviation) / (2.0 * self.p("entry_deviation_bps")))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.35 + 0.45 * score),
             edge_bps=edge,
@@ -1014,6 +1147,7 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
             imbalance = abs(float(f.orderbook_imbalance or 0.0))
             recovery_bps = float(f.return_30s or 0.0) * 10_000.0
             return self._fire(
+                symbol=f.symbol,
                 score=_clamp(0.55 * imbalance + 0.45 * _clamp(recovery_bps / 20.0)),
                 confidence=_clamp(0.35 + 0.5 * imbalance),
                 edge_bps=edge,
@@ -1044,6 +1178,7 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
         edge = abs(shock_bps) * self.p("retrace_fraction")
         score = _clamp(abs(shock_bps) / (2.0 * abs(self.p("shock_return_10s_bps"))))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.3 + 0.5 * score),
             edge_bps=edge,
@@ -1139,6 +1274,7 @@ class EventMomentumAlgorithm(TradingAlgorithm):
         freshness = _clamp(1.0 - age / ttl) if ttl > 0 else 0.0
         score = _clamp(0.5 * freshness + 0.5 * _clamp(volume_ratio / 4.0))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.3 + 0.5 * freshness),
             edge_bps=edge,
@@ -1207,6 +1343,7 @@ class CrossSectionalRelativeStrengthAlgorithm(TradingAlgorithm):
         edge = self._volatility_edge(f)
         rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(0.6 * rank_score + 0.4 * _clamp(short_return_bps / 30.0)),
             confidence=_clamp(0.3 + 0.5 * rank_score),
             edge_bps=edge,
@@ -1275,6 +1412,7 @@ class GapContextAlgorithm(TradingAlgorithm):
             return self._reject(("GAP_CONTINUATION_LOST_OPEN",), price=f.price, open_price=open_price)
         edge = self._volatility_edge(f)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(0.5 * _clamp(abs(gap) / 0.05) + 0.5 * _clamp(volume_ratio / 3.0)),
             confidence=_clamp(0.3 + 0.4 * _clamp(volume_ratio / 3.0)),
             edge_bps=edge,
@@ -1298,6 +1436,7 @@ class GapContextAlgorithm(TradingAlgorithm):
         fill_bps = (previous_close / f.price - 1.0) * 10_000.0
         edge = max(0.0, fill_bps) * self.p("fill_capture_fraction")
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(abs(gap) / 0.05),
             confidence=_clamp(0.3 + 0.4 * _clamp(abs(gap) / 0.05)),
             edge_bps=edge,
@@ -1416,6 +1555,7 @@ class RvgiBoxBreakoutAlgorithm(TradingAlgorithm):
             + 0.2 * min(1.0, max(0.0, context.rvgi_diff or 0.0) * 10.0)
         )
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=score,
             edge_bps=edge_bps,
@@ -1556,6 +1696,7 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
         rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
         residual_score = _clamp(short_residual / 30.0)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(0.45 * rank_score + 0.35 * residual_score + 0.2 * _clamp(microprice_edge)),
             confidence=_clamp(0.3 + 0.4 * rank_score + 0.2 * residual_score),
             edge_bps=edge,
@@ -1682,6 +1823,7 @@ class AdaptiveAnchoredVwapReversionAlgorithm(TradingAlgorithm):
         )
         score = _clamp(abs(zscore) / (2.0 * self.p("min_entry_zscore")))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.3 + 0.45 * score),
             edge_bps=edge,
@@ -1811,6 +1953,7 @@ class OfiMicropriceExhaustionReversalAlgorithm(TradingAlgorithm):
         edge = abs(shock_bps) * self.p("retrace_fraction")
         score = _clamp(abs(shock_bps) / (2.0 * abs(self.p("shock_return_10s_bps"))))
         return self._fire(
+            symbol=f.symbol,
             score=score,
             confidence=_clamp(0.25 + 0.4 * score + 0.2 * _clamp(ofi_slope)),
             edge_bps=edge,
@@ -1923,6 +2066,7 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
         # A wider opening range is a stronger in-play signal, but it also means a
         # wider stop; the score reflects flow agreement and RVOL, not range width.
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(
                 0.5 * _clamp(relative_volume / 3.0)
                 + 0.5 * _clamp((f.aggressor_imbalance_5s or 0.0) + 0.5)
@@ -2034,6 +2178,7 @@ class MarketIntradayMomentumAlgorithm(TradingAlgorithm):
 
         edge = self._volatility_edge(f)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(0.5 * _clamp(r1 / 100.0) + 0.5 * _clamp(volatility_percentile)),
             confidence=_clamp(0.3 + 0.4 * _clamp(volatility_percentile)),
             edge_bps=edge,
@@ -2247,6 +2392,7 @@ class MarketIntradayMomentumShortAlgorithm(ShortTradingAlgorithm):
 
         edge = self._volatility_edge(f)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(0.5 * _clamp(drop_bps / 100.0) + 0.5 * _clamp(volatility_percentile)),
             confidence=_clamp(0.3 + 0.4 * _clamp(volatility_percentile)),
             edge_bps=edge,
@@ -2351,6 +2497,7 @@ class OpeningRangeBreakdownAlgorithm(ShortTradingAlgorithm):
 
         edge = self._volatility_edge(f)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(
                 0.5 * _clamp(relative_volume / 3.0)
                 + 0.5 * _clamp(0.5 - (f.aggressor_imbalance_5s or 0.0))
@@ -2498,6 +2645,7 @@ class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
         rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
         residual_score = _clamp(-short_residual / 30.0)
         return self._fire(
+            symbol=f.symbol,
             score=_clamp(
                 0.45 * rank_score + 0.35 * residual_score + 0.2 * _clamp(-microprice_edge)
             ),

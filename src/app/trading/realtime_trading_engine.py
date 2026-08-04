@@ -66,11 +66,23 @@ def _is_domestic_symbol_or_market(symbol: str, market: str = "") -> bool:
 
 
 def _is_krx_core_buy_session(now_utc: datetime | None = None) -> bool:
+    """KRX 연속체결(정규장) 세션인지.
+
+    이전에는 여기서 09:00-15:20 을 직접 계산했다. 그 값이 ``market_session.py`` 의
+    09:00-15:30 및 ``web.py`` 의 또 다른 경계와 어긋나 있었기 때문에
+    (``docs/realtime_session_gap_analysis.md`` §3 항목 4) 판정을 canonical service 에
+    위임한다. KRX_REGULAR 세션 창(09:00-15:20)이 원래 의도한 값이며, 종가 단일가
+    (15:20-15:30) 는 연속체결이 아니므로 제외된다.
+    """
+    from app.data.market_capabilities import MarketGroup, SessionId, default_service
+
     current = now_utc or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local = current.astimezone(ZoneInfo("Asia/Seoul"))
-    return local.weekday() < 5 and day_time(9, 0) <= local.time() <= day_time(15, 20)
+    return any(
+        capability.session is SessionId.KRX_REGULAR
+        for capability in default_service().active_capabilities(MarketGroup.KR, current)
+    )
 
 
 def _is_no_available_sell_quantity_error(exc: Exception) -> bool:

@@ -2480,6 +2480,19 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertFalse(web_module._is_live_market_core_open("KRX", opening_auction))
 
     def test_reliability_does_not_require_krx_regular_ticks_during_opening_auction(self) -> None:
+        """KRX 시가 단일가 중에는 KRX 정규장 틱을 요구하지 않는다.
+
+        08:45 KST 에는 미국 시장도 함께 열려 있지 않다. 08:45 KST = 전일 19:45 ET 이고,
+        KIS 공식 애프터마켓 주문 시간은 06:00~07:00 KST (Summer Time 05:00~07:00),
+        즉 ET 16:00-17:00/18:00 이므로 19:45 ET 는 완전 마감이다.
+        이전 구현이 애프터마켓을 20:00 ET 까지로 잘못 잡고 있어서 이 시각에 미국이
+        "거래 가능"으로 보였고, 이 테스트도 그 값을 고정하고 있었다.
+        근거: docs/kis_market_session_capability_matrix.md §5.1
+
+        따라서 이 시각의 올바른 결과는 "요구되는 시장이 없음"이다. 미국이 실제로 열려
+        있을 때 미국 틱이 요구되는지는
+        ``test_reliability_requires_us_ticks_during_us_core_session`` 이 검증한다.
+        """
         opening_auction = datetime(2026, 6, 30, 23, 45, tzinfo=timezone.utc)
         captured: list[tuple[str, ...]] = []
 
@@ -2506,12 +2519,46 @@ class RealtimeModesTest(unittest.TestCase):
             policy.from_environment.return_value.conflicts.return_value = ()
             result = web_module._evaluate_auto_reliability(opening_auction)
 
-        self.assertEqual(captured, [("US",)])
-        self.assertEqual(result["components"]["market_data"]["required_markets"], ["US"])
+        self.assertEqual(captured, [()])
+        self.assertNotIn(
+            "KRX", result["components"]["market_data"]["required_markets"]
+        )
+        self.assertEqual(result["components"]["market_data"]["required_markets"], [])
         self.assertEqual(
             result["components"]["market_data"]["extended_order_markets"],
             ["US", "KRX"],
         )
+
+    def test_reliability_requires_us_ticks_during_us_core_session(self) -> None:
+        """미국 정규장 중에는 미국 틱이 실제로 요구된다 (KRX 는 마감이라 제외)."""
+        us_core = datetime(2026, 7, 1, 15, 0, tzinfo=timezone.utc)  # 11:00 ET, 00:00 KST
+        captured: list[tuple[str, ...]] = []
+
+        def market_health(_now, groups):
+            captured.append(tuple(groups))
+            return {"ok": True, "healthy": {"US": ["AAPL", "MSFT"], "KRX": []}}
+
+        with (
+            patch("app.web._active_live_market_groups", return_value=("US", "KRX")),
+            patch("app.web._cached_kis_connection_probe", return_value={
+                "ok": True,
+                "account_checked": True,
+                "actual_equity": 200000.0,
+            }),
+            patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
+            patch("app.web.load_short_horizon_strategy_config", return_value={
+                "execution": {"live_trading_enabled": True},
+            }),
+            patch("app.web.TradingPolicySnapshot") as policy,
+            patch("app.web._latest_model_reliability", return_value={"ok": True}),
+            patch("app.web._auto_market_health", side_effect=market_health),
+            patch.dict("os.environ", {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"}),
+        ):
+            policy.from_environment.return_value.conflicts.return_value = ()
+            result = web_module._evaluate_auto_reliability(us_core)
+
+        self.assertEqual(captured, [("US",)])
+        self.assertEqual(result["components"]["market_data"]["required_markets"], ["US"])
 
     def test_live_affordable_krx_discovery_default_limit_is_broader_for_small_cash(self) -> None:
         stored = StoredResearch(

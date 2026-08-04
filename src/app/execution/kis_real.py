@@ -346,6 +346,12 @@ class KisDevelopersApiClient:
         )
         self._orders: dict[str, FinalOrder] = {}
         self._order_org_numbers: dict[str, str] = {}
+        # order_id -> 원주문 route (endpoint family, venue, session, ORD_DVSN).
+        #
+        # 정정·취소는 **이 값**으로 라우팅한다. 이전에는 정정 시점의 시각으로
+        # daytime/regular 를 다시 판정했고, 그래서 주간거래로 접수한 주문을 세션 경계
+        # 이후에 정정하면 일반 order-rvsecncl 로 전송됐다 (원주문 불일치).
+        self._order_routes: dict[str, dict[str, Any]] = {}
         # (ticker, exchange) -> (dtm_tr_psbl_yn as bool, monotonic timestamp)
         self._daytime_tradable_cache: dict[tuple[str, str], tuple[bool, float]] = {}
 
@@ -369,6 +375,14 @@ class KisDevelopersApiClient:
             order_id = f"KIS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         self._orders[order_id] = order
         self._order_org_numbers[order_id] = str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or "")
+        self._record_order_route(
+            order_id,
+            route_family="DOMESTIC_CASH",
+            endpoint="/uapi/domestic-stock/v1/trading/order-cash",
+            exchange_id_code=body.get("EXCG_ID_DVSN_CD", "KRX"),
+            order_division=body.get("ORD_DVSN", "00"),
+            venue="NXT" if body.get("EXCG_ID_DVSN_CD") == "NXT" else "KRX",
+        )
         return MockKisOrderReceipt(
             order_id=order_id,
             accepted=True,
@@ -602,6 +616,13 @@ class KisDevelopersApiClient:
         self._order_org_numbers[order_id] = str(
             output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or ""
         )
+        self._record_order_route(
+            order_id,
+            route_family="DOMESTIC_CASH",
+            endpoint="/uapi/domestic-stock/v1/trading/order-credit",
+            exchange_id_code="KRX",
+            order_division=_domestic_order_division_code(exchange_id_code="KRX"),
+        )
         return MockKisOrderReceipt(
             order_id=order_id,
             accepted=True,
@@ -682,7 +703,8 @@ class KisDevelopersApiClient:
         body = self._overseas_order_body(order, exchange_code)
         path = "/uapi/overseas-stock/v1/trading/order"
         tr_id = self.endpoints.overseas_tr_id_for_order(exchange_code, order.side)
-        if _is_us_daytime_order_session(order.market):
+        daytime = _is_us_daytime_order_session(order.market)
+        if daytime:
             # KIS supports only a subset of US names for 주간거래; the rest are
             # rejected at the broker. Checking here turns a broker rejection
             # into a local, explainable block.
@@ -707,6 +729,14 @@ class KisDevelopersApiClient:
             order_id = f"KISOVRS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
         self._orders[order_id] = order
         self._order_org_numbers[order_id] = str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or "")
+        self._record_order_route(
+            order_id,
+            route_family=(
+                "OVERSEAS_DAYTIME" if daytime else "OVERSEAS_REGULAR"
+            ),
+            endpoint=path,
+            overseas_exchange_code=exchange_code,
+        )
         return MockKisOrderReceipt(
             order_id=order_id,
             accepted=True,
@@ -748,11 +778,9 @@ class KisDevelopersApiClient:
     def _amend_overseas_limit_order(self, order_id: str, replacement: FinalOrder) -> MockKisOrderReceipt:
         exchange_code = _overseas_exchange_code(replacement.market)
         body = self._overseas_revise_cancel_body(order_id, replacement, exchange_code, revise=True)
-        path = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
-        tr_id = self.endpoints.overseas_revise_cancel_tr_id(exchange_code)
-        if _is_us_daytime_order_session(replacement.market):
-            path = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
-            tr_id = self.endpoints.overseas_daytime_revise_cancel_tr_id
+        path, tr_id = self._overseas_revise_cancel_route(
+            order_id, exchange_code, replacement
+        )
         response = self._post(path, tr_id=tr_id, body=body, include_hashkey=True)
         self._ensure_success(response, "KIS overseas order revise rejected")
         return self._receipt_from_revise_cancel_response(response, replacement, fallback_order_id=order_id)
@@ -760,11 +788,7 @@ class KisDevelopersApiClient:
     def _cancel_overseas_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
         exchange_code = _overseas_exchange_code(order.market)
         body = self._overseas_revise_cancel_body(order_id, order, exchange_code, revise=False)
-        path = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
-        tr_id = self.endpoints.overseas_revise_cancel_tr_id(exchange_code)
-        if _is_us_daytime_order_session(order.market):
-            path = "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl"
-            tr_id = self.endpoints.overseas_daytime_revise_cancel_tr_id
+        path, tr_id = self._overseas_revise_cancel_route(order_id, exchange_code, order)
         response = self._post(path, tr_id=tr_id, body=body, include_hashkey=True)
         self._ensure_success(response, "KIS overseas order cancel rejected")
         return self._receipt_from_revise_cancel_response(response, order, fallback_order_id=order_id, status="CANCELED")
@@ -1575,15 +1599,102 @@ class KisDevelopersApiClient:
                 "fix this before requesting a new access token."
             ) from exc
 
+    def _domestic_exchange_id_code(self, order: FinalOrder) -> str:
+        """``EXCG_ID_DVSN_CD``. 공식 허용값은 ``KRX`` / ``NXT`` / ``SOR`` 뿐이다.
+
+        문서: "미입력시 KRX로 진행되며, 모의투자는 KRX만 가능". 이전 구현은 이 값을
+        ``"KRX"`` 로 하드코딩해 NXT/SOR 라우팅이 아예 불가능했다. 여기서는 주문에 실린
+        venue 힌트를 쓰고, 해석할 수 없으면 문서상 기본값인 KRX 로 둔다.
+        """
+        from app.data.market_capabilities import VERIFIED_ORDER_DIVISIONS
+
+        for candidate in (
+            getattr(order, "exchange_code", ""),
+            getattr(order, "execution_venue", ""),
+        ):
+            code = str(candidate or "").upper().strip()
+            if code == "NEXTRADE":
+                code = "NXT"
+            if code in VERIFIED_ORDER_DIVISIONS:
+                return code
+        return "KRX"
+
+    def _record_order_route(
+        self,
+        order_id: str,
+        *,
+        route_family: str,
+        endpoint: str,
+        exchange_id_code: str | None = None,
+        overseas_exchange_code: str | None = None,
+        order_division: str | None = None,
+        session: str = "",
+        venue: str = "",
+    ) -> None:
+        """원주문이 실제로 어느 엔드포인트 family 로 갔는지 기록한다.
+
+        정정·취소가 이 값을 읽어 **같은 family** 로만 라우팅한다. 세션이 바뀌었다고 다른
+        venue 로 자동 정정하지 않는다 — 그런 전이는 "원주문 취소 + 신규 주문" 이라는
+        명시적 상태 전이로만 허용된다.
+        """
+        self._order_routes[str(order_id)] = {
+            "route_family": route_family,
+            "endpoint": endpoint,
+            "exchange_id_code": exchange_id_code,
+            "overseas_exchange_code": overseas_exchange_code,
+            "order_division": order_division,
+            "session": session,
+            "venue": venue,
+        }
+
+    def order_route(self, order_id: str) -> dict[str, Any] | None:
+        """저널/코디네이터가 원주문 route 를 읽어 갈 수 있게 노출한다."""
+        route = self._order_routes.get(str(order_id))
+        return dict(route) if route else None
+
+    def _overseas_revise_cancel_route(
+        self, order_id: str, exchange_code: str, order: FinalOrder | None = None
+    ) -> tuple[str, str]:
+        """정정·취소 엔드포인트 + TR. **원주문 family 를 그대로 따른다.**
+
+        원주문 route 를 모르는 경우(프로세스 재시작 등) 현재 시각으로 추정하지 않고
+        현재 세션 판정으로 되돌아가되, 그 사실을 사유코드로 남길 수 있게 한다. 추정이
+        위험한 이유는 주간거래 ODNO 를 일반 endpoint 로 보내면 원주문 불일치가 되기
+        때문이다.
+        """
+        recorded = self._order_routes.get(str(order_id)) or {}
+        family = str(recorded.get("route_family") or "")
+        if not family:
+            # 원주문 route 기록이 없다 (프로세스 재시작, 또는 이 프로세스가 접수하지 않은
+            # 주문). 정정 대상 주문의 market 으로 현재 세션을 판정한다 — 기록이 있을 때는
+            # 절대 이 경로로 오지 않으므로, 기록된 family 가 시각 재판정에 밀리지 않는다.
+            known = order or self._orders.get(str(order_id))
+            market = str(getattr(known, "market", "") or "")
+            family = (
+                "OVERSEAS_DAYTIME"
+                if market and _is_us_daytime_order_session(market)
+                else "OVERSEAS_REGULAR"
+            )
+        if family == "OVERSEAS_DAYTIME":
+            return (
+                "/uapi/overseas-stock/v1/trading/daytime-order-rvsecncl",
+                self.endpoints.overseas_daytime_revise_cancel_tr_id,
+            )
+        return (
+            "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+            self.endpoints.overseas_revise_cancel_tr_id(exchange_code),
+        )
+
     def _order_body(self, order: FinalOrder) -> dict[str, str]:
+        exchange_id_code = self._domestic_exchange_id_code(order)
         return {
             "CANO": self.credentials.account_no,
             "ACNT_PRDT_CD": self.credentials.account_product_code,
             "PDNO": order.ticker,
-            "ORD_DVSN": _domestic_order_division_code(),
+            "ORD_DVSN": _domestic_order_division_code(exchange_id_code=exchange_id_code),
             "ORD_QTY": str(int(order.quantity)),
             "ORD_UNPR": str(int(round(order.limit_price))),
-            "EXCG_ID_DVSN_CD": "KRX",
+            "EXCG_ID_DVSN_CD": exchange_id_code,
             "SLL_TYPE": "",
             "CNDT_PRIC": "",
         }
@@ -1604,18 +1715,33 @@ class KisDevelopersApiClient:
         }
 
     def _revise_cancel_body(self, order_id: str, order: FinalOrder, *, revise: bool) -> dict[str, str]:
+        """국내 정정·취소 body.
+
+        ``ORD_DVSN`` 과 ``EXCG_ID_DVSN_CD`` 는 **원주문 값을 그대로** 쓴다. 시간외 단일가
+        (07) 로 접수한 주문을 정정 시점 시각으로 다시 계산해 지정가(00) 로 보내면 거래소가
+        원주문과 주문구분 불일치로 거부한다. 원주문 기록이 없으면(프로세스 재시작 등)
+        현재 세션값으로 되돌아가되 거래소는 문서상 기본값인 KRX 를 유지한다.
+        """
+        recorded = self._order_routes.get(str(order_id)) or {}
+        exchange_id_code = str(
+            recorded.get("exchange_id_code") or self._domestic_exchange_id_code(order)
+        )
+        division = str(
+            recorded.get("order_division")
+            or _domestic_order_division_code(exchange_id_code=exchange_id_code)
+        )
         return {
             "CANO": self.credentials.account_no,
             "ACNT_PRDT_CD": self.credentials.account_product_code,
             "KRX_FWDG_ORD_ORGNO": self._order_org_numbers.get(order_id, ""),
             "ORGN_ODNO": order_id,
-            "ORD_DVSN": _domestic_order_division_code(),
+            "ORD_DVSN": division,
             "RVSE_CNCL_DVSN_CD": "01" if revise else "02",
             "ORD_QTY": str(int(order.quantity)),
             "ORD_UNPR": str(int(round(order.limit_price))) if revise else "0",
             "QTY_ALL_ORD_YN": "N" if revise else "Y",
             "CNDT_PRIC": "",
-            "EXCG_ID_DVSN_CD": "KRX",
+            "EXCG_ID_DVSN_CD": exchange_id_code,
         }
 
     def _overseas_revise_cancel_body(
@@ -2253,25 +2379,45 @@ def _format_overseas_price(value: float) -> str:
     return text if text else "0"
 
 
-def _domestic_order_division_code(now: datetime | None = None) -> str:
+def _domestic_order_division_code(
+    now: datetime | None = None, *, exchange_id_code: str = "KRX"
+) -> str:
+    """세션에 맞는 국내 ``ORD_DVSN``.
+
+    거래소별 허용값이 **다르다** (공식 문서의 별도 표):
+
+    * KRX — 00 지정가, 05 장전 시간외, 06 장후 시간외, 07 시간외 단일가 ...
+    * NXT — 00 지정가, 03, 04, 11~16, 21~24. **05/06/07 없음.**
+    * SOR — 00, 01, 03, 04, 11~16. **05/06/07·21~24 없음.**
+
+    이전 구현은 거래소를 무시하고 시각만 보고 05/06/07 을 골랐다. ``EXCG_ID_DVSN_CD`` 가
+    NXT 가 되는 순간 그 값은 비허용이 되어 조용히 거부된다. 그래서 여기서는 canonical
+    service 가 계산한 세션별 값을 쓰고, 거래소 허용 집합으로 한 번 더 검증한다.
+    """
     forced = os.getenv("KIS_DOMESTIC_ORD_DVSN", "").strip()
+    from app.data.market_capabilities import (
+        MarketGroup,
+        VERIFIED_ORDER_DIVISIONS,
+        Venue,
+        default_service,
+    )
+
+    exchange = str(exchange_id_code or "KRX").upper().strip() or "KRX"
+    allowed = VERIFIED_ORDER_DIVISIONS.get(exchange, VERIFIED_ORDER_DIVISIONS["KRX"])
     if forced:
-        return forced
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        return "00"
+        # 운영자가 명시한 값도 공식 허용 집합을 벗어나면 쓰지 않는다 (fail-closed).
+        return forced if forced in allowed else "00"
+
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local = current.astimezone(ZoneInfo("Asia/Seoul"))
-    minute = local.hour * 60 + local.minute
-    if 8 * 60 + 30 <= minute < 8 * 60 + 40:
-        return "05"
-    if 15 * 60 + 40 <= minute < 16 * 60:
-        return "06"
-    if 16 * 60 <= minute <= 18 * 60:
-        return "07"
+    target_venue = Venue.NXT if exchange == "NXT" else Venue.KRX
+    for capability in default_service().active_capabilities(MarketGroup.KR, current):
+        if capability.venue is not target_venue:
+            continue
+        division = capability.limit_order_division()
+        if division in allowed:
+            return division
     return "00"
 
 
@@ -2290,6 +2436,17 @@ def _enforce_daytime_tradable() -> bool:
 
 
 def _is_us_daytime_order_session(market: str, now: datetime | None = None) -> bool:
+    """미국 주간거래(장전거래) 주문 세션인지.
+
+    이전에는 여기서 KST 09:00-16:50 을 직접 계산했다. KIS 공식 문서의 주간거래 시간은
+    **10:00 ~ 18:00 (한국시간, Summer Time 동일)** 이므로 두 방향으로 틀렸다:
+
+    * 09:00-10:00 KST — 주간거래 시간이 아닌데 ``daytime-order`` 를 호출해 거부당함.
+    * 16:50-18:00 KST — 주간거래 시간인데 일반 ``order`` 로 라우팅해 거부당함.
+
+    판정을 canonical capability service 로 위임한다.
+    근거: ``docs/kis_market_session_capability_matrix.md`` §5.1
+    """
     market_name = str(market or "").upper()
     if not any(token in market_name for token in ("US", "NASDAQ", "NASD", "NYSE", "AMEX", "OVERSEAS")):
         return False
@@ -2298,16 +2455,15 @@ def _is_us_daytime_order_session(market: str, now: datetime | None = None) -> bo
         return True
     if override in {"0", "false", "no", "off"}:
         return False
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        return False
+    from app.data.market_capabilities import MarketGroup, SessionId, default_service
+
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local = current.astimezone(ZoneInfo("Asia/Seoul"))
-    minute = local.hour * 60 + local.minute
-    return local.weekday() < 5 and 9 * 60 <= minute <= 16 * 60 + 50
+    return any(
+        capability.session is SessionId.US_DAYTIME
+        for capability in default_service().active_capabilities(MarketGroup.US, current)
+    )
 
 
 def _cash_by_currency_from_summary(summary_row: dict[str, Any], krw_cash: float) -> dict[str, float]:

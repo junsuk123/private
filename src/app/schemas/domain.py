@@ -452,6 +452,18 @@ class FinalOrder:
     # separate positions to the broker and cannot be netted.
     credit_type: str | None = None
     loan_date: str | None = None
+    # --- Session / venue routing (optional) ---------------------------------- #
+    # 비어 있으면 KisSessionOrderRouter 가 현재 capability 와 symbol exchange map 으로
+    # 계산한다. 계산 결과가 모호하면 (예: 썸머타임의 미국 주간거래·프리마켓 중첩)
+    # 주문은 차단된다 — 임의로 하나를 고르지 않는다.
+    #
+    # 값을 채워 두면 라우터는 그 세션/venue 로만 라우팅하며, 현재 세션과 맞지 않으면
+    # ``SESSION_MISMATCH`` 로 fail-closed 한다. 정정·취소가 원주문 route family 를
+    # 유지해야 하기 때문에 필요한 필드다.
+    market_session: str = ""
+    execution_venue: str = ""
+    exchange_code: str = ""
+    order_condition: str = ""
 
     @property
     def resolved_position_effect(self) -> str:

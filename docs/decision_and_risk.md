@@ -476,10 +476,33 @@ US(~60-87bp)를 분리 적합합니다(`LIVE_MODEL_SPLIT_BY_MARKET`).
 
 이 데이터에서 모든 후보가 `LOW_LIQUIDITY_TECHNICAL_BLOCK` / `hold`로 귀결됐고, 그 결과 선택
 계층에 **BUY intent가 하나도 도달하지 않았습니다.** `allows_new_entry()`는 신규 진입을
-**정규장으로 한정**하고, 막힌 이유를 `NEW_ENTRY_OUTSIDE_REGULAR_SESSION:US=after`처럼 위상과
-함께 보고합니다. 판정은 **스캔 중인 종목의 시장 기준**입니다 — 국내 장중에 미국 종목만 스캔하는
-상황에서 "장이 열렸다"는 말은 의미가 없기 때문입니다. 청산은 이 게이트의 영향을 받지 않습니다.
-`TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true`로 이전 동작을 복원할 수 있습니다.
+**정규장으로 한정**하고, 막힌 이유를 위상과 함께 보고합니다. 판정은 **스캔 중인 종목의 시장
+기준**입니다 — 국내 장중에 미국 종목만 스캔하는 상황에서 "장이 열렸다"는 말은 의미가 없기
+때문입니다. 청산은 이 게이트의 영향을 받지 않습니다.
+
+**세션 판정의 단일 권한 (갱신).** `allows_new_entry()` 는 더 이상 자체 시각창을 갖지 않고
+`app.data.market_capabilities.MarketSessionService` 에 위임합니다. 그 이전에는 세션 판정이
+독립적으로 7곳에 존재하고 KRX 정규장 경계조차 09:00–15:20 / 15:30 / 16:50 로 서로 달랐습니다
+(`docs/realtime_session_gap_analysis.md` §3). 이제 판정은 네 값으로 **분리**됩니다:
+
+| 값 | 질문 |
+|---|---|
+| `data_available` | 실시간 데이터가 오는가 |
+| `trade_available` | 공식 주문 route 가 존재하는가 |
+| `new_entry_allowed` | 신규 진입해도 되는가 |
+| `exit_allowed` | 청산할 수 있는가 |
+
+"닫혀 있지 않다 ≠ 매수해도 된다" 였던 원래 교훈에 "데이터가 온다 ≠ 주문이 접수된다" 가
+추가된 것입니다. 세션 세분화(`KRX_PREOPEN`/`KRX_OPENING_AUCTION`/`KRX_REGULAR`/
+`KRX_CLOSING_AUCTION`/`KRX_AFTER_CLOSE`/`KRX_AFTER_SINGLE_PRICE`/`NXT_*`/`US_DAYTIME`/
+`US_PREMARKET`/`US_REGULAR`/`US_AFTERMARKET`)와 세션별 정책은
+`config/market_sessions.yaml` 에 있습니다.
+
+세션별 제어는 `TRADING_ALLOW_ENTRY_<SESSION>` 이고, 기존
+`TRADING_ALLOW_EXTENDED_HOURS_ENTRY=true` 는 backward-compatible alias 로 유지되지만
+**장외 세션에만** 적용되며 그것만으로는 실주문이 열리지 않습니다 — 세션별
+`live_order_authorized` 가 추가로 필요합니다 (`EXTENDED_LIVE_ORDER_NOT_AUTHORIZED`).
+운영 절차는 `docs/extended_hours_live_trading.md`.
 
 ### 10.2 GNN 권한 순환 교착
 

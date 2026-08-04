@@ -131,7 +131,9 @@ def test_raw_absorption_is_collected_when_sparse_rest_ticks_cannot_price_edge():
     assert result.recorded == result.adopted == 1
     assert plan_store.plans[0].diagnostics["algorithm_live_triggered"] is False
     assert plan_store.plans[0].max_holding_seconds == 600
-    assert "EDGE_BELOW_ALGORITHM_FLOOR" in plan_store.plans[0].signal_reason_codes
+    # The floor that rejected it is the market's round-trip cost, so the reason
+    # code names the cost rather than an arbitrary threshold.
+    assert "EDGE_BELOW_COST_FLOOR" in plan_store.plans[0].signal_reason_codes
 
 
 def test_collector_rejects_weak_recovery_krx_and_future_book():

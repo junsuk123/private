@@ -77,7 +77,7 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
 | --- | --- |
 | `src/app/web.py` | FastAPI 앱, 루트 GUI, API, realtime/live runtime orchestration |
 | `src/app/web_account_routes.py`, `account_dashboard.py` | `/account` 라우트와 payload 구성 |
-| `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, 세션 판정, REST fallback |
+| `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, **세션·capability 단일 권한 (`market_capabilities.py`)**, REST fallback |
 | `src/app/features/` | indicator engine, live feature frame, short-horizon/semantic feature, provenance |
 | `src/app/technical/` | 근거 기반 기술적 예측 레이어 (regime, 방법론, 예측, 리플레이) — 자문 전용 |
 | `src/app/graph/` | custom KnowledgeGraph, FactTable, RDF/OWL/SHACL 레이어, 거시–미시 추론, theory vote, NPU evidence scorer |
@@ -224,3 +224,36 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
 7. 숏 전략 3개는 코드에 존재하지만 **전량 `SHADOW`이며 실주문 권한이 없습니다.** 승격에는 최소 20 거래일의 forward 표본이 필요하므로 정상 상태입니다. 또한 KIS 대주 조회 TR id와 응답 필드명은 실계좌 응답으로 검증되지 않았고(read-only 경로), GNN 방향별 utility head는 미구현입니다 — 숏 arm은 현재 realized posterior와 규칙 신호로만 평가됩니다. 상세는 [short_selling_deployment.md](short_selling_deployment.md) §15.
 
 관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [short_selling_deployment.md](short_selling_deployment.md) · [validation.md](validation.md)
+
+
+## 세션·거래소 capability 계층 (국내·미국 전 세션)
+
+세션 판정의 **유일한 source of truth** 는 `src/app/data/market_capabilities.py` 의
+`MarketSessionService` 다. 이전에는 같은 판정이 `market_session.py`, `web.py`(2곳),
+`realtime_trading_engine.py`, `kis_real.py`, `kis_realtime.py`, `llm_classifier.py` 에
+독립적으로 존재하고 경계값이 서로 달랐다 (`docs/realtime_session_gap_analysis.md` §3).
+
+정보는 두 층으로 분리된다:
+
+| 층 | 위치 | 내용 | 변경 가능성 |
+|---|---|---|---|
+| 검증된 API 사실 | `market_capabilities.py` 의 `_VERIFIED_*` 테이블 | TR ID, 엔드포인트, `EXCG_ID_DVSN_CD`, `ORD_DVSN` 허용값, subscription key 형식 | **설정으로 덮어쓸 수 없다** |
+| 거래소 규정 / 우리 정책 | `config/market_sessions.yaml` | 세션 시각창, 휴장·조기폐장 스냅샷(버전 기록), 세션별 정책 임계값 | 설정 |
+
+검증 근거는 `research_notes/한국투자증권_오픈API_전체문서_*.xlsx` 이고 정리본은
+`docs/kis_market_session_capability_matrix.md` 다.
+
+주요 구성 요소:
+
+* `MarketCapability` — (market, venue, session) 조합의 완전한 능력 서술.
+  `data_available` / `trade_available` / `new_entry_allowed` / `exit_allowed` 를 **분리**한다.
+* `KisSessionOrderRouter` (`src/app/execution/kis_session_order_router.py`) — 주문 route
+  결정의 유일한 지점. 정정·취소는 원주문 route family 를 유지한다.
+* `FeedMetadata` (`realtime_types.py`) — 모든 실시간 이벤트에 market/venue/session/
+  feed_scope/TR/subscription_key 를 부착. `stream_id` 가 분 bar identity 와 `record_id` 에
+  들어가 KRX·NXT·통합 피드가 구조적으로 섞이지 않는다.
+* 실시간 저장소 스키마 v2 — `schema_version` / `schema_migrations` 테이블과 무손실
+  versioned migration. v1 시절 행은 `metadata_inferred=1` 로 표시되어 신규 진입 근거에서 제외된다.
+
+`market_session.py` 는 PRE/REGULAR/AFTER/CLOSED 4단계를 쓰는 기존 호출자를 위한
+backward-compatible wrapper 로 축소됐다. 신규 코드는 `SessionId` 와 `MarketCapability` 를 직접 쓴다.

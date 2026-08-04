@@ -12,9 +12,15 @@
 #   3. built-in defaults in strategy_algorithms.py
 #
 # These are STARTING values to be tuned from realized net PnL. They are not
-# assumed optimal. In particular: KRX round-trip cost (sell tax 15 bps + fees +
-# spread) is roughly 25-30 bps, so any strategy whose expected edge sits below
-# that will be — correctly — rejected downstream by the ProfitabilityGate.
+# assumed optimal. KRX round-trip cost (sell tax 20 bps + fees + slippage +
+# safety margin) is roughly 28-34 bps and the US round trip is 51-70 bps, so an
+# edge below that is rejected — now at the ALGORITHM layer too, not only
+# downstream by the ProfitabilityGate (see ``shared.cost_aware_floor_enabled``).
+#
+# The sell tax is 20 bps (config/trading_costs.json ``sell_tax_rate: 0.002``).
+# An earlier version of this comment said 15 bps; the engine always read the
+# JSON, so nothing miscalculated, but anyone tuning a threshold against the
+# comment would have been 5 bps optimistic on every KRX round trip.
 
 # Market intraday momentum: 하루 1회 왕복. KRX 왕복비용 27.8bps 중 20bps가 법정
 # 거래세이고 이는 왕복마다 부과되므로, 전략의 왕복 횟수가 엣지만큼 중요하다.
@@ -44,9 +50,25 @@ shared:
   capture_fraction: 0.5
   # Minimum ticks in the 5s window before any mechanical trigger may fire.
   min_tick_count_5s: 3.0
-  # Algorithm-level edge floor in bps. This is a sanity floor only — the
-  # authoritative net-of-cost decision stays with the ProfitabilityGate.
+  # Absolute lower bound, used only when the cost config cannot be read. It is
+  # NOT the operative floor: with cost_aware_floor_enabled the floor becomes
+  # round_trip_cost * cost_floor_multiple + min_net_buffer_bps, resolved per
+  # market from config/trading_costs.json — about 44 bps on KRX and 61 bps on US
+  # at the current fee schedule.
+  #
+  # Why this changed: a flat 8 bps let every algorithm fire on edges that could
+  # not survive their own round trip, which is exactly the measured pathology
+  # (gap_context on KRX: +12.1 bps gross, -15.8 bps net over 65 fills). The
+  # trigger layer and the ProfitabilityGate were using different arithmetic, and
+  # the trigger layer's was structurally wrong.
   min_expected_edge_bps: 8.0
+  cost_aware_floor_enabled: 1.0
+  # 1.0 = the edge must cover its round trip exactly once. Raise it to demand
+  # the edge exceed cost by a margin; both terms are estimates, so equality is
+  # a loss whenever either is off.
+  cost_floor_multiple: 1.0
+  # Net bps that must survive the round trip for the trade to be worth taking.
+  min_net_buffer_bps: 10.0
 
 # Tick order-flow continuation, confirmed by bar trend agreement.
 intraday_momentum:

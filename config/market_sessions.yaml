@@ -1,0 +1,254 @@
+# 시장·세션 capability 및 정책 설정.
+#
+# 이 파일은 "한국투자증권 Open API 문서에 없는 정보"를 코드에서 분리해 담는다.
+#   * 세션 시각창 / 휴장일 / 조기폐장  -> 거래소 업무규정 영역 (API 문서 밖)
+#   * 세션별 운영 정책               -> 우리 시스템의 리스크 결정
+#
+# API 문서에서 확인된 정보(TR ID, 엔드포인트, EXCG_ID_DVSN_CD, ORD_DVSN 허용값)는
+# 여기가 아니라 src/app/data/market_capabilities.py 의 VERIFIED 테이블에 있다.
+# 그쪽 값을 이 파일로 덮어쓸 수는 없다 (의도적).
+#
+# 검증 근거: docs/kis_market_session_capability_matrix.md
+
+schema_version: 1
+
+calendar:
+  # 이 스냅샷의 버전. artifact metadata 에 기록되어 "어느 캘린더로 학습/거래했는지" 추적된다.
+  version: "2026-08-04.1"
+  source: "KRX/NYSE 공표 일정 수기 스냅샷 (외부 provider 미설치 환경의 fallback)"
+  # 커버리지를 벗어난 날짜는 신규 진입 fail-closed (SESSION_CALENDAR_STALE).
+  # 청산 경로는 별도 평가한다.
+  coverage_start: "2026-01-01"
+  coverage_end: "2027-12-31"
+
+  # 외부 exchange calendar provider 가 설치되어 있으면 우선 사용한다.
+  # (지원: exchange_calendars). 미설치/실패 시 아래 스냅샷으로 fallback.
+  prefer_external_provider: true
+
+  KR:
+    # 주의: 음력 기반 휴장일(설날/추석/부처님오신날)과 임시공휴일·대체공휴일은
+    # 이 스냅샷에 포함되어 있지 않다. 아래 completeness 값이 그것을 명시한다.
+    # 누락된 휴장일은 "세션은 열려 있는데 피드 증거가 없음" 런타임 가드
+    # (SESSION_CALENDAR_SUSPECT) 로 잡는다. 신규 진입은 그 경우에도 fail-closed 다.
+    completeness: fixed_date_only
+    holidays:
+      - "2026-01-01"   # 신정
+      - "2026-03-01"   # 삼일절
+      - "2026-05-01"   # 근로자의 날 (KRX 휴장)
+      - "2026-05-05"   # 어린이날
+      - "2026-06-06"   # 현충일
+      - "2026-08-15"   # 광복절
+      - "2026-10-03"   # 개천절
+      - "2026-10-09"   # 한글날
+      - "2026-12-25"   # 성탄절
+      - "2026-12-31"   # 연말 휴장
+      - "2027-01-01"
+      - "2027-03-01"
+      - "2027-05-01"
+      - "2027-05-05"
+      - "2027-06-06"
+      - "2027-08-15"
+      - "2027-10-03"
+      - "2027-10-09"
+      - "2027-12-25"
+      - "2027-12-31"
+    early_close: {}
+
+  US:
+    completeness: full
+    holidays:
+      - "2026-01-01"
+      - "2026-01-19"
+      - "2026-02-16"
+      - "2026-04-03"
+      - "2026-05-25"
+      - "2026-06-19"
+      - "2026-07-03"
+      - "2026-09-07"
+      - "2026-11-26"
+      - "2026-12-25"
+      - "2027-01-01"
+      - "2027-01-18"
+      - "2027-02-15"
+      - "2027-03-26"
+      - "2027-05-31"
+      - "2027-06-18"
+      - "2027-07-05"
+      - "2027-09-06"
+      - "2027-11-25"
+      - "2027-12-24"
+    # 조기폐장일: 정규장 종료시각(거래소 현지시간). 애프터마켓도 그에 맞춰 당겨진다.
+    early_close:
+      "2026-11-27": "13:00"
+      "2026-12-24": "13:00"
+      "2027-11-26": "13:00"
+
+# 미국 주간거래(10:00~18:00 KST)와 프리마켓(썸머타임 17:00~22:30 KST)이 겹치는
+# 구간의 주문 route 우선순위. 신규 진입은 겹치는 동안 어느 값이든 차단된다
+# (SESSION_ROUTE_AMBIGUOUS); 이 값은 청산 route 선택에만 쓰인다.
+us_overlap_order_precedence: night   # night | daytime
+
+sessions:
+  # ---------------- 국내 KRX ----------------
+  KRX_PREOPEN:
+    window: { tz: Asia/Seoul, start: "08:30", end: "08:40" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 120
+    max_quote_age_ms: 120000
+    max_book_age_ms: 120000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  KRX_OPENING_AUCTION:
+    window: { tz: Asia/Seoul, start: "08:40", end: "09:00" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 150
+    max_quote_age_ms: 60000
+    max_book_age_ms: 60000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  KRX_REGULAR:
+    window: { tz: Asia/Seoul, start: "09:00", end: "15:20" }
+    data_enabled: true
+    new_entry_enabled: true
+    exit_enabled: true
+    live_order_authorized: true
+    max_spread_bps: 60
+    max_quote_age_ms: 5000
+    max_book_age_ms: 5000
+    minimum_trade_rate: 0.2
+    maximum_position_weight: 0.35
+
+  KRX_CLOSING_AUCTION:
+    window: { tz: Asia/Seoul, start: "15:20", end: "15:30" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: true
+    max_spread_bps: 150
+    max_quote_age_ms: 60000
+    max_book_age_ms: 60000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.35
+
+  KRX_AFTER_CLOSE:
+    window: { tz: Asia/Seoul, start: "15:40", end: "16:00" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 120
+    max_quote_age_ms: 120000
+    max_book_age_ms: 120000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  KRX_AFTER_SINGLE_PRICE:
+    window: { tz: Asia/Seoul, start: "16:00", end: "18:00" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 200
+    max_quote_age_ms: 600000
+    max_book_age_ms: 600000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  # ---------------- 국내 NXT (넥스트레이드) ----------------
+  NXT_PRE:
+    window: { tz: Asia/Seoul, start: "08:00", end: "08:50" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 150
+    max_quote_age_ms: 60000
+    max_book_age_ms: 60000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  NXT_REGULAR:
+    window: { tz: Asia/Seoul, start: "09:00", end: "15:20" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 80
+    max_quote_age_ms: 10000
+    max_book_age_ms: 10000
+    minimum_trade_rate: 0.1
+    maximum_position_weight: 0.15
+
+  NXT_POST:
+    window: { tz: Asia/Seoul, start: "15:30", end: "20:00" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 150
+    max_quote_age_ms: 60000
+    max_book_age_ms: 60000
+    minimum_trade_rate: 0.0
+    maximum_position_weight: 0.05
+
+  # ---------------- 미국 ----------------
+  # 주간거래는 한국시간 고정창이므로 tz 가 Asia/Seoul 이다 (ET 로는 이동창).
+  # 공식 주문창 10:00~18:00, 공식 시세창 10:00~16:00 → data_window_end 로 분리.
+  US_DAYTIME:
+    window: { tz: Asia/Seoul, start: "10:00", end: "18:00" }
+    data_window_end: "16:00"
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 120
+    max_quote_age_ms: 30000
+    max_book_age_ms: 30000
+    minimum_trade_rate: 0.05
+    maximum_position_weight: 0.10
+
+  US_PREMARKET:
+    window: { tz: America/New_York, start: "04:00", end: "09:30" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 150
+    max_quote_age_ms: 30000
+    max_book_age_ms: 30000
+    minimum_trade_rate: 0.05
+    maximum_position_weight: 0.10
+
+  US_REGULAR:
+    window: { tz: America/New_York, start: "09:30", end: "16:00" }
+    data_enabled: true
+    new_entry_enabled: true
+    exit_enabled: true
+    live_order_authorized: true
+    max_spread_bps: 50
+    max_quote_age_ms: 5000
+    max_book_age_ms: 5000
+    minimum_trade_rate: 0.2
+    maximum_position_weight: 0.35
+
+  # 종료시각은 DST 에 따라 다르다 (KIS 공문: 애프터마켓 06:00~07:00 KST,
+  # Summer Time 05:00~07:00 KST → ET 로 환산하면 17:00 / 18:00).
+  US_AFTERMARKET:
+    window: { tz: America/New_York, start: "16:00", end: "17:00", dst_end: "18:00" }
+    data_enabled: true
+    new_entry_enabled: false
+    exit_enabled: true
+    live_order_authorized: false
+    max_spread_bps: 150
+    max_quote_age_ms: 30000
+    max_book_age_ms: 30000
+    minimum_trade_rate: 0.05
+    maximum_position_weight: 0.10

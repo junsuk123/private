@@ -233,7 +233,11 @@ class TestCompositeEngine:
         assert codes == ()
 
     def test_owned_strategy_runs_its_own_algorithm(self):
-        features = tick_features(breakout_strength=0.0007)
+        # KRX symbol on purpose: the entry floor is now the market's round-trip
+        # cost, and this fixture's ~53bp edge clears KRX (~44bp) but not US
+        # (~61bp). The subject here is which algorithm runs, so the market has to
+        # be stated rather than inherited from a placeholder ticker.
+        features = tick_features(symbol="005930", breakout_strength=0.0007)
         momentum = self.engine.evaluate_owned_strategy(features, "intraday_momentum")
         breakout = self.engine.evaluate_owned_strategy(features, "breakout_volume")
         assert momentum.selected_methodology == "intraday_momentum"
@@ -291,8 +295,13 @@ class TestCompositeEngine:
         assert "VWAP_DISPLACEMENT_TOO_SMALL" in signal.reason_codes
 
     def test_shock_reversal_needs_a_shock_and_a_contracting_spread(self):
+        # 140bp shock: at the configured 40% recovery capture that is ~56bp of
+        # expected edge, which is what it takes to clear a ~44bp KRX floor. The
+        # old fixture used 60bp, worth ~24bp — a trade that cannot pay for its
+        # own round trip (see the companion test below).
         shock = tick_features(
-            return_10s=-0.0060,
+            symbol="005930",
+            return_10s=-0.0140,
             spread_change_5s=-2.5,
             aggressor_imbalance_5s=-0.20,
             orderbook_imbalance=0.30,
@@ -303,7 +312,8 @@ class TestCompositeEngine:
 
         widening = self.engine.evaluate_owned_strategy(
             tick_features(
-                return_10s=-0.0060,
+                symbol="005930",
+                return_10s=-0.0140,
                 spread_change_5s=3.0,
                 aggressor_imbalance_5s=-0.20,
                 orderbook_imbalance=0.30,
@@ -312,6 +322,26 @@ class TestCompositeEngine:
         )
         assert widening.direction == SignalDirection.HOLD
         assert "SPREAD_STILL_WIDENING" in widening.reason_codes
+
+    def test_shock_reversal_refuses_a_shock_too_small_to_pay_its_costs(self):
+        # The configured minimum (40bp shock, 40% capture = 16bp) and this 60bp
+        # shock (24bp) are both below the ~34bp KRX round trip, so the strategy's
+        # own thresholds describe a structurally negative-expectancy trade. It
+        # used to fire here, clear an 8bp floor, and die at the ProfitabilityGate.
+        small = tick_features(
+            symbol="005930",
+            return_10s=-0.0060,
+            spread_change_5s=-2.5,
+            aggressor_imbalance_5s=-0.20,
+            orderbook_imbalance=0.30,
+        )
+
+        signal = self.engine.evaluate_owned_strategy(small, "liquidity_shock_reversal")
+
+        assert signal.direction == SignalDirection.HOLD
+        assert "EDGE_BELOW_COST_FLOOR" in signal.reason_codes
+        # The stabilisation itself was still detected; only the economics failed.
+        assert "LIQUIDITY_SHOCK_STABILISED" in signal.reason_codes
 
     def test_us_ask_heavy_absorption_branch_requires_price_recovery(self):
         absorbed = tick_features(
