@@ -79,7 +79,7 @@ python scripts/live_readiness_check.py
 GET  /api/account/dashboard                        GET  /api/account/technical
 GET  /api/account/asset-history?range=1D|1W|1M|3M  GET  /api/account/macro-micro
 GET  /api/realtime-trading/status                  GET  /api/refactor/dashboard
-GET  /api/refactor/market-view?symbol=005930       GET  /api/trade-explanations
+GET  /api/refactor/market-view?symbol={symbol}     GET  /api/trade-explanations
 GET  /api/ontology/graph                           GET  /api/realtime/runtime
 GET  /api/npu/runtime                              GET  /api/gnn/realtime-trust
 GET  /api/system-diagnostics                       GET  /api/auto-reliability/status

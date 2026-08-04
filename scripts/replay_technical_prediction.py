@@ -5,7 +5,7 @@ no-look-ahead :class:`TechnicalReplayEvaluator`, and writes a reproducible JSON
 report under ``data/models/technical_replay_reports/``.
 
 Usage:
-    python scripts/replay_technical_prediction.py --symbol 005930 --since 2026-07-01
+    python scripts/replay_technical_prediction.py --symbol SYMBOL --since 2026-07-01
     python scripts/replay_technical_prediction.py --from-bars path/to/bars.json
 
 The ``--from-bars`` mode reads a JSON list of

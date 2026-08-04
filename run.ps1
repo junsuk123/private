@@ -344,7 +344,8 @@ Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"
 # 세션 구조 전략(market_intraday_momentum)은 같은 종목의 09:00-09:30과 14:50-15:20을
 # 동시에 필요로 하는데, 수집기는 300초마다 종목을 교체한다. 실측: 저장된 KRX
 # 360 심볼-일 중 두 구간을 모두 가진 것이 단 2건이어서 평가 자체가 불가능했다.
-Set-DefaultEnv "REALTIME_SESSION_ANCHOR_SYMBOLS" "005930,000660"
+# 비워 두면 보유/관찰/거래대금 랭킹/상장 유니버스 순으로 세션 앵커를 동적 선정한다.
+Set-DefaultEnv "REALTIME_SESSION_ANCHOR_SYMBOLS" ""
 Set-DefaultEnv "REALTIME_SESSION_ANCHOR_MAX" "2"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_LIMIT" "360"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC" "180"
@@ -438,13 +439,13 @@ if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_CLASSIFIER_ENABLED", "
   }
 }
 Set-DefaultEnv "LIVE_REFRESH_SECONDS" "15"
-Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "60"
+Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "300"
 Set-DefaultEnv "LIVE_RESEARCH_COLLECTION_INTERVAL_SECONDS" "180"
 Set-DefaultEnv "AUTO_START_LIVE_WORKER" "true"
 Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
-Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "60"
+Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "300"
 # 투자자별 매매동향(개인/외국인/기관 순매수) 일일 갱신. KIS는 이 값을 영업일 단위로만
 # 제공하고, residual_relative_strength는 이 정보를 필수 조건으로 쓴다. 갱신이 멈추면
 # 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
@@ -482,7 +483,7 @@ Set-DefaultEnv "EXEC_UNKNOWN_SPREAD_PENALTY_RATE" "0.006"
 Set-DefaultEnv "EXEC_BUY_MAX_CHASE_BPS" "20"
 # --- 진입 체결 방식: 스프레드를 지불하지 않고 게시한다 -------------------------
 # 기존에는 매수를 best_ask에, 매도를 best_bid에 넣어 왕복 스프레드 전액을 지불했다.
-# 실측 KRX 스프레드는 13~50bps(005930 약 19bps)인데 비용 모델의 spread_rate는 0이고
+# 실측 KRX 스프레드는 종목별로 크게 다른데 비용 모델의 spread_rate는 0이고
 # 학습 라벨은 신호봉 종가 체결을 가정한다 — 즉 모델이 채점한 체결가를 실행이 한 번도
 # 시도하지 않고 있었다. 전략 플랜 자체도 passive_limit을 선언하고 있었다.
 #

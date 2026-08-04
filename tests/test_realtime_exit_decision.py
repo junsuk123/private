@@ -927,6 +927,29 @@ class _NoQuantityAmendCoordinator(_AmendAwareCoordinator):
 
 
 class RealtimeSellAmendTest(unittest.TestCase):
+    def test_live_trace_records_only_actual_stages_reached_by_cycle(self) -> None:
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=_AmendAwareCoordinator(),
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+        )
+
+        engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+        trace = engine.get_status()["live_trace"]
+
+        self.assertTrue(trace["completed"])
+        self.assertEqual(trace["cycle_id"], "2026-07-02T01:00:00+00:00")
+        self.assertEqual(
+            [stage["stage_id"] for stage in trace["stages"]],
+            ["market_session", "account", "candidates", "execution_gate"],
+        )
+        self.assertTrue(all(stage["actual"] for stage in trace["stages"]))
+        self.assertEqual(trace["outcome"]["buy_submitted"], 0)
+
     def test_ignored_holding_skips_sell_evaluation(self) -> None:
         ignored = Holding(
             ticker="LCFYW",

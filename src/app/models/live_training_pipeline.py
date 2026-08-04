@@ -10,6 +10,7 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from app.data.realtime_store import RealtimeMarketDataStore
@@ -46,7 +47,8 @@ DEFAULT_LABEL_STRATEGY = "intraday_momentum"
 DEFAULT_TRAINING_MIN_ROW_SPACING_SECONDS = 15.0
 MIN_TRIPLE_BARRIER_PATH_POINTS = 2
 TRAINING_RECIPE_VERSION = "canonical_observation_thinned_symbol_temporal_holdout_v3"
-INCREMENTAL_TRAINING_STATE_VERSION = 1
+INCREMENTAL_TRAINING_STATE_VERSION = 2
+TRAINING_ROW_STORE_SCHEMA_VERSION = "4"
 _LIVE_TRAINING_LOCK = threading.Lock()
 _FEATURE_FRAME_CACHE_LOCK = threading.Lock()
 _FEATURE_FRAME_CACHE: dict[str, Any] = {
@@ -308,7 +310,7 @@ def train_live_short_horizon_from_collected_features(
     # duplicate challengers concurrently; the follower will then hit the dataset
     # fingerprint fast path.
     with _LIVE_TRAINING_LOCK:
-        artifact = _train_live_short_horizon_from_collected_features_unlocked(
+        artifact, training_rows = _train_live_short_horizon_from_collected_features_unlocked(
             journal_path=journal_path,
             registry=registry,
             minimum_examples=minimum_examples,
@@ -324,6 +326,7 @@ def train_live_short_horizon_from_collected_features(
                 minimum_positive_labels=minimum_positive_labels,
                 minimum_negative_labels=minimum_negative_labels,
                 training_row_store_path=training_row_store_path,
+                rows=training_rows,
             )
         return artifact
 
@@ -336,6 +339,7 @@ def _train_per_market_models(
     minimum_positive_labels: int,
     minimum_negative_labels: int,
     training_row_store_path: str | Path | None,
+    rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Fit one artifact per market from the same materialized rows.
 
@@ -345,8 +349,9 @@ def _train_per_market_models(
     summary: dict[str, Any] = {}
     try:
         base_root = (registry or ModelArtifactRegistry()).root
-        row_store_path = _training_row_store_path(journal_path, training_row_store_path)
-        rows = _thin_training_rows(_load_materialized_training_rows(row_store_path))
+        if rows is None:
+            row_store_path = _training_row_store_path(journal_path, training_row_store_path)
+            rows = _thin_training_rows(_load_materialized_training_rows(row_store_path))
         by_market: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             by_market[str(row.get("market") or _row_market(str(row.get("ticker") or "")))].append(row)
@@ -382,7 +387,7 @@ def _train_live_short_horizon_from_collected_features_unlocked(
     minimum_positive_labels: int,
     minimum_negative_labels: int,
     training_row_store_path: str | Path | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     _prune_news_sentiment_store()
     fresh_rows = build_live_training_rows_from_feature_journal(
         journal_path,
@@ -392,6 +397,7 @@ def _train_live_short_horizon_from_collected_features_unlocked(
     materialized_rows, row_merge = _merge_materialized_training_rows(
         row_store_path,
         fresh_rows,
+        load_thinned=True,
     )
     rows = _thin_training_rows(materialized_rows)
     registry = registry or ModelArtifactRegistry()
@@ -422,7 +428,7 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             **previous,
             "training_skipped": True,
             "skip_reason": "UNCHANGED_LABELLED_DATASET",
-        }
+        }, rows
     changed_keys = set(row_merge.get("changed_keys") or ())
     incremental_rows = [
         row for row in rows if _training_row_key(row) in changed_keys
@@ -438,19 +444,22 @@ def _train_live_short_horizon_from_collected_features_unlocked(
     elif not incremental_rows:
         # A changed thinned dataset without a directly selected changed row can
         # occur when a newer observation replaces the representative of a time
-        # bucket. Continue from the parent with that bucket representative.
-        previous_ids = set(previous_state.get("trained_observation_ids") or ())
-        incremental_rows = [
-            row
-            for row in rows
-            if _training_row_key(row) not in previous_ids
-        ]
-    if training_mode == "incremental" and not incremental_rows:
-        return {
-            **previous,
-            "training_skipped": True,
-            "skip_reason": "NO_EFFECTIVE_INCREMENTAL_ROWS",
-        }
+        # bucket. Refit from the bounded row store in this rare case. Persisting
+        # every historical row hash in every artifact made each challenger grow
+        # with the dataset and duplicated tens of thousands of IDs per cycle.
+        training_mode = "full"
+        full_retrain_reason = "THINNED_REPRESENTATIVE_CHANGED"
+        incremental_rows = rows
+    elif _negative_challenger_recovery_required(registry):
+        # Incremental fitting intentionally learns only from the new/changed
+        # observations.  That makes it responsive, but after several losing
+        # challengers the warm-start path can keep walking farther into a local
+        # regime and never revisit the broad history that made the incumbent
+        # useful.  A consecutive-negative streak is therefore a recovery signal:
+        # discard the warm start and refit the bounded, de-overlapped store.
+        training_mode = "full"
+        full_retrain_reason = "NEGATIVE_CHALLENGER_RECOVERY"
+        incremental_rows = rows
     update_news_trust_from_rows(rows)
     artifact = train_live_short_horizon_model(
         rows,
@@ -478,9 +487,6 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             # is what stops a model fitted in a calm tape from serving a repricing.
             "macro_regime": _current_macro_regime(),
             "label_basis": _label_barriers()[3],
-            "trained_observation_ids": [
-                _training_row_key(row) for row in rows
-            ],
         },
     )
     _annotate_saved_artifact(
@@ -490,9 +496,11 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             "source": str(journal_path),
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
-            "materialized_row_count": len(materialized_rows),
+            "materialized_row_count": row_merge["after_rows"],
             "fresh_row_count": len(fresh_rows),
             "new_materialized_row_count": row_merge["new_rows"],
+            "pruned_materialized_row_count": row_merge["pruned_rows"],
+            "materialized_row_limit": row_merge["maximum_rows"],
             "duplicate_rows_removed": row_merge["duplicate_rows_removed"],
             "invalid_rows_removed": row_merge["invalid_rows_removed"],
             "minimum_row_spacing_seconds": _training_min_row_spacing_seconds(),
@@ -517,7 +525,31 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             "row_quality": _row_quality_summary(rows),
         },
     )
-    return artifact
+    return artifact, rows
+
+
+def _negative_challenger_recovery_required(
+    registry: ModelArtifactRegistry,
+) -> bool:
+    """Recover one cycle before challengers would stale the live incumbent.
+
+    Waiting until the configured limit is already reached creates a predictable
+    outage: the third negative incremental challenger stales the incumbent, then
+    the *next* six-minute cycle performs the broad refit.  Start that broad refit
+    when the existing streak is one below the limit.  If the full refit also
+    fails, the normal staleness gate still demotes the model; safety is unchanged.
+    """
+
+    try:
+        verdict = registry.staleness()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if "MODEL_CONSECUTIVE_NEGATIVE_CHALLENGERS" in verdict.reason_codes:
+        return True
+    streak = int(getattr(verdict, "consecutive_negative_challengers", 0) or 0)
+    diagnostics = getattr(verdict, "diagnostics", {}) or {}
+    limit = int(diagnostics.get("consecutive_negative_challenger_limit") or 3)
+    return streak >= max(1, limit - 1)
 
 
 def live_training_status(
@@ -531,18 +563,19 @@ def live_training_status(
     journal_path = Path(journal_path)
     registry = registry or ModelArtifactRegistry()
     row_store_path = _training_row_store_path(journal_path, training_row_store_path)
-    rows = _load_materialized_training_rows(row_store_path)
-    if not rows:
-        rows = build_live_training_rows_from_feature_journal(journal_path, db_path=db_path)
     latest_saved = _latest_saved_artifact(registry)
     latest_live_eligible = _live_eligible_artifact(registry)
+    training_rows = _materialized_training_row_count(row_store_path)
+    if training_rows is None:
+        metrics = (latest_saved or {}).get("metrics") or {}
+        training_rows = int(float(metrics.get("example_count", 0) or 0))
     return {
         "realtime_store_exists": db_path.exists(),
         "realtime_store_path": str(db_path),
         "feature_journal_exists": journal_path.exists(),
         "feature_journal_path": str(journal_path),
         "feature_frame_lines": _line_count(journal_path),
-        "training_rows": len(rows),
+        "training_rows": training_rows,
         "training_row_store_path": str(row_store_path),
         "training_row_store_exists": row_store_path.exists(),
         "latest_live_eligible_exists": registry.latest_path.exists(),
@@ -581,7 +614,16 @@ def build_live_training_rows_from_feature_journal(
     for symbol, symbol_frames in by_symbol.items():
         ordered = _dedupe_sorted_frames(symbol_frames)
         times = [_parse_frame_time(frame) for frame in ordered]
-        prices = [_frame_mark_price(frame, price_lookup) for frame in ordered]
+        # Future path points are label inputs too. Applying quality checks only
+        # to the entry frame let one malformed future orderbook create a
+        # +212,000bps label even though that malformed frame itself was excluded
+        # from training.
+        prices = [
+            _frame_mark_price(frame, price_lookup)
+            if _frame_passes_label_path_quality(frame)
+            else None
+            for frame in ordered
+        ]
         for index, current in enumerate(ordered):
             if not _frame_passes_training_quality(current):
                 continue
@@ -609,6 +651,11 @@ def build_live_training_rows_from_feature_journal(
             if labelled is None:
                 continue
             label, forward_net_return_bps, gross_forward_return_bps, label_source = labelled
+            if not _label_returns_are_plausible(
+                forward_net_return_bps,
+                gross_forward_return_bps,
+            ):
+                continue
             row = {
                 "features": features,
                 "label": label,
@@ -635,7 +682,8 @@ def build_live_training_rows_from_feature_journal(
                     strategy_geometries,
                 )
             rows.append(row)
-    return _market_adjust_rows(rows)
+    adjusted = _market_adjust_rows(rows)
+    return [row for row in adjusted if _row_has_plausible_label(row)]
 
 
 def _row_market(symbol: str) -> str:
@@ -697,27 +745,34 @@ def _market_adjust_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if os.getenv("LIVE_LABEL_MARKET_ADJUST", "true").strip().lower() not in {"1", "true", "yes", "on"}:
         return rows
     bucket_seconds = max(30.0, _env_float("LIVE_LABEL_MARKET_BUCKET_SECONDS", 300.0))
-    buckets: dict[int, list[float]] = defaultdict(list)
-    bucket_symbols: dict[int, set[str]] = defaultdict(set)
-    parsed: list[tuple[int, float] | None] = []
+    buckets: dict[tuple[str, int], dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    parsed: list[tuple[tuple[str, int], float] | None] = []
     for row in rows:
         entry_time = _parse_iso_time(str(row.get("as_of") or ""))
         raw = float(row.get("forward_net_return_bps", 0.0))
         if entry_time is None:
             parsed.append(None)
             continue
-        key = int(entry_time.timestamp() // bucket_seconds)
-        buckets[key].append(raw)
-        bucket_symbols[key].add(str(row.get("ticker") or ""))
+        key = (
+            str(row.get("market") or _row_market(str(row.get("ticker") or ""))),
+            int(entry_time.timestamp() // bucket_seconds),
+        )
+        buckets[key][str(row.get("ticker") or "")].append(raw)
         parsed.append((key, raw))
     for row, item in zip(rows, parsed, strict=True):
         raw = float(row.get("forward_net_return_bps", 0.0))
         row["raw_forward_net_return_bps"] = raw
-        if item is None or len(bucket_symbols[item[0]]) < 2:
+        if item is None or len(buckets[item[0]]) < 2:
             row["market_bps"] = 0.0
             continue  # cannot identify a market factor from a single name; keep absolute.
         key, _ = item
-        market_bps = sum(buckets[key]) / len(buckets[key])
+        # One bursty ticker must not dominate the market factor merely because
+        # it emitted more frames. Aggregate once per symbol, then use the median
+        # across symbols for robustness to a single bad feed.
+        per_symbol = [sum(values) / len(values) for values in buckets[key].values()]
+        market_bps = float(median(per_symbol))
         abnormal_bps = raw - market_bps
         row["market_bps"] = market_bps
         row["forward_net_return_bps"] = abnormal_bps
@@ -928,7 +983,12 @@ def _load_feature_frames(journal_path: str | Path) -> list[dict[str, Any]]:
     path = Path(journal_path)
     if not path.exists():
         return []
-    max_frames = max(1_000, int(_env_float("LIVE_TRAINING_MAX_FEATURE_FRAMES", 25_000)))
+    if path.stat().st_size > _feature_journal_max_bytes():
+        _discard_oversized_feature_journal(path)
+        return []
+    # Long-term labelled history lives in the materialized SQLite store. This
+    # source journal only needs enough recent path for the 10-minute label.
+    max_frames = max(1_000, int(_env_float("LIVE_TRAINING_MAX_FEATURE_FRAMES", 2_000)))
     resolved = str(path.resolve())
     stat = path.stat()
     size = stat.st_size
@@ -1028,6 +1088,45 @@ def _frame_passes_training_quality(frame: dict[str, Any]) -> bool:
     if drop_flat_frames and not _frame_has_training_signal(values):
         return False
     return True
+
+
+def _frame_passes_label_path_quality(frame: dict[str, Any]) -> bool:
+    """Validate every future mark used by TP/SL labelling.
+
+    Unlike entry quality this deliberately permits flat frames: an unchanged
+    future price is valid path evidence. It rejects malformed/wide books and
+    non-finite marks before they can become a return label.
+    """
+    values = frame.get("values")
+    if not isinstance(values, dict):
+        return False
+    try:
+        mark = float(frame.get("mark_price") or 0.0)
+        spread_bps = float(values.get("spread_bps", 0.0))
+        bid_depth = float(values.get("bid_depth", 0.0))
+        ask_depth = float(values.get("ask_depth", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (mark, spread_bps, bid_depth, ask_depth)):
+        return False
+    return bool(
+        mark > 0
+        and 0.0 <= spread_bps <= _env_float("LIVE_TRAINING_MAX_SPREAD_BPS", 80.0)
+        and bid_depth > 0
+        and ask_depth > 0
+    )
+
+
+def _label_returns_are_plausible(*returns_bps: float) -> bool:
+    maximum = max(
+        100.0,
+        _env_float("LIVE_TRAINING_MAX_ABS_FORWARD_RETURN_BPS", 5_000.0),
+    )
+    try:
+        values = tuple(float(value) for value in returns_bps)
+    except (TypeError, ValueError):
+        return False
+    return all(math.isfinite(value) and abs(value) <= maximum for value in values)
 
 
 def _frame_has_training_signal(values: dict[str, Any]) -> bool:
@@ -1168,44 +1267,50 @@ def _training_row_store_path(
 def _merge_materialized_training_rows(
     path: Path,
     fresh_rows: list[dict[str, Any]],
+    *,
+    load_thinned: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rejected_fresh_rows = sum(
+        1 for row in fresh_rows if not _row_has_plausible_label(row)
+    )
+    fresh_rows = [row for row in fresh_rows if _row_has_plausible_label(row)]
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as conn:
+    with closing(sqlite3.connect(path, timeout=30.0)) as conn:
+        conn.execute("pragma busy_timeout = 30000")
         _ensure_training_row_schema(conn)
-        compacted = _compact_materialized_training_rows(conn)
-        before_keys = {
-            str(row[0])
-            for row in conn.execute("select row_key from live_training_rows").fetchall()
-        }
-        existing_payloads = {
-            str(key): str(payload)
-            for key, payload in conn.execute(
-                "select row_key, payload from live_training_rows"
-            ).fetchall()
-        }
-        before_count = len(before_keys)
+        compacted = _compact_materialized_training_rows_once(conn)
+        before_count = int(
+            conn.execute("select count(*) from live_training_rows").fetchone()[0]
+        )
         now = datetime.now(timezone.utc).isoformat()
         payloads = [
             (
                 _training_row_key(row),
                 str(row.get("as_of") or ""),
+                str(row.get("market") or _row_market(str(row.get("ticker") or ""))),
+                str(row.get("ticker") or ""),
                 json.dumps(row, sort_keys=True, separators=(",", ":")),
                 now,
             )
             for row in fresh_rows
         ]
+        incoming_keys = {key for key, _as_of, _market, _ticker, _payload, _updated_at in payloads}
+        existing_payloads = _training_payloads_for_keys(conn, incoming_keys)
+        before_keys = set(existing_payloads)
         changed_keys = {
             key
-            for key, _as_of, payload, _updated_at in payloads
+            for key, _as_of, _market, _ticker, payload, _updated_at in payloads
             if existing_payloads.get(key) != payload
         }
         if payloads:
             conn.executemany(
                 """
-                insert into live_training_rows(row_key, as_of, payload, updated_at)
-                values (?, ?, ?, ?)
+                insert into live_training_rows(row_key, as_of, market, ticker, payload, updated_at)
+                values (?, ?, ?, ?, ?, ?)
                 on conflict(row_key) do update set
                   as_of=excluded.as_of,
+                  market=excluded.market,
+                  ticker=excluded.ticker,
                   payload=excluded.payload,
                   updated_at=excluded.updated_at
                 where live_training_rows.payload <> excluded.payload
@@ -1214,45 +1319,104 @@ def _merge_materialized_training_rows(
             )
         maximum = max(1_000, int(_env_float("LIVE_TRAINING_MAX_MATERIALIZED_ROWS", 100_000)))
         count = int(conn.execute("select count(*) from live_training_rows").fetchone()[0])
+        pruned_rows = max(0, count - maximum)
         if count > maximum:
-            conn.execute(
-                """
-                delete from live_training_rows
-                where row_key in (
-                  select row_key from live_training_rows
-                  order by as_of asc, row_key asc
-                  limit ?
-                )
-                """,
-                (count - maximum,),
-            )
+            _prune_materialized_training_rows(conn, pruned_rows)
         conn.commit()
         after_count = int(
             conn.execute("select count(*) from live_training_rows").fetchone()[0]
         )
-    return _load_materialized_training_rows(path), {
+    return _load_materialized_training_rows(path, thin=load_thinned), {
         "before_rows": before_count,
         "after_rows": after_count,
         "new_rows": sum(
-            1
-            for row in fresh_rows
-            if _training_row_key(row) not in before_keys
+            1 for key in incoming_keys if key not in before_keys
         ),
+        "pruned_rows": pruned_rows,
+        "maximum_rows": maximum,
         "duplicate_rows_removed": int(compacted["duplicate_rows_removed"]),
-        "invalid_rows_removed": int(compacted["invalid_rows_removed"]),
+        "invalid_rows_removed": int(compacted["invalid_rows_removed"]) + rejected_fresh_rows,
         "changed_keys": tuple(sorted(changed_keys)),
     }
 
 
-def _load_materialized_training_rows(path: Path) -> list[dict[str, Any]]:
+def _materialized_training_row_count(path: Path) -> int | None:
+    """Return the dashboard count without decoding every materialized payload."""
+    if not path.exists():
+        return 0
+    try:
+        with closing(sqlite3.connect(path, timeout=2.0)) as conn:
+            row = conn.execute("select count(*) from live_training_rows").fetchone()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row else 0
+
+
+def materialized_training_row_count(
+    path: str | Path = DEFAULT_TRAINING_ROW_STORE_PATH,
+) -> int:
+    """Public cheap count used to avoid redundant historical backfills."""
+    return int(_materialized_training_row_count(Path(path)) or 0)
+
+
+def _training_payloads_for_keys(
+    conn: sqlite3.Connection,
+    keys: set[str],
+) -> dict[str, str]:
+    """Read only incoming identities instead of scanning the full rolling store."""
+
+    if not keys:
+        return {}
+    ordered = sorted(keys)
+    payloads: dict[str, str] = {}
+    # Stay below SQLite's common 999-variable limit.
+    for offset in range(0, len(ordered), 500):
+        chunk = ordered[offset : offset + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for key, payload in conn.execute(
+            f"select row_key, payload from live_training_rows where row_key in ({placeholders})",
+            chunk,
+        ):
+            payloads[str(key)] = str(payload)
+    return payloads
+
+
+def _load_materialized_training_rows(
+    path: Path,
+    *,
+    thin: bool = False,
+) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        with closing(sqlite3.connect(path)) as conn:
+        with closing(sqlite3.connect(path, timeout=30.0)) as conn:
+            conn.execute("pragma busy_timeout = 30000")
             _ensure_training_row_schema(conn)
-            rows = conn.execute(
-                "select payload from live_training_rows order by as_of asc, row_key asc"
-            ).fetchall()
+            if thin:
+                spacing = _training_min_row_spacing_seconds()
+                rows = conn.execute(
+                    """
+                    select payload from (
+                      select payload, as_of, row_key,
+                             row_number() over (
+                               partition by ticker,
+                                 case
+                                   when strftime('%s', as_of) is null then row_key
+                                   else cast(cast(strftime('%s', as_of) as integer) / ? as integer)
+                                 end
+                               order by as_of desc, row_key desc
+                             ) as representative
+                      from live_training_rows
+                    )
+                    where representative = 1
+                    order by as_of asc, row_key asc
+                    """,
+                    (spacing,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "select payload from live_training_rows order by as_of asc, row_key asc"
+                ).fetchall()
     except sqlite3.Error:
         return []
     loaded: list[dict[str, Any]] = []
@@ -1271,9 +1435,16 @@ def _row_matches_live_schema(row: dict[str, Any]) -> bool:
     if row_hash and row_hash != LIVE_SHORT_HORIZON_SCHEMA.schema_hash:
         return False
     features = row.get("features")
-    return isinstance(features, dict) and all(
+    return _row_has_plausible_label(row) and isinstance(features, dict) and all(
         name in features for name in LIVE_SHORT_HORIZON_SCHEMA.feature_names
     )
+
+
+def _row_has_plausible_label(row: dict[str, Any]) -> bool:
+    values = [row.get("forward_net_return_bps"), row.get("gross_forward_return_bps")]
+    if row.get("raw_forward_net_return_bps") is not None:
+        values.append(row.get("raw_forward_net_return_bps"))
+    return _label_returns_are_plausible(*values)
 
 
 def _ensure_training_row_schema(conn: sqlite3.Connection) -> None:
@@ -1282,6 +1453,8 @@ def _ensure_training_row_schema(conn: sqlite3.Connection) -> None:
         create table if not exists live_training_rows (
           row_key text primary key,
           as_of text not null,
+          market text not null default '',
+          ticker text not null default '',
           payload text not null,
           updated_at text not null
         )
@@ -1290,6 +1463,152 @@ def _ensure_training_row_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "create index if not exists idx_live_training_rows_as_of on live_training_rows(as_of)"
     )
+    columns = {
+        str(row[1]) for row in conn.execute("pragma table_info(live_training_rows)")
+    }
+    if "market" not in columns:
+        conn.execute(
+            "alter table live_training_rows add column market text not null default ''"
+        )
+    if "ticker" not in columns:
+        conn.execute(
+            "alter table live_training_rows add column ticker text not null default ''"
+        )
+    conn.execute(
+        "create table if not exists live_training_store_metadata "
+        "(key text primary key, value text not null)"
+    )
+    conn.execute(
+        "create index if not exists idx_live_training_rows_retention "
+        "on live_training_rows(as_of, row_key)"
+    )
+    conn.execute(
+        "create index if not exists idx_live_training_rows_market_retention "
+        "on live_training_rows(market, as_of, row_key)"
+    )
+    conn.execute(
+        "create index if not exists idx_live_training_rows_ticker_as_of "
+        "on live_training_rows(ticker, as_of, row_key)"
+    )
+
+
+def _compact_materialized_training_rows_once(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
+    row = conn.execute(
+        "select value from live_training_store_metadata where key='schema_version'"
+    ).fetchone()
+    if row and str(row[0]) == TRAINING_ROW_STORE_SCHEMA_VERSION:
+        remaining = int(
+            conn.execute("select count(*) from live_training_rows").fetchone()[0]
+        )
+        return {
+            "duplicate_rows_removed": 0,
+            "invalid_rows_removed": 0,
+            "remaining_rows": remaining,
+        }
+    # Historical versions already compacted the entire table on every merge, so
+    # production row keys are canonical. Migrations only populate indexed routing
+    # columns. Re-decoding and re-inserting 245MB of JSON made
+    # startup take minutes and starved the API thread pool.
+    before_cleanup = int(
+        conn.execute("select count(*) from live_training_rows").fetchone()[0]
+    )
+    maximum_return_bps = max(
+        100.0,
+        _env_float("LIVE_TRAINING_MAX_ABS_FORWARD_RETURN_BPS", 5_000.0),
+    )
+    conn.execute(
+        """
+        delete from live_training_rows
+        where not json_valid(payload)
+           or abs(cast(json_extract(payload, '$.forward_net_return_bps') as real)) > ?
+           or abs(cast(json_extract(payload, '$.gross_forward_return_bps') as real)) > ?
+           or abs(cast(coalesce(json_extract(payload, '$.raw_forward_net_return_bps'), 0) as real)) > ?
+        """,
+        (maximum_return_bps, maximum_return_bps, maximum_return_bps),
+    )
+    conn.execute(
+        """
+        update live_training_rows
+        set market = case
+          when json_valid(payload) then coalesce(
+            nullif(json_extract(payload, '$.market'), ''),
+            case
+              when length(json_extract(payload, '$.ticker')) = 6
+               and json_extract(payload, '$.ticker') not glob '*[^0-9]*'
+              then 'KR' else 'US'
+            end
+          )
+          else 'UNKNOWN'
+        end
+        where market = ''
+        """
+    )
+    conn.execute(
+        """
+        update live_training_rows
+        set ticker = case
+          when json_valid(payload) then coalesce(json_extract(payload, '$.ticker'), '')
+          else ''
+        end
+        where ticker = ''
+        """
+    )
+    remaining = int(
+        conn.execute("select count(*) from live_training_rows").fetchone()[0]
+    )
+    removed_implausible = max(0, before_cleanup - remaining)
+    result = {
+        "duplicate_rows_removed": 0,
+        "invalid_rows_removed": removed_implausible,
+        "remaining_rows": remaining,
+    }
+    conn.execute(
+        "insert into live_training_store_metadata(key, value) values('schema_version', ?) "
+        "on conflict(key) do update set value=excluded.value",
+        (TRAINING_ROW_STORE_SCHEMA_VERSION,),
+    )
+    conn.commit()
+    return result
+
+
+def _prune_materialized_training_rows(
+    conn: sqlite3.Connection,
+    excess: int,
+) -> None:
+    """Remove oldest rows from the largest market first.
+
+    A single global FIFO let overnight US traffic evict nearly all KRX examples.
+    Choosing the largest population for each bounded prune preserves minority-market
+    history while the total store continues to accept new rows at its hard cap.
+    """
+    remaining = max(0, int(excess))
+    while remaining > 0:
+        groups = conn.execute(
+            "select market, count(*) from live_training_rows "
+            "group by market order by count(*) desc, market asc"
+        ).fetchall()
+        if not groups:
+            return
+        market, count = str(groups[0][0] or ""), int(groups[0][1])
+        other_max = int(groups[1][1]) if len(groups) > 1 else 0
+        # Delete only enough to reach the next-largest population in one pass.
+        # If all groups are equal, a one-row step rotates the donor naturally.
+        batch = min(remaining, max(1, count - other_max))
+        conn.execute(
+            """
+            delete from live_training_rows
+            where row_key in (
+              select row_key from live_training_rows
+              where market = ?
+              order by as_of asc, row_key asc
+              limit ?
+            )
+            """,
+            (market, batch),
+        )
+        remaining -= batch
 
 
 def _training_row_key(row: dict[str, Any]) -> str:
@@ -1333,21 +1652,29 @@ def _compact_materialized_training_rows(
         str(row[0])
         for row in conn.execute("select row_key from live_training_rows").fetchall()
     }
+    needs_market_backfill = bool(
+        conn.execute(
+            "select 1 from live_training_rows where market = '' limit 1"
+        ).fetchone()
+    )
     if (
         invalid_rows
         or duplicate_rows
         or expected_keys != set(canonical)
+        or needs_market_backfill
     ):
         conn.execute("delete from live_training_rows")
         conn.executemany(
             """
-            insert into live_training_rows(row_key, as_of, payload, updated_at)
-            values (?, ?, ?, ?)
+            insert into live_training_rows(row_key, as_of, market, ticker, payload, updated_at)
+            values (?, ?, ?, ?, ?, ?)
             """,
             (
                 (
                     key,
                     str(row.get("as_of") or ""),
+                    str(row.get("market") or _row_market(str(row.get("ticker") or ""))),
+                    str(row.get("ticker") or ""),
                     json.dumps(row, sort_keys=True, separators=(",", ":")),
                     updated_at,
                 )
@@ -1457,16 +1784,16 @@ def _incremental_data_format_signature() -> str:
 
 
 def _symbols_in_realtime_store(store: RealtimeMarketDataStore) -> tuple[str, ...]:
-    with closing(store._connect()) as conn:  # noqa: SLF001 - narrow internal query for pipeline orchestration.
-        rows = conn.execute(
-            """
-            select symbol from realtime_ticks
-            union
-            select symbol from realtime_orderbook
-            order by symbol
-            """
-        ).fetchall()
-    return tuple(str(row[0]) for row in rows)
+    # The previous UNION scanned both multi-GB history tables every five minutes.
+    # Training can only build a valid frame from fresh quotes/books, so use the
+    # store's indexed recency query and keep the periodic workload bounded.
+    lookback_seconds = max(
+        60.0,
+        _env_float("LIVE_TRAINING_ACTIVE_SYMBOL_LOOKBACK_SECONDS", 900.0),
+    )
+    limit = max(1, int(_env_float("LIVE_TRAINING_ACTIVE_SYMBOL_LIMIT", 64)))
+    since = datetime.now(timezone.utc) - timedelta(seconds=lookback_seconds)
+    return tuple(str(symbol) for symbol in store.active_symbols(since, limit=limit))
 
 
 def _dedupe_sorted_frames(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1527,12 +1854,10 @@ def _annotate_saved_artifact(artifact: dict[str, Any], registry: ModelArtifactRe
 
 
 def _latest_saved_payload(registry: ModelArtifactRegistry) -> dict[str, Any] | None:
-    candidates = sorted(
-        (path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+    candidates = (
+        path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()
     )
-    for path in candidates:
+    for path in sorted(candidates, key=lambda candidate: candidate.name, reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1545,24 +1870,58 @@ def _latest_saved_payload(registry: ModelArtifactRegistry) -> dict[str, Any] | N
 def _line_count(path: Path) -> int:
     if not path.exists():
         return 0
-    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    if path.stat().st_size > _feature_journal_max_bytes():
+        # Status endpoints must never scan a multi-GB transient journal. The
+        # training loader will rotate it before attempting to parse frames.
+        return 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def _feature_journal_max_bytes() -> int:
+    try:
+        return max(
+            16 * 1024 * 1024,
+            int(float(os.getenv("LIVE_FEATURE_JOURNAL_MAX_BYTES", str(256 * 1024 * 1024)))),
+        )
+    except (TypeError, ValueError):
+        return 256 * 1024 * 1024
+
+
+def _discard_oversized_feature_journal(path: Path) -> None:
+    rotated = path.with_suffix(path.suffix + ".oversized")
+    try:
+        if rotated.exists():
+            rotated.unlink()
+        os.replace(path, rotated)
+        rotated.unlink(missing_ok=True)
+    except OSError:
+        # Failing closed here means skipping this cycle, never loading the giant
+        # file into the live server. A later frame writer/iteration retries rotation.
+        return
+    with _FEATURE_FRAME_CACHE_LOCK:
+        _FEATURE_FRAME_CACHE.update(
+            {"path": None, "offset": 0, "mtime_ns": None, "head_digest": None, "frames": []}
+        )
 
 
 def _latest_saved_artifact(registry: ModelArtifactRegistry) -> dict[str, Any] | None:
-    candidates = sorted(
-        (path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
+    candidates = (
+        path for path in registry.root.glob("live_short_horizon.*.json") if path.is_file()
     )
-    if not candidates:
+    latest = max(candidates, key=lambda candidate: candidate.name, default=None)
+    if latest is None:
         return None
     try:
-        payload = json.loads(candidates[0].read_text(encoding="utf-8"))
+        payload = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"path": str(candidates[0]), "readable": False}
+        return {"path": str(latest), "readable": False}
     return {
-        "artifact_id": str(payload.get("artifact_id") or candidates[0].stem),
-        "path": str(candidates[0]),
+        "artifact_id": str(payload.get("artifact_id") or latest.stem),
+        "path": str(latest),
         "live_eligible": bool(payload.get("live_eligible")),
         "reason_codes": tuple(str(item) for item in payload.get("reason_codes") or ()),
         "example_count": int(float((payload.get("metrics") or {}).get("example_count") or 0)),

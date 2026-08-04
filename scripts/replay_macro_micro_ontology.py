@@ -6,7 +6,7 @@ series and writes a reproducible JSON report under
 
 Usage:
     python scripts/replay_macro_micro_ontology.py --from-bars bars.json
-    python scripts/replay_macro_micro_ontology.py --symbol 005930 --symbol 000660 --since 2026-07-01
+    python scripts/replay_macro_micro_ontology.py --symbol SYMBOL_A --symbol SYMBOL_B --since 2026-07-01
 
 ``--from-bars`` reads a JSON list of {ticker,as_of,open,high,low,close,volume}
 rows (multiple tickers), so the harness runs offline / in CI.

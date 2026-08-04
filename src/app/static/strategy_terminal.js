@@ -13,7 +13,654 @@ const terminalState = {
   chartMode: 'seconds',
   chartAnimationFrame: null,
   chartLastPaint: 0,
+  gnnGraphBusy: false,
+  gnnGraph: null,
+  gnnStateBusy: false,
+  gnnInference: null,
 };
+
+// Visualization is an operator preference only. Training and inference remain
+// independent, while the expensive graph requests and render loop default off.
+const GNN_VISUALIZATION_STORAGE_KEY = 'strategy-terminal-gnn-3d-enabled-v1';
+let gnnVisualizationEnabled = readGnnVisualizationPreference();
+
+let gnn3dState = null;
+let gnnThreePromise = null;
+
+const gnnGraphView = {
+  filter: 'all', zoom: 1, panX: 0, panY: 0, nodes: [], nodeMap: new Map(),
+  hovered: null, selected: null, dragging: false, moved: false, lastX: 0, lastY: 0,
+  frame: null, signature: null, lastPaint: 0,
+};
+
+const gnnClusterStyle = {
+  input_context: { label: '41-D INPUT FEATURES', color: '#8178ff', x: 120, y: 335, radius: 145 },
+  input_identity: { label: 'STRATEGY IDENTITY', color: '#a990ff', x: 120, y: 335, radius: 82 },
+  hidden: { label: '16-D R-GCN MESSAGE', color: '#f6d778', x: 355, y: 335, radius: 105 },
+  momentum: { label: 'MOMENTUM', color: '#ff537b', x: 590, y: 160, radius: 92 },
+  breakout: { label: 'BREAKOUT', color: '#ffb861', x: 700, y: 245, radius: 92 },
+  reversion: { label: 'REVERSION', color: '#20d9ff', x: 610, y: 455, radius: 102 },
+  relative_strength: { label: 'RELATIVE', color: '#72e1bd', x: 745, y: 500, radius: 64 },
+  specialist: { label: 'SPECIALIST', color: '#a78bfa', x: 670, y: 340, radius: 68 },
+  output: { label: '104 STRATEGY HEAD OUTPUTS', color: '#5eead4', x: 1010, y: 335, radius: 175 },
+};
+
+const gnnRelationStyle = {
+  same_methodology_family: { color: '#b9d9d0', label: '동일 방법론 계열' },
+  confirming_methodology: { color: '#ffd58a', label: '상호 확인 관계' },
+  contrasting_methodology: { color: '#61c7d9', label: '대조 방법론 관계' },
+  self_encoder_weight: { color: '#8278ff', label: '자기 특성 인코더 가중치' },
+  strategy_head_weight: { color: '#5eead4', label: '전략 출력 헤드 가중치' },
+  owns_output_head: { color: '#a7f3d0', label: '전략 출력 소유 관계' },
+};
+
+async function fetchGnnGraph() {
+  if (!gnnVisualizationEnabled) return;
+  if (terminalState.gnnGraphBusy) return;
+  terminalState.gnnGraphBusy = true;
+  try {
+    const response = await fetch('/api/account/gnn-graph', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const data = await response.json();
+    if (!gnnVisualizationEnabled) return;
+    terminalState.gnnGraph = data;
+    renderGnnGraphSummary(data);
+    prepareGnnGraph(data);
+  } catch (error) {
+    const status = document.getElementById('gnn-model-status');
+    status.textContent = 'LOAD ERROR';
+    status.className = 'status-chip blocked';
+    document.getElementById('gnn-model-summary').textContent = `GNN 그래프를 불러오지 못했습니다: ${error.message}`;
+  } finally {
+    terminalState.gnnGraphBusy = false;
+  }
+}
+
+async function fetchGnnState() {
+  if (!gnnVisualizationEnabled) return;
+  if (terminalState.gnnStateBusy) return;
+  terminalState.gnnStateBusy = true;
+  try {
+    const response = await fetch('/api/account/gnn-state', { cache: 'no-store' });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    const inference = await response.json();
+    if (!gnnVisualizationEnabled) return;
+    terminalState.gnnInference = inference;
+    renderGnnLiveState(terminalState.gnnInference);
+  } catch (_error) {
+    renderGnnLiveState({ state: 'OFFLINE', active: false, age_seconds: null });
+  } finally {
+    terminalState.gnnStateBusy = false;
+  }
+}
+
+function renderGnnLiveState(state) {
+  const badge = document.getElementById('gnn-inference-live');
+  if (!badge) return;
+  const active = Boolean(state?.active);
+  const blocked = !active && state?.state === 'BLOCKED';
+  badge.className = `gnn-inference-live ${active ? 'running' : blocked ? 'blocked' : 'idle'}`;
+  document.getElementById('gnn-inference-live-state').textContent = active
+    ? 'INFERENCE RUNNING'
+    : blocked ? 'INFERENCE BLOCKED' : state?.state === 'OFFLINE' ? 'INFERENCE OFFLINE' : 'INFERENCE IDLE';
+  const age = Number(state?.age_seconds);
+  document.getElementById('gnn-inference-live-detail').textContent = active
+    ? `${state.symbol || '-'} · ${state.path || 'GNN'} · 메시지 전파 중`
+    : Number.isFinite(age) ? `마지막 추론 로그 ${age < 60 ? `${age.toFixed(1)}초` : `${(age / 60).toFixed(1)}분`} 전` : '최근 추론 신호 없음';
+  if (!active) setGnnPhaseIndicator(null);
+}
+
+function setGnnPhaseIndicator(phase) {
+  document.querySelectorAll('[data-gnn-phase]').forEach((item) => {
+    item.classList.toggle('active', item.dataset.gnnPhase === phase);
+  });
+}
+
+function renderGnnGraphSummary(data) {
+  const model = data.model || {};
+  const inference = data.inference || {};
+  const counts = data.counts || {};
+  const status = document.getElementById('gnn-model-status');
+  const compatible = model.available && model.runtime_compatible;
+  status.textContent = !model.available ? 'NO CHECKPOINT' : compatible ? 'LIVE COMPATIBLE' : 'CHECKPOINT STALE';
+  status.className = `status-chip ${compatible ? 'passed' : 'blocked'}`;
+  document.getElementById('gnn-model-summary').textContent = compatible
+    ? '학습된 R-GCN 메시지 관계와 최근 실시간 추론을 함께 표시합니다.'
+    : `학습 그래프는 표시되지만 현재 런타임 추론은 차단됨 · ${(model.runtime_reasons || []).join(' · ') || '호환성 확인 필요'}`;
+  document.getElementById('gnn-training-size').textContent = `${formatInteger(model.training_rows)}행 · ${formatInteger(model.training_snapshots)} 스냅샷`;
+  document.getElementById('gnn-validation-accuracy').textContent = Number.isFinite(Number(model.validation_accuracy))
+    ? `${(Number(model.validation_accuracy) * 100).toFixed(1)}%`
+    : '-';
+  document.getElementById('gnn-graph-size').textContent = `${formatInteger(counts.nodes)} 노드 · ${formatInteger(counts.links)} 전체 연결`;
+  document.getElementById('gnn-inference-size').textContent = `${formatInteger(inference.successful_decisions)} 성공 · ${formatInteger(inference.blocked_decisions)} 차단`;
+  document.getElementById('gnn-model-provenance').textContent =
+    `SOURCE ${data.source?.checkpoint || '-'} · 실제 체크포인트 텐서 기반 · 기존 시장 사실 온톨로지 그래프와 분리 · 최근 추론 ${shortDateTime(inference.latest_at)}`;
+}
+
+function prepareGnnGraph(data) {
+  const signature = `${data.model?.checkpoint_hash || ''}:${data.counts?.nodes || 0}:${data.counts?.links || 0}:${data.inference?.latest_at || ''}`;
+  const previous = new Map(gnnGraphView.nodes.map((node) => [node.id, node]));
+  gnnGraphView.nodes = [];
+  const groups = new Map();
+  (data.nodes || []).forEach((node) => {
+    const layoutGroup = node.kind === 'output' ? `output:${node.family || 'specialist'}` : node.cluster;
+    if (!groups.has(layoutGroup)) groups.set(layoutGroup, []);
+    groups.get(layoutGroup).push(node);
+  });
+  const outputCenters = {
+    momentum: { x: 930, y: 115 }, breakout: { x: 1080, y: 245 },
+    reversion: { x: 930, y: 485 }, relative_strength: { x: 1100, y: 515 },
+    specialist: { x: 1070, y: 380 },
+  };
+  groups.forEach((items, layoutGroup) => {
+    const isOutput = layoutGroup.startsWith('output:');
+    const family = isOutput ? layoutGroup.slice(7) : layoutGroup;
+    const style = isOutput
+      ? { ...(gnnClusterStyle[family] || gnnClusterStyle.specialist), ...(outputCenters[family] || outputCenters.specialist), radius: items.length > 16 ? 82 : 58 }
+      : (gnnClusterStyle[family] || gnnClusterStyle.specialist);
+    items.forEach((node, index) => {
+      const angle = -Math.PI / 2 + index / Math.max(1, items.length) * Math.PI * 2 + seededGraphUnit(node.id) * .25;
+      const ringFactor = items.length > 20 && index % 2 ? .82 : .48;
+      const ring = style.radius * (ringFactor + .12 * seededGraphUnit(`${node.id}:radius`));
+      const old = previous.get(node.id);
+      gnnGraphView.nodes.push({ ...node, x: old?.x ?? style.x + Math.cos(angle) * ring, y: old?.y ?? style.y + Math.sin(angle) * ring });
+    });
+  });
+  gnnGraphView.nodeMap = new Map(gnnGraphView.nodes.map((node) => [node.id, node]));
+  gnnGraphView.signature = signature;
+  bindGnnControls();
+  startGnn3d(data, signature);
+}
+
+function bindGnnControls() {
+  const reset = document.getElementById('gnn-reset-view');
+  if (reset && reset.dataset.bound !== 'true') {
+    reset.dataset.bound = 'true';
+    reset.addEventListener('click', resetGnnGraphView);
+  }
+  document.querySelectorAll('[data-gnn-relation]').forEach((button) => {
+    if (button.dataset.bound === 'true') return;
+    button.dataset.bound = 'true';
+    button.addEventListener('click', () => {
+      gnnGraphView.filter = button.dataset.gnnRelation || 'all';
+      document.querySelectorAll('[data-gnn-relation]').forEach((item) => item.classList.toggle('active', item === button));
+      if (gnn3dState?.rebuildEdges) gnn3dState.rebuildEdges();
+    });
+  });
+}
+
+async function loadGnnThree() {
+  if (window.__threeModule) return window.__threeModule;
+  if (!gnnThreePromise) {
+    gnnThreePromise = import('https://unpkg.com/three@0.165.0/build/three.module.js')
+      .then((module) => { window.__threeModule = module; return module; })
+      .catch((error) => { console.warn('3D GNN renderer unavailable; using 2D fallback.', error); return null; });
+  }
+  return gnnThreePromise;
+}
+
+async function startGnn3d(data, signature) {
+  if (!gnnVisualizationEnabled) return;
+  if (gnn3dState?.signature === signature) {
+    gnn3dState.data = data;
+    gnn3dState.rebuildEdges();
+    return;
+  }
+  const THREE = await loadGnnThree();
+  if (!gnnVisualizationEnabled) return;
+  if (!THREE) {
+    bindGnnGraphCanvas();
+    if (!gnnGraphView.frame) gnnGraphView.frame = requestAnimationFrame(drawGnnGraph);
+    return;
+  }
+  if (gnn3dState?.cleanup) gnn3dState.cleanup();
+  if (gnnGraphView.frame) { cancelAnimationFrame(gnnGraphView.frame); gnnGraphView.frame = null; }
+  const canvas = document.getElementById('gnn-model-canvas');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x02050b);
+  scene.fog = new THREE.FogExp2(0x02050b, 0.00105);
+  const camera = new THREE.PerspectiveCamera(48, 1, .1, 3000);
+  camera.position.set(0, 0, 820);
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  } catch (error) {
+    console.warn('WebGL unavailable; using 2D GNN fallback.', error);
+    bindGnnGraphCanvas();
+    if (!gnnGraphView.frame) gnnGraphView.frame = requestAnimationFrame(drawGnnGraph);
+    return;
+  }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.15;
+  const root = new THREE.Group();
+  scene.add(root);
+  scene.add(new THREE.HemisphereLight(0xbfe8ff, 0x080617, 1.25));
+  const keyLight = new THREE.PointLight(0x38e8ff, 52, 1400); keyLight.position.set(80, 220, 420); scene.add(keyLight);
+  const rimLight = new THREE.PointLight(0xb45cff, 40, 1200); rimLight.position.set(-360, -180, -250); scene.add(rimLight);
+
+  const starPositions = [];
+  for (let index = 0; index < 700; index += 1) {
+    const radius = 600 + seededGraphUnit(`gnn-star:${index}`) * 850;
+    const theta = seededGraphUnit(`gnn-star-t:${index}`) * Math.PI * 2;
+    const phi = Math.acos(2 * seededGraphUnit(`gnn-star-p:${index}`) - 1);
+    starPositions.push(radius * Math.sin(phi) * Math.cos(theta), radius * Math.sin(phi) * Math.sin(theta), radius * Math.cos(phi));
+  }
+  const starsGeometry = new THREE.BufferGeometry();
+  starsGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+  scene.add(new THREE.Points(starsGeometry, new THREE.PointsMaterial({ color: 0x315597, size: 1.25, transparent: true, opacity: .5, depthWrite: false })));
+
+  const nodeMap = new Map();
+  const meshes = [];
+  const labels = [];
+  (data.nodes || []).forEach((node) => {
+    const position = gnn3dNodePosition(node);
+    const color = new THREE.Color(gnn3dNodeColor(node));
+    const radius = node.kind === 'strategy' ? 7.2 : node.kind === 'hidden' ? 4.1 : node.kind === 'feature' ? 2.8 : 2.4;
+    const segments = node.kind === 'strategy' ? 18 : 10;
+    const material = new THREE.MeshStandardMaterial({
+      color, emissive: color, emissiveIntensity: node.kind === 'strategy' ? .36 : .13,
+      roughness: .32, metalness: .16,
+    });
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, segments, segments), material);
+    mesh.position.set(position.x, position.y, position.z);
+    mesh.userData = { ...node, baseEmissive: material.emissiveIntensity, baseRadius: radius };
+    root.add(mesh); meshes.push(mesh); nodeMap.set(node.id, mesh);
+    if (node.kind === 'strategy') {
+      const label = createGnn3dLabel(THREE, shortGnnLabel(node.label), color.getHex());
+      label.position.set(position.x + 11, position.y + 10, position.z);
+      label.userData = node; root.add(label); labels.push(label);
+    }
+  });
+
+  const edgeLayer = new THREE.Group();
+  const glowLayer = new THREE.Group();
+  root.add(edgeLayer); root.add(glowLayer);
+  const phaseGroups = new Map();
+  let visibleEdges = [];
+  function filteredLinks() {
+    return (gnn3dState?.data?.links || data.links || []).filter((link) => {
+      if (gnnGraphView.filter === 'all') return true;
+      if (gnnGraphView.filter === 'learned_parameter') return link.kind === 'learned_parameter';
+      if (gnnGraphView.filter === 'strategy_topology') return !link.kind || link.kind === 'topology';
+      return link.relation === gnnGraphView.filter;
+    });
+  }
+  function clearGroup(group) {
+    while (group.children.length) {
+      const child = group.children.pop(); child.geometry?.dispose(); child.material?.dispose();
+    }
+  }
+  function rebuildEdges() {
+    clearGroup(edgeLayer); clearGroup(glowLayer); phaseGroups.clear();
+    visibleEdges = filteredLinks().filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
+    const positions = [], colors = [];
+    visibleEdges.forEach((link) => {
+      const source = nodeMap.get(link.source).position, target = nodeMap.get(link.target).position;
+      positions.push(source.x, source.y, source.z, target.x, target.y, target.z);
+      const base = new THREE.Color(gnn3dEdgeColor(link));
+      const strength = .22 + Number(link.learned_strength || 0) * .78;
+      base.multiplyScalar(strength); colors.push(base.r, base.g, base.b, base.r, base.g, base.b);
+    });
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    edgeLayer.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: .18, depthWrite: false })));
+    ['input', 'message_passing', 'strategy_election', 'output_decode'].forEach((phase) => {
+      const phaseEdges = visibleEdges.filter((link) => gnn3dEdgePhase(link) === phase);
+      const phasePositions = [];
+      phaseEdges.forEach((link) => {
+        const source = nodeMap.get(link.source).position, target = nodeMap.get(link.target).position;
+        phasePositions.push(source.x, source.y, source.z, target.x, target.y, target.z);
+      });
+      const phaseGeometry = new THREE.BufferGeometry();
+      phaseGeometry.setAttribute('position', new THREE.Float32BufferAttribute(phasePositions, 3));
+      const phaseLine = new THREE.LineSegments(phaseGeometry, new THREE.LineBasicMaterial({
+        color: gnn3dPhaseColor(phase), transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      phaseLine.userData.edges = phaseEdges; glowLayer.add(phaseLine); phaseGroups.set(phase, phaseLine);
+    });
+  }
+
+  const particleCount = 260;
+  const particleArray = new Float32Array(particleCount * 3);
+  const particleGeometry = new THREE.BufferGeometry();
+  particleGeometry.setAttribute('position', new THREE.BufferAttribute(particleArray, 3));
+  const particles = new THREE.Points(particleGeometry, new THREE.PointsMaterial({
+    color: 0x66fbff, size: 3.4, transparent: true, opacity: 0,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  root.add(particles);
+
+  let dragging = false, moved = false, lastX = 0, lastY = 0;
+  let rotationX = -.1, rotationY = .18, cameraTarget = 820;
+  const pointer = new THREE.Vector2(9, 9), raycaster = new THREE.Raycaster();
+  const controller = new AbortController();
+  function updatePointer(event) {
+    const rect = canvas.getBoundingClientRect();
+    pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+  canvas.addEventListener('pointerdown', (event) => {
+    updatePointer(event); dragging = true; moved = false; lastX = event.clientX; lastY = event.clientY; canvas.setPointerCapture(event.pointerId);
+  }, { signal: controller.signal });
+  canvas.addEventListener('pointermove', (event) => {
+    updatePointer(event);
+    if (!dragging) return;
+    const dx = event.clientX - lastX, dy = event.clientY - lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 1) moved = true;
+    rotationY += dx * .006; rotationX += dy * .006; lastX = event.clientX; lastY = event.clientY;
+  }, { signal: controller.signal });
+  canvas.addEventListener('pointerup', (event) => {
+    updatePointer(event); dragging = false;
+    if (!moved) {
+      raycaster.setFromCamera(pointer, camera);
+      const hit = raycaster.intersectObjects(meshes, false)[0];
+      if (hit) renderGnnInspector(hit.object.userData);
+    }
+  }, { signal: controller.signal });
+  canvas.addEventListener('wheel', (event) => {
+    event.preventDefault(); cameraTarget = Math.max(390, Math.min(1250, cameraTarget + event.deltaY * .6));
+  }, { passive: false, signal: controller.signal });
+
+  function resize() {
+    const rect = canvas.getBoundingClientRect();
+    renderer.setSize(rect.width, rect.height, false); camera.aspect = rect.width / Math.max(1, rect.height); camera.updateProjectionMatrix();
+  }
+  function resetView() { rotationX = -.1; rotationY = .18; cameraTarget = 820; }
+  function cleanup() {
+    controller.abort(); window.removeEventListener('resize', resize); gnn3dState.stop = true;
+    scene.traverse((object) => { object.geometry?.dispose(); if (object.material) (Array.isArray(object.material) ? object.material : [object.material]).forEach((material) => { material.map?.dispose(); material.dispose(); }); });
+    renderer.dispose();
+  }
+  gnn3dState = { signature, data, renderer, scene, root, stop: false, rebuildEdges, resetView, cleanup };
+  rebuildEdges(); resize(); window.addEventListener('resize', resize, { passive: true });
+
+  function animate(now) {
+    if (!gnn3dState || gnn3dState.stop) return;
+    requestAnimationFrame(animate);
+    const live = Boolean(terminalState.gnnInference?.active);
+    const phases = ['input', 'message_passing', 'strategy_election', 'output_decode'];
+    const phaseIndex = live ? Math.floor((now % 3600) / 900) : -1;
+    const activePhase = phaseIndex >= 0 ? phases[phaseIndex] : null;
+    if (!dragging) rotationY += live ? .0016 : .00045;
+    root.rotation.x += (rotationX - root.rotation.x) * .12; root.rotation.y += (rotationY - root.rotation.y) * .12;
+    camera.position.z += (cameraTarget - camera.position.z) * .09;
+    const pulse = .55 + Math.sin(now / 115) * .45;
+    phaseGroups.forEach((line, phase) => { line.material.opacity = live && phase === activePhase ? .28 + pulse * .48 : 0; });
+    meshes.forEach((mesh) => {
+      const nodePhase = gnn3dNodePhase(mesh.userData);
+      const active = live && nodePhase === activePhase;
+      mesh.material.emissiveIntensity = active ? 1.25 + pulse * 1.2 : mesh.userData.baseEmissive;
+      mesh.scale.setScalar(active ? 1.08 + pulse * .32 : 1);
+    });
+    labels.forEach((label) => { label.material.opacity = live && activePhase === 'strategy_election' ? 1 : .72; });
+    const activeEdges = activePhase ? (phaseGroups.get(activePhase)?.userData.edges || []) : [];
+    particles.material.opacity = live && activeEdges.length ? .5 + pulse * .45 : 0;
+    if (live && activeEdges.length) {
+      for (let index = 0; index < particleCount; index += 1) {
+        const edge = activeEdges[index % activeEdges.length];
+        const source = nodeMap.get(edge.source).position, target = nodeMap.get(edge.target).position;
+        const t = (now * .00038 + seededGraphUnit(`particle:${index}`)) % 1;
+        particleArray[index * 3] = source.x + (target.x - source.x) * t;
+        particleArray[index * 3 + 1] = source.y + (target.y - source.y) * t;
+        particleArray[index * 3 + 2] = source.z + (target.z - source.z) * t;
+      }
+      particleGeometry.attributes.position.needsUpdate = true;
+    }
+    setGnnPhaseIndicator(activePhase);
+    raycaster.setFromCamera(pointer, camera);
+    const hit = raycaster.intersectObjects(meshes, false)[0];
+    if (hit && !dragging) updateGnn3dTooltip(canvas, hit.object.userData, pointer); else document.getElementById('gnn-model-tooltip').hidden = true;
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame(animate);
+}
+
+function gnn3dNodePosition(node) {
+  const index = Number(node.feature_index ?? node.hidden_index ?? node.channel_index ?? node.checkpoint_index ?? 0);
+  const unitA = seededGraphUnit(`${node.id}:a`), unitB = seededGraphUnit(`${node.id}:b`);
+  const sphere = (center, radius) => {
+    const theta = unitA * Math.PI * 2, phi = Math.acos(2 * unitB - 1), spread = radius * (.45 + seededGraphUnit(`${node.id}:r`) * .55);
+    return { x: center[0] + Math.sin(phi) * Math.cos(theta) * spread, y: center[1] + Math.cos(phi) * spread, z: center[2] + Math.sin(phi) * Math.sin(theta) * spread };
+  };
+  if (node.kind === 'feature') return sphere([-315, 0, 0], 145);
+  if (node.kind === 'hidden') return sphere([-105, 0, 0], 90);
+  const familyCenters = { momentum: [85, 115, 35], breakout: [145, 15, -85], reversion: [70, -125, 30], relative_strength: [190, -100, 105], specialist: [140, 0, 100] };
+  if (node.kind === 'strategy') return sphere(familyCenters[node.cluster] || familyCenters.specialist, 48);
+  const outputCenters = { momentum: [345, 135, 20], breakout: [370, 35, -95], reversion: [345, -130, 15], relative_strength: [410, -90, 110], specialist: [380, 0, 100] };
+  return sphere(outputCenters[node.family] || outputCenters.specialist, 88 + (index % 3) * 6);
+}
+
+function gnn3dNodeColor(node) {
+  return (gnnClusterStyle[node.family || node.cluster] || gnnClusterStyle.specialist).color;
+}
+function gnn3dEdgeColor(link) {
+  const key = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
+  return (gnnRelationStyle[key] || { color: '#7187a0' }).color;
+}
+function gnn3dEdgePhase(link) {
+  if (link.relation === 'strategy_head_weight') return 'output_decode';
+  if (link.relation === 'owns_output_head') return 'strategy_election';
+  if (!link.kind || link.kind === 'topology' || String(link.relation || '').startsWith('relation_encoder:')) return 'message_passing';
+  return 'input';
+}
+function gnn3dNodePhase(node) {
+  if (node.kind === 'feature') return 'input';
+  if (node.kind === 'hidden') return 'message_passing';
+  if (node.kind === 'strategy') return 'strategy_election';
+  return 'output_decode';
+}
+function gnn3dPhaseColor(phase) {
+  return { input: 0x9c7dff, message_passing: 0x2af7ff, strategy_election: 0xff4fd8, output_decode: 0x64ffb5 }[phase] || 0xffffff;
+}
+function createGnn3dLabel(THREE, text, color) {
+  const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 72;
+  const ctx = canvas.getContext('2d'); ctx.fillStyle = 'rgba(3,7,13,.78)'; ctx.fillRect(0, 8, 320, 46);
+  ctx.strokeStyle = `#${color.toString(16).padStart(6, '0')}`; ctx.strokeRect(1, 9, 318, 44);
+  ctx.fillStyle = '#e9fbff'; ctx.font = 'bold 21px Inter, sans-serif'; ctx.fillText(text, 10, 39);
+  const texture = new THREE.CanvasTexture(canvas);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: .72, depthWrite: false }));
+  sprite.scale.set(82, 18, 1); return sprite;
+}
+function updateGnn3dTooltip(canvas, node, pointer) {
+  const tooltip = document.getElementById('gnn-model-tooltip'), rect = canvas.getBoundingClientRect();
+  tooltip.hidden = false; tooltip.style.left = `${Math.min(rect.width - 245, Math.max(8, (pointer.x + 1) * rect.width / 2 + 12))}px`;
+  tooltip.style.top = `${Math.min(rect.height - 70, Math.max(8, (-pointer.y + 1) * rect.height / 2 + 12))}px`;
+  tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${escapeHtml(String(node.layer || node.kind || '').toUpperCase())} · 3D compute node`;
+}
+
+function drawGnnGraph(timestamp) {
+  if (!gnnVisualizationEnabled) { gnnGraphView.frame = null; return; }
+  gnnGraphView.frame = requestAnimationFrame(drawGnnGraph);
+  if (timestamp - gnnGraphView.lastPaint < 32) return;
+  gnnGraphView.lastPaint = timestamp;
+  const data = terminalState.gnnGraph;
+  const canvas = document.getElementById('gnn-model-canvas');
+  if (!data || !canvas) return;
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  const baseScale = Math.min(width / 1200, height / 650);
+  const scale = baseScale * gnnGraphView.zoom;
+  const ox = (width - 1200 * baseScale) / 2 + gnnGraphView.panX;
+  const oy = (height - 650 * baseScale) / 2 + gnnGraphView.panY;
+  const point = (node) => ({ x: ox + node.x * scale, y: oy + node.y * scale });
+
+  ctx.fillStyle = '#03060b';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = 'rgba(58, 82, 160, .28)';
+  for (let x = 18; x < width; x += 38) for (let y = 18; y < height; y += 38) {
+    ctx.beginPath(); ctx.arc(x, y, 1.2, 0, Math.PI * 2); ctx.fill();
+  }
+
+  Object.entries(gnnClusterStyle).filter(([clusterId]) => clusterId !== 'output').forEach(([clusterId, style]) => {
+    if (!gnnGraphView.nodes.some((node) => node.cluster === clusterId)) return;
+    const center = point(style);
+    const radius = style.radius * scale;
+    const glow = ctx.createRadialGradient(center.x, center.y, 0, center.x, center.y, radius);
+    glow.addColorStop(0, `${style.color}22`); glow.addColorStop(.58, `${style.color}0b`); glow.addColorStop(1, `${style.color}00`);
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(center.x, center.y, radius, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `${style.color}aa`; ctx.font = `${Math.max(8, 9 * scale)}px Consolas, monospace`;
+    ctx.fillText(style.label, center.x - radius * .55, center.y - radius * .72);
+  });
+  ctx.fillStyle = '#5eead4aa';
+  ctx.font = `${Math.max(8, 9 * scale)}px Consolas, monospace`;
+  ctx.fillText('104 STRATEGY HEAD OUTPUTS', ox + 855 * scale, oy + 30 * scale);
+
+  const visibleLinks = (data.links || []).filter((link) => {
+    if (gnnGraphView.filter === 'all') return true;
+    if (gnnGraphView.filter === 'learned_parameter') return link.kind === 'learned_parameter';
+    if (gnnGraphView.filter === 'strategy_topology') return !link.kind || link.kind === 'topology';
+    return link.relation === gnnGraphView.filter;
+  });
+  visibleLinks.forEach((link) => {
+    const source = gnnGraphView.nodeMap.get(link.source), target = gnnGraphView.nodeMap.get(link.target);
+    if (!source || !target) return;
+    const a = point(source), b = point(target);
+    const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1;
+    const direction = seededGraphUnit(`${link.source}:${link.target}`) > .5 ? 1 : -1;
+    const bend = direction * Math.min(34, distance * .11);
+    const cx = (a.x + b.x) / 2 - dy / distance * bend;
+    const cy = (a.y + b.y) / 2 + dx / distance * bend;
+    const relationKey = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
+    const relation = gnnRelationStyle[relationKey] || { color: '#8aa1b7' };
+    const active = source.active || target.active;
+    ctx.save();
+    ctx.strokeStyle = relation.color;
+    const parameter = link.kind === 'learned_parameter';
+    ctx.globalAlpha = (parameter ? .018 + Number(link.learned_strength || 0) * .075 : .055 + Number(link.learned_strength || 0) * .16) * (active ? 2.15 : 1);
+    ctx.lineWidth = parameter ? .25 + Number(link.learned_strength || 0) * .48 : .45 + Number(link.learned_strength || 0) * 1.05;
+    if (active) { ctx.shadowBlur = 7; ctx.shadowColor = relation.color; }
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(cx, cy, b.x, b.y); ctx.stroke();
+    ctx.restore();
+  });
+
+  const pulse = .5 + Math.sin(timestamp / 240) * .5;
+  gnnGraphView.nodes.forEach((node) => {
+    const p = point(node);
+    const family = node.family || node.cluster;
+    const style = gnnClusterStyle[family] || gnnClusterStyle.specialist;
+    const baseRadius = node.kind === 'strategy' ? 7.5 : node.kind === 'hidden' ? 4.2 : node.kind === 'feature' ? 3.2 : 2.8;
+    const radius = (baseRadius + Number(node.learned_strength || 0) * (node.kind === 'strategy' ? 5.5 : 1.8) + (node.active ? pulse * 2.2 : 0)) * Math.max(.72, scale);
+    ctx.save();
+    ctx.fillStyle = style.color; ctx.shadowColor = style.color; ctx.shadowBlur = node.active ? 20 : 9;
+    ctx.globalAlpha = node === gnnGraphView.hovered ? 1 : .9;
+    ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = node === gnnGraphView.selected ? 2.4 : 1;
+    ctx.strokeStyle = node === gnnGraphView.selected ? '#ffffff' : '#071019'; ctx.stroke();
+    ctx.shadowBlur = 0; ctx.fillStyle = '#dce9f4'; ctx.globalAlpha = .92;
+    ctx.font = `${Math.max(7, 8 * scale)}px Inter, sans-serif`;
+    if (node.kind === 'strategy' || node === gnnGraphView.hovered || node === gnnGraphView.selected || gnnGraphView.zoom > 1.75) {
+      ctx.fillText(shortGnnLabel(node.label), p.x + radius + 4, p.y + 3);
+    }
+    ctx.restore();
+  });
+  gnnGraphView.transform = { scale, ox, oy, width, height };
+}
+
+function bindGnnGraphCanvas() {
+  const canvas = document.getElementById('gnn-model-canvas');
+  if (!canvas || canvas.dataset.gnnBound === 'true') return;
+  canvas.dataset.gnnBound = 'true';
+  const localPoint = (event) => {
+    const rect = canvas.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  };
+  const pick = (screen) => {
+    const t = gnnGraphView.transform;
+    if (!t) return null;
+    let result = null, best = Infinity;
+    gnnGraphView.nodes.forEach((node) => {
+      const x = t.ox + node.x * t.scale, y = t.oy + node.y * t.scale;
+      const distance = Math.hypot(screen.x - x, screen.y - y);
+      if (distance < 15 && distance < best) { result = node; best = distance; }
+    });
+    return result;
+  };
+  canvas.addEventListener('pointerdown', (event) => {
+    gnnGraphView.dragging = true; gnnGraphView.moved = false;
+    gnnGraphView.lastX = event.clientX; gnnGraphView.lastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointermove', (event) => {
+    if (gnnGraphView.dragging) {
+      const dx = event.clientX - gnnGraphView.lastX, dy = event.clientY - gnnGraphView.lastY;
+      if (Math.abs(dx) + Math.abs(dy) > 1) gnnGraphView.moved = true;
+      gnnGraphView.panX += dx; gnnGraphView.panY += dy;
+      gnnGraphView.lastX = event.clientX; gnnGraphView.lastY = event.clientY;
+      return;
+    }
+    gnnGraphView.hovered = pick(localPoint(event));
+    updateGnnTooltip(event, gnnGraphView.hovered);
+  });
+  canvas.addEventListener('pointerup', (event) => {
+    if (!gnnGraphView.moved) {
+      const node = pick(localPoint(event));
+      if (node) { gnnGraphView.selected = node; renderGnnInspector(node); }
+    }
+    gnnGraphView.dragging = false;
+  });
+  canvas.addEventListener('pointerleave', () => {
+    gnnGraphView.dragging = false; gnnGraphView.hovered = null;
+    document.getElementById('gnn-model-tooltip').hidden = true;
+  });
+  canvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    gnnGraphView.zoom = Math.max(.55, Math.min(2.8, gnnGraphView.zoom * (event.deltaY > 0 ? .9 : 1.1)));
+  }, { passive: false });
+}
+
+function resetGnnGraphView() {
+  gnnGraphView.zoom = 1; gnnGraphView.panX = 0; gnnGraphView.panY = 0;
+  if (gnn3dState?.resetView) gnn3dState.resetView();
+}
+function updateGnnTooltip(event, node) {
+  const tooltip = document.getElementById('gnn-model-tooltip');
+  if (!node) { tooltip.hidden = true; return; }
+  const stage = document.querySelector('.gnn-model-stage').getBoundingClientRect();
+  tooltip.hidden = false;
+  tooltip.style.left = `${Math.min(stage.width - 245, Math.max(8, event.clientX - stage.left + 12))}px`;
+  tooltip.style.top = `${Math.min(stage.height - 70, Math.max(8, event.clientY - stage.top + 12))}px`;
+  const detail = node.kind === 'strategy'
+    ? `학습 강도 ${Number(node.learned_strength || 0).toFixed(3)} · 추론 ${formatInteger(node.inference_count)}회`
+    : `${String(node.layer || node.kind || '').toUpperCase()} · 체크포인트 계산 노드`;
+  tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${escapeHtml(detail)}`;
+}
+function renderGnnInspector(node) {
+  if (node.kind !== 'strategy') {
+    const details = node.kind === 'feature'
+      ? [['계산 계층', '입력 특징'], ['특징 인덱스', node.feature_index], ['입력 차원', terminalState.gnnGraph?.model?.feature_dim]]
+      : node.kind === 'hidden'
+        ? [['계산 계층', 'R-GCN 메시지 은닉층'], ['은닉 인덱스', node.hidden_index], ['은닉 차원', terminalState.gnnGraph?.model?.hidden_dim]]
+        : [['계산 계층', '전략별 출력 헤드'], ['전략', node.strategy_id], ['출력 채널', node.channel], ['채널 인덱스', node.channel_index]];
+    document.getElementById('gnn-model-inspector').innerHTML = `
+      <span>CHECKPOINT COMPUTE NODE</span><h3>${escapeHtml(node.label)}</h3>
+      <p>저장된 체크포인트 텐서에서 복원한 실제 계산 노드입니다.</p>
+      <dl>${details.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value ?? '-')}</dd></div>`).join('')}</dl>`;
+    return;
+  }
+  const cluster = gnnClusterStyle[node.cluster] || gnnClusterStyle.specialist;
+  document.getElementById('gnn-model-inspector').innerHTML = `
+    <span>TRAINED STRATEGY NODE</span><h3>${escapeHtml(node.label)}</h3>
+    <p>${cluster.label} 군집 · 체크포인트 전략 인덱스 ${Number(node.checkpoint_index) + 1}</p>
+    <dl><div><dt>학습 헤드 강도</dt><dd>${Number(node.learned_strength || 0).toFixed(4)}</dd></div>
+    <div><dt>학습 라벨</dt><dd>${formatInteger(node.training_labels)}</dd></div>
+    <div><dt>학습 양수 순효율</dt><dd>${node.training_positive_net_rate == null ? '-' : `${(Number(node.training_positive_net_rate) * 100).toFixed(1)}%`}</dd></div>
+    <div><dt>최근 GNN 추론</dt><dd>${formatInteger(node.inference_count)}회</dd></div>
+    <div><dt>최근 효용</dt><dd>${node.latest_utility == null ? '-' : Number(node.latest_utility).toFixed(3)}</dd></div>
+    <div><dt>예상 순효율</dt><dd>${node.latest_expected_net_bps == null ? '-' : `${Number(node.latest_expected_net_bps).toFixed(2)} bp`}</dd></div></dl>`;
+}
+function shortGnnLabel(value) {
+  const words = String(value || '').split(' ');
+  return words.length > 2 ? `${words[0]} ${words[1]}` : String(value || '');
+}
+function seededGraphUnit(value) {
+  let hash = 2166136261;
+  for (const char of String(value)) { hash ^= char.charCodeAt(0); hash = Math.imul(hash, 16777619); }
+  return (hash >>> 0) / 4294967295;
+}
 
 const strategyLabels = {
   intraday_momentum: '장중 모멘텀',
@@ -1099,14 +1746,23 @@ function renderDecisionOntology(trace) {
   layoutNodes(graphSources, 'source', 72, (item) => ({
     id: `source:${item.id}`,
     title: item.label,
-    value: item.available ? `${item.samples || 0} samples` : 'DATA MISSING',
-    className: item.available ? '' : 'unavailable',
+    value: String(item.status || '').toUpperCase() === 'PARTIAL'
+      ? `PARTIAL · ${item.samples || 0} fields`
+      : item.available ? `${item.samples || 0} samples` : 'DATA MISSING',
+    className: String(item.status || '').toUpperCase() === 'PARTIAL'
+      ? 'partial' : item.available ? '' : 'unavailable',
     detail: {
       kind: 'SOURCE DATA',
       title: item.label,
-      value: item.available ? '수신 중' : '데이터 없음',
+      value: String(item.status || '').toUpperCase() === 'PARTIAL'
+        ? '부분 가용' : item.available ? '수신 중' : '데이터 없음',
       description: item.available ? '실시간 지표 계산에 사용되는 원천 데이터입니다.' : '현재 시장 응답에서 이 데이터가 제공되지 않습니다.',
-      rows: [['ID', item.id], ['샘플', item.samples || 0], ['갱신', item.updated_at || '-']],
+      rows: [
+        ['ID', item.id],
+        ['상태', item.status || (item.available ? 'AVAILABLE' : 'MISSING')],
+        ['샘플', item.samples || 0],
+        ['갱신', item.updated_at || '-'],
+      ],
     },
   }));
   layoutNodes(graphIndicators, 'indicator', 62, (item) => ({
@@ -1541,17 +2197,112 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function readGnnVisualizationPreference() {
+  try {
+    return localStorage.getItem(GNN_VISUALIZATION_STORAGE_KEY) === 'true';
+  } catch (_error) {
+    return false;
+  }
+}
+
+function applyGnnVisualizationState() {
+  const toggle = document.getElementById('gnn-visualization-toggle');
+  const paused = document.getElementById('gnn-visualization-paused');
+  const status = document.getElementById('gnn-model-status');
+  const summary = document.getElementById('gnn-model-summary');
+  if (toggle) {
+    toggle.classList.toggle('active', gnnVisualizationEnabled);
+    toggle.setAttribute('aria-pressed', String(gnnVisualizationEnabled));
+    toggle.textContent = gnnVisualizationEnabled ? '3D 시각화 끄기' : '3D 시각화 켜기';
+  }
+  if (paused) paused.hidden = gnnVisualizationEnabled;
+  if (gnnVisualizationEnabled) {
+    if (status) { status.textContent = 'LOADING'; status.className = 'status-chip waiting'; }
+    if (summary) summary.textContent = '학습 체크포인트와 최근 추론 기록을 불러오는 중입니다.';
+    fetchGnnGraph();
+    fetchGnnState();
+    return;
+  }
+  if (gnn3dState?.cleanup) gnn3dState.cleanup();
+  gnn3dState = null;
+  if (gnnGraphView.frame) cancelAnimationFrame(gnnGraphView.frame);
+  gnnGraphView.frame = null;
+  const tooltip = document.getElementById('gnn-model-tooltip');
+  if (tooltip) tooltip.hidden = true;
+  setGnnPhaseIndicator(null);
+  if (status) { status.textContent = 'VISUALIZATION OFF'; status.className = 'status-chip'; }
+  if (summary) summary.textContent = '3D 시각화만 꺼져 있습니다. GNN 학습과 추론은 계속 실행됩니다.';
+  renderGnnLiveState({ state: 'OFFLINE', active: false, age_seconds: null });
+}
+
+function bindGnnVisualizationToggle() {
+  const toggle = document.getElementById('gnn-visualization-toggle');
+  if (!toggle || toggle.dataset.bound === 'true') return;
+  toggle.dataset.bound = 'true';
+  toggle.addEventListener('click', () => {
+    gnnVisualizationEnabled = !gnnVisualizationEnabled;
+    try {
+      localStorage.setItem(GNN_VISUALIZATION_STORAGE_KEY, String(gnnVisualizationEnabled));
+    } catch (_error) {
+      /* Private mode: the choice applies until the page is closed. */
+    }
+    applyGnnVisualizationState();
+  });
+}
+
+// Layout density. The dense grid is the default so a fresh browser lands on the
+// one-screen view; the preference sticks per browser because an operator who
+// wants the stacked view wants it on every reload, not once.
+const layoutToggle = document.getElementById('layout-toggle');
+if (layoutToggle) {
+  const readLayout = () => {
+    try {
+      return localStorage.getItem('terminalLayout');
+    } catch (error) {
+      return null;
+    }
+  };
+  const applyLayout = (classic) => {
+    document.body.classList.toggle('classic-layout', classic);
+    layoutToggle.textContent = classic ? '⤡' : '⤢';
+    layoutToggle.title = classic ? '밀집(한 화면) 레이아웃으로 전환' : '기본(세로) 레이아웃으로 전환';
+    // Canvases size themselves from their box, and a class flip fires no resize.
+    window.dispatchEvent(new Event('resize'));
+  };
+  applyLayout(readLayout() === 'classic');
+  layoutToggle.addEventListener('click', () => {
+    const classic = !document.body.classList.contains('classic-layout');
+    try {
+      localStorage.setItem('terminalLayout', classic ? 'classic' : 'dense');
+    } catch (error) {
+      /* private mode: the choice just does not persist. */
+    }
+    applyLayout(classic);
+  });
+}
 document.getElementById('terminal-refresh').addEventListener('click', () => {
   fetchMarketView();
   fetchAssetSummary();
   fetchSystemDiagnostics();
+  fetchGnnGraph();
+  fetchGnnState();
 });
+bindGnnVisualizationToggle();
+applyGnnVisualizationState();
+// Every canvas sizes its backing store from its box, so a box that changed
+// without a repaint shows a stretched or clipped chart. Frames are now
+// resizable and movable, which makes that a routine event rather than a
+// once-a-session one: repaint the canvas-backed panels whenever the layout
+// reports a size change. The decision-ontology SVG is deliberately absent - it
+// carries a viewBox and scales on its own, and rebuilding its node tree at
+// drag framerate is the one repaint here that actually costs something.
 window.addEventListener('resize', () => {
   if (terminalState.data) {
     renderTradingChart(
       terminalState.data.market || {},
       terminalState.data.algorithm,
     );
+    renderSecondAnalysis(terminalState.data.market || {});
   }
   if (terminalState.diagnostics) {
     renderTrainingMonitor((terminalState.diagnostics.flows || {}).training || {});
@@ -1586,6 +2337,8 @@ setInterval(() => fetchMarketStream(), 1000);
 setInterval(() => fetchMarketView(), 3000);
 setInterval(() => fetchSystemDiagnostics(), 5000);
 setInterval(() => fetchAssetSummary(), 15000);
+setInterval(() => fetchGnnGraph(), 15000);
+setInterval(() => fetchGnnState(), 1000);
 fetchMarketView();
 fetchAssetSummary();
 fetchSystemDiagnostics();

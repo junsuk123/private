@@ -13,7 +13,7 @@ from app.schemas.domain import FinalOrder, OrderSide, OrderType
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a no-submit FinalOrder dry-run report.")
-    parser.add_argument("--symbols", nargs="+", default=["005930"])
+    parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument("--no-submit", action="store_true", required=True)
     args = parser.parse_args()
 

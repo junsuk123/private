@@ -36,7 +36,7 @@
   "observed_at": "2026-08-02T09:05:00+09:00",
   "source": "kis-web-ui-manual",
   "symbols": {
-    "005930": {
+    "900001": {
       "available": true,
       "quantity": 500,
       "fee_bps_annualised": 800

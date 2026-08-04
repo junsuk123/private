@@ -406,6 +406,10 @@ class MicroSymbolReasoner:
                 expected_entry_price=None, expected_exit_price=None,
                 expected_gross_return_bps=None, expected_net_return_bps=None,
                 downside_risk_bps=None) -> MicroReasoningResult:
+        frame_diagnostics = getattr(data.live_feature_frame, "diagnostics", None)
+        measured_diagnostics = (
+            dict(frame_diagnostics) if isinstance(frame_diagnostics, Mapping) else {}
+        )
         return MicroReasoningResult(
             timestamp=data.timestamp,
             symbol=data.symbol,
@@ -423,6 +427,7 @@ class MicroSymbolReasoner:
             reason_codes=tuple(dict.fromkeys(reasons)),
             explanation_paths=tuple(paths),
             diagnostics={
+                **measured_diagnostics,
                 "macro_result_ref": data.macro_result_ref,
                 "event_evidence_count": len(data.event_evidence),
             },

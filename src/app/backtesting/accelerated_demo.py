@@ -692,9 +692,7 @@ def generate_synthetic_charts(
     for index, ticker in enumerate(tickers):
         calendar = _calendar_for_ticker(ticker)
         timestamps = _session_timestamps(calendar, total_bars, bar_interval_minutes)
-        price = rng.uniform(30, 450)
-        if ticker in {"005930", "000660"}:
-            price = rng.uniform(70_000, 210_000)
+        price = rng.uniform(70_000, 210_000) if calendar.name == "KRX" else rng.uniform(30, 450)
         trend_bucket = index % 10
         upward_bias = os.getenv("SIM_DEMO_UPWARD_BIAS", "1").strip().lower() not in {"0", "false", "no"}
         if upward_bias:

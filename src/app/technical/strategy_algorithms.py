@@ -342,6 +342,12 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "trailing_bps": 10.0,
     },
     "liquidity_shock_reversal": {
+        # The new ask-heavy absorption branch is validated on two US sessions
+        # only.  Keep the whole arm shadow-only until forward outcomes provide
+        # enough independent sessions for promotion.
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "live_authorized": 0.0,
         "shock_return_10s_bps": -40.0,
         "max_spread_change_5s": 0.0,
         "min_aggressor_imbalance": -0.35,
@@ -350,6 +356,12 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "retrace_fraction": 0.4,
         "stop_buffer_bps": 6.0,
         "trailing_bps": 14.0,
+        "absorption_us_only": 1.0,
+        "max_absorption_orderbook_imbalance": -0.30,
+        "min_absorption_return_30s_bps": 2.0,
+        "max_absorption_spread_change_5s": 0.0,
+        "absorption_capture_fraction": 0.35,
+        "absorption_horizon_seconds": 600.0,
     },
     "event_momentum": {
         "min_volume_spike_ratio": 2.0,
@@ -729,6 +741,7 @@ class TradingAlgorithm:
         confidence: float,
         edge_bps: float,
         reasons: tuple[str, ...],
+        horizon_seconds: int | None = None,
         **diagnostics: Any,
     ) -> AlgorithmDecision:
         minimum = self.config.shared("min_expected_edge_bps")
@@ -745,7 +758,11 @@ class TradingAlgorithm:
             score=_clamp(score),
             confidence=_clamp(confidence),
             expected_edge_bps=edge_bps,
-            horizon_seconds=self.horizon_seconds,
+            horizon_seconds=(
+                max(1, int(horizon_seconds))
+                if horizon_seconds is not None
+                else self.horizon_seconds
+            ),
             reason_codes=tuple(dict.fromkeys(reasons)),
             diagnostics=diagnostics,
         )
@@ -953,7 +970,60 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
     strategy_id = "liquidity_shock_reversal"
     thesis = "a mechanical sub-minute drop partially retraces once spread and depth normalise"
 
+    def _absorption_mode(self, f: TechnicalFeatureSet) -> bool:
+        """Ask-heavy book whose price has stopped following the displayed supply.
+
+        This is deliberately not "negative imbalance means buy".  The price must
+        already have recovered over 30 seconds and the spread must be contracting,
+        which is the observable decoupling that distinguishes absorption from a
+        still-toxic sell wave.
+        """
+
+        if self.p("absorption_us_only") >= 1.0:
+            symbol = str(f.symbol or "").strip().upper()
+            if symbol.isdigit() and len(symbol) == 6:
+                return False
+        if not _present(
+            f.return_30s,
+            f.spread_change_5s,
+            f.orderbook_imbalance,
+        ):
+            return False
+        return (
+            (f.return_30s or 0.0) * 10_000.0
+            >= self.p("min_absorption_return_30s_bps")
+            and (f.orderbook_imbalance or 0.0)
+            <= self.p("max_absorption_orderbook_imbalance")
+            and (f.spread_change_5s or 0.0)
+            <= self.p("max_absorption_spread_change_5s")
+        )
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        # US books are REST-polled, so they cannot honestly satisfy the 5-second
+        # streamed-tick readiness gate used by the original shock branch.  The
+        # absorption thesis has its own complete 30-second/book/spread inputs;
+        # evaluate that closed set first.  The original sub-second shock thesis
+        # still fails closed unless the streamed tick window is ready.
+        if self._absorption_mode(f):
+            horizon = int(self.p("absorption_horizon_seconds"))
+            edge = tick_expected_move_bps(
+                f.realized_volatility_10s,
+                horizon,
+                capture_fraction=self.p("absorption_capture_fraction"),
+            )
+            imbalance = abs(float(f.orderbook_imbalance or 0.0))
+            recovery_bps = float(f.return_30s or 0.0) * 10_000.0
+            return self._fire(
+                score=_clamp(0.55 * imbalance + 0.45 * _clamp(recovery_bps / 20.0)),
+                confidence=_clamp(0.35 + 0.5 * imbalance),
+                edge_bps=edge,
+                horizon_seconds=horizon,
+                reasons=("ASK_HEAVY_ABSORPTION_CONFIRMED", "THIRTY_SECOND_PRICE_RECOVERY"),
+                return_30s_bps=round(recovery_bps, 3),
+                spread_change_5s=f.spread_change_5s,
+                orderbook_imbalance=f.orderbook_imbalance,
+                validation_scope="US_SHADOW_ONLY",
+            )
         ready, reasons = self._tick_ready(f)
         if not ready:
             return self._reject(reasons)
@@ -984,6 +1054,26 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
+        if self._absorption_mode(f):
+            horizon = int(self.p("absorption_horizon_seconds"))
+            target_bps = tick_expected_move_bps(
+                f.realized_volatility_10s,
+                horizon,
+                capture_fraction=self.p("absorption_capture_fraction"),
+            )
+            return ExitRule(
+                strategy_id=self.strategy_id,
+                stop_price=self._volatility_stop(entry_price, f, 2.0),
+                target_price=(
+                    entry_price * (1.0 + target_bps / 10_000.0)
+                    if target_bps > 0
+                    else None
+                ),
+                trailing_bps=self.p("trailing_bps"),
+                max_holding_seconds=horizon,
+                stop_basis="absorption_tick_volatility_multiple",
+                target_basis="absorption_cost_aware_expected_move",
+            )
         # Stop just under the shock low implied by the observed drop.
         shock_bps = abs((f.return_10s or 0.0) * 10_000.0)
         shock_low = entry_price * (1.0 - shock_bps / 10_000.0) if shock_bps else None

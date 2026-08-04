@@ -115,6 +115,7 @@ class FrameMappingTest(unittest.TestCase):
         self.assertEqual(fs.price, 10_000.0)
         self.assertEqual(fs.rsi, 62.0)
         self.assertEqual(fs.macd_histogram, 0.4)
+        self.assertEqual(fs.return_30s, 0.003)
         self.assertAlmostEqual(fs.vwap_distance_bps, 15.0, places=3)
         self.assertIsNotNone(fs.ema_fast)
         self.assertGreater(fs.ema_fast, fs.ema_slow)  # positive ema_gap_bps

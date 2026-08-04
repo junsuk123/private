@@ -1910,6 +1910,29 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._kis_realtime_complete_symbols = previous
 
+    def test_kis_unified_complete_subscription_symbol_feeds_fast_feature_sampler(self) -> None:
+        with web_module._live_lock:
+            previous = web_module._kis_realtime_complete_symbols
+            web_module._kis_realtime_complete_symbols = ()
+        try:
+            web_module._record_kis_realtime_collector_result(
+                {
+                    "subscriptions_accepted": 2,
+                    "accepted_subscription_pairs": [
+                        {"symbol": "005930", "tr_id": "H0UNCNT0"},
+                        {"symbol": "005930", "tr_id": "H0UNASP0"},
+                    ],
+                }
+            )
+
+            with patch("app.web._dashboard_krx_watch_symbols", return_value=()):
+                symbols = web_module._krx_feature_frame_symbols()
+
+            self.assertEqual(symbols, ("005930",))
+        finally:
+            with web_module._live_lock:
+                web_module._kis_realtime_complete_symbols = previous
+
     def test_live_order_journal_snapshot_reports_submitted_and_blocked_orders(self) -> None:
         events = [
             {
@@ -2515,4 +2538,3 @@ class RealtimeModesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

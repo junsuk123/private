@@ -60,7 +60,7 @@ categories. Under OWL RL rule `cls-hv2`, an asserted `x p v` entails `x a <restr
     rdfs:subClassOf tr:TradeForbiddenAsset .
 ```
 
-So asserting `res:005930 tr:increasesRiskOf tr:Risk_TradeForbidden` makes `res:005930` a
+So asserting `res:SYMBOL tr:increasesRiskOf tr:Risk_TradeForbidden` makes `res:SYMBOL` a
 `tr:TradeForbiddenAsset` after materialization. Class hierarchy (`tr:DomesticStock ⊑ tr:Stock ⊑
 tr:MarketEntity`) and property hierarchy (`tr:supportsSignal ⊑ tr:hasSemanticEvidence`) are
 inferred by standard RDFS/OWL RL rules.

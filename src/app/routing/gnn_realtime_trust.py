@@ -180,8 +180,7 @@ class GnnRealtimeTrustEvaluator:
 
         candidates = self._prediction_candidates(now)
         try:
-            with sqlite3.connect(self.database_path, timeout=5.0) as connection:
-                outcomes = self._outcomes(connection, candidates)
+            outcomes = self._query_outcomes(candidates)
         except sqlite3.Error:
             return self._empty(now, ("GNN_TRUST_MARKET_DATA_QUERY_FAILED",))
 
@@ -315,6 +314,37 @@ class GnnRealtimeTrustEvaluator:
             calibrated_strategy_ids=calibrated_strategy_ids,
             trusted_strategy_ids=trusted_strategy_ids,
         )
+
+    def _query_outcomes(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[tuple[float, float, float, str, float]]:
+        """Read the live WAL without competing with the realtime writer.
+
+        The market database is several gigabytes and is written continuously.
+        A short default SQLite timeout made one transient writer/checkpoint
+        collision cache a total GNN trust failure.  A read-only query-only
+        connection plus bounded retries keeps execution fail-closed while
+        allowing the validation state to recover automatically.
+        """
+        database_uri = f"file:{self.database_path.resolve().as_posix()}?mode=ro"
+        last_error: sqlite3.Error | None = None
+        for attempt in range(3):
+            try:
+                with sqlite3.connect(
+                    database_uri,
+                    uri=True,
+                    timeout=30.0,
+                ) as connection:
+                    connection.execute("pragma query_only = on")
+                    connection.execute("pragma busy_timeout = 30000")
+                    return self._outcomes(connection, candidates)
+            except sqlite3.Error as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.1 * (attempt + 1))
+        assert last_error is not None
+        raise last_error
 
     def _prediction_candidates(
         self, evaluation_time: datetime

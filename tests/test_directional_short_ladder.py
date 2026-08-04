@@ -78,10 +78,71 @@ from app.trading.strategy_performance_store import (
     EVALUATION_SOURCE_SHADOW,
     StrategyPerformanceStore,
 )
+from app.trading.strategy_session import _ElectionProposal
 
 NOW = datetime(2026, 8, 1, 5, 0, tzinfo=timezone.utc)
 KEY = DirectionalStrategyKey.for_short("opening_range_breakdown", "KR")
 LONG_KEY = DirectionalStrategyKey.for_long("opening_range_breakout", "KR")
+
+
+def _proposal(
+    *,
+    direction: PositionDirection,
+    deployment_state: StrategyDeploymentState,
+    borrow_snapshot=None,
+) -> _ElectionProposal:
+    return _ElectionProposal(
+        symbol="005930",
+        strategy_id=(
+            "opening_range_breakdown"
+            if direction is PositionDirection.SHORT
+            else "opening_range_breakout"
+        ),
+        source="test",
+        entry_price=70_000.0,
+        target_return_rate=0.018,
+        stop_loss_rate=0.006,
+        trailing_stop_rate=0.003,
+        max_holding_seconds=3_600,
+        score=0.0,
+        confidence=0.0,
+        expected_net_return_bps=None,
+        expected_cost_bps=None,
+        gnn_actionable=False,
+        gnn_action="UNAVAILABLE",
+        gnn_reason_codes=[],
+        ontology_reason_codes=[],
+        macro_regime="UNKNOWN",
+        micro_regime="",
+        explanation_paths=[],
+        intent=None,
+        candidate_count=None,
+        micro_result=None,
+        evidence_row=None,
+        last_reason="test",
+        direction=direction,
+        deployment_state=deployment_state,
+        borrow_snapshot=borrow_snapshot,
+    )
+
+
+def test_live_short_without_point_in_time_locate_cannot_submit_order() -> None:
+    proposal = _proposal(
+        direction=PositionDirection.SHORT,
+        deployment_state=StrategyDeploymentState.LIVE_PROBE,
+    )
+
+    assert not proposal.submits_orders
+
+
+def test_shadow_proposal_remains_non_ordering_with_or_without_locate() -> None:
+    proposal = _proposal(
+        direction=PositionDirection.SHORT,
+        deployment_state=StrategyDeploymentState.SHADOW,
+        borrow_snapshot=object(),
+    )
+
+    assert not proposal.submits_orders
 
 
 # --------------------------------------------------------------------------- #
@@ -813,6 +874,32 @@ def test_simulator_refuses_quotes_at_or_before_the_signal() -> None:
         simulator.observe(QuoteObservation(NOW - timedelta(seconds=5), 900.0, 901.0)) == ()
     )
     assert simulator.open_plan_count == 1
+
+
+def test_simulator_exposes_symbols_that_still_require_quotes() -> None:
+    simulator = ShadowFillSimulator()
+    simulator.submit(_plan(plan_id="a", symbol="AAA"))
+    simulator.submit(_plan(plan_id="b", symbol="BBB"))
+    simulator.submit(_plan(plan_id="c", symbol="AAA"))
+
+    assert simulator.open_symbols == ("AAA", "BBB")
+    assert simulator.open_plan_count == 3
+
+
+def test_simulator_does_not_reuse_the_entry_quote_as_an_exit() -> None:
+    simulator = ShadowFillSimulator(entry_slippage_bps=0.0, exit_slippage_bps=0.0)
+    simulator.submit(_plan())
+    entry_quote = QuoteObservation(NOW + timedelta(seconds=1), 1000.0, 1010.0)
+
+    assert simulator.observe(entry_quote) == ()
+    assert simulator.observe(entry_quote) == ()
+    assert simulator.open_plan_count == 1
+
+    outcome = simulator.observe(
+        QuoteObservation(NOW + timedelta(seconds=2), 1000.0, 1010.0)
+    )
+    assert outcome[0].outcome == OUTCOME_STOP
+    assert outcome[0].holding_seconds == 1.0
 
 
 def test_short_fills_at_the_bid_and_covers_at_the_ask() -> None:

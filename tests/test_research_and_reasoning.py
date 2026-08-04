@@ -116,21 +116,26 @@ class ResearchAndReasoningTest(unittest.TestCase):
         self.assertEqual(result.events[0].source.source_name, "html")
 
     def test_reasoner_builds_paths_from_graph(self) -> None:
+        # The ticker comes from the sample feed rather than being hardcoded: the
+        # demo collectors moved to synthetic 9000xx symbols so nothing in the
+        # test corpus can be mistaken for a real issuer's data, and a path built
+        # for a ticker the graph never saw carries no triples to assert on.
         markets = collect_sample_market()
+        ticker = markets[0].ticker
         indicators = build_sample_indicators(markets)
         event = classify_text_event(
-            title="005930 wins major HBM contract",
-            body="Samsung Electronics 005930 semiconductor contract and profit growth.",
+            title=f"{ticker} wins major HBM contract",
+            body=f"Demo issuer {ticker} semiconductor contract and profit growth.",
             source=source_now("unit", "local://unit", "unit:2"),
-            known_tickers={"005930": "Samsung Electronics"},
+            known_tickers={ticker: "Demo issuer"},
         )
         graph = build_market_graph(markets, indicators, (event,))
         reasoner = OntologyReasoner(graph)
         reasoner.infer()
-        paths = reasoner.build_reasoning_paths(("005930",))
+        paths = reasoner.build_reasoning_paths((ticker,))
 
         self.assertEqual(len(paths), 1)
-        self.assertEqual(paths[0].ticker, "005930")
+        self.assertEqual(paths[0].ticker, ticker)
         self.assertGreater(len(paths[0].supporting_triples), 0)
 
     def test_ontology_runtime_requests_npu_and_falls_back_without_openvino(self) -> None:

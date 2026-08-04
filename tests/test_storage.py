@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,25 @@ from app.storage import LocalResearchStore
 
 
 class StorageTest(unittest.TestCase):
+    def test_transient_sqlite_writer_lock_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalResearchStore(Path(tmp))
+            attempts = 0
+
+            def operation(_connection):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise sqlite3.OperationalError("database is locked")
+                return 7
+
+            with patch("app.storage.local_store.time.sleep") as sleep:
+                result = store._write_with_retry(operation)
+
+            self.assertEqual(result, 7)
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+
     def test_low_frequency_macro_metric_uses_long_retention_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LocalResearchStore(Path(tmp), retention_days=7)

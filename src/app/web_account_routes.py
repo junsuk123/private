@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.account_dashboard import AccountDashboardService
+from app.gnn_visualization import build_strategy_gnn_state, build_strategy_gnn_visualization
+from app.ui_layout_store import TerminalLayoutStore
 
 
 def create_account_router(
@@ -16,12 +18,16 @@ def create_account_router(
     market_view_provider: Callable[[str | None, int], dict[str, Any]] | None = None,
     market_stream_provider: Callable[[str, int], dict[str, Any]] | None = None,
     market_stream_observer: Callable[[str], None] | None = None,
+    gnn_graph_provider: Callable[[], dict[str, Any]] | None = None,
+    gnn_state_provider: Callable[[], dict[str, Any]] | None = None,
+    layout_store: TerminalLayoutStore | None = None,
     service: AccountDashboardService | None = None,
 ) -> APIRouter:
     router = APIRouter()
     # A shared service can be injected so a background sampler and the HTTP routes
     # write to the same snapshot store; otherwise build one from the providers.
     service = service or AccountDashboardService(status_provider=status_provider, logs_provider=logs_provider)
+    layout_store = layout_store or TerminalLayoutStore()
 
     @router.get("/account", response_class=HTMLResponse)
     def account_dashboard_page() -> HTMLResponse:
@@ -76,6 +82,35 @@ def create_account_router(
     @router.get("/api/account/macro-micro")
     def account_macro_micro() -> JSONResponse:
         return JSONResponse(service.macro_micro())
+
+    @router.get("/api/account/gnn-graph")
+    def account_gnn_graph() -> JSONResponse:
+        provider = gnn_graph_provider or build_strategy_gnn_visualization
+        return JSONResponse(provider())
+
+    @router.get("/api/account/gnn-state")
+    def account_gnn_state() -> JSONResponse:
+        provider = gnn_state_provider or build_strategy_gnn_state
+        return JSONResponse(provider())
+
+    # Frame geometry the operator dragged into place. Server-side rather than
+    # localStorage so an arrangement survives a cache wipe and follows the
+    # operator to the next machine; the payload is normalised in the store
+    # because the browser is an untrusted writer.
+    @router.get("/api/account/layout")
+    def account_layout() -> JSONResponse:
+        return JSONResponse(layout_store.load())
+
+    @router.post("/api/account/layout")
+    def account_layout_save(payload: dict[str, Any] = Body(default_factory=dict)) -> JSONResponse:
+        try:
+            return JSONResponse(layout_store.save(payload))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @router.delete("/api/account/layout")
+    def account_layout_clear() -> JSONResponse:
+        return JSONResponse(layout_store.clear())
 
     @router.get("/api/refactor/dashboard")
     def refactor_dashboard() -> JSONResponse:
@@ -374,8 +409,9 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260730-ops-overview-1" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260803-gnn-3d-2-visualization-toggle-1" />
   <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
+  <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
 <body>
   <main class="terminal-shell">
@@ -391,6 +427,9 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <span class="connection"><i></i><b id="feed-state">데이터 연결 확인 중</b></span>
         <span class="status-chip" id="terminal-mode">SHADOW</span>
         <time id="terminal-clock">--:--:--</time>
+        <button type="button" id="layout-reset" title="저장된 배치를 지우고 기본 배치로 되돌립니다" hidden>초기화</button>
+        <button type="button" id="layout-save" title="현재 프레임 크기를 서버에 저장합니다" hidden>레이아웃 저장</button>
+        <button type="button" id="layout-toggle" aria-label="레이아웃 밀도 전환" title="기본(세로) 레이아웃으로 전환">⤢</button>
         <button type="button" id="terminal-refresh" aria-label="새로고침">↻</button>
       </div>
     </header>
@@ -639,6 +678,56 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       </section>
     </section>
 
+    <section class="terminal-panel gnn-model-panel" id="gnn-model-panel">
+      <div class="panel-head gnn-model-head">
+        <div>
+          <p class="panel-kicker">TRAINED R-GCN · LIVE INFERENCE</p>
+          <h2>학습·추론 GNN 네트워크</h2>
+          <p class="gnn-model-summary" id="gnn-model-summary">학습 체크포인트와 최근 추론 기록을 불러오는 중입니다.</p>
+        </div>
+        <div class="gnn-model-actions">
+          <span class="status-chip waiting" id="gnn-model-status">LOADING</span>
+          <button type="button" class="gnn-visualization-toggle" id="gnn-visualization-toggle" aria-pressed="false">3D 시각화 켜기</button>
+          <button type="button" class="gnn-relation-filter active" data-gnn-relation="all">전체 연결</button>
+          <button type="button" class="gnn-relation-filter" data-gnn-relation="learned_parameter">학습 파라미터</button>
+          <button type="button" class="gnn-relation-filter" data-gnn-relation="strategy_topology">전략 토폴로지</button>
+          <button type="button" class="gnn-relation-filter" data-gnn-relation="same_methodology_family">동일 계열</button>
+          <button type="button" class="gnn-relation-filter" data-gnn-relation="confirming_methodology">상호 확인</button>
+          <button type="button" class="gnn-relation-filter" data-gnn-relation="contrasting_methodology">대조 관계</button>
+          <button type="button" id="gnn-reset-view">전체 맞춤</button>
+        </div>
+      </div>
+      <div class="gnn-model-metrics">
+        <div><span>학습 표본</span><strong id="gnn-training-size">-</strong></div>
+        <div><span>검증 정확도</span><strong id="gnn-validation-accuracy">-</strong></div>
+        <div><span>그래프 크기</span><strong id="gnn-graph-size">-</strong></div>
+        <div><span>최근 추론</span><strong id="gnn-inference-size">-</strong></div>
+      </div>
+      <div class="gnn-model-stage">
+        <canvas id="gnn-model-canvas" aria-label="학습된 전략 R-GCN 관계 및 실시간 추론 그래프"></canvas>
+        <div class="gnn-visualization-paused" id="gnn-visualization-paused">
+          <strong>3D 시각화 꺼짐</strong><span>학습과 추론은 백그라운드에서 계속 실행됩니다.</span>
+        </div>
+        <div class="gnn-inference-live idle" id="gnn-inference-live">
+          <i></i><div><strong id="gnn-inference-live-state">INFERENCE IDLE</strong><small id="gnn-inference-live-detail">최근 추론 신호 대기</small></div>
+        </div>
+        <div class="gnn-phase-track" id="gnn-phase-track">
+          <span data-gnn-phase="input">01 INPUT</span><span data-gnn-phase="message_passing">02 MESSAGE</span><span data-gnn-phase="strategy_election">03 ELECTION</span><span data-gnn-phase="output_decode">04 OUTPUT</span>
+        </div>
+        <div class="gnn-model-tooltip" id="gnn-model-tooltip" hidden></div>
+        <aside class="gnn-model-inspector" id="gnn-model-inspector">
+          <span>MODEL INSPECTOR</span>
+          <h3>전략 노드를 선택하세요</h3>
+          <p>노드 크기는 학습된 출력 헤드 강도, 선의 밝기는 관계별 메시지 가중치를 나타냅니다.</p>
+        </aside>
+      </div>
+      <div class="gnn-relation-legend">
+        <span class="momentum">모멘텀</span><span class="breakout">돌파</span><span class="reversion">회귀</span><span class="relative">상대강도</span>
+        <i></i><small>실선: 학습에 사용된 R-GCN 관계 · 밝기: 학습된 관계 가중치</small>
+      </div>
+      <p class="gnn-model-provenance" id="gnn-model-provenance"></p>
+    </section>
+
     <section class="selection-strip">
       <div class="section-label">
         <span>01</span>
@@ -793,8 +882,11 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260730-entry-trust-v2"></script>
+  <script src="/static/strategy_terminal.js?v=20260803-gnn-visualization-toggle-1"></script>
   <script src="/static/operations_overview.js?v=20260730-entry-trust-v2"></script>
+  <!-- Loaded last: it re-parents the panels into resizable layers, so every
+       other module has already bound its handlers to the elements it moves. -->
+  <script src="/static/terminal_layout.js?v=20260802-movable-frames-2"></script>
 </body>
 </html>
 """

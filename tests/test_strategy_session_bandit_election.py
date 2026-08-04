@@ -179,6 +179,27 @@ def test_election_context_omits_the_rank_when_the_sector_is_unknown(tmp_path):
     assert "sector_candidate_count" not in context
 
 
+def test_election_context_carries_measured_live_session_diagnostics(tmp_path):
+    micro_result = SimpleNamespace(
+        symbol="005930",
+        diagnostics={
+            "opening_range_high": 71_000.0,
+            "opening_range_low": 69_500.0,
+            "opening_range_minutes": 30,
+            "first_half_hour_return_bps": 85.0,
+            "first_half_hour_volatility_percentile": .8,
+        },
+    )
+    context = _manager(tmp_path)._election_context(  # noqa: SLF001
+        "opening_range_breakout", NOW,
+        micro_result=micro_result, symbol="005930", macro=_macro(),
+    )
+    assert context["opening_range_high"] == 71_000.0
+    assert context["opening_range_low"] == 69_500.0
+    assert context["first_half_hour_return_bps"] == 85.0
+    assert context["first_half_hour_volatility_percentile"] == .8
+
+
 def test_change_point_stand_down_prevents_election(tmp_path):
     manager = _manager(tmp_path)
     macro = _macro(change_point_probability=0.85)

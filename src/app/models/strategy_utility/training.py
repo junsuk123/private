@@ -26,7 +26,7 @@ def train_counterfactual_checkpoint(
     output: str | Path,
     *,
     ridge: float = 1.0,
-    input_feature_schema: str = "counterfactual_quantiles_v1",
+    input_feature_schema: str = "counterfactual_quantiles_v2_session_structure",
     authorize_live_shadow: bool = False,
 ) -> dict[str, object]:
     """Calibrate strategy heads on causal stored counterfactual labels.
@@ -174,7 +174,10 @@ def train_counterfactual_checkpoint(
             ),
         ],
         "relation_names": list(RELATION_NAMES) if graph_schema else ["context"],
-        "training_data_range": {"start": None, "end": None},
+        "training_data_range": {
+            "start": min((row.as_of.isoformat() for row in rows), default=None),
+            "end": max((row.label_end.isoformat() for row in rows), default=None),
+        },
         "training_method": method,
         "validation_metrics": validation_metrics,
         "checkpoint_hash": _checkpoint_hash(checkpoint),
@@ -182,7 +185,7 @@ def train_counterfactual_checkpoint(
         "feature_provenance": (
             "causal_minute_bar_microstructure_proxy_v1"
             if input_feature_schema == "realtime_strategy_graph_v4_market"
-            else "causal_counterfactual_quantiles_v1"
+            else "causal_counterfactual_quantiles_v2_session_structure"
         ),
         "live_authorized": live_shadow_authorized,
         "authorization_scope": "ontology_gnn_realtime_trust_gated_execution",
@@ -207,32 +210,60 @@ def train_counterfactual_checkpoint(
 
 def _label_outcome_summary(
     rows: tuple[CounterfactualLabel, ...],
-) -> dict[str, dict[str, float | int | None]]:
-    summary: dict[str, dict[str, float | int | None]] = {}
+) -> dict[str, dict[str, float | int | str | None]]:
+    summary: dict[str, dict[str, float | int | str | None]] = {}
     for strategy_id in STRATEGY_IDS:
         selected = [row for row in rows if row.strategy_id == strategy_id]
         simulated_filled = [row for row in selected if row.filled]
         filled = [row for row in selected if row.triggered and row.filled]
         positive = [row for row in filled if row.net_return_bps > 0]
+        mean_net = (
+            float(np.mean([row.net_return_bps for row in filled]))
+            if filled
+            else None
+        )
+        mean_cost = (
+            float(np.mean([row.all_in_cost_bps for row in filled]))
+            if filled
+            else None
+        )
+        mean_gross = (
+            float(
+                np.mean(
+                    [row.net_return_bps + row.all_in_cost_bps for row in filled]
+                )
+            )
+            if filled
+            else None
+        )
+        if not selected or not any(row.triggered for row in selected):
+            diagnosis = "NO_TRIGGERED_SAMPLES"
+        elif len(filled) < 20:
+            diagnosis = "INSUFFICIENT_FILLED_SAMPLES"
+        elif mean_gross is not None and mean_gross <= 0:
+            diagnosis = "GROSS_EDGE_NON_POSITIVE"
+        elif mean_net is not None and mean_net <= 0:
+            diagnosis = "EXECUTION_COST_EXCEEDS_GROSS_EDGE"
+        else:
+            diagnosis = "POSITIVE_NET_EDGE_OBSERVED"
         summary[strategy_id] = {
             "labels": len(selected),
             "triggered": sum(row.triggered for row in selected),
+            "trigger_rate": (
+                sum(row.triggered for row in selected) / len(selected)
+                if selected
+                else None
+            ),
             "simulated_filled": len(simulated_filled),
             "filled": len(filled),
             "positive_net": len(positive),
             "positive_net_rate_when_filled": (
                 len(positive) / len(filled) if filled else None
             ),
-            "mean_net_return_bps_when_filled": (
-                float(np.mean([row.net_return_bps for row in filled]))
-                if filled
-                else None
-            ),
-            "mean_cost_bps_when_filled": (
-                float(np.mean([row.cost_bps for row in filled]))
-                if filled
-                else None
-            ),
+            "mean_gross_return_bps_when_filled": mean_gross,
+            "mean_net_return_bps_when_filled": mean_net,
+            "mean_cost_bps_when_filled": mean_cost,
+            "performance_diagnosis": diagnosis,
         }
     return summary
 
@@ -570,6 +601,19 @@ def _raw_target(row: CounterfactualLabel) -> tuple[float, ...]:
     boundary_uncertainty = 0.15 + 0.85 * float(
         np.exp(-abs(row.net_return_bps) / 20.0)
     )
+    # --- Borrow leg (channels 8-10) ---------------------------------------- #
+    # The head grew from 8 to 11 channels when shorts arrived, but these targets
+    # did not, so every retrain died on a (…,11) vs (…,8) broadcast and the only
+    # possible checkpoint was one the runtime refuses to load. The decoder's
+    # scaling is mirrored exactly: cost is softplus(raw)*10, locate probability
+    # is sigmoid(raw), epistemic is softplus(raw).
+    borrow_cost_target = _inverse_softplus(max(0.01, float(row.borrow_cost_bps or 0.0) / 10.0))
+    borrow_available_target = 2.0 if row.borrow_available else -2.0
+    # Epistemic uncertainty is model IGNORANCE, so the honest per-row proxy is
+    # whether this row is evidence at all: an unfilled counterfactual is the
+    # model extrapolating, a realized fill is the model being corrected. No
+    # invented constant - a row that never traded carries the higher target.
+    epistemic_target = _inverse_softplus(0.25 if (row.triggered and row.filled) else 1.0)
     return (
         2.0 if positive else -2.0,
         float(np.clip(gross / 25.0, -5.0, 5.0)),
@@ -579,6 +623,9 @@ def _raw_target(row: CounterfactualLabel) -> tuple[float, ...]:
         2.0 if row.filled else -2.0,
         _inverse_softplus(15.0),
         _inverse_softplus(boundary_uncertainty),
+        borrow_cost_target,
+        borrow_available_target,
+        epistemic_target,
     )
 
 
@@ -586,6 +633,14 @@ def _target_mask(row: CounterfactualLabel) -> tuple[float, ...]:
     realized = 1.0 if row.triggered and row.filled else 0.0
     positive = 1.0 if realized and row.net_return_bps > 0.0 else 0.0
     negative = 1.0 if realized and row.net_return_bps <= 0.0 else 0.0
+    # A cash long has no borrow leg, and the decoder already masks channels 8/9
+    # to short strategies. Training them on long rows would fit noise into a
+    # tensor the runtime then ignores - or, if the mask ever moved, teach the
+    # model to charge a long an invented borrow cost. Unobserved locates are
+    # equally excluded: "we did not ask the desk" is not "no inventory".
+    is_short = 1.0 if row.is_short else 0.0
+    borrow_cost_observed = is_short if row.borrow_cost_bps is not None else 0.0
+    borrow_locate_observed = is_short if row.borrow_available is not None else 0.0
     return (
         1.0,
         realized,
@@ -595,6 +650,9 @@ def _target_mask(row: CounterfactualLabel) -> tuple[float, ...]:
         1.0,
         realized,
         realized,
+        borrow_cost_observed,
+        borrow_locate_observed,
+        1.0,
     )
 
 

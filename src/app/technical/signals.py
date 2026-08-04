@@ -113,6 +113,7 @@ class TechnicalFeatureSet:
     return_1s: float | None = None
     return_5s: float | None = None
     return_10s: float | None = None
+    return_30s: float | None = None
     tick_count_1s: float | None = None
     tick_count_5s: float | None = None
     volume_1s_log: float | None = None

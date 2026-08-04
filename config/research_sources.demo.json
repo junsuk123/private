@@ -1,7 +1,7 @@
 {
   "known_tickers": {
-    "005930": "Samsung Electronics",
-    "000660": "SK hynix"
+    "900001": "Demo issuer 1",
+    "900002": "Demo issuer 2"
   },
   "rss_feeds": [
     "../data/fixtures/sample_news.xml"

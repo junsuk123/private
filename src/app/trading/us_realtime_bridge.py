@@ -337,6 +337,9 @@ def _extract_price_book(payload: dict[str, Any]) -> dict[str, float]:
     )
     bid = _first_float(
         flat,
+        # KIS HDFSASP0 / HHDFS76200100: p*=price, v*=size, d*=change.
+        # Treating dbid1/dask1 as prices admitted values such as 5/706 for a
+        # $16 stock and poisoned both live features and forward labels.
         "pbid1",
         "bidp1",
         "ovrs_bidp",
@@ -357,6 +360,7 @@ def _extract_price_book(payload: dict[str, Any]) -> dict[str, float]:
         flat,
         "vbid1",
         "bidv1",
+        "bvol",
         "bid_size",
         "best_bid_size",
         "total_bid_volume",
@@ -365,6 +369,7 @@ def _extract_price_book(payload: dict[str, Any]) -> dict[str, float]:
         flat,
         "vask1",
         "askv1",
+        "avol",
         "ask_size",
         "best_ask_size",
         "total_ask_volume",
@@ -386,6 +391,20 @@ def _extract_price_book(payload: dict[str, Any]) -> dict[str, float]:
         raise RuntimeError(f"INVALID_BID_ASK_FIELDS bid={bid} ask={ask} keys={sorted(flat.keys())[:80]}")
     if last is None:
         raise RuntimeError(f"MISSING_LAST_PRICE_FIELDS keys={sorted(flat.keys())[:80]}")
+    midpoint = (bid + ask) / 2.0
+    spread_bps = (ask - bid) / midpoint * 10_000.0
+    try:
+        maximum_source_spread_bps = max(
+            100.0,
+            float(os.getenv("REALTIME_US_REST_MAX_SOURCE_SPREAD_BPS", "2000")),
+        )
+    except (TypeError, ValueError):
+        maximum_source_spread_bps = 2000.0
+    if spread_bps > maximum_source_spread_bps:
+        raise RuntimeError(
+            "IMPLAUSIBLE_BID_ASK_SPREAD "
+            f"bid={bid} ask={ask} last={last} spread_bps={spread_bps:.2f}"
+        )
 
     return {
         "last": float(last),

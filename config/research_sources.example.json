@@ -1,7 +1,5 @@
 {
   "known_tickers": {
-    "005930": "Samsung Electronics",
-    "000660": "SK hynix",
     "AAPL": "Apple",
     "MSFT": "Microsoft",
     "NVDA": "NVIDIA",
@@ -15,13 +13,6 @@
   "dynamic_pages": [],
   "stooq_symbols": [],
   "yahoo_chart_symbols": [
-    {
-      "symbol": "005930.KS",
-      "ticker": "005930",
-      "market": "KOSPI",
-      "company_name": "Samsung Electronics",
-      "sector": "Semiconductor"
-    },
     {
       "symbol": "AAPL",
       "ticker": "AAPL",

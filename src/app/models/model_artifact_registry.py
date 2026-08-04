@@ -68,7 +68,14 @@ class ModelArtifactRegistry:
         artifact_id = str(artifact["artifact_id"])
         path = self.root / f"{artifact_id}.json"
         incumbent = self._read_latest_payload()
-        promoted, reason = _promotion_decision(artifact, incumbent)
+        candidate_stale = evaluate_model_staleness(artifact).stale
+        incumbent_stale = bool(incumbent) and self.staleness().stale
+        promoted, reason = _promotion_decision(
+            artifact,
+            incumbent,
+            candidate_stale=candidate_stale,
+            incumbent_stale=incumbent_stale,
+        )
         deployment_state = self._record_challenger(artifact, promoted)
         artifact["deployment"] = {
             "promoted": promoted,
@@ -87,7 +94,57 @@ class ModelArtifactRegistry:
             # becomes the active model. Threshold eligibility alone is not
             # sufficient to replace a stronger production model.
             _atomic_write_text(self.latest_path, payload)
+        self._prune_saved_artifacts(
+            protected_artifact_ids={
+                artifact_id,
+                str((incumbent or {}).get("artifact_id") or ""),
+            }
+        )
         return path
+
+    def _prune_saved_artifacts(self, *, protected_artifact_ids: set[str]) -> int:
+        """Bound challenger history without ever removing the active model.
+
+        Training creates a challenger every cycle. On a continuously running
+        workstation that otherwise leaves thousands of JSON files in a synced
+        directory, making status checks and backup/sync progressively slower.
+        ``latest.json`` and deployment state are sidecars and are never matched.
+        """
+        try:
+            limit = max(
+                2,
+                int(float(os.getenv("LIVE_MODEL_ARTIFACT_RETENTION_COUNT", "512"))),
+            )
+        except (TypeError, ValueError):
+            limit = 512
+        try:
+            candidates = sorted(
+                (
+                    candidate
+                    for candidate in self.root.glob("live_short_horizon.*.json")
+                    if candidate.is_file()
+                ),
+                key=lambda candidate: candidate.name,
+                reverse=True,
+            )
+        except OSError:
+            return 0
+        keep = set(candidates[:limit])
+        keep.update(
+            self.root / f"{artifact_id}.json"
+            for artifact_id in protected_artifact_ids
+            if artifact_id
+        )
+        removed = 0
+        for candidate in candidates:
+            if candidate in keep:
+                continue
+            try:
+                candidate.unlink()
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
     def _read_latest_payload(self) -> dict[str, Any] | None:
         if not self.latest_path.exists():
@@ -235,11 +292,18 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _promotion_decision(
     candidate: dict[str, Any],
     incumbent: dict[str, Any] | None,
+    *,
+    candidate_stale: bool = False,
+    incumbent_stale: bool = False,
 ) -> tuple[bool, str]:
     if candidate.get("live_eligible") is not True:
         return False, "NOT_LIVE_ELIGIBLE"
     if not incumbent or incumbent.get("live_eligible") is not True:
         return True, "FIRST_LIVE_ELIGIBLE_MODEL"
+    if candidate_stale:
+        return False, "CHALLENGER_STALE"
+    if incumbent_stale:
+        return True, "STALE_INCUMBENT_REPLACED"
 
     candidate_metrics = candidate.get("metrics") or {}
     incumbent_metrics = incumbent.get("metrics") or {}

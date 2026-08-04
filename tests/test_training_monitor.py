@@ -92,4 +92,4 @@ def test_strategy_terminal_includes_training_monitor() -> None:
     assert response.status_code == 200
     assert 'id="training-performance-chart"' in response.text
     assert 'id="training-data-chart"' in response.text
-    assert "20260730-ops-overview-1" in response.text
+    assert "20260803-gnn-3d-2-visualization-toggle-1" in response.text

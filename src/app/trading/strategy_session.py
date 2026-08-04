@@ -389,7 +389,14 @@ class _ElectionProposal:
 
     @property
     def submits_orders(self) -> bool:
-        return self.deployment_state.submits_orders
+        # Deployment authorisation is necessary but a live SHORT also needs a
+        # point-in-time locate.  Keeping the proposal when the locate is absent is
+        # intentional: SHADOW must record the unexecutable signal so borrow health
+        # and signal quality can accumulate.  Only the broker-facing capability is
+        # removed here.
+        return self.deployment_state.submits_orders and (
+            not self.is_short or self.borrow_snapshot is not None
+        )
 
     def directional_key(self, market: str) -> DirectionalStrategyKey:
         return DirectionalStrategyKey(
@@ -1301,21 +1308,11 @@ class StrategySessionManager:
                     f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
                 )
                 continue
-            if direction is PositionDirection.SHORT and borrow_snapshot is None:
-                # No locate: not a candidate in ANY state. Even a SHADOW plan is
-                # journaled as signal-valid-but-unexecutable rather than as a trade,
-                # so it cannot contribute to the promotion statistics.
-                self._state.last_reason = ",".join(borrow_reasons) or (
-                    ShortReasonCodes.BORROW_UNAVAILABLE
-                )
-                continue
-            if direction is PositionDirection.LONG:
-                authorized, authorization_reason = self._deployment_authorized(
-                    selected_strategy
-                )
-                if not authorized:
-                    self._state.last_reason = authorization_reason
-                    continue
+            # Do not discard SHADOW arms here.  Their proposals are the only
+            # causal source of forward outcomes used to decide whether they can
+            # ever be promoted.  A missing short locate is likewise journaled as
+            # signal-valid-but-unexecutable; ``submits_orders`` still prevents an
+            # order even if the deployment controller says LIVE.
             if _macro_permits(bundle, selected_strategy) is False:
                 self._state.last_reason = (
                     f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
@@ -1466,18 +1463,8 @@ class StrategySessionManager:
                     f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
                 )
                 continue
-            if direction is PositionDirection.SHORT and borrow_snapshot is None:
-                self._state.last_reason = ",".join(borrow_reasons) or (
-                    ShortReasonCodes.BORROW_UNAVAILABLE
-                )
-                continue
-            if direction is PositionDirection.LONG:
-                authorized, authorization_reason = self._deployment_authorized(
-                    selected_strategy
-                )
-                if not authorized:
-                    self._state.last_reason = authorization_reason
-                    continue
+            # Preserve non-authorised and no-locate arms as SHADOW evidence.
+            # Order capability is derived separately by ``submits_orders``.
             # The shadow evidence path does not know the macro regime, so it
             # would happily arm a strategy family the macro layer has blocked.
             # The supervisor would then flag it every cycle; refuse it here.

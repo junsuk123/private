@@ -20,7 +20,7 @@ from app.data.realtime_store import RealtimeMarketDataStore
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check realtime market-data freshness without orders.")
-    parser.add_argument("--symbols", nargs="+", default=["005930"])
+    parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument("--duration-seconds", type=int, default=0)
     parser.add_argument("--fixture", type=Path, default=None)
     parser.add_argument("--db-path", type=Path, default=Path("data/store/realtime_market_data.sqlite3"))

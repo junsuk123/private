@@ -271,6 +271,7 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         return_1s=g("return_1s"),
         return_5s=g("return_5s"),
         return_10s=g("return_10s"),
+        return_30s=g("return_30s"),
         tick_count_1s=g("tick_count_1s"),
         tick_count_5s=g("tick_count_5s"),
         volume_1s_log=g("volume_1s_log"),

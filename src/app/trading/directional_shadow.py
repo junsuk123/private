@@ -352,6 +352,7 @@ class _OpenWalk:
     best_price: float | None = None
     worst_price: float | None = None
     fill_ratio: float = 1.0
+    last_observed_at: datetime | None = None
 
 
 class ShadowFillSimulator:
@@ -438,6 +439,12 @@ class ShadowFillSimulator:
             # same instant, not a later one.
             if quote.observed_at <= walk.plan.signal_at:
                 continue
+            # The engine may reuse its latest cached book across several cycles.
+            # Advancing twice on the same timestamp creates a fictional zero-time
+            # exit (often an immediate spread-driven stop) from one observation.
+            if walk.last_observed_at is not None and quote.observed_at <= walk.last_observed_at:
+                continue
+            walk.last_observed_at = quote.observed_at
             outcome = self._advance(walk, quote)
             if outcome is not None:
                 resolved.append(outcome)
@@ -489,6 +496,12 @@ class ShadowFillSimulator:
     @property
     def open_plan_count(self) -> int:
         return len(self._open)
+
+    @property
+    def open_symbols(self) -> tuple[str, ...]:
+        """Symbols that still need post-signal quotes, in stable order."""
+
+        return tuple(dict.fromkeys(walk.plan.symbol for walk in self._open.values()))
 
     # -- internals ---------------------------------------------------------- #
     def _advance(self, walk: _OpenWalk, quote: QuoteObservation) -> ShadowOutcome | None:

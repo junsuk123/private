@@ -473,6 +473,11 @@ policy가 라이브 판단 근거로 명시적으로 거부하는 데이터입�
 
 ### 15.5 남은 작업
 
+세션 기반 숏 2개(`opening_range_breakdown`, `market_intraday_momentum_short`)는 long 경로와
+같은 `app.features.session_structure` 산출물을 받도록 배선되었다. 이는 영구 무력 상태를
+해제한 것일 뿐 실거래 승격이 아니다. 둘 다 아래 대주 데이터 선행 조건과 별도 배포 사다리를
+그대로 적용받으며 현재 상태는 전량 `SHADOW`, 주문 권한은 0이다.
+
 1. **올바른 대주 조회 확정** — 이것이 첫 단추입니다. KIS 문서에서 대주 TR을 확인하거나,
    `config/borrow_availability.json`을 운영자가 유지합니다. 그전까지 저널은 비어 있고
    숏은 shadow 표본을 쌓지 못합니다. **사다리는 끝까지 배선되어 있으나 가동 중지입니다.**

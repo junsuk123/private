@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 from app.data.market_data_health import evaluate_market_data_health
 from app.data.realtime_types import KIS_REALTIME_SOURCE
@@ -13,6 +15,10 @@ from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.feature_provenance import FeatureProvenance
 from app.features.feature_schema import FeatureSchema, LIVE_SHORT_HORIZON_SCHEMA
 from app.features.news_sentiment_store import NewsSentimentStore
+from app.features import session_structure
+
+
+_FEATURE_JOURNAL_LOCK = threading.Lock()
 
 
 class FeatureFrameError(RuntimeError):
@@ -28,6 +34,7 @@ class LiveFeatureFrame:
     provenance: FeatureProvenance
     mark_price: float = 0.0
     mark_source: str = "unknown"
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def feature_schema_hash(self) -> str:
@@ -176,6 +183,11 @@ class LiveFeatureFrameBuilder:
             decision_time,
             float(prices[-1]),
         )
+        session_diagnostics = (
+            _session_structure_diagnostics(self.store, symbol, decision_time)
+            if not is_us
+            else {}
+        )
         second_features = _second_level_features(
             ticks,
             orderbooks,
@@ -221,6 +233,7 @@ class LiveFeatureFrameBuilder:
             provenance,
             float(prices[-1]),
             "tick" if ticks else "orderbook_mid",
+            session_diagnostics,
         )
         frame.validate()
         self._journal(frame)
@@ -272,17 +285,46 @@ class LiveFeatureFrameBuilder:
         return value if math.isfinite(value) else 0.0
 
     def _journal(self, frame: LiveFeatureFrame) -> None:
+        try:
+            provenance_limit = max(
+                1,
+                int(os.getenv("LIVE_FEATURE_JOURNAL_PROVENANCE_ID_LIMIT", "64")),
+            )
+        except (TypeError, ValueError):
+            provenance_limit = 64
         payload = {
             "symbol": frame.symbol,
             "decision_time": frame.decision_time.isoformat(),
             "feature_schema_hash": frame.feature_schema_hash,
             "mark_price": frame.mark_price,
             "mark_source": frame.mark_source,
-            "source_record_ids": frame.provenance.source_record_ids,
+            # Full provenance remains in the realtime SQLite store. Persisting
+            # every tick ID here made each transient journal row tens of KB.
+            "source_record_ids": frame.provenance.source_record_ids[-provenance_limit:],
             "values": frame.as_feature_dict(),
+            "diagnostics": dict(frame.diagnostics),
         }
-        with self.journal_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+        try:
+            maximum_bytes = max(
+                16 * 1024 * 1024,
+                int(float(os.getenv("LIVE_FEATURE_JOURNAL_MAX_BYTES", str(256 * 1024 * 1024)))),
+            )
+        except (TypeError, ValueError):
+            maximum_bytes = 256 * 1024 * 1024
+        with _FEATURE_JOURNAL_LOCK:
+            if self.journal_path.exists() and self.journal_path.stat().st_size >= maximum_bytes:
+                # Labelled rows have already been materialized. Atomic rotation
+                # keeps collection continuous and bounds this transient source log.
+                rotated = self.journal_path.with_suffix(self.journal_path.suffix + ".rotated")
+                try:
+                    if rotated.exists():
+                        rotated.unlink()
+                    os.replace(self.journal_path, rotated)
+                    rotated.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            with self.journal_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
 
 
 def _technical_columns(prices: list[float], volumes: list[float]) -> dict[str, float]:
@@ -476,6 +518,89 @@ def _rvgi_box_columns(
                 else 0.0
             ),
         )
+    return result
+
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _session_structure_diagnostics(
+    store: RealtimeMarketDataStore,
+    symbol: str,
+    decision_time: datetime,
+    *,
+    minimum_samples: int = 3,
+) -> dict[str, Any]:
+    """Measured KRX opening context from completed bars, absent when unanswerable."""
+    try:
+        raw = store.recent_minute_bars(
+            symbol,
+            decision_time - timedelta(days=14),
+            limit=1600,
+        )
+    except Exception:  # noqa: BLE001 - unavailable context must fail closed.
+        return {}
+    bars = tuple(
+        bar
+        for bar in raw
+        if bar.minute_start + timedelta(minutes=1) <= decision_time
+    )
+    local = decision_time.astimezone(_KST)
+    session_open = local.replace(hour=9, minute=0, second=0, microsecond=0)
+    current_day = local.date()
+    current_bars = tuple(
+        bar for bar in bars if bar.minute_start.astimezone(_KST).date() == current_day
+    )
+    observed = session_structure.opening_range(
+        current_bars,
+        session_open=session_open,
+        minutes=30,
+        now=decision_time,
+    )
+    if observed is None:
+        return {}
+
+    previous = tuple(
+        bar for bar in bars if bar.minute_start.astimezone(_KST).date() < current_day
+    )
+    previous_close = float(previous[-1].close) if previous else 0.0
+    opening_return = session_structure.first_half_hour_return_bps(
+        current_bars,
+        previous_close=previous_close,
+        session_open=session_open,
+        minutes=30,
+        now=decision_time,
+    )
+
+    by_day: dict[Any, list[Any]] = {}
+    for bar in previous:
+        day = bar.minute_start.astimezone(_KST).date()
+        by_day.setdefault(day, []).append(bar)
+    historical_volatility: list[float] = []
+    for day, day_bars in sorted(by_day.items()):
+        day_open = datetime(day.year, day.month, day.day, 9, 0, tzinfo=_KST)
+        prior_range = session_structure.opening_range(
+            day_bars,
+            session_open=day_open,
+            minutes=30,
+            now=day_open + timedelta(days=1),
+        )
+        if prior_range is not None:
+            historical_volatility.append(prior_range.volatility)
+    volatility_percentile = session_structure.first_half_hour_volatility_percentile(
+        historical_volatility,
+        observed.volatility,
+        minimum_samples=minimum_samples,
+    )
+    result: dict[str, Any] = {
+        "opening_range_high": observed.high,
+        "opening_range_low": observed.low,
+        "opening_range_minutes": observed.minutes,
+    }
+    if opening_return is not None:
+        result["first_half_hour_return_bps"] = opening_return
+    if volatility_percentile is not None:
+        result["first_half_hour_volatility_percentile"] = volatility_percentile
     return result
 
 

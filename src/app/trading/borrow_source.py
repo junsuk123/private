@@ -121,7 +121,7 @@ class FileBorrowSource:
           "observed_at": "2026-08-02T09:05:00+09:00",
           "source": "kis-web-ui",
           "symbols": {
-            "005930": {"available": true, "quantity": 500, "fee_bps_annualised": 800},
+            "SYMBOL_A": {"available": true, "quantity": 500, "fee_bps_annualised": 800},
             "000660": {"available": false, "reason": "no inventory"}
           }
         }

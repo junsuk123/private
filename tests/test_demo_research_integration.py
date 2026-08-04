@@ -20,11 +20,11 @@ class DemoResearchIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(len(context.events), len(research.events))
         self.assertTrue(
             any(
-                triple.predicate == "hasRecentNews" and triple.subject == "005930"
+                triple.predicate == "hasRecentNews" and triple.subject == "900001"
                 for triple in context.graph.triples()
             )
         )
-        self.assertTrue(any(path.ticker == "005930" for path in context.reasoning_paths))
+        self.assertTrue(any(path.ticker == "900001" for path in context.reasoning_paths))
 
 
 if __name__ == "__main__":

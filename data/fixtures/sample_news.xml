@@ -3,15 +3,15 @@
   <channel>
     <title>Sample Market News</title>
     <item>
-      <title>005930 memory profit growth beats expectations</title>
-      <description>Samsung Electronics 005930 reports semiconductor profit growth and record HBM demand from AI server customers.</description>
-      <link>https://example.test/news/005930-memory-growth</link>
+      <title>900001 profit growth beats expectations</title>
+      <description>Demo issuer 1 (900001) reports profit growth and record demand from enterprise customers.</description>
+      <link>https://example.test/news/900001-growth</link>
       <pubDate>Wed, 10 Jun 2026 09:00:00 GMT</pubDate>
     </item>
     <item>
-      <title>000660 valuation pressure rises as macro rate risk increases</title>
-      <description>SK hynix 000660 keeps strong memory growth, but higher treasury yield and valuation pressure increase risk for aggressive buying.</description>
-      <link>https://example.test/news/000660-rate-risk</link>
+      <title>900002 valuation pressure rises as macro rate risk increases</title>
+      <description>Demo issuer 2 (900002) keeps strong growth, but higher treasury yield and valuation pressure increase risk for aggressive buying.</description>
+      <link>https://example.test/news/900002-rate-risk</link>
       <pubDate>Wed, 10 Jun 2026 10:00:00 GMT</pubDate>
     </item>
   </channel>

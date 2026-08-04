@@ -1,0 +1,234 @@
+/* ==========================================================================
+   MOVABLE, RESIZABLE FRAME LAYOUT
+   The dense terminal packs every panel onto one screen, but which panel
+   deserves the pixels changes with the shift: during the open the price chart
+   earns its height, while a stalled entry chain makes the blockade panel the
+   only thing worth reading. So terminal_layout.js re-parents the panels into
+   layers > columns > frames and puts a splitter between neighbours - the CSS
+   grid in strategy_terminal.css stays as the no-JS fallback and as the layout
+   the reset button restores.
+
+   Sizes live in flex-grow, never pixels: an arrangement made on a laptop then
+   means the same thing on a desk monitor.
+   ========================================================================== */
+@media (min-width: 1200px) and (min-height: 680px) {
+  body:not(.classic-layout) .terminal-shell.tl-managed {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    width: 100%;
+    max-width: none;
+    height: 100vh;
+    padding: 6px 8px;
+    overflow: hidden;
+  }
+  body:not(.classic-layout) .terminal-shell.tl-managed > .terminal-header,
+  body:not(.classic-layout) .terminal-shell.tl-managed > .terminal-footer {
+    flex: 0 0 auto;
+  }
+
+  .tl-layer {
+    display: flex;
+    flex-direction: row;
+    flex-basis: 0;
+    min-width: 0;
+    min-height: 0;
+  }
+  .tl-col {
+    display: flex;
+    flex-direction: column;
+    flex-basis: 0;
+    min-width: 0;
+    min-height: 0;
+  }
+  /* Same treatment the grid layout gives its cells: every frame owns its own
+     scrollbar so a deep panel never pushes the page past one screen. */
+  .tl-col > * {
+    position: relative;
+    flex-basis: 0;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #24344a transparent;
+  }
+
+  /* ------------------------------------------------------------- splitters */
+  .tl-layer > .tl-grip,
+  .tl-col > .tl-grip,
+  .terminal-shell.tl-managed > .tl-grip {
+    position: relative;
+    flex: 0 0 7px;
+    align-self: stretch;
+    margin: 0;
+    overflow: visible;
+    border-radius: 4px;
+    background: transparent;
+    transition: background .14s ease;
+    touch-action: none;
+  }
+  .tl-grip::after {
+    content: "";
+    position: absolute;
+    inset: 50% auto auto 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 3px;
+    background: #22303f;
+    transition: background .14s ease, box-shadow .14s ease;
+  }
+  .tl-grip-x { cursor: col-resize; }
+  .tl-grip-x::after { width: 2px; height: 26px; }
+  .tl-grip-y { cursor: row-resize; width: auto; }
+  .tl-grip-y::after { width: 26px; height: 2px; }
+  .tl-grip:hover, .tl-grip.tl-active { background: rgba(57, 215, 231, .07); }
+  .tl-grip:hover::after, .tl-grip.tl-active::after {
+    background: var(--cyan);
+    box-shadow: 0 0 8px rgba(57, 215, 231, .6);
+  }
+  .tl-grip:focus-visible { outline: 1px solid var(--cyan); outline-offset: -1px; }
+
+  /* A drag must not select the text under the pointer, and the resize cursor
+     has to survive leaving the 7px splitter mid-drag. */
+  body.tl-dragging { user-select: none; }
+  body.tl-dragging.tl-dragging-x, body.tl-dragging.tl-dragging-x * { cursor: col-resize !important; }
+  body.tl-dragging.tl-dragging-y, body.tl-dragging.tl-dragging-y * { cursor: row-resize !important; }
+  /* Canvases repaint on their own interval; freezing pointer events during the
+     drag keeps a chart from swallowing the pointermove stream. */
+  body.tl-dragging .tl-col > *:not(.tl-grip) { pointer-events: none; }
+
+  /* ----------------------------------------------------------- move handle */
+  /* Sticky and zero-height: the handle stays pinned to the frame's top-right
+     while the frame's own content scrolls under it, and it claims no layout
+     row of its own. grid-column covers the frames that are grid containers
+     (diagnostics, workspace), where a stray child would otherwise eat a cell. */
+  .tl-frame-tools {
+    position: sticky;
+    top: 0;
+    z-index: 6;
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: flex-end;
+    flex: 0 0 0px;
+    height: 0;
+    margin: 0;
+    overflow: visible;
+    pointer-events: none;
+  }
+  .tl-move {
+    pointer-events: auto;
+    width: 20px;
+    height: 16px;
+    margin-right: -2px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: #3d4c60;
+    font-size: 11px;
+    line-height: 1;
+    cursor: grab;
+    opacity: 0;
+    transition: opacity .14s ease, color .14s ease, background .14s ease;
+    touch-action: none;
+  }
+  .tl-col > *:hover > .tl-frame-tools > .tl-move { opacity: 1; }
+  .tl-move:hover, .tl-move:focus-visible {
+    opacity: 1;
+    border-color: rgba(57, 215, 231, .45);
+    background: rgba(57, 215, 231, .1);
+    color: var(--cyan);
+  }
+  .tl-move:active { cursor: grabbing; }
+
+  /* ---------------------------------------------------------- move preview */
+  body.tl-moving { user-select: none; cursor: grabbing; }
+  body.tl-moving .tl-col > *:not(.tl-placeholder) { pointer-events: none; }
+  body.tl-moving .tl-move { pointer-events: auto; }
+
+  /* The placeholder is a real flex item, so the layout reflows around it: what
+     you see during the drag is the arrangement you get on release. */
+  .tl-placeholder {
+    display: grid;
+    place-items: center;
+    flex-basis: 0;
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    border: 1px dashed rgba(57, 215, 231, .75);
+    border-radius: 8px;
+    background:
+      repeating-linear-gradient(135deg, rgba(57, 215, 231, .07) 0 8px, transparent 8px 16px),
+      rgba(57, 215, 231, .05);
+    box-shadow: inset 0 0 22px rgba(57, 215, 231, .16);
+    animation: tl-placeholder-pulse 1.1s ease-in-out infinite;
+    overflow: hidden;
+  }
+  .tl-placeholder span {
+    padding: 3px 8px;
+    border-radius: 5px;
+    background: rgba(5, 12, 20, .72);
+    color: var(--cyan);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: .04em;
+    white-space: nowrap;
+  }
+  @keyframes tl-placeholder-pulse {
+    50% { border-color: rgba(57, 215, 231, .35); box-shadow: inset 0 0 26px rgba(57, 215, 231, .07); }
+  }
+  /* Which layer is about to receive the frame - the coarse answer, read at a
+     glance, before the eye finds the placeholder. */
+  .tl-layer.tl-drop-layer { outline: 1px solid rgba(57, 215, 231, .28); outline-offset: -1px; border-radius: 9px; }
+  .tl-drag-chip {
+    position: fixed;
+    z-index: 60;
+    top: 0;
+    left: 0;
+    padding: 4px 9px;
+    border: 1px solid rgba(57, 215, 231, .5);
+    border-radius: 6px;
+    background: rgba(6, 13, 21, .92);
+    color: #d8faff;
+    font-size: 9px;
+    font-weight: 800;
+    pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, .45);
+  }
+}
+
+/* Header controls. Save is deliberately explicit: dragging a frame is cheap and
+   reversible, overwriting the saved arrangement for every browser is not. */
+#layout-save, #layout-reset {
+  height: 31px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 9px;
+  background: var(--panel);
+  color: #8fa0b4;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  cursor: pointer;
+}
+#layout-save:hover, #layout-reset:hover { border-color: rgba(57, 215, 231, .5); color: #d8faff; }
+#layout-save[hidden], #layout-reset[hidden] { display: none; }
+#layout-save.dirty {
+  border-color: rgba(243, 185, 95, .55);
+  background: rgba(243, 185, 95, .1);
+  color: var(--amber);
+}
+#layout-save.saved {
+  border-color: rgba(66, 211, 146, .5);
+  background: rgba(66, 211, 146, .1);
+  color: var(--green);
+}
+#layout-save.failed {
+  border-color: rgba(255, 102, 120, .5);
+  background: rgba(255, 102, 120, .1);
+  color: var(--red);
+}
+@media (min-width: 1200px) and (min-height: 680px) {
+  body:not(.classic-layout) #layout-save,
+  body:not(.classic-layout) #layout-reset { height: 26px; padding: 0 7px; }
+}

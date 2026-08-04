@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -56,12 +56,21 @@ def test_reliability_evaluator_requires_every_hard_gate() -> None:
     assert result["score"] == 1.0
 
 
+def test_market_health_is_vacuously_ready_when_no_core_feed_is_required() -> None:
+    result = web_module._auto_market_health(datetime.now(timezone.utc), ())
+
+    assert result["ok"] is True
+    assert result["ready_markets"] == []
+    assert result["missing_markets"] == []
+
+
 def test_model_reliability_uses_active_champion_not_rejected_challenger() -> None:
     now = datetime.now(timezone.utc)
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         active = {
             "artifact_id": "active-champion",
+            "created_at": now.isoformat(),
             "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
             "live_eligible": True,
             "metrics": {"auc": 0.72, "precision_at_k": 0.43},
@@ -104,6 +113,7 @@ def test_successful_unchanged_training_heartbeat_keeps_incumbent_fresh() -> None
         root = Path(directory)
         active = {
             "artifact_id": "active-champion",
+            "created_at": now.isoformat(),
             "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
             "live_eligible": True,
             "metrics": {"auc": 0.72, "precision_at_k": 0.43},
@@ -156,6 +166,7 @@ def test_recent_running_training_cycle_is_a_healthy_heartbeat() -> None:
         root = Path(directory)
         artifact = {
             "artifact_id": "active-champion",
+            "created_at": now.isoformat(),
             "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
             "live_eligible": True,
             "metrics": {"auc": 0.72, "precision_at_k": 0.43},
@@ -193,6 +204,30 @@ def test_recent_running_training_cycle_is_a_healthy_heartbeat() -> None:
     assert result["training_heartbeat_ok"] is True
     assert result["training_in_progress"] is True
     assert result["training_heartbeat_at"] == now.isoformat()
+
+
+def test_model_reliability_rejects_canonically_stale_incumbent() -> None:
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        artifact = {
+            "artifact_id": "stale-champion",
+            "created_at": (now.replace(microsecond=0) - timedelta(hours=7)).isoformat(),
+            "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+            "live_eligible": True,
+            "metrics": {"auc": 0.72, "precision_at_k": 0.43},
+            "reason_codes": [],
+        }
+        (root / "latest.json").write_text(json.dumps(artifact), encoding="utf-8")
+        (root / "live_short_horizon.stale.json").write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+        with patch.object(web_module, "Path", return_value=root):
+            result = web_module._latest_model_reliability(now)
+
+    assert result["ok"] is False
+    assert result["trust_level"] == "SHADOW_ONLY"
+    assert "MODEL_AGE_EXCEEDED" in result["reason_codes"]
 
 
 def test_reliability_step_promotes_only_after_sustained_passes() -> None:
@@ -244,3 +279,23 @@ def test_live_mode_is_demoted_immediately_on_broker_failure() -> None:
 
     assert result["mode"] == "learning"
     demote.assert_called_once()
+
+
+def test_learning_mode_fails_closed_when_reliability_is_low() -> None:
+    failed = {
+        **_ready_snapshot(),
+        "score": 0.8,
+        "ready": False,
+        "reasons": ["MODEL_NOT_READY"],
+    }
+    with (
+        patch.object(web_module, "_evaluate_auto_reliability", return_value=failed),
+        patch.object(web_module, "_active_operation_mode", return_value="learning"),
+        patch.object(web_module, "_auto_reliability_enter_learning"),
+        patch.object(web_module, "_auto_reliability_enforce_sell_only") as enforce,
+        patch.object(web_module, "_auto_reliability_learning_maintenance"),
+    ):
+        result = web_module._auto_reliability_step()
+
+    assert result["mode"] == "learning"
+    enforce.assert_called_once_with("MODEL_NOT_READY")

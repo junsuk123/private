@@ -325,6 +325,7 @@ class RealtimeTradingEngine:
             "errors": 0,
             "last_reason": None,
             "last_summary": None,
+            "live_trace": None,
         }
         self._seed_loss_cooldowns_from_order_log()
 
@@ -421,9 +422,52 @@ class RealtimeTradingEngine:
         with self._lock:
             self._recent.appendleft(event)
 
+    def _start_live_trace(self, decision_time: datetime) -> None:
+        with self._lock:
+            self._status["live_trace"] = {
+                "cycle_id": decision_time.isoformat(),
+                "started_at": decision_time.isoformat(),
+                "finished_at": None,
+                "completed": False,
+                "current_stage": "cycle_start",
+                "stages": [],
+            }
+
+    def _trace_stage(
+        self,
+        stage_id: str,
+        title: str,
+        description: str,
+        *,
+        nodes: tuple[str, ...] = (),
+        links: tuple[dict[str, str], ...] = (),
+        ticker: str | None = None,
+    ) -> None:
+        observed_at = datetime.now(timezone.utc).isoformat()
+        stage = {
+            "stage_id": stage_id,
+            "path_id": f"live:{stage_id}",
+            "title": title,
+            "description": description,
+            "observed_at": observed_at,
+            "nodes": list(dict.fromkeys(str(node) for node in nodes if node)),
+            "links": [dict(link) for link in links],
+            "ticker": ticker,
+            "tone": "live",
+            "actual": True,
+        }
+        with self._lock:
+            trace = dict(self._status.get("live_trace") or {})
+            stages = list(trace.get("stages") or ())
+            stages.append(stage)
+            trace["stages"] = stages[-16:]
+            trace["current_stage"] = stage_id
+            self._status["live_trace"] = trace
+
     # ---- one cycle ------------------------------------------------------
     def run_once(self, decision_time: datetime | None = None) -> dict[str, Any]:
         decision_time = decision_time or datetime.now(timezone.utc)
+        self._start_live_trace(decision_time)
         _begin_technical_decision_cycle()
         summary: dict[str, Any] = {
             "at": decision_time.isoformat(),
@@ -444,17 +488,42 @@ class RealtimeTradingEngine:
         }
 
         if not self.session_open_provider():
+            self._trace_stage(
+                "market_session",
+                "시장 세션 확인",
+                "실제 거래 엔진이 신규 진입 가능 세션이 아님을 확인했습니다.",
+                nodes=("OntologyMultiStagePipeline", "NoTradeSignal"),
+                links=({"source": "OntologyMultiStagePipeline", "target": "NoTradeSignal", "predicate": "blockedBySession"},),
+            )
             summary["reason"] = "MARKET_SESSION_CLOSED"
             self._finish_cycle(summary)
             return summary
 
+        self._trace_stage(
+            "market_session",
+            "시장 세션 확인",
+            "실제 거래 엔진이 주문 평가 가능 세션을 확인했습니다.",
+            nodes=("OntologyMultiStagePipeline", "OntologyFilter1:LightweightScreening"),
+        )
         account = self.account_provider()
         if account is None:
+            self._trace_stage(
+                "account",
+                "계좌 상태 확인",
+                "실제 계좌 스냅샷을 읽지 못해 사이클을 중단했습니다.",
+                nodes=("OntologyFilter1:LightweightScreening", "NoTradeSignal"),
+            )
             summary["reason"] = "NO_ACCOUNT_SNAPSHOT"
             self._finish_cycle(summary)
             return summary
 
         held_tickers = {h.ticker for h in (account.holdings or ())}
+        self._trace_stage(
+            "account",
+            "계좌 상태 확인",
+            f"실제 계좌 확인 완료 · 보유 {len(held_tickers)}종목",
+            nodes=("OntologyFilter1:LightweightScreening",),
+        )
         # 매도·매수는 독립 예산을 갖는다 — 매도가 사이클 한도를 다 써서 매수를 굶기면 안 된다.
         sell_submitted = 0
         buy_submitted = 0
@@ -511,6 +580,13 @@ class RealtimeTradingEngine:
                 summary["reason"] = summary["reason"] or f"BUY_CANDIDATE_PROVIDER_ERROR:{exc.__class__.__name__}"
         summary["buy_candidate_count"] = len(cycle_buy_candidates)
         summary["buy_candidate_sample"] = list(cycle_buy_candidates[:10])
+        self._trace_stage(
+            "candidates",
+            "실시간 후보 탐색",
+            f"실제 스트리밍 후보 {len(cycle_buy_candidates)}개를 확인했습니다.",
+            nodes=("OntologyFilter1:LightweightScreening", "CandidateStock", *cycle_buy_candidates[:6]),
+            links=({"source": "OntologyFilter1:LightweightScreening", "target": "CandidateStock", "predicate": "producesCandidate"},),
+        )
 
         # Macro/micro ontology reasoning for live candidate control and diagnostics.
         # It can only rank or block new BUY candidates; it never submits an order.
@@ -525,6 +601,20 @@ class RealtimeTradingEngine:
                 )
             except Exception:  # noqa: BLE001 - advisory panel must never affect trading.
                 macro_micro_bundle = None
+        if self.macro_micro_observer is not None:
+            macro_result = (
+                getattr(macro_micro_bundle, "macro_result", None)
+                or getattr(macro_micro_bundle, "macro", None)
+            )
+            raw_macro_regime = getattr(macro_result, "market_regime", "") or ""
+            macro_regime = str(getattr(raw_macro_regime, "value", raw_macro_regime))
+            self._trace_stage(
+                "macro_micro",
+                "매크로·마이크로 추론",
+                f"실제 추론 완료 · 시장 국면 {macro_regime or '미확정'}",
+                nodes=("MacroMarket", "OntologyFilter2:EntryDecision"),
+                links=({"source": "MacroMarket", "target": "OntologyFilter2:EntryDecision", "predicate": "feedsDecision"},),
+            )
         if buy_enabled and _macro_micro_blocks_buy(macro_micro_bundle):
             buy_enabled = False
             self._buy_disabled_reason = "MACRO_MICRO_BLOCK_BUY"
@@ -546,6 +636,19 @@ class RealtimeTradingEngine:
                 )
                 summary["strategy_session"] = strategy_session
                 summary["owned_buy_candidates"] = list(cycle_buy_candidates)
+                selected_symbol = str(strategy_session.get("selected_symbol") or "")
+                selected_strategy = str(strategy_session.get("selected_strategy") or "")
+                self._trace_stage(
+                    "strategy_election",
+                    "전략 선출",
+                    (
+                        f"실제 선출 결과 · {selected_symbol} / {selected_strategy}"
+                        if selected_symbol and selected_strategy
+                        else f"실제 선출 결과 · 미선택 ({strategy_session.get('last_reason') or '조건 미충족'})"
+                    ),
+                    nodes=("OntologyFilter2:EntryDecision", selected_symbol, "NoTradeSignal" if not selected_symbol else "FinalTradeGate"),
+                    ticker=selected_symbol or None,
+                )
             except Exception as exc:  # noqa: BLE001 - ownership failure must fail closed.
                 buy_enabled = False
                 self._buy_disabled_reason = f"STRATEGY_SESSION_ERROR:{exc.__class__.__name__}"
@@ -687,6 +790,12 @@ class RealtimeTradingEngine:
 
         # 2) 매수: 미보유 후보 진입(매도와 독립 예산).
         if not buy_enabled:
+            self._trace_stage(
+                "execution_gate",
+                "최종 주문 게이트",
+                f"실제 주문 차단 · {self._buy_disabled_reason or 'BUY_DISABLED'}",
+                nodes=("OntologyFilter3:FinalRiskApproval", "NoTradeSignal"),
+            )
             summary["reason"] = summary["reason"] or (self._buy_disabled_reason or "BUY_DISABLED")
             summary["buy_disabled"] = True
             summary["buy_disabled_reason"] = self._buy_disabled_reason or "REALTIME_BUY_ENABLED=false"
@@ -790,6 +899,18 @@ class RealtimeTradingEngine:
         summary["buy_submitted"] = buy_submitted
         summary["buy_submit_attempted"] = buy_submit_attempted
         summary["sell_submitted"] = sell_submitted
+        self._trace_stage(
+            "execution_gate",
+            "최종 주문 게이트",
+            (
+                f"실제 주문 처리 · 평가 {summary['buy_evaluated']}건, 제출 시도 {buy_submit_attempted}건, 제출 {buy_submitted}건"
+            ),
+            nodes=(
+                "OntologyFilter3:FinalRiskApproval",
+                "FinalTradeGate",
+                "NoTradeSignal" if buy_submitted <= 0 else "CandidateStock",
+            ),
+        )
         if skipped_market_closed_symbols:
             summary["skipped_market_closed_symbols"] = skipped_market_closed_symbols
         # Short-side bookkeeping. Runs AFTER every order decision so it can never
@@ -850,7 +971,13 @@ class RealtimeTradingEngine:
                 if self.strategy_session_manager is not None
                 else ()
             )
-            quotes = self._short_cycle_quotes(candidates, decision_time)
+            # Candidate rotation must not orphan an already-open shadow plan.
+            # Keep walking every adopted symbol until it resolves or expires,
+            # even after it leaves the current election universe.
+            observed_symbols = tuple(
+                dict.fromkeys((*candidates, *service.open_symbols))
+            )
+            quotes = self._short_cycle_quotes(observed_symbols, decision_time)
             short_summary["evaluation"] = service.evaluate_tick(
                 quotes, now=decision_time, new_plans=plans
             ).as_dict()
@@ -1818,6 +1945,17 @@ class RealtimeTradingEngine:
             self._status["errors"] += summary["errors"]
             self._status["last_reason"] = summary["reason"]
             self._status["last_summary"] = summary
+            trace = dict(self._status.get("live_trace") or {})
+            trace["finished_at"] = datetime.now(timezone.utc).isoformat()
+            trace["completed"] = True
+            trace["outcome"] = {
+                "reason": summary.get("reason"),
+                "buy_evaluated": int(summary.get("buy_evaluated") or 0),
+                "buy_submit_attempted": int(summary.get("buy_submit_attempted") or 0),
+                "buy_submitted": int(summary.get("buy_submitted") or 0),
+                "sell_submitted": int(summary.get("sell_submitted") or 0),
+            }
+            self._status["live_trace"] = trace
         if should_observe and self.cycle_observer is not None:
             try:
                 self.cycle_observer(dict(summary))

@@ -16,6 +16,7 @@ from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
 from app.trading.contracts import Bar
 from app.features.schemas import OHLCVBar
+from app.features import session_structure
 from app.technical import indicators as ti
 
 
@@ -35,7 +36,9 @@ class EvaluationConfig:
     venue: str = "NASD"
     market: str = "US"
     instrument_type: str = "overseas_stock"
-    feature_schema_name: str = "counterfactual_quantiles_v1"
+    # v2 replaces legacy bar-count opening features with the causal, clock-based
+    # 30-minute authority shared by live serving. Old labels are not compatible.
+    feature_schema_name: str = "counterfactual_quantiles_v2_session_structure"
     infer_market_from_symbol: bool = True
 
 
@@ -218,7 +221,7 @@ def load_news_sentiment(
             value = _optional_float(score)
             if value is None:
                 continue
-            # KIS-style suffixed duplicates ("005930.KS") describe the same issuer.
+            # Suffixed vendor symbols and bare exchange codes describe the same issuer.
             key = str(ticker or "").upper().split(".", 1)[0].strip()
             if key:
                 by_ticker[key].append((moment, value))
@@ -451,11 +454,19 @@ def _opening_range_breakout_quantile(
     relative-volume selection filter rather than on the breakout alone. Returned
     as 0..1 where >0.5 means "above the opening range high".
     """
-    if index < session_start + range_bars:
+    del range_bars  # retained for compatibility; the authoritative range is 30 minutes.
+    if session_start < 0 or session_start >= len(bars) or index >= len(bars):
         return 0.0
-    window = bars[session_start : session_start + range_bars]
-    high = max(bar.high for bar in window)
-    low = min(bar.low for bar in window)
+    observed = session_structure.opening_range(
+        bars[: index + 1],
+        session_open=bars[session_start].start_time,
+        minutes=30,
+        now=bars[index].end_time,
+    )
+    if observed is None:
+        return 0.0
+    high = observed.high
+    low = observed.low
     span = high - low
     if span <= 0 or high <= 0:
         return 0.0
@@ -525,44 +536,40 @@ def _intraday_momentum_quantiles(
         return absent
 
     previous_close = bars[session_start - 1].close
-    if previous_close <= 0:
+    observed = session_structure.opening_range(
+        bars[: index + 1],
+        session_open=bars[session_start].start_time,
+        minutes=30,
+        now=current.end_time,
+    )
+    r1_bps = session_structure.first_half_hour_return_bps(
+        bars[: index + 1],
+        previous_close=previous_close,
+        session_open=bars[session_start].start_time,
+        minutes=30,
+        now=current.end_time,
+    )
+    if observed is None or r1_bps is None:
         return absent
-
-    # --- first half-hour of THIS session -----------------------------------
-    first_bars = [
-        bar
-        for bar in bars[session_start : index + 1]
-        if _FIRST_HALF_HOUR[0] <= _kst_minute_of_day(bar.end_time) < _FIRST_HALF_HOUR[1]
-    ]
-    if len(first_bars) < 5:
-        # Without the opening window there is no signal. Reporting 0 (never fires) is
-        # the honest answer; inventing one from a partial window is how a feature
-        # starts meaning something other than its name.
-        return absent
-    first_close = first_bars[-1].close
-    r1 = first_close / previous_close - 1.0
+    r1 = r1_bps / 10_000.0
     if r1 <= 0:
         # Long-only: a negative first half-hour predicts a negative last half-hour,
         # which is not expressible here.
         return {**absent, "intraday_momentum_window": 1.0}
 
-    highs = [bar.high for bar in first_bars]
-    lows = [bar.low for bar in first_bars]
-    closes = [bar.close for bar in first_bars if bar.close > 0]
-    realised = (
-        (max(highs) - min(lows)) / fmean(closes) if closes and fmean(closes) > 0 else 0.0
-    )
-
     # Same measure on earlier sessions, for a like-for-like percentile.
     prior_vols = _prior_session_opening_volatility(bars, session_start)
-    volatility_q = (
-        causal_percentile(realised, prior_vols) if len(prior_vols) >= 3 else 0.0
+    volatility_q = session_structure.first_half_hour_volatility_percentile(
+        prior_vols, observed.volatility, minimum_samples=3
     )
 
     return {
         "intraday_momentum_signal": max(0.0, min(1.0, 0.5 + r1 / 0.02)),
         "intraday_momentum_window": 1.0,
-        "first_half_hour_volatility": volatility_q,
+        # Counterfactual quantile tensors are finite by contract.  An unrankable
+        # volatility therefore remains a non-triggering zero here; the live
+        # election context preserves the stronger None/absent distinction.
+        "first_half_hour_volatility": volatility_q if volatility_q is not None else 0.0,
     }
 
 
@@ -573,23 +580,20 @@ def _prior_session_opening_volatility(
     by_day: dict[int, list[Bar]] = defaultdict(list)
     for position in range(session_start):
         bar = bars[position]
-        minute = _kst_minute_of_day(bar.end_time)
-        if _FIRST_HALF_HOUR[0] <= minute < _FIRST_HALF_HOUR[1]:
-            by_day[bar.start_time.astimezone(_KST).date().toordinal()].append(bar)
+        by_day[bar.start_time.astimezone(_KST).date().toordinal()].append(bar)
     values: list[float] = []
     for day in sorted(by_day):
         window = by_day[day]
-        if len(window) < 5:
-            continue
-        closes = [bar.close for bar in window if bar.close > 0]
-        if not closes:
-            continue
-        mean_close = fmean(closes)
-        if mean_close <= 0:
-            continue
-        values.append(
-            (max(bar.high for bar in window) - min(bar.low for bar in window)) / mean_close
+        local_day = window[0].start_time.astimezone(_KST)
+        session_open = local_day.replace(hour=9, minute=0, second=0, microsecond=0)
+        observed = session_structure.opening_range(
+            window,
+            session_open=session_open,
+            minutes=30,
+            now=window[-1].end_time,
         )
+        if observed is not None:
+            values.append(observed.volatility)
     return values
 
 
@@ -842,24 +846,51 @@ def build_labels(
             volume_confirmed = (
                 causal_percentile(current.volume, volume_history) >= 0.65
             )
+            breakout_move = current.close / prior_high - 1
             quantiles = {
-                "return": causal_percentile(current_return, return_history),
+                # Directional LONG signals must not turn a tied zero move into a
+                # top-quantile observation (the empirical CDF returns 1.0 for a
+                # value tied with an all-zero history).  Preserve the percentile
+                # only on the thesis-consistent side of zero.
+                "return": (
+                    causal_percentile(current_return, return_history)
+                    if current_return > 0
+                    else 0.0
+                ),
                 "volume": causal_percentile(current.volume, volume_history),
                 "breakout": causal_percentile(
-                    current.close / prior_high - 1,
+                    breakout_move,
                     [
                         bars[j].close / max(bar.high for bar in bars[max(0, j - 10) : j]) - 1
                         for j in range(max(10, history_start), index)
                     ],
-                ),
+                ) if breakout_move > 0 else 0.0,
                 "vwap_deviation": causal_percentile(
                     current.close / vwap_proxy - 1,
                     [bar.close / vwap_proxy - 1 for bar in bars[history_start:index]],
                 ),
                 "reversion": causal_percentile(current_return, return_history),
                 "liquidity_shock": causal_percentile(spreads[index], spread_history),
-                "price_drop": causal_percentile(-current_return, [-item for item in return_history]),
-                "recovery": causal_percentile(current_return, return_history),
+                # A reversal is a two-step event: the PREVIOUS bar supplies the
+                # sell-off and the CURRENT bar supplies the recovery.  Ranking the
+                # same return once with each sign made the two conditions mutually
+                # exclusive for normal observations, while tied zero-return bars
+                # scored 1.0 on both sides.  That selected stationary/thin bars as
+                # "reversals" and was the dominant source of the strategy's
+                # measured losses.
+                "price_drop": (
+                    causal_percentile(
+                        -returns[index - 1],
+                        [-item for item in returns[history_start : index - 1]],
+                    )
+                    if returns[index - 1] < 0
+                    else 0.0
+                ),
+                "recovery": (
+                    causal_percentile(current_return, return_history)
+                    if current_return > 0
+                    else 0.0
+                ),
                 "liquidity": causal_percentile(current.volume, volume_history),
                 # Event features come from the separate news-sentiment store the
                 # event-LLM pipeline writes. Absent (no coverage for this ticker at

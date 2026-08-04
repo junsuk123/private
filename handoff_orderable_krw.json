@@ -120,7 +120,7 @@
   "red_herrings_already_ruled_out": [
     "NOT the GNN. It was the reported reason (NO_POSITIVE_NET_GNN_EDGE) for 11,614 cycles and was never the actual constraint.",
     "NOT minute-bar warm-up. Bars reached 30/20 and candidates were still 0.",
-    "NOT orderbook staleness. Measured: the book is fresh 93% of wall-clock time for 005930 (median inter-arrival 0.01s). An earlier single sample landed in one of 6 rare >15s gaps and was misleading.",
+    "NOT orderbook staleness. The measured reference book was fresh 93% of wall-clock time (median inter-arrival 0.01s). An earlier single sample landed in one of 6 rare >15s gaps and was misleading.",
     "NOT genuinely insufficient funds. KIS reports 100,002 orderable. An earlier conclusion of 'insufficient cash' was based on the zeroed value and was WRONG.",
     "NOT the KRW_SETTLEMENT display bucket. It is a derived residual in account_dashboard.py with orderable hardcoded to 0.0 by design; it is a symptom of where the money landed, not the cause."
   ]

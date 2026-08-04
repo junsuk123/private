@@ -116,6 +116,42 @@ class WebGraphPayloadTest(unittest.TestCase):
         self.assertEqual(kinds["MicroRegime:BREAKOUT_CANDIDATE"], "support")
         self.assertTrue(set(kinds.values()).issubset(visible_kinds))
 
+    def test_full_graph_payload_bypasses_ui_trimming(self) -> None:
+        try:
+            import app.web as web
+        except TypeError as exc:
+            self.skipTest(f"web app import is unavailable in this dependency set: {exc}")
+
+        graph = KnowledgeGraph()
+        for index in range(12):
+            graph.add(f"NODE:{index}", "supportsSignal", f"SIGNAL:{index}", f"test:{index}")
+        context = SimpleNamespace(
+            graph=graph,
+            events=(),
+            markets=(),
+            reasoning_paths=(),
+            ontology_runtime=SimpleNamespace(as_dict=lambda: {}),
+            candidate_selection=None,
+            parameter_tuning=(),
+            temporal_frames=(),
+        )
+
+        old_node_limit = web.ONTOLOGY_UI_NODE_LIMIT
+        old_link_limit = web.ONTOLOGY_UI_LINK_LIMIT
+        try:
+            web.ONTOLOGY_UI_NODE_LIMIT = 4
+            web.ONTOLOGY_UI_LINK_LIMIT = 4
+            compact = web._graph_payload(context)
+            full = web._graph_payload(context, trim_for_ui=False)
+        finally:
+            web.ONTOLOGY_UI_NODE_LIMIT = old_node_limit
+            web.ONTOLOGY_UI_LINK_LIMIT = old_link_limit
+
+        self.assertTrue(compact["truncated"])
+        self.assertFalse(full["truncated"])
+        self.assertEqual(full["display_counts"], full["counts"])
+        self.assertEqual(len(full["links"]), 12)
+
 
 if __name__ == "__main__":
     unittest.main()

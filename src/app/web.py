@@ -51,6 +51,7 @@ from app.models.live_training_pipeline import (
     backfill_live_feature_frames_from_realtime_store,
     collect_live_feature_frames_from_realtime_store,
     live_training_status,
+    materialized_training_row_count,
     train_live_short_horizon_from_collected_features,
 )
 from app.models.live_signal_predictor import live_signal_model_inference_enabled
@@ -226,6 +227,12 @@ _live_training_history_cache: dict[str, Any] = {
     "root": "",
     "limit": 0,
     "payload": None,
+}
+_system_diagnostics_cache_lock = threading.Lock()
+_system_diagnostics_cache: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "payload": None,
+    "refreshing": False,
 }
 # US ticker→exchange map (NASD/NYSE/AMEX) auto-refresh: the NASDAQ Trader listings
 # change over time, so a background worker rebuilds data/universe/us_exchange_map.csv
@@ -460,7 +467,7 @@ def _strategy_market_view_with_live_session(
     # a symbol, that client-side query must not override the authoritative
     # selection. During SCANNING, also replace an old/off-market selection with
     # the first candidate the engine is actually evaluating. This prevents a
-    # stale 005930 shadow row from masquerading as the current US decision.
+    # a stale shadow row from masquerading as the current market decision.
     if active_owner:
         selected = owned_symbol
     elif candidate_symbols and requested_symbol not in candidate_symbols:
@@ -1532,9 +1539,14 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
         latest_challenger_path.stat().st_mtime,
         timezone.utc,
     )
+    canonical_staleness = ModelArtifactRegistry(root).staleness(now=now)
   except (OSError, ValueError, json.JSONDecodeError):
     return {"ok": False, "reason": "MODEL_ARTIFACT_MISSING_OR_INVALID"}
-  active_age_seconds = max(0.0, (now - active_modified_at).total_seconds())
+  active_age_seconds = (
+      canonical_staleness.age_seconds
+      if canonical_staleness.age_seconds is not None
+      else max(0.0, (now - active_modified_at).total_seconds())
+  )
   training_age_seconds = max(0.0, (now - training_modified_at).total_seconds())
   heartbeat_at = None
   heartbeat_ok = False
@@ -1595,11 +1607,7 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
       _auto_reliability_int("AUTO_RELIABILITY_MODEL_MAX_AGE_SECONDS", 1800, 60)
   )
   maximum_active_age = float(
-      _auto_reliability_int(
-          "AUTO_RELIABILITY_ACTIVE_MODEL_MAX_AGE_SECONDS",
-          2_592_000,
-          3600,
-      )
+      canonical_staleness.diagnostics.get("max_age_seconds") or 21_600.0
   )
   live_eligible = bool(active.get("live_eligible"))
   schema_matches = active.get("feature_schema_hash") == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
@@ -1608,8 +1616,8 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
     reason_codes.append("ACTIVE_MODEL_NOT_LIVE_ELIGIBLE")
   if not schema_matches:
     reason_codes.append("ACTIVE_MODEL_SCHEMA_MISMATCH")
-  if active_age_seconds > maximum_active_age:
-    reason_codes.append("ACTIVE_MODEL_EXPIRED")
+  if canonical_staleness.stale:
+    reason_codes.extend(canonical_staleness.reason_codes)
   if training_age_seconds > maximum_training_age:
     reason_codes.append("MODEL_TRAINING_STALE")
   return {
@@ -1618,6 +1626,7 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
       "schema_matches": schema_matches,
       "age_seconds": active_age_seconds,
       "maximum_age_seconds": maximum_active_age,
+      "trust_level": canonical_staleness.trust_level.value,
       "training_age_seconds": training_age_seconds,
       "training_heartbeat_at": heartbeat_at.isoformat() if heartbeat_at else None,
       "training_heartbeat_ok": heartbeat_ok,
@@ -1658,6 +1667,25 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
   us_age = _auto_reliability_int("AUTO_RELIABILITY_US_MAX_AGE_SECONDS", 90)
   database = Path(os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"))
   healthy: dict[str, list[str]] = {"KRX": [], "US": []}
+  # No core entry session means there is no realtime feed to require. Market
+  # session gates still reject new orders, while the reliability controller can
+  # remain armed for the next open instead of misclassifying normal closure as
+  # a data outage and demoting the whole process to learning mode.
+  if not groups:
+    return {
+        "ok": True,
+        "healthy": healthy,
+        "minimum_per_market": minimum,
+        "minimum_by_market": minimum_by_market,
+        "ready_markets": [],
+        "partial": False,
+        "missing_markets": [],
+        "max_age_seconds": {
+            "KRX": kr_age,
+            "KRX_TRADE_ACTIVITY": kr_trade_activity_age,
+            "US": us_age,
+        },
+    }
   if not database.exists():
     return {"ok": False, "healthy": healthy, "minimum_per_market": minimum, "reason": "MARKET_DATA_STORE_MISSING"}
   try:
@@ -1825,6 +1853,27 @@ def _auto_reliability_transition_to_learning(reason: str) -> None:
   audit.record("auto_reliability_demoted_to_learning", {"reason": reason})
 
 
+def _auto_reliability_enforce_sell_only(reason: str) -> None:
+  """Fail closed when reliability is low even if learning mode was already active."""
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if engine is None or not hasattr(engine, "disable_buys"):
+    return
+  try:
+    status = engine.get_status() if hasattr(engine, "get_status") else {}
+  except Exception:  # noqa: BLE001 - disabling buys remains the safe fallback.
+    status = {}
+  expected_reason = f"AUTO_RELIABILITY_DEMOTION:{reason}"
+  if (
+      status.get("buy_enabled") is not False
+      or str(status.get("buy_disabled_reason") or "") != expected_reason
+  ):
+    # Reliability can recover one component while another remains blocked. Keep
+    # the operator-visible reason synchronized even when the mode itself does
+    # not transition (for example MARKET_DATA_NOT_READY -> MODEL_NOT_READY).
+    engine.disable_buys(expected_reason)
+
+
 def _auto_reliability_transition_to_live() -> dict[str, Any]:
   result = _operation_mode_start_response({"mode": "live_trading"})
   if result.get("ok") and result.get("live_trading_status") == "armed":
@@ -1897,7 +1946,9 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
             "NO_OPEN_MARKET",
         )
     )
-    if critical or unready_streak >= demote_after:
+    startup_grace = _live_market_data_startup_grace_active(now)
+    market_data_only = set(snapshot["reasons"]) == {"MARKET_DATA_NOT_READY"}
+    if critical or (unready_streak >= demote_after and not (market_data_only and startup_grace)):
       reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
       _auto_reliability_transition_to_learning(reason)
       current_mode = "learning"
@@ -1906,6 +1957,9 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
     _auto_reliability_enter_learning()
     current_mode = "learning"
     transition_reason = ",".join(snapshot["reasons"]) or "INITIAL_LOW_RELIABILITY"
+  if not snapshot["ready"] and current_mode != "live_trading":
+    reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
+    _auto_reliability_enforce_sell_only(reason)
   if current_mode != "live_trading":
     _auto_reliability_learning_maintenance(now, tuple(snapshot["active_markets"]))
   with _live_lock:
@@ -1923,6 +1977,34 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
       _auto_reliability_state["last_transition_at"] = now.isoformat()
       _auto_reliability_state["last_transition_reason"] = transition_reason
     return _to_jsonable(dict(_auto_reliability_state))
+
+
+def _live_market_data_startup_grace_active(now: datetime) -> bool:
+  """Allow the realtime socket to warm up before a data-only demotion.
+
+  Per-order tick/book freshness remains fail-closed throughout this window, so
+  the grace period cannot authorize an order using stale data.  It only avoids
+  tearing live mode down before KIS has acknowledged subscriptions and emitted
+  the first trade/book pair after a clean process restart.
+  """
+  with _live_lock:
+    active = _operation_mode_state.get("active")
+  payload = _to_jsonable(active) if active is not None else {}
+  if not isinstance(payload, dict) or str(payload.get("mode") or "") != "live_trading":
+    return False
+  try:
+    started_at = datetime.fromisoformat(
+        str(payload.get("started_at") or "").replace("Z", "+00:00")
+    )
+    if started_at.tzinfo is None:
+      started_at = started_at.replace(tzinfo=timezone.utc)
+  except (TypeError, ValueError):
+    return False
+  grace_seconds = max(
+      30,
+      _auto_reliability_int("AUTO_RELIABILITY_MARKET_DATA_STARTUP_GRACE_SECONDS", 180, 30),
+  )
+  return max(0.0, (now - started_at).total_seconds()) < grace_seconds
 
 
 def _auto_reliability_loop() -> None:
@@ -3070,12 +3152,20 @@ def _lightweight_diagnostics_response(snapshot: dict[str, Any] | None = None) ->
 
 
 @app.get("/api/ontology/graph")
-def ontology_graph() -> JSONResponse:
+def ontology_graph(full: bool = False) -> JSONResponse:
     snapshot = _live_snapshot()
     context = snapshot.get("context")
     if context is None:
       _ensure_background_refresh()
-      return _json(_empty_graph_payload(snapshot))
+      payload = _empty_graph_payload(snapshot)
+      payload["live_trace"] = _current_live_reasoning_trace()
+      return _json(payload)
+    # The dashboard's 3D view explicitly requests the complete graph.  Keep the
+    # compact cached payload as the default for lightweight API consumers.
+    if full:
+      payload = _graph_payload(context, trim_for_ui=False)
+      payload["live_trace"] = _current_live_reasoning_trace()
+      return _json(payload)
     payload = snapshot.get("graph_payload")
     if payload is None or snapshot.get("graph_payload_context_id") != id(context):
       payload = _graph_payload(context)
@@ -3083,7 +3173,35 @@ def ontology_graph() -> JSONResponse:
         if _live_state["context"] is context:
           _live_state["graph_payload"] = payload
           _live_state["graph_payload_context_id"] = id(context)
-    return _json(payload)
+    response_payload = dict(payload)
+    response_payload["live_trace"] = _current_live_reasoning_trace()
+    return _json(response_payload)
+
+
+def _current_live_reasoning_trace() -> dict[str, Any] | None:
+    """Latest stages actually reached by the live trading engine.
+
+    This is deliberately separate from ``reasoning_steps``. Those steps explain
+    the latest stored ontology result; ``live_trace`` is clocked by the running
+    order engine and is the only source the realtime graph animation follows.
+    """
+    with _realtime_trading_lock:
+      engine = _realtime_trading_engine
+    if engine is None:
+      return None
+    try:
+      status = engine.get_status() or {}
+    except Exception:  # noqa: BLE001 - graph diagnostics must never stop trading.
+      return None
+    trace = status.get("live_trace")
+    return dict(trace) if isinstance(trace, dict) else None
+
+
+@app.get("/api/ontology/live-trace")
+def ontology_live_trace() -> JSONResponse:
+    """Lightweight actual engine trace for the graph's one-second follow mode."""
+    trace = _current_live_reasoning_trace()
+    return _json({"ok": trace is not None, "trace": trace})
 
 
 @app.get("/api/ontology/runtime")
@@ -3273,9 +3391,9 @@ def ai_validation() -> JSONResponse:
           llm_validation["error"] = "LLM_CLASSIFIER_NOT_CONFIGURED"
         else:
           sample = classifier.classify(
-              "Samsung wins large AI memory supply contract",
-              "Samsung Electronics announced a multi-year HBM memory supply agreement for AI accelerators. Analysts expect higher revenue and margins.",
-              {"005930": "Samsung Electronics"},
+              "Example issuer wins a large supply contract",
+              "The issuer announced a multi-year supply agreement. Analysts expect higher revenue and margins.",
+              {"DEMO": "Example issuer"},
           )
           labels = tuple(str(item) for item in sample.event_labels)
           llm_validation.update(
@@ -4096,7 +4214,7 @@ def _live_training_history(
       and cached_payload is not None
       and _live_training_history_cache.get("root") == cache_key
       and int(_live_training_history_cache.get("limit") or 0) == history_limit
-      and now_monotonic - float(_live_training_history_cache.get("loaded_at") or 0.0) < 5.0
+      and now_monotonic - float(_live_training_history_cache.get("loaded_at") or 0.0) < 60.0
   ):
     return dict(cached_payload)
 
@@ -4712,7 +4830,55 @@ def _system_diagnostics_payload() -> dict[str, Any]:
 
 @app.get("/api/system-diagnostics")
 def system_diagnostics() -> JSONResponse:
-  return _json(_system_diagnostics_payload())
+  return _json(_cached_system_diagnostics_payload())
+
+
+def _cached_system_diagnostics_payload() -> dict[str, Any]:
+  """Serve dashboard polling without stacking expensive history reads.
+
+  The terminal asks every five seconds, while a full diagnostic includes model
+  history and several live stores. Once a payload exists, refresh it in one
+  background thread and immediately return the last complete snapshot.
+  """
+  now_monotonic = time.monotonic()
+  try:
+    ttl = max(10.0, float(os.getenv("SYSTEM_DIAGNOSTICS_CACHE_SECONDS", "30")))
+  except (TypeError, ValueError):
+    ttl = 30.0
+  with _system_diagnostics_cache_lock:
+    payload = _system_diagnostics_cache.get("payload")
+    loaded_at = float(_system_diagnostics_cache.get("loaded_at") or 0.0)
+    if isinstance(payload, dict) and now_monotonic - loaded_at < ttl:
+      return dict(payload)
+    if isinstance(payload, dict):
+      if not bool(_system_diagnostics_cache.get("refreshing")):
+        _system_diagnostics_cache["refreshing"] = True
+        threading.Thread(
+          target=_refresh_system_diagnostics_cache,
+          name="system-diagnostics-refresh",
+          daemon=True,
+        ).start()
+      return dict(payload)
+    # The first request computes once while holding the lock. Other first-wave
+    # pollers wait here and reuse that result instead of launching duplicates.
+    computed = _system_diagnostics_payload()
+    _system_diagnostics_cache.update(
+      {"payload": computed, "loaded_at": time.monotonic(), "refreshing": False}
+    )
+    return dict(computed)
+
+
+def _refresh_system_diagnostics_cache() -> None:
+  try:
+    computed = _system_diagnostics_payload()
+  except Exception:  # noqa: BLE001 - retain the last complete dashboard snapshot.
+    with _system_diagnostics_cache_lock:
+      _system_diagnostics_cache["refreshing"] = False
+    return
+  with _system_diagnostics_cache_lock:
+    _system_diagnostics_cache.update(
+      {"payload": computed, "loaded_at": time.monotonic(), "refreshing": False}
+    )
 
 
 @app.post("/api/operation-mode/stop-learning")
@@ -5792,8 +5958,8 @@ def _buy_candidate_warmup_detail() -> dict:
 
   ``_candidate_has_strategy_feature_history`` needs N completed bars. After a
   restart, or in the first minutes of a session, every streaming symbol fails it
-  while looking perfectly healthy at the tick level — 005930 was rejected with
-  32,013 ticks in ten minutes because only 13 of the required 20 bars existed.
+  while looking perfectly healthy at the tick level — a symbol can have many
+  ticks in ten minutes while still lacking the required completed bars.
   Reporting the shortfall and an ETA turns that from a mystery into a wait.
   """
   try:
@@ -5875,14 +6041,37 @@ def _entry_blockade_chain() -> list[dict]:
   summary = (status or {}).get("last_summary") or {}
   session = summary.get("strategy_session") or {}
 
-  armed = bool(summary.get("live_armed"))
-  _link("live_armed", armed, "라이브 제출 무장됨" if armed else "라이브 제출이 무장되지 않음")
+  # A cycle that returns early on MARKET_SESSION_CLOSED never reaches the line
+  # that stamps live_armed, so a missing key means "not evaluated this cycle",
+  # not "disarmed". Reading the absence as False made this chain report the
+  # arming layer every night and weekend while the real constraint was the
+  # market session — precisely the misattribution the chain exists to prevent.
+  # Absent falls back to the engine's standing buy_enabled flag, same as the
+  # terminal's live_trading view does.
+  armed_value = summary.get("live_armed")
+  armed = bool(status.get("buy_enabled")) if armed_value is None else bool(armed_value)
+  disabled_reason = str(status.get("buy_disabled_reason") or "").strip()
+  _link(
+      "live_armed",
+      armed,
+      "라이브 제출 무장됨"
+      if armed
+      else f"라이브 제출이 무장되지 않음{f' ({disabled_reason})' if disabled_reason else ''}",
+      {"evaluated_this_cycle": armed_value is not None, "buy_disabled_reason": disabled_reason or None},
+  )
 
   sessions = new_entry_session_report()
   candidates = tuple(summary.get("buy_candidate_sample") or ())
   groups = {"KRX" if str(s).isdigit() and len(str(s)) == 6 else "US" for s in candidates}
   scanned = {g: sessions["groups"].get(g, {}) for g in groups} or sessions["groups"]
-  session_ok = any(item.get("allows_new_entry") for item in scanned.values())
+  # The cycle's own early-return verdict is authoritative.  Diagnostics may be
+  # requested after a session boundary, at which point recomputing from the
+  # wall clock can incorrectly rewrite a closed-market cycle as open.
+  session_ok = (
+      False
+      if str(summary.get("reason") or "") == "MARKET_SESSION_CLOSED"
+      else any(item.get("allows_new_entry") for item in scanned.values())
+  )
   _link(
     "market_session",
     session_ok,
@@ -5933,8 +6122,13 @@ def _entry_blockade_chain() -> list[dict]:
     )[:12]},
   )
 
-  # The bandit fields exist only on the post-refactor build; their absence is
-  # itself the answer (the process is serving older code).
+  # The bandit fields exist only on the post-refactor build, so their absence
+  # from the ENGINE is the answer. Their absence from the last cycle summary is
+  # not: a cycle that returned early (closed market) publishes no session block
+  # at all, and reading that as "old code — restart the server" sent the
+  # operator to restart a healthy process every time the market was shut.
+  if "bandit_selected_arm" not in session:
+    session = (status or {}).get("strategy_session") or session
   bandit_present = "bandit_selected_arm" in session
   if bandit_present:
     arm = session.get("bandit_selected_arm")
@@ -7519,7 +7713,36 @@ _weekend_brief_status: dict[str, Any] = {
 
 def _krx_reference_symbols() -> tuple[str, ...]:
   """Liquid KRX names used as the market proxy for the Monday gap."""
-  return _realtime_session_anchor_symbols() or ("005930",)
+  anchors = _realtime_session_anchor_symbols()
+  if anchors:
+    return anchors
+  limit = max(1, _auto_reliability_int("REALTIME_SESSION_ANCHOR_MAX", 2, 1))
+  candidates: list[str] = []
+  try:
+    candidates.extend(_cached_domestic_ranking_symbols())
+  except Exception:  # noqa: BLE001 - reference discovery is best-effort.
+    pass
+  try:
+    candidates.extend(
+        RealtimeMarketDataStore().active_symbols(
+            datetime.now(timezone.utc) - timedelta(days=1),
+            limit=limit * 4,
+        )
+    )
+  except Exception:  # noqa: BLE001 - listed-universe fallback remains available.
+    pass
+  if not candidates:
+    try:
+      candidates.extend(load_krx_listed_universe(limit=limit * 4))
+    except Exception:  # noqa: BLE001 - unknown is safer than fabricated evidence.
+      pass
+  return tuple(
+      dict.fromkeys(
+          str(symbol).strip().zfill(6)
+          for symbol in candidates
+          if str(symbol).strip().isdigit() and len(str(symbol).strip()) <= 6
+      )
+  )[:limit]
 
 
 def _session_move_bps(symbols: tuple[str, ...], since: datetime, until: datetime) -> float | None:
@@ -7755,7 +7978,14 @@ def _live_training_loop() -> None:
   registry.save는 적격 모델만 latest를 원자적으로 교체하므로, 부적격 재학습은 기존 모델을 보존하고
   라이브 예측기(매 예측마다 latest 재로딩)는 재시작 없이 개선된 모델을 자동 반영한다.
   """
+  startup_delay = max(
+      0.0,
+      _env_float_web("LIVE_TRAINING_STARTUP_DELAY_SECONDS", 20.0),
+  )
+  if _live_training_stop.wait(startup_delay):
+    return
   while not _live_training_stop.is_set():
+    next_wait_seconds = float(LIVE_TRAINING_INTERVAL_SECONDS)
     with _live_lock:
       _live_training_heartbeat.update(
           {
@@ -7764,7 +7994,21 @@ def _live_training_loop() -> None:
           }
       )
     try:
-      backfill = backfill_live_feature_frames_from_realtime_store()
+      minimum_rows_before_skip = max(
+          30,
+          _auto_reliability_int("LIVE_TRAINING_BACKFILL_MIN_MATERIALIZED_ROWS", 1_000, 30),
+      )
+      stored_training_rows = materialized_training_row_count()
+      if stored_training_rows >= minimum_rows_before_skip:
+        backfill = {
+            "built": 0,
+            "attempted": 0,
+            "errors": {},
+            "reason": "MATERIALIZED_HISTORY_SUFFICIENT",
+            "materialized_training_rows": stored_training_rows,
+        }
+      else:
+        backfill = backfill_live_feature_frames_from_realtime_store()
       collection = collect_live_feature_frames_from_realtime_store()
       artifact = train_live_short_horizon_from_collected_features()
       metrics = artifact.get("metrics") or {}
@@ -7823,20 +8067,32 @@ def _live_training_loop() -> None:
             },
         )
     except Exception as exc:  # noqa: BLE001 - 학습 실패가 서버/트레이딩을 죽여서는 안 된다.
+      error_message = str(exc) or exc.__class__.__name__
+      if "database is locked" in error_message.lower():
+        # Startup and periodic store maintenance can briefly own SQLite's writer
+        # lock. Retry promptly; waiting the normal five-minute cadence would make
+        # one transient collision look like a stopped learner.
+        next_wait_seconds = max(
+            5.0,
+            min(
+                30.0,
+                _env_float_web("LIVE_TRAINING_DB_LOCK_RETRY_SECONDS", 15.0),
+            ),
+        )
       with _live_lock:
         _live_training_heartbeat.update(
             {
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "ok": False,
                 "skipped": False,
-                "error": str(exc) or exc.__class__.__name__,
+                "error": error_message,
             }
         )
         _append_collection_log_unlocked(
             "error",
-            f"Live training cycle failed: {str(exc) or exc.__class__.__name__}",
+            f"Live training cycle failed: {error_message}",
         )
-    _live_training_stop.wait(LIVE_TRAINING_INTERVAL_SECONDS)
+    _live_training_stop.wait(next_wait_seconds)
 
 
 def _start_live_training_worker() -> None:
@@ -7927,6 +8183,19 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
         frames[symbol] = builder.build(symbol, decision_time=observed_at)
       except Exception as exc:  # closed-world: no valid frame means no new evidence.
         _record_live_shadow_error(symbol, exc, observed_at)
+    try:
+      # Collect the new absorption thesis independently of ontology/GNN election.
+      # This is a shadow-only journal/simulator path and cannot submit an order.
+      from app.trading.mechanical_shadow import default_mechanical_shadow_collector
+
+      default_mechanical_shadow_collector().collect(
+          frames.values(),
+          observed_at=observed_at,
+      )
+    except Exception as exc:
+      # The experimental collector is never allowed to starve the established
+      # ontology/GNN evidence refresh.
+      _record_live_shadow_error("_mechanical_shadow", exc, observed_at)
     _refresh_live_candidate_shadow(frames, observed_at)
   except Exception as exc:
     _record_live_shadow_error("_pipeline", exc, observed_at)
@@ -8265,7 +8534,18 @@ def _krx_feature_frame_symbols() -> tuple[str, ...]:
 
 def _krx_feature_frame_loop() -> None:
   interval = max(2.0, _env_float_web("LIVE_KRX_FEATURE_FRAME_SECONDS", 5.0))
-  store = RealtimeMarketDataStore()
+  # Startup launches several SQLite-backed workers together. Initial schema
+  # maintenance can briefly hold the writer lock; retry instead of letting this
+  # one daemon die permanently before the first feature frame is sampled.
+  store = None
+  while store is None and not _krx_feature_frame_stop.is_set():
+    try:
+      store = RealtimeMarketDataStore()
+    except Exception:  # noqa: BLE001 - transient SQLite startup contention.
+      if _krx_feature_frame_stop.wait(min(5.0, interval)):
+        return
+  if store is None:
+    return
   while not _krx_feature_frame_stop.is_set():
     for symbol in _krx_feature_frame_symbols():
       try:
@@ -8854,6 +9134,7 @@ def _build_macro_micro_observer(decision_engine):
 
     def _builder(symbol, macro_result):
       features = None
+      frame = None
       technical_feature_error_code = None
       broker_quote = None
       realtime_tick = None
@@ -8899,6 +9180,7 @@ def _build_macro_micro_observer(decision_engine):
           allowed_micro_strategies=macro_result.allowed_micro_strategies,
           blocked_micro_strategies=macro_result.blocked_micro_strategies,
           technical_features=features,
+          live_feature_frame=frame,
           technical_feature_error_code=technical_feature_error_code,
           holding_state=holding_state,
           realtime_tick=realtime_tick, broker_quote=broker_quote,
@@ -10640,14 +10922,46 @@ def _realtime_session_anchor_symbols() -> tuple[str, ...]:
   enough to produce one session-structure observation per day each, which is what
   turns an unmeasurable strategy into a measurable one.
   """
-  raw = os.getenv("REALTIME_SESSION_ANCHOR_SYMBOLS", "005930,000660")
+  raw = os.getenv("REALTIME_SESSION_ANCHOR_SYMBOLS", "")
   symbols = [token.strip() for token in raw.split(",")]
   anchors = [s for s in symbols if s.isdigit() and len(s) == 6]
   try:
     limit = max(0, int(os.getenv("REALTIME_SESSION_ANCHOR_MAX", "2")))
   except (TypeError, ValueError):
     limit = 2
-  return tuple(dict.fromkeys(anchors))[:limit]
+  if anchors or limit == 0:
+    return tuple(dict.fromkeys(anchors))[:limit]
+
+  # No implicit issuer preference: choose from observed/ranked/configured data,
+  # then the listed universe. The process cache pins the result for the session
+  # so intraday strategies see both the opening and closing windows.
+  session_key = datetime.now(timezone.utc).date().isoformat()
+  cached = _realtime_session_anchor_cache.get("symbols")
+  if _realtime_session_anchor_cache.get("session") == session_key and cached:
+    return tuple(cached)[:limit]
+  candidates: list[str] = []
+  for provider in (_cached_domestic_ranking_symbols, _load_realtime_collection_symbols):
+    try:
+      candidates.extend(provider())
+    except Exception:  # noqa: BLE001 - the next dynamic source may still work.
+      continue
+  if not candidates:
+    try:
+      candidates.extend(load_krx_listed_universe(limit=max(limit * 4, limit)))
+    except Exception:  # noqa: BLE001 - no anchor is safer than inventing a symbol.
+      pass
+  resolved = tuple(
+      dict.fromkeys(
+          str(symbol).strip().zfill(6)
+          for symbol in candidates
+          if str(symbol).strip().isdigit() and len(str(symbol).strip()) <= 6
+      )
+  )[:limit]
+  _realtime_session_anchor_cache.update({"session": session_key, "symbols": resolved})
+  return resolved
+
+
+_realtime_session_anchor_cache: dict[str, Any] = {"session": None, "symbols": ()}
 
 
 def _kis_realtime_training_candidate_viable(
@@ -10734,7 +11048,15 @@ def _kis_realtime_collector_loop() -> None:
     from app.data.kis_realtime import _domestic_subscription_tr_ids
     from app.data.market_session import streaming_phase
 
-    unified_feed = _domestic_subscription_tr_ids()[0] in {"H0UNCNT0", "H0NXCNT0"}
+    subscription_tr_ids = _domestic_subscription_tr_ids()
+    # During the regular session the KRX-only trade channel is the dependable
+    # source of prints.  The unified channel can continue publishing books while
+    # its trade leg is silent, which leaves every candidate stale.  Keep an
+    # explicit KIS_REALTIME_FEED override authoritative; otherwise use KRX-only
+    # in the core session and unified outside it for NXT coverage.
+    if not os.getenv("KIS_REALTIME_FEED", "").strip() and market_phase("KRX") is MarketPhase.REGULAR:
+      subscription_tr_ids = ("H0STCNT0", "H0STASP0")
+    unified_feed = subscription_tr_ids[0] in {"H0UNCNT0", "H0NXCNT0"}
     streaming_phases = (
         {MarketPhase.REGULAR, MarketPhase.PRE, MarketPhase.AFTER}
         if unified_feed
@@ -10792,6 +11114,7 @@ def _kis_realtime_collector_loop() -> None:
               session_active_provider=lambda: (
                   _kis_realtime_session_owner() in {"KRX", "BOTH"}
               ),
+              subscription_tr_ids=subscription_tr_ids,
           )
       )
       _record_kis_realtime_collector_result(counts)
@@ -10857,10 +11180,17 @@ def _record_kis_realtime_collector_result(counts: dict[str, Any]) -> None:
     tr_id = str(item.get("tr_id") or "").strip()
     if symbol and tr_id:
       accepted_by_symbol.setdefault(symbol, set()).add(tr_id)
+  # KRX-only, unified KRX+NXT and NXT feeds use different TR IDs for the
+  # same trade/orderbook pair.  Treat every supported domestic pair as
+  # complete; otherwise the default unified feed is subscribed successfully
+  # but the fast feature sampler sees zero symbols.
+  domestic_trade_tr_ids = {"H0STCNT0", "H0UNCNT0", "H0NXCNT0"}
+  domestic_orderbook_tr_ids = {"H0STASP0", "H0UNASP0", "H0NXASP0"}
   complete_symbols = tuple(
       symbol
       for symbol, tr_ids in accepted_by_symbol.items()
-      if {"H0STCNT0", "H0STASP0"}.issubset(tr_ids)
+      if tr_ids.intersection(domestic_trade_tr_ids)
+      and tr_ids.intersection(domestic_orderbook_tr_ids)
   )
   if complete_symbols:
     with _live_lock:
@@ -10916,9 +11246,8 @@ def _record_kis_realtime_collector_bad_subscription(counts: dict[str, Any]) -> N
 
 def _load_realtime_collection_symbols(path: str | Path = "config/realtime_market_data.json") -> tuple[str, ...]:
   config_path = Path(path)
-  fallback_path = Path("config/realtime_market_data.example.json")
   data: dict[str, Any] = {}
-  for candidate in (config_path, fallback_path):
+  for candidate in (config_path,):
     if not candidate.exists():
       continue
     try:
@@ -12713,7 +13042,7 @@ def _compact_technical_payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _graph_payload(context: Any) -> dict[str, Any]:
+def _graph_payload(context: Any, *, trim_for_ui: bool = True) -> dict[str, Any]:
     triples = context.graph.triples()
     event_meta = _event_metadata_map(context.events, context.reasoning_paths)
     links: list[dict[str, Any]] = []
@@ -12764,23 +13093,31 @@ def _graph_payload(context: Any) -> dict[str, Any]:
             score = round(importance.get(node_id, 0.0), 4)
             nodes[node_id] = _node_payload(node_id, score, event_meta.get(node_id), kind_overrides.get(str(node_id)))
 
-    display_nodes, display_links, display_steps = _trim_graph_payload_for_ui(
-        list(nodes.values()),
-        links,
-        _build_reasoning_steps(context.reasoning_paths),
-    )
+    reasoning_steps = _build_reasoning_steps(context.reasoning_paths)
+    if trim_for_ui:
+        display_nodes, display_links, display_steps = _trim_graph_payload_for_ui(
+            list(nodes.values()),
+            links,
+            reasoning_steps,
+        )
+    else:
+        display_nodes = list(nodes.values())
+        display_links = links
+        display_steps = reasoning_steps
     # Overlay the hierarchical macro–micro reasoning (advisory) onto the graph so
     # the visualization reflects market regime -> candidates -> per-symbol micro.
     # Added AFTER trimming so it always renders; additive (existing graph intact).
     display_nodes, display_links, macro_micro_summary = _apply_macro_micro_overlay(display_nodes, display_links)
+    payload_node_count = len(display_nodes) if not trim_for_ui else len(nodes)
+    payload_link_count = len(display_links) if not trim_for_ui else len(links)
     return {
         "nodes": display_nodes,
         "links": display_links,
         "reasoning_steps": display_steps,
         "macro_micro": macro_micro_summary,
-        "counts": {"nodes": len(nodes), "links": len(links)},
+        "counts": {"nodes": payload_node_count, "links": payload_link_count},
         "display_counts": {"nodes": len(display_nodes), "links": len(display_links)},
-        "truncated": len(display_nodes) < len(nodes) or len(display_links) < len(links),
+        "truncated": trim_for_ui and (len(display_nodes) < len(nodes) or len(display_links) < len(links)),
         "runtime": context.ontology_runtime.as_dict(),
         "candidate_selection": _candidate_selection_payload(getattr(context, "candidate_selection", None)),
         "parameter_tuning": tuple(getattr(context, "parameter_tuning", ()) or ()),
@@ -12960,7 +13297,7 @@ def _trim_graph_payload_for_ui(
 
 
 def _resolve_instrument_label(node_id: str) -> str:
-    """Map a bare ticker code (e.g. 005930) to a display name (삼성전자) when known."""
+    """Map a bare ticker code to a configured display name when known."""
     from app.graph.rdf_adapter import _instrument_name_map
 
     text = str(node_id)
@@ -13745,9 +14082,9 @@ HTML = """
         </section>
         <section class="ontology-scene ontology-wide-layout">
           <div class="ontology-toolbar">
-            <span class="ontology-badge">3D 온톨로지 네트워크</span>
+            <span class="ontology-badge">실시간 3D GNN 네트워크</span>
             <span class="ontology-badge" id="ontologyCounts">노드 - | 관계 -</span>
-            <button id="resetGraph" type="button">시점 초기화</button>
+            <button id="resetGraph" type="button">전체 그래프 맞춤</button>
             <button id="toggleLabels" type="button">라벨 켜기</button>
             <button id="toggleReasoning" type="button">추론 일시정지</button>
             <span class="ontology-badge" id="reasoningBadge">추론 단계 -</span>
@@ -14075,20 +14412,33 @@ HTML = """
       const canvas = document.getElementById('ontologyCanvas');
       if (!canvas || canvas.offsetParent === null) return;
       try {
-        const data = await (await fetch('/api/ontology/graph')).json();
+        const data = await (await fetch('/api/ontology/graph?full=true', { cache: 'no-store' })).json();
         if (!data || !data.counts) return;
         const display = data.display_counts || {};
         const suffix = data.truncated ? ` | shown ${display.nodes || 0}/${data.counts.nodes} nodes, ${display.links || 0}/${data.counts.links} links` : '';
         document.getElementById('ontologyCounts').textContent = `Nodes ${data.counts.nodes} | Links ${data.counts.links}${suffix}`;
         // 그래프가 비었거나(컨텍스트 미준비) 직전과 동일하면 재렌더 생략 — 준비되면 자동으로 그려진다.
         const signature = graphSignature(data);
-        if (signature === lastGraphSignature && Number(data.counts.nodes || 0) > 0) return;
+        if (signature === lastGraphSignature && Number(data.counts.nodes || 0) > 0) {
+          if (graphState && graphState.applyLiveTrace) graphState.applyLiveTrace(data.live_trace);
+          return;
+        }
         if (Number(data.counts.nodes || 0) <= 0) return;
         lastGraphSignature = signature;
         await renderOntologyGraph(data);
         renderSystemFlow({ analysis: 'done' }, { analysis: 'Ontology graph ready' });
       } catch (error) {
         console.error('ontology graph load failed', error);
+      }
+    }
+
+    async function loadOntologyLiveTrace() {
+      if (!graphState || !graphState.applyLiveTrace) return;
+      try {
+        const payload = await (await fetch('/api/ontology/live-trace', { cache: 'no-store' })).json();
+        if (payload && payload.trace) graphState.applyLiveTrace(payload.trace);
+      } catch (error) {
+        console.debug('live ontology trace unavailable', error);
       }
     }
 
@@ -15539,36 +15889,68 @@ HTML = """
     async function renderOntologyGraph(data) {
       const canvas = document.getElementById('ontologyCanvas');
       const tooltip = document.getElementById('ontologyTooltip');
-      renderOntologyGraph2d(data, canvas, tooltip);
-      return; // Obsidian-style 2D force graph is the canonical ontology view.
-      tooltip.style.display = 'block';
-      tooltip.style.left = '12px';
-      tooltip.style.top = '52px';
-      tooltip.textContent = '2D 폴백으로 그래프를 우선 표시합니다.';
       const THREE = await loadThree();
       if (!THREE) {
-        tooltip.textContent = '3D 라이브러리를 불러오지 못해 2D로 표시합니다.';
+        renderOntologyGraph2d(data, canvas, tooltip);
         return;
       }
 
       if (graphState) {
         graphState.stop = true;
+        if (graphState.cleanup) graphState.cleanup();
         if (graphState.renderer) graphState.renderer.dispose();
       }
 
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x0f172a);
+      scene.background = new THREE.Color(0x050914);
+      scene.fog = new THREE.FogExp2(0x050914, 0.00048);
       const camera = new THREE.PerspectiveCamera(52, 1, 0.1, 5000);
       camera.position.set(0, 0, 760);
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+      let renderer;
+      try {
+        renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
+      } catch (error) {
+        console.warn('WebGL unavailable; using 2D graph fallback.', error);
+        renderOntologyGraph2d(data, canvas, tooltip);
+        return;
+      }
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.18;
 
       const root = new THREE.Group();
       scene.add(root);
-      scene.add(new THREE.AmbientLight(0xffffff, 0.78));
-      const light = new THREE.PointLight(0xffffff, 1.1);
+      scene.add(new THREE.HemisphereLight(0xbfe8ff, 0x11152b, 1.35));
+      const light = new THREE.PointLight(0x8fdcff, 75, 1800);
       light.position.set(300, 280, 500);
       scene.add(light);
+      const rimLight = new THREE.PointLight(0xa855f7, 55, 1500);
+      rimLight.position.set(-420, -220, -280);
+      scene.add(rimLight);
+
+      // A sparse star field gives the rotating graph stable depth cues without
+      // competing with the actual GNN edges.
+      const starPositions = [];
+      for (let index = 0; index < 900; index += 1) {
+        const radius = 720 + seededUnit(`star:${index}:r`) * 1200;
+        const theta = seededUnit(`star:${index}:t`) * Math.PI * 2;
+        const phi = Math.acos(2 * seededUnit(`star:${index}:p`) - 1);
+        starPositions.push(
+          radius * Math.sin(phi) * Math.cos(theta),
+          radius * Math.sin(phi) * Math.sin(theta),
+          radius * Math.cos(phi),
+        );
+      }
+      const starGeometry = new THREE.BufferGeometry();
+      starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starPositions, 3));
+      scene.add(new THREE.Points(starGeometry, new THREE.PointsMaterial({
+        color: 0x8db9dc,
+        size: 1.4,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false,
+      })));
 
       const renderGraph = prepareRenderableGraph(data.nodes || [], data.links || []);
       const nodes = computeGraphLayout(renderGraph.nodes, renderGraph.links);
@@ -15578,6 +15960,8 @@ HTML = """
       const nodeMap = new Map(nodes.map((node) => [node.id, node]));
       const raycaster = new THREE.Raycaster();
       const pointer = new THREE.Vector2(99, 99);
+      const interactionController = new AbortController();
+      const interactionSignal = interactionController.signal;
       const nodeMeshes = [];
       const labelSprites = [];
       const linkLines = [];
@@ -15588,11 +15972,10 @@ HTML = """
       const lineByKey = new Map();
       const labelState = { visible: false };
       const reasoningState = {
-        steps: (data.reasoning_steps || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
-        playing: true,
+        steps: (((data.live_trace || {}).stages) || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
+        playing: false,
+        followLive: true,
         currentIndex: -1,
-        startedAt: performance.now(),
-        stepMs: 1450,
         activeNodeIds: new Set(),
         activeLinkKeys: new Set(),
       };
@@ -15606,11 +15989,16 @@ HTML = """
           new THREE.Vector3(...source.position),
           new THREE.Vector3(...target.position),
         ]);
-        const material = new THREE.LineBasicMaterial({ color: edgeColor(link.predicate), transparent: true, opacity: 0.26 });
+        const material = new THREE.LineBasicMaterial({
+          color: edgeColor(link.predicate),
+          transparent: true,
+          opacity: 0.42,
+          depthWrite: false,
+        });
         const line = new THREE.Line(geometry, material);
         line.userData = { source: link.source, target: link.target, predicate: link.predicate };
         line.userData.baseColor = edgeColor(link.predicate);
-        line.userData.baseOpacity = 0.26;
+        line.userData.baseOpacity = 0.42;
         root.add(line);
         linkLines.push(line);
         lineByKey.set(linkKey(link.source, link.target, link.predicate), line);
@@ -15630,13 +16018,15 @@ HTML = """
 
       for (const node of nodes) {
         const radius = nodeRadius(node, graphMetrics);
-        const geometry = new THREE.SphereGeometry(radius, 16, 16);
+        const sphereSegments = nodes.length > 500 ? 8 : nodes.length > 250 ? 12 : 20;
+        const geometry = new THREE.SphereGeometry(radius, sphereSegments, sphereSegments);
         const highlighted = Boolean(node.highlight);
         const material = new THREE.MeshStandardMaterial({
           color: nodeColor(node.kind),
           emissive: nodeColor(node.kind),
           emissiveIntensity: highlighted ? 0.34 : 0.08,
-          roughness: 0.62,
+          roughness: 0.34,
+          metalness: 0.12,
         });
         const mesh = new THREE.Mesh(geometry, material);
         mesh.position.set(...node.position);
@@ -15698,29 +16088,34 @@ HTML = """
         camera.updateProjectionMatrix();
       }
 
+      function updatePointer(event) {
+        const rect = canvas.getBoundingClientRect();
+        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      }
+
       canvas.addEventListener('pointerdown', (event) => {
+        updatePointer(event);
         dragging = true;
         lastX = event.clientX;
         lastY = event.clientY;
         pausedUntil = performance.now() + 2500;
         canvas.setPointerCapture(event.pointerId);
-      });
+      }, { signal: interactionSignal });
       canvas.addEventListener('pointermove', (event) => {
-        const rect = canvas.getBoundingClientRect();
-        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        updatePointer(event);
         if (!dragging) return;
         rotationY += (event.clientX - lastX) * 0.008;
         rotationX += (event.clientY - lastY) * 0.008;
         lastX = event.clientX;
         lastY = event.clientY;
-      });
-      canvas.addEventListener('pointerup', () => { dragging = false; });
+      }, { signal: interactionSignal });
+      canvas.addEventListener('pointerup', () => { dragging = false; }, { signal: interactionSignal });
       canvas.addEventListener('wheel', (event) => {
         event.preventDefault();
         targetZoom = Math.max(260, Math.min(1300, targetZoom + event.deltaY * 0.7));
         pausedUntil = performance.now() + 2200;
-      }, { passive: false });
+      }, { passive: false, signal: interactionSignal });
       document.getElementById('resetGraph').onclick = () => {
         rotationX = -0.18;
         rotationY = 0.34;
@@ -15730,12 +16125,11 @@ HTML = """
       document.getElementById('toggleLabels').onclick = () => {
         labelState.visible = !labelState.visible;
         document.getElementById('toggleLabels').textContent = labelState.visible ? '라벨 끄기' : '라벨 켜기';
-        updateVisibility();
+        updateVisibility(false);
       };
       document.getElementById('toggleReasoning').onclick = () => {
-        reasoningState.playing = !reasoningState.playing;
-        reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
-        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+        reasoningState.followLive = !reasoningState.followLive;
+        document.getElementById('toggleReasoning').textContent = reasoningState.followLive ? '실시간 추적 중' : '화면 고정됨';
       };
       document.querySelectorAll('#ontologyFilters input').forEach((input) => {
         input.onchange = () => {
@@ -15745,14 +16139,16 @@ HTML = """
         };
       });
 
-      canvas.addEventListener('click', () => {
+      canvas.addEventListener('click', (event) => {
+        updatePointer(event);
         raycaster.setFromCamera(pointer, camera);
         const hit = raycaster.intersectObjects(nodeMeshes.filter((mesh) => mesh.visible), false)[0];
         if (hit) renderNodePanel(hit.object.userData, data.links);
-      });
+      }, { signal: interactionSignal });
 
-      function updateVisibility() {
+      function updateVisibility(refit = true) {
         let visibleCount = 0;
+        let visibleLinkCount = 0;
         for (const mesh of nodeMeshes) {
           mesh.visible = activeKinds.has(mesh.userData.kind);
           if (mesh.visible) visibleCount += 1;
@@ -15767,6 +16163,7 @@ HTML = """
           const source = nodeMap.get(line.userData.source);
           const target = nodeMap.get(line.userData.target);
           line.visible = Boolean(source && target && activeKinds.has(source.kind) && activeKinds.has(target.kind));
+          if (line.visible) visibleLinkCount += 1;
         }
         for (const line of linkGlowLines) {
           const source = nodeMap.get(line.userData.source);
@@ -15779,9 +16176,9 @@ HTML = """
             && reasoningState.activeLinkKeys.has(linkKey(line.userData.source, line.userData.target, line.userData.predicate))
           );
         }
-        fitVisibleGraph();
+        if (refit) fitVisibleGraph();
         document.getElementById('ontologyCounts').textContent =
-          `노드 ${data.counts.nodes} · 관계 ${data.counts.links} · 표시 ${visibleCount}/${renderGraph.links.length}`;
+          `전체 노드 ${data.counts.nodes} · 전체 연결 ${data.counts.links} · 현재 ${visibleCount}/${visibleLinkCount}`;
       }
 
       function fitVisibleGraph() {
@@ -15892,13 +16289,8 @@ HTML = """
 
       function updateReasoning(now) {
         if (!reasoningState.steps.length) {
-          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          document.getElementById('reasoningBadge').textContent = '실제 추론 대기 중';
           return;
-        }
-        if (reasoningState.playing) {
-          const elapsed = Math.max(0, now - reasoningState.startedAt);
-          const index = Math.floor(elapsed / reasoningState.stepMs) % reasoningState.steps.length;
-          if (index !== reasoningState.currentIndex) setActiveReasoningStep(index);
         }
       }
 
@@ -15908,12 +16300,12 @@ HTML = """
         const step = reasoningState.steps[index];
         reasoningState.activeNodeIds = new Set(step.nodes || []);
         reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
-        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningBadge').textContent = `실제 단계 ${index + 1}/${reasoningState.steps.length}`;
         document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
-        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · ${formatLiveTraceTime(step.observed_at)}`;
         document.getElementById('reasoningDescription').textContent = step.description || '';
         document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
-        updateVisibility();
+        updateVisibility(false);
       }
 
       function applyReasoningGlow(now) {
@@ -15952,10 +16344,30 @@ HTML = """
         }
       }
 
-      graphState = { renderer, stop: false };
+      function applyLiveTrace(trace) {
+        if (!reasoningState.followLive || !trace) return;
+        const steps = (trace.stages || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id)));
+        reasoningState.steps = steps;
+        if (steps.length) setActiveReasoningStep(steps.length - 1);
+      }
+
+      const cleanup = () => {
+        interactionController.abort();
+        window.removeEventListener('resize', resize);
+        scene.traverse((object) => {
+          if (object.geometry) object.geometry.dispose();
+          const materials = Array.isArray(object.material) ? object.material : object.material ? [object.material] : [];
+          for (const material of materials) {
+            if (material.map) material.map.dispose();
+            material.dispose();
+          }
+        });
+      };
+      graphState = { renderer, stop: false, cleanup, applyLiveTrace };
       resize();
       window.addEventListener('resize', resize);
-      if (reasoningState.steps.length) setActiveReasoningStep(0);
+      document.getElementById('toggleReasoning').textContent = '실시간 추적 중';
+      if (reasoningState.steps.length) setActiveReasoningStep(reasoningState.steps.length - 1);
 
       function animate(now) {
         if (!graphState || graphState.stop) return;
@@ -15991,7 +16403,11 @@ HTML = """
     }
 
     function renderOntologyGraph2d(data, canvas, tooltip) {
-      if (graphState) graphState.stop = true;
+      if (graphState) {
+        graphState.stop = true;
+        if (graphState.cleanup) graphState.cleanup();
+        if (graphState.renderer) graphState.renderer.dispose();
+      }
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
@@ -16021,11 +16437,10 @@ HTML = """
       });
 
       const reasoningState = {
-        steps: (data.reasoning_steps || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
-        playing: true,
+        steps: (((data.live_trace || {}).stages) || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id))),
+        playing: false,
+        followLive: true,
         currentIndex: -1,
-        startedAt: performance.now(),
-        stepMs: 1450,
         activeNodeIds: new Set(),
         activeLinkKeys: new Set(),
       };
@@ -16087,21 +16502,25 @@ HTML = """
         const step = reasoningState.steps[index];
         reasoningState.activeNodeIds = new Set(step.nodes || []);
         reasoningState.activeLinkKeys = new Set((step.links || []).map((link) => linkKey(link.source, link.target, link.predicate)));
-        document.getElementById('reasoningBadge').textContent = `추론 단계 ${index + 1}/${reasoningState.steps.length}`;
+        document.getElementById('reasoningBadge').textContent = `실제 단계 ${index + 1}/${reasoningState.steps.length}`;
         document.getElementById('reasoningTitle').textContent = step.title || '추론 단계';
-        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · 신뢰도 ${step.confidence_percent ?? '-'}%`;
+        document.getElementById('reasoningMeta').textContent = `${step.ticker || '-'} · ${formatLiveTraceTime(step.observed_at)}`;
         document.getElementById('reasoningDescription').textContent = step.description || '';
         document.getElementById('reasoningProgress').style.width = `${((index + 1) / reasoningState.steps.length) * 100}%`;
       }
 
       function updateReasoning(now) {
         if (!reasoningState.steps.length) {
-          document.getElementById('reasoningBadge').textContent = '추론 단계 0/0';
+          document.getElementById('reasoningBadge').textContent = '실제 추론 대기 중';
           return;
         }
-        if (!reasoningState.playing) return;
-        const index = Math.floor(Math.max(0, now - reasoningState.startedAt) / reasoningState.stepMs) % reasoningState.steps.length;
-        if (index !== reasoningState.currentIndex) setActiveReasoningStep(index);
+      }
+
+      function applyLiveTrace(trace) {
+        if (!reasoningState.followLive || !trace) return;
+        const steps = (trace.stages || []).filter((step) => (step.nodes || []).some((id) => nodeMap.has(id)));
+        reasoningState.steps = steps;
+        if (steps.length) setActiveReasoningStep(steps.length - 1);
       }
 
       function stepSim() {
@@ -16251,9 +16670,8 @@ HTML = """
         document.getElementById('toggleLabels').textContent = view.labels ? '라벨 끄기' : '라벨 켜기';
       };
       document.getElementById('toggleReasoning').onclick = () => {
-        reasoningState.playing = !reasoningState.playing;
-        reasoningState.startedAt = performance.now() - Math.max(0, reasoningState.currentIndex) * reasoningState.stepMs;
-        document.getElementById('toggleReasoning').textContent = reasoningState.playing ? '추론 일시정지' : '추론 재생';
+        reasoningState.followLive = !reasoningState.followLive;
+        document.getElementById('toggleReasoning').textContent = reasoningState.followLive ? '실시간 추적 중' : '화면 고정됨';
       };
       document.querySelectorAll('#ontologyFilters input').forEach((input) => {
         input.onchange = () => {
@@ -16263,11 +16681,13 @@ HTML = """
         };
       });
 
-      graphState = { stop: false, renderer: null };
+      const cleanup = () => window.removeEventListener('resize', resize);
+      graphState = { stop: false, renderer: null, cleanup, applyLiveTrace };
       resize();
       window.addEventListener('resize', resize, { passive: true });
       fitVisibleGraph2d();
-      if (reasoningState.steps.length) setActiveReasoningStep(0);
+      document.getElementById('toggleReasoning').textContent = '실시간 추적 중';
+      if (reasoningState.steps.length) setActiveReasoningStep(reasoningState.steps.length - 1);
       requestAnimationFrame(draw);
     }
     function intColorToCss(value) {
@@ -16877,10 +17297,25 @@ HTML = """
       return `${source}::${predicate}::${target}`;
     }
 
+    function formatLiveTraceTime(value) {
+      if (!value) return '실제 시각 대기';
+      const parsed = new Date(value);
+      if (Number.isNaN(parsed.getTime())) return String(value);
+      return `실제 ${parsed.toLocaleTimeString('ko-KR', { hour12: false })}`;
+    }
+
     function graphSignature(graph) {
       const counts = graph.counts || {};
       const latestStep = (graph.reasoning_steps || []).map((step) => `${step.path_id}:${step.title}:${step.description}`).join('|');
-      return `${counts.nodes || 0}:${counts.links || 0}:${latestStep}`;
+      let topologyHash = 2166136261;
+      for (const link of graph.links || []) {
+        const value = `${link.source}>${link.predicate}>${link.target}|`;
+        for (let index = 0; index < value.length; index += 1) {
+          topologyHash ^= value.charCodeAt(index);
+          topologyHash = Math.imul(topologyHash, 16777619);
+        }
+      }
+      return `${counts.nodes || 0}:${counts.links || 0}:${topologyHash >>> 0}:${latestStep}`;
     }
 
     function renderNodePanel(node, links) {
@@ -17235,7 +17670,7 @@ HTML = """
     loadRealtimeRuntime();
     loadOperationModeStatus().catch(() => {});
     loadDiagnostics();
-    // Ontology graph rendering is intentionally disabled in the GUI.
+    loadOntologyGraph();
     loadMockPerformance();
     refreshLiveSnapshot();
     setInterval(() => loadOperationModeStatus().catch(() => {}), 3000);
@@ -17243,7 +17678,8 @@ HTML = """
     setInterval(() => refreshLiveTradingProgress().catch(() => {}), 3000);
     setInterval(refreshLiveSnapshot, 5000);
     setInterval(() => loadMockPerformance().catch(() => {}), 3000);
-    // Ontology graph rendering is intentionally disabled in the GUI.
+    setInterval(() => loadOntologyGraph().catch(() => {}), 15000);
+    setInterval(() => loadOntologyLiveTrace().catch(() => {}), 1000);
   </script>
 </body>
 </html>

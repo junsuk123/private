@@ -293,7 +293,7 @@ def _instrument_name_map() -> dict[str, str]:
 
 
 def _display_label(nid: str, attrs: Mapping[str, str]) -> str:
-    """Prefer a human-readable name (e.g. 삼성전자) over the bare 6-digit code."""
+    """Prefer a configured human-readable name over the bare exchange code."""
     symbol = str(attrs.get("hasSymbol") or _local(nid))
     base = symbol.split(".", 1)[0]
     names = _instrument_name_map()

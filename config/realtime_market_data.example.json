@@ -1,5 +1,5 @@
 {
-  "symbols": ["005930", "000660"],
+  "symbols": [],
   "max_quote_age_ms": 3000,
   "max_orderbook_age_ms": 3000,
   "persist_ticks": true,

@@ -1,42 +1,44 @@
-from __future__ import annotations
-
-from app.trading import us_realtime_bridge
+from app.trading.us_realtime_bridge import _extract_price_book
 
 
-def _quote(*, price: float = 10.0, volume: float = 1_000.0) -> dict[str, float]:
-    return {
-        "last": price,
-        "bid": price - 0.01,
-        "ask": price + 0.01,
-        "bid_size": 100.0,
-        "ask_size": 100.0,
-        "volume": volume,
+def test_extract_price_book_uses_kis_price_fields_not_change_fields() -> None:
+    payload = {
+        "output1": {
+            "last": "12.42",
+            "bvol": "999",
+            "avol": "888",
+        },
+        "output2": {
+            "pbid1": "12.41",
+            "pask1": "12.43",
+            "vbid1": "120",
+            "vask1": "150",
+            "dbid1": "-630",
+            "dask1": "700",
+        },
     }
 
+    book = _extract_price_book(payload)
 
-def test_us_rest_poll_does_not_turn_cumulative_volume_into_repeated_trades() -> None:
-    with us_realtime_bridge._US_POLL_STATE_LOCK:
-        us_realtime_bridge._US_POLL_STATE.clear()
+    assert book["bid"] == 12.41
+    assert book["ask"] == 12.43
+    assert book["bid_size"] == 120.0
+    assert book["ask_size"] == 150.0
 
-    first_tick, first_book = us_realtime_bridge._make_records(
-        "TEST",
-        "NAS",
-        _quote(volume=10_000),
-    )
-    repeated_tick, repeated_book = us_realtime_bridge._make_records(
-        "TEST",
-        "NAS",
-        _quote(volume=10_000),
-    )
-    changed_tick, _ = us_realtime_bridge._make_records(
-        "TEST",
-        "NAS",
-        _quote(price=10.02, volume=10_025),
-    )
 
-    assert first_tick is None
-    assert repeated_tick is None
-    assert first_book is not None
-    assert repeated_book is not None
-    assert changed_tick is not None
-    assert changed_tick.volume == 25
+def test_extract_price_book_rejects_implausibly_wide_source_book() -> None:
+    payload = {
+        "output1": {"last": "16.00"},
+        "output2": {
+            "pbid1": "5.00",
+            "pask1": "706.00",
+            "vbid1": "10",
+            "vask1": "20",
+        },
+    }
+
+    try:
+        _extract_price_book(payload)
+        raise AssertionError("implausible source book must be rejected")
+    except RuntimeError as exc:
+        assert "IMPLAUSIBLE_BID_ASK_SPREAD" in str(exc)

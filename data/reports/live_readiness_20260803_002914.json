@@ -1,0 +1,38 @@
+{
+  "checked_at": "2026-08-02T15:29:14.254134+00:00",
+  "diagnostics": {
+    "live_eligible_model": "RuntimeError"
+  },
+  "dry_run": true,
+  "failures": {},
+  "gates": {
+    "kis_health": true,
+    "kis_secret_file": true,
+    "live_eligible_model_diagnostic": false,
+    "live_flags_diagnostic": true,
+    "live_trading_safety_config": true,
+    "order_execution_config": true,
+    "trading_policy": true
+  },
+  "no_orders": true,
+  "policy_version": "tp_cb99c5f6f4a6",
+  "trading_policy": {
+    "allow_loss_exit": true,
+    "confidence_threshold": 0.51,
+    "conflicts": [],
+    "emergency_stop_rate": 0.05,
+    "hard_stop_rate": 0.03,
+    "label_horizon_seconds": 600.0,
+    "label_stop_loss_bps": 100.0,
+    "label_take_profit_bps": 25.0,
+    "maximum_position_weight": 0.1,
+    "minimum_net_edge_kr": 0.008,
+    "minimum_net_edge_us": 0.012,
+    "policy_version": "tp_cb99c5f6f4a6",
+    "profit_time_exit_seconds": 300.0,
+    "quick_take_profit_net_rate": 0.008,
+    "source": "environment",
+    "stop_loss_net_rate": 0.015,
+    "take_profit_net_rate": 0.0025
+  }
+}

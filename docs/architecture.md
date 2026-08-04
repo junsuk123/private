@@ -139,7 +139,7 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | `GET /api/account/macro-micro` | 거시–미시 온톨로지 패널 (자문) |
 | `GET /api/realtime-trading/status` | 실시간 엔진 상태, 최근 이벤트, 거부 사유 분포 |
 | `GET /api/refactor/dashboard` | 전략 소유 경로의 프로파일·게이트·shadow 상태 |
-| `GET /api/refactor/market-view?symbol=005930&limit=180` | 로컬 차트/마켓 뷰 |
+| `GET /api/refactor/market-view?symbol={symbol}&limit=180` | 로컬 차트/마켓 뷰 |
 | `POST /api/live-trading/terminate?shutdown=true` | BUY 차단 → 청산 SELL 제출 → 서버 종료 예약 |
 | `GET /api/trade-explanations` | `/display`용 사람이 읽는 판단 카드 |
 | `GET /api/ontology/graph`, `/api/ontology/runtime` | 그래프 payload, 온톨로지 런타임 상태 |
@@ -156,6 +156,17 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | `GET /api/borrow/{symbol}/availability`, `/api/borrow/health` | 대주 locate와 데스크 건강도 |
 | `GET /api/directional-bandit/evaluations` | LONG vs SHORT vs NO_TRADE 보수적 엣지 비교 |
 | `POST /api/short-strategies/{id}/suspend` | 수동 중단. **승격 endpoint는 존재하지 않음** |
+
+`/api/refactor/market-view`의 LIVE DECISION ONTOLOGY source 노드는 고정 플래그가 아니다.
+`event_feed`는 뉴스 저장소 조회 건수, `cross_section`은 shadow 판단에 보존된
+`sector_rank_table`과 대상 종목 순위, `session_context`는 시계 사실과 가격 사실을 각각
+측정한다. 시계는 계산 가능하지만 30분 가격 구간이나 과거 변동성 표본이 부족하면
+`session_context.status=PARTIAL`이며, UI도 이를 `DATA MISSING`과 구분한다.
+
+KRX 세션 가격 사실의 단일 계산 권한은 `app.features.session_structure`이다. 라이브 frame과
+stored counterfactual은 모두 이 모듈의 30분 시초 범위, 전일 종가 기준 첫 30분 수익률,
+과거 세션만을 사용한 변동성 percentile을 호출한다. 15:20~15:30 종가 단일가 매매는
+연속매매 구간으로 취급하지 않는다.
 
 ## 7. 운영 모드
 

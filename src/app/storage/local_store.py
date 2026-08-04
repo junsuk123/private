@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from app.graph import Triple
 from app.runtime import DataMode, default_environment
@@ -20,6 +21,9 @@ from app.schemas.domain import (
     RealtimeQuote,
     ReasoningPath,
 )
+
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -477,7 +481,7 @@ class LocalResearchStore:
         macro_cutoff = datetime.now(timezone.utc) - timedelta(days=_macro_retention_days())
         cutoff_text = cutoff.isoformat()
         macro_cutoff_text = macro_cutoff.isoformat()
-        with closing(self._connect()) as conn:
+        def write(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
                 """
                 delete from records
@@ -488,6 +492,8 @@ class LocalResearchStore:
             )
             conn.commit()
             return int(cursor.rowcount)
+
+        return self._write_with_retry(write)
 
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
@@ -570,7 +576,29 @@ class LocalResearchStore:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(self.db_path, timeout=60)
+        conn.execute("pragma busy_timeout=60000")
+        return conn
+
+    def _write_with_retry(
+        self,
+        operation: Callable[[sqlite3.Connection], _T],
+        *,
+        attempts: int = 3,
+    ) -> _T:
+        """Retry transient SQLite writer contention without hiding real errors."""
+
+        maximum = max(1, int(attempts))
+        for attempt in range(maximum):
+            try:
+                with closing(self._connect()) as conn:
+                    return operation(conn)
+            except sqlite3.OperationalError as exc:
+                locked = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if not locked or attempt + 1 >= maximum:
+                    raise
+                time.sleep(0.1 * (2**attempt))
+        raise RuntimeError("unreachable sqlite retry state")
 
     def _insert_unique(
         self,
@@ -601,7 +629,7 @@ class LocalResearchStore:
                 )
             )
 
-        with closing(self._connect()) as conn:
+        def write(conn: sqlite3.Connection) -> int:
             before = conn.total_changes
             conn.executemany(
                 """
@@ -612,17 +640,20 @@ class LocalResearchStore:
                 rows,
             )
             conn.commit()
-            inserted = int(conn.total_changes - before)
-        return inserted
+            return int(conn.total_changes - before)
+
+        return self._write_with_retry(write)
 
     def _insert_typed(self, sql: str, rows: list[tuple[Any, ...]]) -> int:
         if not rows:
             return 0
-        with closing(self._connect()) as conn:
+        def write(conn: sqlite3.Connection) -> int:
             before = conn.total_changes
             conn.executemany(sql, rows)
             conn.commit()
             return int(conn.total_changes - before)
+
+        return self._write_with_retry(write)
 
     def _read_kind(self, kind: str, limit: int | None = None) -> tuple[dict[str, Any], ...]:
         if limit is not None and limit <= 0:

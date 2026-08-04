@@ -251,6 +251,16 @@ python -m pytest tests/test_directional_short_ladder.py
 
 - strategy-utility NPU 추론은 CPU 대비 지연과 golden tolerance 문제로 미승격입니다.
 - 이벤트 모멘텀·횡단면 상대강도·갭 전략은 필요한 point-in-time 사실이 없으면 closed-world로 차단됩니다.
+- `opening_range_breakout`과 `market_intraday_momentum`의 세션 가격 사실은 이제 라이브와
+  counterfactual이 동일 계산 함수를 사용합니다. 다만 30분 구간 미완성, 전일 종가 부재,
+  과거 변동성 표본 3개 미만이면 필드는 생략되고 네 개 세션 전략은 fail-closed입니다.
+  이 배선 변경은 배포 권한을 올리지 않으며 해당 long 2개와 short 2개는 계속 SHADOW입니다.
+  기존 counterfactual의 bar-count 근사와 수치가 달라질 수 있으므로 schema를
+  `counterfactual_quantiles_v2_session_structure`로 올렸습니다. v1 label/model card/checkpoint는
+  재사용하지 않고 label 재생성 및 재학습이 필요합니다.
+- LIVE DECISION ONTOLOGY의 `event_feed`·`cross_section`·`session_context` 가용성은 입력에
+  반응하는 테스트로 고정했습니다. 특히 세션 시계만 있고 가격 사실이 없으면 `PARTIAL`이며,
+  `sector_rank_table`에 대상 종목의 실제 순위가 있으면 횡단면 source/indicator가 available입니다.
 - `calibrated_strategy_ids`에 있다는 사실만으로 실거래 진입 권한을 주지 않습니다.
 - 대표성 있는 시장·regime별 out-of-sample alpha와 다중검정 보정 우월성은 아직 주장하지 않습니다.
 - **숏 전략 3개의 수익성은 어떤 형태로도 측정되지 않았습니다.** forward 표본이 0이며, 이것이

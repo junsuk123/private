@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pytest
 
+from app.evaluation.stored_counterfactual import CounterfactualLabel
 from app.models.strategy_utility import (
     FixedShapeStrategyUtilityModel,
     StrategyUtilityModelConfig,
 )
+from app.models.strategy_utility.training import _label_outcome_summary
 
 
 def _inputs():
@@ -67,3 +71,27 @@ def test_checkpoint_roundtrip_preserves_inference(tmp_path) -> None:
         model.infer(*_inputs()).utility,
         restored.infer(*_inputs()).utility,
     )
+
+
+def test_strategy_outcome_summary_separates_gross_edge_from_cost_drag() -> None:
+    start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    rows = tuple(
+        CounterfactualLabel(
+            as_of=start + timedelta(minutes=index),
+            label_end=start + timedelta(minutes=index + 1),
+            symbol="005930",
+            strategy_id="intraday_momentum",
+            triggered=True,
+            filled=True,
+            net_return_bps=-10.0,
+            cost_bps=30.0,
+            exit_reason="TIME",
+        )
+        for index in range(20)
+    )
+
+    summary = _label_outcome_summary(rows)["intraday_momentum"]
+
+    assert summary["mean_gross_return_bps_when_filled"] == 20.0
+    assert summary["mean_cost_bps_when_filled"] == 30.0
+    assert summary["performance_diagnosis"] == "EXECUTION_COST_EXCEEDS_GROSS_EDGE"

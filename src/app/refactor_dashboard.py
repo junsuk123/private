@@ -6,11 +6,12 @@ import re
 import sqlite3
 from collections import Counter
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from app.config.refactor_profile import load_refactor_profile
+from app.features import session_structure
 from app.strategy.experts import ALL_EXPERT_TYPES
 
 
@@ -174,19 +175,22 @@ def build_strategy_market_view(
     requested = str(symbol or "").strip().upper()
     if requested and not _SYMBOL_PATTERN.fullmatch(requested):
         raise ValueError("invalid symbol")
-    selected = requested or _default_symbol(shadow, lifecycle) or "005930"
+    market_database = base / "data/store/realtime_market_data.sqlite3"
+    selected = requested or _default_symbol(shadow, lifecycle, market_database) or ""
     safe_limit = max(30, min(390, int(limit or 180)))
     market = _market_series(
-        base / "data/store/realtime_market_data.sqlite3",
+        market_database,
         selected,
         safe_limit,
     )
     candidates = _candidate_symbols(
-        base / "data/store/realtime_market_data.sqlite3",
+        market_database,
         shadow,
         selected,
     )
     selection = _selection_for_symbol(shadow, selected)
+    if not selection.get("sector_rank_table"):
+        selection["sector_rank_table"] = _live_sector_rank_table()
     strategy_id = str(
         selection.get("strategy_id")
         or selection.get("ontology_strategy_id")
@@ -198,7 +202,13 @@ def build_strategy_market_view(
         selected,
         selection,
     )
-    decision_ontology = _decision_ontology(market, selection)
+    decision_ontology = _decision_ontology(
+        market,
+        selection,
+        event_feed=_event_feed_status(
+            base / "data/store/news_sentiment.sqlite3", selected
+        ),
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": dashboard.get("mode"),
@@ -391,12 +401,44 @@ def _readiness_reason(readiness: dict[str, Any]) -> str:
     return "최근 readiness 보고서가 없거나 모든 정책 검사를 통과했습니다."
 
 
-def _default_symbol(shadow: dict[str, Any], lifecycle: dict[str, Any]) -> str | None:
+def _default_symbol(
+    shadow: dict[str, Any],
+    lifecycle: dict[str, Any],
+    market_database: Path | None = None,
+) -> str | None:
     positions = lifecycle.get("positions") or []
-    if positions:
-        return str(positions[0].get("symbol") or "").upper() or None
+    for position in positions:
+        symbol = str(position.get("symbol") or "").strip().upper()
+        if _SYMBOL_PATTERN.fullmatch(symbol):
+            return symbol
     latest = shadow.get("latest") or {}
-    return str(latest.get("symbol") or "").upper() or None
+    symbol = str(latest.get("symbol") or "").strip().upper()
+    if _SYMBOL_PATTERN.fullmatch(symbol):
+        return symbol
+    for candidate in (shadow.get("latest_by_symbol") or {}):
+        symbol = str(candidate or "").strip().upper()
+        if _SYMBOL_PATTERN.fullmatch(symbol):
+            return symbol
+    if market_database is None or not market_database.exists():
+        return None
+    try:
+        connection = sqlite3.connect(market_database)
+        try:
+            row = connection.execute(
+                """
+                select symbol from realtime_minute_bars
+                where symbol is not null and trim(symbol) <> ''
+                group by symbol
+                order by max(minute_start) desc, count(*) desc
+                limit 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return None
+    symbol = str(row[0] if row else "").strip().upper()
+    return symbol if _SYMBOL_PATTERN.fullmatch(symbol) else None
 
 
 def _selection_for_symbol(shadow: dict[str, Any], symbol: str) -> dict[str, Any]:
@@ -477,7 +519,54 @@ def _selection_for_symbol(shadow: dict[str, Any], symbol: str) -> dict[str, Any]
         "ontology_strategy_id": ontology_strategy_id,
         "ontology_reason_codes": ontology.get("reason_codes") or [],
         "all_decisions": decisions,
+        "sector_rank_table": row.get("sector_rank_table") or next(
+            (
+                (decision.get("diagnostics") or {}).get("sector_rank_table")
+                for decision in decisions
+                if isinstance(decision.get("diagnostics"), dict)
+                and (decision.get("diagnostics") or {}).get("sector_rank_table")
+            ),
+            None,
+        ),
     }
+
+
+def _event_feed_status(path: Path, symbol: str) -> dict[str, Any]:
+    """Report an actual event-store query, including an honest zero-row result."""
+    result = {"queried": False, "samples": 0, "updated_at": None, "score": None}
+    if not path.exists():
+        return result
+    try:
+        with sqlite3.connect(path) as connection:
+            row = connection.execute(
+                "select count(*), max(observed_at) from news_sentiment where ticker = ?",
+                (symbol,),
+            ).fetchone()
+            latest = connection.execute(
+                "select score from news_sentiment where ticker = ? order by observed_at desc limit 1",
+                (symbol,),
+            ).fetchone()
+    except sqlite3.Error:
+        return result
+    return {
+        "queried": True,
+        "samples": int(row[0] or 0) if row else 0,
+        "updated_at": row[1] if row else None,
+        "score": float(latest[0]) if latest else None,
+    }
+
+
+def _live_sector_rank_table() -> dict[str, Any] | None:
+    """Read the macro reasoner's delivered table from the live diagnostic feed."""
+    try:
+        from app.graph.macro_micro_feed import snapshot
+
+        bundle = snapshot() or {}
+    except Exception:  # noqa: BLE001 - dashboard diagnostics degrade safely.
+        return None
+    macro = bundle.get("macro_result") if isinstance(bundle, dict) else None
+    table = macro.get("sector_rank_table") if isinstance(macro, dict) else None
+    return dict(table) if isinstance(table, dict) else None
 
 
 def _candidate_symbols(
@@ -539,6 +628,7 @@ def _candidate_symbols(
 
 def _market_series(database: Path, symbol: str, limit: int) -> dict[str, Any]:
     empty = {
+        "symbol": symbol,
         "bars": [],
         "second_bars": [],
         "microstructure": {},
@@ -765,6 +855,7 @@ def _market_series(database: Path, symbol: str, limit: int) -> dict[str, Any]:
             )
         )
     return {
+        "symbol": symbol,
         "bars": payload_bars,
         "second_bars": second_bars,
         "microstructure": microstructure,
@@ -985,6 +1076,11 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "cross_sectional_relative_strength": ["Relative Strength", "MA20", "VWAP"],
         "gap_context": ["Session Open", "Gap", "VWAP", "Volume"],
         "rvgi_box_breakout": ["RVGI", "RVGI Signal", "Box High", "Box Low", "Volume"],
+        "opening_range_breakout": ["Opening Range High", "Opening Range Low", "Relative Volume"],
+        "market_intraday_momentum": ["First 30m Return", "First 30m Volatility", "Close Clock"],
+        "market_intraday_momentum_short": ["First 30m Return", "First 30m Volatility", "Borrow"],
+        "opening_range_breakdown": ["Opening Range High", "Opening Range Low", "Sell Flow", "Borrow"],
+        "residual_relative_weakness": ["Sector Rank", "Residual Return", "Borrow"],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
 
@@ -992,6 +1088,8 @@ def _visual_indicators(strategy_id: str) -> list[str]:
 def _decision_ontology(
     market: dict[str, Any],
     selection: dict[str, Any],
+    *,
+    event_feed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a compact, explainable data-to-decision graph for the live terminal.
 
@@ -1055,6 +1153,22 @@ def _decision_ontology(
     liquidity = _finite(latest.get("liquidity_score"))
     volatility = _finite(latest.get("volatility"))
     micro = market.get("microstructure") or {}
+    event_feed = event_feed or {}
+    sector_table = selection.get("sector_rank_table")
+    sector_table = sector_table if isinstance(sector_table, dict) else {}
+    symbol = str(market.get("symbol") or "").upper()
+    ranks = sector_table.get("ranks") if isinstance(sector_table.get("ranks"), dict) else {}
+    sizes = sector_table.get("sector_sizes") if isinstance(sector_table.get("sector_sizes"), dict) else {}
+    sectors = sector_table.get("sector_of") if isinstance(sector_table.get("sector_of"), dict) else {}
+    sector = sectors.get(symbol)
+    sector_rank = _finite(ranks.get(symbol))
+    sector_size = _finite(sizes.get(sector)) if sector else None
+    relative_strength_score = (
+        1.0 - (sector_rank - 1.0) / max(1.0, sector_size - 1.0)
+        if sector_rank is not None and sector_size is not None and sector_size > 1
+        else None
+    )
+    session_values = _dashboard_session_context(bars)
     rvgi_result = None
     box_result = None
     try:
@@ -1188,13 +1302,18 @@ def _decision_ontology(
             "충격 이후 양의 수익률 강도", "minute_bars",
         ),
         "event_relevance": _indicator(
-            "이벤트 관련성", None, None, "실시간 이벤트 특성이 시장 DB에 없음", "event_feed",
+            "이벤트 관련성",
+            _bounded(abs(float(event_feed["score"]))) if event_feed.get("score") is not None else None,
+            _finite(event_feed.get("score")), "뉴스 이벤트 저장소의 실제 조회 결과", "event_feed",
         ),
         "event_direction": _indicator(
-            "이벤트 방향", None, None, "실시간 이벤트 방향 특성이 시장 DB에 없음", "event_feed",
+            "이벤트 방향",
+            _bounded((float(event_feed["score"]) + 1.0) / 2.0) if event_feed.get("score") is not None else None,
+            _finite(event_feed.get("score")), "뉴스 이벤트 저장소의 최신 방향 점수", "event_feed",
         ),
         "relative_strength": _indicator(
-            "횡단면 상대강도", None, None, "동시 종목 횡단면 특성이 이 응답에 없음", "cross_section",
+            "횡단면 상대강도", relative_strength_score, sector_rank,
+            f"sector={sector or 'unknown'}, rank={sector_rank}, size={sector_size}", "cross_section",
         ),
         "liquidity": _indicator(
             "유동성 점수", _bounded(liquidity), liquidity,
@@ -1202,6 +1321,24 @@ def _decision_ontology(
         ),
         "gap": _indicator(
             "시가 갭", None, None, "세션 기준 이전 종가 특성이 이 응답에 없음", "session_context",
+        ),
+        "opening_range": _indicator(
+            "시초 범위 위치", session_values.get("opening_range_position"),
+            session_values.get("opening_range_high"),
+            f"low={session_values.get('opening_range_low')}", "session_context",
+        ),
+        "first_half_hour_return": _indicator(
+            "첫 30분 수익률",
+            _bounded(.5 + float(session_values["first_half_hour_return_bps"]) / 200.0)
+            if session_values.get("first_half_hour_return_bps") is not None else None,
+            session_values.get("first_half_hour_return_bps"),
+            "전일 종가 대비 첫 30분 종료 가격 수익률(bps)", "session_context",
+        ),
+        "first_half_hour_volatility": _indicator(
+            "첫 30분 변동성 분위",
+            session_values.get("first_half_hour_volatility_percentile"),
+            session_values.get("first_half_hour_volatility_percentile"),
+            "동일 종목의 과거 첫 30분 변동성 대비 경험적 분위", "session_context",
         ),
         "opening_confirmation": _indicator(
             "시가 확인", _percentile(latest_return, returns), latest_return,
@@ -1237,6 +1374,17 @@ def _decision_ontology(
             ("box_position", ">=", .8),
             ("volume", ">=", .65),
         ],
+        "opening_range_breakout": [("opening_range", ">=", .8), ("volume", ">=", .65)],
+        "market_intraday_momentum": [
+            ("first_half_hour_return", ">=", .8),
+            ("first_half_hour_volatility", ">=", .6),
+        ],
+        "market_intraday_momentum_short": [
+            ("first_half_hour_return", "<=", .2),
+            ("first_half_hour_volatility", ">=", .6),
+        ],
+        "opening_range_breakdown": [("opening_range", "<=", .2), ("volume", ">=", .65)],
+        "residual_relative_weakness": [("relative_strength", "<=", .2), ("liquidity", ">=", .65)],
     }
     ontology_strategy = str(
         selection.get("ontology_strategy_id") or selection.get("strategy_id") or ""
@@ -1286,9 +1434,24 @@ def _decision_ontology(
             micro.get("as_of") or market.get("last_event_at"),
         ),
         _source("orderbook", "실시간 호가", bool(book), 1 if book else 0, book.get("exchange_timestamp")),
-        _source("event_feed", "이벤트·뉴스", False, 0, None),
-        _source("cross_section", "횡단면 종목군", False, 0, None),
-        _source("session_context", "세션 컨텍스트", False, 0, None),
+        _source(
+            "event_feed", "이벤트·뉴스", int(event_feed.get("samples") or 0) > 0,
+            int(event_feed.get("samples") or 0), event_feed.get("updated_at"),
+            status="AVAILABLE" if int(event_feed.get("samples") or 0) > 0 else "MISSING",
+            queried=bool(event_feed.get("queried")),
+        ),
+        _source(
+            "cross_section", "횡단면 종목군", bool(sector_table), len(ranks),
+            selection.get("as_of"),
+            status="AVAILABLE" if relative_strength_score is not None else "PARTIAL" if sector_table else "MISSING",
+        ),
+        _source(
+            "session_context", "세션 컨텍스트", True,
+            int(session_values.get("price_field_count") or 0), market.get("last_event_at"),
+            status="AVAILABLE" if session_values.get("price_complete") else "PARTIAL",
+            clock_available=True,
+            price_available=bool(session_values.get("price_complete")),
+        ),
     ]
     reasons = [
         str(reason)
@@ -1322,6 +1485,79 @@ def _decision_ontology(
             "reason_codes": reasons,
         },
     }
+
+
+def _dashboard_session_context(bars: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reconstruct price session facts with the same causal authority as serving."""
+    parsed: list[tuple[datetime, dict[str, Any]]] = []
+    for row in bars:
+        raw = row.get("time") or row.get("minute_start")
+        try:
+            start = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        parsed.append((start, row))
+    if not parsed:
+        return {"price_complete": False, "price_field_count": 0}
+    parsed.sort(key=lambda item: item[0])
+    kst = timezone(timedelta(hours=9))
+    latest_day = parsed[-1][0].astimezone(kst).date()
+    current = [row for start, row in parsed if start.astimezone(kst).date() == latest_day]
+    prior = [(start, row) for start, row in parsed if start.astimezone(kst).date() < latest_day]
+    session_open = datetime(latest_day.year, latest_day.month, latest_day.day, 9, 0, tzinfo=kst)
+    now = parsed[-1][0] + timedelta(minutes=1)
+    observed = session_structure.opening_range(
+        current, session_open=session_open, minutes=30, now=now
+    )
+    if observed is None:
+        return {"price_complete": False, "price_field_count": 0}
+    result: dict[str, Any] = {
+        "opening_range_high": observed.high,
+        "opening_range_low": observed.low,
+    }
+    previous_close = float(prior[-1][1].get("close") or 0.0) if prior else 0.0
+    opening_return = session_structure.first_half_hour_return_bps(
+        current,
+        previous_close=previous_close,
+        session_open=session_open,
+        minutes=30,
+        now=now,
+    )
+    if opening_return is not None:
+        result["first_half_hour_return_bps"] = opening_return
+    history: list[float] = []
+    prior_days = sorted({start.astimezone(kst).date() for start, _ in prior})
+    for day in prior_days:
+        day_bars = [row for start, row in prior if start.astimezone(kst).date() == day]
+        day_open = datetime(day.year, day.month, day.day, 9, 0, tzinfo=kst)
+        past = session_structure.opening_range(
+            day_bars, session_open=day_open, minutes=30,
+            now=day_open + timedelta(days=1),
+        )
+        if past is not None:
+            history.append(past.volatility)
+    volatility = session_structure.first_half_hour_volatility_percentile(
+        history, observed.volatility, minimum_samples=3
+    )
+    if volatility is not None:
+        result["first_half_hour_volatility_percentile"] = volatility
+    latest_close = _finite(current[-1].get("close")) if current else None
+    span = observed.high - observed.low
+    if latest_close is not None and span > 0:
+        result["opening_range_position"] = _bounded(
+            (latest_close - observed.low) / span
+        )
+    result["price_field_count"] = sum(
+        result.get(key) is not None
+        for key in (
+            "opening_range_high", "opening_range_low",
+            "first_half_hour_return_bps", "first_half_hour_volatility_percentile",
+        )
+    )
+    result["price_complete"] = result["price_field_count"] == 4
+    return result
 
 
 def _finite(value: Any) -> float | None:
@@ -1366,6 +1602,7 @@ def _source(
     available: bool,
     samples: int,
     updated_at: Any,
+    **metadata: Any,
 ) -> dict[str, Any]:
     return {
         "id": source_id,
@@ -1373,6 +1610,7 @@ def _source(
         "available": available,
         "samples": samples,
         "updated_at": updated_at,
+        **metadata,
     }
 
 

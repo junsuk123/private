@@ -76,6 +76,37 @@ def test_stored_labels_have_strict_future_label_window() -> None:
     )
 
 
+def test_flat_tied_bars_are_not_momentum_breakout_or_reversal_signals() -> None:
+    flat = tuple(
+        replace(
+            bar,
+            open=100.0,
+            high=100.1,
+            low=99.9,
+            close=100.0,
+            volume=100.0,
+        )
+        for bar in _bars(15)
+    )
+    labels = build_labels(
+        {"TEST": flat},
+        EvaluationConfig(
+            history_bars=5,
+            horizon_bars=3,
+            stride_bars=1,
+            minimum_symbol_bars=10,
+        ),
+    )
+
+    guarded = {
+        "intraday_momentum",
+        "breakout_volume",
+        "liquidity_shock_reversal",
+    }
+    assert labels
+    assert not any(label.triggered for label in labels if label.strategy_id in guarded)
+
+
 def test_realtime_strategy_context_v2_contains_rvgi_box_descriptors() -> None:
     labels = build_labels(
         {"TEST": _bars(40)},

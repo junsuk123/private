@@ -79,6 +79,9 @@ vwap_mean_reversion:
 
 # Mechanical sub-minute drop; requires the spread to be contracting again.
 liquidity_shock_reversal:
+  enabled: true
+  shadow_enabled: true
+  live_authorized: false
   shock_return_10s_bps: -40.0
   max_spread_change_5s: 0.0
   min_aggressor_imbalance: -0.35
@@ -87,6 +90,14 @@ liquidity_shock_reversal:
   retrace_fraction: 0.4
   stop_buffer_bps: 6.0
   trailing_bps: 14.0
+  # US-only shadow branch selected from purged 10-minute observations:
+  # train +17.5bp, validation +7.6bp, untouched test +7.2bp after costs.
+  absorption_us_only: true
+  max_absorption_orderbook_imbalance: -0.30
+  min_absorption_return_30s_bps: 2.0
+  max_absorption_spread_change_5s: 0.0
+  absorption_capture_fraction: 0.35
+  absorption_horizon_seconds: 600
 
 # TTL-bounded repricing. Requires a point-in-time event feed; without one the
 # algorithm fails closed rather than guessing freshness.

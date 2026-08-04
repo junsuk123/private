@@ -3,7 +3,9 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+import json
+from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -72,6 +74,49 @@ class ModelTrainingArtifactsTest(unittest.TestCase):
             challenger["deployment"]["reason"],
             "CHALLENGER_REGRESSES_ACTIVE_MODEL",
         )
+
+    def test_fresh_eligible_challenger_replaces_stale_active_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            incumbent = _artifact("incumbent", auc=0.72, precision=0.43, top_k_return=5.0)
+            challenger = _artifact("challenger", auc=0.60, precision=0.36, top_k_return=1.0)
+            registry.save(incumbent)
+            stale_payload = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+            stale_payload["created_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=7)
+            ).isoformat()
+            registry.latest_path.write_text(json.dumps(stale_payload), encoding="utf-8")
+
+            registry.save(challenger)
+            active = registry.load_latest_live_eligible()
+
+        self.assertEqual(active.artifact_id, "challenger")
+        self.assertTrue(challenger["deployment"]["promoted"])
+        self.assertEqual(
+            challenger["deployment"]["reason"],
+            "STALE_INCUMBENT_REPLACED",
+        )
+
+    def test_registry_prunes_old_challengers_but_keeps_active_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ", {"LIVE_MODEL_ARTIFACT_RETENTION_COUNT": "2"}
+        ):
+            registry = ModelArtifactRegistry(tmp)
+            for index in range(6):
+                registry.save(
+                    _artifact(
+                        f"live_short_horizon.20260101T00000{index}Z",
+                        auc=0.72 - index * 0.01,
+                        precision=0.43,
+                        top_k_return=5.0,
+                    )
+                )
+            saved = sorted(Path(tmp).glob("live_short_horizon.*.json"))
+            active = registry.load_latest_live_eligible()
+
+        self.assertLessEqual(len(saved), 3)
+        self.assertEqual(active.artifact_id, "live_short_horizon.20260101T000000Z")
+        self.assertTrue(any(path.stem == active.artifact_id for path in saved))
 
 
 def _rows() -> list[dict]:

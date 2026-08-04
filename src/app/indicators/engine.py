@@ -16,43 +16,7 @@ def build_sample_indicators(markets: tuple[MarketSnapshot, ...]) -> dict[str, In
     `build_trusted_indicators_from_markets` or measured indicator records
     instead.
     """
-    values = {
-        "005930": IndicatorSnapshot(
-            ticker="005930",
-            revenue_growth=0.12,
-            operating_income_growth=0.28,
-            operating_margin=0.19,
-            roe=0.11,
-            debt_ratio=0.31,
-            per=16.8,
-            pbr=1.35,
-            rsi_14d=57.0,
-            volume_ratio=1.18,
-            macro_risk_score=0.38,
-            source_ids=("sample-indicator:financial-005930", "sample-indicator:market-005930", "sample-indicator:macro-kr"),
-        ),
-        "000660": IndicatorSnapshot(
-            ticker="000660",
-            revenue_growth=0.31,
-            operating_income_growth=0.47,
-            operating_margin=0.22,
-            roe=0.16,
-            debt_ratio=0.44,
-            per=22.4,
-            pbr=2.1,
-            rsi_14d=64.0,
-            volume_ratio=1.42,
-            macro_risk_score=0.43,
-            source_ids=("sample-indicator:financial-000660", "sample-indicator:market-000660", "sample-indicator:macro-kr"),
-        ),
-    }
-    indicators: dict[str, IndicatorSnapshot] = {}
-    for market in markets:
-        if market.ticker in values:
-            indicators[market.ticker] = values[market.ticker]
-        else:
-            indicators[market.ticker] = _reference_indicator(market)
-    return indicators
+    return {market.ticker: _reference_indicator(market) for market in markets}
 
 
 def build_trusted_indicators_from_markets(markets: tuple[MarketSnapshot, ...]) -> dict[str, IndicatorSnapshot]:

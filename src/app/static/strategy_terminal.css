@@ -34,15 +34,78 @@ button, a { font: inherit; }
 }
 .terminal-header { order: 0; }
 .live-owner-strip { order: 1; }
-.selection-strip { order: 2; }
-.instrument-hero { order: 3; }
-.workspace-grid { order: 4; }
-.execution-panel { order: 5; }
-.decision-ontology-panel { order: 6; }
-.second-analysis-panel { order: 7; }
-.asset-overview { order: 8; }
-.diagnostics-panel { order: 9; }
-.terminal-footer { order: 10; }
+.gnn-model-panel { order: 2; }
+.selection-strip { order: 3; }
+.instrument-hero { order: 4; }
+.workspace-grid { order: 5; }
+.execution-panel { order: 6; }
+.decision-ontology-panel { order: 7; }
+.second-analysis-panel { order: 8; }
+.asset-overview { order: 9; }
+.diagnostics-panel { order: 10; }
+.terminal-footer { order: 11; }
+
+.gnn-model-panel {
+  margin-top: 12px;
+  padding: 14px;
+  overflow: hidden;
+  border-color: rgba(57, 215, 231, .3);
+  background:
+    radial-gradient(circle at 50% 42%, rgba(35, 91, 112, .15), transparent 34%),
+    #05080e;
+}
+.gnn-model-head { align-items: flex-start; gap: 16px; }
+.gnn-model-head h2 { margin-bottom: 4px; }
+.gnn-model-summary { margin: 0; color: #8292a7; font-size: 9px; line-height: 1.5; }
+.gnn-model-actions { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 5px; }
+.gnn-model-actions button {
+  min-height: 27px; border: 1px solid #26374a; border-radius: 5px; padding: 0 9px;
+  background: #0d1621; color: #8193a9; font-size: 8px; cursor: pointer;
+}
+.gnn-model-actions button:hover, .gnn-model-actions button.active { border-color: var(--cyan); color: #d8faff; background: rgba(57, 215, 231, .09); }
+.gnn-model-actions .gnn-visualization-toggle { border-color: rgba(57, 215, 231, .55); color: #aeeef4; }
+.gnn-model-actions .gnn-visualization-toggle.active { border-color: #46e6a5; color: #baffdf; background: rgba(70, 230, 165, .12); box-shadow: 0 0 12px rgba(70, 230, 165, .12); }
+.gnn-model-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; border: 1px solid #1c2a39; border-radius: 7px; overflow: hidden; }
+.gnn-model-metrics div { padding: 8px 11px; border-right: 1px solid #1c2a39; background: rgba(8, 14, 23, .8); }
+.gnn-model-metrics div:last-child { border-right: 0; }
+.gnn-model-metrics span, .gnn-model-metrics strong { display: block; }
+.gnn-model-metrics span { color: #63758a; font-size: 7px; letter-spacing: .08em; }
+.gnn-model-metrics strong { margin-top: 4px; color: #c6d5e5; font: 700 11px Consolas, monospace; }
+.gnn-model-stage { position: relative; height: 610px; margin-top: 10px; border: 1px solid #172334; border-radius: 8px; overflow: hidden; background: #03060b; }
+.gnn-visualization-paused { position: absolute; z-index: 6; inset: 0; display: grid; place-content: center; gap: 7px; text-align: center; background: radial-gradient(circle at center, rgba(17, 29, 43, .96), rgba(3, 6, 11, .98) 62%); }
+.gnn-visualization-paused[hidden] { display: none; }
+.gnn-visualization-paused strong { color: #a9b9ca; font: 700 12px Consolas, monospace; letter-spacing: .08em; }
+.gnn-visualization-paused span { color: #65778b; font-size: 9px; }
+#gnn-model-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+#gnn-model-canvas:active { cursor: grabbing; }
+.gnn-model-tooltip { position: absolute; z-index: 4; pointer-events: none; max-width: 230px; padding: 7px 9px; border: 1px solid rgba(57, 215, 231, .45); border-radius: 5px; background: rgba(5, 10, 18, .94); color: #d9e8f5; font: 8px/1.5 Consolas, monospace; box-shadow: 0 0 18px rgba(57, 215, 231, .14); }
+.gnn-inference-live { position: absolute; z-index: 4; top: 12px; left: 12px; display: flex; align-items: center; gap: 9px; padding: 8px 11px; border: 1px solid #26384b; border-radius: 7px; background: rgba(5, 10, 18, .82); backdrop-filter: blur(7px); }
+.gnn-inference-live i { width: 9px; height: 9px; border-radius: 50%; background: #526276; box-shadow: 0 0 8px rgba(82, 98, 118, .5); }
+.gnn-inference-live strong, .gnn-inference-live small { display: block; }
+.gnn-inference-live strong { color: #8293a8; font: 700 9px Consolas, monospace; letter-spacing: .08em; }
+.gnn-inference-live small { margin-top: 3px; color: #5f7186; font-size: 7px; }
+.gnn-inference-live.running { border-color: rgba(42, 247, 255, .65); box-shadow: 0 0 22px rgba(42, 247, 255, .2), inset 0 0 14px rgba(42, 247, 255, .06); }
+.gnn-inference-live.running i { background: #2af7ff; box-shadow: 0 0 7px #2af7ff, 0 0 18px #00bfff; animation: gnn-live-pulse .82s ease-in-out infinite alternate; }
+.gnn-inference-live.running strong { color: #8cfcff; text-shadow: 0 0 8px rgba(42, 247, 255, .8); }
+.gnn-inference-live.blocked { border-color: rgba(255, 83, 123, .46); }
+.gnn-inference-live.blocked i { background: #ff537b; box-shadow: 0 0 10px rgba(255, 83, 123, .72); }
+.gnn-inference-live.blocked strong { color: #ff8ca6; }
+.gnn-phase-track { position: absolute; z-index: 4; left: 12px; bottom: 12px; display: flex; gap: 4px; padding: 5px; border: 1px solid #203043; border-radius: 6px; background: rgba(4, 9, 16, .78); }
+.gnn-phase-track span { padding: 5px 7px; border-radius: 4px; color: #506177; font: 7px Consolas, monospace; transition: color .15s, background .15s, box-shadow .15s; }
+.gnn-phase-track span.active { color: #baffff; background: rgba(42, 247, 255, .15); box-shadow: inset 0 0 9px rgba(42, 247, 255, .18), 0 0 9px rgba(42, 247, 255, .12); text-shadow: 0 0 7px #2af7ff; }
+@keyframes gnn-live-pulse { from { transform: scale(.78); opacity: .65; } to { transform: scale(1.24); opacity: 1; } }
+.gnn-model-inspector { position: absolute; z-index: 3; top: 12px; right: 12px; width: 230px; padding: 11px; border: 1px solid rgba(91, 119, 150, .42); border-radius: 7px; background: rgba(7, 12, 20, .88); backdrop-filter: blur(7px); }
+.gnn-model-inspector > span { color: var(--cyan); font: 7px Consolas, monospace; letter-spacing: .12em; }
+.gnn-model-inspector h3 { margin: 7px 0 5px; font-size: 11px; }
+.gnn-model-inspector p { margin: 0; color: #728399; font-size: 8px; line-height: 1.55; }
+.gnn-model-inspector dl { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 9px 0 0; }
+.gnn-model-inspector dt { color: #617287; font-size: 7px; }
+.gnn-model-inspector dd { margin: 2px 0 0; color: #d5e1ed; font: 8px Consolas, monospace; overflow-wrap: anywhere; }
+.gnn-relation-legend { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 9px; color: #718399; font-size: 8px; }
+.gnn-relation-legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; margin-right: 5px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+.gnn-relation-legend .momentum { color: #ff537b; }.gnn-relation-legend .breakout { color: #ffd878; }.gnn-relation-legend .reversion { color: #20d9ff; }.gnn-relation-legend .relative { color: #72e1bd; }
+.gnn-relation-legend i { width: 28px; height: 1px; background: linear-gradient(90deg, transparent, #9dc8d4, transparent); }
+.gnn-model-provenance { margin: 8px 0 0; color: #53657a; font-size: 7px; line-height: 1.5; overflow-wrap: anywhere; }
 
 .live-owner-strip {
   display: grid;
@@ -139,7 +202,8 @@ button, a { font: inherit; }
   color: var(--red);
 }
 #terminal-clock { min-width: 72px; color: #a8b6c8; font: 12px/1.2 Consolas, monospace; }
-#terminal-refresh {
+#terminal-refresh,
+#layout-toggle {
   width: 31px;
   height: 31px;
   border: 1px solid var(--line);
@@ -148,6 +212,8 @@ button, a { font: inherit; }
   color: var(--text);
   cursor: pointer;
 }
+#layout-toggle { color: var(--cyan); font-size: 13px; line-height: 1; }
+#layout-toggle:hover, #terminal-refresh:hover { border-color: rgba(57, 215, 231, .5); }
 
 .asset-overview {
   border: 1px solid var(--line);
@@ -1044,6 +1110,8 @@ button, a { font: inherit; }
 .graph-node rect { fill: #111b27; stroke: #2a394c; stroke-width: 1; transition: fill .16s, stroke .16s; }
 .graph-node:hover rect { fill: #172536; stroke: #58718d; }
 .graph-node.unavailable rect { stroke: #3d4857; stroke-dasharray: 4 3; opacity: .72; }
+.graph-node.partial rect { stroke: #d9a441; stroke-dasharray: 7 3; }
+.graph-node.partial .node-value { fill: #f0c66d; }
 .graph-node.selected rect { stroke: var(--cyan); stroke-width: 2; filter: drop-shadow(0 0 5px rgba(57, 215, 231, .32)); }
 .graph-node.blocked rect { stroke: rgba(255, 102, 120, .65); }
 .graph-node .node-title { fill: #d8e2ed; font: 700 10px sans-serif; }
@@ -1106,6 +1174,13 @@ button, a { font: inherit; }
   .worker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .evidence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .training-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gnn-model-head { flex-direction: column; }
+  .gnn-model-actions { justify-content: flex-start; }
+  .gnn-model-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gnn-model-metrics div:nth-child(2) { border-right: 0; }
+  .gnn-model-metrics div:nth-child(-n+2) { border-bottom: 1px solid #1c2a39; }
+  .gnn-model-stage { height: 480px; }
+  .gnn-model-inspector { top: auto; bottom: 8px; right: 8px; width: min(230px, calc(100% - 16px)); }
   .instrument-hero { grid-template-columns: 1fr; }
   .algorithm-card { grid-column: auto; }
   .execution-track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1140,4 +1215,335 @@ button, a { font: inherit; }
   .training-monitor-head { flex-direction: column; }
   .training-monitor-state { justify-items: start; }
   .training-kpis { grid-template-columns: 1fr; }
+}
+
+/* ==========================================================================
+   DENSE CONTROL-ROOM LAYOUT
+   The terminal was one 1680px column: 13 panels stacked, roughly six screens
+   of scrolling to read a single decision cycle, so the operator never saw the
+   market, the gate that blocked it and the order it produced at the same
+   moment. On a desktop the shell now becomes a fixed 100vh grid of horizontal
+   layers - every panel is on screen at once and the deep ones scroll inside
+   their own cell instead of pushing the page down. The ⤢ button in the header
+   sets body.classic-layout, which restores the stacked view verbatim.
+   ========================================================================== */
+@media (min-width: 1200px) and (min-height: 680px) {
+  body:not(.classic-layout) { height: 100vh; overflow: hidden; }
+
+  body:not(.classic-layout) .terminal-shell {
+    display: grid;
+    width: 100%;
+    max-width: none;
+    height: 100vh;
+    gap: 6px;
+    padding: 6px 8px;
+    overflow: hidden;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    grid-template-rows:
+      auto
+      minmax(0, 1.1fr)
+      minmax(0, .8fr)
+      minmax(0, 1.25fr)
+      minmax(0, 1.15fr)
+      minmax(0, 1.35fr)
+      auto;
+    grid-template-areas:
+      "hd  hd  hd  hd  hd  hd  hd  hd  hd  hd  hd  hd"
+      "ops ops ops ops ops ops own own own ast ast ast"
+      "sel sel sel ins ins ins ins sec sec sec sec sec"
+      "wrk wrk wrk wrk wrk wrk wrk exe exe exe exe exe"
+      "gnn gnn gnn gnn gnn don don don don don don don"
+      "dia dia dia dia dia dia dia dia dia dia dia dia"
+      "ft  ft  ft  ft  ft  ft  ft  ft  ft  ft  ft  ft";
+  }
+
+  /* Every layer cell owns its own scrollbar; the page itself never scrolls. */
+  body:not(.classic-layout) .terminal-shell > * {
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: #24344a transparent;
+  }
+  body:not(.classic-layout) ::-webkit-scrollbar { width: 6px; height: 6px; }
+  body:not(.classic-layout) ::-webkit-scrollbar-thumb { border-radius: 4px; background: #24344a; }
+  body:not(.classic-layout) ::-webkit-scrollbar-track { background: transparent; }
+
+  body:not(.classic-layout) .terminal-header { grid-area: hd; overflow: visible; }
+  body:not(.classic-layout) .ops-overview { grid-area: ops; }
+  body:not(.classic-layout) .live-owner-strip { grid-area: own; }
+  body:not(.classic-layout) .asset-overview { grid-area: ast; }
+  body:not(.classic-layout) .selection-strip { grid-area: sel; }
+  body:not(.classic-layout) .instrument-hero { grid-area: ins; }
+  body:not(.classic-layout) .second-analysis-panel { grid-area: sec; }
+  body:not(.classic-layout) .workspace-grid { grid-area: wrk; overflow: hidden; }
+  body:not(.classic-layout) .execution-panel { grid-area: exe; }
+  body:not(.classic-layout) .gnn-model-panel { grid-area: gnn; }
+  body:not(.classic-layout) .decision-ontology-panel { grid-area: don; }
+  body:not(.classic-layout) .diagnostics-panel { grid-area: dia; }
+  body:not(.classic-layout) .terminal-footer { grid-area: ft; overflow: visible; }
+
+  /* --- shared compaction ------------------------------------------------ */
+  body:not(.classic-layout) .terminal-panel,
+  body:not(.classic-layout) .ops-overview,
+  body:not(.classic-layout) .live-owner-strip,
+  body:not(.classic-layout) .asset-overview,
+  body:not(.classic-layout) .selection-strip,
+  body:not(.classic-layout) .instrument-hero,
+  body:not(.classic-layout) .chart-panel,
+  body:not(.classic-layout) .ontology-panel,
+  body:not(.classic-layout) .execution-panel,
+  body:not(.classic-layout) .second-analysis-panel,
+  body:not(.classic-layout) .decision-ontology-panel,
+  body:not(.classic-layout) .gnn-model-panel,
+  body:not(.classic-layout) .diagnostics-panel {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  body:not(.classic-layout) .panel-head h2,
+  body:not(.classic-layout) .diagnostics-head h2,
+  body:not(.classic-layout) .live-owner-heading h2,
+  body:not(.classic-layout) .asset-overview-head h2,
+  body:not(.classic-layout) .ops-overview-head h2 { font-size: 12px; }
+  body:not(.classic-layout) .panel-kicker { font-size: 7px; letter-spacing: .12em; }
+
+  /* --- header / footer -------------------------------------------------- */
+  body:not(.classic-layout) .terminal-header { min-height: 0; padding-bottom: 6px; }
+  body:not(.classic-layout) .brand-mark { width: 28px; height: 28px; border-radius: 8px; }
+  body:not(.classic-layout) .brand h1 { font-size: 14px; }
+  body:not(.classic-layout) #terminal-refresh,
+  body:not(.classic-layout) #layout-toggle { width: 26px; height: 26px; }
+  body:not(.classic-layout) .terminal-footer {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 12px;
+    padding: 5px 9px;
+  }
+
+  /* --- 01 operations overview ------------------------------------------- */
+  body:not(.classic-layout) .ops-gate-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  body:not(.classic-layout) .ops-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .ops-footer { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .ops-footer-wide { grid-column: 1 / -1; }
+  body:not(.classic-layout) .blockade-chain { max-height: 16vh; overflow: auto; }
+  body:not(.classic-layout) .ops-strategy-list { max-height: 44px; }
+
+  /* --- 02 live owner / 03 assets ---------------------------------------- */
+  body:not(.classic-layout) .live-owner-strip { grid-template-columns: 1fr; gap: 7px; align-content: start; }
+  body:not(.classic-layout) .live-owner-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .live-owner-metrics article:nth-child(2) { border-right: 0; }
+  body:not(.classic-layout) .live-owner-metrics article:nth-child(-n+2) { border-bottom: 1px solid #233144; }
+  body:not(.classic-layout) .asset-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 7px; }
+  body:not(.classic-layout) .asset-metrics article:nth-child(2) { border-right: 0; }
+  body:not(.classic-layout) .asset-metrics article:nth-child(-n+2) { border-bottom: 1px solid #1c2836; }
+  body:not(.classic-layout) .asset-metrics .asset-primary > strong { font-size: 16px; }
+
+  /* --- 04 candidates / 05 instrument ------------------------------------ */
+  body:not(.classic-layout) .selection-strip {
+    grid-template-columns: 1fr;
+    align-items: start;
+    align-content: start;
+    gap: 7px;
+  }
+  body:not(.classic-layout) .candidate-list { flex-wrap: wrap; overflow: auto; }
+  body:not(.classic-layout) .candidate { min-width: 104px; padding: 6px 8px; }
+  body:not(.classic-layout) .instrument-hero {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    gap: 8px;
+    align-content: start;
+  }
+  body:not(.classic-layout) .instrument-title h2 { margin: 4px 0 2px; font-size: 20px; }
+  body:not(.classic-layout) .price-line strong { font-size: 17px; }
+  body:not(.classic-layout) .algorithm-card { grid-column: 1 / -1; padding: 8px 10px; }
+  body:not(.classic-layout) .algorithm-card h3 { margin: 5px 0 3px; font-size: 12px; }
+  body:not(.classic-layout) .instrument-stat { padding: 7px 9px; }
+
+  /* --- 06 second-level microstructure ----------------------------------- */
+  body:not(.classic-layout) .second-analysis-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .second-analysis-grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+    margin-top: 7px;
+  }
+  body:not(.classic-layout) .second-chart-wrap { min-height: 0; }
+  body:not(.classic-layout) #second-price-chart { position: absolute; inset: 0; width: 100%; height: 100%; }
+  body:not(.classic-layout) .second-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-content: start;
+    overflow: auto;
+  }
+  body:not(.classic-layout) .second-metrics article { padding: 6px; }
+  body:not(.classic-layout) .second-analysis-footer { margin-top: 6px; }
+
+  /* --- 07 price chart + ontology gate ----------------------------------- */
+  body:not(.classic-layout) .workspace-grid {
+    grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+    gap: 6px;
+    height: 100%;
+  }
+  body:not(.classic-layout) .workspace-grid > * { min-width: 0; min-height: 0; overflow: auto; }
+  body:not(.classic-layout) .chart-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .chart-wrap { flex: 1 1 auto; height: auto; min-height: 90px; margin-top: 6px; }
+  body:not(.classic-layout) #price-chart { position: absolute; inset: 0; }
+  body:not(.classic-layout) .volume-wrap { height: 44px; }
+  body:not(.classic-layout) .chart-footer { margin-top: 5px; padding-top: 5px; }
+  body:not(.classic-layout) .ontology-flow { margin-top: 7px; gap: 5px; }
+  body:not(.classic-layout) .ontology-node { padding: 6px 8px 6px 28px; }
+  body:not(.classic-layout) .reason-box { margin-top: 8px; padding-top: 7px; }
+
+  /* --- 08 order lifecycle ------------------------------------------------ */
+  body:not(.classic-layout) .execution-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .execution-track {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    margin-top: 7px;
+  }
+  body:not(.classic-layout) .execution-stage { padding: 7px; }
+  body:not(.classic-layout) .execution-stage::after { display: none; }
+  body:not(.classic-layout) .execution-bottom {
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    margin-top: 7px;
+  }
+  body:not(.classic-layout) .execution-tape,
+  body:not(.classic-layout) .orderbook-card { min-height: 0; overflow: auto; }
+
+  /* --- 09 trained GNN ---------------------------------------------------- */
+  body:not(.classic-layout) .gnn-model-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .gnn-model-metrics { margin-top: 7px; }
+  body:not(.classic-layout) .gnn-model-metrics div { padding: 5px 8px; }
+  body:not(.classic-layout) .gnn-model-stage { flex: 1 1 auto; height: auto; min-height: 120px; margin-top: 6px; }
+  body:not(.classic-layout) .gnn-model-inspector { width: 178px; padding: 8px; }
+  body:not(.classic-layout) .gnn-relation-legend { margin-top: 6px; }
+  body:not(.classic-layout) .gnn-model-provenance {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    margin-top: 5px;
+  }
+
+  /* --- 10 decision ontology graph ---------------------------------------- */
+  body:not(.classic-layout) .decision-ontology-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .ontology-legend { margin: 7px 0 6px; }
+  body:not(.classic-layout) .decision-ontology-layout {
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) 190px;
+  }
+  /* The SVG carries a viewBox, so dropping its min-width/height lets it scale
+     the whole data → indicator → algorithm → decision path into the cell
+     instead of hiding two thirds of it behind scrollbars. */
+  body:not(.classic-layout) .decision-ontology-canvas { overflow: hidden; }
+  body:not(.classic-layout) #decision-ontology-graph {
+    width: 100%;
+    min-width: 0;
+    height: 100%;
+    min-height: 0;
+  }
+  body:not(.classic-layout) .ontology-inspector { overflow: auto; padding: 9px; }
+  body:not(.classic-layout) .ontology-inspector h3 { margin: 7px 0 4px; font-size: 11px; }
+  body:not(.classic-layout) .inspector-value { margin: 7px 0; font-size: 14px; }
+  body:not(.classic-layout) .algorithm-catalog {
+    flex: 0 0 auto;
+    grid-template-columns: repeat(6, minmax(104px, 1fr));
+    max-height: 68px;
+    overflow: auto;
+    margin-top: 6px;
+  }
+  body:not(.classic-layout) .ontology-provenance {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    margin-top: 5px;
+  }
+
+  /* --- 11 diagnostics + training ----------------------------------------
+     display:contents flattens the two 2-up sub-grids so workers, blockers,
+     evidence and activity sit on ONE horizontal row instead of four stacked
+     half-rows; the training monitor does the same with its two charts. */
+  body:not(.classic-layout) .diagnostics-panel {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-rows: min-content;
+    align-content: start;
+    gap: 6px 8px;
+  }
+  body:not(.classic-layout) .diagnostics-head,
+  body:not(.classic-layout) .diagnostics-progress { grid-column: 1 / -1; }
+  body:not(.classic-layout) .diagnostics-progress { margin: 0; }
+  body:not(.classic-layout) .diagnostics-grid { display: contents; }
+  body:not(.classic-layout) .diagnostics-grid > article { padding: 8px; }
+  body:not(.classic-layout) .worker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .evidence-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .worker-grid,
+  body:not(.classic-layout) .blocker-list,
+  body:not(.classic-layout) .evidence-grid,
+  body:not(.classic-layout) .activity-list { max-height: 15vh; overflow: auto; }
+  body:not(.classic-layout) .training-monitor {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-auto-rows: min-content;
+    gap: 6px 8px;
+    margin-top: 0;
+    padding: 8px;
+  }
+  body:not(.classic-layout) .training-monitor-head { grid-column: 1 / -1; }
+  body:not(.classic-layout) .training-kpis {
+    grid-column: span 2;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 0;
+  }
+  body:not(.classic-layout) .training-chart-grid { display: contents; }
+  body:not(.classic-layout) .training-chart-card { min-width: 0; margin: 0; }
+  body:not(.classic-layout) .training-chart-card canvas { height: 82px; }
+  body:not(.classic-layout) .training-cycle-list {
+    grid-column: 1 / -1;
+    max-height: 58px;
+    overflow: auto;
+    margin: 0;
+  }
+}
+
+/* Short laptop panels pay for their density by dropping explanatory prose -
+   never a value, a state or a reason code, only sentences that describe what
+   the panel is. */
+@media (min-width: 1200px) and (max-height: 900px) {
+  body:not(.classic-layout) .live-owner-heading small,
+  body:not(.classic-layout) .gnn-model-summary,
+  body:not(.classic-layout) .ontology-graph-summary,
+  body:not(.classic-layout) .gnn-model-provenance,
+  body:not(.classic-layout) .ontology-provenance,
+  body:not(.classic-layout) .blockade-note,
+  body:not(.classic-layout) .tech-note { display: none; }
+  body:not(.classic-layout) .terminal-shell { gap: 5px; padding: 5px 6px; }
+}
+
+/* An ultrawide monitor gets a fourth column of breathing room instead of
+   stretched panels: the two tallest graphs share the row with the assets. */
+@media (min-width: 2200px) and (min-height: 680px) {
+  body:not(.classic-layout) .terminal-shell {
+    grid-template-rows:
+      auto
+      minmax(0, 1.15fr)
+      minmax(0, .85fr)
+      minmax(0, 1.35fr)
+      minmax(0, 1.35fr)
+      auto;
+    grid-template-areas:
+      "hd  hd  hd  hd  hd  hd  hd  hd  hd  hd  hd  hd"
+      "ops ops ops ops ops own own own ast ast ast ast"
+      "sel sel sel ins ins ins ins sec sec sec sec sec"
+      "wrk wrk wrk wrk wrk exe exe exe dia dia dia dia"
+      "gnn gnn gnn gnn gnn don don don dia dia dia dia"
+      "ft  ft  ft  ft  ft  ft  ft  ft  ft  ft  ft  ft";
+  }
+  body:not(.classic-layout) .diagnostics-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .training-monitor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body:not(.classic-layout) .training-kpis { grid-column: 1 / -1; grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }

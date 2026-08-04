@@ -24,7 +24,7 @@ Why the numbers below are what they are
 ---------------------------------------
 The first generation of this table set stops of 18-35bps. Measured against the
 live tape that is *inside the bid-ask spread*: KRX top-of-book spreads run
-13-50bps (005930 ~19bps, 338840 ~50bps). A stop narrower than one spread is
+materially different by symbol and liquidity. A stop narrower than one spread is
 triggered by bid-ask bounce alone, so the trade never gets to express its thesis.
 
 The shadow checkpoint's own simulated outcomes confirmed it exactly. On KRX, with

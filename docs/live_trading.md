@@ -30,8 +30,8 @@ copy config\order_execution.example.json config\order_execution.json
 python scripts/live_readiness_check.py --dry-run
 python scripts/live_readiness_check.py --check kis-auth,kis-account --no-orders
 python scripts/check_kis_connection.py --account
-python scripts/live_order_dry_run.py --symbols 005930,000660 --no-submit
-python scripts/check_realtime_market_data.py --symbols 005930 --fixture path\to\kis_fixture.txt
+python scripts/live_order_dry_run.py --symbols <symbol-a>,<symbol-b> --no-submit
+python scripts/check_realtime_market_data.py --symbols <symbol> --fixture path\to\kis_fixture.txt
 ```
 
 리포트는 `data/reports/live_readiness_*.json`, `data/reports/live_order_dry_run_*.json`에 남습니다. `require_recent_readiness_report=true`이므로 30분 이내의 readiness 리포트가 없으면 제출이 막힙니다.

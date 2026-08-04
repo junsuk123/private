@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -15,7 +16,9 @@ from app.data.realtime_store import RealtimeMarketDataStore
 from app.data.realtime_types import KIS_REALTIME_SOURCE, OrderbookLevel, RealtimeOrderbookSnapshot, RealtimeTradeTick
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.live_training_pipeline import (
+    _materialized_training_row_count,
     _merge_materialized_training_rows,
+    _negative_challenger_recovery_required,
     _thin_training_rows,
     backfill_live_feature_frames_from_realtime_store,
     build_live_training_rows_from_feature_journal,
@@ -27,6 +30,36 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 
 
 class LiveTrainingPipelineTest(unittest.TestCase):
+    def test_negative_challenger_recovery_starts_before_incumbent_stales(self) -> None:
+        registry = SimpleNamespace(
+            staleness=lambda: SimpleNamespace(
+                stale=False,
+                reason_codes=("MODEL_FRESH",),
+                consecutive_negative_challengers=2,
+                diagnostics={"consecutive_negative_challenger_limit": 3},
+            )
+        )
+
+        self.assertTrue(_negative_challenger_recovery_required(registry))
+
+    def test_training_status_count_does_not_decode_materialized_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "training.sqlite3"
+            rows = [
+                _training_row(
+                    ticker=f"{index:06d}",
+                    as_of=f"2026-07-28T13:00:{index:02d}+00:00",
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                for index in range(10)
+            ]
+            _merge_materialized_training_rows(store, rows)
+
+            count = _materialized_training_row_count(store)
+
+        self.assertEqual(count, 10)
+
     def test_materialized_rows_replace_matured_label_for_same_observation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = Path(tmp) / "training.sqlite3"
@@ -50,6 +83,121 @@ class LiveTrainingPipelineTest(unittest.TestCase):
         self.assertEqual(rows[0]["label"], 1)
         self.assertEqual(rows[0]["label_source"], "triple_barrier_take_profit")
         self.assertEqual(stats["new_rows"], 0)
+
+    def test_materialized_store_rejects_implausible_forward_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "training.sqlite3"
+            valid = _training_row(
+                ticker="F",
+                as_of="2026-07-28T13:00:00+00:00",
+                label=1,
+                label_source="triple_barrier_take_profit",
+            )
+            corrupt = {
+                **_training_row(
+                    ticker="LYFT",
+                    as_of="2026-07-28T13:00:01+00:00",
+                    label=1,
+                    label_source="triple_barrier_take_profit",
+                ),
+                "forward_net_return_bps": 141_428.0,
+                "gross_forward_return_bps": 212_152.0,
+            }
+
+            rows, stats = _merge_materialized_training_rows(store, [valid, corrupt])
+
+        self.assertEqual([row["ticker"] for row in rows], ["F"])
+        self.assertEqual(stats["invalid_rows_removed"], 1)
+
+    def test_materialized_store_prunes_oldest_rows_and_keeps_new_ingestion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "training.sqlite3"
+            start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+            initial = [
+                _training_row(
+                    ticker=f"{index:06d}",
+                    as_of=(start + timedelta(seconds=index)).isoformat(),
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                for index in range(1_000)
+            ]
+            newer = [
+                _training_row(
+                    ticker=f"N{index}",
+                    as_of=(start + timedelta(seconds=1_000 + index)).isoformat(),
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                for index in range(2)
+            ]
+            with patch.dict(
+                os.environ,
+                {"LIVE_TRAINING_MAX_MATERIALIZED_ROWS": "1000"},
+            ):
+                _merge_materialized_training_rows(store, initial)
+                rows, stats = _merge_materialized_training_rows(store, newer)
+
+        self.assertEqual(len(rows), 1_000)
+        self.assertEqual(stats["before_rows"], 1_000)
+        self.assertEqual(stats["after_rows"], 1_000)
+        self.assertEqual(stats["new_rows"], 2)
+        self.assertEqual(stats["pruned_rows"], 2)
+        self.assertEqual(stats["maximum_rows"], 1_000)
+        self.assertEqual(
+            {row["ticker"] for row in rows[-2:]},
+            {"N0", "N1"},
+        )
+        self.assertNotIn("000000", {row["ticker"] for row in rows})
+        self.assertNotIn("000001", {row["ticker"] for row in rows})
+
+    def test_materialized_store_pruning_preserves_minority_market_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / "training.sqlite3"
+            start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+            initial = []
+            for index in range(900):
+                row = _training_row(
+                    ticker=f"US{index}",
+                    as_of=(start + timedelta(seconds=index)).isoformat(),
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                row["market"] = "US"
+                initial.append(row)
+            for index in range(100):
+                row = _training_row(
+                    ticker=f"KR{index}",
+                    as_of=(start + timedelta(seconds=index)).isoformat(),
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                row["market"] = "KR"
+                initial.append(row)
+            newer = []
+            for index in range(10):
+                row = _training_row(
+                    ticker=f"NEWKR{index}",
+                    as_of=(start + timedelta(seconds=2_000 + index)).isoformat(),
+                    label=index % 2,
+                    label_source="triple_barrier_terminal",
+                )
+                row["market"] = "KR"
+                newer.append(row)
+            with patch.dict(
+                os.environ,
+                {"LIVE_TRAINING_MAX_MATERIALIZED_ROWS": "1000"},
+            ):
+                _merge_materialized_training_rows(store, initial)
+                rows, stats = _merge_materialized_training_rows(store, newer)
+
+        by_market = {
+            market: sum(1 for row in rows if row.get("market") == market)
+            for market in ("KR", "US")
+        }
+        self.assertEqual(stats["pruned_rows"], 10)
+        self.assertEqual(by_market, {"KR": 110, "US": 890})
+        self.assertTrue(all(any(row["ticker"] == f"KR{i}" for row in rows) for i in range(100)))
 
     def test_training_rows_collapse_sub_five_second_refreshes_per_symbol(self) -> None:
         rows = [
@@ -99,6 +247,56 @@ class LiveTrainingPipelineTest(unittest.TestCase):
             rows = build_live_training_rows_from_feature_journal(journal)
 
         self.assertEqual(rows, [])
+
+    def test_bad_future_orderbook_cannot_poison_forward_label(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
+            marks = (100.0, 100.1, 500.0, 100.2)
+            spreads = (3.0, 3.0, 19_000.0, 3.0)
+            with journal.open("w", encoding="utf-8") as file:
+                for index, (mark, spread) in enumerate(zip(marks, spreads, strict=True)):
+                    values = {name: 0.0 for name in names}
+                    values.update(
+                        {
+                            "return_30s": 0.001,
+                            "return_1m": 0.001,
+                            "return_3m": 0.001,
+                            "spread_bps": spread,
+                            "bid_depth": 100.0,
+                            "ask_depth": 100.0,
+                            "depth_ratio": 1.0,
+                            "cost_to_volatility_ratio": 1.0,
+                            "realized_volatility_3m": 0.001,
+                            "volume_spike_ratio": 1.0,
+                        }
+                    )
+                    file.write(
+                        json.dumps(
+                            {
+                                "symbol": "AAPL",
+                                "decision_time": (
+                                    datetime(2026, 7, 28, 13, 0, tzinfo=timezone.utc)
+                                    + timedelta(minutes=index)
+                                ).isoformat(),
+                                "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
+                                "mark_price": mark,
+                                "mark_source": "orderbook_mid",
+                                "source_record_ids": [f"book-{index}"],
+                                "values": values,
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+
+            rows = build_live_training_rows_from_feature_journal(journal)
+
+        self.assertTrue(rows)
+        self.assertLess(
+            max(abs(float(row["gross_forward_return_bps"])) for row in rows),
+            5_000.0,
+        )
 
     def test_training_from_collected_frames_creates_latest_when_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,6 +432,38 @@ class LiveTrainingPipelineTest(unittest.TestCase):
             second["training_state"]["full_retrain_reason"],
             "NO_COMPATIBLE_PARENT_STATE",
         )
+
+    def test_negative_challenger_streak_forces_broad_full_refit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            _write_frames(journal, count=200)
+            registry = ModelArtifactRegistry(Path(tmp) / "models")
+            with patch.dict(os.environ, {"LIVE_LABEL_MIN_NET_RETURN_BPS": "20"}):
+                first = train_live_short_horizon_from_collected_features(
+                    journal_path=journal,
+                    registry=registry,
+                )
+                _write_frames(journal, count=220)
+                with patch.object(
+                    registry,
+                    "staleness",
+                    return_value=SimpleNamespace(
+                        stale=True,
+                        reason_codes=("MODEL_CONSECUTIVE_NEGATIVE_CHALLENGERS",)
+                    ),
+                ):
+                    second = train_live_short_horizon_from_collected_features(
+                        journal_path=journal,
+                        registry=registry,
+                    )
+
+        self.assertEqual(first["training_state"]["mode"], "full")
+        self.assertEqual(second["training_state"]["mode"], "full")
+        self.assertEqual(
+            second["training_state"]["full_retrain_reason"],
+            "NEGATIVE_CHALLENGER_RECOVERY",
+        )
+        self.assertIsNone(second["training_state"]["parent_artifact_id"])
 
     def test_insufficient_collected_frames_do_not_create_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

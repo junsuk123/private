@@ -72,6 +72,10 @@ def build_analysis_context(
     risk_rules: RiskRules | None = None,
 ) -> AnalysisContext:
     account = account_override or collect_sample_account()
+    demo_offline_context = allow_sample_indicators or (research_result is None and stored_research is None)
+    # Issuer-neutral reference rows keep graph/reasoning demos operational when a
+    # research-only source has no quotes. Live affordability and trusted-source
+    # policies still reject these synthetic rows for execution.
     sample_markets = collect_sample_market()
     stored_markets = stored_research.market_snapshots if stored_research else ()
     live_markets = research_result.market_snapshots if research_result else ()
@@ -85,7 +89,6 @@ def build_analysis_context(
         markets = tuple(market for market in raw_markets if market.ticker in candidate_set)
     else:
         markets = _limit_markets_for_runtime(raw_markets)
-    demo_offline_context = allow_sample_indicators or (research_result is None and stored_research is None)
     indicators = (
         build_sample_indicators(markets)
         if demo_offline_context
@@ -96,7 +99,7 @@ def build_analysis_context(
     # Sample events are valid only for an explicitly offline/demo context.
     # Injecting them into a live context creates synthetic ontology evidence even
     # though the runtime policy says synthetic inputs are forbidden.
-    sample_events = collect_sample_research_events() if demo_offline_context else ()
+    sample_events = collect_sample_research_events(sample_markets) if demo_offline_context else ()
     events = _merge_events(_merge_events(stored_events, live_events), sample_events)
     events = _limit_events_for_runtime(events, markets)
     stored_raw_records = getattr(stored_research, "raw_records", ()) if stored_research else ()
@@ -494,9 +497,20 @@ def _select_analysis_candidates(markets: tuple[MarketSnapshot, ...]) -> Candidat
 
 
 def _priority_tickers(markets: tuple[MarketSnapshot, ...]) -> set[str]:
-    priority = {"005930", "005930.KS", "000660", "000660.KS", "AAPL", "MSFT", "NVDA", "SPY", "QQQ"}
-    available = {market.ticker for market in markets}
-    return priority & available
+    try:
+        limit = max(0, int(os.getenv("ANALYSIS_PRIORITY_COUNT", "8")))
+    except ValueError:
+        limit = 8
+    ranked = sorted(
+        markets,
+        key=lambda market: (
+            float(market.average_daily_trading_value or 0.0),
+            float(market.source.quality_score or 0.0),
+            market.source.retrieved_at.timestamp(),
+        ),
+        reverse=True,
+    )
+    return {market.ticker for market in ranked[:limit]}
 
 
 def _ontology_parameter_tuning(
@@ -620,7 +634,15 @@ def _tuning_signal_nodes(mode: str) -> tuple[str, ...]:
     }.get(mode, ("MarketInterpretationParameterTuning",))
 
 
-def collect_sample_research_events() -> tuple[ClassifiedEvent, ...]:
+def collect_sample_research_events(
+    markets: tuple[MarketSnapshot, ...] | None = None,
+) -> tuple[ClassifiedEvent, ...]:
+    selected_markets = tuple(markets or collect_sample_market())
+    if not selected_markets:
+        return ()
+    market = selected_markets[0]
+    ticker = market.ticker
+    issuer = market.company_name or ticker
     source = SourceMetadata(
         source_name="sample_research",
         retrieved_at=datetime.now(timezone.utc),
@@ -629,13 +651,13 @@ def collect_sample_research_events() -> tuple[ClassifiedEvent, ...]:
     )
     return (
         classify_text_event(
-            title="005930 reports memory profit growth and HBM demand strength",
+            title=f"{ticker} reports improving demand and profit growth",
             body=(
-                "Samsung Electronics 005930 semiconductor memory profit growth improved. "
-                "AI server demand supports HBM and advanced memory outlook."
+                f"{issuer} {ticker} reported improving profit growth. "
+                "Customer demand supports the issuer's outlook."
             ),
             source=source,
-            known_tickers={"005930": "Samsung Electronics", "000660": "SK hynix"},
+            known_tickers={item.ticker: item.company_name or item.ticker for item in selected_markets},
         ),
     )
 
@@ -657,8 +679,9 @@ def _limit_markets_for_runtime(markets: tuple[MarketSnapshot, ...]) -> tuple[Mar
         limit = 300
     if len(markets) <= limit:
         return markets
-    priority = {"005930", "005930.KS", "000660", "000660.KS", "AAPL", "MSFT", "NVDA", "SPY", "QQQ"}
+    priority = _priority_tickers(markets)
     prioritized = [market for market in markets if market.ticker in priority]
+    prioritized.sort(key=lambda market: float(market.average_daily_trading_value or 0.0), reverse=True)
     remaining = [market for market in markets if market.ticker not in priority]
     remaining.sort(key=lambda market: market.source.retrieved_at, reverse=True)
     selected = prioritized + remaining[: max(0, limit - len(prioritized))]

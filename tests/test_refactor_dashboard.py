@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.refactor_dashboard import (
+    _decision_ontology,
+    _event_feed_status,
     _second_level_market_series,
     build_refactor_dashboard,
     build_strategy_market_stream,
@@ -335,6 +337,17 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
         if algorithm["id"] == "intraday_momentum"
     )["final_selected"] is True
     assert trace["final_decision"]["action"] == "BUY"
+    source_by_id = {source["id"]: source for source in trace["sources"]}
+    assert source_by_id["event_feed"]["status"] == "MISSING"
+    assert source_by_id["session_context"]["status"] == "PARTIAL"
+    for strategy_id in (
+        "market_intraday_momentum_short",
+        "opening_range_breakdown",
+        "residual_relative_weakness",
+    ):
+        algorithm = next(item for item in trace["algorithms"] if item["id"] == strategy_id)
+        assert algorithm["requirements"]
+        assert algorithm["visual_indicators"]
     assert result["execution"]["stages"][2]["status"] == "complete"
     assert result["live_order_capable"] is False
 
@@ -342,6 +355,44 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
     assert stream["symbol"] == "005930"
     assert stream["market"]["second_bars"][0]["close"] == 102
     assert stream["market"]["microstructure"]["tick_count_1s"] == 1
+
+
+def test_event_source_is_based_on_a_store_query(tmp_path: Path) -> None:
+    path = tmp_path / "news.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "create table news_sentiment (ticker text, observed_at text, score real)"
+        )
+        connection.execute(
+            "insert into news_sentiment values ('005930', '2026-07-27T00:00:00+00:00', .6)"
+        )
+    status = _event_feed_status(path, "005930")
+    assert status == {
+        "queried": True,
+        "samples": 1,
+        "updated_at": "2026-07-27T00:00:00+00:00",
+        "score": .6,
+    }
+
+
+def test_cross_section_source_reports_real_rank_table_availability() -> None:
+    trace = _decision_ontology(
+        {"symbol": "005930", "bars": [], "microstructure": {}},
+        {
+            "sector_rank_table": {
+                "ranks": {"005930": 1, "000660": 2},
+                "sector_sizes": {"semiconductor": 2},
+                "sector_of": {"005930": "semiconductor", "000660": "semiconductor"},
+            },
+            "all_decisions": [],
+        },
+    )
+    source = next(item for item in trace["sources"] if item["id"] == "cross_section")
+    indicator = next(item for item in trace["indicators"] if item["id"] == "relative_strength")
+    assert source["available"] is True
+    assert source["status"] == "AVAILABLE"
+    assert indicator["available"] is True
+    assert indicator["score"] == 1.0
 
 
 def test_market_view_keeps_ontology_admissible_when_gnn_says_no_trade(tmp_path: Path) -> None:

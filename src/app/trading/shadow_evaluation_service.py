@@ -261,6 +261,13 @@ class ShadowEvaluationService:
                 "last_tick": self._last_stats.as_dict(),
             }
 
+    @property
+    def open_symbols(self) -> tuple[str, ...]:
+        """Symbols whose plans must keep receiving quotes until resolution."""
+
+        with self._lock:
+            return self.simulator.open_symbols
+
     # -- persistence --------------------------------------------------------- #
     def _persist(self, outcome: ShadowOutcome) -> None:
         """Write one resolved outcome to both stores.

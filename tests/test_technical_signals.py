@@ -313,6 +313,75 @@ class TestCompositeEngine:
         assert widening.direction == SignalDirection.HOLD
         assert "SPREAD_STILL_WIDENING" in widening.reason_codes
 
+    def test_us_ask_heavy_absorption_branch_requires_price_recovery(self):
+        absorbed = tick_features(
+            symbol="SOFI",
+            return_30s=0.0004,
+            orderbook_imbalance=-0.40,
+            spread_change_5s=-0.2,
+        )
+
+        fired = self.engine.evaluate_owned_strategy(
+            absorbed,
+            "liquidity_shock_reversal",
+        )
+
+        assert fired.direction == SignalDirection.BUY
+        assert "ASK_HEAVY_ABSORPTION_CONFIRMED" in fired.reason_codes
+        assert fired.expected_horizon_seconds == 600
+
+        rest_polled = self.engine.evaluate_owned_strategy(
+            tick_features(
+                symbol="SOFI",
+                return_30s=0.0004,
+                orderbook_imbalance=-0.40,
+                spread_change_5s=-0.2,
+                second_data_ready=False,
+                tick_count_5s=0,
+            ),
+            "liquidity_shock_reversal",
+        )
+        assert rest_polled.direction == SignalDirection.BUY
+        assert "ASK_HEAVY_ABSORPTION_CONFIRMED" in rest_polled.reason_codes
+
+        still_falling = self.engine.evaluate_owned_strategy(
+            tick_features(
+                symbol="SOFI",
+                return_30s=-0.0001,
+                orderbook_imbalance=-0.40,
+                spread_change_5s=-0.2,
+            ),
+            "liquidity_shock_reversal",
+        )
+        assert still_falling.direction == SignalDirection.HOLD
+        assert "NO_LIQUIDITY_SHOCK_DETECTED" in still_falling.reason_codes
+
+        flat_recovery = self.engine.evaluate_owned_strategy(
+            tick_features(
+                symbol="SOFI",
+                return_30s=0.0001,
+                orderbook_imbalance=-0.40,
+                spread_change_5s=-0.2,
+            ),
+            "liquidity_shock_reversal",
+        )
+        assert flat_recovery.direction == SignalDirection.HOLD
+        assert "ASK_HEAVY_ABSORPTION_CONFIRMED" not in flat_recovery.reason_codes
+
+    def test_absorption_branch_is_not_extrapolated_to_krx(self):
+        result = self.engine.evaluate_owned_strategy(
+            tick_features(
+                symbol="005930",
+                return_30s=0.0004,
+                orderbook_imbalance=-0.40,
+                spread_change_5s=-0.2,
+            ),
+            "liquidity_shock_reversal",
+        )
+
+        assert result.direction == SignalDirection.HOLD
+        assert "ASK_HEAVY_ABSORPTION_CONFIRMED" not in result.reason_codes
+
     def test_event_momentum_requires_event_context(self):
         from app.technical.strategy_algorithms import ElectionContext
 

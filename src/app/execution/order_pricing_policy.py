@@ -22,7 +22,7 @@ missing:
 Why entries post passively
 --------------------------
 Crossing on entry and again on exit pays the FULL round-trip spread. Measured on the
-live KRX tape that is 13-50bps (005930 ~19bps), against a modelled round-trip cost of
+live KRX tape that can vary materially by symbol, against a modelled round-trip cost of
 27.8bps -- so crossing roughly doubled the real cost of a KRX trade. Meanwhile the
 training labels charge ``spread_rate = 0`` and fill at the signal bar's close, i.e.
 they price a PASSIVE fill. Execution was contradicting the very model that scored the
