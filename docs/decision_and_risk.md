@@ -446,6 +446,35 @@ AUC 0.49 / 상위 25개 -54bp를 측정한 챌린저들이 반복 실패하는 �
 아닙니다). 아티팩트는 감사를 위해 디스크에 남고, `LIVE_MODEL_ENFORCE_STALENESS=false`로
 강제 해제할 수 있습니다.
 
+강등은 **단계적**입니다: `trained_model → shadow_only → ontology/bandit → no_trade`.
+`ModelArtifactRegistry.load_latest_live_eligible()`이 낡은 아티팩트에 대해
+`LATEST_MODEL_STALE`을 던져 첫 단계를 구현합니다 — 강등된 모델은 진입 가격을 낼 수 없고,
+호출자는 온톨로지와 보수적 밴딧으로 후퇴합니다. 둘 다 학습된 모델이 필요 없고 스스로
+`NO_TRADE`를 선택할 수 있습니다.
+
+**그 후퇴가 실행되지 않던 버그 (2026-08-05 수정).** 신뢰도 컨트롤러가 레지스트리 위에서
+`disable_buys()`를 무조건 호출해, 모델 단독 실패가 곧 전면 정지였습니다. 671 사이클 연속
+차단되고 당일 거래가 0건이었습니다. 더 나쁜 점은 매수가 **평가조차** 되지 않으면 다음 모델이
+학습할 결정 기록도 생성되지 않는다는 것 — 강등이 자기 회복을 막았습니다.
+
+이제 `_auto_reliability_model_degraded_only()`가 (a) 실패 사유가 `MODEL_NOT_READY`
+**하나뿐**이고 (b) trust level이 `UNUSABLE`이 아닐 때만 참이며, 그 경우 매수 평가를
+유지합니다. 그 외 실패 요소(브로커·런타임·설정·리스크 정책·시세·장 미개장) 또는 `UNUSABLE`은
+그대로 fail-closed입니다. 킬 스위치는 `AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK=false`.
+
+이것은 **집행 재개가 아니라 판단 재개**입니다: 낡은 모델은 레지스트리가 막고, learning 모드는
+`live_orders_allowed=false`이며, 밴딧은 `NO_TRADE`를 실제 선택지로 갖습니다.
+`require_live_gnn`은 이 교착의 원인이 **아니었습니다** — `bandit_enabled=true`와 함께면 이미
+veto가 아니라 penalty로 동작합니다.
+
+**승격 쪽 같은 형태의 교착 (같은 날 수정).** `_promotion_decision`이 스키마를 보지 않고
+지표만 비교해서, 스키마가 은퇴한 incumbent가 자기 교체를 막았습니다. 실측: v5 후보(순수익
++19.75bps, 적격)가 v4 incumbent의 더 높은 precision에 밀려 `CHALLENGER_REGRESSES_ACTIVE_MODEL`로
+거부됐고, 그 incumbent는 `MODEL_FEATURE_SCHEMA_MISMATCH`로 예측을 아예 못 내는 상태였습니다.
+서로 다른 feature set의 precision 비교는 애초에 의미가 없습니다. 이제 현재 스키마 후보가
+구 스키마 incumbent를 만나면 `OBSOLETE_SCHEMA_INCUMBENT_REPLACED`로 교체하며, 같은 스키마
+내부의 진짜 퇴행 차단은 그대로입니다.
+
 ### 9.6 라벨과 실행 규칙 정렬 — `app.strategy.exit_geometry`
 
 공용 라벨은 `TP=25bps / SL=100bps / 600s`였고 실제 실행은 `-22bps / +100bps / 1800s`였습니다.

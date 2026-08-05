@@ -21,6 +21,39 @@ from app.routing.shadow_intelligence import (
 logger = logging.getLogger(__name__)
 
 
+#: 해외(미국) 실시간 TR 쌍과 세션 인식 subscription key. 값의 근거는
+#: ``docs/kis_market_session_capability_matrix.md`` §4.
+_OVERSEAS_SUBSCRIPTION_TR_IDS = ("HDFSCNT0", "HDFSASP0")
+
+
+async def run_event_driven_kis_overseas_websocket_collector(
+    **collector_kwargs: Any,
+) -> dict[str, Any]:
+    """미국 수집을 국내와 **같은** event-driven 런타임으로 돌린다.
+
+    이전에는 미국만 ``run_kis_overseas_realtime_websocket_collector`` 를 직접 호출해
+    ``event_sink`` 없이 동작했다. 그 경로는 메시지마다 ``build_latest_minute_bar`` 로
+    저장소를 다시 읽어 분 bar 를 재집계하는데, 6GB 규모 tick 테이블에서는 lock 경합으로
+    실패하고 (그 호출은 try 로 감싸여 있지도 않아) 수집기 자체를 죽였다. 결과적으로
+    틱은 쌓이는데 분 bar 만 사라지는 상태가 되고, macro reasoner 가 연속 분 bar 를
+    얻지 못해 ``MACRO_INSUFFICIENT_DATA`` → ``NO_TRADE_MARKET`` → 신규 매수 전면 차단이
+    됐다.
+
+    event-driven 런타임은 (a) 분 bar 를 메모리 집계기로 만들고, (b) 영속화를 WebSocket
+    콜백 밖의 워커로 옮기며, (c) 국내와 동일한 metadata 파이프라인을 쓴다.
+    """
+    collector_kwargs.setdefault(
+        "subscription_tr_ids", _OVERSEAS_SUBSCRIPTION_TR_IDS
+    )
+    if "subscription_key_factory" not in collector_kwargs:
+        from app.data.kis_realtime import overseas_realtime_subscription_key
+
+        collector_kwargs["subscription_key_factory"] = (
+            overseas_realtime_subscription_key
+        )
+    return await run_event_driven_kis_websocket_collector(**collector_kwargs)
+
+
 async def run_event_driven_kis_websocket_collector(
     *,
     event_bus_capacity: int = 4096,

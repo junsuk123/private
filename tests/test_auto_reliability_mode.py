@@ -281,21 +281,105 @@ def test_live_mode_is_demoted_immediately_on_broker_failure() -> None:
     demote.assert_called_once()
 
 
-def test_learning_mode_fails_closed_when_reliability_is_low() -> None:
-    failed = {
+def _model_snapshot(reasons, trust="SHADOW_ONLY") -> dict:
+    return {
         **_ready_snapshot(),
         "score": 0.8,
         "ready": False,
-        "reasons": ["MODEL_NOT_READY"],
+        "reasons": list(reasons),
+        "components": {"model": {"ok": False, "trust_level": trust}},
     }
+
+
+def _run_step(snapshot):
     with (
-        patch.object(web_module, "_evaluate_auto_reliability", return_value=failed),
+        patch.object(web_module, "_evaluate_auto_reliability", return_value=snapshot),
         patch.object(web_module, "_active_operation_mode", return_value="learning"),
         patch.object(web_module, "_auto_reliability_enter_learning"),
         patch.object(web_module, "_auto_reliability_enforce_sell_only") as enforce,
+        patch.object(web_module, "_auto_reliability_enter_model_degraded") as degraded,
         patch.object(web_module, "_auto_reliability_learning_maintenance"),
     ):
         result = web_module._auto_reliability_step()
+    return result, enforce, degraded
+
+
+def test_learning_mode_fails_closed_when_reliability_is_low() -> None:
+    # A component other than the model must still stop entries outright.
+    result, enforce, degraded = _run_step(_model_snapshot(["BROKER_NOT_READY"]))
 
     assert result["mode"] == "learning"
+    enforce.assert_called_once_with("BROKER_NOT_READY")
+    degraded.assert_not_called()
+
+
+def test_model_only_demotion_falls_back_instead_of_blocking_entries() -> None:
+    # model_staleness documents trained_model -> shadow_only -> ontology/bandit.
+    # The registry already refuses to price entries with a stale artifact, so the
+    # controller must let that fallback run rather than disabling buys.
+    result, enforce, degraded = _run_step(_model_snapshot(["MODEL_NOT_READY"]))
+
+    assert result["mode"] == "learning"
+    degraded.assert_called_once_with("MODEL_NOT_READY")
+    enforce.assert_not_called()
+
+
+def test_unusable_model_still_fails_closed() -> None:
+    # UNUSABLE means there is no artifact to reason about at all.
+    result, enforce, degraded = _run_step(
+        _model_snapshot(["MODEL_NOT_READY"], trust="UNUSABLE")
+    )
+
     enforce.assert_called_once_with("MODEL_NOT_READY")
+    degraded.assert_not_called()
+
+
+def test_model_degradation_combined_with_another_failure_fails_closed() -> None:
+    result, enforce, degraded = _run_step(
+        _model_snapshot(["MODEL_NOT_READY", "MARKET_DATA_NOT_READY"])
+    )
+
+    assert enforce.call_count == 1
+    degraded.assert_not_called()
+
+
+def test_model_degraded_fallback_can_be_switched_off() -> None:
+    with patch.dict(
+        "os.environ", {"AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK": "false"}
+    ):
+        result, enforce, degraded = _run_step(_model_snapshot(["MODEL_NOT_READY"]))
+
+    enforce.assert_called_once_with("MODEL_NOT_READY")
+    degraded.assert_not_called()
+
+
+def test_model_degraded_only_lifts_a_block_this_controller_placed() -> None:
+    # A manual disable, a liquidation, or REALTIME_BUY_ENABLED=false must survive.
+    for disabled_reason in (
+        "MANUAL_OPERATOR_DISABLE",
+        "REALTIME_BUY_ENABLED=false",
+        "AUTO_RELIABILITY_DEMOTION:MODEL_NOT_READY,BROKER_NOT_READY",
+    ):
+        engine = SimpleNamespace(
+            get_status=lambda reason=disabled_reason: {
+                "buy_enabled": False,
+                "buy_disabled_reason": reason,
+            },
+            enable_buys=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError(f"must not re-enable after {disabled_reason}")
+            ),
+        )
+        with patch.object(web_module, "_realtime_trading_engine", engine):
+            web_module._auto_reliability_enter_model_degraded("MODEL_NOT_READY")
+
+    calls = []
+    engine = SimpleNamespace(
+        get_status=lambda: {
+            "buy_enabled": False,
+            "buy_disabled_reason": "AUTO_RELIABILITY_DEMOTION:MODEL_NOT_READY",
+        },
+        enable_buys=lambda reason: calls.append(reason),
+    )
+    with patch.object(web_module, "_realtime_trading_engine", engine):
+        web_module._auto_reliability_enter_model_degraded("MODEL_NOT_READY")
+    assert len(calls) == 1 and calls[0].startswith("AUTO_RELIABILITY_MODEL_DEGRADED:")

@@ -49,7 +49,8 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
   + 공개 시장/거시/뉴스/공시 데이터
   → source_policy 신뢰도·신선도·provenance 판정, synthetic/sample 차단
   → RealtimeMarketDataStore / LocalResearchStore / AccountSnapshotStore (SQLite)
-  → IndicatorEngine · microstructure feature · LiveFeatureFrame(live_short_horizon_v2)
+  → IndicatorEngine · microstructure feature
+  → LiveFeatureFrame(live_short_horizon_v5_state_only, 40컬럼 + book_quality)
   → [자문] TechnicalPredictionEngine (regime + 방법론 + 보수적 expected exit price)
   → [자문] 거시–미시 온톨로지: MacroMarketReasoner → MicroSymbolReasoner(병렬)
             → OntologyCoordinator → GlobalTradeArbiter (SELL/REDUCE를 BUY보다 먼저 랭킹)
@@ -221,7 +222,20 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
 4. decision/feature JSONL 로그가 수백 MB 규모까지 자라며 문서화된 retention/compaction 정책이 없습니다.
 5. 소액 계좌 단타는 왕복 비용을 고려하면 구조적으로 기대값이 음수에 가깝습니다. 게이트는 엔지니어링 통제일 뿐 수익을 보장하지 않습니다.
 6. 이벤트·횡단면 상대강도·갭 전략은 해당 point-in-time 사실이 실시간 feature schema에 없으면 closed-world로 차단됩니다. 결측 사실을 합성해 0이 아닌 적합도를 만들지 않습니다.
-7. 숏 전략 3개는 코드에 존재하지만 **전량 `SHADOW`이며 실주문 권한이 없습니다.** 승격에는 최소 20 거래일의 forward 표본이 필요하므로 정상 상태입니다. 또한 KIS 대주 조회 TR id와 응답 필드명은 실계좌 응답으로 검증되지 않았고(read-only 경로), GNN 방향별 utility head는 미구현입니다 — 숏 arm은 현재 realized posterior와 규칙 신호로만 평가됩니다. 상세는 [short_selling_deployment.md](short_selling_deployment.md) §15.
+7. **feature schema 변경에 대한 방어가 얇습니다.** `LIVE_FEATURE_NAMES`를 한 번 바꾸자 학습 행
+   해시 필터, 승격 지표 비교, 프레임 품질 게이트 세 곳이 **모두 조용히** 실패했습니다(2026-08-05,
+   [validation.md](validation.md) §12.4). 특히 프레임 저널의 `values`가 곧 모델 벡터이므로 거기서
+   값을 읽는 검사는 feature 제거에 함께 무너집니다. 세 곳은 고쳤고 회귀 테스트를 붙였지만
+   구조적 보호(스키마 변경 시 의존처를 열거하는 장치)는 없습니다.
+8. **구독 예산이 두 목적을 동시에 만족시키지 못합니다.** KIS는 approval key당 등록 수가
+   제한되고 호가는 종목당 등록을 2배로 씁니다. 그런데 호가 없는 종목은 feature frame을 만들 수
+   없고(`MISSING_SOURCE_RECORDS`) `ok_for_live_buy`도 통과할 수 없어, **학습 데이터 유입과 매수
+   자격이 동시에 호가에 걸립니다.** macro breadth(체결만으로 충분)와 학습 폭(호가 필요) 사이의
+   교환이며 `REALTIME_DEPTH_TIER_MIN`으로 하한만 고정해 둔 상태입니다. 근본 해결은 아닙니다.
+9. **approval key 1개로 국내·해외 세션을 번갈아 씁니다.** 한쪽이 세션을 점유하면 다른 쪽
+   수집기는 대기하므로, 미국장 시간대에는 KRX feature frame이 0이고 그 반대도 같습니다.
+   장 마감 시간대에 학습 표본이 사실상 멈추는 이유입니다.
+10. 숏 전략 3개는 코드에 존재하지만 **전량 `SHADOW`이며 실주문 권한이 없습니다.** 승격에는 최소 20 거래일의 forward 표본이 필요하므로 정상 상태입니다. 또한 KIS 대주 조회 TR id와 응답 필드명은 실계좌 응답으로 검증되지 않았고(read-only 경로), GNN 방향별 utility head는 미구현입니다 — 숏 arm은 현재 realized posterior와 규칙 신호로만 평가됩니다. 상세는 [short_selling_deployment.md](short_selling_deployment.md) §15.
 
 관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [short_selling_deployment.md](short_selling_deployment.md) · [validation.md](validation.md)
 

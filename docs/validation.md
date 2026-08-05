@@ -23,6 +23,11 @@
 | 스퀴즈 필터 | **비활성** | 공매도 잔고 소스 없음. 대주 게이트가 fail-closed 담당 |
 | KIS 대주 주문 경로 | mock transport 검증만 | 실주문 미제출 |
 | GNN 방향별 utility head | **미구현** | 숏 arm은 realized posterior + 규칙 신호로만 평가 |
+| feature schema v5 (정체성 컬럼 8개 제거) | 프로덕션 적용, 승격 확인 | 아래 §12. 홀드아웃 1 split + 라이브 재학습 |
+| 단계적 모델 강등 fallback | 프로덕션 적용 | `AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK`, `tests/test_auto_reliability_mode.py` |
+| 스키마 인식 승격 | 프로덕션 적용 | `OBSOLETE_SCHEMA_INCUMBENT_REPLACED`, `tests/test_model_training_artifacts.py` |
+| KIS 구독 티어링 (depth / trade-only) | 코드 적용, **KRX 미검증** | KR 세션을 아직 만나지 않음. §12.3 |
+| KR 단기 모델 라이브 적격 | **미달** | precision@k 0.333 vs 임계 0.35 |
 
 ## 2. 수익성 리팩터 리플레이
 
@@ -290,4 +295,112 @@ python -m pytest tests/test_directional_short_ladder.py
   `app.features.short_indicators`가 계산합니다. `short_interest_ratio` / `days_to_cover`는
   소스가 없어 미측정이며, 그 사실이 명시적으로 보고됩니다.
 
+### 열린 문제 (2026-08-05 기준)
+
+- **KR 단기 모델이 라이브 부적격입니다.** precision@k 0.333 vs 임계 0.35. v4의 0.222에서
+  올랐고 top-K 순수익은 −20.43 → +7.30bps로 부호가 반전됐지만 임계 미달입니다. KR 학습
+  데이터가 소수 종목 편중(단일 종목 26.7%)에서 나왔으므로 구독 폭이 넓어진 뒤 재평가가 필요합니다.
+- **구독 티어링 · dwell · depth floor가 KRX에서 검증되지 않았습니다.** 코드와 단위 테스트는
+  통과했고 라이브 설정 계산도 확인했으나(30종목 / 6 depth → 하한 적용 후 재계산), KRX 수집기가
+  아직 한국장 세션을 만나지 않았습니다. 검증 지점은 다음 KR 개장 시 수집 로그의
+  `depth_symbols` / `trade_only_symbols` / `registrations_spent`입니다.
+- **v5 이전 프레임은 `book_quality`가 없어 fail-closed로 탈락합니다.** 의도된 안전 방향이지만,
+  스키마 전환 직후 약 1시간 구간의 프레임은 학습에 쓰이지 않습니다. 재스탬프하지 않은 이유는
+  저널이 provenance 기록이고 해당 행이 이미 materialized store에 있기 때문입니다.
+- **KRX 세션 판정에 `SESSION_CALENDAR_SUSPECT`가 관측됩니다.** 마감 시간대에는 정상이지만
+  개장 시각에도 남아 있으면 휴장일 캘린더 소스를 확인해야 합니다.
+- **소액 계좌 · 통화 불일치.** 미국 후보만 열린 시간대에 USD 주문가능액이 $67.57 수준이면
+  의미 있는 사이즈가 나오지 않습니다. 원화 잔고로는 미국 종목을 바로 살 수 없고, 환전은 이
+  저장소가 처리하지 않습니다(브로커가 반영해 줄 때까지 스냅샷은 변하지 않습니다).
+- **decision/feature JSONL 로그 성장이 여전히 통제되지 않습니다.** 관측값:
+  `refactor-shadow-comparison.jsonl` 1.59GB, `decision-log.jsonl` 236MB,
+  `live-feature-frames.jsonl` 73MB. 저널만 크기 기반 회전이 있고 나머지는 정책이 없습니다.
+- **`tests/test_web_graph_payload.py::test_full_graph_payload_bypasses_ui_trimming`이 순서
+  의존적입니다.** 단독 실행 시 통과, 전체 스위트에서 실패. 그래프 payload 경로의 공유 상태
+  문제로 보이며 원인 미규명입니다.
+
 CPU GNN은 실시간 판단에 연결되어 있지만, 각 전략의 신규 진입 권한은 live forward 증거에 따라 자동으로 부여되거나 회수됩니다. 숏 arm의 권한은 이와 **별도로** arm별 배포 상태에서 관리됩니다 — 상세는 [short_selling_deployment.md](short_selling_deployment.md).
+
+## 12. 정체성 feature 제거 — schema v4 → v5 (2026-08-05)
+
+### 12.1 증상과 오진 가능성
+
+단기 모델이 671 사이클 연속 라이브 게이트에 실패했습니다. 표면 지표는 모순돼 보였습니다:
+AUC 0.667–0.694(양호)인데 precision@top-1%는 0.148–0.343으로 **양성 base rate 0.395를 크게
+밑돌았고**, top-K 순수익이 −16 ~ −51bps로 지속 음수였습니다.
+
+"모델에 엣지가 없다"로 결론내면 오진입니다. 예측 확률 십분위로 쪼개면 랭킹은 정상입니다:
+
+| 십분위 | label률 | 순수익 |
+| --- | --- | --- |
+| **D1 (최상위)** | 0.495 | **−0.66** ← 패턴 붕괴 |
+| D2 | 0.685 | **+25.29** |
+| D3 | 0.675 | +25.96 |
+| D4 | 0.588 | +22.76 |
+| D5 | 0.495 | +5.07 |
+| D6–D10 | 0.30 → 0.12 | −13 → **−43** |
+
+D2→D10이 완벽히 단조입니다. **최상단만 뒤집혀 있었습니다.**
+
+### 12.2 원인 — feature가 시장 상태가 아니라 종목 정체성을 인코딩
+
+top-53 중 **44개(83%)가 단일 종목**이었습니다. 종목간분산/총분산 비율(1.0 = 순수 정체성):
+
+| feature | 비율 | 성질 |
+| --- | --- | --- |
+| `bid_depth` / `ask_depth` | 0.986 / 0.984 | 정규화 안 된 원시 주식 수 |
+| `box_high` / `low` / `mid` / `previous_close` | 0.943 | 원시 가격 수준 |
+| `liquidity_score` | 0.891 | 로그 거래량 절대값 |
+| `realized_volatility_3m` | 0.779 | 종목 고유 변동성 수준 |
+| `return_5s` / `volume_spike_ratio` (대조) | 0.004 / 0.001 | 순수 상태 |
+
+LP 유동성을 받는 ETF 한 종목이 `ask_depth` z=+4.03(1,838만주 vs 평균 138만주)에 고정되고,
+**그 종목의 최소 depth조차 대부분 종목의 최대치보다 높습니다**(z=+1.71). 모델이 이 feature에
+양의 가중치를 주므로 최상단을 영구 점거합니다. 즉 precision@k는 모델 실력이 아니라 **그 한
+종목의 홀드아웃 구간 운**을 측정하고 있었습니다. AUC는 전 pair 순위라 이 오염에 둔감합니다.
+
+### 12.3 조치와 측정
+
+8개를 모델 벡터에서 제거했습니다(40 컬럼). 각각의 scale-free 대응물이 **이미 feature set에
+존재**해 정보 손실이 없습니다: `depth_ratio`(0.208), `box_position`(0.211), `box_width_pct`,
+`breakout_distance_bps`, `orderbook_imbalance`(0.436).
+
+동일 홀드아웃 split 재학습:
+
+| 지표 | v4 (48) | v5 (40) |
+| --- | --- | --- |
+| AUC | 0.727 | **0.736** |
+| precision@k | 0.148 | **0.444** (base rate 0.395 상회) |
+| top-K 순수익 | **−50.96bps** | **+18.32bps** |
+| top-K 단일종목 집중 | 44/54 | 13/54 |
+| 라이브 게이트 | fail | **PASS** |
+
+라이브 재학습(같은 사이클, 수 분 차이):
+
+| registry | v4 | v5 |
+| --- | --- | --- |
+| combined | 부적격 · auc 0.665 · p@k 0.466 · **−9.97bps** | **적격** · auc 0.720 · p@k 0.621 · **+19.75bps** |
+| KR | 부적격 · auc 0.685 · p@k 0.222 · **−20.43bps** | 부적격 · auc 0.700 · p@k **0.333** · **+7.30bps** |
+| US | 적격 · auc 0.802 · p@k 1.000 · +28.58 | 적격 · auc 0.810 · p@k 1.000 · **+29.51** |
+
+승격된 아티팩트 `live_short_horizon.20260805T140115987083Z` (auc 0.7471 / p@k 0.621 /
+**+21.41bps**)로 게이트가 671 사이클 만에 처음 통과했습니다(`score 1.0/0.9`).
+
+**증거의 한계 (명시).** 홀드아웃 split 1개와 라이브 재학습 소수 사이클입니다. 대표성 있는
+out-of-sample alpha 주장이 아닙니다. **KR은 여전히 부적격**(p@k 0.333 vs 0.35)이며, KR 학습
+데이터는 소수 종목 편중(단일 종목 26.7%) 상태에서 나온 것이라 구독 폭이 넓어진 뒤 재평가가
+필요합니다.
+
+### 12.4 스키마 변경이 조용히 깨뜨린 3곳
+
+feature set 하나를 바꾸자 세 곳이 **모두 조용히** 실패했습니다. 방어가 얇다는 신호로 기록합니다.
+
+| 위치 | 실패 방식 | 조치 |
+| --- | --- | --- |
+| `_row_matches_live_schema` | 저장된 해시 불일치로 학습 행 10만 개 전량 폐기(콜드 스타트) | 신규 set이 진부분집합임을 확인 후 백업·해시 재스탬프 |
+| `_promotion_decision` | 스키마 무시 지표 비교로 죽은 incumbent가 교체를 차단 | `OBSOLETE_SCHEMA_INCUMBENT_REPLACED` |
+| `_frame_passes_training_quality` / `_frame_passes_label_path_quality` | `values.get("bid_depth", 0.0)` → 0.0 → `>0` 실패로 **모든 v5 프레임 탈락, 행 유입 73분간 정지** | 깊이를 `book_quality` 블록으로 분리, 구 프레임은 `values` 폴백 |
+
+세 번째가 가장 위험했습니다: 프레임 저널의 `values`는 **정확히 모델 feature 벡터**이므로,
+품질 게이트가 거기서 값을 읽는 순간 "모델 입력 변경"이 "데이터 무결성 검사 무력화"가 됩니다.
+깊이는 모델 입력이 아니라 "이 호가창이 정상인가" 검사이므로 별 필드로 옮겼습니다.

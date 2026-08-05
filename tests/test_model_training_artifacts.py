@@ -139,6 +139,63 @@ def _rows() -> list[dict]:
     return rows
 
 
+class ObsoleteSchemaPromotionTest(unittest.TestCase):
+    """A retired-schema incumbent must not veto its own replacement.
+
+    ``live_signal_predictor`` raises MODEL_FEATURE_SCHEMA_MISMATCH for an artifact
+    trained on a different feature set, so such an incumbent can never serve a
+    prediction. Its metrics are also not comparable — precision_at_k over a
+    different feature set is a different measurement. Observed on the 2026-08-05
+    v4->v5 change: a v5 candidate (net +19.75bps, live-eligible) was rejected as
+    CHALLENGER_REGRESSES_ACTIVE_MODEL against a dead v4 incumbent's higher
+    precision, so the migration could never land.
+    """
+
+    def test_current_schema_candidate_replaces_obsolete_schema_incumbent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            incumbent = _artifact("v4", auc=0.80, precision=0.79, top_k_return=16.4)
+            registry.save(incumbent)
+            retired = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+            retired["feature_schema_hash"] = "retired0000000000000000f"
+            registry.latest_path.write_text(json.dumps(retired), encoding="utf-8")
+
+            # Lower precision than the incumbent: promotion must happen anyway.
+            challenger = _artifact("v5", auc=0.74, precision=0.62, top_k_return=19.8)
+            registry.save(challenger)
+            active = registry.load_latest_live_eligible()
+
+        self.assertEqual(active.artifact_id, "v5")
+        self.assertEqual(
+            challenger["deployment"]["reason"], "OBSOLETE_SCHEMA_INCUMBENT_REPLACED"
+        )
+
+    def test_obsolete_candidate_cannot_displace_a_current_incumbent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            registry.save(_artifact("current", auc=0.80, precision=0.79, top_k_return=16.4))
+            stale_schema = _artifact("old", auc=0.74, precision=0.62, top_k_return=19.8)
+            stale_schema["feature_schema_hash"] = "retired0000000000000000f"
+            registry.save(stale_schema)
+            active = registry.load_latest_live_eligible()
+
+        self.assertEqual(active.artifact_id, "current")
+        self.assertFalse(stale_schema["deployment"]["promoted"])
+
+    def test_same_schema_regression_is_still_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            registry.save(_artifact("incumbent", auc=0.80, precision=0.79, top_k_return=16.4))
+            worse = _artifact("worse", auc=0.74, precision=0.62, top_k_return=19.8)
+            registry.save(worse)
+            active = registry.load_latest_live_eligible()
+
+        self.assertEqual(active.artifact_id, "incumbent")
+        self.assertEqual(
+            worse["deployment"]["reason"], "CHALLENGER_REGRESSES_ACTIVE_MODEL"
+        )
+
+
 def _artifact(
     artifact_id: str,
     *,

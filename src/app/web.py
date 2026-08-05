@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Container, Mapping, Sequence
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -47,6 +47,7 @@ from app.config import LiveConfigError, load_live_trading_safety_config, load_or
 from app.config.refactor_flags import RefactorFeatureFlags
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.model_artifact_registry import ModelArtifactRegistry
+from app.models.model_staleness import ModelTrustLevel
 from app.models.live_training_pipeline import (
     backfill_live_feature_frames_from_realtime_store,
     collect_live_feature_frames_from_realtime_store,
@@ -748,6 +749,15 @@ _kis_realtime_observed_subscription_capacity: int | None = None
 _kis_realtime_observed_capacity_at: float = 0.0
 _kis_realtime_complete_symbols: tuple[str, ...] = ()
 _kis_realtime_last_resubscribe_request_at = 0.0
+# Symbols the collector should subscribe for DEPTH as well as trades. Everything
+# else is trade-only, which costs one KIS registration instead of two. Written by
+# _kis_realtime_collector_symbols(), read by the collector's tier filter.
+_kis_realtime_orderbook_symbols: set[str] = set()
+# When each currently-selected symbol entered the subscription set. A symbol needs
+# to stay subscribed for several minutes before it has the CONSECUTIVE minute bars
+# that macro breadth and candidate health both require; evicting it earlier means
+# the slot is spent without ever producing a usable symbol.
+_kis_realtime_symbol_subscribed_at: dict[str, float] = {}
 _mock_kis_lock = threading.Lock()
 _mock_kis: MockKisDevelopersApi | None = None
 _mock_trading_state: dict[str, Any] = {
@@ -1839,10 +1849,71 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
   }
 
 
-def _auto_reliability_transition_to_learning(reason: str) -> None:
+def _auto_reliability_model_degraded_only(snapshot: Mapping[str, Any]) -> bool:
+  """Is the ONLY problem a stale-but-scoreable short-horizon model?
+
+  ``model_staleness`` documents demotion as graded —
+  ``trained_model -> shadow_only -> ontology / bandit / no_trade`` — and
+  ``ModelArtifactRegistry.load_latest_live_eligible`` already implements the first
+  step by RAISING ``LATEST_MODEL_STALE`` so a demoted artifact can never price an
+  entry. The intended next step is that the caller falls back to the ontology and
+  the conservative bandit, which need no trained model and can themselves elect
+  NO_TRADE.
+
+  That fallback never ran: this controller sat above the registry and disabled
+  entries outright, so a model-only demotion became a full stop (671 consecutive
+  unready cycles observed on 2026-08-05). Entries then stopped being EVALUATED at
+  all, which also stopped producing the decision records the next model learns
+  from — the demotion blocked its own recovery.
+
+  Kept deliberately narrow. Any other failing component (broker, runtime, config,
+  risk policy, market data, no open market) still fails closed, and an
+  ``UNUSABLE`` trust level means there is no artifact to reason about at all.
+  """
+  if not _env_bool_web("AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK", True):
+    return False
+  if set(snapshot.get("reasons") or ()) != {"MODEL_NOT_READY"}:
+    return False
+  model = (snapshot.get("components") or {}).get("model") or {}
+  return str(model.get("trust_level") or "") != ModelTrustLevel.UNUSABLE.value
+
+
+def _auto_reliability_enter_model_degraded(reason: str) -> None:
+  """Let the ontology/bandit fallback run instead of blocking entries.
+
+  Entries stay gated by every other authority — the profitability gate, the
+  bandit's NO_TRADE outcome, and the operation mode itself. Learning mode does not
+  permit live order submission, so this restores decision-MAKING, not execution.
+  """
   with _realtime_trading_lock:
     engine = _realtime_trading_engine
-  if engine is not None and hasattr(engine, "disable_buys"):
+  if engine is None or not hasattr(engine, "enable_buys"):
+    return
+  try:
+    status = engine.get_status() if hasattr(engine, "get_status") else {}
+  except Exception:  # noqa: BLE001 - leaving buys as they are is the safe default.
+    return
+  disabled_reason = str(status.get("buy_disabled_reason") or "")
+  if status.get("buy_enabled") is True:
+    return
+  # Only lift a block THIS controller placed for a model-only demotion. A manual
+  # disable, a liquidation, or REALTIME_BUY_ENABLED=false must survive untouched.
+  if not disabled_reason.startswith("AUTO_RELIABILITY_DEMOTION:"):
+    return
+  if set(disabled_reason.split(":", 1)[-1].split(",")) != {"MODEL_NOT_READY"}:
+    return
+  engine.enable_buys(f"AUTO_RELIABILITY_MODEL_DEGRADED:{reason}")
+  audit.record("auto_reliability_model_degraded_fallback", {"reason": reason})
+
+
+def _auto_reliability_transition_to_learning(
+    reason: str,
+    *,
+    disable_buys: bool = True,
+) -> None:
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if disable_buys and engine is not None and hasattr(engine, "disable_buys"):
     engine.disable_buys(f"AUTO_RELIABILITY_DEMOTION:{reason}")
   # Keep the engine alive in sell-only mode. Stopping the worker here stranded
   # existing positions without take-profit, stop-loss, or time-exit monitoring.
@@ -1950,7 +2021,12 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
     market_data_only = set(snapshot["reasons"]) == {"MARKET_DATA_NOT_READY"}
     if critical or (unready_streak >= demote_after and not (market_data_only and startup_grace)):
       reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
-      _auto_reliability_transition_to_learning(reason)
+      # Leaving live_trading is the first graded step and still applies. Killing
+      # entries is the second, and a stale-but-scoreable model does not warrant it.
+      _auto_reliability_transition_to_learning(
+          reason,
+          disable_buys=not _auto_reliability_model_degraded_only(snapshot),
+      )
       current_mode = "learning"
       transition_reason = reason
   elif not snapshot["ready"] and active_state is None:
@@ -1959,7 +2035,10 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
     transition_reason = ",".join(snapshot["reasons"]) or "INITIAL_LOW_RELIABILITY"
   if not snapshot["ready"] and current_mode != "live_trading":
     reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
-    _auto_reliability_enforce_sell_only(reason)
+    if _auto_reliability_model_degraded_only(snapshot):
+      _auto_reliability_enter_model_degraded(reason)
+    else:
+      _auto_reliability_enforce_sell_only(reason)
   if current_mode != "live_trading":
     _auto_reliability_learning_maintenance(now, tuple(snapshot["active_markets"]))
   with _live_lock:
@@ -8685,8 +8764,19 @@ def _kis_overseas_realtime_collector_loop() -> None:
       # re-diffs in place. This also swaps the tr_key family automatically when
       # the daytime window opens or closes (DNASAAPL <-> RBAQAAPL), because the
       # key factory is session-aware and the diff is computed on tr_keys.
+      # 국내와 **같은** 수집 경로를 쓴다. 미국만 event_sink 없이 돌면 메시지마다
+      # build_latest_minute_bar 로 저장소를 재조회해 분 bar 를 만들게 되고, 6GB 규모
+      # tick 테이블에서 lock 경합으로 실패해 수집기가 죽는다 (그 호출은 try 밖에 있었다).
+      # 그러면 틱은 쌓이는데 분 bar 만 사라지고, macro 가 연속 분 bar 를 얻지 못해
+      # NO_TRADE_MARKET 으로 신규 매수가 전면 차단된다.
+      overseas_collector_fn = run_kis_overseas_realtime_websocket_collector
+      if RefactorFeatureFlags.from_env().websocket_market_data:
+        from app.data.event_runtime import (
+            run_event_driven_kis_overseas_websocket_collector,
+        )
+        overseas_collector_fn = run_event_driven_kis_overseas_websocket_collector
       counts = asyncio.run(
-          run_kis_overseas_realtime_websocket_collector(
+          overseas_collector_fn(
               symbols=symbols,
               symbols_provider=_kis_overseas_realtime_symbols,
               store=RealtimeMarketDataStore(),
@@ -10839,9 +10929,9 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   """
   base = list(_load_realtime_collection_symbols())
   try:
-    requested_max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "18")))
+    requested_max_syms = max(2, int(os.getenv("REALTIME_COLLECTOR_MAX_SYMBOLS", "32")))
   except (TypeError, ValueError):
-    requested_max_syms = 18
+    requested_max_syms = 32
   try:
     configured_max_subscriptions = max(2, int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")))
   except (TypeError, ValueError):
@@ -10852,7 +10942,11 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
       if observed_capacity
       else configured_max_subscriptions
   )
-  max_syms = max(1, min(requested_max_syms, max_subscriptions // 2))
+  # Symbols are no longer uniformly two registrations each: only the orderable
+  # tier carries depth (see _select_within_subscription_budget). The cap is
+  # therefore the registration budget itself — a fully trade-only set costs one
+  # each — with the greedy walk below enforcing the real spend.
+  max_syms = max(1, min(requested_max_syms, max_subscriptions))
   held_domestic: list[str] = []
   context_domestic: list[str] = []
   try:
@@ -10922,35 +11016,181 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   #   3. session anchors — placed ABOVE the rotating pool so they survive rotation,
   #      but below the two above so they can never starve them.
   #   4. affordable/pending candidates, which get the remaining scarce quote+trade
-  #      pairs before static blue chips the account may not be able to buy.
+  #      pairs before static blue chips the account may not be able to buy. Within
+  #      this group, symbols already warming up are preferred (see below).
+  #
+  # Stability bias inside the rotating pool: a symbol already subscribed and still
+  # inside its dwell window goes ahead of a newcomer. A subscription only starts
+  # paying once it has produced CONSECUTIVE minute bars, so a pool that reshuffles
+  # faster than that keeps buying warmups and never collects one — measured on
+  # 2026-08-05, exactly one statically-pinned name held 30/30 of the last 30 minute
+  # bars while every rotating name sat at 3-6/30.
+  #
+  # This REORDERS the pool and never adds to it. Re-admitting a symbol that has
+  # dropped out of every upstream source would let dead names hold slots that
+  # currently-wanted candidates need, which is a worse failure than churn.
+  warming = set(_kis_realtime_warming_symbols())
+  pool_ordered = [symbol for symbol in candidate_pool if symbol in warming]
+  pool_ordered += [symbol for symbol in candidate_pool if symbol not in warming]
   merged = list(
       dict.fromkeys(
           [
               *held_domestic,
               *dashboard_watch,
               *anchors,
-              *candidate_pool,
+              *pool_ordered,
           ]
       )
   )
-  return tuple(merged[:max_syms])
+  # Depth is what makes a symbol ORDERABLE (market_data_health marks any symbol
+  # without a fresh orderbook ORDERBOOK_COUNT_ZERO, so it can never pass
+  # ok_for_live_buy). Give it to the names that must be priced — positions, what
+  # the operator is watching, and actual buy candidates — and let the breadth
+  # names stream trades only.
+  orderbook_tier = {
+      *held_domestic,
+      *dashboard_watch,
+      *pending_warmup,
+      *kr_extra,
+  }
+  # Depth is the SCARCER resource, not the luxury. A trade-only symbol produces
+  # minute bars (macro breadth) but cannot produce a LiveFeatureFrame at all --
+  # live_feature_frame raises MISSING_SOURCE_RECORDS without an orderbook, and six
+  # of the model's inputs (spread_bps, orderbook_imbalance, depth_ratio,
+  # aggressor_imbalance_5s, spread_change_5s, orderbook_imbalance_change_5s) are
+  # depth-derived. It also can never pass ok_for_live_buy. So depth gates BOTH the
+  # training funnel and buy eligibility, while trade-only only adds breadth.
+  #
+  # Tiering by need alone collapsed the depth tier to whatever happened to be held
+  # or affordable (6 symbols on 2026-08-05) and cut frame producers from 18 to 6 --
+  # trading a macro-breadth win for a training-data loss. Hold a floor of depth
+  # symbols first, then spend what is left on trade-only breadth, so this can only
+  # add coverage relative to the uniform quote+trade pairing it replaced.
+  try:
+    depth_floor = max(0, int(os.getenv("REALTIME_DEPTH_TIER_MIN", "18")))
+  except (TypeError, ValueError):
+    depth_floor = 18
+  for symbol in merged:
+    if len(orderbook_tier) >= depth_floor:
+      break
+    orderbook_tier.add(symbol)
+  selected, depth_symbols = _select_within_subscription_budget(
+      merged,
+      orderbook_tier=orderbook_tier,
+      max_symbols=max_syms,
+      max_subscriptions=max_subscriptions,
+  )
+  _remember_kis_realtime_selection(selected, depth_symbols)
+  return selected
+
+
+def _kis_realtime_warming_symbols(now: float | None = None) -> tuple[str, ...]:
+  """Currently-subscribed symbols still inside their minimum dwell window."""
+  now = time.time() if now is None else now
+  dwell = max(0.0, _env_float_web("REALTIME_SYMBOL_MIN_DWELL_SECONDS", 300.0))
+  if dwell <= 0:
+    return ()
+  with _live_lock:
+    return tuple(
+        symbol
+        for symbol, since in sorted(
+            _kis_realtime_symbol_subscribed_at.items(), key=lambda item: item[1]
+        )
+        if now - float(since or 0.0) < dwell
+    )
+
+
+def _select_within_subscription_budget(
+    ordered_symbols: Sequence[str],
+    *,
+    orderbook_tier: Container[str],
+    max_symbols: int,
+    max_subscriptions: int,
+) -> tuple[tuple[str, ...], set[str]]:
+  """Take symbols in priority order until the KIS registration budget is spent.
+
+  Returns the selection and the symbols that actually kept depth. A depth-tier
+  symbol costs two registrations (trade + depth), a breadth symbol one.
+
+  When depth no longer fits but a trade slot does, the symbol is DEMOTED to
+  trade-only rather than dropped: a held position that streams prints can still
+  be tracked, whereas one dropped for want of a second registration goes dark.
+  The returned depth set is what the collector's tier filter must honour —
+  deriving it from the input tier instead would re-request depth for a demoted
+  symbol and overspend the very budget this walk enforces.
+
+  Skipping a symbol that does not fit while continuing the walk is deliberate:
+  one unaffordable name near the front should not discard the cheap breadth
+  names behind it.
+  """
+  selected: list[str] = []
+  depth: set[str] = set()
+  spent = 0
+  for symbol in ordered_symbols:
+    if len(selected) >= max_symbols:
+      break
+    remaining = max_subscriptions - spent
+    wants_depth = symbol in orderbook_tier
+    cost = 2 if wants_depth else 1
+    if cost > remaining:
+      if not (wants_depth and remaining >= 1):
+        continue
+      cost = 1  # demote to trade-only rather than lose the symbol entirely
+      wants_depth = False
+    selected.append(symbol)
+    if wants_depth:
+      depth.add(symbol)
+    spent += cost
+  return tuple(selected), depth
+
+
+def _remember_kis_realtime_selection(
+    selected: Sequence[str],
+    depth_symbols: Container[str],
+) -> None:
+  """Record the depth tier and stamp dwell clocks for the chosen symbols."""
+  now = time.time()
+  chosen = set(selected)
+  with _live_lock:
+    _kis_realtime_orderbook_symbols.clear()
+    _kis_realtime_orderbook_symbols.update(
+        symbol for symbol in selected if symbol in depth_symbols
+    )
+    for symbol in tuple(_kis_realtime_symbol_subscribed_at):
+      if symbol not in chosen:
+        _kis_realtime_symbol_subscribed_at.pop(symbol, None)
+    for symbol in selected:
+      _kis_realtime_symbol_subscribed_at.setdefault(symbol, now)
+
+
+def _kis_realtime_symbol_wants_orderbook(symbol: str) -> bool:
+  """Collector-side tier filter. Unknown symbols keep depth (fail safe)."""
+  ticker = str(symbol or "").upper().strip()
+  with _live_lock:
+    if not _kis_realtime_orderbook_symbols:
+      return True
+    return ticker in _kis_realtime_orderbook_symbols
 
 
 def _realtime_session_anchor_symbols() -> tuple[str, ...]:
   """KRX symbols kept subscribed for a whole session, whatever else rotates.
 
-  Deliberately a SMALL set: each anchor consumes one of the scarce quote+trade
-  subscription pairs that candidate discovery also needs. Two liquid names are
-  enough to produce one session-structure observation per day each, which is what
-  turns an unmeasurable strategy into a measurable one.
+  These are the breadth core. An anchor now costs ONE registration, not a
+  quote+trade pair — depth goes only to the orderable tier — so the set that used
+  to be held to two names for budget reasons can be wide enough to actually serve
+  its second purpose: the macro reasoner needs consecutive minute bars across
+  several names to judge market breadth at all, and a rotating pool never
+  accumulates them. Two anchors were enough for session-structure strategies and
+  demonstrably not enough for macro, which sat at MACRO_INSUFFICIENT_DATA →
+  NO_TRADE_MARKET with only one continuously-covered symbol.
   """
   raw = os.getenv("REALTIME_SESSION_ANCHOR_SYMBOLS", "")
   symbols = [token.strip() for token in raw.split(",")]
   anchors = [s for s in symbols if s.isdigit() and len(s) == 6]
   try:
-    limit = max(0, int(os.getenv("REALTIME_SESSION_ANCHOR_MAX", "2")))
+    limit = max(0, int(os.getenv("REALTIME_SESSION_ANCHOR_MAX", "8")))
   except (TypeError, ValueError):
-    limit = 2
+    limit = 8
   if anchors or limit == 0:
     return tuple(dict.fromkeys(anchors))[:limit]
 
@@ -11100,6 +11340,9 @@ def _kis_realtime_collector_loop() -> None:
       if _kis_realtime_collector_stop.wait(closed_fallback_seconds):
         return
       continue
+    depth_symbols = sum(
+        1 for ticker in symbols if _kis_realtime_symbol_wants_orderbook(ticker)
+    )
     with _live_lock:
       _append_collection_log_unlocked(
           "running",
@@ -11109,6 +11352,12 @@ def _kis_realtime_collector_loop() -> None:
               "symbol_sample": list(symbols[:12]),
               "skipped_subscriptions": len(_kis_realtime_collector_skip_pairs()),
               "subscription_budget": int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")),
+              # Depth tier costs two registrations, breadth one. Surfaced so an
+              # operator can see WHY a symbol count fits the budget.
+              "depth_symbols": depth_symbols,
+              "trade_only_symbols": len(symbols) - depth_symbols,
+              "registrations_spent": depth_symbols * 2 + (len(symbols) - depth_symbols),
+              "warming_symbols": len(_kis_realtime_warming_symbols()),
               "phase": market_phase("KRX").value,
           },
       )
@@ -11137,6 +11386,7 @@ def _kis_realtime_collector_loop() -> None:
                   _kis_realtime_session_owner() in {"KRX", "BOTH"}
               ),
               subscription_tr_ids=subscription_tr_ids,
+              orderbook_symbol_filter=_kis_realtime_symbol_wants_orderbook,
           )
       )
       _record_kis_realtime_collector_result(counts)

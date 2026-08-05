@@ -86,6 +86,16 @@ KIS_REALTIME_LIVE_WS_URL = "ws://ops.koreainvestment.com:21000/tryitout"
 KIS_EXCHANGE_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 
+def _is_orderbook_tr_id(tr_id: str) -> bool:
+    """True for the depth/quote leg of a TR pair (H0STASP0, H0UNASP0, HDFSASP0…).
+
+    Every KIS orderbook TR ends in ``ASP0``; the trade leg ends in ``CNT0``.
+    Matching on the suffix keeps this correct for the domestic, NXT, unified and
+    overseas pairs without a hard-coded table that would silently miss a new one.
+    """
+    return "ASP" in str(tr_id).upper()
+
+
 @dataclass(frozen=True)
 class ParsedKisRealtimeMessage:
     ticks: tuple[RealtimeTradeTick, ...] = ()
@@ -143,7 +153,12 @@ class KisRealtimeSubscriptionManager:
                 counts["ticks"] += self.store.save_ticks(ticks)
                 counts["orderbooks"] += self.store.save_orderbooks(orderbooks)
                 for symbol in {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}:
-                    self.store.build_latest_minute_bar(symbol)
+                    # 집계 실패가 수집 루프를 멈추지 않게 한다 (위 분기와 같은 이유).
+                    try:
+                        self.store.build_latest_minute_bar(symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        counts["minute_bar_errors"] = counts.get("minute_bar_errors", 0) + 1
+                        counts["last_minute_bar_error"] = str(exc) or exc.__class__.__name__
             counts["messages"] += 1
             if max_messages is not None and counts["messages"] >= max_messages:
                 break
@@ -203,6 +218,7 @@ async def run_kis_realtime_websocket_collector(
     symbols_provider: Callable[[], Iterable[str]] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     session_active_provider: Callable[[], bool] | None = None,
+    orderbook_symbol_filter: Callable[[str], bool] | None = None,
 ) -> dict[str, Any]:
     """Stream KIS realtime data over ONE persistent websocket session.
 
@@ -212,6 +228,14 @@ async def run_kis_realtime_websocket_collector(
     reconnecting. That matters because every reconnect used to mint a new
     approval key, and KIS bills realtime registrations per session — the old
     behaviour drained the account's budget until a single symbol fit.
+
+    ``orderbook_symbol_filter`` splits the symbol set into two tiers. A symbol it
+    rejects is subscribed for trades only, halving its cost from two
+    registrations to one. Depth is only needed to *price an order*; minute bars
+    and macro breadth are built from prints alone. With KIS billing ~41
+    registrations per approval key, trade-only breadth symbols roughly double how
+    many names one session can observe. Callers that need every symbol orderable
+    pass ``None`` and keep the previous behaviour.
     """
     websockets = _load_websockets()
     client = client or build_kis_client(enabled=True)
@@ -290,13 +314,23 @@ async def run_kis_realtime_websocket_collector(
     def _desired_registrations(symbol_set: Iterable[str]) -> list[tuple[str, str, str]]:
         """(symbol, tr_key, tr_id) triples the session should currently hold."""
         wanted: list[tuple[str, str, str]] = []
+        trade_only = 0
         for symbol in symbol_set:
             tr_key = _registration_key(symbol)
             for tr_id in subscription_tr_ids:
                 if (symbol, tr_id) in skipped_pairs or (tr_key, tr_id) in skipped_pairs:
                     counts["subscriptions_skipped"] = counts.get("subscriptions_skipped", 0) + 1
                     continue
+                if _is_orderbook_tr_id(tr_id) and orderbook_symbol_filter is not None:
+                    try:
+                        wants_depth = bool(orderbook_symbol_filter(symbol))
+                    except Exception:  # noqa: BLE001 - a filter fault must not drop depth.
+                        wants_depth = True
+                    if not wants_depth:
+                        trade_only += 1
+                        continue
                 wanted.append((symbol, tr_key, tr_id))
+        counts["trade_only_symbols"] = trade_only
         return wanted
 
     async def _apply_registrations(websocket, wanted) -> bool:
@@ -716,8 +750,20 @@ async def _process_kis_realtime_raw(
         return False
     counts["ticks"] += store.save_ticks(ticks)
     counts["orderbooks"] += store.save_orderbooks(orderbooks)
-    for symbol in {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}:
-        store.build_latest_minute_bar(symbol)
+    observed = {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}
+    # 분 bar 를 **메시지마다** 재집계하지 않는다.
+    #
+    # 이 경로(``event_sink`` 없음)는 기존 기본 경로이고, 예전에는 메시지마다
+    # ``build_latest_minute_bar`` 를 불렀다. 그 호출은 저장소를 다시 읽어 이번 분을 통째로
+    # 재집계하므로, 6GB 규모 tick 테이블에서 초당 수 회 발생하면 lock 경합으로
+    # ``sqlite3.OperationalError`` 를 던진다. 그리고 그 호출은 try 밖에 있어서 예외가
+    # collector 를 타고 올라가 "KIS overseas realtime collector failed" 로 수집이 멈췄다.
+    # 결과는 "틱은 매 분 수백 개 쌓이는데 분 bar 만 사라지는" 상태였고, macro reasoner 가
+    # 연속 분 bar 를 얻지 못해 NO_TRADE_MARKET → 신규 매수 전면 차단이 됐다.
+    #
+    # 분 bar 는 분 단위 산출물이므로 심볼당 몇 초 간격이면 충분히 수렴한다.
+    _build_minute_bars_throttled(store, observed, counts)
+    for symbol in observed:
         try:
             if feature_builder is not None:
                 feature_builder.build(symbol)
@@ -1045,13 +1091,17 @@ def _build_minute_bars_throttled(
         if previous is not None and (stamp - previous) < interval:
             continue
         try:
-            store.build_latest_minute_bar(symbol, now=current)
+            bar = store.build_latest_minute_bar(symbol, now=current)
         except Exception as exc:  # noqa: BLE001 - bar 집계 실패가 수집을 멈추면 안 된다.
             counts["minute_bar_errors"] = counts.get("minute_bar_errors", 0) + 1
             counts["last_minute_bar_error"] = str(exc) or exc.__class__.__name__
             continue
         _LAST_MINUTE_BAR_BUILT[symbol] = stamp
-        counts["minute_bars_built"] = counts.get("minute_bars_built", 0) + 1
+        # 시도가 아니라 **실제로 만들어진 bar** 만 센다. 이번 분에 체결이 없으면
+        # ``build_latest_minute_bar`` 는 None 을 돌려주며, 그것을 성공으로 세면
+        # "bar 를 만들고 있다"는 잘못된 신호가 된다.
+        if bar is not None:
+            counts["minute_bars_built"] = counts.get("minute_bars_built", 0) + 1
     # 구독이 바뀌며 사라진 심볼의 항목이 무한히 쌓이지 않게 한다.
     if len(_LAST_MINUTE_BAR_BUILT) > 512:
         for stale in [

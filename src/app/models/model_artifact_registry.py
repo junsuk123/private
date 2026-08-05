@@ -289,6 +289,23 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _schema_is_current(artifact: dict[str, Any] | None) -> bool:
+    """Was this artifact trained on the feature schema the process runs today?
+
+    Imported lazily: ``feature_schema`` is a leaf module, but the registry is
+    imported by the training pipeline that also builds frames, and a module-level
+    import here would tie artifact bookkeeping to feature construction.
+    """
+    from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
+
+    if not artifact:
+        return False
+    recorded = str(artifact.get("feature_schema_hash") or "")
+    # An artifact that never recorded a hash predates the field; treat it as
+    # unknown-and-therefore-not-current rather than assuming a match.
+    return recorded == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
+
+
 def _promotion_decision(
     candidate: dict[str, Any],
     incumbent: dict[str, Any] | None,
@@ -304,6 +321,16 @@ def _promotion_decision(
         return False, "CHALLENGER_STALE"
     if incumbent_stale:
         return True, "STALE_INCUMBENT_REPLACED"
+    # An incumbent trained on a retired feature schema cannot serve a prediction at
+    # all — live_signal_predictor raises MODEL_FEATURE_SCHEMA_MISMATCH — so it must
+    # not be allowed to veto its own replacement. The metric comparison below is
+    # meaningless across schemas: precision_at_k computed over a different feature
+    # set is a different measurement, and treating it as a regression is what let a
+    # dead incumbent block every successor. Observed on the 2026-08-05 v4->v5 change,
+    # where a v5 candidate (net +19.75bps, eligible) lost to a v4 incumbent's higher
+    # precision and the schema migration could never land.
+    if _schema_is_current(candidate) and not _schema_is_current(incumbent):
+        return True, "OBSOLETE_SCHEMA_INCUMBENT_REPLACED"
 
     candidate_metrics = candidate.get("metrics") or {}
     incumbent_metrics = incumbent.get("metrics") or {}

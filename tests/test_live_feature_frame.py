@@ -14,6 +14,66 @@ from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.features.live_feature_frame import LiveFeatureFrameBuilder
 
 
+class FeatureSchemaIdentityTest(unittest.TestCase):
+    """The model vector must carry market STATE, never instrument IDENTITY.
+
+    A per-symbol-constant column pins the top of a pooled cross-sectional ranking
+    to one instrument: on 2026-08-05 raw ``ask_depth``/``bid_depth`` put 44 of the
+    top 53 predictions on a single liquidity-provider-quoted ETF, giving a top-k
+    net return of -51bps and precision@k 0.148 against a 0.395 base rate, while
+    deciles 2-10 ranked monotonically. Removing them moved precision@k to 0.444 and
+    top-k net to +18bps.
+    """
+
+    # Raw sizes and raw price levels. Each had a between-symbol variance ratio
+    # above 0.75 (1.0 = pure identity) when measured over the KR training rows.
+    IDENTITY_FEATURES = (
+        "bid_depth",
+        "ask_depth",
+        "liquidity_score",
+        "realized_volatility_3m",
+        "box_high",
+        "box_low",
+        "box_mid",
+        "box_previous_close",
+    )
+
+    # The scale-free columns that carry the same information. If one of these is
+    # ever dropped, the identity column it replaced must not come back instead.
+    SCALE_FREE_COUNTERPARTS = (
+        "depth_ratio",
+        "orderbook_imbalance",
+        "box_position",
+        "box_width_pct",
+        "breakout_distance_bps",
+    )
+
+    def test_model_vector_excludes_instrument_identity_features(self) -> None:
+        present = sorted(
+            set(self.IDENTITY_FEATURES) & set(LIVE_SHORT_HORIZON_SCHEMA.feature_names)
+        )
+        self.assertEqual(
+            present,
+            [],
+            "identity features are back in the model vector; see this class's docstring "
+            "-- put raw levels in the strategy layer, which compares a symbol to itself",
+        )
+
+    def test_scale_free_counterparts_are_retained(self) -> None:
+        for name in self.SCALE_FREE_COUNTERPARTS:
+            self.assertIn(name, LIVE_SHORT_HORIZON_SCHEMA.feature_names, name)
+
+    def test_schema_is_internally_consistent(self) -> None:
+        names = LIVE_SHORT_HORIZON_SCHEMA.feature_names
+        self.assertEqual(len(names), len(set(names)), "duplicate feature name")
+        self.assertEqual(len(names), len(LIVE_SHORT_HORIZON_SCHEMA.dtypes))
+
+    def test_dropping_identity_features_changed_the_schema_hash(self) -> None:
+        # A v4 artifact scored with a v5 vector would read the wrong column for
+        # every weight, so the hash MUST differ from the pre-removal schema.
+        self.assertNotEqual(LIVE_SHORT_HORIZON_SCHEMA.schema_hash, "3bbec7413bcb24f89d55d995")
+
+
 class LiveFeatureFrameTest(unittest.TestCase):
     def test_feature_frame_has_schema_hash_and_provenance(self) -> None:
         now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)

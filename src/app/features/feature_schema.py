@@ -5,6 +5,32 @@ import json
 from dataclasses import dataclass
 
 
+# Every name here must describe MARKET STATE, not WHICH INSTRUMENT this is.
+#
+# A feature whose value is essentially constant per symbol is an identity label
+# wearing a number's clothes. Because top-k is selected by absolute probability
+# across a pooled cross-section, one such feature is enough to pin the top of the
+# ranking to a single instrument forever, and precision@k then measures that one
+# instrument's luck in the holdout window instead of model skill.
+#
+# Measured on 2026-08-05 (between-symbol variance / total variance; 1.0 = pure
+# identity). ``bid_depth`` 0.986 and ``ask_depth`` 0.984 are raw share counts, so
+# an ETF quoted by a liquidity provider sat at z=+4.03 and its MINIMUM depth still
+# outranked almost every stock's maximum: 44 of the top 53 predictions were that
+# one ticker, top-k net return was -51bps, and precision@k was 0.148 against a
+# 0.395 base rate — while deciles 2-10 ranked perfectly monotonically (+26bps down
+# to -43bps). The model was fine; the tip of its ranking was one instrument.
+#
+# Dropping the eight identity features on the same holdout split: precision@k
+# 0.148 -> 0.444, top-k net -50.96 -> +18.32bps, AUC 0.727 -> 0.736, top-k symbol
+# concentration 44/54 -> 13/54. No information is lost because the scale-free
+# counterpart of each was ALREADY here: depth_ratio (0.208) for the depths,
+# box_position (0.211) / box_width_pct / breakout_distance_bps for the box levels,
+# orderbook_imbalance (0.436) alongside the depth ratio.
+#
+# Before adding a feature, check this ratio. Raw prices, raw sizes, and raw
+# per-symbol levels belong in the strategy layer, which compares a symbol against
+# ITSELF; they do not belong in a pooled cross-sectional regressor.
 LIVE_FEATURE_NAMES: tuple[str, ...] = (
     # Tick/microstructure features. These are deliberately separate from the
     # 30s+ features below so the model can react to entry-timing changes without
@@ -27,11 +53,13 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     "distance_from_vwap",
     "spread_bps",
     "orderbook_imbalance",
-    "bid_depth",
-    "ask_depth",
+    # bid_depth / ask_depth removed: raw share counts, identity ratio 0.986/0.984.
+    # depth_ratio below is the scale-free form and stays.
     "depth_ratio",
-    "liquidity_score",
-    "realized_volatility_3m",
+    # liquidity_score (0.891) and realized_volatility_3m (0.779) removed for the
+    # same reason. Both remain COMPUTED and are still consumed by the profitability
+    # gate, the strategy supervisor, and the bandit, which compare a symbol against
+    # its own history rather than pooling across instruments.
     "max_drop_3m",
     "cost_to_volatility_ratio",
     "principal_cushion_ratio",
@@ -61,13 +89,14 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     "rvgi_slope",
     "rvgi_bullish_cross",
     "box_available",
-    "box_high",
-    "box_low",
-    "box_mid",
+    # box_high / box_low / box_mid / box_previous_close removed: raw price levels,
+    # identity ratio 0.943. The box is still built and still drives the box-breakout
+    # strategies; only its ABSOLUTE levels leave the model vector. What the model
+    # needs from a box is where price sits inside it and how wide it is, which the
+    # three scale-free columns below already carry.
     "box_width_pct",
     "box_position",
     "breakout_distance_bps",
-    "box_previous_close",
     "box_context_timestamp_epoch",
 )
 
@@ -93,10 +122,11 @@ class FeatureSchema:
 
 
 LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
-    # v3 adds true 1/5/10-second microstructure columns. The version string is
-    # part of the schema_hash, so prior artifacts cannot be mistaken for a model
-    # trained on these new inputs.
-    version="live_short_horizon_v4_rvgi_box",
+    # v5 removes the eight instrument-identity columns documented above. The version
+    # string is part of the schema_hash, so every v4 artifact retires and a fresh
+    # model retrains — required here, because a v4 artifact scored with v5 inputs
+    # would silently read the wrong column for every weight.
+    version="live_short_horizon_v5_state_only",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.data.realtime_types import KIS_REALTIME_SOURCE, OrderbookLevel, RealtimeOrderbookSnapshot, RealtimeTradeTick
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
+from app.models import live_training_pipeline as pipeline
 from app.models.live_training_pipeline import (
     _materialized_training_row_count,
     _merge_materialized_training_rows,
@@ -643,6 +644,67 @@ def _seed_realtime_store(store: RealtimeMarketDataStore, now: datetime) -> None:
             ),
         )
     )
+
+
+class BookQualityIndependentOfFeatureSetTest(unittest.TestCase):
+    """Depth-based quality gates must not depend on depth being a MODEL input.
+
+    Both gates originally read bid/ask depth out of the frame's ``values`` dict,
+    which holds exactly the model feature vector. Removing the raw depths from the
+    schema in v5 therefore made ``values.get("bid_depth", 0.0)`` return 0.0 for
+    every new frame, so ``bid_depth > 0`` failed and row materialization froze
+    completely -- the store's newest row stayed at 12:47 for over an hour while the
+    journal kept accumulating perfectly good frames. Depth now travels in a
+    separate ``book_quality`` block for precisely this reason.
+    """
+
+    BASE_VALUES = {
+        "spread_bps": 10.0,
+        "cost_to_volatility_ratio": 2.0,
+        "return_1s": 0.001,
+    }
+
+    def _frame(self, *, book_quality=None, values_extra=None):
+        return {
+            "values": {**self.BASE_VALUES, **(values_extra or {})},
+            "mark_price": 100.0,
+            **({} if book_quality is None else {"book_quality": book_quality}),
+        }
+
+    def test_v5_frame_with_quality_metadata_passes_both_gates(self) -> None:
+        frame = self._frame(book_quality={"bid_depth": 500.0, "ask_depth": 600.0})
+        self.assertTrue(pipeline._frame_passes_training_quality(frame))
+        self.assertTrue(pipeline._frame_passes_label_path_quality(frame))
+
+    def test_pre_v5_frame_with_depth_in_values_still_validates(self) -> None:
+        frame = self._frame(values_extra={"bid_depth": 500.0, "ask_depth": 600.0})
+        self.assertTrue(pipeline._frame_passes_training_quality(frame))
+        self.assertTrue(pipeline._frame_passes_label_path_quality(frame))
+
+    def test_frame_without_any_depth_source_is_rejected(self) -> None:
+        # Fail closed: an unvouched book must not become a return label.
+        frame = self._frame()
+        self.assertFalse(pipeline._frame_passes_training_quality(frame))
+        self.assertFalse(pipeline._frame_passes_label_path_quality(frame))
+
+    def test_one_sided_and_non_finite_books_are_still_rejected(self) -> None:
+        for depths in (
+            {"bid_depth": 0.0, "ask_depth": 600.0},
+            {"bid_depth": 500.0, "ask_depth": 0.0},
+            {"bid_depth": float("nan"), "ask_depth": 600.0},
+            {"bid_depth": float("inf"), "ask_depth": 600.0},
+        ):
+            frame = self._frame(book_quality=depths)
+            self.assertFalse(pipeline._frame_passes_training_quality(frame), depths)
+            self.assertFalse(pipeline._frame_passes_label_path_quality(frame), depths)
+
+    def test_builder_journals_depth_outside_the_model_vector(self) -> None:
+        from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
+
+        # The removed identity features must NOT be back in the model vector, and
+        # the quality block must carry them instead.
+        self.assertNotIn("bid_depth", LIVE_SHORT_HORIZON_SCHEMA.feature_names)
+        self.assertNotIn("ask_depth", LIVE_SHORT_HORIZON_SCHEMA.feature_names)
 
 
 if __name__ == "__main__":

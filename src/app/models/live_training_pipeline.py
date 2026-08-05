@@ -1095,6 +1095,34 @@ def _read_recent_lines(path: Path, maximum: int) -> list[str]:
     return data.splitlines()[-maximum:]
 
 
+def _frame_book_depths(frame: dict[str, Any]) -> tuple[float, float] | None:
+    """Bid/ask depth for QUALITY checks, independent of the model feature set.
+
+    Prefers the ``book_quality`` block the frame journals for exactly this purpose.
+    Falls back to ``values`` so frames written before schema v5 -- when the raw
+    depths were still model inputs -- keep validating identically.
+
+    Returns None when neither source carries usable depth, which the callers treat
+    as "cannot vouch for this book". Reading these out of ``values`` alone is what
+    made the v5 feature removal silently freeze row materialization: the absent key
+    defaulted to 0.0 and every frame failed ``bid_depth > 0``.
+    """
+    for source in (frame.get("book_quality"), frame.get("values")):
+        if not isinstance(source, dict):
+            continue
+        if "bid_depth" not in source or "ask_depth" not in source:
+            continue
+        try:
+            bid = float(source.get("bid_depth"))
+            ask = float(source.get("ask_depth"))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(bid) and math.isfinite(ask)):
+            return None
+        return bid, ask
+    return None
+
+
 def _frame_passes_training_quality(frame: dict[str, Any]) -> bool:
     values = frame.get("values")
     if not isinstance(values, dict):
@@ -1107,14 +1135,16 @@ def _frame_passes_training_quality(frame: dict[str, Any]) -> bool:
         "yes",
         "on",
     }
+    depths = _frame_book_depths(frame)
+    if depths is None:
+        return False
+    bid_depth, ask_depth = depths
     try:
         spread_bps = float(values.get("spread_bps", 0.0))
-        bid_depth = float(values.get("bid_depth", 0.0))
-        ask_depth = float(values.get("ask_depth", 0.0))
         cost_to_vol = float(values.get("cost_to_volatility_ratio", 0.0))
     except (TypeError, ValueError):
         return False
-    if not all(math.isfinite(value) for value in (spread_bps, bid_depth, ask_depth, cost_to_vol)):
+    if not all(math.isfinite(value) for value in (spread_bps, cost_to_vol)):
         return False
     if spread_bps > max_spread_bps or bid_depth <= 0 or ask_depth <= 0 or cost_to_vol > max_cost_to_vol:
         return False
@@ -1133,14 +1163,16 @@ def _frame_passes_label_path_quality(frame: dict[str, Any]) -> bool:
     values = frame.get("values")
     if not isinstance(values, dict):
         return False
+    depths = _frame_book_depths(frame)
+    if depths is None:
+        return False
+    bid_depth, ask_depth = depths
     try:
         mark = float(frame.get("mark_price") or 0.0)
         spread_bps = float(values.get("spread_bps", 0.0))
-        bid_depth = float(values.get("bid_depth", 0.0))
-        ask_depth = float(values.get("ask_depth", 0.0))
     except (TypeError, ValueError):
         return False
-    if not all(math.isfinite(value) for value in (mark, spread_bps, bid_depth, ask_depth)):
+    if not all(math.isfinite(value) for value in (mark, spread_bps)):
         return False
     return bool(
         mark > 0

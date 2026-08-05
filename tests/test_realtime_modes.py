@@ -41,6 +41,11 @@ class RealtimeModesTest(unittest.TestCase):
                     "rotation_index": 0,
                 }
             )
+            # Subscription tiering/dwell state is module-global and survives between
+            # tests; a leftover dwell stamp reorders the next test's symbol set.
+            web_module._kis_realtime_orderbook_symbols.clear()
+            web_module._kis_realtime_symbol_subscribed_at.clear()
+        web_module._realtime_session_anchor_cache.update({"session": None, "symbols": ()})
         from app.graph import macro_micro_feed
 
         macro_micro_feed.clear()
@@ -1762,6 +1767,153 @@ class RealtimeModesTest(unittest.TestCase):
             symbols = web_module._kis_realtime_collector_symbols()
 
         self.assertLessEqual(len(symbols), 5)
+
+    def _collector_symbols_with(
+        self, *, breadth, affordable, budget="40", held=(), anchor_max=None, depth_floor=None
+    ):
+        account = AccountSnapshot(
+            cash=100000.0,
+            holdings=tuple(
+                Holding(ticker, "KR", "Unit", "Unknown", 1, 4500.0, 4500.0)
+                for ticker in held
+            ),
+            cash_by_currency={"KRW": 100000.0},
+        )
+        with (
+            patch("app.web._live_account_snapshot_for_analysis", return_value=account),
+            patch("app.web._load_realtime_collection_symbols", return_value=tuple(breadth)),
+            patch("app.web._live_affordable_buy_candidate_symbols", return_value=tuple(affordable)),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch("app.web._pending_krx_buy_candidate_warmup_symbols", return_value=()),
+            patch("app.web._dashboard_krx_watch_symbols", return_value=()),
+            patch.dict(
+                "os.environ",
+                {
+                    "REALTIME_COLLECTOR_MAX_SYMBOLS": "40",
+                    "KIS_REALTIME_MAX_SUBSCRIPTIONS": budget,
+                    **({} if anchor_max is None else {"REALTIME_SESSION_ANCHOR_MAX": anchor_max}),
+                    **({} if depth_floor is None else {"REALTIME_DEPTH_TIER_MIN": depth_floor}),
+                },
+            ),
+        ):
+            return web_module._kis_realtime_collector_symbols()
+
+    def test_depth_floor_is_filled_before_any_trade_only_breadth(self) -> None:
+        # Depth is the scarcer resource: without an orderbook a symbol can produce
+        # neither a LiveFeatureFrame (the training funnel) nor ok_for_live_buy. Only
+        # the overflow past the floor may be trade-only, so tiering can only ADD
+        # coverage relative to the uniform quote+trade pairing it replaced.
+        breadth = tuple(f"{index:06d}" for index in range(100, 130))
+        affordable = ("413630", "232680")
+        symbols = self._collector_symbols_with(
+            breadth=breadth, affordable=affordable, budget="40", depth_floor="10"
+        )
+        depth = [s for s in symbols if web_module._kis_realtime_symbol_wants_orderbook(s)]
+        trade_only = [s for s in symbols if s not in depth]
+
+        self.assertGreaterEqual(len(depth), 10, "depth floor must be honoured")
+        self.assertTrue(trade_only, "leftover budget should buy trade-only breadth")
+        self.assertGreater(
+            len(symbols), 40 // 2, "tiering must still beat the old budget//2 cap"
+        )
+        self.assertLessEqual(len(depth) * 2 + len(trade_only), 40)
+        for ticker in affordable:
+            self.assertTrue(
+                web_module._kis_realtime_symbol_wants_orderbook(ticker),
+                f"{ticker} is orderable and needs depth",
+            )
+
+    def test_depth_floor_never_overspends_a_small_budget(self) -> None:
+        breadth = tuple(f"{index:06d}" for index in range(100, 140))
+        symbols = self._collector_symbols_with(
+            breadth=breadth, affordable=(), budget="10", depth_floor="18"
+        )
+        depth = [s for s in symbols if web_module._kis_realtime_symbol_wants_orderbook(s)]
+        spent = len(depth) * 2 + (len(symbols) - len(depth))
+
+        self.assertLessEqual(spent, 10, "a floor larger than the budget must not overspend")
+        self.assertTrue(symbols)
+
+    def test_collector_never_exceeds_the_kis_registration_budget(self) -> None:
+        breadth = tuple(f"{index:06d}" for index in range(200, 260))
+        affordable = tuple(f"{index:06d}" for index in range(300, 320))
+        symbols = self._collector_symbols_with(
+            breadth=breadth, affordable=affordable, budget="24"
+        )
+
+        spent = sum(
+            2 if web_module._kis_realtime_symbol_wants_orderbook(ticker) else 1
+            for ticker in symbols
+        )
+        self.assertLessEqual(spent, 24)
+        self.assertTrue(symbols)
+
+    def test_held_positions_keep_depth_even_when_breadth_fills_the_budget(self) -> None:
+        # A position that cannot be priced cannot be exited, so depth for held names
+        # outranks every breadth slot.
+        breadth = tuple(f"{index:06d}" for index in range(400, 460))
+        symbols = self._collector_symbols_with(
+            breadth=breadth, affordable=(), budget="12", held=("006880",)
+        )
+
+        self.assertIn("006880", symbols)
+        self.assertTrue(web_module._kis_realtime_symbol_wants_orderbook("006880"))
+
+    def test_depth_tier_symbol_is_demoted_not_dropped_when_budget_runs_short(self) -> None:
+        # A symbol dropped for want of a second registration goes dark entirely;
+        # one demoted to trade-only can still be tracked from prints.
+        selected, depth = web_module._select_within_subscription_budget(
+            ["held_a", "held_b", "breadth"],
+            orderbook_tier={"held_a", "held_b"},
+            max_symbols=10,
+            max_subscriptions=3,
+        )
+
+        self.assertIn("held_b", selected)
+        self.assertNotIn("held_b", depth, "a demoted symbol must not still claim depth")
+        spent = sum(2 if ticker in depth else 1 for ticker in selected)
+        self.assertLessEqual(spent, 3)
+
+    def test_warming_symbol_survives_a_pool_reshuffle(self) -> None:
+        # The churn that caused the outage: upstream candidate lists reorder faster
+        # than a symbol can accumulate consecutive minute bars, so the truncation
+        # dropped a different set every cycle and nothing ever qualified.
+        # Anchors are pinned for the whole session by design, so they are disabled
+        # here to leave only the rotating pool under test.
+        pool = tuple(f"{index:06d}" for index in range(500, 512))
+        first = self._collector_symbols_with(
+            breadth=pool, affordable=(), budget="8", anchor_max="0"
+        )
+        self.assertTrue(first)
+
+        reshuffled = tuple(reversed(pool))
+        second = self._collector_symbols_with(
+            breadth=reshuffled, affordable=(), budget="8", anchor_max="0"
+        )
+
+        retained = set(first) & set(second)
+        self.assertEqual(
+            set(first),
+            retained,
+            "a reversed pool evicted warming symbols that had not yet produced bars",
+        )
+
+    def test_dwell_expiry_lets_the_pool_rotate_again(self) -> None:
+        pool = tuple(f"{index:06d}" for index in range(600, 612))
+        first = self._collector_symbols_with(
+            breadth=pool, affordable=(), budget="8", anchor_max="0"
+        )
+
+        # Age every dwell stamp past the window; rotation must resume.
+        with web_module._live_lock:
+            for ticker in tuple(web_module._kis_realtime_symbol_subscribed_at):
+                web_module._kis_realtime_symbol_subscribed_at[ticker] = time.time() - 10_000
+
+        self.assertEqual(web_module._kis_realtime_warming_symbols(), ())
+        second = self._collector_symbols_with(
+            breadth=tuple(reversed(pool)), affordable=(), budget="8", anchor_max="0"
+        )
+        self.assertNotEqual(set(first), set(second))
 
     def test_kis_training_candidate_rejects_penny_wide_spread_symbol(self) -> None:
         store = SimpleNamespace(

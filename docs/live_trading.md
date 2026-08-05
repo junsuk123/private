@@ -254,6 +254,40 @@ set -a; . config/runtime_profiles/raspberrypi.env; set +a
 
 Pi 권장 역할: KIS 계좌/주문 상태 모니터, kill-switch/disarm watchdog, 경량 대시보드, REST/WebSocket 헬스 모니터. **권장하지 않음**: 대규모 유니버스 스캔, 무거운 온톨로지 추론, OpenVINO NPU 추론, 모델 학습, 대형 차트. 이미지 패키징용 별도 런처는 [raspberry_pi_deployment.md](raspberry_pi_deployment.md)를 보세요.
 
+### 실시간 구독 예산 배분
+
+KIS는 approval key당 실시간 등록 수를 제한하고, 종목당 체결(CNT0)+호가(ASP0) 2등록을 쓰면
+관측 종목 수가 예산의 절반으로 묶입니다. 그래서 호가는 **주문을 낼 종목에만** 줍니다.
+
+| 티어 | 대상 | 등록 | 얻는 것 |
+| --- | --- | --- | --- |
+| depth | 보유 · 대시보드 관찰 · 매수 후보 · 하한 채움 | 2 | feature frame, `ok_for_live_buy`, 주문 가격 |
+| trade-only | 나머지 breadth 종목 | 1 | 분봉 → macro breadth |
+
+**호가는 있으면 좋은 것이 아니라 더 희소한 자원입니다.** 호가가 없으면
+`live_feature_frame`이 `MISSING_SOURCE_RECORDS`로 거부하므로 학습 행이 한 줄도 나오지 않고,
+`market_data_health`가 `ORDERBOOK_COUNT_ZERO`를 붙여 매수 자격도 없습니다. 필요 기준으로만
+티어를 나눴을 때 frame 생산 종목이 18 → 6으로 줄어 학습 데이터를 잃었으므로,
+`REALTIME_DEPTH_TIER_MIN` 하한을 먼저 채우고 남은 예산만 breadth에 씁니다.
+
+| 환경변수 | 기본 | 역할 |
+| --- | --- | --- |
+| `KIS_REALTIME_MAX_SUBSCRIPTIONS` | 40 | 등록 예산 |
+| `REALTIME_COLLECTOR_MAX_SYMBOLS` | 32 | 종목 수 상한 |
+| `REALTIME_DEPTH_TIER_MIN` | 18 | 호가 티어 하한 (먼저 채움) |
+| `REALTIME_SESSION_ANCHOR_MAX` | 8 | 세션 내내 고정되는 breadth 코어 |
+| `REALTIME_SYMBOL_MIN_DWELL_SECONDS` | 300 | 최소 구독 유지시간 |
+
+dwell이 필요한 이유: 구독은 **연속** 분봉을 만들어야 값을 하는데 후보 목록이 그보다 빨리
+뒤섞이면 워밍업 비용만 계속 지불하고 결과를 못 거둡니다(2026-08-05 실측: 정적 고정 1종목만
+직전 30분 분봉 30/30, 회전 종목은 3–6/30). dwell 창 안의 종목은 회전 풀 **안에서** 신규 후보보다
+우선하되, 풀에서 완전히 빠진 종목을 되살리지는 않습니다 — 되살리면 죽은 종목이 현재 원하는
+후보의 슬롯을 뺏습니다.
+
+수집 로그의 `depth_symbols` / `trade_only_symbols` / `registrations_spent` / `warming_symbols`로
+실제 배분을 확인할 수 있습니다. **국내·해외가 approval key 하나를 번갈아 쓰므로**, 한쪽 세션이
+열려 있으면 다른 쪽 `complete_subscription_symbols`는 비어 있는 것이 정상입니다.
+
 ## 10. 로그와 재동기화
 
 | 위치 | 내용 |

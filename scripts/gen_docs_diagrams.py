@@ -381,7 +381,11 @@ SOURCES = [
     (
         "1",
         "KIS realtime WebSocket",
-        ["Domestic trade ticks", "Orderbook levels", "Session / market phase"],
+        [
+            "Domestic trade ticks",
+            "Orderbook: depth tier only",
+            "Session / market phase",
+        ],
         "data.kis_realtime",
     ),
     (
@@ -471,11 +475,11 @@ FEATURES = [
     (
         "Live feature frame",
         [
-            "Schema live_short_horizon_v2 with",
-            "provenance and freshness flags.",
-            "Triple-barrier short-horizon labels.",
+            "Schema v5: 40 state-only columns.",
+            "Instrument-identity columns removed.",
+            "book_quality kept beside the vector.",
         ],
-        "features.live_feature_frame · models.labeling",
+        "features.live_feature_frame · features.feature_schema",
     ),
     (
         "Semantic and flow features",
@@ -615,7 +619,8 @@ MAPPING = [
         [
             "→ BUY gate (SPREAD_TOO_WIDE, SPREAD_CONSUMES_ALPHA)",
             "→ execution limit price and no-chase cap",
-            "→ execution-quality rejection of alpha-eating fills",
+            "→ feature-frame eligibility AND ok_for_live_buy",
+            "   (no depth = no training row, no entry)",
         ],
     ),
     (

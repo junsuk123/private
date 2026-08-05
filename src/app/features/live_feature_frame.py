@@ -236,7 +236,23 @@ class LiveFeatureFrameBuilder:
             session_diagnostics,
         )
         frame.validate()
-        self._journal(frame)
+        # Book depth is journalled as QUALITY metadata, deliberately outside
+        # ``values``. The labelling pipeline uses it to reject a malformed or
+        # one-sided book before that book can become a return label, which is a
+        # data-integrity question, not a model input. Raw depths were removed from
+        # the model vector in schema v5 because they encode instrument identity
+        # (between-symbol variance ratio 0.986/0.984) -- and because the gates read
+        # them out of ``values``, that removal silently made every frame fail
+        # ``bid_depth > 0`` and froze row materialization. Keeping the two concerns
+        # in separate fields is what stops a feature-set change from disabling a
+        # quality check again.
+        self._journal(
+            frame,
+            book_quality={
+                "bid_depth": float(feature_dict.get("bid_depth", 0.0)),
+                "ask_depth": float(feature_dict.get("ask_depth", 0.0)),
+            },
+        )
         return frame
 
     @staticmethod
@@ -284,7 +300,12 @@ class LiveFeatureFrameBuilder:
             return 0.0
         return value if math.isfinite(value) else 0.0
 
-    def _journal(self, frame: LiveFeatureFrame) -> None:
+    def _journal(
+        self,
+        frame: LiveFeatureFrame,
+        *,
+        book_quality: dict[str, float] | None = None,
+    ) -> None:
         try:
             provenance_limit = max(
                 1,
@@ -302,6 +323,7 @@ class LiveFeatureFrameBuilder:
             # every tick ID here made each transient journal row tens of KB.
             "source_record_ids": frame.provenance.source_record_ids[-provenance_limit:],
             "values": frame.as_feature_dict(),
+            "book_quality": dict(book_quality or {}),
             "diagnostics": dict(frame.diagnostics),
         }
         try:

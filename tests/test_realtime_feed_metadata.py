@@ -7,7 +7,7 @@ venue/session/feed_scope/TR/subscription_key 를 부착해야 한다.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -234,3 +234,89 @@ def test_us_daytime_quote_override_still_works(monkeypatch):
     monkeypatch.setenv("KIS_FORCE_US_DAYTIME_QUOTES", "false")
     noon = datetime(2026, 8, 5, 12, 0, tzinfo=SEOUL).astimezone(timezone.utc)
     assert is_us_daytime_quote_session(noon) is False
+
+
+# --------------------------------------------------------------------------- #
+# 기본(non-sink) 수집 경로가 분 bar 를 만드는지 — "전략 채택 불가"의 최상위 원인
+# --------------------------------------------------------------------------- #
+def test_default_collector_path_builds_minute_bars(tmp_path, monkeypatch):
+    """``event_sink`` 없는 기본 경로에서도 분 bar 가 생성되어야 한다.
+
+    macro reasoner 는 연속 분 bar 를 요구하고, 결손 시 MACRO_INSUFFICIENT_DATA →
+    NO_TRADE_MARKET → 신규 매수 전면 차단이 된다. 즉 분 bar 생성은 진단 편의가 아니라
+    거래 가능성의 전제다.
+    """
+    import asyncio
+
+    from app.data import kis_realtime
+    from app.data.realtime_store import RealtimeMarketDataStore
+
+    monkeypatch.setattr(kis_realtime, "_LAST_MINUTE_BAR_BUILT", {})
+    monkeypatch.setenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "0")
+    store = RealtimeMarketDataStore(tmp_path / "bars.sqlite3")
+    counts: dict = {"messages": 0, "ticks": 0, "orderbooks": 0}
+    # 체결 시각은 **현재 분** 이어야 한다. build_latest_minute_bar 는 진행 중인 분을
+    # 집계하므로, 과거 시각의 체결만 있으면 만들 bar 가 없다.
+    now_kst = datetime.now(SEOUL).strftime("%H%M%S")
+    record = trade_record("005930", "70000", "12", fields=46).split("^")
+    record[1] = now_kst
+    message = domestic_message("H0STCNT0", "^".join(record))
+
+    asyncio.run(
+        kis_realtime._process_kis_realtime_raw(
+            raw=message,
+            websocket=None,
+            symbols={"005930"},
+            store=store,
+            feature_builder=None,
+            counts=counts,
+            event_sink=None,
+        )
+    )
+    assert counts.get("minute_bars_built", 0) >= 1
+    assert not counts.get("minute_bar_errors")
+    bars = store.recent_minute_bars(
+        "005930", datetime.now(timezone.utc) - timedelta(minutes=5), limit=10
+    )
+    assert bars, "기본 경로에서 분 bar 가 만들어지지 않았다"
+    assert bars[-1].stream_id == "KR:KRX:VENUE_SPECIFIC:H0STCNT0"
+
+
+def test_minute_bar_failure_does_not_kill_the_collector(tmp_path, monkeypatch):
+    """분 bar 집계가 실패해도 수집은 계속되어야 한다.
+
+    이전에는 이 호출이 try 밖에 있어서 SQLite lock 예외가 collector 를 타고 올라가
+    "KIS overseas realtime collector failed" 로 수집이 20초씩 멈췄다.
+    """
+    import asyncio
+
+    from app.data import kis_realtime
+    from app.data.realtime_store import RealtimeMarketDataStore
+
+    monkeypatch.setattr(kis_realtime, "_LAST_MINUTE_BAR_BUILT", {})
+    monkeypatch.setenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "0")
+    store = RealtimeMarketDataStore(tmp_path / "boom.sqlite3")
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "build_latest_minute_bar", explode)
+    counts: dict = {"messages": 0, "ticks": 0, "orderbooks": 0}
+    message = domestic_message("H0STCNT0", trade_record("005930", "70000", "12", fields=46))
+
+    # 예외가 밖으로 나오지 않아야 한다.
+    asyncio.run(
+        kis_realtime._process_kis_realtime_raw(
+            raw=message,
+            websocket=None,
+            symbols={"005930"},
+            store=store,
+            feature_builder=None,
+            counts=counts,
+            event_sink=None,
+        )
+    )
+    assert counts.get("minute_bar_errors") == 1
+    assert "locked" in str(counts.get("last_minute_bar_error"))
+    # 틱은 그대로 저장된다.
+    assert counts.get("ticks") == 1
