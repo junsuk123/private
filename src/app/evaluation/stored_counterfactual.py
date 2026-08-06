@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
@@ -1003,24 +1004,51 @@ def build_labels(
                         instrument_type=instrument_type,
                     )
                     cost_bps = baseline_cost.total_cost_rate * 10_000.0
-                    # Target a net reward comparable to the unavoidable
-                    # round-trip cost. A cost+8bp target had very poor
-                    # reward/risk after a normal adverse move.
-                    minimum_gross_bps = (
-                        cost_bps
-                        + fee_policy.safety_margin_rate * 10_000.0
-                        + max(25.0, cost_bps)
+                    # Size BOTH barriers to the horizon's own volatility, floored
+                    # at the round trip.
+                    #
+                    # The previous target was cost + max(25, cost) and the stop was
+                    # whatever the expert declared, so one fixed pair (stop 60 /
+                    # target 160bps) was applied to both markets. Measured
+                    # 2026-08-06 on stored bars: that pair resolves 7.3% target /
+                    # 23.1% stop / 69.6% timeout on US names, and 22.4% / 68.4% /
+                    # 9.2% on KR ones. Opposite pathologies, same constants — the
+                    # label was recording the symbol's volatility, not the signal.
+                    #
+                    # That is also why the MFE head starved: only 9-25% of fills
+                    # ended profitable, so the upside channel (trained on
+                    # profitable fills alone) got 0-21 rows per strategy while the
+                    # downside channel got 5-112.
+                    sigma_bps = _causal_horizon_sigma_bps(
+                        bars,
+                        index,
+                        history_start,
+                        horizon_bars=config.horizon_bars,
                     )
-                    configured_gross_bps = float(
-                        plan.profit_policy.get("bps", 0.0)
+                    target_bps, stop_bps, cost_floor_dominated = _barrier_bps(
+                        sigma_bps=sigma_bps,
+                        cost_bps=cost_bps,
+                        safety_margin_bps=fee_policy.safety_margin_rate * 10_000.0,
+                        configured_target_bps=float(
+                            plan.profit_policy.get("bps", 0.0)
+                        ),
+                        configured_stop_bps=float(
+                            plan.initial_stop.get("bps", 0.0)
+                        ),
                     )
-                    target_bps = max(configured_gross_bps, minimum_gross_bps)
                     plan = replace(
                         plan,
                         profit_policy={
                             **plan.profit_policy,
                             "bps": target_bps,
                             "price": current.close * (1.0 + target_bps / 10_000.0),
+                            "cost_floor_dominated": cost_floor_dominated,
+                            "horizon_sigma_bps": sigma_bps,
+                        },
+                        initial_stop={
+                            **plan.initial_stop,
+                            "bps": stop_bps,
+                            "price": current.close * (1.0 - stop_bps / 10_000.0),
                         },
                     )
                 outcome = (
@@ -1065,6 +1093,101 @@ def build_labels(
                     )
                 )
     return tuple(labels)
+
+
+#: Barrier widths as a multiple of the horizon's typical excursion. A target at
+#: ~1 sigma and a stop at ~0.7 sigma keeps both barriers inside what the horizon
+#: actually delivers, so the label resolves on the SIGNAL rather than on which
+#: market the symbol happens to trade in.
+_VOLATILITY_TARGET_K = 1.0
+_VOLATILITY_STOP_K = 0.7
+#: Never let a volatility estimate collapse the stop into the tick grid.
+_MINIMUM_STOP_BPS = 15.0
+
+
+def _causal_horizon_sigma_bps(
+    bars: Sequence[Bar],
+    index: int,
+    history_start: int,
+    *,
+    horizon_bars: int,
+) -> float | None:
+    """Typical excursion over ``horizon_bars``, estimated from PAST bars only.
+
+    Uses the MEAN absolute per-bar return scaled by ``sqrt(horizon)``.
+
+    Not the median: in a thin name more than half the bars print no price change at
+    all, so the median absolute return is exactly 0 and the estimator returns None
+    for precisely the symbols that need it most. That silently reinstated the fixed
+    160/60 pair on every US name — measured while building this: the median target
+    came out at exactly 160.0bps, unchanged. The mean is non-zero whenever any bar
+    moved, and for a roughly normal return it is ``sigma * sqrt(2/pi)``, so it is a
+    scale estimate rather than a quantile.
+
+    ``sqrt`` scaling because there is not enough history to measure overlapping
+    horizon-length windows directly — history is 30 bars, the horizon is 60.
+
+    Reads ``bars[history_start:index + 1]`` and nothing after ``index``, so it is
+    usable at decision time.
+    """
+    window = [bar for bar in bars[history_start : index + 1] if bar.close > 0]
+    if len(window) < 5:
+        return None
+    moves = [
+        abs(later.close / earlier.close - 1.0)
+        for earlier, later in zip(window, window[1:])
+        if earlier.close > 0
+    ]
+    if not moves:
+        return None
+    per_bar = fmean(moves)
+    if per_bar <= 0:
+        # Every bar in the window printed the same price. There is no scale to
+        # estimate, and inventing one would be worse than saying so.
+        return None
+    return per_bar * math.sqrt(max(1, int(horizon_bars))) * 10_000.0
+
+
+def _barrier_bps(
+    *,
+    sigma_bps: float | None,
+    cost_bps: float,
+    safety_margin_bps: float,
+    configured_target_bps: float,
+    configured_stop_bps: float,
+) -> tuple[float, float, bool]:
+    """``(target_bps, stop_bps, cost_floor_dominated)`` for one labelled trade.
+
+    Two requirements pull in opposite directions and both are real:
+
+    * a target below the round-trip cost teaches a trade that cannot pay, so the
+      cost floor is a hard minimum;
+    * a target above what the horizon delivers is never touched, so the label
+      degenerates into "stopped out or timed out" and carries no signal.
+
+    When the cost floor wins, that IS the finding — measured 2026-08-06: US names
+    need ~88bps to clear a 63bps round trip while the median 60-minute favourable
+    excursion is 15.7bps, so no barrier pair can be both payable and reachable.
+    ``cost_floor_dominated`` is returned rather than hidden so the caller can
+    record it instead of presenting a coin flip as a trading opportunity.
+
+    KR, for contrast, has a 28bps round trip against a 133bps median excursion —
+    there the volatility term leads and the barriers land inside the distribution.
+    """
+    cost_floor = cost_bps + safety_margin_bps + max(8.0, 0.25 * cost_bps)
+    if sigma_bps is None or sigma_bps <= 0:
+        # No usable history: fall back to the strategy's declared geometry, still
+        # floored at cost. This is the old behaviour, kept for the cold-start bars.
+        target = max(configured_target_bps, cost_floor)
+        return (
+            target,
+            max(_MINIMUM_STOP_BPS, configured_stop_bps),
+            configured_target_bps < cost_floor,
+        )
+    volatility_target = _VOLATILITY_TARGET_K * sigma_bps
+    target = max(volatility_target, cost_floor)
+    stop = max(_MINIMUM_STOP_BPS, _VOLATILITY_STOP_K * sigma_bps)
+    return target, stop, cost_floor > volatility_target
 
 
 def _bars_are_contiguous(
