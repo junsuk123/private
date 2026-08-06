@@ -13,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,24 @@ def build_strategy_gnn_visualization(
     head_norms = np.linalg.norm(strategy_heads, axis=(1, 2))
     head_scale = float(max(float(head_norms.max(initial=0.0)), 1e-12))
     label_outcomes = dict(metadata.get("label_outcomes") or {})
+    # ``training_labels`` counts every snapshot the strategy appeared in, which for
+    # the graph path is all of them — the same number that used to certify "500+
+    # rows" for heads with zero supervision. Carry the rows that actually trained
+    # the upside alongside it so the graph cannot imply evidence it does not have.
+    strategy_supervision = dict(metadata.get("strategy_supervision") or {})
+    minimum_upside_rows = int(
+        metadata.get("minimum_upside_supervision_rows")
+        or os.getenv("GNN_MIN_UPSIDE_SUPERVISION_ROWS", "20")
+    )
+
+    def _upside_rows(strategy_id: str) -> int | None:
+        row = strategy_supervision.get(strategy_id)
+        if isinstance(row, dict):
+            return int(row.get("upside_rows") or 0)
+        outcome = label_outcomes.get(strategy_id)
+        if isinstance(outcome, dict) and "positive_net" in outcome:
+            return int(outcome.get("positive_net") or 0)
+        return None
 
     inference = _read_inference_overlay(
         inference_file,
@@ -140,6 +159,14 @@ def build_strategy_gnn_visualization(
                 "checkpoint_index": index,
                 "learned_strength": round(float(head_norms[index] / head_scale), 6),
                 "training_labels": int(outcome.get("labels") or 0),
+                "training_filled_rows": int(outcome.get("filled") or 0),
+                "training_upside_rows": _upside_rows(strategy_id),
+                "minimum_upside_rows": minimum_upside_rows,
+                "upside_supervised": (
+                    None
+                    if _upside_rows(strategy_id) is None
+                    else _upside_rows(strategy_id) >= minimum_upside_rows
+                ),
                 "training_positive_net_rate": _finite_or_none(
                     outcome.get("positive_net_rate_when_filled")
                 ),

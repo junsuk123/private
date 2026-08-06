@@ -379,8 +379,46 @@ class GnnRealtimeTrustEvaluator:
                 or len(rows) < scan_lines
                 or scan_lines >= max_scan_lines
             ):
-                return candidates[-self.window_samples :]
+                return self._bounded_per_strategy(candidates)
             scan_lines = min(max_scan_lines, scan_lines * 2)
+
+    def _bounded_per_strategy(
+        self, candidates: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Bound the trust window per strategy rather than globally.
+
+        Every threshold downstream is per strategy — ``minimum_strategy_samples``
+        and, for entry authority, ``minimum_positive_prediction_samples``. This
+        window used to keep the newest ``window_samples`` across ALL strategies.
+        With five strategies that is ~48 samples each, and since a positive
+        net-edge forecast is a small minority of deduplicated samples, the global
+        cut discarded precisely the evidence ``entry_authorized`` consumes.
+
+        Measured at 2026-08-06T05:30Z (KRX regular session): the expansion loop
+        collected 666 candidates holding 51 positive-edge forecasts, and the
+        global cut left 20 — below the required 5 per strategy for three of five
+        strategies. Those reported ``CALIBRATED_AWAITING_POSITIVE_EDGE``, i.e.
+        "still gathering evidence", when the honest verdict on the full pool was
+        ``POSITIVE_EDGE_VALIDATION_FAILED``: realized net was negative on the
+        forecasts the model called positive. A gate that hides a failed
+        validation behind a "warming up" label is the worst of both outcomes.
+
+        Discarding was also pure waste: the loop above already paid for the scan
+        (~2.1s of JSON parsing), while retaining a candidate costs ~0.4ms in the
+        outcome query. The per-strategy cap keeps the window bounded for
+        pathological inputs without throwing away work already done.
+        """
+        per_strategy: dict[str, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            per_strategy.setdefault(
+                str(candidate["strategy_id"]), []
+            ).append(candidate)
+        kept: list[dict[str, Any]] = []
+        for strategy_candidates in per_strategy.values():
+            # ``candidates`` arrives sorted by as_of, so the tail is the newest.
+            kept.extend(strategy_candidates[-self.window_samples :])
+        kept.sort(key=lambda item: item["as_of"])
+        return kept
 
     def _prediction_candidates_from_rows(
         self,

@@ -234,6 +234,11 @@ class ShadowIntelligenceService:
             self.checkpoint_contract_reasons = tuple(reasons)
         self.model_input_schema = "unspecified"
         self.model_strategy_ids: tuple[str, ...] = ()
+        #: Strategies whose upside (MFE) head was actually taught. Empty means no
+        #: strategy may contribute a positive net-edge forecast — fail closed, so
+        #: a checkpoint that never reported its supervision cannot be read as
+        #: having proved any.
+        self.upside_supervised_strategy_ids: tuple[str, ...] = ()
         self.live_authorized = False
         self.authorization_scope = "none"
         self.checkpoint_hash: str | None = None
@@ -262,6 +267,9 @@ class ShadowIntelligenceService:
                     str(metadata.get("checkpoint_hash"))
                     if metadata.get("checkpoint_hash")
                     else None
+                )
+                self.upside_supervised_strategy_ids = (
+                    _upside_supervised_strategy_ids(metadata)
                 )
             except (OSError, ValueError, json.JSONDecodeError):
                 self.model_input_schema = "unknown"
@@ -546,6 +554,32 @@ class ShadowIntelligenceService:
                 baseline_cost,
                 float(output.cost_bps[0, node_index, index]),
             )
+            probability = float(output.probability_success[0, node_index, index])
+            mfe = float(output.mfe_bps[0, node_index, index])
+            # Drop the upside term when nothing taught it.
+            #
+            # The decoder builds the expectation as
+            # ``probability * mfe - (1 - probability) * mae``, and MFE is trained
+            # only on realized PROFITABLE fills. On the 2026-08-03 checkpoint that
+            # is 0-21 rows per strategy against 5-112 for MAE, so for most
+            # strategies the only positive term in the forecast is an untrained
+            # head. Live measurement: forecasts this model called positive
+            # realized -39 to -163bps and were right 13-43% of the time, while its
+            # negative forecasts were right ~97%. The downside half is evidence;
+            # the upside half was noise wearing the same units.
+            #
+            # Removing ``probability * mfe`` leaves ``-(1 - probability) * mae``
+            # minus costs — an estimate built only from rows that exist. It is
+            # necessarily non-positive, so StrategyRouter rejects it as
+            # NON_POSITIVE_NET_EDGE and it stays in the shadow log as a
+            # calibration sample instead of a fabricated opportunity.
+            #
+            # It comes off GROSS, not off net: the contract in
+            # ``StrategyUtilityEvidence`` requires net == gross - cost, and a gross
+            # forecast carrying an unsupported upside is exactly as fabricated as
+            # the net one. Both numbers have to shed it together.
+            if strategy_id not in self.upside_supervised_strategy_ids:
+                gross -= probability * mfe
             values.append(
                 StrategyUtilityEvidence(
                     evidence_id=f"{version}:{snapshot.snapshot_id}:{strategy_id}",
@@ -555,12 +589,12 @@ class ShadowIntelligenceService:
                     ontology_allowed=allowed,
                     hard_block_reasons=ontology.blocked_strategy_reasons.get(strategy_id, ()),
                     compatibility_score=ontology.compatibility_scores[strategy_id],
-                    probability_success=float(output.probability_success[0, node_index, index]),
+                    probability_success=probability,
                     expected_gross_return_bps=gross,
                     expected_cost_bps=cost,
                     expected_net_return_bps=gross - cost,
                     expected_adverse_excursion_bps=float(output.mae_bps[0, node_index, index]),
-                    expected_favorable_excursion_bps=float(output.mfe_bps[0, node_index, index]),
+                    expected_favorable_excursion_bps=mfe,
                     fill_probability=float(output.fill_probability[0, node_index, index]),
                     expected_holding_seconds=float(output.holding_seconds[0, node_index, index]),
                     aleatoric_uncertainty=float(output.aleatoric_uncertainty[0, node_index, index]),
@@ -793,6 +827,44 @@ def _shadow_route(
         ),
         checkpoint_hash=checkpoint_hash,
     )
+
+
+def _upside_supervised_strategy_ids(metadata: dict) -> tuple[str, ...]:
+    """Which strategies' upside heads carry evidence, per the checkpoint report.
+
+    Prefers the explicit ``upside_supervised_strategy_ids`` written by training.
+    Checkpoints predating that field still carry the same fact in
+    ``label_outcomes[*].positive_net`` — the realized profitable fills are exactly
+    the rows that trained the MFE channel — so derive it rather than forcing a
+    retrain to regain a safety property.
+
+    Fails closed: no recognizable evidence means no strategy is authorized to
+    forecast an upside. That is the honest reading of a checkpoint that never said.
+    """
+    declared = metadata.get("upside_supervised_strategy_ids")
+    if isinstance(declared, (list, tuple)):
+        return tuple(str(item) for item in declared)
+    minimum = int(
+        metadata.get("minimum_upside_supervision_rows")
+        or os.getenv("GNN_MIN_UPSIDE_SUPERVISION_ROWS", "20")
+    )
+    supervision = metadata.get("strategy_supervision")
+    if isinstance(supervision, dict):
+        return tuple(
+            str(strategy_id)
+            for strategy_id, row in supervision.items()
+            if isinstance(row, dict)
+            and int(row.get("upside_rows") or 0) >= minimum
+        )
+    outcomes = metadata.get("label_outcomes")
+    if isinstance(outcomes, dict):
+        return tuple(
+            str(strategy_id)
+            for strategy_id, row in outcomes.items()
+            if isinstance(row, dict)
+            and int(row.get("positive_net") or 0) >= minimum
+        )
+    return ()
 
 
 def _validation_candidates(

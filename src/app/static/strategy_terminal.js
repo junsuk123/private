@@ -804,11 +804,25 @@ function renderGnnInspector(node) {
     <span>TRAINED STRATEGY NODE</span><h3>${escapeHtml(node.label)}</h3>
     <p>${cluster.label} 군집 · 체크포인트 전략 인덱스 ${Number(node.checkpoint_index) + 1}</p>
     <dl><div><dt>학습 헤드 강도</dt><dd>${Number(node.learned_strength || 0).toFixed(4)}</dd></div>
-    <div><dt>학습 라벨</dt><dd>${formatInteger(node.training_labels)}</dd></div>
+    <div><dt>학습 라벨</dt><dd>${formatInteger(node.training_labels)} <small>(체결 ${formatInteger(node.training_filled_rows)})</small></dd></div>
+    <div><dt>상승(MFE) 학습</dt><dd>${gnnUpsideSupervisionLabel(node)}</dd></div>
     <div><dt>학습 양수 순효율</dt><dd>${node.training_positive_net_rate == null ? '-' : `${(Number(node.training_positive_net_rate) * 100).toFixed(1)}%`}</dd></div>
     <div><dt>최근 GNN 추론</dt><dd>${formatInteger(node.inference_count)}회</dd></div>
     <div><dt>최근 효용</dt><dd>${node.latest_utility == null ? '-' : Number(node.latest_utility).toFixed(3)}</dd></div>
     <div><dt>예상 순효율</dt><dd>${node.latest_expected_net_bps == null ? '-' : `${Number(node.latest_expected_net_bps).toFixed(2)} bp`}</dd></div></dl>`;
+}
+function gnnUpsideSupervisionLabel(node) {
+  // ``학습 라벨`` counts snapshots, so it reads high for every strategy including
+  // ones that never triggered. The rows that trained the MFE channel are the only
+  // ones behind a positive net-edge forecast, and when they are short the runtime
+  // suppresses that forecast entirely — say so here rather than letting a big
+  // label count imply the node is ready.
+  const rows = node.training_upside_rows;
+  if (rows == null) return '알 수 없음 (체크포인트 미기록)';
+  const minimum = Number(node.minimum_upside_rows || 20);
+  return node.upside_supervised
+    ? `${formatInteger(rows)}/${minimum} · 학습됨`
+    : `${formatInteger(rows)}/${minimum} · 부족 → 양엣지 예보 억제`;
 }
 function shortGnnLabel(value) {
   const words = String(value || '').split(' ');

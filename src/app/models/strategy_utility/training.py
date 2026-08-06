@@ -132,7 +132,24 @@ def train_counterfactual_checkpoint(
     checkpoint = model.save_checkpoint(output)
     minimum_rows = 10_000
     minimum_snapshots = 1_000
-    strategy_coverage = all(fitted.get(strategy_id, 0) >= 500 for strategy_id in STRATEGY_IDS)
+    # ``fitted`` counts SNAPSHOTS the strategy appeared in, which for the graph
+    # path is every snapshot — 1,615 for all 16 ids, including the 6 whose
+    # conditions never triggered even once. Gating authorization on that number
+    # was vacuous: it certified "500+ rows" for heads with zero supervision.
+    # Coverage has to be measured on realized outcomes, and specifically on the
+    # UPSIDE ones, because those are the only rows that teach the model what a
+    # profitable setup looks like (see ``_strategy_supervision``).
+    supervision = _strategy_supervision(rows)
+    supervised_strategy_ids = tuple(
+        strategy_id
+        for strategy_id in STRATEGY_IDS
+        if supervision[strategy_id]["upside_supervised"]
+    )
+    # ``any``, not ``all``: several ids are structurally unreachable in this
+    # deployment, so requiring every one of them to carry upside evidence can
+    # never be satisfied. The per-strategy flags above are what the runtime
+    # actually enforces; this only asks that the checkpoint taught at least one.
+    strategy_coverage = bool(supervised_strategy_ids)
     live_shadow_authorized = bool(
         authorize_live_shadow
         and input_feature_schema == "realtime_strategy_graph_v4_market"
@@ -163,6 +180,9 @@ def train_counterfactual_checkpoint(
             ),
         },
         "method": method,
+        "strategy_supervision": supervision,
+        "upside_supervised_strategy_ids": list(supervised_strategy_ids),
+        "minimum_upside_supervision_rows": _MINIMUM_UPSIDE_SUPERVISION_ROWS,
         "strategy_ids": list(STRATEGY_IDS),
         "strategy_count": len(STRATEGY_IDS),
         "feature_names": [
@@ -196,10 +216,11 @@ def train_counterfactual_checkpoint(
             "requested": bool(authorize_live_shadow),
             "minimum_rows": minimum_rows,
             "minimum_snapshots": minimum_snapshots,
-            "strategy_minimum_rows": 500,
+            "strategy_minimum_upside_rows": _MINIMUM_UPSIDE_SUPERVISION_ROWS,
             "row_count_ok": len(rows) >= minimum_rows,
             "snapshot_count_ok": len(grouped) >= minimum_snapshots,
             "strategy_coverage_ok": strategy_coverage,
+            "strategy_coverage_basis": "upside_supervision_rows_per_strategy",
             "schema_matches_runtime": (
                 input_feature_schema == "realtime_strategy_graph_v4_market"
             ),
@@ -209,6 +230,48 @@ def train_counterfactual_checkpoint(
     report_path = checkpoint.with_suffix(".json")
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
+
+
+#: Minimum realized POSITIVE outcomes before a strategy's upside head counts as
+#: taught. Same bar ``_label_outcome_summary`` already applies to fills, so the
+#: report and the authorization agree on what "enough samples" means.
+_MINIMUM_UPSIDE_SUPERVISION_ROWS = 20
+
+
+def _strategy_supervision(
+    rows: tuple[CounterfactualLabel, ...],
+) -> dict[str, dict[str, int | bool]]:
+    """Rows that actually carry gradient for each strategy head, per channel side.
+
+    ``_target_mask`` masks the P&L channels to realized fills, and splits them:
+    channel 3 (adverse excursion, MAE) is masked to ``negative`` outcomes and
+    channel 4 (favourable excursion, MFE) to ``positive`` ones. The decoder then
+    forms the whole expectation as ``probability * mfe - (1 - probability) * mae``,
+    so **MFE is the only upside term in every net-edge forecast the model emits.**
+
+    Measured on the 2026-08-03 checkpoint (25,840 rows): MAE heads received 5-112
+    rows while MFE heads received 0-21, six of them exactly zero. An MFE head with
+    no rows keeps its random initialization, and one with a single row reproduces
+    that row — ``rvgi_box_breakout`` learned +132bps from one lucky fill and went
+    on to forecast positive edges whose realized mean was -168bps. The forecasts
+    were not mismodelled, they were unsupervised.
+
+    Publishing the counts lets the runtime drop the upside term it has no evidence
+    for instead of shipping noise as a prediction.
+    """
+    supervision: dict[str, dict[str, int | bool]] = {}
+    for strategy_id in STRATEGY_IDS:
+        selected = [row for row in rows if row.strategy_id == strategy_id]
+        realized = [row for row in selected if row.triggered and row.filled]
+        upside = [row for row in realized if row.net_return_bps > 0]
+        supervision[strategy_id] = {
+            "labels": len(selected),
+            "realized_rows": len(realized),
+            "upside_rows": len(upside),
+            "downside_rows": len(realized) - len(upside),
+            "upside_supervised": len(upside) >= _MINIMUM_UPSIDE_SUPERVISION_ROWS,
+        }
+    return supervision
 
 
 def _label_outcome_summary(

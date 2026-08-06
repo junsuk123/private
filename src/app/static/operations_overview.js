@@ -229,25 +229,73 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
   );
   opsText('ops-gnn-score', opsNumber(gnn?.score, 3));
   opsText('ops-gnn-samples', `표본 ${opsNumber(gnn?.sample_count)}/${opsNumber(gnn?.minimum_samples)}`);
-  opsText('ops-gnn-trusted', `진입 허용 ${trusted.length ? trusted.join(', ') : '없음'} · 보정 통과 ${calibrated.length}`);
+  const strategyRows = Object.values(gnn?.strategy_metrics || {});
+  const upsideSupervised = (gnn?.upside_supervised_strategy_ids || []).length;
+  opsText(
+    'ops-gnn-trusted',
+    `진입 허용 ${trusted.length ? trusted.join(', ') : '없음'} · 보정 통과 ${calibrated.length}`
+      + ` · 상승 학습 ${upsideSupervised}/${strategyRows.length || '-'}`,
+  );
   const progress = Math.min(100, Math.max(0, Number(gnn?.sample_count || 0) / Math.max(1, Number(gnn?.minimum_samples || 1)) * 100));
   const progressNode = document.getElementById('ops-gnn-progress');
   if (progressNode) progressNode.style.width = `${progress}%`;
-  opsText('ops-gnn-positive', opsPercent(gnn?.positive_net_rate));
-  opsText('ops-gnn-net', `${opsNumber(gnn?.mean_realized_net_bps, 2)} bp`);
+  // "0.0%" and "no positive-edge forecast was ever made" are different facts and
+  // the second one is the one that is true right now. A rate over an empty set
+  // rendered as 0% reads as "the model tried and lost every time".
+  const positiveForecasts = strategyRows.reduce(
+    (total, row) => total + Number(row?.trade_sample_count || 0),
+    0,
+  );
+  opsText(
+    'ops-gnn-positive',
+    positiveForecasts ? `${opsPercent(gnn?.positive_net_rate)} (${positiveForecasts}건)` : '양엣지 예보 없음',
+  );
+  opsText(
+    'ops-gnn-net',
+    positiveForecasts ? `${opsNumber(gnn?.mean_realized_net_bps, 2)} bp` : '-',
+  );
   opsText('ops-gnn-uncertainty', opsNumber(gnn?.mean_uncertainty, 3));
   const strategyMetrics = gnn?.strategy_metrics || {};
   const strategyList = document.getElementById('ops-strategy-list');
   if (strategyList) {
     const rows = Object.entries(strategyMetrics);
     strategyList.innerHTML = rows.length
-      ? rows.map(([strategyId, metrics]) => `
-          <div class="ops-strategy-row">
+      ? rows.map(([strategyId, metrics]) => {
+          // Three outcomes that used to collapse into one "보정 통과" badge:
+          //   entry allowed / waiting for live evidence / upside head untaught.
+          // The last one never resolves on its own, so it must not look like
+          // progress. Requires a retrain, not patience.
+          const unsupervised = metrics.upside_supervised === false;
+          const rowsTaught = metrics.upside_training_rows;
+          const minimum = Number(gnn?.minimum_upside_supervision_rows || 20);
+          let cls = 'warn';
+          let label = '보정 통과';
+          let hint = '실시간 양엣지 표본 대기';
+          if (metrics.entry_authorized) {
+            cls = 'pass';
+            label = '진입 허용';
+            hint = '양엣지 검증 통과';
+          } else if (unsupervised) {
+            cls = 'block';
+            label = `상승 미학습 ${rowsTaught == null ? '' : `${rowsTaught}/${minimum}`}`.trim();
+            hint = '상승(MFE) 헤드 학습 부족 → 양엣지 예보 억제됨. 재학습 필요';
+          } else if (!metrics.calibration_passed) {
+            cls = 'block';
+            label = Number(metrics.score || 0).toFixed(3);
+            hint = '보정 미달';
+          } else if (metrics.execution_validation_stage === 'POSITIVE_EDGE_VALIDATION_FAILED') {
+            cls = 'block';
+            label = '양엣지 검증 실패';
+            hint = `양엣지 예보 ${Number(metrics.trade_sample_count || 0)}건의 실현 순효율 ${opsNumber(metrics.mean_realized_net_bps, 1)}bp`;
+          }
+          return `
+          <div class="ops-strategy-row" title="${hint}">
             <b title="${strategyId}">${strategyId}</b>
             <span>${Number(metrics.sample_count || 0)}표본</span>
-            <span class="${metrics.entry_authorized ? 'pass' : (metrics.calibration_passed ? 'warn' : 'block')}">${metrics.entry_authorized ? '진입 허용' : (metrics.calibration_passed ? '보정 통과' : Number(metrics.score || 0).toFixed(3))}</span>
+            <span class="${cls}">${label}</span>
           </div>
-        `).join('')
+        `;
+        }).join('')
       : '<div class="ops-strategy-row"><b>검증 전략 없음</b><span>-</span><span class="block">대기</span></div>';
   }
 

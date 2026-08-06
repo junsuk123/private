@@ -3063,10 +3063,62 @@ def kiosk_exit() -> JSONResponse:
     return _json({"ok": True, "closed": closed})
 
 
+def _with_upside_supervision(payload: dict) -> dict:
+  """Attach why a strategy cannot forecast an upside, not just that it does not.
+
+  ``entry_authorized`` needs positive-edge forecasts, and the runtime now
+  suppresses that term for any strategy whose MFE head was never taught (see
+  ``shadow_intelligence._evidence``). Without this the dashboard shows those
+  strategies sitting at ``CALIBRATED_AWAITING_POSITIVE_EDGE`` with 0 samples
+  forever, which reads as "still collecting" when the truth is "this head has no
+  upside evidence and will not produce one until it is retrained". Two states that
+  demand opposite responses — wait vs. retrain — must not render identically.
+  """
+  from app.routing.shadow_intelligence import _upside_supervised_strategy_ids
+
+  try:
+    metadata = json.loads(
+        _gnn_realtime_trust_evaluator.checkpoint_metadata_path.read_text(
+            encoding="utf-8"
+        )
+    )
+  except (OSError, ValueError, json.JSONDecodeError):
+    return payload
+  supervised = set(_upside_supervised_strategy_ids(metadata))
+  supervision = metadata.get("strategy_supervision")
+  outcomes = metadata.get("label_outcomes")
+  minimum = int(
+      metadata.get("minimum_upside_supervision_rows")
+      or os.getenv("GNN_MIN_UPSIDE_SUPERVISION_ROWS", "20")
+  )
+
+  def upside_rows(strategy_id: str) -> int | None:
+    if isinstance(supervision, dict) and isinstance(
+        supervision.get(strategy_id), dict
+    ):
+      return int(supervision[strategy_id].get("upside_rows") or 0)
+    if isinstance(outcomes, dict) and isinstance(outcomes.get(strategy_id), dict):
+      return int(outcomes[strategy_id].get("positive_net") or 0)
+    return None
+
+  payload["upside_supervised_strategy_ids"] = sorted(supervised)
+  payload["minimum_upside_supervision_rows"] = minimum
+  metrics = payload.get("strategy_metrics")
+  if isinstance(metrics, dict):
+    for strategy_id, row in metrics.items():
+      if not isinstance(row, dict):
+        continue
+      row["upside_supervised"] = strategy_id in supervised
+      row["upside_training_rows"] = upside_rows(strategy_id)
+  return payload
+
+
 @app.get("/api/gnn/realtime-trust")
 def gnn_realtime_trust_status() -> JSONResponse:
   """Current forward-only confidence gate for ontology-weighted GNN routing."""
-  return _json(_gnn_realtime_trust_evaluator.evaluate().as_dict())
+  return _json(
+      _with_upside_supervision(_gnn_realtime_trust_evaluator.evaluate().as_dict())
+  )
 
 
 @app.get("/api/status")

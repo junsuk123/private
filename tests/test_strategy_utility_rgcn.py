@@ -10,7 +10,11 @@ from app.models.strategy_utility import (
     FixedShapeStrategyUtilityModel,
     StrategyUtilityModelConfig,
 )
-from app.models.strategy_utility.training import _label_outcome_summary
+from app.models.strategy_utility.training import (
+    _MINIMUM_UPSIDE_SUPERVISION_ROWS,
+    _label_outcome_summary,
+    _strategy_supervision,
+)
 
 
 def _inputs():
@@ -95,3 +99,69 @@ def test_strategy_outcome_summary_separates_gross_edge_from_cost_drag() -> None:
     assert summary["mean_gross_return_bps_when_filled"] == 20.0
     assert summary["mean_cost_bps_when_filled"] == 30.0
     assert summary["performance_diagnosis"] == "EXECUTION_COST_EXCEEDS_GROSS_EDGE"
+
+
+def _label(index: int, *, net_bps: float, strategy_id: str) -> CounterfactualLabel:
+    start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    return CounterfactualLabel(
+        as_of=start + timedelta(minutes=index),
+        label_end=start + timedelta(minutes=index + 1),
+        symbol="005930",
+        strategy_id=strategy_id,
+        triggered=True,
+        filled=True,
+        net_return_bps=net_bps,
+        cost_bps=30.0,
+        exit_reason="TIME",
+    )
+
+
+def test_supervision_counts_the_rows_that_actually_train_each_channel() -> None:
+    """MAE trains on losing fills, MFE on winning ones -- count them apart.
+
+    The decoder makes MFE the only positive term in a net-edge forecast, so a
+    strategy with many losing fills and two winning ones has a well-taught
+    downside and an untaught upside. One number for "samples" hides exactly the
+    asymmetry that matters.
+    """
+    rows = tuple(
+        [_label(i, net_bps=-20.0, strategy_id="intraday_momentum") for i in range(40)]
+        + [_label(100 + i, net_bps=15.0, strategy_id="intraday_momentum") for i in range(2)]
+    )
+
+    supervision = _strategy_supervision(rows)["intraday_momentum"]
+
+    assert supervision["realized_rows"] == 42
+    assert supervision["downside_rows"] == 40
+    assert supervision["upside_rows"] == 2
+    assert supervision["upside_supervised"] is False
+
+
+def test_upside_supervision_requires_the_documented_minimum() -> None:
+    minimum = _MINIMUM_UPSIDE_SUPERVISION_ROWS
+    just_under = tuple(
+        _label(i, net_bps=15.0, strategy_id="breakout_volume")
+        for i in range(minimum - 1)
+    )
+    exactly_enough = tuple(
+        _label(i, net_bps=15.0, strategy_id="breakout_volume")
+        for i in range(minimum)
+    )
+
+    assert _strategy_supervision(just_under)["breakout_volume"]["upside_supervised"] is False
+    assert _strategy_supervision(exactly_enough)["breakout_volume"]["upside_supervised"] is True
+
+
+def test_unreachable_strategies_report_no_supervision_not_full_coverage() -> None:
+    """The bug this replaced: coverage was counted per SNAPSHOT, so a strategy
+    that never triggered still certified 1,615 rows and passed a 500-row gate."""
+    rows = tuple(
+        _label(i, net_bps=15.0, strategy_id="intraday_momentum") for i in range(30)
+    )
+
+    supervision = _strategy_supervision(rows)
+
+    assert supervision["intraday_momentum"]["upside_supervised"] is True
+    assert supervision["event_momentum"]["labels"] == 0
+    assert supervision["event_momentum"]["upside_rows"] == 0
+    assert supervision["event_momentum"]["upside_supervised"] is False

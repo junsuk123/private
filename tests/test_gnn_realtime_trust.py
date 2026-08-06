@@ -479,6 +479,117 @@ def test_realtime_outcome_uses_first_strategy_exit_before_horizon_reversal(
     assert outcome[0] > 0.0
 
 
+def test_busy_strategy_does_not_evict_another_strategys_positive_edge_samples(
+    tmp_path,
+) -> None:
+    """The trust window is bounded per strategy, not across all of them.
+
+    Every threshold is per strategy, so a global newest-N cut let one
+    high-frequency strategy starve another's positive-edge evidence. Observed on
+    2026-08-06: three of five strategies reported
+    ``CALIBRATED_AWAITING_POSITIVE_EDGE`` — "still gathering evidence" — when the
+    evidence existed and said validation had FAILED.
+    """
+    log_path = tmp_path / "shadow.jsonl"
+    database = tmp_path / "realtime.sqlite3"
+    metadata_path = tmp_path / "model.json"
+    metadata_path.write_text(
+        json.dumps({"checkpoint_hash": "active-checkpoint"}),
+        encoding="utf-8",
+    )
+    base = datetime(2026, 8, 6, 2, 0, tzinfo=timezone.utc)
+    payloads = []
+    rows = []
+
+    def sample(symbol: str, at: datetime, strategy: str, expected_net: float):
+        rows.extend(
+            (
+                (symbol, at.isoformat(), 100.0),
+                (symbol, (at + timedelta(seconds=30)).isoformat(), 99.0),
+            )
+        )
+        payloads.append(
+            {
+                "as_of": at.isoformat(),
+                "symbol": symbol,
+                "validation_candidates": [
+                    {
+                        "path": "cpu_gnn_validation",
+                        "action": "VALIDATE_ONLY",
+                        "strategy_id": strategy,
+                        "validation_strategy_id": strategy,
+                        "probability_success": 0.6,
+                        "expected_net_return_bps": expected_net,
+                        "expected_cost_bps": 5.0,
+                        "total_uncertainty": 0.2,
+                        "ontology_compatibility": 0.8,
+                        "checkpoint_hash": "active-checkpoint",
+                    }
+                ],
+            }
+        )
+
+    # Six positive-edge forecasts, older than the flood below. Enough to clear
+    # minimum_positive_prediction_samples (5) and force a real verdict.
+    for index in range(6):
+        sample(f"KR{index}", base + timedelta(seconds=index * 31),
+               "intraday_momentum", 20.0)
+    # A second strategy quoting far more often, occupying the newest samples.
+    for index in range(40):
+        sample(f"US{index}", base + timedelta(seconds=400 + index * 31),
+               "liquidity_shock_reversal", -30.0)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            create table realtime_ticks (
+                symbol text not null,
+                received_at text not null,
+                price real not null
+            )
+            """
+        )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            rows,
+        )
+    log_path.write_text(
+        "".join(json.dumps(payload) + "\n" for payload in payloads),
+        encoding="utf-8",
+    )
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path=log_path,
+        database_path=database,
+        checkpoint_metadata_path=metadata_path,
+        horizon_seconds=30,
+        minimum_samples=10,
+        window_samples=20,
+        cache_seconds=1,
+    )
+
+    candidates = evaluator._prediction_candidates(
+        base + timedelta(seconds=3_000)
+    )
+    per_strategy: dict[str, int] = {}
+    for candidate in candidates:
+        strategy = candidate["strategy_id"]
+        per_strategy[strategy] = per_strategy.get(strategy, 0) + 1
+
+    # A global newest-20 cut kept only the busy strategy and dropped all six.
+    assert per_strategy["intraday_momentum"] == 6
+    assert per_strategy["liquidity_shock_reversal"] == 20
+
+    result = evaluator.evaluate(base + timedelta(seconds=3_000))
+    metrics = result.strategy_metrics["intraday_momentum"]
+
+    assert metrics["trade_sample_count"] == 6
+    # The verdict is a real failure, not "warming up" — realized net was
+    # negative on exactly the forecasts the model called positive.
+    assert metrics["execution_validation_stage"] == "POSITIVE_EDGE_VALIDATION_FAILED"
+    assert metrics["entry_authorized"] is False
+    assert result.trusted_strategy_ids == ()
+
+
 def test_negative_calibration_does_not_grant_positive_entry_authority(
     tmp_path,
 ) -> None:
@@ -563,3 +674,67 @@ def test_negative_calibration_does_not_grant_positive_entry_authority(
     assert metrics["execution_validation_stage"] == (
         "CALIBRATED_AWAITING_POSITIVE_EDGE"
     )
+
+
+def test_trust_payload_distinguishes_untaught_upside_from_awaiting_samples(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """The dashboard needs "retrain me" and "wait for me" to look different.
+
+    Both render as ``CALIBRATED_AWAITING_POSITIVE_EDGE`` with 0 positive samples,
+    but a suppressed upside head never resolves on its own. The API has to say
+    which strategies were taught an upside before the UI can show it.
+    """
+    from app import web
+
+    metadata = {
+        "strategy_ids": ["intraday_momentum", "breakout_volume"],
+        "minimum_upside_supervision_rows": 20,
+        "strategy_supervision": {
+            "intraday_momentum": {"upside_rows": 25},
+            "breakout_volume": {"upside_rows": 4},
+        },
+    }
+    path = tmp_path / "rgcn_shadow.json"
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(
+        web._gnn_realtime_trust_evaluator, "checkpoint_metadata_path", path
+    )
+
+    payload = web._with_upside_supervision(
+        {
+            "strategy_metrics": {
+                "intraday_momentum": {"trade_sample_count": 0},
+                "breakout_volume": {"trade_sample_count": 0},
+            }
+        }
+    )
+
+    assert payload["upside_supervised_strategy_ids"] == ["intraday_momentum"]
+    assert payload["minimum_upside_supervision_rows"] == 20
+    taught = payload["strategy_metrics"]["intraday_momentum"]
+    untaught = payload["strategy_metrics"]["breakout_volume"]
+    assert taught["upside_supervised"] is True
+    assert taught["upside_training_rows"] == 25
+    assert untaught["upside_supervised"] is False
+    assert untaught["upside_training_rows"] == 4
+
+
+def test_unreadable_checkpoint_metadata_leaves_the_trust_payload_untouched(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A diagnostic surface must not be able to break the gate it reports on."""
+    from app import web
+
+    monkeypatch.setattr(
+        web._gnn_realtime_trust_evaluator,
+        "checkpoint_metadata_path",
+        tmp_path / "missing.json",
+    )
+    original = {"passed": True, "strategy_metrics": {"a": {"score": 1.0}}}
+
+    payload = web._with_upside_supervision(dict(original))
+
+    assert payload == original

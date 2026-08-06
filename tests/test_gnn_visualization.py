@@ -158,3 +158,32 @@ def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:
     assert activation["strategies"]["intraday_momentum"]["state"] == "ELECTED_NO_TRADE"
     assert activation["layers"]["strategy_election"]["observed"] is True
     assert activation["layers"]["input"]["observed"] is False
+
+
+def test_strategy_nodes_publish_upside_supervision_next_to_label_count() -> None:
+    """``training_labels`` counts snapshots, so it is high even for a strategy that
+    never triggered — it was the number that used to certify coverage for heads with
+    zero supervision. The graph must carry the rows that actually trained the upside
+    beside it, or it implies evidence the checkpoint does not have."""
+    from app.gnn_visualization import build_strategy_gnn_visualization
+
+    payload = build_strategy_gnn_visualization()
+    nodes = [node for node in payload["nodes"] if node.get("kind") == "strategy"]
+    if not nodes:
+        return
+
+    for node in nodes:
+        assert "training_upside_rows" in node
+        assert "training_filled_rows" in node
+        assert "minimum_upside_rows" in node
+        assert "upside_supervised" in node
+        rows = node["training_upside_rows"]
+        if rows is None:
+            assert node["upside_supervised"] is None
+        else:
+            assert node["upside_supervised"] == (
+                rows >= node["minimum_upside_rows"]
+            )
+            # An upside row is a realized profitable fill, so it can never exceed
+            # the fills it came from.
+            assert rows <= node["training_filled_rows"]
