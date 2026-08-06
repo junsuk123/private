@@ -177,8 +177,10 @@ class LiveFeatureFrameBuilder:
         ask_depth = float(orderbook.total_ask_volume)
         depth_ratio = bid_depth / max(1.0, ask_depth)
         technical = _technical_columns(prices, volumes)
+        # ONE minute-bar fetch per frame, shared by every slow-context consumer.
+        slow_bars = _slow_context_bars(self.store, symbol, decision_time)
         rvgi_box = _rvgi_box_columns(
-            self.store,
+            slow_bars,
             symbol,
             decision_time,
             float(prices[-1]),
@@ -193,8 +195,18 @@ class LiveFeatureFrameBuilder:
             orderbooks,
             decision_time,
         )
+        # Slow indicator families, computed from COMPLETED fixed-time bars only.
+        # Placed after second_features so aggressor flow can join the volume family.
+        family_columns = _indicator_family_columns(
+            slow_bars,
+            spread_bps=float(orderbook.spread_bps),
+            liquidity_score=technical.get("liquidity_score"),
+            orderbook_imbalance=technical.get("orderbook_imbalance"),
+            aggressor_imbalance=second_features.get("aggressor_imbalance_5s"),
+        )
         feature_dict = {
             **second_features,
+            **family_columns,
             "return_30s": _window_return(ticks, decision_time, seconds=30),
             "return_1m": _window_return(ticks, decision_time, seconds=60),
             "return_3m": _safe_return(prices[-1], prices[0]),
@@ -456,14 +468,75 @@ def _second_level_features(
     }
 
 
+def _slow_context_bars(store, symbol: str, decision_time: datetime):
+    """One minute-bar fetch per frame, shared by every slow-context consumer.
+
+    ``recent_minute_bars`` is a query against a multi-GB SQLite store. The frame
+    runs per symbol on a ~5s sweep, so each extra call is paid 25x per sweep under
+    WAL contention with the ingest writers. Adding a second independent fetch for
+    the indicator families stalled the trading loop hard enough to wedge the
+    server twice; the arithmetic on the bars was never the expensive part.
+    """
+    from app.technical.causal_bars import completed_bars
+
+    try:
+        rows = store.recent_minute_bars(
+            symbol,
+            decision_time - timedelta(minutes=240),
+            limit=240,
+        )
+    except Exception:  # noqa: BLE001 - slow context fails closed, never raises.
+        rows = ()
+    return completed_bars(
+        rows,
+        symbol=symbol,
+        as_of=decision_time,
+        timeframe_minutes=1,
+        warmup_required=64,
+    )
+
+
+def _indicator_family_columns(
+    bar_set,
+    *,
+    spread_bps: float | None = None,
+    liquidity_score: float | None = None,
+    orderbook_imbalance: float | None = None,
+    aggressor_imbalance: float | None = None,
+) -> dict[str, float]:
+    """Compact indicator-family columns from COMPLETED bars.
+
+    Uses the shared causal bar builder so a live value and a replay value for the
+    same as-of are produced by identical code. On any failure every column falls
+    back to its neutral and the ``*_available`` flags read 0 -- the model is told
+    the reading is missing rather than being handed a fabricated neutral.
+    """
+    from app.technical.indicator_families import (
+        build_families,
+        compact_model_features,
+    )
+
+    try:
+        bars = tuple(getattr(bar_set, "bars", ()) or ())
+        bundle = build_families(
+            bars,
+            aggressor_imbalance=aggressor_imbalance,
+            orderbook_imbalance=orderbook_imbalance,
+            spread_bps=spread_bps,
+            liquidity_score=liquidity_score,
+        )
+        return compact_model_features(bars, bundle)
+    except Exception:  # noqa: BLE001 - families fail closed to an all-zero mask.
+        return compact_model_features((), build_families(()))
+
+
 def _rvgi_box_columns(
-    store: RealtimeMarketDataStore,
+    bar_set,
     symbol: str,
     decision_time: datetime,
     current_price: float,
 ) -> dict[str, float]:
     """Build slow descriptors from completed one-minute bars, never ticks."""
-    from app.features.schemas import OHLCVBar
     from app.technical import indicators as ti
 
     unavailable = {
@@ -483,31 +556,11 @@ def _rvgi_box_columns(
         "box_previous_close": 0.0,
         "box_context_timestamp_epoch": 0.0,
     }
-    try:
-        raw = store.recent_minute_bars(
-            symbol,
-            decision_time - timedelta(days=2),
-            limit=80,
-        )
-    except Exception:  # noqa: BLE001 - unavailable slow context fails closed.
+    # Bars come from the single per-frame fetch (see _slow_context_bars); this
+    # function no longer queries the store itself.
+    bars = tuple(getattr(bar_set, "bars", ()) or ())
+    if not bars:
         return unavailable
-    completed = tuple(
-        bar
-        for bar in raw
-        if bar.minute_start + timedelta(minutes=1) <= decision_time
-    )
-    bars = tuple(
-        OHLCVBar(
-            ticker=symbol,
-            as_of=bar.minute_start + timedelta(minutes=1),
-            open=bar.open,
-            high=bar.high,
-            low=bar.low,
-            close=bar.close,
-            volume=float(bar.volume),
-        )
-        for bar in completed
-    )
     rvgi_result = ti.rvgi(bars, 10)
     box = ti.causal_box_geometry(bars, 20)
     result = dict(unavailable)

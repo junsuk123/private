@@ -295,6 +295,28 @@ python -m pytest tests/test_directional_short_ladder.py
   `app.features.short_indicators`가 계산합니다. `short_interest_ratio` / `days_to_cover`는
   소스가 없어 미측정이며, 그 사실이 명시적으로 보고됩니다.
 
+## 13. feature schema v6 — 지표 계열 계층 (2026-08-06)
+
+v6은 22개 컬럼을 **추가**합니다: 6개 계열 점수 + 5개 availability 플래그 + 11개 scale-free
+스칼라. 40 → **62 컬럼**, hash `f3f8f330a8cf04969e8545fa`.
+
+19개 원시 지표를 그대로 넣지 않은 이유는 대부분의 원시 값이 **종목별 수준(level)** 이고,
+그것이 §12에서 제거한 바로 그 정체성 실패 모드이기 때문입니다. 추가된 컬럼은 전부 scale-free
+이거나 0/1 플래그입니다.
+
+**마이그레이션 비용 (우회하지 않음).** v4→v5는 부분집합 축소라 저장 행을 재스탬프할 수
+있었지만, v6은 **추가**이므로 기존 10만 행에 새 컬럼이 존재하지 않아 재스탬프가 불가능합니다.
+따라서:
+
+- v6 모델은 신규 행을 새로 쌓아 학습해야 합니다(콜드 스타트).
+- 그때까지 registry가 v5 아티팩트를 schema mismatch로 거부하고, §9.5의 단계적 강등이
+  ontology/bandit 경로로 진입 평가를 유지합니다.
+- `live_signal_predictor`가 `MODEL_FEATURE_SCHEMA_MISMATCH` / `MODEL_FEATURE_ORDER_MISMATCH`를
+  가중치 적용 **전에** 던지므로, 구 아티팩트가 새 벡터를 채점하는 일은 구조적으로 불가능합니다.
+
+구 모델을 새 스키마에 억지로 매핑하지 않은 이유: 모든 가중치가 잘못된 컬럼을 읽게 되며,
+이는 모델 없이 거래하는 것보다 나쁩니다.
+
 ### 열린 문제 (2026-08-05 기준)
 
 - **KR 단기 모델이 라이브 부적격입니다.** precision@k 0.333 vs 임계 0.35. v4의 0.222에서

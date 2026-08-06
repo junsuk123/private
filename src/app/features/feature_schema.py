@@ -98,6 +98,42 @@ LIVE_FEATURE_NAMES: tuple[str, ...] = (
     "box_position",
     "breakout_distance_bps",
     "box_context_timestamp_epoch",
+    # Indicator-family layer (schema v6). Six signed family scores plus five
+    # availability flags plus eleven scale-free scalars, produced by
+    # ``app.technical.indicator_families.compact_model_features`` from COMPLETED
+    # fixed-time bars.
+    #
+    # Compact on purpose: the nineteen underlying indicators are not added
+    # individually because most raw readings are per-symbol LEVELS, which is the
+    # instrument-identity failure mode that v5 removed. Every column below is
+    # scale-free or a 0/1 flag.
+    #
+    # The ``*_available`` flags are the availability mask. The live tensor forbids
+    # NaN, so an uncomputable family still emits a neutral number -- the flag is
+    # the only thing that distinguishes "genuinely neutral" from "not computable",
+    # and without it the model learns from a value that means nothing.
+    "trend_family_score",
+    "momentum_family_score",
+    "mean_reversion_family_score",
+    "breakout_structure_score",
+    "volume_flow_score",
+    "volatility_risk_score",
+    "trend_available",
+    "momentum_available",
+    "mean_reversion_available",
+    "structure_available",
+    "volume_flow_available",
+    "adx_14",
+    "dmi_spread",
+    "cci_20_scaled",
+    "roc_10_bps",
+    "stochastic_diff",
+    "williams_r_14_scaled",
+    "trix_histogram_normalized",
+    "obv_slope_zscore",
+    "envelope_position",
+    "ichimoku_cloud_position",
+    "trendline_residual_zscore",
 )
 
 
@@ -122,11 +158,17 @@ class FeatureSchema:
 
 
 LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
-    # v5 removes the eight instrument-identity columns documented above. The version
-    # string is part of the schema_hash, so every v4 artifact retires and a fresh
-    # model retrains — required here, because a v4 artifact scored with v5 inputs
-    # would silently read the wrong column for every weight.
-    version="live_short_horizon_v5_state_only",
+    # v5 removed the eight instrument-identity columns documented above. v6 ADDS
+    # the indicator-family layer with its availability mask.
+    #
+    # Migration cost is real and is not worked around: v6 columns did not exist
+    # when the stored rows were written, so unlike the v4->v5 subset change those
+    # rows CANNOT be re-stamped, and a v6 model must accumulate fresh rows. Until
+    # one exists the registry refuses the v5 artifact on schema mismatch and the
+    # graded demotion keeps entries running on the ontology/bandit path. Forcing
+    # the old artifact onto the new vector would make every weight read the wrong
+    # column, which is worse than trading without a model.
+    version="live_short_horizon_v6_indicator_families",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

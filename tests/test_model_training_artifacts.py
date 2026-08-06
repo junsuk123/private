@@ -139,6 +139,209 @@ def _rows() -> list[dict]:
     return rows
 
 
+class AbsoluteEconomicsPromotionTest(unittest.TestCase):
+    """Relative merit is not enough to earn live expected-return authority.
+
+    Every other promotion branch is relative -- better than the incumbent, or the
+    incumbent is stale/obsolete. That let "first eligible" and "stale incumbent
+    replaced" promote a model without ever asking whether its own best decile pays
+    for a round trip. A model whose top-k loses money is not usable just because
+    the alternative is worse.
+    """
+
+    def test_non_positive_top_k_net_return_cannot_promote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            loser = _artifact("loser", auc=0.95, precision=0.99, top_k_return=-1.0)
+            registry.save(loser)
+
+        self.assertFalse(loser["deployment"]["promoted"])
+        self.assertEqual(
+            loser["deployment"]["reason"], "TOP_K_NET_RETURN_NON_POSITIVE"
+        )
+
+    def test_high_auc_but_unprofitable_top_k_is_refused(self):
+        # The exact shape observed on 2026-08-05: AUC looked healthy while the
+        # top-of-book decile lost money.
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            artifact = _artifact("auc_only", auc=0.99, precision=0.90, top_k_return=-25.8)
+            registry.save(artifact)
+            self.assertFalse(registry.latest_path.exists())
+
+        self.assertFalse(artifact["deployment"]["promoted"])
+
+    def test_top_k_below_runtime_minimum_cannot_promote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            weak = _artifact("weak", auc=0.80, precision=0.60, top_k_return=4.0)
+            weak["thresholds"] = {"minimum_expected_net_return_bps": 10.0}
+            registry.save(weak)
+
+        self.assertFalse(weak["deployment"]["promoted"])
+        self.assertEqual(
+            weak["deployment"]["reason"], "TOP_K_NET_RETURN_BELOW_RUNTIME_MINIMUM"
+        )
+
+    def test_absolute_floor_also_applies_when_replacing_a_stale_incumbent(self):
+        # STALE_INCUMBENT_REPLACED used to bypass economics entirely.
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            registry.save(_artifact("incumbent", auc=0.72, precision=0.43, top_k_return=5.0))
+            stale = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+            stale["created_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=7)
+            ).isoformat()
+            registry.latest_path.write_text(json.dumps(stale), encoding="utf-8")
+
+            unprofitable = _artifact("unprofitable", auc=0.90, precision=0.90, top_k_return=-3.0)
+            registry.save(unprofitable)
+            active = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(unprofitable["deployment"]["promoted"])
+        self.assertEqual(active["artifact_id"], "incumbent")
+
+    def test_in_sample_only_metrics_cannot_promote(self):
+        """A fit is not a measurement.
+
+        The trainer evaluates on the training set when the sample is too small to
+        split. Observed 2026-08-06: auc 0.9865 / precision 1.000 / +43.8bps with
+        validation_example_count == 0 reached live order authority.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            overfit = _artifact("overfit", auc=0.9865, precision=1.0, top_k_return=43.8)
+            overfit["metrics"]["holdout_evaluated"] = 0.0
+            overfit["metrics"]["validation_example_count"] = 0.0
+            registry.save(overfit)
+            self.assertFalse(registry.latest_path.exists())
+
+        self.assertFalse(overfit["deployment"]["promoted"])
+        self.assertEqual(overfit["deployment"]["reason"], "IN_SAMPLE_METRICS_ONLY")
+
+    def test_zero_validation_rows_cannot_promote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            unvalidated = _artifact("unvalidated", auc=0.95, precision=0.95, top_k_return=40.0)
+            unvalidated["metrics"]["validation_example_count"] = 0.0
+            registry.save(unvalidated)
+
+        self.assertFalse(unvalidated["deployment"]["promoted"])
+        self.assertEqual(unvalidated["deployment"]["reason"], "NO_HOLDOUT_VALIDATION")
+
+    def test_holdout_evaluated_candidate_promotes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            good = _artifact("holdout", auc=0.75, precision=0.55, top_k_return=21.4)
+            good["metrics"]["holdout_evaluated"] = 1.0
+            good["metrics"]["validation_example_count"] = 3601.0
+            registry.save(good)
+            active = registry.load_latest_live_eligible()
+
+        self.assertTrue(good["deployment"]["promoted"])
+        self.assertEqual(active.artifact_id, "holdout")
+
+    def test_in_sample_artifact_cannot_replace_a_stale_incumbent(self):
+        # STALE_INCUMBENT_REPLACED was the exact path the unvalidated model took.
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            registry.save(_artifact("incumbent", auc=0.72, precision=0.43, top_k_return=5.0))
+            stale = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+            stale["created_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=7)
+            ).isoformat()
+            registry.latest_path.write_text(json.dumps(stale), encoding="utf-8")
+
+            overfit = _artifact("overfit", auc=0.99, precision=1.0, top_k_return=43.8)
+            overfit["metrics"]["holdout_evaluated"] = 0.0
+            registry.save(overfit)
+            active = json.loads(registry.latest_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(overfit["deployment"]["promoted"])
+        self.assertEqual(active["artifact_id"], "incumbent")
+
+    def test_tiny_holdout_cannot_promote_at_production_floors(self):
+        """16 rows across 3 symbols is a holdout in name only.
+
+        Observed 2026-08-06: exactly that shape produced auc 0.983 / +35bps and
+        took live authority because the size floors defaulted off.
+        """
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_ROWS": "200",
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_SYMBOLS": "5",
+            },
+        ):
+            registry = ModelArtifactRegistry(tmp)
+            tiny = _artifact("tiny", auc=0.983, precision=0.625, top_k_return=35.1)
+            tiny["metrics"]["holdout_evaluated"] = 1.0
+            tiny["metrics"]["validation_example_count"] = 16.0
+            tiny["metrics"]["validation_symbol_count"] = 3.0
+            registry.save(tiny)
+
+        self.assertFalse(tiny["deployment"]["promoted"])
+        self.assertEqual(tiny["deployment"]["reason"], "VALIDATION_SAMPLE_TOO_SMALL")
+
+    def test_too_few_validation_symbols_cannot_promote(self):
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_ROWS": "10",
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_SYMBOLS": "5",
+            },
+        ):
+            registry = ModelArtifactRegistry(tmp)
+            narrow = _artifact("narrow", auc=0.90, precision=0.80, top_k_return=30.0)
+            narrow["metrics"]["holdout_evaluated"] = 1.0
+            narrow["metrics"]["validation_example_count"] = 4000.0
+            narrow["metrics"]["validation_symbol_count"] = 2.0
+            registry.save(narrow)
+
+        self.assertFalse(narrow["deployment"]["promoted"])
+        self.assertEqual(
+            narrow["deployment"]["reason"], "VALIDATION_SYMBOL_COUNT_TOO_SMALL"
+        )
+
+    def test_production_scale_holdout_promotes(self):
+        import os
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_ROWS": "200",
+                "LIVE_MODEL_PROMOTION_MIN_VALIDATION_SYMBOLS": "5",
+            },
+        ):
+            registry = ModelArtifactRegistry(tmp)
+            solid = _artifact("solid", auc=0.75, precision=0.55, top_k_return=21.4)
+            solid["metrics"]["holdout_evaluated"] = 1.0
+            solid["metrics"]["validation_example_count"] = 3601.0
+            solid["metrics"]["validation_symbol_count"] = 44.0
+            registry.save(solid)
+            active = registry.load_latest_live_eligible()
+
+        self.assertTrue(solid["deployment"]["promoted"])
+        self.assertEqual(active.artifact_id, "solid")
+
+    def test_profitable_candidate_still_promotes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            good = _artifact("good", auc=0.75, precision=0.55, top_k_return=21.4)
+            registry.save(good)
+            active = registry.load_latest_live_eligible()
+
+        self.assertTrue(good["deployment"]["promoted"])
+        self.assertEqual(active.artifact_id, "good")
+
+
 class ObsoleteSchemaPromotionTest(unittest.TestCase):
     """A retired-schema incumbent must not veto its own replacement.
 

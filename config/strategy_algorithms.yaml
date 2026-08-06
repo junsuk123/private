@@ -243,3 +243,62 @@ ofi_microprice_exhaustion_reversal:
   stop_buffer_bps: 6.0
   trailing_bps: 14.0
   horizon_seconds: 150.0
+
+# ---------------------------------------------------------------------------
+# Indicator family periods.
+#
+# Formulas live in app.features.indicator_engine (single source); these are only
+# the periods. Values are the conventional defaults for each indicator, NOT tuned
+# thresholds — nothing here has been fitted, so treating any of it as calibrated
+# would be a fabricated edge. Threshold tuning belongs with the family scoring
+# work, which is not wired yet (see docs/validation.md §11).
+#
+# Every function returns None on insufficient data, so raising a period here
+# lengthens warmup rather than silently degrading a value to a neutral number.
+# ---------------------------------------------------------------------------
+indicator_families:
+  moving_average:
+    sma_windows: [5, 10, 20, 60]
+    ema_windows: [5, 12, 20, 26, 60]
+    alignment_windows: [5, 20, 60]
+    slope_lookback_bars: 1
+    disparity_window: 20
+  envelope:
+    window: 20
+    percentage: 0.02
+    use_ema: false
+  bollinger:
+    period: 20
+    num_std: 2.0
+  ichimoku:
+    # Causal only: the chart's 26-bar forward-shifted cloud is never fed to a
+    # model. senkou_a/b are the values computable at decision_time.
+    tenkan_period: 9
+    kijun_period: 26
+    senkou_b_period: 52
+  trendline:
+    # Rolling OLS on log close. Pivot-based trendlines are deliberately avoided:
+    # a pivot is only confirmed by bars to its right, which is look-ahead online.
+    window: 60
+    support_quantile: 0.10
+    resistance_quantile: 0.90
+  trend_auxiliary:
+    macd: {fast: 12, slow: 26, signal: 9}
+    dmi_period: 14
+    trix: {period: 15, signal_period: 9}
+  volatility:
+    atr_period: 14
+    atr_expansion_baseline_multiple: 3
+  strength_and_flow:
+    cci_period: 20
+    mfi_period: 14
+    obv_slope_window: 20
+    obv_zscore_window: 20
+    volume_zscore_window: 20
+    relative_volume_window: 20
+  momentum:
+    momentum_period: 10
+    roc_periods: [5, 10, 20]
+    rsi_period: 14
+    stochastic: {period: 14, signal: 3}
+    williams_r_period: 14

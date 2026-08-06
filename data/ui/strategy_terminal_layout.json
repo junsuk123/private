@@ -1,6 +1,6 @@
 {
   "schema": "strategy_terminal_layout_v2",
-  "saved_at": "2026-08-03T00:14:01Z",
+  "saved_at": "2026-08-05T01:10:48Z",
   "layers": [
     {
       "height": 0.8538,
@@ -67,7 +67,7 @@
       ]
     },
     {
-      "height": 2.5659,
+      "height": 0.3967,
       "columns": [
         {
           "width": 7.0,
@@ -90,10 +90,10 @@
       ]
     },
     {
-      "height": 1.0873,
+      "height": 2.1699,
       "columns": [
         {
-          "width": 2.4876,
+          "width": 4.0777,
           "frames": [
             {
               "key": "gnn",
@@ -102,7 +102,7 @@
           ]
         },
         {
-          "width": 9.5124,
+          "width": 7.9223,
           "frames": [
             {
               "key": "don",
@@ -113,7 +113,7 @@
       ]
     },
     {
-      "height": 0.6518,
+      "height": 1.7384,
       "columns": [
         {
           "width": 12.0,

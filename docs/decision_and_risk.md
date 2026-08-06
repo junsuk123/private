@@ -35,7 +35,7 @@
 
 | 모듈 | 역할 |
 | --- | --- |
-| `technical/indicators.py` | SMA/EMA/MACD/RSI/Bollinger/ATR/volume-spike는 `features/indicator_engine.py`에 위임(단일 진실원). VWAP, Donchian, rolling z-score, spread-bps, orderbook imbalance 추가. 순수 함수, NaN-safe, pandas 없음 |
+| `technical/indicators.py` | 표준 수식은 전부 `features/indicator_engine.py`에 위임(**단일 진실원**). SMA/EMA/MACD/RSI/Bollinger/ATR/volume-spike에 더해 Envelope, Ichimoku(인과), Trendline(rolling OLS), DMI/ADX, TRIX, CCI, Williams %R, Momentum/ROC, MA slope·정배열·이격도, OBV slope/z-score, ATR%/expansion, volume z-score/relative volume의 bar 지향 wrapper 제공. VWAP, Donchian, rolling z-score, spread-bps, orderbook imbalance, RVGI, causal box는 여기서 정의. 순수 함수, NaN-safe, pandas 없음 |
 | `technical/regime.py` | 규칙 기반 `TechnicalRegimeClassifier` → 8개 regime + confidence + 사유 + feature 기여도. 리스크 게이트 우선 |
 | `technical/signals.py` | 방법론 provider + `CompositeTechnicalSignalEngine` (regime gating, VWAP/거래량 확인 필수, 단일 지표 BUY 금지) |
 | `technical/feature_builder.py` | OHLCV(+호가) → `TechnicalFeatureSet`, live feature frame 매핑 |
@@ -486,6 +486,108 @@ veto가 아니라 penalty로 동작합니다.
 `LIVE_LABEL_STRATEGY=legacy`입니다. 학습 행에는 `market`이 기록되어 KR(왕복 ~28bp)과
 US(~60-87bp)를 분리 적합합니다(`LIVE_MODEL_SPLIT_BY_MARKET`).
 
+
+### 9.6-B 완성봉 파이프라인 — `app.technical.causal_bars`
+
+느린 지표가 **최근 N개 틱**에서 계산됐습니다. 그러면 "RSI(14)"가 활발한 종목에서는 14초,
+조용한 종목에서는 40분을 뜻합니다 — 같은 숫자가 무관한 두 가지를 가리키고 period에 시간
+의미가 없습니다. 게다가 진행 중인 분이 포함돼 1초 뒤 재계산하면 **과거 값이 바뀝니다.**
+
+이제 `completed_bars()`가:
+- `as_of`가 속한 분을 **항상 제외**합니다. 저장소는 조용한 종목의 마지막 분을 잃지 않으려고
+  진행 중 분도 주기 저장하는데, 그것은 저장 정책으로는 옳고 지표 입력으로는 틀립니다.
+- 1m을 기준으로 3m·5m을 완성 1m에서 인과적으로 집계합니다. 창이 닫히기 전에는 방출하지
+  않으므로 5분 중 2분으로 만든 집계는 나오지 않습니다.
+- live와 replay가 **같은 함수**를 호출하므로 두 값이 구조적으로 비교 가능합니다.
+- `as_of` · `timeframe` · `bar_count` · `warmup_complete` · `source_record_ids` 를 provenance로 남깁니다.
+
+진행 중 분은 `forming_bar()`로 따로 제공합니다 — 진입 타이밍은 가장 신선한 체결을 원하고,
+지표는 나중에 수정되지 않을 값을 원합니다. 둘은 다른 질문입니다.
+
+### 9.6-C 지표 계열과 국면 가중 — `app.technical.indicator_families`
+
+모든 지표가 동의해야 하는 AND 게이트로 만들면 지표를 추가할수록 거래 가능성이 **줄어듭니다**
+— 19개 지표는 19개 veto가 되고 정직한 결과는 영구 NO_TRADE입니다. 반대로 아무 확인도 없으면
+노이즈 오실레이터 하나로 진입합니다.
+
+중간 지점: 6개 계열(trend / momentum / mean_reversion / structure / volume_flow /
+volatility_risk)이 각각 계산 가능한 멤버만으로 `[-1,1]` 점수 하나를 내고, 멤버가 전부 계산
+불가면 0.0이 아니라 **`available=False`** 를 보고합니다.
+
+- **독립 계열 2개 이상**이 같은 방향이어야 BUY 근거가 됩니다. 한 계열 내부의 합치는 독립
+  근거가 아닙니다 — RSI·Stochastic·Williams %R은 같은 아이디어의 세 가지 관측입니다.
+- 충돌하는 계열은 **차단이 아니라 conviction 감쇠**입니다. 진짜 전환점에서는 추세 계열과
+  회귀 계열이 반드시 충돌하므로, 그것을 veto로 두면 모든 전환을 놓칩니다.
+- `ADX >= 25`면 mean_reversion 가중치를 1/4로 낮춥니다(삭제가 아님). 추세를 역행하는 것이
+  평균회귀 북이 출혈하는 고전적 경로입니다.
+- `volatility_risk`는 방향에 기여하지 않고 conviction만 감쇠시킵니다.
+
+### 9.7 모델 융합 권한 — `app.technical.prediction`
+
+엔진은 최종 net을 `min(rule_net, model_net)`으로 계산했습니다. 이것은 보수성이 아니라 **더
+비관적인 추정기에게 veto를 넘기는 것**이고, 그 추정기가 stale·schema 불일치·미승인·fallback일
+때도 마찬가지였습니다. rule이 +30bps, 미승인 모델이 −40bps면 결과는 −40bps가 되고
+`StrategyRouter`가 `NON_POSITIVE_NET_EDGE`로 후보를 제거했습니다. 모델이 **획득하지 않은
+거부권**을 갖고 있었습니다.
+
+이제 권한이 명시적이고 유계입니다:
+
+```
+rule_net  = rule_gross - all_in_cost
+w         = 0                              모델이 fallback 또는 미승인이면
+          = min(0.5, 0.5*(1-uncertainty))  그 외
+fused_net = (1-w)*rule_net + w*model_net - penalty
+penalty   = 0  단, (model_net<0 이고 rule_net>0) 일 때만 부과
+```
+
+`w`의 상한이 0.5인 이유는 단일 추정기가 판단 전체를 갖지 못하게 하기 위함입니다. 신뢰 가능한
+모델이 반대 방향이면 **유계 penalty**로 반영되며, rule의 측정된 엣지를 모델 값으로 대체하지는
+않습니다. 미승인 모델은 shadow evidence로만 남습니다.
+
+진단은 `rule_gross_bps` · `all_in_cost_bps` · `rule_net_bps` · `model_net_bps` ·
+`model_reliability_weight` · `uncertainty_penalty_bps` · `fused_net_bps` ·
+`required_net_bps` · `cost_coverage_ratio` 전체를 노출하므로 어느 항이 후보를 죽였는지
+감사할 수 있습니다.
+
+### 9.8 비용 실행가능성 — `CostViabilityPolicy`
+
+```
+required_gross = max(cost * 1.3, cost + 2bps, empirical_strategy_floor)
+```
+
+세 하한의 max인 이유는 **어느 한 knob을 낮춰도 비경제적 거래가 통과하지 못하게** 하기
+위함입니다. 전략의 최선 gross 엣지가 이 값에 도달할 수 없으면 음수 net을 만들지 않고
+`HORIZON_COST_UNVIABLE`로 분류합니다. "신호가 없다"와 "구조적으로 불가능하다"는 다른
+사실이고, 하나의 코드로 합치면 애초에 자격을 얻을 수 없던 후보가 숨습니다.
+ProfitabilityGate와 cost coverage 1.3은 그대로이며 이 절은 그 위에 얹힌 사전 분류입니다.
+
+### 9.9 선택 진단 — `app.technical.selection_diagnostics`
+
+후보 하나당 레코드 하나, 레코드당 stage 하나입니다. stage는 파이프라인 순서로 선언되어
+**최초로 실패한 단계가 원인**이며, 이후 계층이 그것을 덮어쓰지 못합니다(덮어쓰면 funnel이 엉뚱한
+계층을 지목합니다). 수치는 계속 채워지므로 일찍 죽은 후보도 분해가 완전합니다.
+
+`SHADOW_ONLY` / `LIVE_NOT_AUTHORIZED`는 **배포 상태**이고 경제성과 분리해 집계됩니다 —
+"엣지가 없다"와 "아직 거래 권한이 없다"가 하나의 숫자로 합쳐지지 않습니다. 기존 reason code는
+삭제하지 않고 stage가 상위 라벨로 추가됩니다.
+
+```powershell
+python scripts/diagnose_strategy_selection.py          # 표
+python scripts/diagnose_strategy_selection.py --json    # 기계 판독
+python scripts/diagnose_strategy_selection.py --source journal
+```
+
+### 9.10 모델 승격 절대 경제성 — `app.models.model_artifact_registry`
+
+승격 분기가 전부 **상대적**이었습니다(incumbent보다 낫다 / incumbent가 stale·obsolete다).
+그래서 `FIRST_LIVE_ELIGIBLE_MODEL`과 `STALE_INCUMBENT_REPLACED`는 후보 자신의 top-k 순수익이
+왕복 비용을 감당하는지 **한 번도 묻지 않고** 라이브 권한을 줬습니다. 최선 분위가 손실을 내는
+모델은 대안이 더 나쁘다는 이유로 사용 가능해지지 않습니다.
+
+이제 상대 비교 **이전에** 절대 조건을 검사합니다: `top_k_net > 0`, 런타임
+`minimum_expected_net_return_bps` 이상, 그리고 `top_k_net - SE > 0`(하한). 표본수 하한은
+기본 OFF이며 아티팩트가 해당 지표를 실제로 기록한 경우에만 적용됩니다 — 측정되지 않은 값에
+하한을 적용할 수 없고, 기본 ON은 정당한 소표본 학습 경로를 거짓 음성으로 막았습니다.
 
 ## 10. 진입 차단 지점 진단 (2026-07-31)
 

@@ -98,3 +98,21 @@ def clean_strategy_performance_history():
         store._cache.clear()  # noqa: SLF001 - test-only cache reset
     except Exception:  # noqa: BLE001 - a store that was never created needs no reset.
         pass
+
+
+@pytest.fixture(autouse=True)
+def relax_promotion_sample_floors(monkeypatch):
+    """Promotion SAMPLE-SIZE floors are a deployment policy, not trainer behaviour.
+
+    The trainer fixtures deliberately use tiny synthetic datasets to exercise the
+    fitting and registry paths. Production floors (hundreds of validation rows
+    across several symbols) would reject those artifacts and make every trainer
+    test fail for a reason that has nothing to do with what it is testing.
+
+    Only the SIZE floors are relaxed. The qualitative guards stay live in every
+    test: holdout must exist, top-k net must be positive and clear the runtime
+    minimum, and its lower bound must be positive. Tests that assert the size
+    floors set these variables explicitly.
+    """
+    monkeypatch.setenv("LIVE_MODEL_PROMOTION_MIN_VALIDATION_ROWS", "0")
+    monkeypatch.setenv("LIVE_MODEL_PROMOTION_MIN_VALIDATION_SYMBOLS", "0")

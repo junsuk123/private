@@ -289,6 +289,96 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _meets_absolute_economics(candidate: dict[str, Any]) -> tuple[bool, str]:
+    """Does this artifact pay for a round trip on its OWN measurements?
+
+    Relative promotion is necessary but not sufficient. The floors below are the
+    same quantities the runtime already believes in — the artifact's own
+    ``minimum_expected_net_return_bps`` threshold and its measured top-k net
+    return — so this adds no new tunable that could be relaxed to manufacture a
+    promotion. Sample-size floors exist because a top-k of 3 rows can show any
+    number at all.
+
+    Env overrides raise, never lower, the bar unless explicitly configured.
+    """
+    metrics = candidate.get("metrics") or {}
+    thresholds = candidate.get("thresholds") or {}
+
+    # Holdout evidence is a REQUIREMENT, not a tunable.
+    #
+    # The trainer falls back to evaluating on the training set itself when the
+    # sample is too small to split. Those metrics are a fit, not a measurement:
+    # observed on 2026-08-06 a freshly-seeded artifact reported auc 0.9865,
+    # precision@k 1.000 and +43.8bps top-k with validation_example_count == 0, and
+    # reached live order authority because the sample-size floors below default to
+    # off. A configurable floor was the wrong instrument -- the question is not
+    # "how many rows" but "was this ever measured out of sample at all".
+    #
+    # Enforced only when the field is PRESENT: absence means an artifact written
+    # before the field existed, and a floor cannot be applied to something that was
+    # never recorded. The live trainer always records both.
+    if "holdout_evaluated" in metrics and _finite_metric(metrics, "holdout_evaluated") <= 0.0:
+        return False, "IN_SAMPLE_METRICS_ONLY"
+    if (
+        "validation_example_count" in metrics
+        and _finite_metric(metrics, "validation_example_count") <= 0.0
+    ):
+        return False, "NO_HOLDOUT_VALIDATION"
+
+    minimum_net = _env_float(
+        "LIVE_MODEL_PROMOTION_MIN_TOP_K_NET_BPS",
+        _finite_metric(thresholds, "minimum_expected_net_return_bps"),
+    )
+    top_k_net = _finite_metric(metrics, "avg_forward_net_return_bps_top_k")
+    if top_k_net <= 0.0:
+        return False, "TOP_K_NET_RETURN_NON_POSITIVE"
+    if minimum_net > 0.0 and top_k_net < minimum_net:
+        return False, "TOP_K_NET_RETURN_BELOW_RUNTIME_MINIMUM"
+
+    min_precision = _env_float("LIVE_MODEL_PROMOTION_MIN_PRECISION_AT_K", 0.0)
+    if min_precision > 0.0 and _finite_metric(metrics, "precision_at_k") < min_precision:
+        return False, "PRECISION_AT_K_BELOW_MINIMUM"
+
+    # Sample-size floors. A holdout of 16 rows across 3 symbols is a holdout in
+    # name only: on 2026-08-06 exactly that produced auc 0.983 / +35bps and took
+    # live authority, which is noise wearing a measurement's clothes. Defaulting
+    # these OFF (an earlier choice made to keep small-fixture tests green) is what
+    # allowed it, so they now default ON at production-scale values.
+    #
+    # Still enforced only when the artifact RECORDED the quantity: an absent count
+    # is unknown, not zero, and rejecting on absence would block every artifact
+    # written before the field existed. The live trainer always writes both.
+    for metric_name, env_name, code in (
+        (
+            "validation_example_count",
+            "LIVE_MODEL_PROMOTION_MIN_VALIDATION_ROWS",
+            "VALIDATION_SAMPLE_TOO_SMALL",
+        ),
+        (
+            "validation_symbol_count",
+            "LIVE_MODEL_PROMOTION_MIN_VALIDATION_SYMBOLS",
+            "VALIDATION_SYMBOL_COUNT_TOO_SMALL",
+        ),
+    ):
+        default = 200.0 if metric_name == "validation_example_count" else 5.0
+        minimum = _env_float(env_name, default)
+        if minimum <= 0.0 or metric_name not in metrics:
+            continue
+        if _finite_metric(metrics, metric_name) < minimum:
+            return False, code
+
+    # Lower confidence bound on the top-k mean. Without a dispersion measure in the
+    # artifact this uses top_k_count as the effective n and treats the mean itself
+    # as the scale, which is deliberately crude but strictly conservative: it can
+    # only reject, never admit, relative to the point estimate.
+    top_k_count = _finite_metric(metrics, "top_k_count")
+    if top_k_count >= 2.0:
+        standard_error = abs(top_k_net) / math.sqrt(top_k_count)
+        if top_k_net - standard_error <= 0.0:
+            return False, "TOP_K_NET_RETURN_LOWER_BOUND_NON_POSITIVE"
+    return True, "ABSOLUTE_ECONOMICS_OK"
+
+
 def _schema_is_current(artifact: dict[str, Any] | None) -> bool:
     """Was this artifact trained on the feature schema the process runs today?
 
@@ -315,6 +405,17 @@ def _promotion_decision(
 ) -> tuple[bool, str]:
     if candidate.get("live_eligible") is not True:
         return False, "NOT_LIVE_ELIGIBLE"
+    # Absolute economic floor, checked before any RELATIVE comparison.
+    #
+    # Every other branch here is relative: better than the incumbent, or the
+    # incumbent is stale/obsolete. That let a model reach live authority on
+    # relative merit alone -- "first eligible" and "stale incumbent replaced" both
+    # promote without ever asking whether the candidate's own top-k net return is
+    # large enough to pay for a round trip. A model whose best decile loses money
+    # is not a usable model just because the alternative is worse.
+    economic_ok, economic_reason = _meets_absolute_economics(candidate)
+    if not economic_ok:
+        return False, economic_reason
     if not incumbent or incumbent.get("live_eligible") is not True:
         return True, "FIRST_LIVE_ELIGIBLE_MODEL"
     if candidate_stale:

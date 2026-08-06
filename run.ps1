@@ -278,6 +278,21 @@ Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
 # To run WITHOUT placing real orders, set this to "true" (then arm via
 # scripts/arm_live_trading.py) or set LIVE_ORDER_SUBMIT_ENABLED "false".
 Set-RunEnv "REQUIRE_MANUAL_ARMING" "false"
+# --- Event-driven market-data ingestion (2026-08-04) ---------------------------------
+# 국내·미국 실시간 수집을 event bus + 영속화 워커 경로로 돌린다. 켜면:
+#   * 분 bar 를 in-memory 집계기(IncrementalMinuteBarBuilder)로 만든다 — 메시지마다
+#     저장소를 재조회하지 않으므로 6GB 규모 tick 테이블의 lock 경합이 사라진다.
+#   * DB 작업이 WebSocket 콜백 밖으로 나간다.
+#   * 국내와 미국이 **같은** 수집 경로를 쓴다.
+#
+# 이 값이 false 였던 동안 두 시장 모두 non-sink 경로로 돌았고, 거기서 매 메시지
+# build_latest_minute_bar 가 호출되며 lock 경합 예외로 수집기가 죽어 분 bar 가 결손됐다.
+# 그 결손이 macro 의 MACRO_INSUFFICIENT_DATA -> NO_TRADE_MARKET -> 신규매수 전면차단으로
+# 이어졌다. 자세한 배경: docs/realtime_session_gap_analysis.md
+#
+# config/refactor_profile.json 의 flags 는 진단·비교 화면의 posture 선언이고, 실제 코드
+# 경로를 여는 것은 이 환경변수다. 둘이 어긋나 있으면 JSON 이 아니라 이 값이 이긴다.
+Set-DefaultEnv "REFACTOR_WEBSOCKET_MARKET_DATA" "true"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"

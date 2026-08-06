@@ -22,6 +22,23 @@ class RoutingDecision:
         return self.action == StrategyRoutingAction.NO_TRADE.value
 
 
+def _net_surplus_bps(item: StrategyUtilityEvidence) -> float:
+    """How far past its OWN requirement this candidate sits.
+
+    ``required_net_return_bps`` is optional on the evidence contract; when a
+    producer has not supplied it the surplus degrades to the raw net, which is the
+    previous behaviour. Missing data must not silently promote a candidate, so the
+    fallback is the more conservative of the two readings.
+    """
+    net = float(getattr(item, "expected_net_return_bps", 0.0) or 0.0)
+    required = getattr(item, "required_net_return_bps", None)
+    try:
+        required_value = float(required) if required is not None else 0.0
+    except (TypeError, ValueError):
+        required_value = 0.0
+    return net - max(0.0, required_value)
+
+
 class StrategyRouter:
     def __init__(
         self,
@@ -77,11 +94,18 @@ class StrategyRouter:
                 blocked_reasons.append(f"UTILITY_BELOW_THRESHOLD:{item.strategy_id}")
                 continue
             candidates.append((item, weighted_utility))
+        # Rank by SURPLUS over the bar each candidate had to clear, not by raw net.
+        #
+        # Raw net favours whichever strategy happens to carry the highest cost, and
+        # an arbitrary per-strategy target made the comparison worse still: two
+        # candidates with different targets were being ordered on numbers that did
+        # not mean the same thing. Surplus (net minus its own requirement) is
+        # comparable across strategies, markets and horizons by construction.
         ranked = sorted(
             candidates,
             key=lambda pair: (
+                _net_surplus_bps(pair[0]),
                 pair[1],
-                pair[0].expected_net_return_bps,
                 pair[0].fill_probability,
                 pair[0].strategy_id,
             ),

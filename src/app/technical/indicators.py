@@ -34,13 +34,32 @@ from typing import Sequence
 from app.features.schemas import OHLCVBar
 from app.features.indicator_engine import (
     atr as _atr_hlc,
+    atr_expansion as _atr_expansion,
+    atr_percent as _atr_percent,
     bollinger_bands as _bollinger_tuple,
+    cci as _cci,
+    dmi_adx as _dmi_adx,
     ema as _ema,
+    envelope as _envelope,
+    ichimoku as _ichimoku,
+    ma_alignment_score as _ma_alignment_score,
+    ma_slope_bps as _ma_slope_bps,
     macd as _macd_tuple,
+    momentum as _momentum,
+    obv_slope as _obv_slope,
+    obv_zscore as _obv_zscore,
     period_return as _period_return,
+    price_disparity as _price_disparity,
+    relative_volume as _relative_volume,
+    roc_bps as _roc_bps,
     rsi as _rsi,
     sma as _sma,
+    stochastic_diff as _stochastic_diff,
+    trendline as _trendline,
+    trix as _trix,
     volume_spike_ratio as _volume_spike_ratio,
+    volume_zscore as _volume_zscore,
+    williams_r as _williams_r,
 )
 
 __all__ = [
@@ -490,3 +509,177 @@ def causal_box_geometry(
         history[-1].as_of,
         True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Bar-oriented wrappers for the remaining indicator families.                  #
+#                                                                              #
+# Formulas live in ``indicator_engine`` and are NOT duplicated here; these only #
+# unpack OHLCV bars and keep the ``None == unavailable`` contract.              #
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class IchimokuResult:
+    tenkan: float | None
+    kijun: float | None
+    senkou_a: float | None
+    senkou_b: float | None
+    tenkan_kijun_gap_bps: float | None
+    price_vs_cloud: float | None
+    cloud_thickness_bps: float | None
+    cloud_direction: float | None
+    ok: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class EnvelopeResult:
+    mid: float | None
+    upper: float | None
+    lower: float | None
+    position: float | None
+    distance_to_upper_bps: float | None
+    distance_to_lower_bps: float | None
+    ok: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class TrendlineResult:
+    slope_bps_per_bar: float | None
+    r_squared: float | None
+    residual_zscore: float | None
+    support_residual_quantile: float | None
+    resistance_residual_quantile: float | None
+    ok: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class DmiResult:
+    plus_di: float | None
+    minus_di: float | None
+    adx: float | None
+    #: plus_di - minus_di. Sign is direction, magnitude is conviction.
+    dmi_spread: float | None
+    ok: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class TrixResult:
+    trix: float | None
+    signal: float | None
+    histogram: float | None
+    ok: bool = False
+    reason: str = ""
+
+
+def ichimoku(bars: Sequence[OHLCVBar], **kwargs: int) -> IchimokuResult:
+    values = _ichimoku(highs(bars), lows(bars), closes(bars), **kwargs)
+    ok = values.get("kijun") is not None
+    return IchimokuResult(
+        **values, ok=ok, reason="" if ok else "insufficient_data"
+    )
+
+
+def envelope(
+    bars: Sequence[OHLCVBar],
+    period: int = 20,
+    percentage: float = 0.02,
+    use_ema: bool = False,
+) -> EnvelopeResult:
+    mid, upper, lower, position, to_upper, to_lower = _envelope(
+        closes(bars), period, percentage, use_ema
+    )
+    ok = mid is not None
+    return EnvelopeResult(
+        mid, upper, lower, position, to_upper, to_lower,
+        ok=ok, reason="" if ok else "insufficient_data",
+    )
+
+
+def trendline(bars: Sequence[OHLCVBar], window: int = 60) -> TrendlineResult:
+    values = _trendline(closes(bars), window)
+    ok = values.get("slope_bps_per_bar") is not None
+    return TrendlineResult(
+        **values, ok=ok, reason="" if ok else "insufficient_data"
+    )
+
+
+def dmi_adx(bars: Sequence[OHLCVBar], period: int = 14) -> DmiResult:
+    plus_di, minus_di, adx = _dmi_adx(highs(bars), lows(bars), closes(bars), period)
+    spread = (
+        plus_di - minus_di if plus_di is not None and minus_di is not None else None
+    )
+    ok = adx is not None
+    return DmiResult(
+        plus_di, minus_di, adx, spread, ok=ok, reason="" if ok else "insufficient_data"
+    )
+
+
+def trix(bars: Sequence[OHLCVBar], period: int = 15, signal_period: int = 9) -> TrixResult:
+    line, signal_value, histogram = _trix(closes(bars), period, signal_period)
+    ok = line is not None
+    return TrixResult(
+        line, signal_value, histogram, ok=ok, reason="" if ok else "insufficient_data"
+    )
+
+
+def cci(bars: Sequence[OHLCVBar], period: int = 20) -> float | None:
+    return _cci(highs(bars), lows(bars), closes(bars), period)
+
+
+def williams_r(bars: Sequence[OHLCVBar], period: int = 14) -> float | None:
+    return _williams_r(highs(bars), lows(bars), closes(bars), period)
+
+
+def stochastic_diff(
+    bars: Sequence[OHLCVBar], period: int = 14, signal: int = 3
+) -> float | None:
+    return _stochastic_diff(highs(bars), lows(bars), closes(bars), period, signal)
+
+
+def atr_percent(bars: Sequence[OHLCVBar], period: int = 14) -> float | None:
+    return _atr_percent(highs(bars), lows(bars), closes(bars), period)
+
+
+def atr_expansion(bars: Sequence[OHLCVBar], period: int = 14) -> float | None:
+    return _atr_expansion(highs(bars), lows(bars), closes(bars), period)
+
+
+def momentum(bars: Sequence[OHLCVBar], period: int = 10) -> float | None:
+    return _momentum(closes(bars), period)
+
+
+def roc_bps(bars: Sequence[OHLCVBar], period: int = 10) -> float | None:
+    return _roc_bps(closes(bars), period)
+
+
+def ma_slope_bps(bars: Sequence[OHLCVBar], period: int, lookback: int = 1) -> float | None:
+    return _ma_slope_bps(closes(bars), period, lookback)
+
+
+def ma_alignment_score(
+    bars: Sequence[OHLCVBar], windows: tuple[int, ...] = (5, 20, 60)
+) -> float | None:
+    return _ma_alignment_score(closes(bars), windows)
+
+
+def price_disparity(bars: Sequence[OHLCVBar], period: int = 20) -> float | None:
+    return _price_disparity(closes(bars), period)
+
+
+def obv_slope(bars: Sequence[OHLCVBar], window: int = 20) -> float | None:
+    return _obv_slope(closes(bars), volumes(bars), window)
+
+
+def obv_zscore(bars: Sequence[OHLCVBar], window: int = 20) -> float | None:
+    return _obv_zscore(closes(bars), volumes(bars), window)
+
+
+def volume_zscore(bars: Sequence[OHLCVBar], window: int = 20) -> float | None:
+    return _volume_zscore(volumes(bars), window)
+
+
+def relative_volume(bars: Sequence[OHLCVBar], window: int = 20) -> float | None:
+    return _relative_volume(volumes(bars), window)

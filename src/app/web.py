@@ -1896,11 +1896,15 @@ def _auto_reliability_enter_model_degraded(reason: str) -> None:
   disabled_reason = str(status.get("buy_disabled_reason") or "")
   if status.get("buy_enabled") is True:
     return
-  # Only lift a block THIS controller placed for a model-only demotion. A manual
-  # disable, a liquidation, or REALTIME_BUY_ENABLED=false must survive untouched.
+  # Only lift a block THIS controller placed. A manual disable, a liquidation, or
+  # REALTIME_BUY_ENABLED=false carries a different reason and must survive.
+  #
+  # The block's reason string is NOT required to match the current one. It records
+  # why the block was placed, which can be several cycles old: a block stamped
+  # MARKET_DATA_NOT_READY stayed in force after the feed recovered, because the
+  # caller had already established that the ONLY remaining failure is the model.
+  # The live snapshot is authoritative over a stale string.
   if not disabled_reason.startswith("AUTO_RELIABILITY_DEMOTION:"):
-    return
-  if set(disabled_reason.split(":", 1)[-1].split(",")) != {"MODEL_NOT_READY"}:
     return
   engine.enable_buys(f"AUTO_RELIABILITY_MODEL_DEGRADED:{reason}")
   audit.record("auto_reliability_model_degraded_fallback", {"reason": reason})
@@ -6340,6 +6344,45 @@ def weekend_brief_refresh() -> JSONResponse:
     return _json({"ok": True, "result": _run_weekend_brief_once()})
   except Exception as exc:  # noqa: BLE001
     return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+@app.get("/api/strategy-selection/diagnostics")
+def strategy_selection_diagnostics() -> JSONResponse:
+  """Per-candidate selection funnel, stage counts and edge decomposition.
+
+  Additive: no existing response shape changes. Returns ``available: false`` with
+  a reason rather than an error when the engine has not produced a cycle yet, so
+  a dashboard can render the panel unconditionally.
+  """
+  from app.technical.selection_diagnostics import STAGE_ORDER
+
+  try:
+    with _realtime_trading_lock:
+      engine = _realtime_trading_engine
+    collector = getattr(engine, "selection_diagnostics", None) if engine else None
+    if collector is None:
+      return _json(
+          {
+              "ok": True,
+              "available": False,
+              "reason": "NO_SELECTION_CYCLE_YET",
+              "stages": [stage.value for stage in STAGE_ORDER],
+          }
+      )
+    payload = collector.as_dict()
+    payload.update(
+        {
+            "ok": True,
+            "available": True,
+            "stages": [stage.value for stage in STAGE_ORDER],
+            "blocking_summary": list(collector.blocking_summary()),
+        }
+    )
+    return _json(payload)
+  except Exception as exc:  # noqa: BLE001 - diagnostics must never 500.
+    return _json(
+        {"ok": False, "available": False, "error": f"{type(exc).__name__}: {exc}"}
+    )
 
 
 @app.get("/api/realtime-trading/entry-blockade")
@@ -11340,9 +11383,16 @@ def _kis_realtime_collector_loop() -> None:
       if _kis_realtime_collector_stop.wait(closed_fallback_seconds):
         return
       continue
+    # Both of these take _live_lock internally, so they MUST be computed before
+    # the logging block below acquires it. _live_lock is a plain, non-reentrant
+    # threading.Lock: re-acquiring it on the same thread deadlocks that thread
+    # forever, and because every worker and the ASGI event loop also need this
+    # lock, the whole process stops serving. Observed as a wedged server with 0%
+    # CPU and ~50 threads all parked on this one lock.
     depth_symbols = sum(
         1 for ticker in symbols if _kis_realtime_symbol_wants_orderbook(ticker)
     )
+    warming_symbol_count = len(_kis_realtime_warming_symbols())
     with _live_lock:
       _append_collection_log_unlocked(
           "running",
@@ -11357,7 +11407,7 @@ def _kis_realtime_collector_loop() -> None:
               "depth_symbols": depth_symbols,
               "trade_only_symbols": len(symbols) - depth_symbols,
               "registrations_spent": depth_symbols * 2 + (len(symbols) - depth_symbols),
-              "warming_symbols": len(_kis_realtime_warming_symbols()),
+              "warming_symbols": warming_symbol_count,
               "phase": market_phase("KRX").value,
           },
       )

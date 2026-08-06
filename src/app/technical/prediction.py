@@ -131,6 +131,113 @@ class ExpectedMoveEstimator:
 
 
 @dataclass(frozen=True)
+class ModelFusionPolicy:
+    """How much expected-return authority a trained model actually gets.
+
+    The engine used to take ``min(rule_net, model_net)`` unconditionally. That is
+    not conservatism, it is a veto handed to whichever estimator is more
+    pessimistic — including a model that is stale, schema-mismatched, fitted on a
+    different feature set, or simply not economically validated. A rule edge of
+    +30bps and an unreliable model saying -40bps produced -40bps, and the router
+    then dropped the candidate as NON_POSITIVE_NET_EDGE. The model silently held
+    veto power it had never earned.
+
+    Now authority is explicit and bounded: ``weight`` is 0 unless the model is
+    approved AND non-fallback, and a disagreeing model costs a bounded
+    ``uncertainty_penalty_bps`` rather than replacing the rule estimate.
+    """
+
+    #: Blend weight ceiling for a fully reliable model. Deliberately below 1.0:
+    #: no single estimator gets the whole decision.
+    max_model_weight: float = 0.5
+    #: Penalty applied when a reliable model disagrees in SIGN with the rule.
+    #: Bounded so a model can discourage but not invert a measured rule edge.
+    disagreement_penalty_bps: float = 8.0
+    #: Extra penalty scaled by the model's own uncertainty score.
+    uncertainty_penalty_bps: float = 6.0
+
+    def weight_for(self, model_prediction: _ModelPredictionLike | None) -> float:
+        """0 when the model has not earned expected-return authority."""
+        if model_prediction is None:
+            return 0.0
+        if getattr(model_prediction, "is_fallback", False):
+            return 0.0
+        if not getattr(model_prediction, "approved", False):
+            return 0.0
+        uncertainty = max(0.0, min(1.0, _f(getattr(model_prediction, "uncertainty_score", 0.0))))
+        return max(0.0, min(1.0, self.max_model_weight * (1.0 - uncertainty)))
+
+    def fuse(
+        self,
+        *,
+        rule_net_bps: float,
+        model_prediction: _ModelPredictionLike | None,
+    ) -> tuple[float, float, float | None, float]:
+        """Return (fused_net_bps, weight, model_net_bps, penalty_bps)."""
+        weight = self.weight_for(model_prediction)
+        model_net: float | None = None
+        if model_prediction is not None and not getattr(model_prediction, "is_fallback", False):
+            model_net = _f(getattr(model_prediction, "expected_net_return_bps", None), None)
+        if weight <= 0.0 or model_net is None:
+            # Model is shadow evidence only. The rule estimate stands unchanged.
+            return rule_net_bps, 0.0, model_net, 0.0
+        penalty = 0.0
+        if (model_net < 0.0) and (rule_net_bps > 0.0):
+            uncertainty = max(
+                0.0, min(1.0, _f(getattr(model_prediction, "uncertainty_score", 0.0)))
+            )
+            penalty = self.disagreement_penalty_bps + self.uncertainty_penalty_bps * uncertainty
+        fused = (1.0 - weight) * rule_net_bps + weight * model_net - penalty
+        return fused, weight, model_net, penalty
+
+
+def _f(value: object, default: float = 0.0) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+@dataclass(frozen=True)
+class CostViabilityPolicy:
+    """The bar a candidate must clear, derived from cost — never from a target.
+
+    ``required_gross_bps`` is the max of three independently-motivated floors so
+    that lowering any single knob cannot quietly make an uneconomic trade look
+    viable. When the strategy's own best plausible gross edge cannot reach it, the
+    honest classification is HORIZON_COST_UNVIABLE, not a negative net number that
+    downstream code reports as "no edge".
+    """
+
+    min_cost_coverage_ratio: float = 1.3
+    minimum_net_buffer_bps: float = 2.0
+    #: Per-strategy empirical floors, bps. Only measured values belong here.
+    empirical_strategy_floor_bps: Mapping[str, float] = field(default_factory=dict)
+
+    def required_gross_bps(self, all_in_cost_bps: float, strategy_id: str = "") -> float:
+        cost = max(0.0, _f(all_in_cost_bps))
+        return max(
+            cost * max(1.0, self.min_cost_coverage_ratio),
+            cost + max(0.0, self.minimum_net_buffer_bps),
+            max(0.0, _f(self.empirical_strategy_floor_bps.get(strategy_id, 0.0))),
+        )
+
+    def required_net_bps(self, all_in_cost_bps: float, strategy_id: str = "") -> float:
+        return self.required_gross_bps(all_in_cost_bps, strategy_id) - max(
+            0.0, _f(all_in_cost_bps)
+        )
+
+    def cost_coverage_ratio(
+        self, gross_bps: float, all_in_cost_bps: float
+    ) -> float | None:
+        cost = max(0.0, _f(all_in_cost_bps))
+        if cost <= 0.0:
+            return None
+        return _f(gross_bps) / cost
+
+
+@dataclass(frozen=True)
 class PredictionConfig:
     min_confidence: float = 0.5
     min_net_return_bps: float = 0.0       # net must be > 0; the gate applies the real buffer
@@ -143,6 +250,8 @@ class PredictionConfig:
     # Warning-only threshold (not a hard block): flags setups whose adverse-
     # excursion estimate is heavily skewed vs the expected favorable move.
     max_downside_to_edge_ratio: float = 6.0
+    fusion: ModelFusionPolicy = field(default_factory=ModelFusionPolicy)
+    cost_viability: CostViabilityPolicy = field(default_factory=CostViabilityPolicy)
 
     @classmethod
     def from_env(cls) -> "PredictionConfig":
@@ -217,11 +326,54 @@ class TechnicalPredictionEngine:
 
         gross_bps = gross_return * 10_000.0
         cost_bps = all_in_cost_bps if all_in_cost_bps is not None else (features.spread_bps or 0.0)
-        # Blend model net-return estimate conservatively (take the lower).
-        net_bps = gross_bps - max(0.0, cost_bps)
-        if model_prediction is not None and not getattr(model_prediction, "is_fallback", False):
-            model_net = float(getattr(model_prediction, "expected_net_return_bps", net_bps))
-            net_bps = min(net_bps, model_net)
+        rule_net_bps = gross_bps - max(0.0, cost_bps)
+
+        # Cost viability BEFORE fusion: if this strategy/horizon cannot clear the
+        # cost-derived bar even at its own best plausible gross edge, the answer is
+        # "uneconomic", which is a different fact from "no signal". Reporting it as
+        # a negative net let a real setup and an impossible one share one code.
+        viability = self.config.cost_viability
+        required_net = viability.required_net_bps(cost_bps, composite.selected_methodology)
+        coverage = viability.cost_coverage_ratio(gross_bps, cost_bps)
+        if gross_bps < viability.required_gross_bps(cost_bps, composite.selected_methodology):
+            return self._no_trade(
+                features, composite,
+                reason_codes + [rc.HORIZON_COST_UNVIABLE],
+                (
+                    f"Best plausible gross {gross_bps:.1f}bps cannot clear the "
+                    f"cost-derived floor at ~{cost_bps:.1f}bps cost."
+                ),
+                exit_price=exit_price, gross_return=gross_return,
+                net_bps=rule_net_bps, downside_bps=downside_bps, confidence=confidence,
+                extra_diagnostics={
+                    "rule_gross_bps": gross_bps,
+                    "all_in_cost_bps": cost_bps,
+                    "rule_net_bps": rule_net_bps,
+                    "required_net_bps": required_net,
+                    "cost_coverage_ratio": coverage,
+                },
+            )
+
+        # Fuse rule and model with EXPLICIT, bounded model authority. A model that
+        # is unapproved, fallback, or uncertain gets weight 0 and stays shadow
+        # evidence; it can no longer replace a measured rule edge with its own.
+        net_bps, model_weight, model_net_bps, uncertainty_penalty_bps = (
+            self.config.fusion.fuse(
+                rule_net_bps=rule_net_bps,
+                model_prediction=model_prediction,
+            )
+        )
+        fusion_diagnostics = {
+            "rule_gross_bps": gross_bps,
+            "all_in_cost_bps": cost_bps,
+            "rule_net_bps": rule_net_bps,
+            "model_net_bps": model_net_bps,
+            "model_reliability_weight": model_weight,
+            "uncertainty_penalty_bps": uncertainty_penalty_bps,
+            "fused_net_bps": net_bps,
+            "required_net_bps": required_net,
+            "cost_coverage_ratio": coverage,
+        }
 
         # ---- Quality gates -> NO_TRADE (never an approval) ---- #
         if confidence < self.config.min_confidence:
@@ -229,16 +381,25 @@ class TechnicalPredictionEngine:
             return self._no_trade(features, composite, reason_codes,
                                   f"Confidence {confidence:.2f} below minimum.",
                                   exit_price=exit_price, gross_return=gross_return,
-                                  net_bps=net_bps, downside_bps=downside_bps, confidence=confidence)
-        required_net_bps = self.config.min_net_return_bps + float(
-            self.config.horizon_edge_buffer_bps.get(composite.expected_horizon_seconds, 0.0)
+                                  net_bps=net_bps, downside_bps=downside_bps, confidence=confidence,
+                                  extra_diagnostics=fusion_diagnostics)
+        # The cost-derived floor is authoritative; the legacy per-horizon buffer is
+        # kept as an additional (never a replacement) requirement.
+        required_net_bps = max(
+            required_net,
+            self.config.min_net_return_bps
+            + float(
+                self.config.horizon_edge_buffer_bps.get(composite.expected_horizon_seconds, 0.0)
+            ),
         )
+        fusion_diagnostics["required_net_bps"] = required_net_bps
         if net_bps <= required_net_bps:
             reason_codes.append(rc.TECHNICAL_EDGE_NON_POSITIVE)
             return self._no_trade(features, composite, reason_codes,
                                   "Expected net return not positive after cost.",
                                   exit_price=exit_price, gross_return=gross_return,
-                                  net_bps=net_bps, downside_bps=downside_bps, confidence=confidence)
+                                  net_bps=net_bps, downside_bps=downside_bps, confidence=confidence,
+                                  extra_diagnostics=fusion_diagnostics)
         # Downside risk is surfaced as INFORMATION + a warning code, not a hard
         # block: adverse excursion routinely exceeds the expected favorable move
         # over short horizons, and the authoritative risk/reward stop is set by
@@ -267,7 +428,11 @@ class TechnicalPredictionEngine:
             regime=regime,
             reason_codes=tuple(dict.fromkeys(reason_codes)),
             explanation=explanation,
-            diagnostics={"composite": composite.as_dict(), "cost_bps": cost_bps},
+            diagnostics={
+                "composite": composite.as_dict(),
+                "cost_bps": cost_bps,
+                **fusion_diagnostics,
+            },
         )
 
     # ------------------------------------------------------------------ #
@@ -283,6 +448,7 @@ class TechnicalPredictionEngine:
         net_bps: float | None = None,
         downside_bps: float | None = None,
         confidence: float = 0.0,
+        extra_diagnostics: Mapping[str, object] | None = None,
     ) -> TechnicalPrediction:
         return TechnicalPrediction(
             symbol=features.symbol,
@@ -299,5 +465,8 @@ class TechnicalPredictionEngine:
             regime=composite.regime.value,
             reason_codes=tuple(dict.fromkeys(reason_codes)),
             explanation=explanation,
-            diagnostics={"composite": composite.as_dict()},
+            diagnostics={
+                "composite": composite.as_dict(),
+                **dict(extra_diagnostics or {}),
+            },
         )

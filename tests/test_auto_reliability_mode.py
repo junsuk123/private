@@ -353,12 +353,32 @@ def test_model_degraded_fallback_can_be_switched_off() -> None:
     degraded.assert_not_called()
 
 
+def test_model_degraded_lifts_a_block_stamped_with_a_stale_reason() -> None:
+    """The block records why it was placed, which may be several cycles old.
+
+    A block stamped MARKET_DATA_NOT_READY stayed in force after the feed
+    recovered, because the caller had already established that the only remaining
+    failure is the model. The live snapshot wins over the stale string.
+    """
+    calls = []
+    engine = SimpleNamespace(
+        get_status=lambda: {
+            "buy_enabled": False,
+            "buy_disabled_reason": "AUTO_RELIABILITY_DEMOTION:MARKET_DATA_NOT_READY",
+        },
+        enable_buys=lambda reason: calls.append(reason),
+    )
+    with patch.object(web_module, "_realtime_trading_engine", engine):
+        web_module._auto_reliability_enter_model_degraded("MODEL_NOT_READY")
+    assert len(calls) == 1
+
+
 def test_model_degraded_only_lifts_a_block_this_controller_placed() -> None:
     # A manual disable, a liquidation, or REALTIME_BUY_ENABLED=false must survive.
     for disabled_reason in (
         "MANUAL_OPERATOR_DISABLE",
         "REALTIME_BUY_ENABLED=false",
-        "AUTO_RELIABILITY_DEMOTION:MODEL_NOT_READY,BROKER_NOT_READY",
+        "LIQUIDATION_REQUESTED",
     ):
         engine = SimpleNamespace(
             get_status=lambda reason=disabled_reason: {
