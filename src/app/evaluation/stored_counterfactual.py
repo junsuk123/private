@@ -114,10 +114,32 @@ class _Interval:
 
 
 def causal_percentile(value: float, history: Sequence[float]) -> float:
-    """Empirical percentile using prior observations only."""
+    """Empirical percentile using prior observations only, with ties at midrank.
+
+    The old definition was ``sum(item <= value) / n``, which counts a tie as
+    "below" and therefore scores a value equal to its entire history at 1.0 —
+    the top of the distribution.
+
+    On this data that is not a corner case, it is the common case. Measured
+    2026-08-07 on stored minute bars: 52.3% of US bars and 29.8% of KR bars print
+    EXACTLY zero return, because a thin name's price simply does not change from
+    one minute to the next. Under ``<=`` every one of those flat bars scored 1.0
+    on the return percentile, so ``intraday_momentum``'s "return in the top 20% of
+    its history" fired on a bar that did not move. **72.8% of all US momentum
+    triggers were flat bars** (36.4% on KR). The strategy family that is supposed
+    to buy strength was mostly buying non-events in illiquid symbols, and every
+    other percentile feature — volume, breakout, spread, relative strength —
+    carried the same distortion wherever its values repeat.
+
+    Midrank (``below + 0.5 * equal``) is the standard tie correction: a value tied
+    with its whole history lands at 0.5, which is what "no information" should
+    look like, and a genuine move still ranks at the top.
+    """
     if not history:
         return 0.5
-    return sum(item <= value for item in history) / len(history)
+    below = sum(item < value for item in history)
+    equal = sum(item == value for item in history)
+    return (below + 0.5 * equal) / len(history)
 
 
 @dataclass(frozen=True)

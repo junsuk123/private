@@ -256,3 +256,32 @@ def test_stop_never_collapses_into_the_tick_grid() -> None:
         configured_stop_bps=60.0,
     )
     assert stop >= 15.0
+
+
+def test_flat_bar_does_not_score_as_top_percentile() -> None:
+    """A value tied with its whole history is the least informative observation
+    there is, so it must land mid-distribution, not at the top.
+
+    Under the old ``sum(item <= value)/n`` a flat bar scored 1.0. Measured on
+    stored minute bars 2026-08-07: 52.3% of US bars print exactly zero return, and
+    72.8% of all ``intraday_momentum`` triggers were those flat bars — the
+    "buy strength" family was mostly buying non-events in illiquid symbols.
+    """
+    assert causal_percentile(0.0, [0.0] * 30) == 0.5
+    assert causal_percentile(0.0, [-0.001] * 15 + [0.0] * 15) == 0.75
+    # A genuine move still ranks at the top, which is the property that made the
+    # broken definition look correct in testing.
+    assert causal_percentile(0.01, [0.0] * 30) == 1.0
+    assert causal_percentile(-0.01, [0.0] * 30) == 0.0
+
+
+def test_percentile_ties_use_midrank_not_upper_bound() -> None:
+    history = [1.0, 2.0, 2.0, 2.0, 3.0]
+    # below=1, equal=3  ->  (1 + 1.5) / 5
+    assert causal_percentile(2.0, history) == 0.5
+    assert causal_percentile(1.0, history) == 0.1
+    assert causal_percentile(3.0, history) == 0.9
+
+
+def test_empty_history_is_neutral_not_confident() -> None:
+    assert causal_percentile(0.5, []) == 0.5
