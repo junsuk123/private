@@ -10889,19 +10889,43 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
     return ()
   if "KRX" not in _active_live_market_groups():
     return ()
-  ttl = float(os.getenv("REALTIME_KRX_RANKING_TTL_SEC", "30"))
+  # Refreshed per SESSION, not per 30 seconds.
+  #
+  # This used to re-pick every 30s from the volume, fluctuation and volume-power
+  # rankings — from whatever was spiking at that instant. Measured 2026-07-28..08-07:
+  # day-over-day membership survival 4.7-15%, 960 distinct names, and only 005930
+  # recurred enough to build history (2,097 bars against 16.6 for everything else).
+  # A symbol needs 20 bars to be considered at all, so the engine was holding data
+  # on 870 names and could evaluate almost none. See app.trading.domestic_universe.
+  ttl = float(os.getenv("REALTIME_KRX_RANKING_TTL_SEC", "300"))
   now = time.monotonic()
   with _live_lock:
     if now - float(_domestic_ranking_cache.get("at") or 0.0) < ttl and _domestic_ranking_cache.get("symbols"):
       return tuple(_domestic_ranking_cache.get("symbols") or ())
   try:
     from app.trading.domestic_realtime_bridge import fetch_domestic_ranking_symbols
+    from app.trading.domestic_universe import (
+      load_state,
+      resolve_universe,
+      save_state,
+      universe_size,
+    )
 
-    raw_sources = os.getenv("REALTIME_KRX_RANKING_SOURCES", "volume_rank,fluctuation,volume_power")
+    # Turnover ranking only by default. The movers lists are the least stable input
+    # available and they select wide-spread names, which is the wrong direction when
+    # a KRX round trip already costs ~28bps.
+    raw_sources = os.getenv("REALTIME_KRX_RANKING_SOURCES", "volume_rank")
     sources = tuple(item.strip().lower() for item in raw_sources.split(",") if item.strip())
-    limit = max(1, int(float(os.getenv("REALTIME_KRX_RANKING_CANDIDATE_LIMIT", "24"))))
-    result = fetch_domestic_ranking_symbols(sources=sources, max_symbols=limit)
-    symbols = tuple(result.get("symbols") or ())
+    size = universe_size()
+    result = fetch_domestic_ranking_symbols(sources=sources, max_symbols=size * 3)
+    decision = resolve_universe(
+      tuple(result.get("symbols") or ()),
+      state=load_state(),
+      size=size,
+    )
+    if decision.source in {"reselected", "session_locked"}:
+      save_state(decision)
+    symbols = decision.symbols
   except Exception:  # noqa: BLE001 - best-effort; never break candidate discovery.
     symbols = ()
   with _live_lock:
