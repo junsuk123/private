@@ -71,6 +71,36 @@ function Stop-LocalAppServerProcessTree {
   }
 }
 
+function Stop-OrphanedSupervisors {
+  <#
+    Kill run.ps1 supervisors left over from previous launches - every one except
+    this process.
+
+    Each launch starts a supervisor that owns the server and, in its finally block,
+    asks the server to shut down. An orphan from an earlier run is therefore a
+    process holding a shutdown trigger for a server it no longer owns: when it
+    eventually notices its child is gone, it runs that finally and stops whichever
+    server is listening on the port by then - which will be the NEW one. That is a
+    server dying minutes after a clean start for no visible reason.
+
+    Stop-Process is used deliberately instead of a graceful stop: running the
+    orphan's finally is precisely the behaviour being prevented.
+  #>
+  $self = $PID
+  $orphans = Get-CimInstance Win32_Process -Filter "name = 'powershell.exe' or name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.ProcessId -ne $self -and
+      $_.CommandLine -and
+      $_.CommandLine -like '*-File*' -and
+      $_.CommandLine -like '*run.ps1*'
+    }
+  foreach ($orphan in $orphans) {
+    Write-Host "  Stopping orphaned launcher (PID $($orphan.ProcessId))."
+    Stop-Process -Id $orphan.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  if ($orphans) { Start-Sleep -Milliseconds 400 }
+}
+
 function Stop-ExistingLocalAppServers {
   <#
     Replace a running server WITHOUT force-killing it.
@@ -84,6 +114,7 @@ function Stop-ExistingLocalAppServers {
     only force-kill if it will not go. Force-kill remains available because a hung
     server that cannot answer HTTP must still be replaceable.
   #>
+  Stop-OrphanedSupervisors
   $listeners = Get-LocalAppServerListeners
   if (-not $listeners) { return $true }
 
