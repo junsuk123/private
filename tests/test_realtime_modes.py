@@ -1508,6 +1508,52 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(bundle.macro_result.candidate_symbols, ("AAPL",))
         self.assertNotIn("MACRO_INSUFFICIENT_DATA", bundle.macro_result.reason_codes)
 
+    def test_web_macro_observer_uses_anchor_context_without_buy_candidates(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        class Store:
+            def active_symbols(self, since, limit):
+                return ("005930", "000660")
+
+            def recent_minute_bars(self, symbol, since, limit):
+                return tuple(
+                    SimpleNamespace(close=100.0 + index, volume=1000)
+                    for index in range(24)
+                )
+
+            def recent_ticks(self, symbol, since):
+                return ()
+
+            def recent_orderbooks(self, symbol, since):
+                return ()
+
+        decision_engine = SimpleNamespace(
+            store=Store(),
+            feature_builder=SimpleNamespace(),
+            market_refresher=None,
+        )
+        observer = web_module._build_macro_micro_observer(decision_engine)
+
+        self.assertIsNotNone(observer)
+        with patch(
+            "app.web._realtime_session_anchor_symbols",
+            return_value=("005930", "000660"),
+        ):
+            bundle = observer(
+                AccountSnapshot(cash=1_000_000.0, holdings=()),
+                (),
+                (),
+                now,
+            )
+
+        self.assertEqual(bundle.macro_result.candidate_symbols, ())
+        self.assertNotIn(
+            "MACRO_INSUFFICIENT_DATA", bundle.macro_result.reason_codes
+        )
+        diagnostics = bundle.macro_result.diagnostics
+        self.assertEqual(diagnostics["market_context_symbol_count"], 2)
+        self.assertEqual(diagnostics["trading_candidate_input_count"], 0)
+
     def test_us_learning_watchlist_stays_fixed_during_cache_ttl(self) -> None:
         account = AccountSnapshot(
             cash=0.0,
@@ -1620,8 +1666,12 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._us_learning_watchlist_cache["at"] = 0.0
             second = web_module._sticky_us_learning_symbols(2)
 
+        # The head of the pool is the measured-density set and stays subscribed;
+        # only the tail rotates. Rotating the WHOLE pool walked every dense name
+        # out of the feed every few minutes, which is what left the session-boxed
+        # strategies without a symbol observed at both ends of a session.
         self.assertEqual(first, ("AAPL", "MSFT"))
-        self.assertEqual(second, ("SOFI", "PFE"))
+        self.assertEqual(second, ("AAPL", "SOFI"))
 
     def test_recent_us_watchlist_ranks_sustained_fresh_ticks(self) -> None:
         account = AccountSnapshot(

@@ -689,7 +689,11 @@ class CompositeTechnicalSignalEngine:
             return self._hold(features, regime_diag, signals, reason_codes, vwap_signal)
 
         if not contributors:
-            reason_codes.append(rc.TECHNICAL_EDGE_NON_POSITIVE)
+            # No methodology emitted a BUY is an inactive setup, not evidence
+            # that an otherwise valid strategy has negative expectancy.  The old
+            # code mixed those states and made the GUI's "non-positive edge"
+            # count look like an algorithm-performance verdict.
+            reason_codes.append(rc.TECHNICAL_SETUP_NOT_ACTIVE)
             return self._hold(features, regime_diag, signals, reason_codes, vwap_signal)
 
         # ---- Weighted aggregation ---- #

@@ -12,12 +12,18 @@ from statistics import fmean
 from typing import Any, Mapping, Sequence
 
 from app.backtesting.event_simulator import EventDrivenFillSimulator
-from app.data.investor_flow_store import business_date_for
+from app.data.investor_flow_store import InvestorFlowStore, business_date_for
 from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
 from app.trading.contracts import Bar
+from app.trading.directional import parse_direction, stop_price, target_price
 from app.features.schemas import OHLCVBar
 from app.features import session_structure
+from app.features import strategy_graph_context
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+    StrategyGraphContextError,
+)
 from app.technical import indicators as ti
 
 
@@ -40,6 +46,11 @@ class EvaluationConfig:
     # v2 replaces legacy bar-count opening features with the causal, clock-based
     # 30-minute authority shared by live serving. Old labels are not compatible.
     feature_schema_name: str = "counterfactual_quantiles_v2_session_structure"
+    # When enabled, each strategy is observed for its own live max-holding
+    # period instead of forcing every thesis into the generic 60-bar window.
+    # Kept opt-in so compact unit-test fixtures and historical comparisons can
+    # explicitly retain their requested horizon.
+    align_strategy_horizons: bool = False
     infer_market_from_symbol: bool = True
 
 
@@ -82,6 +93,11 @@ class CounterfactualLabel:
     # Partial fills. A label whose fill ratio is below 1 describes a smaller position
     # than the strategy asked for, and the unfilled remainder earns nothing.
     fill_ratio: float = 1.0
+    gross_return_bps: float = 0.0
+    mae_bps: float = 0.0
+    mfe_bps: float = 0.0
+    holding_seconds: float = 0.0
+    cost_floor_dominated: bool = False
 
     @property
     def is_short(self) -> bool:
@@ -96,6 +112,8 @@ class CounterfactualLabel:
         could not have known.
         """
         if not self.short_restriction_passed:
+            return False
+        if self.exit_reason == "FUTURE_WINDOW_CENSORED":
             return False
         if self.borrow_observed_at is not None and self.feature_snapshot_at is not None:
             if self.borrow_observed_at > self.feature_snapshot_at:
@@ -503,14 +521,13 @@ def _opening_range_breakout_quantile(
     return max(0.0, 0.4 + excess)
 
 
-# KRX session geometry, in minutes past midnight Korea time. Continuous trading ends
-# at 15:20 and 15:20-15:30 is a closing single-price auction, so the tradable "last
+# Session geometry comes from ``session_structure.regular_session`` so KRX and US
+# rows are boxed by their own exchange clock. KRX continuous trading ends at 15:20
+# and 15:20-15:30 is a closing single-price auction, so the tradable "last
 # half-hour" is 14:50-15:20 — NOT 15:00-15:30. Entering into the auction would price
 # against a mechanism this system does not model.
 _KST = timezone(timedelta(hours=9))
-_FIRST_HALF_HOUR = (9 * 60, 9 * 60 + 30)
 _PENULTIMATE_HALF_HOUR = (14 * 60 + 20, 14 * 60 + 50)
-_LAST_CONTINUOUS_HALF_HOUR = (14 * 60 + 50, 15 * 60 + 20)
 
 
 def _kst_minute_of_day(moment: datetime) -> int:
@@ -552,8 +569,8 @@ def _intraday_momentum_quantiles(
     if session_start <= 0 or index <= session_start:
         return absent
     current = bars[index]
-    minute = _kst_minute_of_day(current.end_time)
-    in_window = _LAST_CONTINUOUS_HALF_HOUR[0] <= minute < _LAST_CONTINUOUS_HALF_HOUR[1]
+    session = session_structure.regular_session(current.symbol)
+    in_window = session.in_last_continuous_half_hour(current.end_time)
     if not in_window:
         # Cheap exit: outside the entry window nothing else matters.
         return absent
@@ -596,19 +613,42 @@ def _intraday_momentum_quantiles(
     }
 
 
+def _overnight_carry_window(bars: Sequence[Bar], index: int) -> float:
+    """1.0 inside the last continuous half hour of this symbol's own session.
+
+    Deliberately independent of the opening range. ``intraday_momentum_window``
+    also encodes the same clock, but only after an opening range could be
+    measured, so reusing it would have made an overnight carry inherit a
+    first-half-hour data requirement it does not have — and the opening window is
+    exactly the one this feed most often misses.
+    """
+    current = bars[index]
+    session = session_structure.regular_session(current.symbol)
+    return 1.0 if session.in_last_continuous_half_hour(current.end_time) else 0.0
+
+
 def _prior_session_opening_volatility(
     bars: Sequence[Bar], session_start: int
 ) -> list[float]:
     """First-half-hour range/price for every session strictly before this one."""
+    if session_start <= 0:
+        return []
+    session = session_structure.regular_session(bars[0].symbol)
+    zone = session.zone
     by_day: dict[int, list[Bar]] = defaultdict(list)
     for position in range(session_start):
         bar = bars[position]
-        by_day[bar.start_time.astimezone(_KST).date().toordinal()].append(bar)
+        by_day[bar.start_time.astimezone(zone).date().toordinal()].append(bar)
     values: list[float] = []
     for day in sorted(by_day):
         window = by_day[day]
-        local_day = window[0].start_time.astimezone(_KST)
-        session_open = local_day.replace(hour=9, minute=0, second=0, microsecond=0)
+        local_day = window[0].start_time.astimezone(zone)
+        session_open = local_day.replace(
+            hour=session.open_time.hour,
+            minute=session.open_time.minute,
+            second=0,
+            microsecond=0,
+        )
         observed = session_structure.opening_range(
             window,
             session_open=session_open,
@@ -697,9 +737,13 @@ def _microstructure_quantiles(
     if len(spread_values) >= 3:
         baseline = fmean(spread_values[:-1])
         latest = spread_values[-1]
-        # Spread back to or below its baseline == liquidity has returned.
+        # Spread back to or below its baseline == liquidity has fully returned.
+        # The previous ``1 - latest / baseline`` formula returned zero at the
+        # exact point described as recovered, so no normalised tape could ever
+        # clear a 0.65 confirmation gate.  Score 1.0 at/below baseline and decay
+        # linearly to zero as the spread widens from 1x to 2x baseline.
         result["liquidity_recovery"] = (
-            max(0.0, min(1.0, 1.0 - (latest / baseline))) if baseline > 0 else 0.0
+            max(0.0, min(1.0, 2.0 - (latest / baseline))) if baseline > 0 else 0.0
         )
         # Toxicity: a spread blowing out relative to baseline means the
         # counterparty is better informed than a reversion thesis assumes.
@@ -773,6 +817,26 @@ def build_labels(
     simulator = EventDrivenFillSimulator()
     labels: list[CounterfactualLabel] = []
     experts = tuple(expert_type() for expert_type in ALL_EXPERT_TYPES)
+    future_bars_by_strategy = {
+        expert.strategy_id: (
+            max(1, math.ceil(expert.config.max_holding_seconds / 60.0) + 1)
+            if config.align_strategy_horizons
+            else config.horizon_bars
+        )
+        for expert in experts
+    }
+    maximum_future_bars = max(future_bars_by_strategy.values())
+    # The loop below is bounded by the SHORTEST horizon, not the longest.
+    #
+    # Bounding it by the longest let one strategy truncate every other strategy's
+    # labels: adding an 18-hour overnight thesis (1,081 bars) cut the stored label
+    # set from 60,108 rows to 25,537 and moved the last labelled bar three days
+    # earlier, which in turn dropped every strategy below the upside-supervision
+    # floor and de-authorized the whole checkpoint. A per-strategy horizon has to
+    # cost that strategy its unobservable tail and nobody else's; each expert
+    # already slices ``future`` to its own window, so the only change needed is to
+    # skip the strategies whose window runs past the end.
+    minimum_future_bars = min(future_bars_by_strategy.values())
     microstructure_by_symbol = microstructure_by_symbol or {}
     investor_flow_by_symbol = investor_flow_by_symbol or {}
     news_by_ticker = news_by_ticker or {}
@@ -810,7 +874,7 @@ def build_labels(
             session_open_index.append(current_session_start)
         for index in range(
             config.history_bars,
-            len(bars) - config.horizon_bars,
+            len(bars) - minimum_future_bars,
             config.stride_bars,
         ):
             current = bars[index]
@@ -870,6 +934,22 @@ def build_labels(
                 causal_percentile(current.volume, volume_history) >= 0.65
             )
             breakout_move = current.close / prior_high - 1
+            prior_range_high = max(
+                bar.high for bar in bars[max(0, index - 11) : index - 1]
+            )
+            prior_breakout_accepted = bool(
+                index > 1
+                and bars[index - 1].close > prior_range_high
+                and current.close >= bars[index - 1].close
+            )
+            minutes_from_open = max(
+                0.0,
+                (
+                    current.start_time
+                    - bars[session_open_index[index]].start_time
+                ).total_seconds()
+                / 60.0,
+            )
             quantiles = {
                 # Directional LONG signals must not turn a tied zero move into a
                 # top-quantile observation (the empirical CDF returns 1.0 for a
@@ -888,12 +968,19 @@ def build_labels(
                         for j in range(max(10, history_start), index)
                     ],
                 ) if breakout_move > 0 else 0.0,
+                "breakout_acceptance": 1.0 if prior_breakout_accepted else 0.0,
                 "vwap_deviation": causal_percentile(
                     current.close / vwap_proxy - 1,
                     [bar.close / vwap_proxy - 1 for bar in bars[history_start:index]],
                 ),
                 "reversion": causal_percentile(current_return, return_history),
-                "liquidity_shock": causal_percentile(spreads[index], spread_history),
+                "liquidity_shock": (
+                    causal_percentile(
+                        spreads[index - 1], spreads[history_start : index - 1]
+                    )
+                    if spreads[index - 1] > 0
+                    else 0.0
+                ),
                 # A reversal is a two-step event: the PREVIOUS bar supplies the
                 # sell-off and the CURRENT bar supplies the recovery.  Ranking the
                 # same return once with each sign made the two conditions mutually
@@ -927,9 +1014,16 @@ def build_labels(
                 ),
                 # Gap and opening confirmation come from the session-open bar,
                 # located from bar timestamps rather than an exchange calendar.
+                "overnight_carry_window": _overnight_carry_window(bars, index),
                 "gap": _gap_quantile(bars, index, session_open_index[index]),
                 "opening_confirmation": _opening_confirmation_quantile(
                     bars, index, session_open_index[index]
+                ),
+                # Gap continuation is an opening price-discovery thesis, not a
+                # permanent all-day attribute. Wait five minutes for discovery
+                # and stop admitting new entries after the first half-hour.
+                "gap_entry_window": (
+                    1.0 if 5.0 <= minutes_from_open <= 30.0 else 0.0
                 ),
                 # Relative volume -- the "stocks in play" filter. Not consumed by
                 # the legacy experts, but the opening-range expert requires it and
@@ -940,6 +1034,12 @@ def build_labels(
                         _relative_volume(volumes[j], volumes[max(0, j - 20) : j])
                         for j in range(max(20, history_start), index)
                     ],
+                ),
+                "momentum_persistence_short": _rolling_mean_percentile(
+                    returns, index, history_start, 5
+                ),
+                "momentum_persistence_long": _rolling_mean_percentile(
+                    returns, index, history_start, 15
                 ),
                 "opening_range_breakout": _opening_range_breakout_quantile(
                     bars, index, session_open_index[index]
@@ -983,7 +1083,7 @@ def build_labels(
             }
             as_of = current.end_time
             future = _contiguous_future_bars(
-                bars[index + 1 : index + 1 + config.horizon_bars],
+                bars[index + 1 : index + 1 + maximum_future_bars],
                 expected_start=current.end_time,
                 maximum_gap_seconds=config.maximum_bar_gap_seconds,
             )
@@ -992,6 +1092,27 @@ def build_labels(
                 min(config.minimum_future_bars, config.horizon_bars),
             )
             if len(future) < required_future_bars:
+                continue
+            # Built once per snapshot rather than once per strategy: the vector
+            # does not depend on which expert is being labelled. A snapshot whose
+            # contract cannot be built drops out of the label set entirely — the
+            # alternative is a row carrying a fabricated field, which is how an
+            # untrained weight reaches production.
+            try:
+                label_features = _label_features(
+                    config.feature_schema_name,
+                    current=current,
+                    current_return=current_return,
+                    return_history=return_history,
+                    close_history=[bar.close for bar in bars[history_start:index]],
+                    volume_history=volume_history,
+                    vwap_proxy=vwap_proxy,
+                    microstructure=micro_by_time.get(current.start_time),
+                    rvgi_result=rvgi_result,
+                    box=box,
+                    quantiles=quantiles,
+                )
+            except StrategyGraphContextError:
                 continue
             context = ExpertContext(
                 symbol=symbol,
@@ -1005,6 +1126,14 @@ def build_labels(
             for expert in experts:
                 plan = expert.propose(context)
                 triggered = plan is not None
+                strategy_future_bars = future_bars_by_strategy[expert.strategy_id]
+                if index + strategy_future_bars >= len(bars):
+                    # This strategy's own horizon runs past the end of the stored
+                    # series, so its outcome is unobservable at this bar. Skipping
+                    # it here is what keeps a long-horizon thesis from deleting
+                    # every short-horizon label in the dataset.
+                    continue
+                strategy_future = future[:strategy_future_bars]
                 # A strategy that did not fire is a useful classification
                 # negative, but it is not a hypothetical filled trade.  The
                 # previous implementation forced every expert to propose with
@@ -1045,7 +1174,7 @@ def build_labels(
                         bars,
                         index,
                         history_start,
-                        horizon_bars=config.horizon_bars,
+                        horizon_bars=strategy_future_bars,
                     )
                     target_bps, stop_bps, cost_floor_dominated = _barrier_bps(
                         sigma_bps=sigma_bps,
@@ -1063,20 +1192,28 @@ def build_labels(
                         profit_policy={
                             **plan.profit_policy,
                             "bps": target_bps,
-                            "price": current.close * (1.0 + target_bps / 10_000.0),
+                            "price": target_price(
+                                current.close,
+                                target_bps / 10_000.0,
+                                parse_direction(plan.position_direction),
+                            ),
                             "cost_floor_dominated": cost_floor_dominated,
                             "horizon_sigma_bps": sigma_bps,
                         },
                         initial_stop={
                             **plan.initial_stop,
                             "bps": stop_bps,
-                            "price": current.close * (1.0 - stop_bps / 10_000.0),
+                            "price": stop_price(
+                                current.close,
+                                stop_bps / 10_000.0,
+                                parse_direction(plan.position_direction),
+                            ),
                         },
                     )
                 outcome = (
                     simulator.simulate(
                         plan,
-                        future,
+                        strategy_future,
                         as_of=as_of,
                         venue=venue,
                         market=market,
@@ -1088,7 +1225,7 @@ def build_labels(
                 labels.append(
                     CounterfactualLabel(
                         as_of=as_of,
-                        label_end=future[-1].end_time,
+                        label_end=strategy_future[-1].end_time,
                         symbol=symbol,
                         strategy_id=expert.strategy_id,
                         triggered=triggered,
@@ -1102,15 +1239,24 @@ def build_labels(
                             if outcome is not None
                             else "STRATEGY_NOT_TRIGGERED"
                         ),
-                        features=_label_features(
-                            config.feature_schema_name,
-                            current=current,
-                            current_return=current_return,
-                            return_history=return_history,
-                            vwap_proxy=vwap_proxy,
-                            rvgi_result=rvgi_result,
-                            box=box,
-                            quantiles=quantiles,
+                        features=label_features,
+                        direction=(
+                            plan.position_direction if plan is not None else "LONG"
+                        ),
+                        execution_product=(
+                            plan.execution_product if plan is not None else "CASH"
+                        ),
+                        gross_return_bps=(
+                            outcome.gross_return_bps if outcome is not None else 0.0
+                        ),
+                        mae_bps=(outcome.mae_bps if outcome is not None else 0.0),
+                        mfe_bps=(outcome.mfe_bps if outcome is not None else 0.0),
+                        holding_seconds=(
+                            outcome.holding_seconds if outcome is not None else 0.0
+                        ),
+                        cost_floor_dominated=bool(
+                            plan is not None
+                            and plan.profit_policy.get("cost_floor_dominated", False)
                         ),
                     )
                 )
@@ -1177,6 +1323,7 @@ def _barrier_bps(
     safety_margin_bps: float,
     configured_target_bps: float,
     configured_stop_bps: float,
+    stop_volatility_k: float = _VOLATILITY_STOP_K,
 ) -> tuple[float, float, bool]:
     """``(target_bps, stop_bps, cost_floor_dominated)`` for one labelled trade.
 
@@ -1207,8 +1354,15 @@ def _barrier_bps(
             configured_target_bps < cost_floor,
         )
     volatility_target = _VOLATILITY_TARGET_K * sigma_bps
-    target = max(volatility_target, cost_floor)
-    stop = max(_MINIMUM_STOP_BPS, _VOLATILITY_STOP_K * sigma_bps)
+    # The live geometry is a floor, not a comment. Ignoring the configured
+    # barriers let training optimise a different stop/target pair than the
+    # executor used. Volatility may widen either side, never narrow it.
+    target = max(configured_target_bps, volatility_target, cost_floor)
+    stop = max(
+        _MINIMUM_STOP_BPS,
+        configured_stop_bps,
+        max(0.1, stop_volatility_k) * sigma_bps,
+    )
     return target, stop, cost_floor > volatility_target
 
 
@@ -1260,11 +1414,24 @@ def _label_features(
     current,
     current_return: float,
     return_history: Sequence[float],
+    close_history: Sequence[float],
+    volume_history: Sequence[float],
     vwap_proxy: float,
+    microstructure: BarMicrostructure | None,
     rvgi_result,
     box,
     quantiles: dict[str, float],
 ) -> tuple[float, ...]:
+    if schema_name == STRATEGY_GRAPH_CONTEXT_SCHEMA:
+        return _strategy_graph_context_features(
+            current=current,
+            current_return=current_return,
+            close_history=close_history,
+            volume_history=volume_history,
+            microstructure=microstructure,
+            rvgi_result=rvgi_result,
+            box=box,
+        )
     micro = _realtime_microstructure_proxy_features(
         current=current,
         current_return=current_return,
@@ -1301,6 +1468,113 @@ def _label_features(
         quantiles["event_relevance"],
         quantiles["relative_strength"],
         quantiles["gap"],
+    )
+
+
+def _strategy_graph_context_features(
+    *,
+    current,
+    current_return: float,
+    close_history: Sequence[float],
+    volume_history: Sequence[float],
+    microstructure: BarMicrostructure | None,
+    rvgi_result,
+    box,
+) -> tuple[float, ...]:
+    """The aligned GNN context, built from the SAME source columns as serving.
+
+    Every field here has a counterpart in
+    :func:`app.features.live_feature_frame._strategy_graph_context_columns`
+    computed by the same estimator over the same window, and the two are pinned
+    together by ``tests/test_strategy_graph_context.py``.
+
+    The v4 builder this replaces derived a "spread" from the bar's high-low range
+    and an order-flow proxy from where the bar closed inside that range, while
+    serving supplied a real spread and a real book imbalance in those slots --
+    even though ``realtime_minute_bars`` had been persisting the real columns all
+    along and ``load_minute_microstructure`` was already loading them. They were
+    simply never routed into the feature vector.
+
+    A bar with no microstructure ROW at all raises, because the snapshot cannot
+    be placed. A row whose book sample is missing is a different thing and is
+    reported through ``microstructure_available``: the store writes 0.0 rather
+    than NULL for a minute it never sampled, and nine of ten KRX minutes are in
+    that state, so raising there would discard almost the entire KRX catalogue.
+    """
+    if microstructure is None:
+        raise StrategyGraphContextError(
+            "strategy graph context requires persisted bar microstructure"
+        )
+    price = float(current.close)
+    vwap = strategy_graph_context.volume_weighted_close(
+        close_history,
+        volume_history,
+    )
+    # Returns are derived from the window's own closes rather than taken from the
+    # caller's ``return_history``. That list starts one bar EARLIER (its first
+    # entry is the history window's opening bar measured against the bar before
+    # it), so it holds 30 returns where the serving path holds 29 — a volatility
+    # computed over a different sample on each side, which is the same class of
+    # drift as the slot mismatch even though both are called "realized_volatility".
+    window_returns = [
+        float(close_history[position]) / float(close_history[position - 1]) - 1.0
+        for position in range(1, len(close_history))
+        if float(close_history[position - 1]) > 0
+    ]
+    box_high = float(box.high) if box.ok and box.high else 0.0
+    return strategy_graph_context.build_strategy_graph_context(
+        {
+            **strategy_graph_context.microstructure_columns(
+                microstructure.spread_bps,
+                microstructure.orderbook_imbalance,
+                microstructure.liquidity_score,
+            ),
+            "return_1m_scaled": strategy_graph_context.scaled_return(current_return),
+            "realized_volatility_30m": strategy_graph_context.realized_volatility(
+                window_returns
+            ),
+            "distance_from_vwap": (
+                strategy_graph_context.safe_ratio(price, vwap) - 1.0 if vwap else 0.0
+            ),
+            "volume_spike_ratio": strategy_graph_context.volume_spike_ratio(
+                float(current.volume),
+                volume_history,
+            ),
+            "is_krx": strategy_graph_context.is_krx_symbol(
+                getattr(current, "symbol", "")
+            ),
+            "rvgi_available": 1.0 if rvgi_result.ok else 0.0,
+            "rvgi": float(rvgi_result.main or 0.0),
+            "rvgi_signal": float(rvgi_result.signal or 0.0),
+            "rvgi_diff": (
+                float((rvgi_result.main or 0.0) - (rvgi_result.signal or 0.0))
+                if rvgi_result.ok
+                else 0.0
+            ),
+            "rvgi_slope": float(rvgi_result.slope or 0.0),
+            "rvgi_bullish_cross": 1.0 if rvgi_result.bullish_cross else 0.0,
+            "box_available": 1.0 if box.ok else 0.0,
+            "box_high_ratio": strategy_graph_context.safe_ratio(box_high, price),
+            "box_low_ratio": strategy_graph_context.safe_ratio(
+                float(box.low) if box.ok and box.low else 0.0, price
+            ),
+            "box_mid_ratio": strategy_graph_context.safe_ratio(
+                float(box.mid) if box.ok and box.mid else 0.0, price
+            ),
+            "box_width_pct": float(box.width_pct or 0.0),
+            "box_position": float(box.position or 0.0),
+            "breakout_distance_pct": (
+                (price / box_high - 1.0) * 100.0 if box_high > 0 else 0.0
+            ),
+            # v4 hardcoded 0.0 in this slot while serving divided a real previous
+            # close by the price, so the two sides disagreed by construction.
+            "box_previous_close_ratio": strategy_graph_context.safe_ratio(
+                close_history[-1] if close_history else 0.0, price
+            ),
+            "box_context_available": (
+                1.0 if box.source_timestamp is not None else 0.0
+            ),
+        }
     )
 
 
@@ -1386,9 +1660,15 @@ def build_report(
     *,
     config: EvaluationConfig | None = None,
 ) -> dict[str, object]:
-    selected_config = config or EvaluationConfig()
+    selected_config = config or EvaluationConfig(align_strategy_horizons=True)
     bars_by_symbol = load_minute_bars(database)
-    labels = build_labels(bars_by_symbol, selected_config)
+    labels = build_labels(
+        bars_by_symbol,
+        selected_config,
+        microstructure_by_symbol=load_minute_microstructure(database),
+        investor_flow_by_symbol=InvestorFlowStore().load_all(),
+        news_by_ticker=load_news_sentiment(),
+    )
     config_json = json.dumps(asdict(selected_config), sort_keys=True, separators=(",", ":"))
     data_digest = hashlib.sha256()
     for row in labels:

@@ -338,9 +338,14 @@ def _series_from_store(store: Any, symbol: str, since: datetime) -> tuple[list[f
         bars = store.recent_minute_bars(symbol, since, limit=120)
     except Exception:  # noqa: BLE001
         bars = ()
-    if bars:
-        valid_bars = tuple(bar for bar in bars if float(bar.close) > 0)
-        if valid_bars:
+    valid_bars = tuple(bar for bar in bars if float(bar.close) > 0)
+    if valid_bars:
+        # Five-period trend needs six closes.  Returning one to five freshly
+        # rebuilt bars here hid the already-streaming tick tape and made every
+        # restart look like ``MACRO_INSUFFICIENT_DATA`` for roughly five
+        # minutes.  Prefer completed minutes once they can support the trend;
+        # until then continue to the causal tick fallback below.
+        if len(valid_bars) >= 6:
             return (
                 [float(bar.close) for bar in valid_bars],
                 [float(max(0, bar.volume)) for bar in valid_bars],
@@ -349,10 +354,41 @@ def _series_from_store(store: Any, symbol: str, since: datetime) -> tuple[list[f
         ticks = store.recent_ticks(symbol, since)
     except Exception:  # noqa: BLE001
         ticks = ()
-    prices = [float(t.price) for t in ticks if getattr(t, "price", 0) and float(t.price) > 0]
+    # During minute-bar warmup, collapse a high-frequency tape into ten-second
+    # closes.  This prevents five adjacent prints from masquerading as a
+    # five-period market trend while still giving the macro layer real, causal
+    # visibility within about a minute of restart.
+    bucketed: dict[int, Any] = {}
+    for tick in ticks:
+        price = getattr(tick, "price", 0)
+        if not price or float(price) <= 0:
+            continue
+        observed_at = getattr(tick, "received_at", None) or getattr(
+            tick, "exchange_timestamp", None
+        )
+        if isinstance(observed_at, datetime):
+            bucketed[int(observed_at.timestamp()) // 10] = tick
+    usable_ticks = list(bucketed.values()) if len(bucketed) >= 6 else list(ticks)
+    prices = [
+        float(t.price)
+        for t in usable_ticks
+        if getattr(t, "price", 0) and float(t.price) > 0
+    ]
     if prices:
-        volumes = [float(max(0, getattr(t, "volume", 0) or 0)) for t in ticks if getattr(t, "price", 0) and float(t.price) > 0]
+        volumes = [
+            float(max(0, getattr(t, "volume", 0) or 0))
+            for t in usable_ticks
+            if getattr(t, "price", 0) and float(t.price) > 0
+        ]
         return prices, volumes
+    # A sparse market may have completed bars but no recent prints. Preserve
+    # those real observations; the builder will correctly keep the trend empty
+    # until at least two/required observations exist.
+    if valid_bars:
+        return (
+            [float(bar.close) for bar in valid_bars],
+            [float(max(0, bar.volume)) for bar in valid_bars],
+        )
     # Fallback: orderbook mid-price series (US REST-polled quotes, etc.).
     try:
         books = store.recent_orderbooks(symbol, since)

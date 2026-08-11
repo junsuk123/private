@@ -130,6 +130,13 @@ class LocalResearchStore:
         for snapshot in snapshots:
             source = snapshot.source
             observed_at = source.observed_at or source.retrieved_at
+            if source.source_name in {"listed_universe_reference", "listed_universe_catalog"}:
+                # Static universe rows are refreshed every collection cycle, but
+                # they are not intraday observations. One row per UTC day keeps
+                # recency semantics without adding ~1,500 rows every 15 seconds.
+                observed_at = _as_aware(observed_at).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
             source_id = source.source_id or source.source_name
             rows.append(
                 (
@@ -237,6 +244,62 @@ class LocalResearchStore:
             rows,
         )
 
+    def _sync_from_realtime(
+        self,
+        realtime_db_path: str | Path,
+        *,
+        source_table: str,
+        columns: str,
+        insert_sql: str,
+        limit: int,
+    ) -> int:
+        """Project rows appended to a realtime table since the last call.
+
+        Both projections used to read ``order by <timestamp> desc limit 20000``.
+        Neither table has an index on that column alone -- only ``(symbol, time)``
+        -- so SQLite full-scanned the source and sorted it in a temp b-tree, then
+        re-wrote the same 20,000 rows the previous cycle had already written.
+        Measured on the live store (4.5M ticks): 33.5s per call, repeated every
+        refresh cycle, which is why a cycle configured for 180s took ~224s and the
+        UI never left "refreshing".
+
+        ``rowid`` is monotonic for both tables -- ticks are appended, and the bar
+        table's ``insert or replace`` re-inserts an updated bar at a higher rowid
+        -- so a stored watermark turns the same work into an indexed seek over
+        only what is new (measured: 0.10s). The watermark is advanced only after
+        the insert commits, so a failed cycle re-copies rather than skips.
+        """
+        path = Path(realtime_db_path)
+        if not path.exists():
+            return 0
+        batch = max(1, int(limit))
+        watermark_key = f"{path.as_posix()}::{source_table}"
+        with closing(sqlite3.connect(path, timeout=30)) as conn:
+            highest = conn.execute(f"select max(rowid) from {source_table}").fetchone()[0]
+            if highest is None:
+                return 0
+            watermark = self._read_sync_watermark(watermark_key)
+            if watermark <= 0 or watermark > int(highest):
+                # First projection, or a rebuilt source database whose rowids
+                # restarted below the stored mark. Seed from the tail so a cold
+                # start copies the recent window instead of replaying history.
+                watermark = max(0, int(highest) - batch)
+            rows = conn.execute(
+                f"""
+                select rowid, {columns}
+                from {source_table}
+                where rowid > ?
+                order by rowid
+                limit ?
+                """,
+                (watermark, batch),
+            ).fetchall()
+        if not rows:
+            return 0
+        inserted = self._insert_typed(insert_sql, [tuple(row[1:]) for row in rows])
+        self._write_sync_watermark(watermark_key, int(rows[-1][0]))
+        return inserted
+
     def sync_realtime_ohlcv(
         self,
         realtime_db_path: str | Path = "data/store/realtime_market_data.sqlite3",
@@ -244,26 +307,16 @@ class LocalResearchStore:
         limit: int = 20_000,
     ) -> int:
         """Idempotently project recent realtime bars into the research typed schema."""
-        path = Path(realtime_db_path)
-        if not path.exists():
-            return 0
-        with closing(sqlite3.connect(path, timeout=30)) as conn:
-            rows = conn.execute(
-                """
-                select symbol, minute_start, open, high, low, close, volume
-                from realtime_minute_bars
-                order by minute_start desc
-                limit ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
-        return self._insert_typed(
-            """
+        return self._sync_from_realtime(
+            realtime_db_path,
+            source_table="realtime_minute_bars",
+            columns="symbol, minute_start, open, high, low, close, volume",
+            insert_sql="""
             insert or replace into typed_ohlcv_bars
               (ticker, observed_at, open, high, low, close, volume, source_id)
             values (?, ?, ?, ?, ?, ?, ?, 'realtime_market_data')
             """,
-            [tuple(row) for row in rows],
+            limit=limit,
         )
 
     def sync_realtime_quotes(
@@ -273,27 +326,40 @@ class LocalResearchStore:
         limit: int = 20_000,
     ) -> int:
         """Idempotently project trade ticks into the typed quote schema."""
-        path = Path(realtime_db_path)
-        if not path.exists():
-            return 0
-        with closing(sqlite3.connect(path, timeout=30)) as conn:
-            rows = conn.execute(
-                """
-                select symbol, exchange_timestamp, price, null, null, volume, source
-                from realtime_ticks
-                order by exchange_timestamp desc
-                limit ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
-        return self._insert_typed(
-            """
+        return self._sync_from_realtime(
+            realtime_db_path,
+            source_table="realtime_ticks",
+            columns="symbol, exchange_timestamp, price, null, null, volume, source",
+            insert_sql="""
             insert or replace into typed_realtime_quotes
               (ticker, observed_at, price, bid, ask, volume, source_id)
             values (?, ?, ?, ?, ?, ?, ?)
             """,
-            [tuple(row) for row in rows],
+            limit=limit,
         )
+
+    def _read_sync_watermark(self, source_key: str) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "select last_rowid from sync_watermarks where source_key = ?",
+                (source_key,),
+            ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def _write_sync_watermark(self, source_key: str, last_rowid: int) -> None:
+        recorded_at = datetime.now(timezone.utc).isoformat()
+
+        def write(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                insert or replace into sync_watermarks (source_key, last_rowid, updated_at)
+                values (?, ?, ?)
+                """,
+                (source_key, int(last_rowid), recorded_at),
+            )
+            conn.commit()
+
+        self._write_with_retry(write)
 
     def load(self) -> StoredResearch:
         self.prune_stale()
@@ -392,6 +458,14 @@ class LocalResearchStore:
             reasoning_paths=(),
         )
 
+    def load_recent_events(self, *, limit: int = 500) -> tuple[ClassifiedEvent, ...]:
+        """Read only the newest classified events for latency-sensitive consumers."""
+
+        return tuple(
+            _event_from_dict(item)
+            for item in self._read_kind("events", max(1, int(limit)))
+        )
+
     def summary(self, *, prune: bool = True) -> dict[str, int | str]:
         if prune:
             self.prune_stale()
@@ -481,17 +555,52 @@ class LocalResearchStore:
         macro_cutoff = datetime.now(timezone.utc) - timedelta(days=_macro_retention_days())
         cutoff_text = cutoff.isoformat()
         macro_cutoff_text = macro_cutoff.isoformat()
+        try:
+            batch_size = max(1_000, int(os.getenv("RESEARCH_PRUNE_BATCH_SIZE", "10000")))
+        except (TypeError, ValueError):
+            batch_size = 10_000
+        def _retention_days(name: str, default: int) -> int:
+            try:
+                return max(1, int(os.getenv(name, str(default))))
+            except (TypeError, ValueError):
+                return default
+
+        typed_cutoffs = {
+            "typed_market_snapshots": datetime.now(timezone.utc) - timedelta(
+                days=_retention_days("RESEARCH_TYPED_MARKET_RETENTION_DAYS", 7)
+            ),
+            "typed_realtime_quotes": datetime.now(timezone.utc) - timedelta(
+                days=_retention_days("RESEARCH_TYPED_QUOTE_RETENTION_DAYS", 7)
+            ),
+            "typed_ohlcv_bars": datetime.now(timezone.utc) - timedelta(
+                days=_retention_days("RESEARCH_TYPED_BAR_RETENTION_DAYS", 45)
+            ),
+            "typed_candidate_scores": datetime.now(timezone.utc) - timedelta(
+                days=_retention_days("RESEARCH_TYPED_SCORE_RETENTION_DAYS", 30)
+            ),
+        }
+
         def write(conn: sqlite3.Connection) -> int:
-            cursor = conn.execute(
+            before = conn.total_changes
+            conn.execute(
                 """
-                delete from records
-                where (kind = 'macro_metrics' and observed_at < ?)
-                   or (kind <> 'macro_metrics' and observed_at < ?)
+                delete from records where rowid in (
+                    select rowid from records
+                    where (kind = 'macro_metrics' and observed_at < ?)
+                       or (kind <> 'macro_metrics' and observed_at < ?)
+                    limit ?
+                )
                 """,
-                (macro_cutoff_text, cutoff_text),
+                (macro_cutoff_text, cutoff_text, batch_size),
             )
+            for table, typed_cutoff in typed_cutoffs.items():
+                conn.execute(
+                    f"delete from {table} where rowid in ("
+                    f"select rowid from {table} where observed_at < ? limit ?)",
+                    (typed_cutoff.isoformat(), batch_size),
+                )
             conn.commit()
-            return int(cursor.rowcount)
+            return int(conn.total_changes - before)
 
         return self._write_with_retry(write)
 
@@ -569,6 +678,15 @@ class LocalResearchStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                create table if not exists sync_watermarks (
+                    source_key text primary key,
+                    last_rowid integer not null,
+                    updated_at text not null
+                )
+                """
+            )
             conn.execute("create index if not exists idx_typed_ohlcv_ticker_time on typed_ohlcv_bars(ticker, observed_at)")
             conn.execute("create index if not exists idx_typed_quotes_ticker_time on typed_realtime_quotes(ticker, observed_at)")
             conn.execute("create index if not exists idx_typed_market_ticker_time on typed_market_snapshots(ticker, observed_at)")
@@ -631,9 +749,10 @@ class LocalResearchStore:
 
         def write(conn: sqlite3.Connection) -> int:
             before = conn.total_changes
+            conflict = "replace" if kind == "market_snapshots" else "ignore"
             conn.executemany(
-                """
-                insert or ignore into records
+                f"""
+                insert or {conflict} into records
                   (kind, record_key, observed_at, inserted_at, payload)
                 values (?, ?, ?, ?, ?)
                 """,
@@ -853,6 +972,8 @@ def _raw_key(row: dict[str, Any]) -> str:
 
 def _market_key(row: dict[str, Any]) -> str:
     source = row["source"]
+    if source.get("source_name") in {"listed_universe_reference", "listed_universe_catalog"}:
+        return f"{row['ticker']}:{source.get('source_id') or source.get('source_name')}"
     return f"{row['ticker']}:{source.get('source_id')}:{source.get('retrieved_at')}"
 
 

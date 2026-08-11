@@ -31,6 +31,8 @@ _MOMENTUM = {
     "event_momentum",
     "cross_sectional_relative_strength",
     "market_intraday_momentum",
+    # A carry is a continuation thesis held across a session boundary.
+    "overnight_gap_carry",
 }
 _BREAKOUT = {
     "breakout_volume",

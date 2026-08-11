@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.data.classifier import classify_text_event, source_now
 from app.data.public_collectors import RssNewsCollector
 from app.graph import OntologyReasoner
+from app.schemas.domain import EventType
 from app.graph.runtime import get_ontology_runtime, reset_ontology_runtime_cache
 from app.graph.builders import build_market_graph
 from app.indicators import build_sample_indicators
@@ -90,6 +91,43 @@ class ResearchAndReasoningTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].tickers, ("000660",))
         self.assertEqual(events[0].sentiment, "POSITIVE")
+
+    def test_rss_collector_preserves_configured_macro_event_type(self) -> None:
+        rss = """<?xml version="1.0"?>
+        <rss><channel><item>
+          <title>Federal Reserve policy update</title>
+          <description>Federal funds rate policy statement.</description>
+          <link>https://example.test/macro/1</link>
+          <pubDate>Mon, 10 Aug 2026 09:00:00 GMT</pubDate>
+        </item></channel></rss>"""
+
+        result = RssNewsCollector(FakeClient(rss)).collect_with_articles(
+            "https://example.test/rss",
+            {},
+            fetch_articles=False,
+            event_type=EventType.MACRO,
+        )
+
+        self.assertEqual(result.events[0].event_type, EventType.MACRO)
+
+    def test_tickerless_macro_event_gets_global_market_lineage(self) -> None:
+        event = classify_text_event(
+            title="Federal Reserve policy update",
+            body="Federal funds rate policy statement.",
+            source=source_now("unit", "local://macro", "macro:1"),
+            known_tickers={},
+            event_type=EventType.MACRO,
+        )
+
+        graph = build_market_graph((), (), (event,))
+
+        self.assertTrue(
+            graph.matching(
+                subject="Market:GLOBAL",
+                predicate="hasRecentNews",
+                object_=f"{EventType.MACRO}:{event.event_id}",
+            )
+        )
 
     def test_rss_collector_can_fetch_article_body_and_raw_record(self) -> None:
         rss_url = "https://example.test/rss"

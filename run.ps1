@@ -5,7 +5,12 @@ param(
   [switch]$ForceRestart,
   # Skip the graceful request entirely and kill immediately (last resort, e.g. the
   # server is hung and not answering HTTP).
-  [switch]$HardKill
+  [switch]$HardKill,
+  # Bind to every interface so a phone or the Pi can open the SAME dashboard this
+  # machine sees. Off by default: this server has no authentication of its own and
+  # accepts live-trading and shutdown requests, so reachability and a token are one
+  # decision. A token is generated and printed if APP_ACCESS_TOKEN is not already set.
+  [switch]$External
 )
 
 $ErrorActionPreference = "Stop"
@@ -299,6 +304,28 @@ Stop-WorkspaceRunPyProcesses
 Set-DefaultEnv "PYTHONPATH" "src"
 Set-DefaultEnv "APP_ENV" "local"
 Set-DefaultEnv "APP_PORT" "8010"
+
+# --- External access (opt-in) -------------------------------------------------
+# Without -External nothing here runs and the server stays loopback-only, which
+# is the posture every previous launch had.
+if ($External) {
+  Set-RunEnv "APP_HOST" "0.0.0.0"
+  $accessToken = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
+  if (-not $accessToken -or $accessToken.Length -lt 16) {
+    # Generated per launch rather than persisted: a token written to disk in a
+    # OneDrive-synced repo is a token that leaves this machine.
+    $bytes = New-Object byte[] 24
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $accessToken = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+    Set-RunEnv "APP_ACCESS_TOKEN" $accessToken
+    Write-Host "Generated a one-session access token." -ForegroundColor Cyan
+  }
+  Write-Host ""
+  Write-Host "EXTERNAL ACCESS IS ON." -ForegroundColor Yellow
+  Write-Host "  This server submits REAL orders and accepts shutdown requests." -ForegroundColor Yellow
+  Write-Host "  Anything that can reach this port needs only the token below." -ForegroundColor Yellow
+  Write-Host ""
+}
 Set-DefaultEnv "DATA_ENV" "realtime"
 Set-RunEnv "TRADING_MODE" "live_trading"
 Set-RunEnv "LIVE_TRADING_ENABLED" "true"
@@ -309,6 +336,27 @@ Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
 # To run WITHOUT placing real orders, set this to "true" (then arm via
 # scripts/arm_live_trading.py) or set LIVE_ORDER_SUBMIT_ENABLED "false".
 Set-RunEnv "REQUIRE_MANUAL_ARMING" "false"
+# --- GNN-direct election (operator posture, 2026-08-08) ------------------------------
+# 운영자 결정: GNN 이 고른 전략이 그대로 채택되고 곧바로 실거래로 간다.
+# 이 한 변수가 두 곳을 동시에 바꾼다(플래그 두 개가 어긋나는 상태를 만들지 않으려고
+# 일부러 같은 이름을 쓴다):
+#   * StrategySessionManager — 밴딧의 비관적 하한과 NO_TRADE 선택지를 건너뛰고
+#     GNN 예측 net edge 1등을 그대로 ARM 한다.
+#   * SharedDecisionEngine  — 채택된 전략(strategy_locked)에 한해 ProfitabilityGate 의
+#     거부권을 자문으로 강등한다. 게이트는 계속 돌고 판정도 기록되지만 막지 않는다.
+#     (진단 필드: profitability_gate_bypassed / _overruled_reasons)
+#
+# 켜기 전 실측을 남겨 둔다. 이 posture 가 받아들이는 숫자다:
+#   * GNN 선택의 라이브 전방검증 107건 — positive_net_rate 0.0, 평균 실현 net -62.08bps
+#   * success 헤드 체결 408셀 정확도 61.8% vs 상수 예측기 기준선 84.6%
+#   * counterfactual 16전략 중 14개 net 음수 (KRX intraday_momentum +9.8,
+#     cross_sectional_relative_strength +8.5 만 양수. US 는 전 전략 -33~-66)
+#
+# 그대로 두는 것: RiskManager(주문 자체를 만드는 주체라 우회 대상이 아니다),
+# 숏 SHADOW 사다리, 세션/유동성 판정.
+# 전역 (종목, 전략, 방향) 공동 순위와 NO_TRADE를 사용한다. 종목별 GNN
+# 1등을 먼저 확정하면 최종 밴딧과 다른 목적함수로 전역 우승 조합을 버릴 수 있다.
+Set-RunEnv "STRATEGY_SESSION_GNN_DIRECT_ELECTION" "false"
 # --- Event-driven market-data ingestion (2026-08-04) ---------------------------------
 # 국내·미국 실시간 수집을 event bus + 영속화 워커 경로로 돌린다. 켜면:
 #   * 분 bar 를 in-memory 집계기(IncrementalMinuteBarBuilder)로 만든다 — 메시지마다
@@ -388,11 +436,22 @@ Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.0"
 Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"
 # 세션 앵커: 로테이션에서 제외하고 장 내내 유지하는 소수 종목.
 # 세션 구조 전략(market_intraday_momentum)은 같은 종목의 09:00-09:30과 14:50-15:20을
-# 동시에 필요로 하는데, 수집기는 300초마다 종목을 교체한다. 실측: 저장된 KRX
-# 360 심볼-일 중 두 구간을 모두 가진 것이 단 2건이어서 평가 자체가 불가능했다.
+# 동시에 필요로 하는데, 수집기는 300초마다 종목을 교체한다.
 # 비워 두면 보유/관찰/거래대금 랭킹/상장 유니버스 순으로 세션 앵커를 동적 선정한다.
+#
+# 이 값은 2 였다. 코드 기본값은 8 이고(_realtime_session_anchor_symbols) 그 docstring 은
+# 2가 macro 에 "demonstrably not enough" 라고 명시하는데, Set-DefaultEnv 는 미설정 시에만
+# 적용하므로 런처의 2가 코드의 8을 조용히 되돌리고 있었다. 코드만 읽으면 8로 보인다.
+#
+# 실측(2026-08-08, 저장 분봉 40일): 09:00-09:30 을 가진 KR 심볼-일 182, 14:50-15:20 을
+# 가진 것 303, **둘 다 가진 것 49**. 게다가 최근이 더 나쁘다 — 08-06 은 개장 구간이 0건,
+# 08-07 은 open 28 / close 73 인데 **겹침 0**. 그래서 market_intraday_momentum 과
+# _short 는 40일 학습 구간에서 단 한 번도 발화하지 못했다
+# (STRUCTURALLY_UNREACHABLE:CONTEXT_UNAVAILABLE:FIRST_HALF_HOUR).
+#
+# 앵커 1개당 등록 1건이고(호가+체결 쌍이 아니다) 수집 상한은 40 이므로 8은 여유 안이다.
 Set-DefaultEnv "REALTIME_SESSION_ANCHOR_SYMBOLS" ""
-Set-DefaultEnv "REALTIME_SESSION_ANCHOR_MAX" "2"
+Set-DefaultEnv "REALTIME_SESSION_ANCHOR_MAX" "8"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_LIMIT" "360"
 Set-DefaultEnv "REALTIME_BUY_CANDIDATE_MAX_AGE_SEC" "180"
 Set-DefaultEnv "REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE" "40"
@@ -487,6 +546,8 @@ if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_CLASSIFIER_ENABLED", "
 Set-DefaultEnv "LIVE_REFRESH_SECONDS" "15"
 Set-DefaultEnv "LEARNING_COLLECTION_INTERVAL_SECONDS" "300"
 Set-DefaultEnv "LIVE_RESEARCH_COLLECTION_INTERVAL_SECONDS" "180"
+Set-DefaultEnv "LIVE_EVENT_EVIDENCE_TTL_HOURS" "24"
+Set-DefaultEnv "LIVE_MACRO_EVENT_EVIDENCE_TTL_HOURS" "96"
 Set-DefaultEnv "AUTO_START_LIVE_WORKER" "true"
 Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
@@ -508,6 +569,18 @@ Set-DefaultEnv "INVESTOR_FLOW_REFRESH_SECONDS" "21600"
 Set-DefaultEnv "INVESTOR_FLOW_MINIMUM_BARS" "100"
 Set-DefaultEnv "LIVE_SIGNAL_MODEL_INFERENCE_ENABLED" "true"
 Set-DefaultEnv "RESEARCH_RETENTION_DAYS" "30"
+Set-DefaultEnv "REALTIME_RAW_RETENTION_HOURS" "168"
+Set-DefaultEnv "REALTIME_MINUTE_BAR_RETENTION_DAYS" "45"
+Set-DefaultEnv "REALTIME_PRUNE_BATCH_SIZE" "25000"
+Set-DefaultEnv "RESEARCH_TYPED_MARKET_RETENTION_DAYS" "7"
+Set-DefaultEnv "RESEARCH_TYPED_QUOTE_RETENTION_DAYS" "7"
+Set-DefaultEnv "RESEARCH_TYPED_BAR_RETENTION_DAYS" "45"
+Set-DefaultEnv "RESEARCH_TYPED_SCORE_RETENTION_DAYS" "30"
+Set-DefaultEnv "RESEARCH_PRUNE_BATCH_SIZE" "10000"
+Set-DefaultEnv "ACCOUNT_DASHBOARD_RETENTION_DAYS" "90"
+Set-DefaultEnv "ACCOUNT_TRADE_RETENTION_DAYS" "365"
+Set-DefaultEnv "ACCOUNT_DASHBOARD_RAW_PAYLOAD_KEEP" "10"
+Set-DefaultEnv "ACCOUNT_DASHBOARD_PRUNE_BATCH_SIZE" "250"
 Set-DefaultEnv "ANALYSIS_MARKET_LIMIT" "300"
 Set-DefaultEnv "ONTOLOGY_NPU_BATCH_SIZE" "4096"
 Set-DefaultEnv "ONTOLOGY_FILTER1_TARGET_COUNT" "80"
@@ -583,6 +656,32 @@ try {
   Write-Host "Web UI: $url"
   Write-Host "Account dashboard: $launchUrl"
   Write-Host "Server logs: $serverOutLog"
+
+  if ($External) {
+    # The address a phone can actually open — "0.0.0.0" is not one. Printed with
+    # the token attached because the first request from a browser cannot set a
+    # header; the server turns that one query parameter into a cookie.
+    $lanAddress = (
+      Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object {
+          $_.IPAddress -notlike "127.*" -and
+          $_.IPAddress -notlike "169.254.*" -and
+          $_.PrefixOrigin -in @("Dhcp", "Manual")
+        } |
+        Select-Object -First 1 -ExpandProperty IPAddress
+    )
+    if ($lanAddress) {
+      $token = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
+      Write-Host ""
+      Write-Host "Open this on the other device (same dashboard as here):" -ForegroundColor Cyan
+      Write-Host "  http://${lanAddress}:${port}/account?token=$token" -ForegroundColor Cyan
+      Write-Host ""
+      Write-Host "If it does not load, Windows Firewall is blocking the port. Allow it once:" -ForegroundColor DarkGray
+      Write-Host "  New-NetFirewallRule -DisplayName 'private app $port' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -Profile Private" -ForegroundColor DarkGray
+    } else {
+      Write-Host "Could not determine a LAN address for this machine." -ForegroundColor Yellow
+    }
+  }
 
   $browserExe = if ($Headless) { $null } else { Find-BrowserExecutable }
   if ($Headless) {

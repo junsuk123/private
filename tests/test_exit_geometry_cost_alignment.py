@@ -24,6 +24,7 @@ from app.strategy.exit_geometry import (
     all_geometries,
     exit_geometry,
     label_geometries,
+    resolve_exit_geometry,
 )
 
 # Every catalogued strategy plus the adopted-position fallback.
@@ -105,6 +106,87 @@ def test_net_ratio_degrades_on_a_costlier_venue() -> None:
     """
     geometry = exit_geometry("intraday_momentum")
     assert geometry.net_reward_risk_ratio(67.0) < geometry.net_reward_risk_ratio(28.0)
+
+
+# --- Cost-relative resolution ---------------------------------------------- #
+# The gap the tests above could not see: every assertion in this file is made at
+# REFERENCE_ROUND_TRIP_COST_BPS, which is KRX's 28. The table passed all of them
+# while being applied, unchanged, to a US tape whose measured median round trip is
+# 63.2bps (p90 125.2) across the 775 stored shadow fills. There it delivered a net
+# reward:risk of 0.83 against the 1.5 asserted above — a break-even win rate of 55%
+# instead of 40%, which is why no arm evaluated on that tape could ever pass.
+
+
+@pytest.mark.parametrize("strategy_id", ALL_KEYS)
+@pytest.mark.parametrize("cost_bps", (28.0, 52.0, 63.2, 79.6, 125.2))
+def test_resolved_geometry_holds_the_invariant_at_the_measured_cost(
+    strategy_id: str, cost_bps: float
+) -> None:
+    """net R:R must be ~1.5 at the cost actually paid, not only at the reference."""
+    geometry = resolve_exit_geometry(strategy_id, round_trip_cost_bps=cost_bps)
+    net = geometry.net_reward_risk_ratio(cost_bps)
+    assert net >= TARGET_NET_REWARD_RISK - 0.05, (
+        f"{strategy_id} nets {net:.2f} reward:risk at a measured {cost_bps}bps "
+        f"round trip, below the {TARGET_NET_REWARD_RISK} the table is built on"
+    )
+
+
+@pytest.mark.parametrize("spread_bps", (5.0, 20.0, 35.0, 60.0))
+def test_resolved_stop_clears_three_measured_spreads(spread_bps: float) -> None:
+    """The 'outside the spread' rule, against THIS symbol's spread.
+
+    ``MINIMUM_STOP_BPS`` encodes 3 x a *typical KRX* spread. On a wider name that
+    constant is back inside the spread, which is the original defect one venue over.
+    """
+    geometry = resolve_exit_geometry(
+        "intraday_momentum", round_trip_cost_bps=63.2, spread_bps=spread_bps
+    )
+    assert geometry.stop_loss_bps >= min(MINIMUM_STOP_BPS, 3.0 * spread_bps)
+    assert geometry.stop_loss_bps >= 3.0 * spread_bps or spread_bps * 3.0 <= MINIMUM_STOP_BPS
+    assert geometry.trailing_bps < geometry.stop_loss_bps
+
+
+@pytest.mark.parametrize("strategy_id", ALL_KEYS)
+def test_unmeasured_resolution_returns_the_table_verbatim(strategy_id: str) -> None:
+    """No measurement means no change: every existing caller keeps its numbers."""
+    assert resolve_exit_geometry(strategy_id) == exit_geometry(strategy_id)
+
+
+def test_krx_reference_measurement_reproduces_the_table() -> None:
+    """The table IS the formula at the KRX reference, so this must be an identity.
+
+    If it ever stops being one, either the table was hand-edited off its own rule or
+    the resolver drifted from it.
+
+    Note the shorts pass here while being handed the LONG reference: the resolver
+    floors every cost at ``reference_round_trip_cost_bps``, which carries the borrow
+    leg for a short. That floor is load-bearing — a measured cost that omitted borrow
+    would otherwise size a short's target as if it were a long.
+    """
+    for strategy_id, table in all_geometries().items():
+        resolved = resolve_exit_geometry(
+            strategy_id,
+            round_trip_cost_bps=REFERENCE_ROUND_TRIP_COST_BPS,
+            spread_bps=TYPICAL_SPREAD_BPS,
+        )
+        assert resolved.stop_loss_bps == table.stop_loss_bps, strategy_id
+        assert resolved.take_profit_bps == table.take_profit_bps, strategy_id
+        assert resolved.max_holding_seconds == table.max_holding_seconds, strategy_id
+
+
+def test_time_boxed_horizons_are_never_stretched() -> None:
+    """A session-structure clock is the thesis, not a leash on it.
+
+    Stretching it to make room for a larger target would carry the position past the
+    auction the thesis is defined against.
+    """
+    for strategy_id in ("market_intraday_momentum", "overnight_gap_carry"):
+        table = exit_geometry(strategy_id)
+        resolved = resolve_exit_geometry(
+            strategy_id, round_trip_cost_bps=125.2, spread_bps=35.0
+        )
+        assert resolved.take_profit_bps > table.take_profit_bps
+        assert resolved.max_holding_seconds == table.max_holding_seconds
 
 
 def test_idle_session_placeholders_match_the_fallback_geometry() -> None:

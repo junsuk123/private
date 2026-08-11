@@ -120,7 +120,38 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     # strategy_terminal.js against a changed payload contract. There were two
     # markers here from successive features; the older one only recorded which
     # release last touched the file, and every bump broke it.
-    assert "20260804-gnn-activation-1" in page.text
+    assert "20260810-market-physics-3" in page.text
+
+
+def test_graph_polling_updates_existing_scene_instead_of_recreating_it() -> None:
+    script = (
+        Path(__file__).parents[1] / "src" / "app" / "static" / "strategy_terminal.js"
+    ).read_text(encoding="utf-8")
+
+    assert "gnn3dState.updateData(data)" in script
+    assert "requestId !== terminalState.gnnGraphRequestId" in script
+    assert "terminalState.ontologySignature === graphSignature" in script
+    # A new inference is dynamic state, not a topology change. Including it in
+    # the scene signature caused the WebGL canvas to be torn down every poll.
+    topology_signature = script.split("function prepareGnnGraph(data)", 1)[1].split(
+        "function bindGnnControls", 1
+    )[0]
+    signature_assignment = topology_signature.split("const signature =", 1)[1].split(";", 1)[0]
+    assert "latest_at" not in signature_assignment
+
+
+def test_graph_physics_uses_live_microstructure_without_faking_inference() -> None:
+    script = (
+        Path(__file__).parents[1] / "src" / "app" / "static" / "strategy_terminal.js"
+    ).read_text(encoding="utf-8")
+
+    assert "micro.return_5s" in script
+    assert "micro.aggressor_imbalance_5s" in script
+    assert "micro.spread_change_5s_bps" in script
+    assert "refreshGnnMarketForces();" in script
+    assert "spring.baseSag * Number(forces.gravity || 1)" in script
+    assert "ambientEnergy * (.16 + Number(link.learned_strength || 0) * .24)" in script
+    assert "(!link.kind || link.kind === 'topology')" in script
 
 
 def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:

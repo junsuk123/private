@@ -12,6 +12,12 @@ from app.config.refactor_flags import RefactorFeatureFlags
 from app.data.event_pipeline import BoundedMarketEventBus, EventDrivenMarketRuntime
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
 from app.data.realtime_store import RealtimeMarketDataStore
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_DIM,
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+    StrategyGraphContextError,
+    build_strategy_graph_context,
+)
 from app.routing.shadow_intelligence import (
     STRATEGY_IDS,
     ShadowIntelligenceService,
@@ -76,7 +82,7 @@ async def run_event_driven_kis_websocket_collector(
     flags = RefactorFeatureFlags.from_env()
     slow_service = (
         ShadowIntelligenceService(
-            feature_dim=28,
+            feature_dim=STRATEGY_GRAPH_CONTEXT_DIM,
             enable_npu_comparison=flags.npu_inference,
         )
         if flags.ontology_router or flags.gnn_shadow
@@ -186,24 +192,14 @@ def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapsho
     features = state.features(now, staleness_ms=5_000)
     if features is None:
         return None
-    values = (
-        features.last_price / 100_000,
-        (features.mid or features.last_price) / 100_000,
-        (features.spread_bps or 0) / 100,
-        (features.microprice or features.last_price) / 100_000,
-        features.orderbook_imbalance or 0,
-        features.order_flow_imbalance / 10_000,
-        features.aggressor_trade_imbalance,
-        features.vwap / 100_000,
-        features.realized_volatility * 100,
-        1.0 if features.fresh else 0.0,
-        1.0 if features.sequence_uncertain else 0.0,
-        1.0,
+    values = _runtime_strategy_graph_context(
+        runtime,
+        event.symbol,
+        now,
+        features.last_price,
     )
-    rvgi_box = _runtime_rvgi_box_features(runtime, event.symbol, now, features.last_price)
-    values = (*values, *rvgi_box)
-    is_krx = event.symbol.isdigit() and len(event.symbol) == 6
-    values = (*values, 1.0 if is_krx else 0.0)
+    if values is None:
+        return None
     return SlowIntelligenceSnapshot(
         snapshot_id=f"{event.symbol}:{event.record_id}",
         symbol=event.symbol,
@@ -214,40 +210,37 @@ def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapsho
         data_fresh=features.fresh,
         tradable=features.fresh and not features.sequence_uncertain,
         allowed_strategy_ids=STRATEGY_IDS,
-        feature_schema_name="realtime_strategy_graph_v4_market",
+        feature_schema_name=STRATEGY_GRAPH_CONTEXT_SCHEMA,
+        reference_price=max(0.0, float(features.last_price)),
     )
 
 
-def _runtime_rvgi_box_features(
+def _runtime_strategy_graph_context(
     runtime: EventDrivenMarketRuntime,
     symbol: str,
     now: datetime,
     last_price: float,
-) -> tuple[float, ...]:
-    """Normalized completed-bar descriptors appended to the GNN snapshot."""
+) -> tuple[float, ...] | None:
+    """Build the same completed-minute-bar context used in training and web inference."""
     if runtime.store is None or last_price <= 0:
-        return (0.0,) * 15
+        return None
     try:
-        from app.features.live_feature_frame import _rvgi_box_columns
+        from app.features.live_feature_frame import (
+            _rvgi_box_columns,
+            _slow_context_bars,
+            _strategy_graph_context_columns,
+        )
 
-        row = _rvgi_box_columns(runtime.store, symbol, now, last_price)
-    except Exception:  # noqa: BLE001 - missing bar history is an explicit mask.
-        return (0.0,) * 15
-    scale = max(float(last_price), 1e-12)
-    return (
-        float(row["rvgi_available"]),
-        float(row["rvgi"]),
-        float(row["rvgi_signal"]),
-        float(row["rvgi_diff"]),
-        float(row["rvgi_slope"]),
-        float(row["rvgi_bullish_cross"]),
-        float(row["box_available"]),
-        float(row["box_high"]) / scale,
-        float(row["box_low"]) / scale,
-        float(row["box_mid"]) / scale,
-        float(row["box_width_pct"]),
-        float(row["box_position"]),
-        float(row["breakout_distance_bps"]) / 100.0,
-        float(row["box_previous_close"]) / scale,
-        1.0 if float(row["box_context_timestamp_epoch"]) > 0 else 0.0,
-    )
+        rvgi_box = _rvgi_box_columns(runtime.store, symbol, now, last_price)
+        bar_set, rows = _slow_context_bars(runtime.store, symbol, now)
+        columns = _strategy_graph_context_columns(
+            bar_set,
+            rows,
+            symbol=symbol,
+            rvgi_box=rvgi_box,
+        )
+        if not columns:
+            return None
+        return build_strategy_graph_context(columns)
+    except (StrategyGraphContextError, TypeError, ValueError):
+        return None

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 #: Where the chosen universe lives so a restart does not reshuffle it.
@@ -31,6 +31,13 @@ class UniverseDecision:
     dropped: tuple[str, ...] = ()
     retained: tuple[str, ...] = ()
     note: str = ""
+    #: Listed names for the chosen symbols, persisted so a restart can re-apply the
+    #: instrument filter without a live ranking fetch. Without this the session-locked
+    #: path has no name to classify by and an untradable incumbent survives the day.
+    names: dict[str, str] = field(default_factory=dict)
+    #: Instruments removed because the account may not trade them, as
+    #: ``InstrumentVerdict.as_dict()`` rows. Reported rather than silently dropped.
+    excluded: tuple[dict[str, Any], ...] = ()
 
 
 def _today(now: datetime | None = None) -> str:
@@ -54,6 +61,14 @@ def save_state(decision: UniverseDecision, path: Path = DEFAULT_STATE_PATH) -> N
                     "symbols": list(decision.symbols),
                     "source": decision.source,
                     "note": decision.note,
+                    # Names for the chosen symbols only, so the file does not grow
+                    # into a rolling cache of everything ever ranked.
+                    "names": {
+                        symbol: decision.names[symbol]
+                        for symbol in decision.symbols
+                        if symbol in decision.names
+                    },
+                    "excluded": list(decision.excluded),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -73,6 +88,9 @@ def resolve_universe(
     state: dict[str, Any] | None = None,
     size: int = DEFAULT_UNIVERSE_SIZE,
     hysteresis_multiplier: float = DEFAULT_HYSTERESIS_MULTIPLIER,
+    names: Mapping[str, str] | None = None,
+    derivatives_allowed: bool = False,
+    leverage_etf_allowed: bool = False,
 ) -> UniverseDecision:
     """Hold one KRX universe for the whole session instead of re-picking it.
 
@@ -98,11 +116,54 @@ def resolve_universe(
     ``ranked_symbols`` is expected most-liquid-first. Returns the previous session's
     set unchanged when the ranking is unavailable: a stale universe still has depth,
     an empty one has nothing.
+
+    Instrument eligibility is applied to the INCUMBENTS as well as to the fresh
+    ranking, and that is the load-bearing half. Session locking and hysteresis both
+    exist to keep a name once it is chosen, so an untradable instrument that got in
+    before the filter existed would otherwise hold its slot for the rest of the
+    session — which is exactly the state the 2026-08-11 universe was found in, six
+    leveraged ETPs deep. Filtering only the fresh ranking would have left it there.
     """
+    from app.data.instrument_eligibility import filter_tradable
+
     session = _today(now)
     state = state if state is not None else {}
-    previous = tuple(str(s) for s in (state.get("symbols") or ()))
-    ranked = tuple(dict.fromkeys(str(s).strip() for s in ranked_symbols if str(s).strip()))
+    # Names from this refresh win; the persisted ones cover incumbents that are no
+    # longer in the ranking and would otherwise be unclassifiable.
+    resolved_names: dict[str, str] = {
+        str(k).strip().upper(): str(v)
+        for k, v in (state.get("names") or {}).items()
+        if str(v or "").strip()
+    }
+    resolved_names.update(
+        {
+            str(k).strip().upper(): str(v)
+            for k, v in (names or {}).items()
+            if str(v or "").strip()
+        }
+    )
+
+    def _permitted(symbols: Sequence[str]) -> tuple[tuple[str, ...], tuple[Any, ...]]:
+        return filter_tradable(
+            symbols,
+            resolved_names,
+            market="KR",
+            derivatives_allowed=derivatives_allowed,
+            leverage_etf_allowed=leverage_etf_allowed,
+        )
+
+    previous_raw = tuple(str(s) for s in (state.get("symbols") or ()))
+    previous, previous_excluded = _permitted(previous_raw)
+    ranked_raw = tuple(dict.fromkeys(str(s).strip() for s in ranked_symbols if str(s).strip()))
+    ranked, ranked_excluded = _permitted(ranked_raw)
+    excluded_rows = tuple(
+        verdict.as_dict()
+        for verdict in {
+            verdict.symbol: verdict for verdict in (*previous_excluded, *ranked_excluded)
+        }.values()
+    )
+
+    purged = tuple(s for s in previous_raw if s not in set(previous))
 
     if not ranked:
         if previous:
@@ -111,19 +172,60 @@ def resolve_universe(
                 str(state.get("session_date") or session),
                 "carried_over",
                 retained=previous,
+                dropped=purged,
                 note="ranking unavailable; kept previous universe for its history",
+                names=resolved_names,
+                excluded=excluded_rows,
             )
-        return UniverseDecision((), session, "empty", note="no ranking and no prior universe")
+        return UniverseDecision(
+            (), session, "empty",
+            dropped=purged,
+            note="no ranking and no prior universe",
+            names=resolved_names,
+            excluded=excluded_rows,
+        )
 
     if previous and str(state.get("session_date") or "") == session:
         # Same session: the universe is already decided. Re-picking mid-session is
         # exactly the behaviour being removed.
+        #
+        # One exception, and only one: slots vacated by an instrument the account
+        # cannot trade. Those slots were never going to produce a candidate, so
+        # refilling them is not the churn this module fights — it is recovering
+        # capacity that was only ever nominal. The refill is written back
+        # immediately, so the added names become incumbents and the next refresh
+        # takes the plain locked path instead of topping up again.
+        if purged and len(previous) < size:
+            backfilled = list(previous)
+            for symbol in ranked:
+                if len(backfilled) >= size:
+                    break
+                if symbol not in backfilled:
+                    backfilled.append(symbol)
+            if len(backfilled) > len(previous):
+                return UniverseDecision(
+                    tuple(backfilled),
+                    session,
+                    "session_locked",
+                    added=tuple(s for s in backfilled if s not in set(previous)),
+                    dropped=purged,
+                    retained=previous,
+                    note=(
+                        f"purged {len(purged)} untradable instrument(s) and refilled "
+                        f"the vacated slots for session {session}"
+                    ),
+                    names=resolved_names,
+                    excluded=excluded_rows,
+                )
         return UniverseDecision(
             previous,
             session,
             "session_locked",
             retained=previous,
+            dropped=purged,
             note="universe already chosen for this session",
+            names=resolved_names,
+            excluded=excluded_rows,
         )
 
     head = list(ranked[:size])
@@ -151,9 +253,11 @@ def resolve_universe(
         session,
         "reselected",
         added=tuple(s for s in selected if s not in previous_set),
-        dropped=tuple(s for s in previous if s not in selected_set),
+        dropped=tuple(dict.fromkeys((*purged, *(s for s in previous if s not in selected_set)))),
         retained=tuple(s for s in selected if s in previous_set),
         note=f"held for session {session}",
+        names=resolved_names,
+        excluded=excluded_rows,
     )
 
 

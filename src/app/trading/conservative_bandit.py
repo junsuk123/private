@@ -247,6 +247,12 @@ class ArmEvaluation:
     execution_product: str = "CASH"
     deployment_state: str = "SHADOW"
     borrow_available: bool | None = None
+    # How much of ``posterior_mean_net_bps`` came from THIS symbol's own history
+    # rather than the strategy's pooled history. Reported so a pair losing to another
+    # pair of the same strategy has a visible reason.
+    symbol_sample_count: int = 0
+    symbol_mean_net_bps: float | None = None
+    symbol_weight: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -265,6 +271,13 @@ class ArmEvaluation:
             "history_weight": round(self.history_weight, 4),
             "sample_count": self.sample_count,
             "effective_sample_count": round(self.effective_sample_count, 3),
+            "symbol_sample_count": self.symbol_sample_count,
+            "symbol_mean_net_bps": (
+                round(self.symbol_mean_net_bps, 3)
+                if self.symbol_mean_net_bps is not None
+                else None
+            ),
+            "symbol_weight": round(self.symbol_weight, 4),
             "loss_streak": self.loss_streak,
             "admissible": self.admissible,
             "shadow_only": self.shadow_only,
@@ -383,15 +396,24 @@ class BanditConfig:
     # has a large uncertainty penalty, so nothing is ever selected, so no history
     # is ever accumulated. That is a deadlock, not caution.
     #
-    # An arm with at most ``cold_start_max_sample_count`` samples and NO losing
-    # streak may therefore be selected on its forward-looking edge alone, flagged
-    # as exploration so sizing can keep it minimal. The important asymmetry: an arm
-    # whose MEASURED history is negative is never explored — it has already
-    # answered the question, and "keep trying it" is exactly the failure mode this
-    # module exists to prevent.
+    # An arm with at most ``cold_start_max_sample_count`` samples and a losing
+    # streak within ``cold_start_max_loss_streak`` may therefore be selected on its
+    # forward-looking edge alone, flagged as exploration so sizing can keep it
+    # minimal. The important asymmetry: an arm whose MEASURED history is negative
+    # over enough samples is never explored — it has already answered the question,
+    # and "keep trying it" is exactly the failure mode this module exists to
+    # prevent.
     cold_start_exploration_enabled: bool = True
     cold_start_max_sample_count: int = 3
     cold_start_min_predicted_edge_bps: float = 5.0
+    # How many recent consecutive losses a still-cold arm may carry and remain
+    # explorable. This used to be an implicit 0, which made a SINGLE losing outcome
+    # terminal: the arm was no longer explorable (streak > 0) and not yet
+    # exploitable (negative posterior), and neither could change because only a
+    # selection produces the sample that would clear the streak. One loss inside
+    # the first three trades is a coin flip, not an answer; two in a row starts to
+    # be one, and the measured-negative check below still catches a warm arm.
+    cold_start_max_loss_streak: int = 1
     # --- Direction penalties (bps) ---------------------------------------------
     # Charged to SHORT arms on top of the statistical and context penalties, to
     # cover the asymmetry the realized posterior cannot see: an unbounded and
@@ -450,6 +472,12 @@ class BanditConfig:
             cold_start_min_predicted_edge_bps=_env_float(
                 "BANDIT_COLD_START_MIN_PREDICTED_EDGE_BPS",
                 cls.cold_start_min_predicted_edge_bps,
+            ),
+            cold_start_max_loss_streak=max(
+                0,
+                _env_int(
+                    "BANDIT_COLD_START_MAX_LOSS_STREAK", cls.cold_start_max_loss_streak
+                ),
             ),
             short_direction_penalty_bps=max(
                 0.0,
@@ -596,6 +624,15 @@ class ConservativeStrategyBandit:
         # pair making 60bps long and losing 60bps short reads as break-even — and
         # therefore as permanently untradable in both directions — while a genuine
         # one-sided edge is diluted into invisibility.
+        # ``symbol`` conditions the posterior; it does not partition it. What this
+        # module elects is a (symbol, strategy) PAIR, and until now the realized half
+        # of the pair's score was symbol-blind — every candidate for a given strategy
+        # got the same pooled mean, so the ranking could only ever discriminate
+        # between pairs through the forward-looking estimate. The pooled mean hides a
+        # real effect: across the 19 symbols with enough fills to measure, one
+        # strategy's per-symbol means span 151bps, of which 25bps sd survives after
+        # subtracting sampling noise. See ``StrategyPerformanceStore.posterior`` for
+        # why this is a shrinkage rather than a split.
         posterior: StrategyPosterior = self.store.posterior(
             candidate.arm,
             market=market,
@@ -603,6 +640,7 @@ class ConservativeStrategyBandit:
             change_point_probability=change_point,
             direction=str(candidate.direction),
             execution_product=str(candidate.execution_product),
+            symbol=candidate.symbol,
         )
         reasons.extend(posterior.reason_codes)
 
@@ -670,7 +708,7 @@ class ConservativeStrategyBandit:
         cold = (
             cfg.cold_start_exploration_enabled
             and posterior.sample_count <= cfg.cold_start_max_sample_count
-            and posterior.loss_streak == 0
+            and posterior.loss_streak <= cfg.cold_start_max_loss_streak
         )
         exploration = bool(
             cold
@@ -754,6 +792,9 @@ class ConservativeStrategyBandit:
             history_weight=history_weight,
             sample_count=posterior.sample_count,
             effective_sample_count=posterior.effective_sample_count,
+            symbol_sample_count=posterior.symbol_sample_count,
+            symbol_mean_net_bps=posterior.symbol_mean_net_bps,
+            symbol_weight=posterior.symbol_weight,
             loss_streak=posterior.loss_streak,
             admissible=admissible,
             shadow_only=shadow_only and not admissible,

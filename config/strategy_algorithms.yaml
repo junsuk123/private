@@ -27,6 +27,14 @@
 # 변동성 게이트는 논문의 최강 조건이면서 동시에 비용 조건이다 — 조용한 날의
 # 마지막 30분은 33bps를 움직이지 않는다. 15:20 종가 단일가 전에 반드시 청산.
 market_intraday_momentum:
+  # Shadow-only. It has never produced a single training row -- the session clock
+  # it reads was hardcoded to KRX, so on US it looked for the opening range while
+  # the US market was shut, and on KRX no symbol carried both session windows.
+  # That clock is fixed now, which means tonight is the FIRST time this can fire.
+  # Granting live authority to a thesis on the same night it becomes able to act,
+  # with zero forward outcomes behind it, is exactly what the deployment ladder
+  # exists to prevent.
+  live_authorized: false
   min_first_half_hour_return_bps: 15.0
   min_first_half_hour_volatility_percentile: 0.6
   max_change_point_probability: 0.5
@@ -49,7 +57,10 @@ shared:
   # Never raise above 1.0; there is deliberately no fabricated alpha floor.
   capture_fraction: 0.5
   # Minimum ticks in the 5s window before any mechanical trigger may fire.
-  min_tick_count_5s: 3.0
+  # HDFSCNT0 quiet-name cadence is commonly two distinct prints per 5 seconds.
+  # Two is enough for a causal return and quote/tick-rule flow direction; the
+  # cost-aware edge floor still rejects low-information/low-move setups.
+  min_tick_count_5s: 2.0
   # Absolute lower bound, used only when the cost config cannot be read. It is
   # NOT the operative floor: with cost_aware_floor_enabled the floor becomes
   # round_trip_cost * cost_floor_multiple + min_net_buffer_bps, resolved per
@@ -82,7 +93,8 @@ intraday_momentum:
 # Structural range break; stop sits at the broken level, not at a bps constant.
 breakout_volume:
   min_volume_spike_ratio: 1.5
-  acceptance_return_1s_bps: 0.0
+  min_breakout_excess_bps: 2.0
+  acceptance_return_5s_bps: 1.0
   min_aggressor_imbalance: 0.05
   horizon_seconds: 300.0
   stop_buffer_bps: 8.0
@@ -92,18 +104,49 @@ breakout_volume:
 # Displacement below VWAP; target is VWAP itself, never an arbitrary bps target.
 vwap_mean_reversion:
   entry_deviation_bps: 25.0
+  max_entry_deviation_bps: 150.0
+  max_entry_zscore: 4.0
   max_rsi: 38.0
   max_percent_b: 0.22
+  min_recovery_return_5s_bps: 1.0
+  min_aggressor_imbalance: 0.05
+  min_book_improvement: 0.0
   horizon_seconds: 240.0
+  max_horizon_seconds: 5400.0
   stop_volatility_multiple: 2.0
   target_capture_fraction: 0.7
   trailing_bps: 10.0
+
+# Slow-bar recovery for sparse premarket tapes. Unlike vwap_mean_reversion this
+# does not infer recovery from sub-second prints: a completed one-minute bar must
+# reclaim the fast EMA while MACD turns positive. Live deployment is enabled;
+# the common GNN trust, profitability, bandit, account-risk and session gates
+# still have to pass before an order can be submitted.
+bar_confirmed_vwap_recovery:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: true
+  min_displacement_bps: 75.0
+  max_displacement_zscore: 15.0
+  max_rsi: 45.0
+  min_macd_histogram: 0.0
+  min_momentum_persistence: 0.30
+  min_liquidity_score: 0.40
+  max_spread_bps: 25.0
+  target_capture_fraction: 0.50
+  stop_volatility_multiple: 2.5
+  trailing_bps: 30.0
+  horizon_seconds: 5400.0
+  # Equal to horizon_seconds: the structural-edge clock resolves to the base
+  # horizon unless this is deliberately raised.
+  max_horizon_seconds: 5400.0
 
 # Mechanical sub-minute drop; requires the spread to be contracting again.
 liquidity_shock_reversal:
   enabled: true
   shadow_enabled: true
-  live_authorized: false
+  live_authorized: true
   shock_return_10s_bps: -40.0
   max_spread_change_5s: 0.0
   min_aggressor_imbalance: -0.35
@@ -120,6 +163,7 @@ liquidity_shock_reversal:
   max_absorption_spread_change_5s: 0.0
   absorption_capture_fraction: 0.35
   absorption_horizon_seconds: 600
+  max_absorption_horizon_seconds: 3600
 
 # TTL-bounded repricing. Requires a point-in-time event feed; without one the
 # algorithm fails closed rather than guessing freshness.
@@ -155,7 +199,7 @@ rvgi_box_breakout:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: false
+  live_authorized: true
   rvgi_period: 10
   box_lookback: 20
   cross_confirm_bars: 3
@@ -174,10 +218,8 @@ rvgi_box_breakout:
   horizon_seconds: 300
 
 # --- Added for the current high-volatility, flow-driven tape -----------------
-# All three start with live_authorized: false. They run in shadow so the strategy
-# performance store accumulates per-regime realized outcomes; the conservative
-# bandit cannot give an arm a positive lower bound without those samples, so
-# flipping live_authorized early would only produce a NO_TRADE anyway.
+# Deployment authorization is enabled. The common conservative bandit and
+# profitability gates still reject arms without a positive cost-adjusted edge.
 
 # Market/sector-neutral leadership. Requires residual returns and an investor-flow
 # z-score from the electing layer; without them it fails closed rather than
@@ -187,7 +229,7 @@ residual_relative_strength:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: false
+  live_authorized: true
   min_residual_short_bps: 5.0
   min_residual_long_bps: 0.0
   max_sector_rank: 3.0
@@ -208,7 +250,7 @@ adaptive_anchored_vwap_reversion:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: false
+  live_authorized: true
   min_entry_zscore: 2.0
   max_entry_zscore: 6.0
   min_displacement_bps: 15.0
@@ -229,7 +271,7 @@ ofi_microprice_exhaustion_reversal:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: false
+  live_authorized: true
   shock_return_10s_bps: -35.0
   min_depth_ratio: 1.1
   min_orderbook_imbalance: 0.05
@@ -302,3 +344,23 @@ indicator_families:
     rsi_period: 14
     stochastic: {period: 14, signal: 3}
     williams_r_period: 14
+
+# Overnight gap carry: the only window whose move clears a US round trip.
+# Measured on the stored US tape -- median |move| 6.7bps over 3 minutes, 16.4 over
+# 30, and 69.1 over the overnight gap against a 51.2bps round trip. Magnitude is
+# measured; DIRECTION is not (unconditional overnight mean +15.6bps, below cost),
+# so this is shadow-only until forward outcomes say otherwise.
+overnight_gap_carry:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  overnight_variance_minutes: 532.0
+  max_minutes_to_close: 20.0
+  min_vwap_premium_bps: 10.0
+  min_momentum_persistence: 0.55
+  min_aggressor_imbalance: 0.10
+  max_change_point_probability: 0.5
+  stop_volatility_multiple: 3.0
+  trailing_bps: 45.0
+  horizon_seconds: 64800.0

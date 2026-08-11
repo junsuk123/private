@@ -94,14 +94,31 @@ def fetch_domestic_ranking_symbols(
     *,
     sources: tuple[str, ...] = ("volume_rank", "fluctuation", "volume_power"),
     max_symbols: int = 30,
+    derivatives_allowed: bool = False,
+    leverage_etf_allowed: bool = False,
 ) -> dict[str, Any]:
     """Fetch KRX buy-discovery candidates from KIS domestic ranking APIs.
 
     KIS returns at most 30 rows per ranking endpoint. This combines the official
     volume, fluctuation, and volume-power rankings so the realtime engine has
     fresh domestic names beyond held symbols and the static collection list.
+
+    Instruments the account cannot trade are removed HERE rather than downstream,
+    because this is the only place their listed name is available: every ranking row
+    carries ``hts_kor_isnm`` beside the code, and there is no arithmetic on a 6-digit
+    KRX code that separates KODEX 레버리지 from KODEX 200.
+
+    This matters more than it sounds. A turnover ranking is exactly where leveraged
+    and inverse ETPs concentrate — they are the highest-beta way to express an index
+    view — and on the 2026-08-11 session 12 of the 30 top-turnover names were
+    leveraged ETPs or ETNs, none of them orderable without the 기본예탁금 and
+    사전 의무교육. Discovery was reading the code out of each row and discarding the
+    name, so they went into the universe and occupied slots for the whole session.
     """
+    from app.data.instrument_eligibility import excluded_summary, filter_tradable
+
     selected: list[str] = []
+    names: dict[str, str] = {}
     errors: dict[str, str] = {}
     for source in sources:
         key = str(source or "").strip().lower()
@@ -120,10 +137,48 @@ def fetch_domestic_ranking_symbols(
             symbol = _extract_domestic_symbol(row, spec.symbol_keys)
             if symbol:
                 selected.append(symbol)
+                name = _extract_domestic_name(row)
+                if name:
+                    names.setdefault(symbol, name)
     unique = tuple(dict.fromkeys(selected))
+    # Filter BEFORE truncating to ``max_symbols``: dropping afterwards would let the
+    # excluded names consume slots and hand back a short universe.
+    permitted, excluded = filter_tradable(
+        unique,
+        names,
+        market="KR",
+        derivatives_allowed=derivatives_allowed,
+        leverage_etf_allowed=leverage_etf_allowed,
+    )
     if max_symbols > 0:
-        unique = unique[:max_symbols]
-    return {"symbols": unique, "errors": errors, "ok": not errors}
+        permitted = permitted[:max_symbols]
+    return {
+        "symbols": permitted,
+        "errors": errors,
+        "ok": not errors,
+        # Reported, not just dropped: a universe that silently halves is
+        # indistinguishable from a broken ranking feed.
+        "excluded": tuple(verdict.as_dict() for verdict in excluded),
+        "excluded_counts": excluded_summary(excluded),
+        "names": names,
+    }
+
+
+#: KIS returns the listed name under a different key per ranking endpoint.
+_DOMESTIC_NAME_KEYS: tuple[str, ...] = (
+    "hts_kor_isnm",
+    "prdt_name",
+    "prdt_abrv_name",
+    "kor_isnm",
+)
+
+
+def _extract_domestic_name(row: dict[str, Any]) -> str:
+    for key in _DOMESTIC_NAME_KEYS:
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _ranking_rows(data: dict[str, Any]) -> tuple[dict[str, Any], ...]:

@@ -234,6 +234,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _gnn_direct_election_enabled() -> bool:
+    """Operator posture: the GNN's strategy pick reaches execution unre-judged.
+
+    Deliberately the SAME variable that switches ``StrategySessionConfig``, not a
+    second flag. Two switches for one posture can disagree, and the disagreeing
+    state -- elect directly but still veto downstream -- is the one nobody wants
+    and nobody would notice.
+
+    Read per call rather than cached so the posture can be turned off without a
+    restart; a live account must not need a redeploy to restore a gate.
+    """
+    return _env_bool("STRATEGY_SESSION_GNN_DIRECT_ELECTION", False)
+
+
 def _account_domestic_unrealized_rate(account: AccountSnapshot) -> float:
     cost = 0.0
     pnl = 0.0
@@ -1136,7 +1150,17 @@ class SharedLiveDecisionEngine:
                 account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
             )
         )
-        if not profitability_decision.allowed:
+        # Under the GNN-direct posture the gate is demoted to advisory for an
+        # ELECTED strategy: it still runs and its verdict is still recorded, but it
+        # no longer vetoes. Scoped to ``strategy_locked`` on purpose -- the operator
+        # asked for the GNN's pick to reach execution, not for unrelated fallback
+        # buys to stop being judged.
+        profitability_bypassed = (
+            not profitability_decision.allowed
+            and strategy_locked
+            and _gnn_direct_election_enabled()
+        )
+        if not profitability_decision.allowed and not profitability_bypassed:
             reasons = (
                 *profitability_decision.rejection_reasons,
                 "PROFITABILITY_GATE_REJECTED",
@@ -1308,6 +1332,16 @@ class SharedLiveDecisionEngine:
             "adaptive_risk_rules": adaptive_rules,
             "risk_metadata": risk.metadata,
             "profitability_decision": profitability_decision.as_dict(),
+            # A bypassed veto that leaves no trace is indistinguishable from a
+            # trade the gate approved. Record both the fact and what was
+            # overruled, so a post-mortem can separate "the gate was wrong" from
+            # "the gate was right and we overrode it".
+            "profitability_gate_bypassed": profitability_bypassed,
+            "profitability_gate_overruled_reasons": (
+                list(profitability_decision.rejection_reasons)
+                if profitability_bypassed
+                else []
+            ),
             "technical_prediction": technical_prediction.as_dict() if technical_prediction is not None else None,
             "technical_methodology": technical_methodology,
             "technical_regime": technical_regime,
@@ -1330,6 +1364,12 @@ class SharedLiveDecisionEngine:
         # BLOCK — it never authorizes. RiskManager/ProfitabilityGate remain the sole gates.
         approved = risk.approved and risk.final_order is not None
         reason_codes: tuple[str, ...] = tuple(risk.rejection_reasons)
+        if profitability_bypassed:
+            # Surfaced as a reason code, not only in diagnostics: an approved buy
+            # whose profitability veto was overruled must be visibly different on
+            # screen from one the gate actually passed. The diagnostics dict is
+            # not rendered on the dashboards; reason codes are.
+            reason_codes = (*reason_codes, "PROFITABILITY_GATE_OVERRULED")
         if not strategy_locked:
             try:
                 onto = self._ontology_reasoning_for_buy(symbol, market, profitability_decision, prediction)

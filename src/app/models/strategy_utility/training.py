@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
-from dataclasses import asdict
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 
 from app.evaluation.stored_counterfactual import CounterfactualLabel
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_DIM,
+    STRATEGY_GRAPH_CONTEXT_FIELDS,
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+)
 from app.models.strategy_utility.rgcn import (
     FixedShapeStrategyUtilityModel,
     StrategyUtilityModelConfig,
@@ -40,18 +45,30 @@ def train_counterfactual_checkpoint(
     graph_schema = input_feature_schema in {
         "realtime_strategy_graph_v3",
         "realtime_strategy_graph_v4_market",
+        STRATEGY_GRAPH_CONTEXT_SCHEMA,
     }
+    # The current schema takes its width from the contract module rather than a
+    # literal, so the two can never disagree; the historical widths stay listed
+    # so an old label set is still trainable for comparison.
     context_feature_dim = (
-        28
-        if input_feature_schema == "realtime_strategy_graph_v4_market"
+        STRATEGY_GRAPH_CONTEXT_DIM
+        if input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
         else (
-            27
-            if input_feature_schema
-            in {"realtime_strategy_context_v2", "realtime_strategy_graph_v3"}
-            else 12
+            28
+            if input_feature_schema == "realtime_strategy_graph_v4_market"
+            else (
+                27
+                if input_feature_schema
+                in {"realtime_strategy_context_v2", "realtime_strategy_graph_v3"}
+                else 12
+            )
         )
     )
-    rows = tuple(row for row in labels if len(row.features) == context_feature_dim)
+    rows = tuple(
+        row
+        for row in labels
+        if len(row.features) == context_feature_dim and row.usable_for_training
+    )
     if not rows:
         raise ValueError(
             f"no counterfactual rows with {context_feature_dim} causal features"
@@ -152,7 +169,10 @@ def train_counterfactual_checkpoint(
     strategy_coverage = bool(supervised_strategy_ids)
     live_shadow_authorized = bool(
         authorize_live_shadow
-        and input_feature_schema == "realtime_strategy_graph_v4_market"
+        # Must match what the serving path emits TODAY, not a schema name frozen
+        # into this module. Same literal, same failure mode, as the runtime check
+        # in ``authorization_checks`` below.
+        and input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
         and len(rows) >= minimum_rows
         and len(grouped) >= minimum_snapshots
         and strategy_coverage
@@ -186,10 +206,18 @@ def train_counterfactual_checkpoint(
         "strategy_ids": list(STRATEGY_IDS),
         "strategy_count": len(STRATEGY_IDS),
         "feature_names": [
-            *[
-                f"causal_context_feature_{index}"
-                for index in range(context_feature_dim)
-            ],
+            # Real names for the aligned contract. The anonymous
+            # ``causal_context_feature_{i}`` labels are what let slot 4 mean two
+            # different things for a month without anyone reading the card
+            # noticing.
+            *(
+                list(STRATEGY_GRAPH_CONTEXT_FIELDS)
+                if input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
+                else [
+                    f"causal_context_feature_{index}"
+                    for index in range(context_feature_dim)
+                ]
+            ),
             *(
                 [f"strategy_identity:{strategy_id}" for strategy_id in STRATEGY_IDS]
                 if graph_schema
@@ -206,9 +234,16 @@ def train_counterfactual_checkpoint(
         "checkpoint_hash": _checkpoint_hash(checkpoint),
         "input_feature_schema": input_feature_schema,
         "feature_provenance": (
-            "causal_minute_bar_microstructure_proxy_v1"
-            if input_feature_schema == "realtime_strategy_graph_v4_market"
-            else "causal_counterfactual_quantiles_v2_session_structure"
+            # v5 reads the persisted per-bar spread / imbalance / liquidity
+            # columns. v4's name said "proxy" because it derived those from the
+            # bar's own geometry while serving supplied the real thing.
+            "causal_minute_bar_microstructure_v2_aligned"
+            if input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
+            else (
+                "causal_minute_bar_microstructure_proxy_v1"
+                if input_feature_schema == "realtime_strategy_graph_v4_market"
+                else "causal_counterfactual_quantiles_v2_session_structure"
+            )
         ),
         "live_authorized": live_shadow_authorized,
         "authorization_scope": "ontology_gnn_realtime_trust_gated_execution",
@@ -221,9 +256,20 @@ def train_counterfactual_checkpoint(
             "snapshot_count_ok": len(grouped) >= minimum_snapshots,
             "strategy_coverage_ok": strategy_coverage,
             "strategy_coverage_basis": "upside_supervision_rows_per_strategy",
+            # The runtime schema is whatever the contract module currently
+            # declares. Pinning a literal here is how an authorization check
+            # keeps passing for a schema the serving path no longer emits.
             "schema_matches_runtime": (
-                input_feature_schema == "realtime_strategy_graph_v4_market"
+                input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
             ),
+            # Reported, deliberately NOT blocking. Everything else in this block
+            # is a property of the training run; these two are claims about
+            # SKILL, and whether a model with unestablished skill may take a
+            # trade is an operator decision, not a training-time one. They are
+            # here so the decision is made against the numbers rather than
+            # against a bare ``live_authorized: true``.
+            **_skill_verdict(validation_metrics),
+            **_context_field_coverage(rows, input_feature_schema),
         },
         "config": asdict(config),
     }
@@ -283,6 +329,7 @@ def _label_outcome_summary(
         simulated_filled = [row for row in selected if row.filled]
         filled = [row for row in selected if row.triggered and row.filled]
         positive = [row for row in filled if row.net_return_bps > 0]
+        negative = [row for row in filled if row.net_return_bps < 0]
         mean_net = (
             float(np.mean([row.net_return_bps for row in filled]))
             if filled
@@ -341,9 +388,279 @@ def _label_outcome_summary(
             "mean_gross_return_bps_when_filled": mean_gross,
             "mean_net_return_bps_when_filled": mean_net,
             "mean_cost_bps_when_filled": mean_cost,
+            "mean_holding_seconds_when_filled": (
+                float(np.mean([row.holding_seconds for row in filled]))
+                if filled
+                else None
+            ),
+            "mean_mae_bps_when_filled": (
+                float(np.mean([row.mae_bps for row in filled])) if filled else None
+            ),
+            "mean_mfe_bps_when_filled": (
+                float(np.mean([row.mfe_bps for row in filled])) if filled else None
+            ),
+            "profit_factor_when_filled": (
+                float(
+                    sum(row.net_return_bps for row in positive)
+                    / max(1e-9, abs(sum(row.net_return_bps for row in negative)))
+                )
+                if positive and negative
+                else None
+            ),
+            "cost_floor_dominated_rate": (
+                sum(row.cost_floor_dominated for row in filled) / len(filled)
+                if filled
+                else None
+            ),
+            "exit_reason_counts": dict(
+                sorted(Counter(row.exit_reason for row in filled).items())
+            ),
             "performance_diagnosis": diagnosis,
         }
     return summary
+
+
+#: A binary context flag needs at least this share of minority observations
+#: before its weight means anything. Below it the head has seen essentially one
+#: value and the other side is an untrained regime.
+_MINIMUM_FLAG_SUPPORT = 0.01
+
+
+def _context_field_coverage(
+    rows: tuple[CounterfactualLabel, ...],
+    input_feature_schema: str,
+) -> dict[str, object]:
+    """Which context fields did this training window actually vary?
+
+    ``rvgi_available`` and ``box_context_available`` are constant at 1.0 across
+    all 3,597 snapshots: every bar in the window had a warmed-up indicator. Their
+    weights are therefore fitted on one value only, and the moment serving hits
+    the condition they exist to signal — an unavailable RVGI, where the rvgi
+    columns go to 0.0 — the model runs on an untrained regime with nothing
+    reporting it.
+
+    Deleting them is the wrong fix: without the flag, "0.0 because unavailable"
+    and "0.0 because that is the value" become the same input, which is the
+    silent-default failure the context contract exists to prevent. Reporting is
+    the fix, so coverage is a property an operator can read rather than a
+    property they have to assume.
+    """
+    if input_feature_schema != STRATEGY_GRAPH_CONTEXT_SCHEMA:
+        return {}
+    by_snapshot: dict[tuple[str, object], tuple[float, ...]] = {}
+    for row in rows:
+        by_snapshot[(row.symbol, row.as_of)] = row.features
+    if not by_snapshot:
+        return {}
+    contexts = np.asarray(list(by_snapshot.values()), dtype=np.float64)
+    constant: list[str] = []
+    weak_flags: dict[str, float] = {}
+    for index, name in enumerate(STRATEGY_GRAPH_CONTEXT_FIELDS):
+        column = contexts[:, index]
+        distinct = np.unique(column)
+        if distinct.size == 1:
+            constant.append(name)
+        elif distinct.size == 2:
+            support = float(min((column == value).mean() for value in distinct))
+            if support < _MINIMUM_FLAG_SUPPORT:
+                weak_flags[name] = support
+    return {
+        "context_fields_constant_in_training": constant,
+        "context_flags_below_minimum_support": weak_flags,
+        "context_flag_minimum_support": _MINIMUM_FLAG_SUPPORT,
+        "context_coverage_note": (
+            "constant fields have single-valued weights; serving may still vary "
+            "them, and that regime is untrained rather than merely rare"
+        ),
+    }
+
+
+def _skill_verdict(metrics: dict[str, object]) -> dict[str, object]:
+    """Two plain answers, so nobody has to infer them from raw percentiles.
+
+    They are separate questions and the current data answers them differently:
+    the head ranks trades better than chance, and it does NOT have a
+    demonstrated positive net edge. Collapsing those into one "authorized" flag
+    is what let a below-baseline accuracy read as "no predictive power" while an
+    AUC of 0.74 sat unmeasured.
+    """
+    auc_low = metrics.get("selection_auc_ci_low")
+    null = metrics.get("selection_auc_within_symbol_null")
+    p_value = metrics.get("selection_auc_permutation_p")
+    non_positive = metrics.get("selection_top_decile_net_p_nonpositive")
+    ranking_established = bool(
+        isinstance(auc_low, float)
+        and isinstance(null, float)
+        and isinstance(p_value, float)
+        # Beats chance with 95% of the clustered bootstrap AND clears the
+        # within-symbol null, so the separation is not just "prefers symbols
+        # that happen to win more often".
+        and auc_low > 0.5
+        and p_value < 0.05
+    )
+    edge_established = bool(
+        isinstance(non_positive, float) and non_positive < 0.05
+    )
+    return {
+        "selection_ranking_skill_established": ranking_established,
+        "selection_ranking_clears_within_symbol_null": bool(
+            isinstance(auc_low, float) and isinstance(null, float) and auc_low > null
+        ),
+        "selection_net_edge_established": edge_established,
+        "selection_skill_note": (
+            "ranking skill and a profitable edge are different claims; "
+            "promotion to live election needs the second, not just the first"
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """One (symbol, timestamp) row of the fixed-shape training grid."""
+
+    as_of: object
+    label_end: object
+    symbol: str
+    context: np.ndarray
+    targets: np.ndarray
+    target_masks: np.ndarray
+    attractive: bool
+    nets: np.ndarray
+    filled: np.ndarray
+
+
+def _rank_auc(scores: np.ndarray, outcomes: np.ndarray) -> float | None:
+    """Probability a positive outranks a negative, ties counted as half."""
+    positives = int(outcomes.sum())
+    negatives = int(outcomes.size - positives)
+    if positives == 0 or negatives == 0:
+        return None
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(scores.size, dtype=np.float64)
+    ordered_scores = scores[order]
+    start = 0
+    while start < order.size:
+        stop = start
+        while stop + 1 < order.size and ordered_scores[stop + 1] == ordered_scores[start]:
+            stop += 1
+        ranks[order[start : stop + 1]] = (start + stop) / 2.0 + 1.0
+        start = stop + 1
+    rank_sum = float(ranks[outcomes].sum())
+    return (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+
+
+def _selection_metrics(
+    scores: np.ndarray,
+    nets: np.ndarray,
+    symbols: np.ndarray,
+    *,
+    draws: int = 1000,
+    seed: int = 17,
+) -> dict[str, float | int | None]:
+    """Can the head RANK the trades it would actually take?
+
+    Accuracy cannot answer that. Channel 0's grid is ~97% trivial negatives, so
+    a constant "not a success" predictor beats a model that ranks well but sits
+    on the wrong side of a threshold — which is exactly what the v4/v5 cards
+    showed, and it read as "no predictive power" when the ranking AUC was 0.72.
+
+    Two things here are not optional:
+
+    - **Symbol-clustered resampling.** Rows from one symbol share a price path
+      and 12x-overlapping forward windows, so bootstrapping ROWS would treat
+      hundreds of dependent observations as independent and produce a CI several
+      times too narrow.
+    - **A within-symbol permutation null instead of 0.5.** Shuffling outcomes
+      inside each symbol preserves per-symbol win rates, so the null keeps
+      whatever separation comes from the model merely preferring symbols that
+      win more often. Measured at 0.647 on the current data — a pooled AUC of
+      0.72 is a far weaker claim against that null than against 0.5, and only
+      the excess over it is evidence of timing skill.
+    """
+    outcomes = nets > 0.0
+    observed = _rank_auc(scores, outcomes)
+    result: dict[str, float | int | None] = {
+        "selection_rows": int(scores.size),
+        "selection_symbols": int(np.unique(symbols).size),
+        "selection_positive_rate": (
+            float(outcomes.mean()) if outcomes.size else None
+        ),
+        "selection_mean_net_bps": float(nets.mean()) if nets.size else None,
+        "selection_auc": observed,
+    }
+    if observed is None or scores.size < 20:
+        return result
+
+    rng = np.random.default_rng(seed)
+    unique_symbols = np.unique(symbols)
+    index_by_symbol = [np.flatnonzero(symbols == symbol) for symbol in unique_symbols]
+
+    def top_decile_net(selected: np.ndarray) -> float:
+        count = max(1, int(selected.size * 0.1))
+        best = selected[np.argsort(-scores[selected], kind="mergesort")[:count]]
+        return float(nets[best].mean())
+
+    boot_auc: list[float] = []
+    boot_net: list[float] = []
+    for _ in range(draws):
+        drawn = rng.integers(0, len(index_by_symbol), size=len(index_by_symbol))
+        selected = np.concatenate([index_by_symbol[position] for position in drawn])
+        value = _rank_auc(scores[selected], outcomes[selected])
+        if value is not None:
+            boot_auc.append(value)
+        boot_net.append(top_decile_net(selected))
+
+    null_auc: list[float] = []
+    for _ in range(draws):
+        shuffled = outcomes.copy()
+        for indices in index_by_symbol:
+            shuffled[indices] = rng.permutation(shuffled[indices])
+        value = _rank_auc(scores, shuffled)
+        if value is not None:
+            null_auc.append(value)
+
+    everything = np.arange(scores.size)
+    result.update(
+        {
+            "selection_auc_ci_low": float(np.percentile(boot_auc, 2.5)) if boot_auc else None,
+            "selection_auc_ci_high": float(np.percentile(boot_auc, 97.5)) if boot_auc else None,
+            "selection_auc_within_symbol_null": (
+                float(np.mean(null_auc)) if null_auc else None
+            ),
+            # Fraction of within-symbol permutations reaching the observed AUC.
+            "selection_auc_permutation_p": (
+                float(np.mean(np.asarray(null_auc) >= observed)) if null_auc else None
+            ),
+            "selection_top_decile_net_bps": top_decile_net(everything),
+            "selection_top_decile_net_ci_low": (
+                float(np.percentile(boot_net, 2.5)) if boot_net else None
+            ),
+            "selection_top_decile_net_ci_high": (
+                float(np.percentile(boot_net, 97.5)) if boot_net else None
+            ),
+            # The number that decides whether this model may take a trade: how
+            # often the selected decile fails to make money at all.
+            "selection_top_decile_net_p_nonpositive": (
+                float(np.mean(np.asarray(boot_net) <= 0.0)) if boot_net else None
+            ),
+        }
+    )
+    return result
+
+
+def _krx_flag_index(context_width: int) -> int:
+    """Column carrying the KRX flag, for the market-balanced sample weights.
+
+    Read by NAME on the aligned contract. The v4 layout happened to put the flag
+    last, and this code took ``context[:, -1]`` -- so the moment the contract
+    reordered, the market split silently started reading
+    ``box_context_available`` and every US row was classified as KRX. Exactly the
+    positional-assumption failure the contract module exists to stop, which is
+    why the index is derived rather than assumed.
+    """
+    if context_width == STRATEGY_GRAPH_CONTEXT_DIM:
+        return STRATEGY_GRAPH_CONTEXT_FIELDS.index("is_krx")
+    return context_width - 1
 
 
 def _fit_strategy_relation_graph(
@@ -362,7 +679,7 @@ def _fit_strategy_relation_graph(
         tuple[object, np.ndarray, np.ndarray, np.ndarray, bool]
     ] = []
     fitted = {strategy_id: 0 for strategy_id in STRATEGY_IDS}
-    for positions in grouped.values():
+    for (symbol, _key_as_of), positions in grouped.items():
         by_strategy = {rows[position].strategy_id: rows[position] for position in positions}
         if any(strategy_id not in by_strategy for strategy_id in STRATEGY_IDS):
             continue
@@ -378,17 +695,42 @@ def _fit_strategy_relation_graph(
             for row in ordered
         )
         snapshots.append(
-            (ordered[0].as_of, context, targets, target_masks, attractive)
+            _Snapshot(
+                as_of=ordered[0].as_of,
+                label_end=max(row.label_end for row in ordered),
+                symbol=str(symbol),
+                context=context,
+                targets=targets,
+                target_masks=target_masks,
+                attractive=attractive,
+                # Carried so validation can measure SELECTION quality, which
+                # needs the realised P&L and the symbol each row came from.
+                nets=np.asarray(
+                    [float(row.net_return_bps) for row in ordered], dtype=np.float32
+                ),
+                filled=np.asarray(
+                    [bool(row.triggered and row.filled) for row in ordered], dtype=bool
+                ),
+            )
         )
         for strategy_id in STRATEGY_IDS:
             fitted[strategy_id] += 1
     if len(snapshots) < 2:
         raise ValueError("strategy relation graph requires complete multi-strategy snapshots")
-    snapshots.sort(key=lambda item: item[0])
+    snapshots.sort(key=lambda item: item.as_of)
     split = max(1, min(len(snapshots) - 1, int(len(snapshots) * 0.8)))
-    train = snapshots[:split]
     validation = snapshots[split:]
-    train_context = np.asarray([item[1] for item in train], dtype=np.float32)
+    # PURGE. A label resolves ``horizon`` after its snapshot, so training rows
+    # near the boundary have outcomes drawn from inside the validation window.
+    # Without this the split leaks — measured at 32 of 2,877 rows on the current
+    # data — and validation scores its own training labels.
+    boundary = validation[0].as_of
+    train = [item for item in snapshots[:split] if item.label_end <= boundary]
+    purged_rows = split - len(train)
+    if not train:
+        train = snapshots[:split]
+        purged_rows = 0
+    train_context = np.asarray([item.context for item in train], dtype=np.float32)
     train_x = np.concatenate(
         (
             np.repeat(train_context[:, None, :], STRATEGY_NODE_COUNT, axis=1),
@@ -400,9 +742,9 @@ def _fit_strategy_relation_graph(
         ),
         axis=2,
     )
-    train_y = np.asarray([item[2] for item in train], dtype=np.float32)
+    train_y = np.asarray([item.targets for item in train], dtype=np.float32)
     train_target_mask = np.asarray(
-        [item[3] for item in train],
+        [item.target_masks for item in train],
         dtype=np.float32,
     )
     train_loss_weight = np.ones_like(train_y, dtype=np.float32)
@@ -424,7 +766,8 @@ def _fit_strategy_relation_graph(
             train_loss_weight[~positive, strategy_position, 0] = (
                 total / (2.0 * negative_count)
             )
-    train_is_krx = train_context[:, -1] >= 0.5
+    krx_flag = _krx_flag_index(train_context.shape[1])
+    train_is_krx = train_context[:, krx_flag] >= 0.5
     krx_count = int(train_is_krx.sum())
     us_count = int((~train_is_krx).sum())
     if krx_count and us_count:
@@ -535,7 +878,7 @@ def _fit_strategy_relation_graph(
     full_hidden = _graph_hidden(model, train_x, adjacency)
     no_trade_targets = np.repeat(
         np.asarray(
-            [-2.0 if item[4] else 2.0 for item in train],
+            [-2.0 if item.attractive else 2.0 for item in train],
             dtype=np.float32,
         ),
         STRATEGY_NODE_COUNT,
@@ -546,7 +889,7 @@ def _fit_strategy_relation_graph(
         ridge,
     )[:, 0]
 
-    validation_context = np.asarray([item[1] for item in validation], dtype=np.float32)
+    validation_context = np.asarray([item.context for item in validation], dtype=np.float32)
     validation_x = np.concatenate(
         (
             np.repeat(
@@ -562,9 +905,9 @@ def _fit_strategy_relation_graph(
         ),
         axis=2,
     )
-    validation_target = np.asarray([item[2] for item in validation], dtype=np.float32)
+    validation_target = np.asarray([item.targets for item in validation], dtype=np.float32)
     validation_target_mask = np.asarray(
-        [item[3] for item in validation],
+        [item.target_masks for item in validation],
         dtype=np.float32,
     )
     validation_hidden = _graph_hidden(model, validation_x, adjacency)
@@ -581,31 +924,104 @@ def _fit_strategy_relation_graph(
         )
         / max(1.0, float(validation_target_mask.sum()))
     )
-    success_direction_accuracy = float(
-        np.mean(
-            (validation_prediction[..., 0] > 0)
-            == (validation_target[..., 0] > 0)
-        )
-    )
-    validation_is_krx = validation_context[:, -1] >= 0.5
+    # Direction accuracy is meaningless without its majority-class baseline.
+    #
+    # Channel 0's mask is 1.0 for EVERY cell by construction (see
+    # ``_target_mask``) and that is deliberate -- a strategy that never fired is
+    # a genuine classification negative. The consequence is that the
+    # (snapshot x strategy) grid is overwhelmingly trivial negatives, so a head
+    # answering "not a success" everywhere scores near-perfectly.
+    #
+    # Measured 2026-08-08 on the live checkpoint: 1,622 of 57,552 label cells
+    # triggered (2.82%), so the constant "not a success" predictor scores
+    # 97.18% while the reported figure was 95.58% -- BELOW its own baseline.
+    # The number tracked the trigger rate, not skill, and nothing in the report
+    # said so. Masking is NOT the fix (the mask is all ones); publishing the
+    # baseline is, plus a second figure restricted to REALIZED cells where
+    # success/failure is a real outcome rather than "never fired".
+    #
+    # Channel 5's target is the filled indicator (+2 filled / -2 not), so the
+    # realized mask is read straight off the validation targets.
+    predicted_success = validation_prediction[..., 0] > 0
+    actual_success = validation_target[..., 0] > 0
+    realized_cells = validation_target[..., 5] > 0
+    all_cells = np.ones_like(actual_success, dtype=bool)
 
-    def market_accuracy(mask: np.ndarray) -> float | None:
-        if not bool(mask.any()):
+    def _cells(row_mask: np.ndarray | None) -> np.ndarray:
+        return all_cells if row_mask is None else all_cells & row_mask[:, None]
+
+    def _accuracy(cells: np.ndarray) -> float | None:
+        if not bool(cells.any()):
             return None
-        return float(
-            np.mean(
-                (validation_prediction[mask, ..., 0] > 0)
-                == (validation_target[mask, ..., 0] > 0)
-            )
+        return float(np.mean(predicted_success[cells] == actual_success[cells]))
+
+    def _majority_baseline(cells: np.ndarray) -> float | None:
+        """Score of the best constant predictor -- the bar accuracy must clear."""
+        if not bool(cells.any()):
+            return None
+        positive_rate = float(np.mean(actual_success[cells]))
+        return max(positive_rate, 1.0 - positive_rate)
+
+    success_direction_accuracy = _accuracy(_cells(None))
+    validation_is_krx = (
+        validation_context[:, _krx_flag_index(validation_context.shape[1])] >= 0.5
+    )
+
+    # SELECTION quality on the cells that became real trades. This is the
+    # measurement the accuracy figures above cannot make: a head that ranks
+    # correctly but sits on the wrong side of its threshold scores below the
+    # majority baseline while still separating winners from losers.
+    filled_mask = np.asarray([item.filled for item in validation], dtype=bool)
+    selection_scores = validation_prediction[..., 0][filled_mask].astype(np.float64)
+    selection_nets = np.asarray(
+        [item.nets for item in validation], dtype=np.float64
+    )[filled_mask]
+    selection_symbols = np.repeat(
+        np.asarray([item.symbol for item in validation]),
+        STRATEGY_NODE_COUNT,
+    ).reshape(len(validation), STRATEGY_NODE_COUNT)[filled_mask]
+    selection_market_is_krx = np.repeat(
+        validation_is_krx[:, None], STRATEGY_NODE_COUNT, axis=1
+    )[filled_mask]
+    selection = _selection_metrics(
+        selection_scores,
+        selection_nets,
+        selection_symbols,
+    )
+
+    def market_selection(prefix: str, mask: np.ndarray) -> dict[str, object]:
+        values = _selection_metrics(
+            selection_scores[mask],
+            selection_nets[mask],
+            selection_symbols[mask],
+            seed=17 if prefix == "krx" else 29,
         )
+        return {f"{prefix}_{key}": value for key, value in values.items()}
 
     return model, fitted, {
         "train_snapshots": len(train),
         "validation_snapshots": len(validation),
+        # Training rows dropped because their label resolved after the split.
+        "purged_train_snapshots": purged_rows,
         "raw_head_mse": raw_mse,
+        **selection,
+        **market_selection("krx", selection_market_is_krx),
+        **market_selection("us", ~selection_market_is_krx),
         "success_direction_accuracy": success_direction_accuracy,
-        "krx_success_direction_accuracy": market_accuracy(validation_is_krx),
-        "us_success_direction_accuracy": market_accuracy(~validation_is_krx),
+        # ALWAYS read the accuracy against this. At or below it, the metric is
+        # reporting class imbalance rather than skill and must not be used to
+        # justify promotion.
+        "success_direction_majority_baseline": _majority_baseline(_cells(None)),
+        # Restricted to triggered-and-filled cells, where "success" vs "failure"
+        # is a real outcome instead of "the strategy never fired".
+        "success_direction_accuracy_realized": _accuracy(realized_cells),
+        "success_direction_majority_baseline_realized": _majority_baseline(
+            realized_cells
+        ),
+        "success_direction_realized_cells": int(realized_cells.sum()),
+        "success_direction_total_cells": int(actual_success.size),
+        "krx_success_direction_accuracy": _accuracy(_cells(validation_is_krx)),
+        "us_success_direction_accuracy": _accuracy(_cells(~validation_is_krx)),
         "krx_training_weight": (
             float(sample_weights[train_is_krx][0]) if krx_count else None
         ),

@@ -10,7 +10,20 @@
     "batch_size": 1500,
     "cursor_path": "data/research_universe_cursor.json"
   },
-  "rss_feeds": [],
+  "rss_feeds": [
+    {
+      "url": "https://www.federalreserve.gov/feeds/press_all.xml",
+      "event_type": "MACRO"
+    },
+    {
+      "url": "https://www.bls.gov/feed/bls_latest.rss",
+      "event_type": "MACRO"
+    },
+    {
+      "url": "https://www.sec.gov/news/pressreleases.rss",
+      "event_type": "FINANCIAL"
+    }
+  ],
   "rss_fetch_articles": true,
   "rss_article_fetch_limit_per_feed": 3,
   "retry_failed_sources": true,

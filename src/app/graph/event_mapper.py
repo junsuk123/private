@@ -4,14 +4,18 @@ import os
 from datetime import datetime, timedelta, timezone
 
 from app.graph import KnowledgeGraph
-from app.schemas.domain import ClassifiedEvent, SentimentDirection
+from app.schemas.domain import ClassifiedEvent, EventType, SentimentDirection
 
 
 def add_events_to_graph(graph: KnowledgeGraph, events: tuple[ClassifiedEvent, ...]) -> KnowledgeGraph:
     for event in _fresh_events(events):
         event_node = f"{event.event_type}:{event.event_id}"
+        if event.event_type in (EventType.MACRO, EventType.MARKET):
+            # Macro events have no issuer ticker by design. Give them an explicit
+            # market subject so they have graph lineage instead of disappearing.
+            graph.add("Market:GLOBAL", "hasRecentNews", event_node, event.source.source_id)
         for ticker in event.tickers:
-            predicate = "hasRecentNews" if event.event_type == "NEWS" else "hasRecentDisclosure"
+            predicate = "hasRecentNews" if event.event_type == EventType.NEWS else "hasRecentDisclosure"
             graph.add(ticker, predicate, event_node, event.source.source_id)
 
             if event.sentiment == SentimentDirection.POSITIVE:

@@ -298,14 +298,39 @@ function blockadeExtra(link) {
     parts.push(data.sample.join(', '));
   }
   if (link.stage === 'micro_buy_intents' && Array.isArray(data.blocking_reason_codes)) {
-    parts.push(...data.blocking_reason_codes);
+    const counts = data.reason_code_counts || {};
+    parts.push(...data.blocking_reason_codes.map((code) => (
+      counts[code] > 1 ? `${code} ×${counts[code]}` : code
+    )));
+    if (Array.isArray(data.hard_blocked_symbols) && data.hard_blocked_symbols.length) {
+      parts.push(`하드 차단: ${data.hard_blocked_symbols.join(', ')}`);
+    }
   }
   if (link.stage === 'strategy_election') {
+    if (typeof data.algorithm_evaluated_count === 'number') {
+      parts.push(`실제 트리거 ${data.algorithm_triggered_count || 0}/${data.algorithm_evaluated_count}`);
+    }
+    if (data.best_pair) {
+      parts.push(`최상위 ${data.best_pair.symbol}×${data.best_pair.arm}`);
+    }
+    if (typeof data.change_point_probability === 'number') {
+      parts.push(`변화점 ${(data.change_point_probability * 100).toFixed(1)}%`);
+    }
     if (typeof data.conservative_edge_bps === 'number') {
-      parts.push(`보수적 엣지 ${data.conservative_edge_bps.toFixed(1)}bp`);
+      // The same field carries two different quantities. Under the bandit it is
+      // a pessimistic lower bound; under GNN-direct election it is the model's
+      // raw forward edge with no shrinkage at all. Labelling both "보수적" would
+      // make an unhedged number read as a conservative one.
+      const direct = (data.reason_codes || []).includes('GNN_DIRECT_ELECTION');
+      const label = direct ? 'GNN 예측 엣지(무보정)' : '보수적 엣지';
+      parts.push(`${label} ${data.conservative_edge_bps.toFixed(1)}bp`);
     }
     if (data.is_exploration) parts.push('탐색 진입(최소 비중)');
-    (data.reason_codes || []).forEach((code) => parts.push(code));
+    (data.reason_codes || []).forEach((code) => parts.push(BLOCKADE_REASON_LABELS[code] || code));
+    Object.entries(data.algorithm_rejection_counts || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .forEach(([code, count]) => parts.push(`${code} ×${count}`));
     if (data.session_last_reason) parts.push(data.session_last_reason);
   }
   if (link.stage === 'position' && data.last_reason) parts.push(data.last_reason);
@@ -444,6 +469,7 @@ function renderRefactorDashboard(data) {
     intraday_momentum: '장중 모멘텀',
     breakout_volume: '거래량 돌파',
     vwap_mean_reversion: 'VWAP 평균회귀',
+    bar_confirmed_vwap_recovery: '1분봉 확인 VWAP 회복',
     liquidity_shock_reversal: '유동성 충격 반전',
     event_momentum: '이벤트 모멘텀',
     cross_sectional_relative_strength: '횡단면 상대강도',
@@ -659,11 +685,14 @@ function renderMacroMicroVisual(mm) {
     const topSectors = sectorRows.slice(0, 4);
     const allowed = (mm.allowed_micro_strategies || []).slice(0, 4);
     const blockedStrategies = (mm.blocked_micro_strategies || []).slice(0, 4);
+    const contextSymbols = Array.isArray(mm.market_context_symbols) ? mm.market_context_symbols : [];
+    const contextCount = Number(mm.market_context_symbol_count || contextSymbols.length || 0);
     macro.innerHTML = `
       <div class="mm-summary-grid">
         ${metricTile('시장 레짐', mm.market_regime || '-', noLiveData ? '실시간 시세 대기' : `신뢰도 ${techNum(mm.macro_confidence, 2)}`, blocked ? 'warn' : 'ok')}
         ${metricTile('거시 리스크', mm.macro_risk_level || '-', blocked ? '신규 매수 차단' : '신규 매수 가능', blocked ? 'warn' : 'ok')}
         ${metricTile('후보 종목', String(candidateSymbols.length), candidateSymbols.slice(0, 6).join(', ') || '-', 'info')}
+        ${metricTile('시장 컨텍스트', String(contextCount), contextSymbols.slice(0, 6).join(', ') || '세션 앵커 대기', 'info')}
         ${metricTile('랭킹 의도', String(ranked.length), ranked.slice(0, 3).map((r) => `${r.side}:${r.symbol}`).join(', ') || '-', 'info')}
       </div>
       <div class="mm-lanes">
@@ -998,6 +1027,18 @@ function renderTechnical(technical) {
 // Human-readable hold/rejection reasons. Mirrors app.web._HOLD_REASON_TEXT so the
 // account dashboard shows the same explanations as the kiosk.
 const REASON_TEXT = {
+  BAR_VWAP_RECOVERY_INPUTS_MISSING: '1분봉 회복 판단 데이터 부족',
+  BAR_VWAP_DISPLACEMENT_TOO_SMALL: 'VWAP 하락 이격이 진입 기준보다 작음',
+  BAR_VWAP_VOLATILITY_SCALE_MISSING: '변동성 정규화 값 부족',
+  BAR_VWAP_DISLOCATION_TOO_EXTREME: '정상 회귀보다 구조적 재가격 가능성이 큼',
+  BAR_VWAP_NOT_OVERSOLD: '과매도 조건 미충족',
+  BAR_VWAP_FAST_EMA_NOT_RECLAIMED: '완료 1분봉이 단기 EMA를 아직 회복하지 못함',
+  BAR_VWAP_MACD_NOT_TURNED: 'MACD 회복 전환 미확인',
+  BAR_VWAP_RECOVERY_NOT_PERSISTENT: '1분봉 회복 지속성 부족',
+  BAR_VWAP_LIQUIDITY_TOO_LOW: '회복 거래에 필요한 유동성 부족',
+  BAR_VWAP_SPREAD_TOO_WIDE: '스프레드가 넓어 회복 기대수익 잠식',
+  BAR_CONFIRMED_VWAP_RECOVERY: '완료 1분봉 기준 VWAP 회복 진입 확인',
+  COMPLETED_MINUTE_TREND_TURNED: '완료 1분봉 추세가 상승 전환',
   HOLD_BELOW_PROFIT_TARGET: '아직 목표 수익 미달 → 보유',
   WIDE_SPREAD: '호가 스프레드가 넓어 매수 보류',
   LOW_LIQUIDITY: '유동성 부족으로 보류',
@@ -1025,6 +1066,13 @@ const REASON_TEXT = {
   NO_SELLABLE_QUANTITY: '매도 가능 수량 없음',
   OPEN_ORDER_OR_SETTLEMENT_LOCK: '미체결 주문/결제 잠금',
   NO_ACCOUNT_SNAPSHOT: '계좌 스냅샷 없음',
+  // GNN-direct posture. These must not render as raw codes: they are the only
+  // on-screen sign that the pessimistic bound and the NO_TRADE option are not
+  // in play for this election.
+  PROFITABILITY_GATE_OVERRULED: '⚠ 수익성 게이트 거부를 무시하고 진행(GNN 직결)',
+  GNN_DIRECT_ELECTION: 'GNN 직결 채택(밴딧 하한·NO_TRADE 미적용)',
+  GNN_ESTIMATE_PRESENT: 'GNN 예측 있음',
+  GNN_ESTIMATE_UNAVAILABLE_RANKED_LAST: '⚠ GNN 예측 없이 채택(후순위였으나 단독 후보)',
 };
 
 function humanizeReason(code) {

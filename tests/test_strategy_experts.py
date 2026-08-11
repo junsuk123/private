@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.strategy.catalog import STRATEGY_IDS
-from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext, OwnedStrategyLifecycle
+from app.strategy.experts import (
+    ALL_EXPERT_TYPES,
+    BreakoutVolumeExpert,
+    ExpertContext,
+    LiquidityShockReversalExpert,
+    OwnedStrategyLifecycle,
+    RvgiBoxBreakoutExpert,
+)
 from app.trading.contracts import IntentAction
 from app.trading.directional import PositionDirection
 
@@ -11,11 +18,67 @@ from app.trading.directional import PositionDirection
 NOW = datetime(2026, 7, 27, 1, 0, tzinfo=timezone.utc)
 
 
+def _expert_context(**quantiles: float) -> ExpertContext:
+    return ExpertContext(
+        symbol="005930",
+        as_of=NOW,
+        price=80000,
+        proposed_quantity=1,
+        feature_snapshot_id="features-policy-test",
+        utility_evidence_id="utility-policy-test",
+        quantiles=quantiles,
+    )
+
+
+def test_breakout_requires_follow_through_and_executable_liquidity() -> None:
+    expert = BreakoutVolumeExpert()
+    assert expert.admissible(
+        _expert_context(**{"breakout": 0.9, "breakout_acceptance": 1.0, "volume": 0.9, "return": 0.8, "liquidity": 0.8})
+    )
+    assert not expert.admissible(
+        _expert_context(**{"breakout": 0.9, "breakout_acceptance": 1.0, "volume": 0.9, "return": 0.5, "liquidity": 0.8})
+    )
+    assert not expert.admissible(
+        _expert_context(**{"breakout": 0.9, "breakout_acceptance": 1.0, "volume": 0.9, "return": 0.8, "liquidity": 0.5})
+    )
+
+
+def test_liquidity_shock_reversal_waits_for_actual_normalization() -> None:
+    expert = LiquidityShockReversalExpert()
+    common = dict(liquidity_shock=0.9, price_drop=0.9, recovery=0.8, liquidity=0.8)
+    assert expert.admissible(_expert_context(**common, liquidity_recovery=0.8))
+    assert not expert.admissible(_expert_context(**common, liquidity_recovery=0.2))
+
+
+def test_rvgi_box_requires_cross_timing_and_executable_liquidity() -> None:
+    expert = RvgiBoxBreakoutExpert()
+    context = _expert_context(
+        rvgi_diff=0.9,
+        rvgi_cross=0.9,
+        box_position=0.9,
+        volume=0.8,
+        liquidity=0.8,
+        false_breakout_risk=0.1,
+    )
+    assert expert.admissible(context)
+    assert not expert.admissible(
+        _expert_context(
+            rvgi_diff=0.9,
+            rvgi_cross=0.0,
+            box_position=0.9,
+            volume=0.8,
+            liquidity=0.8,
+            false_breakout_risk=0.1,
+        )
+    )
+
+
 def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
     quantiles = {
         "return": 0.9,
         "volume": 0.9,
         "breakout": 0.9,
+        "breakout_acceptance": 1.0,
         "vwap_deviation": 0.1,
         "reversion": 0.9,
         "liquidity_shock": 0.9,
@@ -27,6 +90,7 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
         "liquidity": 0.9,
         "gap": 0.9,
         "opening_confirmation": 0.9,
+        "gap_entry_window": 1.0,
         "rvgi_diff": 0.9,
         "rvgi_cross": 0.9,
         "box_position": 0.9,
@@ -49,9 +113,17 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
         "relative_volume": 0.9,
         # Market intraday momentum. The window flag is session structure, so an
         # all-inputs-strong fixture must place the moment INSIDE the entry window.
+        # Overnight gap carry reads the same session clock one window later. Its
+        # directional input is ``breakout`` (closing at the top of the recent
+        # range), NOT ``vwap_deviation``: this fixture holds the latter at 0.1
+        # because "strong" means low for the reversion theses, and one fixture
+        # cannot mean both directions at once.
+        "overnight_carry_window": 1.0,
         "intraday_momentum_signal": 0.9,
         "intraday_momentum_window": 1.0,
         "first_half_hour_volatility": 0.9,
+        "momentum_persistence_short": 0.9,
+        "momentum_persistence_long": 0.9,
     }
     # A single "all inputs strong" fixture cannot make both directions fire, and it
     # should not: the inputs that make a long thesis strong are precisely the ones that
@@ -214,7 +286,12 @@ def test_strategy_instance_owns_entry_and_mechanical_exit() -> None:
         proposed_quantity=2,
         feature_snapshot_id="features-1",
         utility_evidence_id="utility-1",
-        quantiles={"return": 0.9, "volume": 0.9},
+        quantiles={
+            "return": 0.9,
+            "volume": 0.9,
+            "momentum_persistence_short": 0.9,
+            "momentum_persistence_long": 0.9,
+        },
     )
     plan = ALL_EXPERT_TYPES[0]().propose(context)
     assert plan is not None

@@ -37,3 +37,27 @@ def test_shadow_comparison_records_disagreement_without_execution(tmp_path) -> N
     assert len(payload["validation_candidates"]) == 1
     assert payload["validation_candidates"][0]["action"] == "VALIDATE_ONLY"
     assert not hasattr(recorder, "broker")
+
+
+def test_shadow_comparison_rotates_oversized_log(tmp_path) -> None:
+    path = tmp_path / "shadow.jsonl"
+    path.write_text("old telemetry\n", encoding="utf-8")
+    recorder = ShadowComparisonRecorder(path, max_bytes=1, backup_count=2)
+
+    recorder.compare(
+        correlation_id="rotation-check",
+        symbol="005930",
+        as_of=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        decisions=(
+            ShadowDecision(
+                path="cpu_gnn",
+                action="HOLD",
+                strategy_id=None,
+                utility=None,
+                reason_codes=("NO_EDGE",),
+            ),
+        ),
+    )
+
+    assert path.with_name("shadow.jsonl.1").read_text(encoding="utf-8") == "old telemetry\n"
+    assert "rotation-check" in path.read_text(encoding="utf-8")

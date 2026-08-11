@@ -103,11 +103,14 @@ class ResearchService:
             _mark(source_key)
 
         rss_collector = RssNewsCollector()
-        for feed_url in config.get("rss_feeds", []):
-            feed_url = _resolve_source(feed_url, base_dir)
+        for rss_source in config.get("rss_feeds", []):
+            feed_url, rss_event_type = _parse_rss_source(rss_source, base_dir)
             source_key = f"rss:{feed_url}"
 
-            def _action(url: str = str(feed_url)) -> None:
+            def _action(
+                url: str = str(feed_url),
+                source_event_type: EventType = rss_event_type,
+            ) -> None:
                 nonlocal llm_items_remaining
                 max_llm_items = min(llm_items_per_source, llm_items_remaining)
                 rss_result = rss_collector.collect_with_articles(
@@ -117,6 +120,7 @@ class ResearchService:
                         max_llm_items=max_llm_items,
                         fetch_articles=rss_fetch_articles,
                         article_limit=rss_article_limit_value,
+                        event_type=source_event_type,
                     )
                 events.extend(rss_result.events)
                 raw_records.extend(rss_result.raw_records)
@@ -365,6 +369,24 @@ def _resolve_source(value: Any, base_dir: Path | None) -> str:
     if base_dir is None:
         return text
     return (base_dir / text).resolve().as_uri()
+
+
+def _parse_rss_source(value: Any, base_dir: Path | None) -> tuple[str, EventType]:
+    """Parse a feed URL plus its semantic scope.
+
+    Plain strings retain the historical NEWS default.  Mapping sources let
+    official central-bank/statistics feeds enter the macro evidence path instead
+    of being mislabelled as issuer news with no ticker.
+    """
+    if isinstance(value, dict):
+        url = _resolve_source(value.get("url", ""), base_dir)
+        raw_type = str(value.get("event_type") or EventType.NEWS.value).upper()
+        try:
+            event_type = EventType(raw_type)
+        except ValueError:
+            event_type = EventType.NEWS
+        return url, event_type
+    return _resolve_source(value, base_dir), EventType.NEWS
 
 
 def _configured_source_count(config: dict[str, Any]) -> int:

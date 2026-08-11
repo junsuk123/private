@@ -88,7 +88,10 @@ class LiveFeatureFrameTest(unittest.TestCase):
         values = frame.as_feature_dict()
         self.assertIn("return_1s", values)
         self.assertIn("aggressor_imbalance_5s", values)
-        self.assertEqual(values["second_data_ready"], 0.0)
+        # Two distinct recent prints plus a contemporaneous book now constitute
+        # the minimum causal overseas window; expected-move volatility can come
+        # from completed minute history when a third print is absent.
+        self.assertEqual(values["second_data_ready"], 1.0)
 
     def test_feature_frame_computes_true_second_level_microstructure(self) -> None:
         now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
@@ -125,10 +128,90 @@ class LiveFeatureFrameTest(unittest.TestCase):
                 journal_path=Path(tmp) / "features.jsonl",
             ).build("005930", decision_time=now)
 
-        values = frame.as_feature_dict()
+        values = frame.as_context_dict()
         self.assertEqual(values["second_data_ready"], 1.0)
         self.assertEqual(values["tick_count_5s"], 5.0)
         self.assertGreater(values["return_5s"], 0.0)
+        self.assertGreater(values["aggressor_imbalance_5s"], 0.0)
+
+    def test_second_window_uses_causal_receive_time_when_exchange_feed_is_delayed(self) -> None:
+        now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            ticks = tuple(
+                RealtimeTradeTick(
+                    symbol="INTC",
+                    exchange_timestamp=now - timedelta(seconds=30 - index),
+                    received_at=now - timedelta(seconds=3 - index * 2),
+                    source=KIS_REALTIME_SOURCE,
+                    price=100.0 + index * 0.05,
+                    volume=100,
+                    trade_direction="BUY",
+                    sequence_key=f"delayed:{index}",
+                    latency_ms=27_000.0,
+                )
+                for index in range(2)
+            )
+            books = tuple(
+                RealtimeOrderbookSnapshot(
+                    symbol="INTC",
+                    exchange_timestamp=now - timedelta(seconds=30 - index),
+                    received_at=now - timedelta(seconds=3 - index * 2),
+                    source=KIS_REALTIME_SOURCE,
+                    levels=(OrderbookLevel(99.9, 1000, 100.1, 900),),
+                    sequence_key=f"delayed-book:{index}",
+                    latency_ms=27_000.0,
+                )
+                for index in range(2)
+            )
+            store.save_ticks(ticks)
+            store.save_orderbooks(books)
+            frame = LiveFeatureFrameBuilder(
+                store, journal_path=Path(tmp) / "features.jsonl"
+            ).build("INTC", decision_time=now)
+
+        values = frame.as_context_dict()
+        self.assertEqual(values["second_data_ready"], 1.0)
+        self.assertGreater(values["return_5s"], 0.0)
+        self.assertEqual(values["source_latency_ms_10s"], 27_000.0)
+
+    def test_overseas_inside_spread_prints_get_causal_quote_direction(self) -> None:
+        now = datetime(2026, 6, 29, 9, 30, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RealtimeMarketDataStore(Path(tmp) / "rt.sqlite3")
+            ticks = tuple(
+                RealtimeTradeTick(
+                    symbol="INTC",
+                    exchange_timestamp=now - timedelta(seconds=3 - index * 2),
+                    received_at=now - timedelta(seconds=3 - index * 2),
+                    source=KIS_REALTIME_SOURCE,
+                    price=100.06 + index * 0.02,
+                    volume=100,
+                    trade_direction=None,
+                    sequence_key=f"us-tick:{index}",
+                )
+                for index in range(2)
+            )
+            books = tuple(
+                RealtimeOrderbookSnapshot(
+                    symbol="INTC",
+                    exchange_timestamp=now - timedelta(seconds=4 - index * 2),
+                    received_at=now - timedelta(seconds=4 - index * 2),
+                    source=KIS_REALTIME_SOURCE,
+                    levels=(OrderbookLevel(100.00, 1000, 100.10, 900),),
+                    sequence_key=f"us-book:{index}",
+                )
+                for index in range(2)
+            )
+            store.save_ticks(ticks)
+            store.save_orderbooks(books)
+            frame = LiveFeatureFrameBuilder(
+                store, journal_path=Path(tmp) / "features.jsonl"
+            ).build("INTC", decision_time=now)
+
+        values = frame.as_feature_dict()
+        self.assertEqual(values["second_data_ready"], 1.0)
+        self.assertEqual(values["tick_count_5s"], 2.0)
         self.assertGreater(values["aggressor_imbalance_5s"], 0.0)
 
     def test_feature_frame_can_use_kis_orderbook_when_trade_ticks_are_sparse(self) -> None:

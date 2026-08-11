@@ -103,8 +103,18 @@ def test_absorption_signal_is_journaled_and_adopted_without_order_path():
     assert result.evaluated == result.triggered == result.recorded == result.adopted == 1
     plan = plan_store.plans[0]
     assert plan.entry_reference_price == 10.01
-    assert plan.max_holding_seconds == 600
+    # The 600s absorption horizon is a FLOOR, not a constant: the barriers are sized
+    # against this book's measured round-trip cost, and a target raised to clear that
+    # cost needs proportionally more time to be reachable. Capped by the submode's own
+    # ``max_absorption_horizon_seconds``.
+    assert 600 <= plan.max_holding_seconds <= 3600
     assert plan.deployment_state == "SHADOW"
+    # The invariant that matters, asserted at the cost actually measured rather than
+    # at the KRX reference constant. Asserting only the reference is how the table
+    # kept reading 1.53 while paying 0.83 on the tape it was being scored on.
+    geometry = plan.diagnostics["exit_geometry"]
+    assert geometry["cost_relative"] is True
+    assert geometry["resolved_net_reward_risk_ratio"] >= 1.45
     assert plan.diagnostics["order_submission_capable"] is False
     assert "GNN_INDEPENDENT_MECHANICAL_SHADOW" in plan.signal_reason_codes
     assert evaluation.plans == plan_store.plans
@@ -130,7 +140,7 @@ def test_raw_absorption_is_collected_when_sparse_rest_ticks_cannot_price_edge():
 
     assert result.recorded == result.adopted == 1
     assert plan_store.plans[0].diagnostics["algorithm_live_triggered"] is False
-    assert plan_store.plans[0].max_holding_seconds == 600
+    assert 600 <= plan_store.plans[0].max_holding_seconds <= 3600
     # The floor that rejected it is the market's round-trip cost, so the reason
     # code names the cost rather than an arbitrary threshold.
     assert "EDGE_BELOW_COST_FLOOR" in plan_store.plans[0].signal_reason_codes

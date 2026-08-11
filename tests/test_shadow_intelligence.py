@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import json
 from types import SimpleNamespace
 
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_DIM,
+    STRATEGY_GRAPH_CONTEXT_FIELDS,
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+    StrategyGraphContextError,
+    as_context_mapping,
+    build_strategy_graph_context,
+)
 from app.routing.shadow_intelligence import (
     ShadowIntelligenceService,
     SlowIntelligenceSnapshot,
@@ -18,31 +27,33 @@ from app.strategy.catalog import STRATEGY_IDS
 NOW = datetime(2026, 7, 27, 1, 0, tzinfo=timezone.utc)
 
 
-def test_live_feature_frame_adapter_emits_trained_28_field_contract() -> None:
-    values = {
-        "distance_from_vwap": 0.01,
-        "spread_bps": 12.0,
-        "orderbook_imbalance": 0.2,
-        "aggressor_imbalance_5s": 0.4,
-        "volume_5s_log": 2.0,
-        "realized_volatility_3m": 0.003,
-        "rvgi_available": 1.0,
-        "rvgi": 0.2,
-        "rvgi_signal": 0.1,
-        "rvgi_diff": 0.1,
-        "rvgi_slope": 0.02,
-        "rvgi_bullish_cross": 1.0,
-        "box_available": 1.0,
-        "box_high": 10.1,
-        "box_low": 9.8,
-        "box_mid": 9.95,
-        "box_width_pct": 0.03,
-        "box_position": 0.8,
-        "breakout_distance_bps": 5.0,
-        "box_previous_close": 9.9,
-        "box_context_timestamp_epoch": NOW.timestamp(),
-    }
-    frame = SimpleNamespace(
+def test_live_entry_points_use_current_graph_context_dimension() -> None:
+    root = Path(__file__).parents[1]
+    for relative_path in ("src/app/web.py", "src/app/data/event_runtime.py"):
+        source = (root / relative_path).read_text(encoding="utf-8")
+        assert "feature_dim=STRATEGY_GRAPH_CONTEXT_DIM" in source
+        assert "feature_dim=28" not in source
+
+
+def _graph_context_values(**overrides: float) -> dict[str, float]:
+    values = {f"graph:{name}": 0.0 for name in STRATEGY_GRAPH_CONTEXT_FIELDS}
+    values.update(
+        {
+            "graph:spread_bps_scaled": 0.12,
+            "graph:orderbook_imbalance": 0.2,
+            "graph:return_1m_scaled": 0.4,
+            "graph:realized_volatility_30m": 0.3,
+            "graph:distance_from_vwap": 0.01,
+            "graph:liquidity_score": 0.7,
+            "graph:volume_spike_ratio": 1.4,
+        }
+    )
+    values.update({f"graph:{name}": value for name, value in overrides.items()})
+    return values
+
+
+def _stub_frame(values: dict[str, float]) -> SimpleNamespace:
+    return SimpleNamespace(
         symbol="SOFI",
         decision_time=NOW,
         mark_price=10.0,
@@ -52,18 +63,125 @@ def test_live_feature_frame_adapter_emits_trained_28_field_contract() -> None:
             tick_record_ids=("tick-1",),
         ),
         validate=lambda: None,
-        as_feature_dict=lambda: values,
+        as_feature_dict=lambda: {},
+        as_context_dict=lambda: values,
     )
 
-    snapshot = slow_snapshot_from_live_feature_frame(frame)
 
-    assert len(snapshot.features) == 28
+def test_live_feature_frame_adapter_emits_the_aligned_context() -> None:
+    snapshot = slow_snapshot_from_live_feature_frame(
+        _stub_frame(_graph_context_values())
+    )
+
+    assert len(snapshot.features) == STRATEGY_GRAPH_CONTEXT_DIM
     assert snapshot.symbol == "SOFI"
-    assert snapshot.features[0] == 0.0001
-    assert snapshot.features[27] == 0.0
-    assert snapshot.feature_schema_name == "realtime_strategy_graph_v4_market"
+    assert snapshot.feature_schema_name == STRATEGY_GRAPH_CONTEXT_SCHEMA
     assert snapshot.data_fresh is True
     assert snapshot.tradable is True
+    named = as_context_mapping(snapshot.features)
+    assert named["orderbook_imbalance"] == pytest.approx(0.2)
+    assert named["return_1m_scaled"] == pytest.approx(0.4)
+
+
+def test_snapshot_carries_the_reference_price_explicitly() -> None:
+    """The cost engine used to read ``features[0] * 100_000`` as the price.
+
+    v5 removed the price level from the context (it encodes instrument
+    identity), so slot 0 is now ``microstructure_available`` — 0.0 or 1.0. Left
+    alone, every cost estimate would have been anchored on 0 or 100,000 KRW
+    instead of the mark.
+    """
+    from app.routing.shadow_intelligence import _reference_price
+
+    snapshot = slow_snapshot_from_live_feature_frame(
+        _stub_frame(_graph_context_values())
+    )
+
+    assert snapshot.reference_price == pytest.approx(10.0)
+    assert _reference_price(snapshot) == pytest.approx(10.0)
+    # Slot 0 is emphatically NOT a price any more.
+    assert snapshot.features[0] in (0.0, 1.0)
+
+
+def test_legacy_snapshot_still_derives_its_price_from_slot_zero() -> None:
+    legacy = SlowIntelligenceSnapshot(
+        snapshot_id="legacy",
+        symbol="SOFI",
+        as_of=NOW,
+        valid_until=NOW + timedelta(seconds=5),
+        feature_snapshot_id="legacy-features",
+        features=(0.0001,) * 12,
+        data_fresh=True,
+        tradable=True,
+        allowed_strategy_ids=STRATEGY_IDS,
+        feature_schema_name="realtime_microstructure_v1",
+    )
+    from app.routing.shadow_intelligence import _reference_price
+
+    assert _reference_price(legacy) == pytest.approx(10.0)
+
+
+def test_unknown_book_does_not_score_as_a_perfect_spread() -> None:
+    """``spread_bps_scaled == 0`` means "no book sample", not "zero spread".
+
+    ``1 - 0/10 == 1.0`` would make every spread-dependent prior peak on exactly
+    the minutes with no microstructure — about nine of ten KRX minutes in the
+    current store.
+    """
+    from app.routing.shadow_intelligence import _strategy_compatibility
+
+    known = as_context_mapping(
+        build_strategy_graph_context(
+            {
+                name.removeprefix("graph:"): value
+                for name, value in _graph_context_values(
+                    microstructure_available=1.0
+                ).items()
+            }
+        )
+    )
+    unknown = dict(known)
+    unknown.update(
+        microstructure_available=0.0,
+        spread_bps_scaled=0.0,
+        orderbook_imbalance=0.0,
+        liquidity_score=0.0,
+    )
+
+    known_scores = _strategy_compatibility(
+        build_strategy_graph_context(known)
+    )
+    unknown_scores = _strategy_compatibility(
+        build_strategy_graph_context(unknown)
+    )
+
+    assert known_scores["intraday_momentum"] > 0.0
+    assert known_scores["bar_confirmed_vwap_recovery"] > 0.0
+    assert unknown_scores["intraday_momentum"] == 0.0
+    assert unknown_scores["breakout_volume"] == 0.0
+    assert unknown_scores["vwap_mean_reversion"] == 0.0
+    assert unknown_scores["bar_confirmed_vwap_recovery"] == 0.0
+
+
+def test_adapter_raises_when_the_frame_cannot_supply_the_contract() -> None:
+    """The defect this replaces: a dropped column became a silent 0.0.
+
+    ``box_high``, ``box_low``, ``box_mid``, ``box_previous_close`` and
+    ``realized_volatility_3m`` were all read out of the live model's feature dict
+    with a default after ``LIVE_FEATURE_NAMES`` stopped carrying them, so five of
+    twenty-eight slots were served as zero against weights fitted on real values.
+    An absent field must now stop the snapshot, not fill it in.
+    """
+    values = _graph_context_values()
+    del values["graph:realized_volatility_30m"]
+    del values["graph:box_high_ratio"]
+
+    with pytest.raises(StrategyGraphContextError) as excinfo:
+        slow_snapshot_from_live_feature_frame(_stub_frame(values))
+
+    message = str(excinfo.value)
+    assert "realized_volatility_30m" in message
+    assert "box_high_ratio" in message
 
 
 def test_slow_intelligence_runs_order_free_comparison_and_throttles(tmp_path) -> None:

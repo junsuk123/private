@@ -23,6 +23,11 @@ from app.data.llm_classifier import configure_default_event_llm_env
 from app.research import ResearchService
 from app.storage import LocalResearchStore
 from app.trading.live_runtime_guard import env_bool as runtime_env_bool
+from app.web_access_guard import (
+    ExternalAccessDenied,
+    binds_externally,
+    require_token_for_external_bind,
+)
 from app.trading_pipeline import load_short_horizon_strategy_config
 from app.config.refactor_profile import load_refactor_profile
 
@@ -31,7 +36,15 @@ def main() -> None:
     _configure_stdout()
     configure_default_event_llm_env()
     parser = argparse.ArgumentParser(description="Run the complete local investment system")
-    parser.add_argument("--host", default="127.0.0.1", help="Web server host")
+    parser.add_argument(
+        "--host",
+        default=os.getenv("APP_HOST", "127.0.0.1"),
+        help=(
+            "Web server host. Stays 127.0.0.1 unless APP_HOST or this flag says "
+            "otherwise; binding elsewhere requires APP_ACCESS_TOKEN because this "
+            "app has no authentication and accepts live-trading requests."
+        ),
+    )
     parser.add_argument("--port", default=8000, type=int, help="Web server port")
     parser.add_argument(
         "--strict-port",
@@ -50,6 +63,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Checked BEFORE anything else starts: the failure mode this prevents is a
+    # server that came up reachable on the LAN with shutdown and live-trading
+    # endpoints open, which is not something to discover after the fact.
+    try:
+        require_token_for_external_bind(args.host)
+    except ExternalAccessDenied as exc:
+        print(f"REFUSING TO START: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
     _stop_existing_app_servers(args.host, args.port)
 
     if not args.skip_startup_checks:
@@ -60,6 +82,18 @@ def main() -> None:
         print(f"Port {args.port} is already in use. Using {port} instead.")
 
     print(f"Web UI: http://{args.host}:{port}")
+    if binds_externally(args.host):
+        # ``http://0.0.0.0:8000`` is not an address anything can open. Print the
+        # LAN address the phone actually needs, and say plainly what is now
+        # reachable, since this is the one line an operator will read before
+        # typing the URL into a device.
+        lan = _lan_address()
+        if lan:
+            print(f"Reachable on this network: http://{lan}:{port}/account?token=...")
+        print(
+            "This server accepts live-trading and shutdown requests. "
+            "Non-loopback clients must present APP_ACCESS_TOKEN."
+        )
     try:
         uvicorn.run(
             "app.web:app",
@@ -154,6 +188,22 @@ def _to_jsonable(value: Any) -> Any:
 def _configure_stdout() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+
+
+def _lan_address() -> str | None:
+    """This machine's address on the local network, or ``None``.
+
+    Uses a UDP socket to a routable address purely to ask the OS which local
+    interface it would route through; no packet is sent and nothing is contacted.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return str(probe.getsockname()[0])
+    except OSError:
+        return None
+    finally:
+        probe.close()
 
 
 def _find_available_port(host: str, preferred_port: int, attempts: int = 50) -> int:

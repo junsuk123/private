@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from app.backtesting.event_simulator import EventDrivenFillSimulator
@@ -76,3 +77,51 @@ def test_future_event_does_not_change_earlier_entry_fill() -> None:
     second = simulator.simulate(_plan(), later, as_of=NOW)
     assert not first.filled
     assert not second.filled
+
+
+def test_incomplete_future_is_censored_not_fake_time_exit() -> None:
+    outcome = EventDrivenFillSimulator().simulate(
+        _plan(), (_bar(0, 99, 101, 100),), as_of=NOW
+    )
+
+    assert outcome.filled
+    assert outcome.exit_reason == "FUTURE_WINDOW_CENSORED"
+
+
+def test_simulator_replays_trailing_stop_from_prior_watermark() -> None:
+    plan = replace(
+        _plan(),
+        profit_policy={"price": 110},
+        trailing_policy={"bps": 100},
+        max_holding_seconds=300,
+    )
+    outcome = EventDrivenFillSimulator().simulate(
+        plan,
+        (
+            _bar(0, 99, 103, 102),
+            _bar(1, 101, 102.5, 101.5),
+        ),
+        as_of=NOW,
+    )
+
+    assert outcome.exit_reason == "TRAILING_STOP"
+    assert outcome.exit_price == 103 * 0.99
+    assert outcome.gross_return_bps > 0
+
+
+def test_short_target_and_return_are_direction_aware() -> None:
+    short = replace(
+        _plan(),
+        side="SELL",
+        position_direction="SHORT",
+        execution_product="CREDIT_BORROW",
+        initial_stop={"price": 102},
+        profit_policy={"price": 97},
+    )
+    outcome = EventDrivenFillSimulator().simulate(
+        short, (_bar(0, 99, 101, 100), _bar(1, 96, 101, 97)), as_of=NOW
+    )
+
+    assert outcome.exit_reason == "PROFIT_TARGET"
+    assert outcome.exit_price == 97
+    assert outcome.gross_return_bps > 0

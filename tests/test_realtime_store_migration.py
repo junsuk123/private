@@ -477,6 +477,38 @@ def test_same_symbol_krx_and_nxt_ticks_are_distinct_rows(tmp_path):
         assert conn.execute("select count(*) from realtime_ticks").fetchone()[0] == 2
 
 
+def test_tick_and_orderbook_tables_do_not_duplicate_rows_into_source_events(tmp_path):
+    path = tmp_path / "no_duplicate_events.sqlite3"
+    store = RealtimeMarketDataStore(path)
+    store.save_ticks((_tick(KRX_META, price=70_000.0, volume=10),))
+    store.save_orderbooks(
+        (
+            RealtimeOrderbookSnapshot(
+                symbol="005930",
+                exchange_timestamp=BASE,
+                received_at=BASE,
+                source=KIS_REALTIME_SOURCE,
+                levels=(OrderbookLevel(69_900.0, 100, 70_100.0, 100),),
+                meta=KRX_META,
+            ),
+        )
+    )
+
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("select count(*) from data_source_events").fetchone()[0] == 0
+
+
+def test_raw_microstructure_retention_prunes_in_bounded_batches(tmp_path):
+    path = tmp_path / "retention.sqlite3"
+    store = RealtimeMarketDataStore(path)
+    store.save_ticks((_tick(KRX_META, price=70_000.0, volume=10),))
+
+    deleted = store.prune_market_history(retention_hours=24, batch_size=1_000)
+
+    assert deleted == 1
+    assert store.latest_tick("005930") is None
+
+
 def test_unified_and_venue_feeds_do_not_double_count_volume(tmp_path):
     """같은 체결이 통합·venue 피드로 둘 다 오더라도 bar 거래량은 두 배가 되지 않는다.
 

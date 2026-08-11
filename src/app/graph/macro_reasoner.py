@@ -817,6 +817,18 @@ class MacroMarketReasoner:
                 "foreign_flow_zscore": data.foreign_flow_zscore,
                 "change_point_probability": data.change_point_probability,
                 "regime_stability": data.regime_stability,
+                "market_context_symbols": list(
+                    data.provenance.get("market_context_symbols") or ()
+                ),
+                "market_context_symbol_count": int(
+                    data.provenance.get("market_context_symbol_count") or 0
+                ),
+                "trading_candidate_input_count": int(
+                    data.provenance.get("trading_candidate_input_count") or 0
+                ),
+                "market_context_source": data.provenance.get(
+                    "market_context_source"
+                ),
                 "max_macro_event_severity": max(
                     (
                         float(item.get("severity", 0.0) or 0.0)

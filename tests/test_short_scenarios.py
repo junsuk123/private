@@ -807,6 +807,142 @@ def test_callable_source_treats_an_error_as_unanswered() -> None:
     assert "broker down" in source.status()["reason"]
 
 
+def test_kis_borrow_source_uses_live_inventory_and_conservative_fee() -> None:
+    from app.trading.borrow_source import KisBorrowSource
+
+    class _Client:
+        def get_lendable_by_company(self, symbol):
+            assert symbol == "005930"
+            return {
+                "available": True,
+                "available_quantity": 321,
+                "raw": {"psbl_yn": "Y", "rqst_psbl_qty": "321"},
+            }
+
+    source = KisBorrowSource(client=_Client())
+    snapshot = source.snapshot("005930", now=NOW)
+    assert snapshot is not None and snapshot.available
+    assert snapshot.available_quantity == 321
+    # Unknown index membership uses KIS's higher "other" policy rate, never the
+    # cheaper KOSPI200 rate by assumption.
+    assert snapshot.borrow_fee_bps_annualised == pytest.approx(600.0)
+    assert snapshot.source.startswith("kis:CTSC2702R")
+    assert source.universe() == ("005930",)
+
+
+def test_kis_lendable_query_normalizes_official_response() -> None:
+    from app.execution.kis_real import KisDevelopersApiClient
+
+    calls = []
+
+    class _Transport:
+        def request(self, method, url, headers=None, params=None, body=None, timeout=None):
+            calls.append((method, url, headers, params))
+            return {
+                "rt_cd": "0",
+                "output1": {"psbl_yn": "Y"},
+                "output2": [
+                    {
+                        "pdno": "005930",
+                        "rqst_psbl_qty": "1,234",
+                        "trad_psbl_qty2": "1,500",
+                    }
+                ],
+            }
+
+    client = KisDevelopersApiClient(
+        app_key="key",
+        app_secret="secret",
+        account_no="12345678",
+        enabled=False,
+        transport=_Transport(),
+        access_token="token",
+    )
+    answer = client.get_lendable_by_company("005930")
+    assert answer["available"] is True
+    assert answer["available_quantity"] == 1234
+    method, url, headers, params = calls[-1]
+    assert method == "GET"
+    assert url.endswith("/uapi/domestic-stock/v1/quotations/lendable-by-company")
+    assert headers["tr_id"] == "CTSC2702R"
+    assert params["PDNO"] == "005930"
+
+
+def test_kis_lendable_query_treats_verified_empty_contract_as_unavailable() -> None:
+    from app.execution.kis_real import KisDevelopersApiClient
+
+    class _Transport:
+        def request(self, method, url, headers=None, params=None, body=None, timeout=None):
+            return {
+                "rt_cd": "0",
+                "msg_cd": "KIOK0560",
+                "msg1": "조회할 내용이 없습니다",
+                "output1": [],
+                "output2": {
+                    "tot_stup_lmt_qty": "0",
+                    "brch_lmt_qty": "0",
+                    "rqst_psbl_qty": "0",
+                },
+            }
+
+    client = KisDevelopersApiClient(
+        app_key="key",
+        app_secret="secret",
+        account_no="12345678",
+        enabled=False,
+        transport=_Transport(),
+        access_token="token",
+    )
+    answer = client.get_lendable_by_company("005930")
+    assert answer["available"] is False
+    assert answer["available_quantity"] == 0
+    assert answer["reject_reason"] == "KIS_BORROW_SYMBOL_NOT_LISTED"
+
+
+def test_credit_order_contract_uses_official_kis_side_and_product_codes() -> None:
+    from app.execution.kis_real import KisDevelopersApiClient, KisEndpointSet
+    from app.schemas.domain import FinalOrder, OrderSide, OrderType
+
+    endpoints = KisEndpointSet.for_mode(False)
+    assert endpoints.credit_tr_id_for_order(OrderSide.SELL) == "TTTC0051U"
+    assert endpoints.credit_tr_id_for_order(OrderSide.BUY) == "TTTC0052U"
+
+    client = KisDevelopersApiClient(
+        app_key="key",
+        app_secret="secret",
+        account_no="12345678",
+        enabled=False,
+        transport=object(),
+        access_token="token",
+    )
+    common = dict(
+        ticker="005930",
+        market="KR",
+        order_type=OrderType.LIMIT,
+        quantity=1,
+        limit_price=70000,
+        position_direction="SHORT",
+        execution_product="CREDIT_BORROW",
+    )
+    opening = FinalOrder(
+        **common,
+        side=OrderSide.SELL,
+        position_effect="OPEN",
+        credit_type="22",
+    )
+    closing = FinalOrder(
+        **common,
+        side=OrderSide.BUY,
+        position_effect="CLOSE",
+        credit_type="26",
+        loan_date="20260810",
+    )
+    assert client._credit_order_body(opening, repay=False)["CRDT_TYPE"] == "22"
+    close_body = client._credit_order_body(closing, repay=True)
+    assert close_body["CRDT_TYPE"] == "26"
+    assert close_body["LOAN_DT"] == "20260810"
+
+
 def test_borrow_balance_reads_the_verified_endpoint_and_skips_cash_rows() -> None:
     """Reconciliation uses the SAME inquire-balance call the portfolio path already
     makes in production — the separate credit-balance endpoint returned 404."""

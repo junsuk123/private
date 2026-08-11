@@ -50,18 +50,20 @@ def test_rolling_mean_percentile_needs_enough_history() -> None:
     assert _rolling_mean_percentile(series, index=2, history_start=0, window=15) == 0.0
 
 
-def test_flat_series_ranks_at_the_top_by_percentile_convention() -> None:
-    """Documents a real sharp edge rather than asserting a tautology.
+def test_flat_series_ranks_at_midrank_not_at_the_top() -> None:
+    """A flat tape is neutral evidence, and the percentile now says so.
 
-    ``causal_percentile`` counts observations <= the value, so on a CONSTANT series
-    every window mean ties and the rank is 1.0 — a flat tape reads as maximum
-    residual strength. That is inherent to the convention used by every feature
-    here, not specific to this one, and it is why residual strength alone cannot
-    arm a trade: the expert additionally requires investor flow and liquidity
-    confirmation, neither of which a flat series satisfies.
+    ``causal_percentile`` used to count observations <= the value, so on a
+    CONSTANT series every window mean tied and the rank came out 1.0 — a tape
+    that had done nothing at all read as MAXIMUM residual strength. Ties are now
+    scored at their midrank, so a fully-tied window lands at 0.5.
+
+    This test asserted the old 1.0 and was left behind when the convention
+    changed, so the suite was red on a value the code was deliberately fixed to
+    stop producing.
     """
     series = [5.0] * 60
-    assert _rolling_mean_percentile(series, index=59, history_start=29, window=15) == 1.0
+    assert _rolling_mean_percentile(series, index=59, history_start=29, window=15) == 0.5
 
 
 # --------------------------------------------------------------------------- #

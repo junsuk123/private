@@ -1012,6 +1012,7 @@ def build_macro_micro_panel(bundle: dict[str, Any] | None) -> dict[str, Any]:
         for i in (bundle.get("ranked_trade_intents") or [])
     ]
     macro_reason_codes = [str(c) for c in (macro.get("reason_codes") or [])]
+    macro_diagnostics = dict(macro.get("diagnostics") or {})
     # No live market data anywhere -> every symbol lacks a price series so the
     # macro regime is NO_TRADE_MARKET(insufficient data) and micro is unavailable.
     # Surface this explicitly so the panel reads as "awaiting feed" rather than
@@ -1030,6 +1031,16 @@ def build_macro_micro_panel(bundle: dict[str, Any] | None) -> dict[str, Any]:
         "macro_risk_level": macro.get("macro_risk_level"),
         "macro_confidence": macro.get("macro_confidence"),
         "macro_reason_codes": macro_reason_codes,
+        "market_context_symbols": list(
+            macro_diagnostics.get("market_context_symbols") or []
+        ),
+        "market_context_symbol_count": int(
+            macro_diagnostics.get("market_context_symbol_count") or 0
+        ),
+        "trading_candidate_input_count": int(
+            macro_diagnostics.get("trading_candidate_input_count") or 0
+        ),
+        "market_context_source": macro_diagnostics.get("market_context_source"),
         "blocks_buy": macro.get("blocks_buy"),
         "sector_rankings": macro.get("sector_rankings") or [],
         "candidate_symbols": macro.get("candidate_symbols") or [],

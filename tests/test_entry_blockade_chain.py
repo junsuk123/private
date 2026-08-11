@@ -97,6 +97,43 @@ def test_live_cycle_arming_flag_wins_over_the_fallback(monkeypatch: pytest.Monke
     assert chain["live_armed"]["data"]["evaluated_this_cycle"] is True
 
 
+def test_soft_micro_holds_do_not_block_joint_symbol_strategy_election(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _closed_market_status()
+    status["last_summary"] = {
+        "reason": "NO_POSITIVE_NET_GNN_EDGE",
+        "buy_candidate_count": 2,
+        "buy_candidate_sample": ["SOFI", "T"],
+        "live_armed": True,
+        "strategy_session": {
+            "phase": "SCANNING",
+            "bandit_selected_arm": "no_trade",
+            "candidate_diagnostics": [
+                {
+                    "symbol": "SOFI",
+                    "selected_strategy": "hold",
+                    "execution_quality": "WEAK",
+                    "reason_codes": ["TECHNICAL_EDGE_NON_POSITIVE"],
+                },
+                {
+                    "symbol": "T",
+                    "selected_strategy": "hold",
+                    "execution_quality": "BLOCKED",
+                    "reason_codes": ["LOW_LIQUIDITY_TECHNICAL_BLOCK"],
+                },
+            ],
+        },
+    }
+
+    chain = _chain_for(monkeypatch, status)
+
+    assert chain["micro_buy_intents"]["ok"] is True
+    assert chain["micro_buy_intents"]["data"]["pair_eligible_count"] == 1
+    assert chain["micro_buy_intents"]["data"]["immediate_signal_count"] == 0
+    assert chain["micro_buy_intents"]["data"]["hard_blocked_symbols"] == ["T"]
+
+
 def test_missing_bandit_fields_still_report_stale_code(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _closed_market_status()
     status["strategy_session"] = {"phase": "SCANNING"}

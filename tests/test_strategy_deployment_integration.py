@@ -28,6 +28,8 @@ from app.technical.strategy_algorithms import (
 from app.trading.strategy_session import _session_structure_context
 
 KST = timezone(timedelta(hours=9))
+#: The session clock is resolved from the symbol, so a KRX assertion must name one.
+KRX_SYMBOL = "005930"
 
 
 # --------------------------------------------------------------------------- #
@@ -87,16 +89,16 @@ def test_unknown_strategy_is_never_live_authorized() -> None:
     ],
 )
 def test_last_continuous_half_hour_window(hour, minute, expected_in_window) -> None:
-    """14:50-15:20, never into the 15:20 auction."""
+    """14:50-15:20 for a KRX symbol, never into the 15:20 auction."""
     moment = datetime(2026, 8, 3, hour, minute, tzinfo=KST)
-    context = _session_structure_context(moment)
+    context = _session_structure_context(moment, KRX_SYMBOL)
     assert context["in_last_continuous_half_hour"] is expected_in_window
 
 
 def test_minutes_to_continuous_close_counts_down_and_goes_negative() -> None:
-    early = _session_structure_context(datetime(2026, 8, 3, 14, 50, tzinfo=KST))
-    late = _session_structure_context(datetime(2026, 8, 3, 15, 15, tzinfo=KST))
-    after = _session_structure_context(datetime(2026, 8, 3, 15, 25, tzinfo=KST))
+    early = _session_structure_context(datetime(2026, 8, 3, 14, 50, tzinfo=KST), KRX_SYMBOL)
+    late = _session_structure_context(datetime(2026, 8, 3, 15, 15, tzinfo=KST), KRX_SYMBOL)
+    after = _session_structure_context(datetime(2026, 8, 3, 15, 25, tzinfo=KST), KRX_SYMBOL)
     assert early["minutes_to_continuous_close"] == pytest.approx(30.0)
     assert late["minutes_to_continuous_close"] == pytest.approx(5.0)
     # Must not wrap to a large positive number after the close, which would read as
@@ -107,7 +109,20 @@ def test_minutes_to_continuous_close_counts_down_and_goes_negative() -> None:
 def test_context_is_timezone_correct_from_utc() -> None:
     """Bars and clocks are UTC; the window is a Korean-calendar fact."""
     utc = datetime(2026, 8, 3, 6, 0, tzinfo=timezone.utc)  # 15:00 KST
-    assert _session_structure_context(utc)["in_last_continuous_half_hour"] is True
+    assert _session_structure_context(utc, KRX_SYMBOL)["in_last_continuous_half_hour"] is True
+
+
+def test_the_window_is_the_symbols_market_not_a_fixed_krx_one() -> None:
+    """A US name's last continuous half hour is 15:30-16:00 New York.
+
+    Reading the KRX window for every symbol put it at 14:50-15:20 Seoul — the
+    middle of the New York night — so every session-boxed strategy rejected every
+    US tick with ``*_OUTSIDE_ENTRY_WINDOW``.
+    """
+    us_close = datetime(2026, 8, 10, 19, 45, tzinfo=timezone.utc)  # 15:45 New York
+
+    assert _session_structure_context(us_close, "PFE")["in_last_continuous_half_hour"] is True
+    assert _session_structure_context(us_close, KRX_SYMBOL)["in_last_continuous_half_hour"] is False
 
 
 # --------------------------------------------------------------------------- #

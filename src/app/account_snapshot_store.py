@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -144,6 +145,7 @@ class AccountSnapshotStore:
                 self._insert_holdings(conn, existing_snapshot_id, created_at, dashboard.get("holdings") or ())
                 self._insert_cash(conn, existing_snapshot_id, created_at, dashboard.get("cash") or ())
                 self._insert_trades(conn, dashboard.get("trades") or ())
+                self._prune_history(conn, created_at)
                 conn.commit()
                 return existing_snapshot_id
 
@@ -176,8 +178,52 @@ class AccountSnapshotStore:
             self._insert_holdings(conn, snapshot_id, created_at, dashboard.get("holdings") or ())
             self._insert_cash(conn, snapshot_id, created_at, dashboard.get("cash") or ())
             self._insert_trades(conn, dashboard.get("trades") or ())
+            self._prune_history(conn, created_at)
             conn.commit()
         return snapshot_id
+
+    def _prune_history(self, conn: sqlite3.Connection, now_text: str) -> None:
+        """Keep structured history while bounding heavyweight dashboard JSON."""
+
+        try:
+            now = datetime.fromisoformat(str(now_text).replace("Z", "+00:00"))
+        except ValueError:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        try:
+            retention_days = max(7, int(os.getenv("ACCOUNT_DASHBOARD_RETENTION_DAYS", "90")))
+            trade_days = max(retention_days, int(os.getenv("ACCOUNT_TRADE_RETENTION_DAYS", "365")))
+            raw_keep = max(1, int(os.getenv("ACCOUNT_DASHBOARD_RAW_PAYLOAD_KEEP", "10")))
+            batch = max(10, int(os.getenv("ACCOUNT_DASHBOARD_PRUNE_BATCH_SIZE", "250")))
+        except (TypeError, ValueError):
+            retention_days, trade_days, raw_keep, batch = 90, 365, 10, 250
+        snapshot_cutoff = (now - timedelta(days=retention_days)).isoformat()
+        trade_cutoff = (now - timedelta(days=trade_days)).isoformat()
+        stale_ids = [
+            int(row[0])
+            for row in conn.execute(
+                "select id from account_snapshots where created_at < ? order by id limit ?",
+                (snapshot_cutoff, batch),
+            ).fetchall()
+        ]
+        if stale_ids:
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(f"delete from holding_snapshots where snapshot_id in ({placeholders})", stale_ids)
+            conn.execute(f"delete from cash_currency_snapshots where snapshot_id in ({placeholders})", stale_ids)
+            conn.execute(f"delete from account_snapshots where id in ({placeholders})", stale_ids)
+        conn.execute(
+            "update account_snapshots set raw_payload_json = null where id in ("
+            "select id from account_snapshots where raw_payload_json is not null "
+            "and id not in (select id from account_snapshots order by created_at desc, id desc limit ?) "
+            "order by id limit ?)",
+            (raw_keep, batch),
+        )
+        conn.execute(
+            "delete from trade_events where id in ("
+            "select id from trade_events where occurred_at < ? order by id limit ?)",
+            (trade_cutoff, batch),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15.0)

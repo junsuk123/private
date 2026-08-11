@@ -47,6 +47,17 @@ SECTOR_KEYWORDS = {
     "Finance": ("bank", "insurance", "brokerage", "은행", "증권", "보험"),
 }
 
+# Common all-caps words and regulatory acronyms that also happen to be valid US
+# symbols.  A listed-universe membership test alone is insufficient: with ~17k
+# symbols almost every three-letter acronym collides with something.  These may
+# still be accepted when the article explicitly marks them as a ticker or names
+# the issuer.
+_AMBIGUOUS_TICKER_WORDS = {
+    "API", "USA", "CIK", "PDS", "COO", "OIA", "NMS", "NSA",
+    "SEC", "FED", "GDP", "CPI", "CEO", "CFO", "ETF", "IPO",
+    "AI", "TV", "US", "UK", "EU",
+}
+
 
 def classify_text_event(
     title: str,
@@ -111,7 +122,10 @@ def classify_text_event(
             summary = llm.summary or summary
             key_facts = llm.key_facts
             event_labels = _merge_strings(event_labels, llm.event_labels)
-            tickers = _merge_strings(tickers, _filter_known_tickers(llm.tickers, known_tickers))
+            tickers = _merge_strings(
+                tickers,
+                _filter_known_tickers(llm.tickers, known_tickers, text=text),
+            )
             companies = _merge_strings(companies, llm.companies)
             sectors = _merge_strings(sectors, llm.sectors)
             classification_confidence = llm.confidence
@@ -155,7 +169,7 @@ def _ticker_token_is_unambiguous(
     compact = re.sub(r"[^A-Z0-9]", "", token.upper())
     if compact.isdigit() and len(compact) == 6:
         return True
-    if len(compact) >= 3:
+    if compact not in _AMBIGUOUS_TICKER_WORDS and len(compact) >= 3:
         return True
     if re.search(rf"\${re.escape(compact)}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
         return True
@@ -233,17 +247,29 @@ def _merge_strings(primary: tuple[str, ...], secondary: tuple[str, ...]) -> tupl
     return tuple(dict.fromkeys((*primary, *secondary)))
 
 
-def _filter_known_tickers(tickers: tuple[str, ...], known_tickers: dict[str, str]) -> tuple[str, ...]:
+def _filter_known_tickers(
+    tickers: tuple[str, ...],
+    known_tickers: dict[str, str],
+    *,
+    text: str = "",
+) -> tuple[str, ...]:
     if not known_tickers:
         return tickers
     aliases = _ticker_aliases(known_tickers)
     filtered = []
     for ticker in tickers:
         key = ticker.upper()
-        if key in aliases:
-            filtered.append(aliases[key])
-        elif ticker in known_tickers:
-            filtered.append(ticker)
+        canonical = aliases.get(key, ticker if ticker in known_tickers else None)
+        if canonical is None:
+            continue
+        if key in _AMBIGUOUS_TICKER_WORDS and not _ticker_token_is_unambiguous(
+            key,
+            text,
+            known_tickers,
+            aliases,
+        ):
+            continue
+        filtered.append(canonical)
     return tuple(dict.fromkeys(filtered))
 
 

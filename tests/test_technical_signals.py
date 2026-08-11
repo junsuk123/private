@@ -73,6 +73,39 @@ def tick_features(**over) -> TechnicalFeatureSet:
     return trend_up_features(**tick)
 
 
+def _absorption_horizon_clears_cost(horizon_seconds: int, symbol: str) -> bool:
+    """Is this holding clock inside its configured range AND able to pay costs?
+
+    ``_cost_feasible_volatility_edge`` promises "the shortest completed-bar
+    volatility horizon clearing costs", so the meaningful assertion is that
+    promise, not whatever number today's volatility happens to produce.
+    """
+    from app.technical.strategy_algorithms import (
+        get_algorithm,
+        tick_expected_move_bps,
+    )
+
+    algorithm = get_algorithm("liquidity_shock_reversal")
+    base = int(algorithm.p("absorption_horizon_seconds"))
+    maximum = int(algorithm.p("max_absorption_horizon_seconds"))
+    if not base <= int(horizon_seconds) <= maximum:
+        return False
+    floor, _ = algorithm.entry_floor_bps(symbol)
+    capture = algorithm.p("absorption_capture_fraction")
+    volatility = tick_features().realized_volatility
+
+    def move(seconds: int) -> float:
+        return tick_expected_move_bps(
+            volatility, seconds, window_seconds=60, capture_fraction=capture
+        )
+
+    if move(int(horizon_seconds)) < floor:
+        return False
+    # Shortest: one second less must NOT clear the floor, unless the clock is
+    # already pinned at the configured base.
+    return int(horizon_seconds) == base or move(int(horizon_seconds) - 1) < floor
+
+
 def _election(strategy_id: str):
     """Minimal election context that satisfies each context-dependent algorithm."""
     from app.technical.strategy_algorithms import ElectionContext
@@ -294,6 +327,49 @@ class TestCompositeEngine:
         assert signal.direction == SignalDirection.HOLD
         assert "VWAP_DISPLACEMENT_TOO_SMALL" in signal.reason_codes
 
+    def test_vwap_reversion_requires_observed_recovery_not_missing_as_zero(self):
+        base = dict(
+            symbol="005930",
+            vwap_distance_bps=-100.0,
+            vwap=101.0,
+            rsi=28.0,
+            bb_percent_b=0.08,
+            orderbook_imbalance_change_5s=0.1,
+        )
+        missing = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=None), "vwap_mean_reversion"
+        )
+        flat = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=0.0), "vwap_mean_reversion"
+        )
+        recovered = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=0.0008), "vwap_mean_reversion"
+        )
+
+        assert missing.direction == SignalDirection.HOLD
+        assert "VWAP_RECOVERY_WINDOW_MISSING" in missing.reason_codes
+        assert flat.direction == SignalDirection.HOLD
+        assert "STILL_FALLING_ON_TICKS" in flat.reason_codes
+        assert recovered.direction == SignalDirection.BUY
+        assert "VWAP_DISPLACEMENT_STABILISED" in recovered.reason_codes
+
+    def test_breakout_requires_positive_five_second_acceptance(self):
+        base = dict(symbol="005930", breakout_strength=0.0007)
+        missing = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=None), "breakout_volume"
+        )
+        flat = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=0.0), "breakout_volume"
+        )
+        accepted = self.engine.evaluate_owned_strategy(
+            tick_features(**base, return_5s=0.0008), "breakout_volume"
+        )
+
+        assert "BREAKOUT_ACCEPTANCE_WINDOW_MISSING" in missing.reason_codes
+        assert rc.FALSE_BREAKOUT_RISK_HIGH in flat.reason_codes
+        assert accepted.direction == SignalDirection.BUY
+        assert "BREAKOUT_ACCEPTED_ON_TICKS" in accepted.reason_codes
+
     def test_shock_reversal_needs_a_shock_and_a_contracting_spread(self):
         # 140bp shock: at the configured 40% recovery capture that is ~56bp of
         # expected edge, which is what it takes to clear a ~44bp KRX floor. The
@@ -343,6 +419,105 @@ class TestCompositeEngine:
         # The stabilisation itself was still detected; only the economics failed.
         assert "LIQUIDITY_SHOCK_STABILISED" in signal.reason_codes
 
+    def test_absorption_horizon_is_the_shortest_that_clears_its_cost_floor(self):
+        """The clock is solved from cost, and the BASE horizon is not a valid answer.
+
+        This assertion used to be ``== 600``, the configured base. On a US name
+        that base is economically infeasible: the fixture's completed-bar
+        volatility carries only 44.3bps over 600s against a 61.2bps round-trip
+        floor, so a position closed there could not pay for itself. Pinning the
+        constant was therefore asserting the one end of the range the solver
+        exists to avoid, and it silently went stale the moment the horizon became
+        cost-derived.
+
+        What is worth pinning is the contract in
+        ``_cost_feasible_volatility_edge``: the SHORTEST horizon whose expected
+        move clears the floor. A regression that reverts the clock to a constant,
+        or that inverts the volatility scaling, breaks this; a change in the
+        fixture's volatility does not.
+        """
+        from app.technical.strategy_algorithms import (
+            get_algorithm,
+            tick_expected_move_bps,
+        )
+
+        algorithm = get_algorithm("liquidity_shock_reversal")
+        features = tick_features(
+            symbol="SOFI",
+            return_30s=0.0004,
+            orderbook_imbalance=-0.40,
+            spread_change_5s=-0.2,
+        )
+        base = int(algorithm.p("absorption_horizon_seconds"))
+        maximum = int(algorithm.p("max_absorption_horizon_seconds"))
+        capture = algorithm.p("absorption_capture_fraction")
+        floor, floor_diagnostics = algorithm.entry_floor_bps("SOFI")
+        edge, horizon = algorithm._cost_feasible_volatility_edge(
+            features,
+            base_horizon_seconds=base,
+            maximum_horizon_seconds=maximum,
+            capture_fraction=capture,
+        )
+
+        # The floor is the venue's round trip, not an arbitrary constant.
+        assert floor_diagnostics["floor_basis"] == "round_trip_cost"
+        assert base <= horizon <= maximum
+        # It clears the floor...
+        assert edge >= floor
+        # ...and it is the shortest horizon that does.
+        assert (
+            tick_expected_move_bps(
+                features.realized_volatility,
+                horizon - 1,
+                window_seconds=60,
+                capture_fraction=capture,
+            )
+            < floor
+        )
+        # The base horizon really is infeasible here, so the solver extending past
+        # it is the behaviour under test rather than an accident of the fixture.
+        assert (
+            tick_expected_move_bps(
+                features.realized_volatility,
+                base,
+                window_seconds=60,
+                capture_fraction=capture,
+            )
+            < floor
+        )
+
+    def test_a_calm_tape_cannot_be_carried_to_a_feasible_absorption_horizon(self):
+        """When even the maximum horizon cannot pay, the clock stops at the cap.
+
+        The solver clamps rather than inventing an unbounded holding time, and the
+        cost floor then rejects the entry downstream — which is the correct pair of
+        behaviours: no fabricated horizon, and no trade.
+        """
+        from app.technical.strategy_algorithms import get_algorithm
+
+        algorithm = get_algorithm("liquidity_shock_reversal")
+        calm = tick_features(
+            symbol="SOFI",
+            return_30s=0.0004,
+            orderbook_imbalance=-0.40,
+            spread_change_5s=-0.2,
+            realized_volatility=0.00002,
+        )
+        maximum = int(algorithm.p("max_absorption_horizon_seconds"))
+        floor, _ = algorithm.entry_floor_bps("SOFI")
+        edge, horizon = algorithm._cost_feasible_volatility_edge(
+            calm,
+            base_horizon_seconds=int(algorithm.p("absorption_horizon_seconds")),
+            maximum_horizon_seconds=maximum,
+            capture_fraction=algorithm.p("absorption_capture_fraction"),
+        )
+
+        assert horizon == maximum
+        assert edge < floor
+        decision = algorithm.entry(calm, _election("liquidity_shock_reversal"))
+        assert decision.triggered is False
+        assert "EDGE_BELOW_COST_FLOOR" in decision.reason_codes
+
     def test_us_ask_heavy_absorption_branch_requires_price_recovery(self):
         absorbed = tick_features(
             symbol="SOFI",
@@ -358,7 +533,10 @@ class TestCompositeEngine:
 
         assert fired.direction == SignalDirection.BUY
         assert "ASK_HEAVY_ABSORPTION_CONFIRMED" in fired.reason_codes
-        assert fired.expected_horizon_seconds == 600
+        # The holding clock is DERIVED from cost, so it is asserted as a property
+        # rather than as a constant -- see
+        # test_absorption_horizon_is_the_shortest_that_clears_its_cost_floor.
+        assert _absorption_horizon_clears_cost(fired.expected_horizon_seconds, "SOFI")
 
         rest_polled = self.engine.evaluate_owned_strategy(
             tick_features(

@@ -210,12 +210,21 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
     shared decision engine needs no extra store reads. Missing keys degrade to
     ``None`` (NaN-safe).
     """
-    d = frame.as_feature_dict()
+    # Quality and slow-context fields deliberately live outside the seconds-model
+    # vector (see LiveFeatureFrame.extras).  Reading only as_feature_dict() erased
+    # them and made US REST candidates look identically neutral.  Keep compatibility
+    # with lightweight/test frames that predate as_context_dict().
+    context_reader = getattr(frame, "as_context_dict", None)
+    d = context_reader() if callable(context_reader) else frame.as_feature_dict()
     price = float(getattr(frame, "mark_price", 0.0) or 0.0) or None
 
     def g(name):
         v = d.get(name)
         return float(v) if v is not None else None
+
+    def slow(name, fallback=None):
+        value = g(f"slow_technical:{name}")
+        return fallback if value is None else value
 
     ema_gap_bps = g("ema_gap_bps")
     # Reconstruct ema_fast/ema_slow so the regime gap calc matches ema_gap_bps.
@@ -226,17 +235,29 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
     return TechnicalFeatureSet(
         symbol=symbol or getattr(frame, "symbol", ""),
         price=price,
-        ema_fast=ema_fast,
-        ema_slow=ema_slow,
-        macd_histogram=g("macd_histogram"),
-        short_return=g("return_1m"),
-        rsi=g("rsi_14"),
-        bb_percent_b=g("bollinger_percent_b"),
-        vwap=vwap,
-        vwap_distance_bps=(dist * 10_000.0) if dist is not None else None,
-        relative_volume=g("volume_spike_ratio"),
-        volume_spike_ratio=g("volume_spike_ratio"),
-        breakout_strength=g("donchian_breakout"),
+        ema_fast=slow("ema_fast", ema_fast),
+        ema_slow=slow("ema_slow", ema_slow),
+        macd=slow("macd"),
+        macd_signal=slow("macd_signal"),
+        macd_histogram=slow("macd_histogram", g("macd_histogram")),
+        short_return=slow("short_return", g("return_1m")),
+        momentum_persistence=slow("momentum_persistence"),
+        rsi=slow("rsi", g("rsi_14")),
+        bb_percent_b=slow("bb_percent_b", g("bollinger_percent_b")),
+        bb_bandwidth=slow("bb_bandwidth"),
+        vwap=slow("vwap", vwap),
+        vwap_distance_bps=slow(
+            "vwap_distance_bps",
+            (dist * 10_000.0) if dist is not None else None,
+        ),
+        vwap_slope=slow("vwap_slope"),
+        relative_volume=slow("relative_volume", g("volume_spike_ratio")),
+        volume_spike_ratio=slow("volume_spike_ratio", g("volume_spike_ratio")),
+        donchian_high=slow("donchian_high"),
+        donchian_low=slow("donchian_low"),
+        breakout_strength=slow("breakout_strength", g("donchian_breakout")),
+        donchian_low_distance=slow("donchian_low_distance"),
+        false_breakout_risk=slow("false_breakout_risk"),
         rvgi=g("rvgi") if (g("rvgi_available") or 0.0) >= 1.0 else None,
         rvgi_signal=g("rvgi_signal") if (g("rvgi_available") or 0.0) >= 1.0 else None,
         rvgi_diff=g("rvgi_diff") if (g("rvgi_available") or 0.0) >= 1.0 else None,
@@ -258,7 +279,9 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
             and (g("box_context_timestamp_epoch") or 0.0) > 0
             else None
         ),
-        realized_volatility=g("realized_volatility_3m"),
+        atr_pct=slow("atr_pct"),
+        realized_volatility=slow("realized_volatility", g("realized_volatility_3m")),
+        volatility_expansion=slow("volatility_expansion"),
         liquidity_score=g("liquidity_score"),
         spread_bps=g("spread_bps"),
         orderbook_imbalance=g("orderbook_imbalance"),

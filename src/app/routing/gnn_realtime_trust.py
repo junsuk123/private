@@ -13,7 +13,18 @@ from typing import Any
 
 from app.cost import TradingCostEngine
 from app.routing.actions import is_actionable_strategy_route
-from app.strategy.exit_geometry import exit_geometry
+from app.strategy.catalog import is_short_strategy
+from app.strategy.exit_geometry import (
+    exit_geometry,
+    reference_round_trip_cost_bps,
+)
+from app.trading.directional import (
+    PositionDirection,
+    gross_return_bps,
+    parse_direction,
+    trailing_breached,
+    trailing_price,
+)
 
 
 @dataclass(frozen=True)
@@ -33,8 +44,15 @@ class GnnRealtimeTrust:
     horizon_seconds: int
     strategy_sample_counts: dict[str, int]
     strategy_metrics: dict[str, dict[str, float | int | bool | str | None]]
+    strategy_market_metrics: dict[
+        str, dict[str, dict[str, float | int | bool | str | None]]
+    ]
     calibrated_strategy_ids: tuple[str, ...]
     trusted_strategy_ids: tuple[str, ...]
+    trusted_strategy_markets: dict[str, tuple[str, ...]]
+    outcome_validation_method: str
+    outcome_validation_uses_live_algorithm: bool
+    outcome_validation_caveat: str
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -258,7 +276,9 @@ class GnnRealtimeTrustEvaluator:
         )
         if score < minimum_score:
             reasons.append("GNN_TRUST_SCORE_BELOW_THRESHOLD")
-        grouped: dict[str, list[tuple[float, float, float, str, float]]] = {}
+        grouped: dict[
+            str, list[tuple[float, float, float, str, float, str]]
+        ] = {}
         for outcome in outcomes:
             grouped.setdefault(outcome[3], []).append(outcome)
         strategy_metrics = {
@@ -275,16 +295,49 @@ class GnnRealtimeTrustEvaluator:
             )
             for strategy_id, strategy_outcomes in sorted(grouped.items())
         }
+        grouped_by_market: dict[
+            tuple[str, str], list[tuple[float, float, float, str, float, str]]
+        ] = {}
+        for outcome in outcomes:
+            grouped_by_market.setdefault((outcome[3], outcome[5]), []).append(outcome)
+        strategy_market_metrics: dict[
+            str, dict[str, dict[str, float | int | bool | str | None]]
+        ] = {}
+        for (strategy_id, market), market_outcomes in sorted(
+            grouped_by_market.items()
+        ):
+            strategy_market_metrics.setdefault(strategy_id, {})[market] = (
+                _strategy_metrics(
+                    market_outcomes,
+                    horizon_seconds=self._strategy_horizon(strategy_id),
+                    minimum_samples=self.minimum_strategy_samples,
+                    minimum_positive_rate=minimum_positive_rate,
+                    maximum_brier=maximum_brier,
+                    maximum_uncertainty=maximum_uncertainty,
+                    minimum_sign_accuracy=minimum_sign_accuracy,
+                    maximum_net_mae_bps=maximum_net_mae_bps,
+                    minimum_score=minimum_score,
+                )
+            )
         calibrated_strategy_ids = tuple(
             strategy_id
             for strategy_id, metrics in strategy_metrics.items()
             if metrics["calibration_passed"] is True
         )
-        trusted_strategy_ids = tuple(
-            strategy_id
-            for strategy_id, metrics in strategy_metrics.items()
-            if metrics["entry_authorized"] is True
-        )
+        trusted_strategy_markets = {
+            strategy_id: tuple(
+                market
+                for market, metrics in sorted(markets.items())
+                if metrics["entry_authorized"] is True
+            )
+            for strategy_id, markets in strategy_market_metrics.items()
+        }
+        trusted_strategy_markets = {
+            strategy_id: markets
+            for strategy_id, markets in trusted_strategy_markets.items()
+            if markets
+        }
+        trusted_strategy_ids = tuple(sorted(trusted_strategy_markets))
         if not calibrated_strategy_ids:
             reasons.append("GNN_TRUST_NO_STRATEGY_PASSED")
         if not trusted_strategy_ids:
@@ -311,14 +364,24 @@ class GnnRealtimeTrustEvaluator:
                 for strategy_id, metrics in strategy_metrics.items()
             },
             strategy_metrics=strategy_metrics,
+            strategy_market_metrics=strategy_market_metrics,
             calibrated_strategy_ids=calibrated_strategy_ids,
             trusted_strategy_ids=trusted_strategy_ids,
+            trusted_strategy_markets=trusted_strategy_markets,
+            outcome_validation_method="directional_strategy_policy_replay_v2",
+            outcome_validation_uses_live_algorithm=True,
+            outcome_validation_caveat=(
+                "entry=first tick after an admissible forecast; "
+                "exit=direction-aware target/stop/trailing/max-holding policy; "
+                "contextual supervisor halts are not reconstructed from "
+                "price-only history"
+            ),
         )
 
     def _query_outcomes(
         self,
         candidates: list[dict[str, Any]],
-    ) -> list[tuple[float, float, float, str, float]]:
+    ) -> list[tuple[float, float, float, str, float, str]]:
         """Read the live WAL without competing with the realtime writer.
 
         The market database is several gigabytes and is written continuously.
@@ -408,10 +471,14 @@ class GnnRealtimeTrustEvaluator:
         outcome query. The per-strategy cap keeps the window bounded for
         pathological inputs without throwing away work already done.
         """
-        per_strategy: dict[str, list[dict[str, Any]]] = {}
+        per_strategy: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for candidate in candidates:
             per_strategy.setdefault(
-                str(candidate["strategy_id"]), []
+                (
+                    str(candidate["strategy_id"]),
+                    str(candidate.get("position_direction") or "LONG"),
+                ),
+                [],
             ).append(candidate)
         kept: list[dict[str, Any]] = []
         for strategy_candidates in per_strategy.values():
@@ -427,7 +494,7 @@ class GnnRealtimeTrustEvaluator:
         evaluation_time: datetime,
         active_checkpoint_hash: str | None,
     ) -> list[dict[str, Any]]:
-        deduplicated: dict[tuple[str, str, int], dict[str, Any]] = {}
+        deduplicated: dict[tuple[str, str, str, int], dict[str, Any]] = {}
         for raw in rows:
             try:
                 payload = json.loads(raw)
@@ -476,9 +543,16 @@ class GnnRealtimeTrustEvaluator:
                 ):
                     continue
                 bucket = int(observed.timestamp()) // strategy_horizon
+                direction = str(
+                    decision.get("position_direction")
+                    or ("SHORT" if is_short_strategy(str(strategy_id)) else "LONG")
+                ).upper()
+                if direction not in {"LONG", "SHORT"}:
+                    continue
                 key = (
                     str(payload.get("symbol") or "").upper(),
                     str(strategy_id),
+                    direction,
                     bucket,
                 )
                 candidate = {
@@ -495,6 +569,7 @@ class GnnRealtimeTrustEvaluator:
                         decision.get("expected_net_return_bps") or 0.0
                     ),
                     "strategy_id": str(strategy_id),
+                    "position_direction": direction,
                     "horizon_seconds": strategy_horizon,
                 }
                 existing = deduplicated.get(key)
@@ -533,7 +608,7 @@ class GnnRealtimeTrustEvaluator:
         self,
         connection: sqlite3.Connection,
         candidates: list[dict[str, Any]],
-    ) -> list[tuple[float, float, float, str, float]]:
+    ) -> list[tuple[float, float, float, str, float, str]]:
         """Resolve bounded outcomes through the symbol/received_at covering index."""
         outcomes: list[tuple[float, float, float, str, float]] = []
         for item in candidates:
@@ -544,6 +619,7 @@ class GnnRealtimeTrustEvaluator:
                         *outcome,
                         str(item["strategy_id"]),
                         float(item.get("expected_net_return_bps") or 0.0),
+                        _market_key(str(item["symbol"])),
                     )
                 )
         return outcomes
@@ -601,9 +677,21 @@ class GnnRealtimeTrustEvaluator:
             ).total_cost_rate
             * 10_000.0
         )
-        geometry = exit_geometry(str(item.get("strategy_id") or ""))
+        strategy_id = str(item.get("strategy_id") or "")
+        direction = parse_direction(
+            item.get("position_direction"),
+            PositionDirection.SHORT
+            if is_short_strategy(strategy_id)
+            else PositionDirection.LONG,
+        )
+        geometry = exit_geometry(strategy_id)
         stop_bps = geometry.stop_loss_bps
         configured_target_bps = geometry.take_profit_bps
+        # Short replay must include at least the same borrow-aware reference cost
+        # that sized its live exit geometry.  The forecast's own cost may be higher
+        # and remains authoritative in that case.
+        directional_cost_floor_bps = reference_round_trip_cost_bps(strategy_id)
+        baseline_cost_bps = max(baseline_cost_bps, directional_cost_floor_bps)
         target_bps = max(
             configured_target_bps,
             baseline_cost_bps + max(25.0, baseline_cost_bps),
@@ -617,12 +705,31 @@ class GnnRealtimeTrustEvaluator:
             (symbol, str(entry[1]), str(exit_[1])),
         ).fetchall()
         exit_price = horizon_exit_price
+        favourable_watermark = entry_price
         for (raw_price,) in path:
             price = float(raw_price or 0.0)
             if price <= 0.0:
                 continue
-            move_bps = (price / entry_price - 1.0) * 10_000.0
+            move_bps = gross_return_bps(entry_price, price, direction)
             if move_bps >= target_bps or move_bps <= -stop_bps:
+                exit_price = price
+                break
+            favourable_watermark = (
+                max(favourable_watermark, price)
+                if direction is PositionDirection.LONG
+                else min(favourable_watermark, price)
+            )
+            resolved_trailing = trailing_price(
+                favourable_watermark,
+                geometry.trailing_bps / 10_000.0,
+                direction,
+            )
+            if trailing_breached(
+                price,
+                resolved_trailing,
+                entry_price,
+                direction,
+            ):
                 exit_price = price
                 break
         realized_cost_bps = (
@@ -637,8 +744,12 @@ class GnnRealtimeTrustEvaluator:
             ).total_cost_rate
             * 10_000.0
         )
-        cost_bps = max(float(item["cost_bps"]), realized_cost_bps)
-        net_bps = (exit_price / entry_price - 1.0) * 10_000.0 - cost_bps
+        cost_bps = max(
+            float(item["cost_bps"]),
+            realized_cost_bps,
+            directional_cost_floor_bps,
+        )
+        net_bps = gross_return_bps(entry_price, exit_price, direction) - cost_bps
         return net_bps, item["probability"], item["uncertainty"]
 
     def _empty(
@@ -662,8 +773,18 @@ class GnnRealtimeTrustEvaluator:
             horizon_seconds=self.horizon_seconds,
             strategy_sample_counts={},
             strategy_metrics={},
+            strategy_market_metrics={},
             calibrated_strategy_ids=(),
             trusted_strategy_ids=(),
+            trusted_strategy_markets={},
+            outcome_validation_method="directional_strategy_policy_replay_v2",
+            outcome_validation_uses_live_algorithm=True,
+            outcome_validation_caveat=(
+                "entry=first tick after an admissible forecast; "
+                "exit=direction-aware target/stop/trailing/max-holding policy; "
+                "contextual supervisor halts are not reconstructed from "
+                "price-only history"
+            ),
         )
 
 
@@ -690,8 +811,13 @@ def _tail_text_lines(path: Path, *, max_lines: int) -> deque[str]:
     )
 
 
+def _market_key(symbol: str) -> str:
+    normalized = str(symbol or "").upper().strip()
+    return "KRX" if normalized.isdigit() and len(normalized) == 6 else "US"
+
+
 def _strategy_metrics(
-    outcomes: list[tuple[float, float, float, str, float]],
+    outcomes: list[tuple[float, float, float, str, float, str]],
     *,
     horizon_seconds: int,
     minimum_samples: int,
@@ -762,7 +888,8 @@ def _strategy_metrics(
         calibration_passed
         and trade_sample_count >= minimum_trade_samples
         and positive_rate >= minimum_positive_rate
-        and mean_net > 0.0
+        and mean_net
+        >= max(0.0, float(os.getenv("GNN_TRUST_MIN_MEAN_NET_BPS", "5.0")))
     )
     return {
         "sample_count": sample_count,
@@ -792,18 +919,16 @@ def _strategy_metrics(
         "entry_authorized": entry_authorized,
         # Backward-compatible UI field: "passed" means model calibration.
         "passed": calibration_passed,
-        # WHAT these numbers measured. The outcome walk prices the first tick at
-        # or after the forecast as the entry and applies the strategy's generic
-        # exit_geometry barrier to a fixed horizon. It does NOT call the live
-        # algorithm's entry(), exit_rule() or invalidation(), so this score
-        # measures the FORECAST's calibration, not the tradable strategy's PnL.
-        # Publishing the method with the number is what stops "GNN trust 0.89"
-        # from being read as "the strategy earns money"; the two can only be the
-        # same once the replay runs the same policy the router executes.
-        "outcome_validation_method": "forecast_horizon_barrier_v1",
-        "outcome_validation_uses_live_algorithm": False,
+        # Entry admissibility was already frozen into the validation candidate.
+        # From that point onward replay uses the same directional target, stop,
+        # trailing and max-holding geometry as StrategySessionManager.  Contextual
+        # supervisor halts cannot be reconstructed from price ticks and therefore
+        # remain outside this metric.
+        "outcome_validation_method": "directional_strategy_policy_replay_v2",
+        "outcome_validation_uses_live_algorithm": True,
         "outcome_validation_caveat": (
-            "entry=first tick after forecast; exit=exit_geometry barrier at fixed "
-            "horizon; live entry()/exit_rule()/invalidation() not replayed"
+            "entry=first tick after an admissible forecast; exit=direction-aware "
+            "target/stop/trailing/max-holding policy; contextual supervisor halts "
+            "are not reconstructed from price-only history"
         ),
     }

@@ -120,6 +120,28 @@ class FrameMappingTest(unittest.TestCase):
         self.assertIsNotNone(fs.ema_fast)
         self.assertGreater(fs.ema_fast, fs.ema_slow)  # positive ema_gap_bps
 
+    def test_completed_minute_context_overrides_sparse_tick_neutral_defaults(self):
+        frame = _trend_up_frame(10_000.0)
+        fast = frame.as_feature_dict()
+        fast.update({"ema_gap_bps": 0.0, "rsi_14": 50.0, "volume_spike_ratio": 1.0})
+        slow = {
+            "slow_technical:ema_fast": 10_020.0,
+            "slow_technical:ema_slow": 10_000.0,
+            "slow_technical:rsi": 64.0,
+            "slow_technical:volume_spike_ratio": 2.4,
+            "slow_technical:realized_volatility": 0.003,
+            "slow_technical:bar_count": 80.0,
+        }
+        frame.as_feature_dict = lambda: dict(fast)
+        frame.as_context_dict = lambda: {**fast, **slow}
+
+        fs = technical_feature_set_from_live_frame(frame, "INTC")
+
+        self.assertEqual(fs.ema_fast, 10_020.0)
+        self.assertEqual(fs.rsi, 64.0)
+        self.assertEqual(fs.volume_spike_ratio, 2.4)
+        self.assertEqual(fs.realized_volatility, 0.003)
+
 
 class TechnicalIntegrationTest(unittest.TestCase):
     def test_technical_prediction_in_diagnostics(self):

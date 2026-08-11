@@ -419,7 +419,8 @@ _DEFAULTS: dict[str, dict[str, float]] = {
     },
     "breakout_volume": {
         "min_volume_spike_ratio": 1.5,
-        "acceptance_return_1s_bps": 0.0,
+        "min_breakout_excess_bps": 2.0,
+        "acceptance_return_5s_bps": 1.0,
         "min_aggressor_imbalance": 0.05,
         "horizon_seconds": 300.0,
         "stop_buffer_bps": 8.0,
@@ -428,12 +429,40 @@ _DEFAULTS: dict[str, dict[str, float]] = {
     },
     "vwap_mean_reversion": {
         "entry_deviation_bps": 25.0,
+        "max_entry_deviation_bps": 150.0,
+        "max_entry_zscore": 4.0,
         "max_rsi": 38.0,
         "max_percent_b": 0.22,
+        "min_recovery_return_5s_bps": 1.0,
+        "min_aggressor_imbalance": 0.05,
+        "min_book_improvement": 0.0,
         "horizon_seconds": 240.0,
+        "max_horizon_seconds": 5400.0,
         "stop_volatility_multiple": 2.0,
         "target_capture_fraction": 0.7,
         "trailing_bps": 10.0,
+    },
+    "bar_confirmed_vwap_recovery": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 1.0,
+        "min_displacement_bps": 75.0,
+        "max_displacement_zscore": 15.0,
+        "max_rsi": 45.0,
+        "min_macd_histogram": 0.0,
+        "min_momentum_persistence": 0.30,
+        "min_liquidity_score": 0.40,
+        "max_spread_bps": 25.0,
+        "target_capture_fraction": 0.50,
+        "stop_volatility_multiple": 2.5,
+        "trailing_bps": 30.0,
+        "horizon_seconds": 5400.0,
+        # ``exit_rule`` reads this to size the holding clock from the structural
+        # edge; without it every elected position raised KeyError. Equal to the
+        # base horizon, so the resolved clock stays exactly what it was before the
+        # knob existed — raising it is a deliberate tuning decision, not a repair.
+        "max_horizon_seconds": 5400.0,
     },
     "liquidity_shock_reversal": {
         # The new ask-heavy absorption branch is validated on two US sessions
@@ -441,7 +470,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # enough independent sessions for promotion.
         "enabled": 1.0,
         "shadow_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "shock_return_10s_bps": -40.0,
         "max_spread_change_5s": 0.0,
         "min_aggressor_imbalance": -0.35,
@@ -456,6 +485,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "max_absorption_spread_change_5s": 0.0,
         "absorption_capture_fraction": 0.35,
         "absorption_horizon_seconds": 600.0,
+        "max_absorption_horizon_seconds": 3600.0,
     },
     "event_momentum": {
         "min_volume_spike_ratio": 2.0,
@@ -486,7 +516,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "rvgi_period": 10.0,
         "box_lookback": 20.0,
         "cross_confirm_bars": 3.0,
@@ -505,14 +535,12 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "horizon_seconds": 300.0,
     },
     # --- Added for the current high-volatility, flow-driven tape --------------
-    # All three ship with live_authorized = 0: they run in shadow until each has
-    # accumulated enough per-regime samples in the strategy performance store for
-    # the conservative bandit to give them a positive lower bound.
+    # Deployment is enabled; common cost, trust, bandit and risk gates remain.
     "residual_relative_strength": {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "min_residual_short_bps": 5.0,
         "min_residual_long_bps": 0.0,
         "max_sector_rank": 3.0,
@@ -530,7 +558,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "min_entry_zscore": 2.0,
         "max_entry_zscore": 6.0,
         "min_displacement_bps": 15.0,
@@ -547,7 +575,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "shock_return_10s_bps": -35.0,
         "min_depth_ratio": 1.1,
         "min_orderbook_imbalance": 0.05,
@@ -585,13 +613,42 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # 14:50 -> 15:15, flat before the 15:20 closing auction.
         "horizon_seconds": 1500.0,
     },
+    "overnight_gap_carry": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        # Direction is unvalidated: the local sample measures the overnight MOVE
+        # (median 69.1bps, above the 51.2bps round trip) but not its sign, and the
+        # unconditional mean is +15.6bps, i.e. a loser before gating. Promotion has
+        # to come from forward outcomes, not from this file.
+        "live_authorized": 0.0,
+        # Variance-equivalent trading minutes carried by an overnight gap.
+        # Calibrated from the stored US sample: median |overnight| 69.1bps against
+        # median |30-minute| 16.4bps is 4.21x, and 4.21^2 x 30 = 532.
+        "overnight_variance_minutes": 532.0,
+        # Only near the close: the carry is a decision about the closing print.
+        "max_minutes_to_close": 20.0,
+        # Closing above the session VWAP is the observable form of "buyers ended
+        # the day in control". Zero is the neutral line, so this asks for a real
+        # premium rather than a rounding error.
+        "min_vwap_premium_bps": 10.0,
+        "min_momentum_persistence": 0.55,
+        "min_aggressor_imbalance": 0.10,
+        "max_change_point_probability": 0.5,
+        # An overnight gap jumps rather than fills, so a stop inside the typical
+        # gap is not a stop; it is a worse fill on a move that already happened.
+        "stop_volatility_multiple": 3.0,
+        "trailing_bps": 45.0,
+        # 15:45 New York to the next open plus settling room.
+        "horizon_seconds": 64800.0,
+    },
     "opening_range_breakout": {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
         # Live authorisation is withheld until this strategy has its own realized
         # history, exactly like every other newly added algorithm here.
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         # "Stocks in play": relative volume is the load-bearing filter in the
         # published result, not a nicety. Practitioner studies place the useful
         # threshold at 1.5-2.0x average volume; 1.5 is the permissive end.
@@ -613,13 +670,9 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "horizon_seconds": 7200.0,
     },
     # --- SHORT theses -------------------------------------------------------- #
-    # All three carry ``live_authorized: 0.0``, which puts them in
-    # ``_DEPLOYMENT_GATED_STRATEGIES`` automatically. That flag is necessary but NOT
-    # sufficient for a short: even flipped to 1.0 by an operator, the per-arm
-    # deployment state in ``app.trading.short_strategy_promotion`` still has to have
-    # reached a live rung, and there is no environment variable that skips it. Two
-    # independent gates, because one flag is how an unvalidated short reaches a real
-    # order.
+    # Deployment flags are enabled. Production also carries an explicit audited
+    # operator override in short_strategy_deployment.yaml; borrow and short-risk
+    # checks remain independent hard gates.
     #
     # Thresholds are the mirror of each long counterpart's, with the direction of
     # every comparison reversed by the algorithm rather than by negating the number,
@@ -628,7 +681,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         # Magnitude, applied to a NEGATIVE first half-hour return. Slightly wider
         # than the long side's 15bps because the borrow leg raises the cost floor.
         "min_first_half_hour_drop_bps": 20.0,
@@ -653,7 +706,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         "min_relative_volume": 1.5,
         # Magnitude below the opening-range LOW, in bps of range width.
         "min_breakdown_excess_bps": 3.0,
@@ -676,7 +729,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "enabled": 1.0,
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
-        "live_authorized": 0.0,
+        "live_authorized": 1.0,
         # Magnitudes applied to NEGATIVE residuals.
         "min_residual_short_weakness_bps": 5.0,
         "min_residual_long_weakness_bps": 0.0,
@@ -810,11 +863,64 @@ class TradingAlgorithm:
         return True, ()
 
     def _volatility_edge(self, f: TechnicalFeatureSet) -> float:
+        volatility = f.realized_volatility_10s
+        window_seconds = 10
+        if not volatility or volatility <= 0:
+            # Sparse but genuine websocket prints can still resolve direction and
+            # price continuation with two events. Expected move then comes from
+            # completed one-minute history, never from a fabricated minimum.
+            volatility = f.realized_volatility
+            window_seconds = 60
         return tick_expected_move_bps(
-            f.realized_volatility_10s,
+            volatility,
             self.horizon_seconds,
+            window_seconds=window_seconds,
             capture_fraction=self.config.shared("capture_fraction"),
         )
+
+    @staticmethod
+    def _horizon_for_structural_edge(
+        f: TechnicalFeatureSet,
+        edge_bps: float,
+        base_horizon_seconds: int,
+        maximum_horizon_seconds: int,
+    ) -> int:
+        """Estimate a feasible holding clock from completed-bar volatility."""
+
+        base = max(1, int(base_horizon_seconds))
+        maximum = max(base, int(maximum_horizon_seconds))
+        minute_vol_bps = max(0.0, float(f.realized_volatility or 0.0) * 10_000.0)
+        if minute_vol_bps <= 0 or edge_bps <= 0:
+            return base
+        estimated = 60.0 * (edge_bps / minute_vol_bps) ** 2
+        return max(base, min(maximum, int(math.ceil(estimated))))
+
+    def _cost_feasible_volatility_edge(
+        self,
+        f: TechnicalFeatureSet,
+        *,
+        base_horizon_seconds: int,
+        maximum_horizon_seconds: int,
+        capture_fraction: float,
+    ) -> tuple[float, int]:
+        """Find the shortest completed-bar volatility horizon clearing costs."""
+
+        minimum, _ = self.entry_floor_bps(f.symbol)
+        minute_volatility = max(0.0, float(f.realized_volatility or 0.0))
+        captured_minute_bps = minute_volatility * 10_000.0 * max(0.0, capture_fraction)
+        base = max(1, int(base_horizon_seconds))
+        maximum = max(base, int(maximum_horizon_seconds))
+        if captured_minute_bps <= 0:
+            return 0.0, base
+        required_seconds = 60.0 * (minimum / captured_minute_bps) ** 2
+        horizon = max(base, min(maximum, int(math.ceil(required_seconds))))
+        edge = tick_expected_move_bps(
+            minute_volatility,
+            horizon,
+            window_seconds=60,
+            capture_fraction=capture_fraction,
+        )
+        return edge, horizon
 
     def _reject(self, reasons: tuple[str, ...], **diagnostics: Any) -> AlgorithmDecision:
         return AlgorithmDecision(
@@ -975,16 +1081,25 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
             return self._reject(reasons)
         if f.breakout_strength is None or f.donchian_high is None:
             return self._reject(("BREAKOUT_LEVEL_UNAVAILABLE",))
-        if f.breakout_strength < 0:
+        breakout_excess_bps = float(f.breakout_strength) * 10_000.0
+        if breakout_excess_bps < self.p("min_breakout_excess_bps"):
             return self._reject(("PRICE_BELOW_BREAKOUT_LEVEL",), breakout_strength=f.breakout_strength)
         volume_ratio = f.volume_spike_ratio
         if volume_ratio is None or volume_ratio < self.p("min_volume_spike_ratio"):
             return self._reject((rc.VOLUME_CONFIRMATION_MISSING,), volume_spike_ratio=volume_ratio)
         # Acceptance: the break must not be fading back on the very next ticks.
-        return_1s_bps = (f.return_1s or 0.0) * 10_000.0
+        # One sparse print used to become a synthetic 0bp one-second return and
+        # pass a >= 0 gate.  A breakout is accepted only when the fully populated
+        # five-second window has actually advanced beyond the broken level.
+        if f.return_5s is None:
+            return self._reject(("BREAKOUT_ACCEPTANCE_WINDOW_MISSING",))
+        return_5s_bps = float(f.return_5s) * 10_000.0
         aggressor = f.aggressor_imbalance_5s
-        if return_1s_bps < self.p("acceptance_return_1s_bps"):
-            return self._reject((rc.FALSE_BREAKOUT_RISK_HIGH, "BREAKOUT_FADING_ON_TICKS"))
+        if return_5s_bps < self.p("acceptance_return_5s_bps"):
+            return self._reject(
+                (rc.FALSE_BREAKOUT_RISK_HIGH, "BREAKOUT_FADING_ON_TICKS"),
+                return_5s_bps=round(return_5s_bps, 3),
+            )
         if aggressor is None or aggressor < self.p("min_aggressor_imbalance"):
             return self._reject((rc.FALSE_BREAKOUT_RISK_HIGH, "BREAKOUT_NOT_FLOW_CONFIRMED"))
 
@@ -997,6 +1112,8 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
             edge_bps=edge,
             reasons=(rc.BREAKOUT_CONFIRMED, "BREAKOUT_ACCEPTED_ON_TICKS"),
             donchian_high=f.donchian_high,
+            breakout_excess_bps=round(breakout_excess_bps, 3),
+            return_5s_bps=round(return_5s_bps, 3),
             volume_spike_ratio=volume_ratio,
             aggressor_imbalance_5s=round(aggressor, 4),
         )
@@ -1043,28 +1160,68 @@ class VwapMeanReversionAlgorithm(TradingAlgorithm):
             return self._reject(("VWAP_UNAVAILABLE",))
         if deviation > -self.p("entry_deviation_bps"):
             return self._reject(("VWAP_DISPLACEMENT_TOO_SMALL",), vwap_distance_bps=deviation)
+        # A very deep displacement is more often repricing than stationary mean
+        # reversion.  Bound it in both raw bps and volatility-normalised units.
+        # The adaptive VWAP strategy owns the wider, explicitly normalised case.
+        if abs(deviation) > self.p("max_entry_deviation_bps"):
+            return self._reject(
+                ("VWAP_DISPLACEMENT_STRUCTURAL_REPRICING",),
+                vwap_distance_bps=round(deviation, 3),
+            )
+        zscore = f.vwap_zscore
+        if zscore is not None and abs(zscore) > self.p("max_entry_zscore"):
+            return self._reject(
+                ("VWAP_DISPLACEMENT_ZSCORE_TOO_EXTREME",),
+                vwap_zscore=round(zscore, 3),
+            )
         oversold = (f.rsi is not None and f.rsi <= self.p("max_rsi")) or (
             f.bb_percent_b is not None and f.bb_percent_b <= self.p("max_percent_b")
         )
         if not oversold:
             return self._reject(("DISPLACEMENT_NOT_OVERSOLD",), rsi=f.rsi, percent_b=f.bb_percent_b)
-        # Stabilisation: never buy while the drop is still accelerating.
-        if (f.return_1s or 0.0) < 0:
-            return self._reject(("STILL_FALLING_ON_TICKS",))
-        if (f.orderbook_imbalance_change_5s or 0.0) < 0:
-            return self._reject(("SELL_PRESSURE_STILL_WORSENING",))
+        # Stabilisation must be observed, not inferred from a missing one-second
+        # window becoming zero. Require a positive five-second recovery, buy-side
+        # aggressor flow, and a non-worsening book.
+        if f.return_5s is None or f.aggressor_imbalance_5s is None:
+            return self._reject(("VWAP_RECOVERY_WINDOW_MISSING",))
+        recovery_bps = float(f.return_5s) * 10_000.0
+        aggressor = float(f.aggressor_imbalance_5s)
+        book_change = f.orderbook_imbalance_change_5s
+        if recovery_bps < self.p("min_recovery_return_5s_bps"):
+            return self._reject(
+                ("STILL_FALLING_ON_TICKS",), recovery_return_5s_bps=round(recovery_bps, 3)
+            )
+        if aggressor < self.p("min_aggressor_imbalance"):
+            return self._reject(
+                ("VWAP_RECOVERY_NOT_BUY_FLOW_CONFIRMED",), aggressor_imbalance_5s=round(aggressor, 4)
+            )
+        if book_change is None or book_change < self.p("min_book_improvement"):
+            return self._reject(
+                ("SELL_PRESSURE_STILL_WORSENING",), orderbook_imbalance_change_5s=book_change
+            )
 
         # Target is structural (VWAP), so the edge is the captured distance.
         edge = abs(deviation) * self.p("target_capture_fraction")
+        horizon = self._horizon_for_structural_edge(
+            f,
+            edge,
+            self.horizon_seconds,
+            int(self.p("max_horizon_seconds")),
+        )
         score = _clamp(abs(deviation) / (2.0 * self.p("entry_deviation_bps")))
         return self._fire(
             symbol=f.symbol,
             score=score,
             confidence=_clamp(0.35 + 0.45 * score),
             edge_bps=edge,
+            horizon_seconds=horizon,
             reasons=(rc.MEAN_REVERSION_CANDIDATE, "VWAP_DISPLACEMENT_STABILISED"),
             vwap=f.vwap,
             vwap_distance_bps=round(deviation, 3),
+            vwap_zscore=round(zscore, 3) if zscore is not None else None,
+            recovery_return_5s_bps=round(recovery_bps, 3),
+            aggressor_imbalance_5s=round(aggressor, 4),
+            estimated_holding_seconds=horizon,
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -1098,6 +1255,144 @@ class VwapMeanReversionAlgorithm(TradingAlgorithm):
 
 # --------------------------------------------------------------------------- #
 # 4. Liquidity shock reversal — spread normalisation after a mechanical drop   #
+# --------------------------------------------------------------------------- #
+# First-class completed-bar VWAP recovery strategy                            #
+class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
+    """Recover a deep VWAP dislocation only after a completed-bar turn.
+
+    This first-class strategy uses completed one-minute bars because sparse
+    premarket names often have a current book but too few prints for a causal
+    sub-second window. It remains SHADOW-only until its own forward outcomes
+    support promotion.
+    """
+
+    strategy_id = "bar_confirmed_vwap_recovery"
+    thesis = "a deep VWAP dislocation recovers after the completed one-minute trend turns"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        required = (
+            f.price,
+            f.vwap,
+            f.vwap_distance_bps,
+            f.ema_fast,
+            f.macd_histogram,
+            f.rsi,
+            f.momentum_persistence,
+            f.realized_volatility,
+            f.liquidity_score,
+            f.spread_bps,
+        )
+        if not _present(*required):
+            return self._reject(("BAR_VWAP_RECOVERY_INPUTS_MISSING",))
+
+        displacement = float(f.vwap_distance_bps)
+        if displacement > -self.p("min_displacement_bps"):
+            return self._reject(
+                ("BAR_VWAP_DISPLACEMENT_TOO_SMALL",),
+                vwap_distance_bps=round(displacement, 3),
+            )
+        zscore = f.vwap_zscore
+        if zscore is None:
+            return self._reject(("BAR_VWAP_VOLATILITY_SCALE_MISSING",))
+        if abs(zscore) > self.p("max_displacement_zscore"):
+            return self._reject(
+                ("BAR_VWAP_DISLOCATION_TOO_EXTREME",),
+                vwap_zscore=round(zscore, 3),
+            )
+        if float(f.rsi) > self.p("max_rsi"):
+            return self._reject(("BAR_VWAP_NOT_OVERSOLD",), rsi=round(float(f.rsi), 3))
+
+        # The completed-bar turn is the entry clock. No 1s/5s return, tick count,
+        # aggressor flow, or order-book delta participates in this decision.
+        if float(f.price) < float(f.ema_fast):
+            return self._reject(
+                ("BAR_VWAP_FAST_EMA_NOT_RECLAIMED",),
+                price=round(float(f.price), 6),
+                ema_fast=round(float(f.ema_fast), 6),
+            )
+        if float(f.macd_histogram) <= self.p("min_macd_histogram"):
+            return self._reject(
+                ("BAR_VWAP_MACD_NOT_TURNED",),
+                macd_histogram=round(float(f.macd_histogram), 8),
+            )
+        if float(f.momentum_persistence) < self.p("min_momentum_persistence"):
+            return self._reject(
+                ("BAR_VWAP_RECOVERY_NOT_PERSISTENT",),
+                momentum_persistence=round(float(f.momentum_persistence), 3),
+            )
+        if float(f.liquidity_score) < self.p("min_liquidity_score"):
+            return self._reject(
+                ("BAR_VWAP_LIQUIDITY_TOO_LOW",),
+                liquidity_score=round(float(f.liquidity_score), 3),
+            )
+        if float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(
+                ("BAR_VWAP_SPREAD_TOO_WIDE",),
+                spread_bps=round(float(f.spread_bps), 3),
+            )
+
+        edge = abs(displacement) * self.p("target_capture_fraction")
+        score = _clamp(abs(zscore) / self.p("max_displacement_zscore"))
+        return self._fire(
+            symbol=f.symbol,
+            score=score,
+            confidence=_clamp(
+                0.30
+                + 0.30 * score
+                + 0.20 * float(f.momentum_persistence)
+                + 0.20 * float(f.liquidity_score)
+            ),
+            edge_bps=edge,
+            reasons=("BAR_CONFIRMED_VWAP_RECOVERY", "COMPLETED_MINUTE_TREND_TURNED"),
+            vwap_distance_bps=round(displacement, 3),
+            vwap_zscore=round(zscore, 3),
+            target_capture_fraction=self.p("target_capture_fraction"),
+            price=round(float(f.price), 6),
+            ema_fast=round(float(f.ema_fast), 6),
+            macd_histogram=round(float(f.macd_histogram), 8),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        target = (
+            entry_price
+            + self.p("target_capture_fraction") * (float(f.vwap) - entry_price)
+            if f.vwap is not None and f.vwap > entry_price
+            else None
+        )
+        # Same capture fraction the entry sized its edge with; ``exit_rule`` had no
+        # such local and raised NameError for every elected position.
+        edge = abs(float(f.vwap_distance_bps or 0.0)) * self.p("target_capture_fraction")
+        horizon = self._horizon_for_structural_edge(
+            f,
+            edge,
+            self.horizon_seconds,
+            int(self.p("max_horizon_seconds")),
+        )
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(
+                entry_price, f, self.p("stop_volatility_multiple")
+            ),
+            target_price=target,
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=horizon,
+            stop_basis="completed_bar_volatility_multiple",
+            target_basis="partial_recovery_to_session_vwap",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        if (
+            f.price is not None
+            and f.ema_fast is not None
+            and f.price < f.ema_fast
+            and (f.macd_histogram or 0.0) < 0
+        ):
+            return ("BAR_VWAP_RECOVERY_FAILED",)
+        return ()
+
+
+# --------------------------------------------------------------------------- #
+# Liquidity shock reversal - normalisation after a mechanical drop            #
 # --------------------------------------------------------------------------- #
 class LiquidityShockReversalAlgorithm(TradingAlgorithm):
     strategy_id = "liquidity_shock_reversal"
@@ -1138,10 +1433,10 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
         # evaluate that closed set first.  The original sub-second shock thesis
         # still fails closed unless the streamed tick window is ready.
         if self._absorption_mode(f):
-            horizon = int(self.p("absorption_horizon_seconds"))
-            edge = tick_expected_move_bps(
-                f.realized_volatility_10s,
-                horizon,
+            edge, horizon = self._cost_feasible_volatility_edge(
+                f,
+                base_horizon_seconds=int(self.p("absorption_horizon_seconds")),
+                maximum_horizon_seconds=int(self.p("max_absorption_horizon_seconds")),
                 capture_fraction=self.p("absorption_capture_fraction"),
             )
             imbalance = abs(float(f.orderbook_imbalance or 0.0))
@@ -1156,7 +1451,8 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
                 return_30s_bps=round(recovery_bps, 3),
                 spread_change_5s=f.spread_change_5s,
                 orderbook_imbalance=f.orderbook_imbalance,
-                validation_scope="US_SHADOW_ONLY",
+                validation_scope="US_LIVE_COST_FEASIBLE_HORIZON",
+                cost_feasible_horizon_seconds=horizon,
             )
         ready, reasons = self._tick_ready(f)
         if not ready:
@@ -1190,10 +1486,10 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
         if self._absorption_mode(f):
-            horizon = int(self.p("absorption_horizon_seconds"))
-            target_bps = tick_expected_move_bps(
-                f.realized_volatility_10s,
-                horizon,
+            target_bps, horizon = self._cost_feasible_volatility_edge(
+                f,
+                base_horizon_seconds=int(self.p("absorption_horizon_seconds")),
+                maximum_horizon_seconds=int(self.p("max_absorption_horizon_seconds")),
                 capture_fraction=self.p("absorption_capture_fraction"),
             )
             return ExitRule(
@@ -2693,6 +2989,143 @@ class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
 # --------------------------------------------------------------------------- #
 # Registry                                                                     #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Overnight gap carry - the only window whose move clears a US round trip      #
+# --------------------------------------------------------------------------- #
+class OvernightGapCarryAlgorithm(TradingAlgorithm):
+    """Carry a closing drive through the overnight gap, on a volatile day only.
+
+    Why this thesis exists at all is arithmetic, not preference. This account's US
+    round trip is 51.2bps, so ``entry_floor_bps`` demands ~61bps of expected move.
+    Measured on the stored US tape, the median absolute move is 6.7bps over three
+    minutes and 16.4 over thirty — a perfect direction oracle at those horizons
+    still loses on 98% of trades. The overnight gap is the first window that
+    clears the bar: median 69.1bps, and 62% of nights move more than the round
+    trip. One position, one round trip.
+
+    Magnitude is what was measured; direction is not. The unconditional overnight
+    return on that sample is +15.6bps (n=55) — comfortably BELOW cost — so the
+    gates here are not decoration. Without them the thesis is a known loser, and
+    with them it is unproven, which is why the strategy ships shadow-only.
+
+    Three preconditions, each doing distinct work:
+
+    ``last continuous half hour``
+        The carry is a decision about the CLOSE, so it can only be taken near it.
+        The window comes from ``session_structure.regular_session``, i.e. 15:30-16:00
+        New York for a US name — not the KRX clock every session-boxed strategy
+        used to read.
+    ``expected gap clears the cost floor``
+        Sized from the symbol's own completed-bar volatility over an overnight
+        variance-equivalent horizon, then handed to ``_fire``, which rejects it
+        against the venue's round-trip cost. A quiet name is not carried.
+    ``the day closed with buyers in control``
+        Price above session VWAP, positive completed-bar persistence and buy-side
+        aggressor flow. This is the directional half, and it is the half the local
+        sample cannot yet confirm.
+    """
+
+    strategy_id = "overnight_gap_carry"
+    thesis = "a closing drive on a volatile day carries through the overnight gap"
+
+    def _expected_gap_bps(self, f: TechnicalFeatureSet) -> float:
+        """Expected overnight move from completed-bar volatility.
+
+        Wall-clock hours are the wrong scale for a gap: an overnight is not 17
+        hours of trading. The knob is a VARIANCE-equivalent number of trading
+        minutes, calibrated from the stored sample — median |overnight| 69.1bps
+        against median |30-minute| 16.4bps is a ratio of 4.21, so the gap carries
+        about 4.21^2 x 30 = 532 minutes of continuous-session variance.
+        """
+        volatility = max(0.0, float(f.realized_volatility or 0.0))
+        if volatility <= 0.0:
+            return 0.0
+        return tick_expected_move_bps(
+            volatility,
+            int(max(60.0, self.p("overnight_variance_minutes") * 60.0)),
+            window_seconds=60,
+            capture_fraction=self.config.shared("capture_fraction"),
+        )
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        ready, reasons = self._tick_ready(f)
+        if not ready:
+            return self._reject(reasons)
+
+        in_window = context.in_last_continuous_half_hour
+        if in_window is None:
+            return self._reject(("OGC_SESSION_CONTEXT_ABSENT",))
+        if not in_window:
+            return self._reject(("OGC_OUTSIDE_ENTRY_WINDOW",))
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining > self.p("max_minutes_to_close"):
+            # Entering at the start of the half hour would pay a full session of
+            # intraday noise before reaching the gap this thesis is about.
+            return self._reject(
+                ("OGC_TOO_EARLY_TO_CARRY",), minutes_to_continuous_close=remaining
+            )
+
+        expected_gap = self._expected_gap_bps(f)
+        if expected_gap <= 0.0:
+            return self._reject(("OGC_VOLATILITY_CONTEXT_ABSENT",))
+
+        displacement = f.vwap_distance_bps
+        if displacement is None:
+            return self._reject(("OGC_VWAP_CONTEXT_ABSENT",))
+        if displacement < self.p("min_vwap_premium_bps"):
+            # Closing BELOW the session VWAP is the sellers' day; the long leg of
+            # this thesis has nothing to carry.
+            return self._reject(("OGC_CLOSE_NOT_ABOVE_VWAP",), vwap_distance_bps=displacement)
+
+        persistence = f.momentum_persistence
+        if persistence is None or persistence < self.p("min_momentum_persistence"):
+            return self._reject(("OGC_CLOSING_DRIVE_NOT_CONFIRMED",))
+        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+            return self._reject(("OGC_FLOW_NOT_BUY_SIDE",))
+
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(("OGC_STRUCTURAL_BREAK",), change_point_probability=change_point)
+
+        return self._fire(
+            symbol=f.symbol,
+            score=_clamp(0.5 * _clamp(displacement / 100.0) + 0.5 * _clamp(persistence)),
+            confidence=_clamp(0.25 + 0.35 * _clamp(persistence) + 0.20 * _clamp(float(f.liquidity_score or 0.0))),
+            edge_bps=expected_gap,
+            reasons=("OGC_CLOSING_DRIVE_CARRIED", "OGC_GAP_CLEARS_ROUND_TRIP"),
+            expected_overnight_gap_bps=round(expected_gap, 3),
+            vwap_distance_bps=round(float(displacement), 3),
+            momentum_persistence=round(float(persistence), 4),
+            minutes_to_continuous_close=remaining,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        # The intended exit is the next session's opening liquidity, so the clock
+        # is the whole carry. Stop and target are wide for the same reason the
+        # thesis exists: an overnight gap routinely travels further in one print
+        # than an intraday stop allows for, and a stop inside the typical gap
+        # would be jumped rather than filled.
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(
+                entry_price, f, self.p("stop_volatility_multiple")
+            ),
+            target_price=entry_price * (1.0 + self._expected_gap_bps(f) / 10_000.0),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=int(self.p("horizon_seconds")),
+            stop_basis="overnight_gap_volatility_multiple",
+            target_basis="overnight_gap_expected_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        # The thesis is about the close that was carried. Once the next session is
+        # open the carry is over, and holding on is a different, unstated trade.
+        remaining = context.minutes_to_continuous_close
+        if remaining is not None and remaining > self.p("max_minutes_to_close"):
+            return ("OGC_CARRY_COMPLETE",)
+        return ()
+
+
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     IntradayMomentumAlgorithm,
     BreakoutVolumeAlgorithm,
@@ -2710,6 +3143,9 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     MarketIntradayMomentumShortAlgorithm,
     OpeningRangeBreakdownAlgorithm,
     ResidualRelativeWeaknessAlgorithm,
+    # Appended so every existing GNN/catalogue output index remains unchanged.
+    BarConfirmedVwapRecoveryAlgorithm,
+    OvernightGapCarryAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -2726,6 +3162,14 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "breakout_volume": ("breakout",),
     "vwap_mean_reversion": ("vwap_reversion", "mean_reversion"),
     "liquidity_shock_reversal": ("mean_reversion",),
+    # Hybrid thesis: the location is mean reversion, but the entry clock is a
+    # completed-bar momentum turn. It must remain admissible in TREND_UP regimes
+    # where the macro layer allows momentum but not blind mean-reversion entries.
+    "bar_confirmed_vwap_recovery": (
+        "vwap_reversion",
+        "mean_reversion",
+        "momentum",
+    ),
     "rvgi_box_breakout": ("breakout", "momentum_confirmation"),
     # The residual variant is a relative-strength thesis, NOT directional
     # momentum: it is precisely the family that stays valid in a falling index,
@@ -2743,6 +3187,10 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     # Beta-neutral, so it belongs to the relative family rather than to directional
     # shorting: it is the short thesis that survives a RISING index.
     "residual_relative_weakness": ("relative_weakness", "short"),
+    # A carry is a continuation thesis, so it belongs to the momentum family and
+    # is correctly blocked when the macro layer blocks momentum: carrying a long
+    # position through a close is precisely what a falling tape punishes.
+    "overnight_gap_carry": ("momentum",),
 }
 
 

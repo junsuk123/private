@@ -4,10 +4,12 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from app.evaluation.stored_counterfactual import (
+    BarMicrostructure,
     EvaluationConfig,
     _barrier_bps,
     _causal_horizon_sigma_bps,
     _execution_market_for_symbol,
+    _microstructure_quantiles,
     build_labels,
     causal_percentile,
 )
@@ -52,6 +54,32 @@ def test_execution_market_is_inferred_from_symbol() -> None:
         "US",
         "overseas_stock",
     )
+
+
+def test_liquidity_recovery_is_full_when_spread_returns_to_baseline() -> None:
+    bars = _bars(3)
+    micro = {
+        bar.start_time: BarMicrostructure(
+            vwap=bar.close,
+            spread_bps=10.0,
+            orderbook_imbalance=0.0,
+            liquidity_score=0.8,
+            volatility=0.01,
+            trade_count=20.0,
+        )
+        for bar in bars
+    }
+
+    quantiles = _microstructure_quantiles(
+        bars=bars,
+        index=2,
+        history_start=0,
+        micro_by_time=micro,
+        spreads=(),
+        spread_history=(),
+    )
+
+    assert quantiles["liquidity_recovery"] == 1.0
 
 
 def test_stored_labels_have_strict_future_label_window() -> None:

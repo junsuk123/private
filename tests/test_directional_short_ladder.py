@@ -304,6 +304,7 @@ def test_credit_contract_refuses_every_mismatch() -> None:
             position_direction="SHORT",
             position_effect="OPEN",
             execution_product="CREDIT_BORROW",
+            credit_type="22",
         )
         payload.update(overrides)
         return FinalOrder(**payload)
@@ -327,6 +328,13 @@ def test_credit_contract_refuses_every_mismatch() -> None:
             direction="SHORT",
             effect="CLOSE",
             side=OrderSide.BUY,
+        )
+    with pytest.raises(ValueError, match="CRDT_TYPE 22"):
+        _require_credit_contract(
+            _order(credit_type="05"),
+            direction="SHORT",
+            effect="OPEN",
+            side=OrderSide.SELL,
         )
 
 
@@ -828,12 +836,21 @@ def test_yaml_overlay_tunes_one_threshold_without_zeroing_the_others() -> None:
     )
 
 
-def test_shipped_config_keeps_every_short_arm_in_shadow() -> None:
-    """The config actually on disk must not authorise anything."""
+def test_shipped_config_operator_override_authorizes_every_short_arm(tmp_path) -> None:
     config = ShortStrategyPromotionConfig.load("config/short_strategy_deployment.yaml")
+    assert config.operator_live_full_override is True
+    controller = ShortStrategyPromotionController(
+        config=config,
+        state_store=DeploymentStateStore(tmp_path / "dep.sqlite3"),
+        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
+        borrow_store=BorrowSnapshotStore(tmp_path / "borrow.sqlite3"),
+    )
     for strategy_id in SHORT_STRATEGY_IDS:
         assert config.strategy_enabled(strategy_id), strategy_id
-        assert config.initial_state_for(strategy_id) is StrategyDeploymentState.SHADOW
+        key = DirectionalStrategyKey.for_short(strategy_id, "US")
+        assert controller.authorized_state(key) is StrategyDeploymentState.LIVE_FULL
+        assert controller.may_submit_orders(key)[0] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -874,6 +891,16 @@ def test_simulator_refuses_quotes_at_or_before_the_signal() -> None:
         simulator.observe(QuoteObservation(NOW - timedelta(seconds=5), 900.0, 901.0)) == ()
     )
     assert simulator.open_plan_count == 1
+
+
+def test_shadow_store_deduplicates_correlated_recent_signals(tmp_path) -> None:
+    store = ShadowPlanStore(tmp_path / "shadow.sqlite3")
+    plan = _plan()
+
+    assert store.record_plan(plan)
+    assert store.has_recent_plan(KEY, "005930", since=NOW - timedelta(minutes=5))
+    assert not store.has_recent_plan(KEY, "005930", since=NOW + timedelta(seconds=1))
+    assert not store.has_recent_plan(KEY, "000660", since=NOW - timedelta(minutes=5))
 
 
 def test_simulator_exposes_symbols_that_still_require_quotes() -> None:
@@ -1062,7 +1089,15 @@ def test_short_strategies_are_appended_never_inserted() -> None:
         "market_intraday_momentum",
     )
     assert STRATEGY_IDS[: len(expected_long_prefix)] == expected_long_prefix
-    assert STRATEGY_IDS[len(expected_long_prefix) :] == SHORT_STRATEGY_IDS
+    short_start = len(expected_long_prefix)
+    short_end = short_start + len(SHORT_STRATEGY_IDS)
+    assert STRATEGY_IDS[short_start:short_end] == SHORT_STRATEGY_IDS
+    # The tail is append-only, so it is pinned by PREFIX rather than by equality:
+    # a later thesis must be able to land after these without rewriting a literal,
+    # while still proving nothing was inserted before or among the shorts.
+    later_appends = ("bar_confirmed_vwap_recovery", "overnight_gap_carry")
+    assert STRATEGY_IDS[short_end : short_end + len(later_appends)] == later_appends
+    assert len(STRATEGY_IDS) == short_end + len(later_appends)
 
 
 def test_every_short_strategy_is_flagged_as_short() -> None:

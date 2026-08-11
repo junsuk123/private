@@ -15,6 +15,7 @@ from app.pipeline import build_analysis_context
 from app.research import ResearchService
 from app.schemas.domain import (
     MacroMetricRecord,
+    MarketSnapshot,
     RawSourceRecord,
     RealtimeExecution,
     RealtimeQuote,
@@ -24,6 +25,38 @@ from app.storage import LocalResearchStore
 
 
 class StorageTest(unittest.TestCase):
+    def test_static_universe_snapshot_refresh_replaces_same_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LocalResearchStore(Path(tmp))
+            now = datetime.now(timezone.utc)
+
+            def snapshot(price: float, seconds: int) -> MarketSnapshot:
+                return MarketSnapshot(
+                    ticker="INTC",
+                    market="US-LISTED",
+                    company_name="Intel",
+                    sector="Technology",
+                    last_price=price,
+                    average_daily_trading_value=1_000_000,
+                    volatility_20d=0.02,
+                    source=SourceMetadata(
+                        source_name="listed_universe_reference",
+                        retrieved_at=now + timedelta(seconds=seconds),
+                        source_id="listed-universe-reference:INTC",
+                    ),
+                )
+
+            for row in (snapshot(100.0, 0), snapshot(101.0, 15)):
+                store.save_research_result(
+                    SimpleNamespace(
+                        events=(), raw_records=(), market_snapshots=(row,), macro_metrics=()
+                    )
+                )
+
+            loaded = store.load_analysis_inputs(prune=False)
+
+        self.assertEqual(len(loaded.market_snapshots), 1)
+        self.assertEqual(loaded.market_snapshots[0].last_price, 101.0)
     def test_transient_sqlite_writer_lock_is_retried(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LocalResearchStore(Path(tmp))

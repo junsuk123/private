@@ -640,6 +640,25 @@ button, a { font: inherit; }
   text-align: left;
   cursor: pointer;
 }
+.candidate.joint-candidate {
+  grid-template-columns: 24px minmax(62px, auto) auto;
+  min-width: 196px;
+}
+.candidate-rank {
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: #50637a;
+  font: 800 9px/1 Consolas, monospace;
+}
+.candidate.joint-candidate small { grid-column: 2 / -1; max-width: 164px; }
+.candidate-meta {
+  grid-column: 2 / -1;
+  color: var(--cyan);
+  font: 800 8px/1.2 Consolas, monospace;
+}
+.candidate.joint-candidate.rejected .candidate-meta { color: var(--red); }
+.candidate.joint-candidate.rejected { opacity: .68; }
+.candidate.joint-candidate.admissible { border-color: rgba(61, 208, 142, .28); }
 .candidate:hover, .candidate.selected { border-color: rgba(57, 215, 231, .62); }
 .candidate.selected { background: rgba(57, 215, 231, .07); }
 .candidate strong { font-size: 12px; }

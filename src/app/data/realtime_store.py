@@ -145,6 +145,8 @@ class RealtimeMarketDataStore:
                     on realtime_orderbook(symbol, exchange_timestamp);
                 create index if not exists idx_realtime_orderbook_symbol_received
                     on realtime_orderbook(symbol, received_at);
+                create index if not exists idx_realtime_orderbook_received
+                    on realtime_orderbook(received_at);
 
                 create table if not exists realtime_minute_bars (
                     symbol text not null,
@@ -210,6 +212,7 @@ class RealtimeMarketDataStore:
         now = time.monotonic()
         if now - self.__class__._last_prune_monotonic >= 3600:
             self.prune_operational_history()
+            self.prune_market_history()
             self.__class__._last_prune_monotonic = now
 
     # ------------------------------------------------------------------ #
@@ -554,22 +557,6 @@ class RealtimeMarketDataStore:
             """,
             rows,
         )
-        self._save_source_events(
-            [
-                (
-                    f"trade:{tick.record_id}",
-                    "trade",
-                    tick.symbol,
-                    tick.exchange_timestamp.isoformat(),
-                    tick.source,
-                    json.dumps(
-                        {"price": tick.price, "volume": tick.volume, "record_id": tick.record_id},
-                        ensure_ascii=True,
-                    ),
-                )
-                for tick in ticks
-            ]
-        )
         return inserted
 
     def save_orderbooks(self, snapshots: tuple[RealtimeOrderbookSnapshot, ...]) -> int:
@@ -603,27 +590,6 @@ class RealtimeMarketDataStore:
             values ({", ".join("?" * (15 + len(_METADATA_COLUMN_NAMES)))})
             """,
             rows,
-        )
-        self._save_source_events(
-            [
-                (
-                    f"orderbook:{snapshot.record_id}",
-                    "orderbook",
-                    snapshot.symbol,
-                    snapshot.exchange_timestamp.isoformat(),
-                    snapshot.source,
-                    json.dumps(
-                        {
-                            "best_bid": snapshot.best_bid,
-                            "best_ask": snapshot.best_ask,
-                            "spread_bps": snapshot.spread_bps,
-                            "record_id": snapshot.record_id,
-                        },
-                        ensure_ascii=True,
-                    ),
-                )
-                for snapshot in snapshots
-            ]
         )
         return inserted
 
@@ -730,7 +696,64 @@ class RealtimeMarketDataStore:
             before = conn.total_changes
             conn.execute("delete from market_data_health where checked_at < ?", (cutoff,))
             conn.execute("delete from data_source_events where observed_at < ?", (cutoff,))
+            # Tick/orderbook events duplicate the authoritative source tables and
+            # used ~1.3M rows in 15 hours. They are no longer written; remove any
+            # legacy copies regardless of age while retaining minute-bar/audit events.
+            conn.execute(
+                "delete from data_source_events where event_type in ('trade', 'orderbook')"
+            )
             conn.commit()
+            return int(conn.total_changes - before)
+
+    def prune_market_history(
+        self,
+        *,
+        retention_hours: int | None = None,
+        minute_bar_retention_days: int | None = None,
+        batch_size: int | None = None,
+    ) -> int:
+        """Bound raw microstructure history while retaining model-ready bars.
+
+        Deletes are intentionally batched so maintenance cannot hold the live WAL
+        writer for minutes on an established multi-gigabyte database.
+        """
+
+        hours = max(
+            24,
+            int(retention_hours) if retention_hours is not None else _env_int("REALTIME_RAW_RETENTION_HOURS", 168),
+        )
+        bar_days = max(
+            7,
+            int(minute_bar_retention_days)
+            if minute_bar_retention_days is not None
+            else _env_int("REALTIME_MINUTE_BAR_RETENTION_DAYS", 45),
+        )
+        limit = max(
+            1_000,
+            int(batch_size)
+            if batch_size is not None
+            else _env_int("REALTIME_PRUNE_BATCH_SIZE", 25_000),
+        )
+        raw_cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        bar_cutoff = (datetime.now(timezone.utc) - timedelta(days=bar_days)).isoformat()
+        with closing(self._connect()) as conn:
+            before = conn.total_changes
+            for table in ("realtime_ticks", "realtime_orderbook"):
+                conn.execute(
+                    f"delete from {table} where rowid in ("
+                    f"select rowid from {table} where received_at < ? limit ?)",
+                    (raw_cutoff, limit),
+                )
+            conn.execute(
+                "delete from realtime_minute_bars where rowid in ("
+                "select rowid from realtime_minute_bars where minute_start < ? limit ?)",
+                (bar_cutoff, limit),
+            )
+            conn.commit()
+            try:
+                conn.execute("pragma wal_checkpoint(passive)")
+            except sqlite3.OperationalError:
+                pass
             return int(conn.total_changes - before)
 
     def backfill_source_events(self, *, retention_hours: int | None = None) -> int:
@@ -1284,7 +1307,11 @@ class RealtimeMarketDataStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("pragma busy_timeout=30000")
+        conn.execute("pragma synchronous=normal")
+        conn.execute("pragma wal_autocheckpoint=2000")
+        return conn
 
 
 def _parse_dt(value: str) -> datetime:

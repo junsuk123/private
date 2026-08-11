@@ -105,7 +105,7 @@ python scripts/benchmark_realtime_pipeline.py --device CPU --output data/reports
 .\.venv\Scripts\python.exe scripts\benchmark_strategy_utility_openvino.py --iterations 30
 ```
 
-아래 값은 이전 `S=7` 체크포인트로 수행한 **역사적 NPU 승격 실험**입니다. 현재 `B1 T1 N8 F36 R3 S8` live 체크포인트의 NPU 승격 근거로 재사용하지 않습니다. 당시 고정 형상은 `B=1, T=4, N=16, F=12, R=4, S=7`, FP32, 30 iterations였습니다.
+아래 값은 이전 `S=7` 체크포인트로 수행한 **역사적 NPU 승격 실험**입니다. 현재 `B1 T1 N16 F40 R3 S16` 체크포인트의 NPU 승격 근거로 재사용하지 않습니다. 당시 고정 형상은 `B=1, T=4, N=16, F=12, R=4, S=7`, FP32, 30 iterations였습니다.
 
 | device | 실제 컴파일 장치 | compile ms | p50 ms | p95 ms | p99 ms | throughput/s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -178,19 +178,33 @@ strategy_rgcn_npu 미승격, CPU fallback
 python scripts/train_strategy_utility_rgcn.py
 ```
 
-`data/models/strategy_utility/rgcn_shadow.json` 현재 상태:
+현재 배포본 `data/models/strategy_utility/rgcn_shadow.json` (v5 정렬 계약, 2026-08-09 승격):
 
 ```text
 method                ontology_strategy_graph_rgcn_joint_gradient_calibration
-input_feature_schema  realtime_strategy_graph_v4_market
-feature_provenance    causal_minute_bar_microstructure_proxy_v1
-rows                  11,696        snapshots 1,462
-strategies            8개 각 1,462
-config                B1 T1 N8 F36 R3 S8, hidden 16, seed 17
+input_feature_schema  realtime_strategy_graph_v5_aligned
+feature_provenance    causal_minute_bar_microstructure_v2_aligned
+rows                  57,552        snapshots 3,597
+strategies            16개 각 3,597
+config                B1 T1 N16 F40 R3 S16, hidden 16, seed 17
 authorization_scope   ontology_gnn_realtime_trust_gated_execution
-checkpoint_hash       9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dcef80b
 authorization_checks  row/snapshot/strategy 커버리지 및 런타임 스키마 일치 통과
 ```
+
+`feature_provenance`의 `proxy_v1` → `v2_aligned` 변화가 이 재학습의 핵심입니다. v4는 학습 시
+스프레드를 봉의 high-low range로, 호가 불균형을 봉 내 종가 위치로 **대리**하면서 서빙에서는 실제
+값을 넣었습니다. `realtime_minute_bars`에 실제 컬럼이 이미 저장돼 있었고
+`load_minute_microstructure`가 그걸 읽고 있었는데도, 그 값이 feature 벡터로 배선되지 않았을
+뿐입니다. 상세는 [ontology_and_gnn.md](ontology_and_gnn.md#context-계약-realtime_strategy_graph_v5_aligned).
+
+직전 v4 체크포인트는 `rgcn_shadow.pre-v5-aligned.{npz,json}`에 보존돼 있습니다. 롤백은 그 두
+파일을 `rgcn_shadow.*`로 되돌리면 됩니다.
+
+**승격이 곧 수익성 입증은 아닙니다.** 이 체크포인트의 선택 지표는
+`selection_ranking_skill_established=true`(AUC 0.737, 순열 p=0.001)이지만
+`selection_net_edge_established=false`(상위 10분위 순수익 CI가 0을 걸침, P(≤0)=0.48)입니다.
+`live_authorized`는 스키마·표본 커버리지 요건이지 엣지 증명이 아니며, 실제 진입 권한은 여전히
+`GnnRealtimeTrustEvaluator`의 전략별 실시간 검증을 통과해야 합니다.
 
 런타임 그래프 연산은 고정 Gather, MatMul, Add, ReLU, Multiply, Concat, Squeeze입니다. 동적 sparse/scatter 연산은 없습니다. 하드 온톨로지 마스크는 학습 그래프 **밖에서** 적용되며 모델이 덮어쓸 수 없습니다.
 

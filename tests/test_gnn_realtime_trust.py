@@ -90,6 +90,10 @@ def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
     assert result.mean_realized_net_bps > 0
     assert result.strategy_sample_counts == {"intraday_momentum": 10}
     assert result.trusted_strategy_ids == ("intraday_momentum",)
+    assert result.trusted_strategy_markets == {"intraday_momentum": ("KRX",)}
+    assert result.strategy_market_metrics["intraday_momentum"]["KRX"][
+        "entry_authorized"
+    ] is True
     assert result.strategy_metrics["intraday_momentum"]["passed"] is True
 
 
@@ -479,6 +483,91 @@ def test_realtime_outcome_uses_first_strategy_exit_before_horizon_reversal(
     assert outcome[0] > 0.0
 
 
+def test_realtime_outcome_replays_live_trailing_exit(tmp_path) -> None:
+    database = tmp_path / "realtime.sqlite3"
+    observed = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "create table realtime_ticks "
+            "(symbol text not null, received_at text not null, price real not null)"
+        )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            (
+                ("005930", observed.isoformat(), 100.0),
+                ("005930", (observed + timedelta(seconds=10)).isoformat(), 101.0),
+                # 30bps giveback from the favourable 101 watermark is 100.697.
+                # The live session exits here, before the later horizon loss.
+                ("005930", (observed + timedelta(seconds=20)).isoformat(), 100.6),
+                ("005930", (observed + timedelta(seconds=30)).isoformat(), 99.0),
+            ),
+        )
+        evaluator = GnnRealtimeTrustEvaluator(
+            comparison_path=tmp_path / "unused.jsonl",
+            database_path=database,
+            horizon_seconds=30,
+            minimum_samples=10,
+        )
+        outcome = evaluator._outcome(
+            connection,
+            {
+                "symbol": "005930",
+                "as_of": observed,
+                "probability": 0.8,
+                "uncertainty": 0.1,
+                "cost_bps": 5.0,
+                "expected_net_return_bps": 30.0,
+                "strategy_id": "intraday_momentum",
+                "position_direction": "LONG",
+                "horizon_seconds": 30,
+            },
+        )
+
+    assert outcome is not None
+    assert outcome[0] > 0.0
+
+
+def test_realtime_outcome_is_direction_aware_for_short_strategy(tmp_path) -> None:
+    database = tmp_path / "realtime.sqlite3"
+    observed = datetime(2026, 7, 30, 0, 0, tzinfo=timezone.utc)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "create table realtime_ticks "
+            "(symbol text not null, received_at text not null, price real not null)"
+        )
+        connection.executemany(
+            "insert into realtime_ticks(symbol, received_at, price) values (?, ?, ?)",
+            (
+                ("005930", observed.isoformat(), 100.0),
+                ("005930", (observed + timedelta(seconds=10)).isoformat(), 98.0),
+                ("005930", (observed + timedelta(seconds=30)).isoformat(), 101.0),
+            ),
+        )
+        evaluator = GnnRealtimeTrustEvaluator(
+            comparison_path=tmp_path / "unused.jsonl",
+            database_path=database,
+            horizon_seconds=30,
+            minimum_samples=10,
+        )
+        outcome = evaluator._outcome(
+            connection,
+            {
+                "symbol": "005930",
+                "as_of": observed,
+                "probability": 0.8,
+                "uncertainty": 0.1,
+                "cost_bps": 5.0,
+                "expected_net_return_bps": 30.0,
+                "strategy_id": "opening_range_breakdown",
+                "position_direction": "SHORT",
+                "horizon_seconds": 30,
+            },
+        )
+
+    assert outcome is not None
+    assert outcome[0] > 0.0
+
+
 def test_busy_strategy_does_not_evict_another_strategys_positive_edge_samples(
     tmp_path,
 ) -> None:
@@ -695,6 +784,24 @@ def test_trust_payload_distinguishes_untaught_upside_from_awaiting_samples(
             "intraday_momentum": {"upside_rows": 25},
             "breakout_volume": {"upside_rows": 4},
         },
+        "label_outcomes_by_market": {
+            "KRX": {
+                "intraday_momentum": {
+                    "filled": 30,
+                    "mean_net_return_bps_when_filled": 8.5,
+                },
+                "breakout_volume": {
+                    "filled": 30,
+                    "mean_net_return_bps_when_filled": -12.0,
+                },
+            },
+            "US": {
+                "intraday_momentum": {
+                    "filled": 40,
+                    "mean_net_return_bps_when_filled": -35.0,
+                }
+            },
+        },
     }
     path = tmp_path / "rgcn_shadow.json"
     path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -713,10 +820,17 @@ def test_trust_payload_distinguishes_untaught_upside_from_awaiting_samples(
 
     assert payload["upside_supervised_strategy_ids"] == ["intraday_momentum"]
     assert payload["minimum_upside_supervision_rows"] == 20
+    assert payload["upside_authorized_strategy_markets"] == {
+        "intraday_momentum": ["KRX"]
+    }
+    assert payload["training_strategy_market_metrics"]["intraday_momentum"][
+        "KRX"
+    ]["mean_net_return_bps_when_filled"] == 8.5
     taught = payload["strategy_metrics"]["intraday_momentum"]
     untaught = payload["strategy_metrics"]["breakout_volume"]
     assert taught["upside_supervised"] is True
     assert taught["upside_training_rows"] == 25
+    assert taught["upside_authorized_markets"] == ["KRX"]
     assert untaught["upside_supervised"] is False
     assert untaught["upside_training_rows"] == 4
 

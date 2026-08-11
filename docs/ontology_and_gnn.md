@@ -199,7 +199,50 @@ node_mask    [B, T, N_max]
 strategy_mask[B, N_max, S]
 ```
 
-토폴로지 구성과 closed-world 마스크는 CPU에서 이뤄지고 모델 그래프 밖에 남습니다. 그래프 사실은 바뀌어도 **텐서 rank/shape은 바뀌지 않습니다.** 현재 체크포인트 계약은 `B1 T1 N8 F36 R3 S8`이며, 28개 causal context feature와 8개 strategy identity feature를 사용합니다.
+토폴로지 구성과 closed-world 마스크는 CPU에서 이뤄지고 모델 그래프 밖에 남습니다. 그래프 사실은 바뀌어도 **텐서 rank/shape은 바뀌지 않습니다.** 현재 체크포인트 계약은 `B1 T1 N16 F40 R3 S16`이며, 24개 causal context feature와 16개 strategy identity feature를 사용합니다.
+
+### context 계약 (`realtime_strategy_graph_v5_aligned`)
+
+context 벡터의 정의는 **`app.features.strategy_graph_context` 한 곳**에 있습니다. 학습 경로
+(`app.evaluation.stored_counterfactual`)와 서빙 경로(`app.routing.shadow_intelligence`)는
+반드시 `build_strategy_graph_context()`를 통해 벡터를 만들며, 필드는 **이름으로만** 접근합니다.
+
+v4까지는 두 경로가 각자 위치 기반 튜플을 조립했고, 두 가지 방식으로 어긋나 있었습니다.
+
+- **같은 슬롯에 다른 양** — slot 2는 학습에서 봉 high-low range, 서빙에서 실제 `spread_bps`.
+  slot 4는 학습에서 `close_location`, 서빙에서 `orderbook_imbalance`. slot 6은 학습에서 clip된
+  분봉 수익률, 서빙에서 `aggressor_imbalance_5s`. 한쪽 양으로 적합된 가중치가 다른 양에 적용됐습니다.
+- **조용히 기본값이 된 슬롯** — 서빙 어댑터가 `values.get(name, default)`로 읽었기 때문에
+  `LIVE_FEATURE_NAMES`가 컬럼을 뺀 뒤 `realized_volatility_3m`, `box_high`, `box_low`,
+  `box_mid`, `box_previous_close` 5개가 **영구 0.0**이 되었습니다. 없는 키와 측정된 0이
+  구분되지 않았습니다.
+
+v5의 규칙은 두 가지입니다.
+
+1. **필드는 이름으로 한 번만 정의**됩니다. 위치는 `STRATEGY_GRAPH_CONTEXT_FIELDS`에만 있고,
+   슬롯 인덱스가 필요한 소비자는 `context_index()`를 씁니다.
+2. **기본값이 없습니다.** 누락·비유한 필드는 `StrategyGraphContextError`입니다. 서빙 경로에서는
+   심볼 단위로 잡혀 shadow 오류로 기록되고, 학습 경로에서는 그 스냅샷이 라벨 집합에서 빠집니다.
+
+필드 목록은 양쪽이 **같은 추정량으로 같은 창(window)** 을 계산할 수 있는 것들의 교집합이며,
+전부 완결된 1분봉과 `realtime_minute_bars`에 함께 저장된 microstructure 컬럼에서 나옵니다.
+한쪽만 만들 수 있는 양은 채우지 않고 **제외**합니다 — `aggressor_imbalance_5s`는 서빙에서 실재하고
+유용하지만 과거 분봉으로는 만들 수 없으므로, 그 가중치는 영원히 학습되지 않습니다.
+
+v4 대비 제거된 것: 3중 중복된 원시 가격 수준과 VWAP 수준(종목 정체성 인코딩), 상수 3개,
+`aggressor`, 원시 거래량 기반 signed flow. 추가된 것: 실제 `liquidity_score`,
+정렬된 `volume_spike_ratio`, 그리고 `microstructure_available`.
+
+#### `microstructure_available`
+
+스토어는 호가 샘플이 없는 분에 NULL이 아니라 **0.0**을 씁니다. 그런데 `best_bid == best_ask`는
+실재하는 시장 상태가 아니므로 0은 "스프레드 0"이 아니라 "표본 없음"입니다. 현재 스토어 기준
+실제 표본이 있는 봉은 **KRX 19,920개 중 2,088개(10.5%)**, US 60,283개 중 47,365개(78.6%)입니다.
+그래서 가용성은 `rvgi_available` / `box_available`과 같은 관례로 **필드**가 되었고, 값이 0일 때
+`spread_bps_scaled` / `orderbook_imbalance` / `liquidity_score`는 함께 0이 됩니다.
+
+`_strategy_compatibility`도 이 값을 곱합니다. 곱하지 않으면 `1 - 0/10 = 1.0`이 되어 **아는 것이
+가장 적은 분에 실행품질 prior가 최대**가 됩니다.
 
 ### 순전파
 
@@ -259,16 +302,80 @@ no_trade  = sigmoid(no_trade_head · Z),  마스킹된 노드는 1.0
 
 ### 현재 체크포인트 상태
 
-`data/models/strategy_utility/rgcn_shadow.json` 기준:
+`rgcn_shadow`는 **v5로 승격되었습니다**(2026-08-09). 직전 v4는
+`rgcn_shadow.pre-v5-aligned.{npz,json}`에 보존돼 있어 두 파일을 되돌리면 롤백됩니다.
+승격 전까지는 서빙이 v5를 내고 체크포인트가 v4라 `MODEL_INPUT_SCHEMA_MISMATCH`로 fail-closed
+되어 있었습니다 — 슬롯 의미가 바뀐 벡터를 옛 가중치에 먹이지 않으려는 설계된 동작입니다.
 
 ```text
 method               ontology_strategy_graph_rgcn_joint_gradient_calibration
-input_feature_schema realtime_strategy_graph_v4_market
-rows / snapshots     11,696 / 1,462   (8개 전략 각 1,462)
-config               B1 T1 N8 F36 R3 S8, hidden 16, seed 17
+input_feature_schema realtime_strategy_graph_v5_aligned
+feature_provenance   causal_minute_bar_microstructure_v2_aligned
+rows / snapshots     57,552 / 3,597   (16개 전략 각 3,597)
+config               B1 T1 N16 F40 R3 S16, hidden 16, seed 17
 authorization_scope  ontology_gnn_realtime_trust_gated_execution
-checkpoint_hash      9a3b4dbf1ced8052ae4a8ffa0705d1bb358ee07b6a3e0c368963f2be7dcef80b
 ```
+
+feature 정렬 수정의 효과는 보정에서 나타났습니다. `raw_head_mse` 0.886 → 0.600,
+`success_direction_accuracy_realized` 0.618 → 0.728.
+
+### 정확도는 이 모델을 측정할 수 없다
+
+`success_direction_accuracy`가 다수결 baseline보다 낮다는 사실이 "무예측력"으로 읽혔지만,
+**그 지표로는 이 모델이 하는 일을 볼 수 없습니다.** 채널 0의 격자는 57,552 셀 중 1,622개만
+발화(2.82%)하므로 "전부 실패"라고 답하는 상수 예측기가 97.18%를 받습니다. 순위는 맞게 매기지만
+임계값이 어긋난 헤드는 이 지표에서 baseline 아래로 떨어집니다 — 실제로 그랬습니다.
+
+같은 체크포인트를 **선택 품질**로 재면 이렇습니다(체결된 검증 셀 408개, 25종목).
+
+| 지표 | 값 |
+| --- | --- |
+| `selection_auc` | **0.737** |
+| 95% CI (종목 클러스터 부트스트랩) | [0.551, 0.831] |
+| **종목내 순열 null** | **0.651** |
+| 순열 p-value | 0.001 |
+| base rate (양의 순수익 비율) | 0.154 |
+| 전체 평균 순수익 | −54.4 bps |
+| 상위 10분위 평균 순수익 | +2.0 bps |
+| 같은 항목 95% CI | [−81.6, +64.9] |
+| P(상위 10분위 ≤ 0) | **0.481** |
+
+두 가지가 방법론적으로 필수입니다.
+
+- **종목 클러스터 재표집.** 한 종목의 행들은 같은 가격 경로와 12배 겹치는 forward window를
+  공유합니다. 행 단위로 부트스트랩하면 종속 관측 수백 개를 독립으로 취급해 CI가 몇 배 좁아집니다.
+- **null은 0.5가 아니라 종목내 순열.** 종목별 승률을 보존한 채 섞으면, "승률 높은 종목을 선호"하는
+  것만으로 생기는 분리가 null에 남습니다. 실측 0.651입니다. 0.5를 null로 쓰면 **횡단면 종목
+  선택을 타이밍 능력으로 착각**합니다.
+
+**결론은 두 개의 서로 다른 주장입니다.**
+
+- **순위 능력은 실재합니다** — AUC 0.737, 순열 p=0.001. 우연이 아닙니다.
+- **수익 엣지는 입증되지 않았습니다** — 상위 10분위 순수익 CI가 0을 크게 걸치고 P(≤0)=0.48입니다.
+  사실상 동전 던지기입니다.
+
+모델 카드의 `selection_ranking_skill_established` / `selection_net_edge_established`가 이 둘을
+분리해 명시합니다. 현재 각각 `true` / `false`이며, **실거래 선출에 필요한 것은 두 번째**입니다.
+남은 제약은 아키텍처가 아니라 표본입니다 — 체결 검증 행 408개는 12배 중첩을 감안하면 독립
+관측 약 34개이고, 이 크기로는 비용(38~52bps) 대비 수 bps의 엣지를 분해할 수 없습니다.
+
+### 학습 분할의 purge
+
+`horizon_bars=60`이라 라벨은 스냅샷보다 60분 뒤에 확정됩니다. 이전 분할은 시간순 80%에서 그냥
+잘랐기 때문에 경계 부근 학습 행의 결과가 **검증 구간 안에서** 나왔습니다(현재 데이터 28행).
+이제 `label_end <= boundary`인 행만 학습에 씁니다(`purged_train_snapshots`로 보고).
+
+### context field 커버리지
+
+`rvgi_available`과 `box_context_available`은 학습 3,597 스냅샷 전체에서 **상수 1.0**입니다.
+이 창의 모든 봉이 warmup을 만족했다는 뜻이고, 따라서 그 가중치는 한 값으로만 적합돼 있습니다.
+서빙에서 RVGI가 실제로 unavailable이 되는 순간(rvgi 컬럼들이 0.0이 되는 그 상황) 모델은
+**학습된 적 없는 영역**에서 돌아갑니다.
+
+**이 필드들을 지우는 것은 오답입니다.** 플래그가 없으면 "unavailable이라 0.0"과 "값이 0.0"이
+같은 입력이 되고, 그건 context 계약이 막으려던 바로 그 silent-default입니다. 대신 카드가
+`context_fields_constant_in_training`과 `context_flags_below_minimum_support`로 보고합니다
+(현재 후자에는 `box_available`이 minority support 0.14%로 올라옵니다).
 
 `live_authorized=true`는 체크포인트 형식과 학습 커버리지가 런타임 사용 요건을 만족한다는 뜻이지, 모든 전략에 주문 권한이 있다는 뜻은 아닙니다. 실제 진입 권한은 `/api/gnn/realtime-trust`의 `trusted_strategy_ids`가 전략별 실시간 성과를 통과할 때만 부여됩니다.
 

@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.web import app
+import app.web as web_module
 from app.risk import PrincipalProtectionEngine, RiskManager
 from app.schemas import AccountSnapshot, MarketSnapshot, RiskRules
 from app.schemas.domain import (
@@ -26,6 +27,61 @@ from app.schemas.domain import (
 
 
 class PrincipalProtectionTest(unittest.TestCase):
+    def test_flat_kis_account_removes_exact_foreign_cash_duplicate_from_equity(self) -> None:
+        basis = web_module._account_basis_from_kis_connection(
+            {
+                "ok": True,
+                "account_checked": True,
+                "krw_cash": 304_746.25,
+                "foreign_cash_krw": 195_263.75,
+                "cash_equivalent_krw": 500_010.0,
+                "actual_equity": 695_273.0,
+                "invested_value": 0.0,
+                "positions": [],
+                "cash_by_currency": {"KRW": 304_746.25, "USD": 137.5},
+            }
+        )
+
+        self.assertIsNotNone(basis)
+        self.assertEqual(basis["equity"], 500_010.0)
+        self.assertTrue(basis["equity_reconciliation"]["corrected"])
+        self.assertEqual(
+            basis["equity_reconciliation"]["reason"],
+            "FOREIGN_CASH_DUPLICATED_IN_BROKER_TOTAL",
+        )
+
+    def test_principal_basis_migrates_once_then_stays_fixed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "principal.json"
+            state_path = Path(tmp) / "state.json"
+            state_path.write_text('{"high_watermark": 673374.0}', encoding="utf-8")
+            live_basis = {
+                "cash": 304_746.25,
+                "cash_equivalent_krw": 500_010.0,
+                "invested_value": 0.0,
+            }
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "PRINCIPAL_PROTECTION_CONFIG": str(config_path),
+                        "PRINCIPAL_PROTECTION_STATE": str(state_path),
+                    },
+                    clear=False,
+                ),
+                patch("app.web._last_live_account_basis", return_value=live_basis),
+            ):
+                legacy = PrincipalProtectionConfig(initial_principal=304_746.25)
+                migrated = web_module._principal_config_with_live_account_basis(legacy)
+                high = web_module._load_principal_high_watermark(500_010.0, migrated)
+                web_module._save_principal_high_watermark(high)
+                fixed = web_module._principal_config_with_live_account_basis(migrated)
+
+            self.assertEqual(migrated.initial_principal, 500_010.0)
+            self.assertEqual(high, 500_010.0)
+            self.assertEqual(fixed.initial_principal, 500_010.0)
+            self.assertIn("reconciled_live_equity_v2", state_path.read_text(encoding="utf-8"))
+
     def test_protected_floor_equals_initial_principal_without_profit(self) -> None:
         account = AccountSnapshot(cash=1_000_000, holdings=())
         config = PrincipalProtectionConfig(initial_principal=1_000_000)

@@ -13,6 +13,25 @@
 #     consecutive-pass counter resets on every failing cycle, so a relaxation still
 #     costs ``required_consecutive_cycles`` clean cycles.
 #
+# What ``required_consecutive_cycles`` is and is NOT
+# --------------------------------------------------
+# It is a DEBOUNCE, not evidence. Cycles are ``evaluation_interval_seconds`` apart
+# (300s) and each one re-reads the same trailing sample of trades, so five
+# consecutive passes are one measurement observed five times, not five independent
+# confirmations of it. Treating the counter as statistical strength was double
+# counting: it bought delay and read as rigour.
+#
+# The evidence burden belongs to the sample gates, which are disjoint by
+# construction and cannot be satisfied by waiting:
+#
+#   * ``required_holdout_windows_passed`` over ``holdout_window_days`` — the windows
+#     do not overlap, so a single good week cannot satisfy several of them;
+#   * ``minimum_filled_trades`` / ``minimum_distinct_trading_days`` /
+#     ``minimum_distinct_symbols`` — new fills, new days, new names.
+#
+# So the counters below are sized as what they are: enough cycles to ride out one
+# transient reading, and no more.
+#
 # Thresholds here OVERRIDE the built-in defaults key by key. A block that names one
 # threshold leaves the others at their default rather than zeroing them.
 #
@@ -21,6 +40,11 @@
 
 enabled: true
 config_version: "short-deployment-v1"
+
+# Explicit operator instruction: deployment-stage shadow restrictions are
+# disabled for every configured short arm. Borrow locate, short-risk limits,
+# profitability, bandit and market-session gates remain authoritative.
+operator_live_full_override: true
 
 # How often the promotion controller re-evaluates every arm. 300s means a demotion
 # trigger acts within five minutes, which is the outer bound on how long a degraded
@@ -88,7 +112,8 @@ promotion:
     # in which case adding it bought nothing and only added exposure.
     minimum_short_rescue_rate: 0.03
     required_holdout_windows_passed: 3
-    required_consecutive_cycles: 5
+    # Debounce only. The 3 disjoint holdout windows above are the evidence.
+    required_consecutive_cycles: 2
 
   # From here on, shadow evidence no longer counts. These rungs are judged on real
   # fills only.
@@ -101,7 +126,8 @@ promotion:
     maximum_live_drawdown_bps: 150.0
     maximum_live_slippage_error_bps: 15.0
     maximum_broker_rejection_rate: 0.03
-    required_consecutive_cycles: 5
+    # Debounce only. ``minimum_live_probe_trades`` / ``_days`` carry the evidence.
+    required_consecutive_cycles: 2
 
   live_limited_to_live_full:
     minimum_total_live_trades: 60
@@ -112,7 +138,10 @@ promotion:
     maximum_live_drawdown_bps: 200.0
     maximum_broker_rejection_rate: 0.02
     minimum_borrow_availability_rate: 0.8
-    required_consecutive_cycles: 10
+    # Debounce only, one rung wider than the others because this is the last rung
+    # and the position limits it unlocks are the largest. 60 live trades over 30
+    # live days is what actually gates it.
+    required_consecutive_cycles: 3
 
 demotion:
   # Every value below is LOOSER than the promotion threshold at the same rung. The

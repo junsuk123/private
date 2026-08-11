@@ -753,6 +753,31 @@ class ShadowPlanStore:
             return False
         return True
 
+    def has_recent_plan(
+        self,
+        key: DirectionalStrategyKey,
+        symbol: str,
+        *,
+        since: datetime,
+    ) -> bool:
+        """Whether this arm already emitted a correlated recent observation."""
+        if not self._available:
+            return True
+        try:
+            with self._lock, closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    select 1 from shadow_plans
+                    where strategy_key = ? and symbol = ? and signal_at >= ?
+                    limit 1
+                    """,
+                    (key.as_text(), str(symbol).upper(), _aware(since).isoformat()),
+                ).fetchone()
+        except sqlite3.Error:
+            # Fail closed: a journal lookup failure must not manufacture samples.
+            return True
+        return row is not None
+
     def record_outcome(self, outcome: ShadowOutcome) -> bool:
         if not self._available:
             return False

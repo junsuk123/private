@@ -12,7 +12,24 @@ from app.schemas.domain import ReasoningPath
 
 
 class WebGraphPayloadTest(unittest.TestCase):
+    """Payload shape tests.
+
+    ``macro_micro_feed`` is process-global, and these tests assert EXACT node and
+    link counts, so they have to start from a known-empty feed. Clearing only in
+    ``tearDown`` protects other tests from this one but not this one from
+    everything that ran before it: whichever module populated the feed earlier
+    added four overlay links, and ``test_full_graph_payload_bypasses_ui_trimming``
+    then saw 16 links where it expected 12. Clear on BOTH sides.
+    """
+
+    def setUp(self) -> None:
+        self._clear_macro_micro_feed()
+
     def tearDown(self) -> None:
+        self._clear_macro_micro_feed()
+
+    @staticmethod
+    def _clear_macro_micro_feed() -> None:
         try:
             from app.graph import macro_micro_feed
 

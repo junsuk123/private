@@ -5,6 +5,16 @@ from datetime import datetime
 
 from app.cost import TradingCostEngine
 from app.trading.contracts import Bar, TradePlan
+from app.trading.directional import (
+    PositionDirection,
+    favourable_watermark,
+    gross_return_bps,
+    parse_direction,
+    stop_breached,
+    target_reached,
+    trailing_breached,
+    trailing_price,
+)
 
 
 @dataclass(frozen=True)
@@ -71,27 +81,88 @@ class EventDrivenFillSimulator:
         entry_bar = future[entry_index]
         stop = float(plan.initial_stop["price"])
         target = float(plan.profit_policy["price"])
+        direction = parse_direction(plan.position_direction)
+        trailing_rate = max(
+            0.0, float(plan.trailing_policy.get("bps", 0.0)) / 10_000.0
+        )
+        baseline_cost = self.cost_engine.estimate(
+            symbol=plan.symbol,
+            market=market,
+            venue=venue,
+            instrument_type=instrument_type,
+            entry_price=limit,
+            expected_exit_price=limit,
+            quantity=plan.proposed_quantity,
+        )
+        trailing_activation_bps = (
+            baseline_cost.total_cost_rate * 10_000.0
+            + max(
+                0.0,
+                float(plan.trailing_policy.get("minimum_net_bps", 5.0)),
+            )
+        )
         deadline = entry_bar.start_time.timestamp() + plan.max_holding_seconds
         exit_price = entry_bar.close
         exit_time = entry_bar.end_time
         exit_reason = "MAX_HOLDING_TIME"
         lows: list[float] = []
         highs: list[float] = []
+        watermark = limit
         for bar in future[entry_index:]:
             if bar.start_time.timestamp() > deadline:
                 break
             lows.append(bar.low)
             highs.append(bar.high)
-            # When both barriers occur inside one OHLC bar, choose the adverse
+            # Use only the PRIOR bar's favourable watermark for the trailing
+            # stop. Creating a new high and then claiming the same bar crossed
+            # the resulting trail assumes an intrabar order OHLC cannot prove.
+            resolved_trailing = trailing_price(
+                watermark, trailing_rate, direction
+            )
+            adverse_price = (
+                bar.low if direction is PositionDirection.LONG else bar.high
+            )
+            favourable_price = (
+                bar.high if direction is PositionDirection.LONG else bar.low
+            )
+            # When stop and target occur inside one OHLC bar, choose the adverse
             # barrier because intrabar ordering is unknown.
-            if bar.low <= stop:
+            if stop_breached(adverse_price, stop, direction):
                 exit_price, exit_time, exit_reason = stop, bar.end_time, "INITIAL_STOP"
                 break
-            if bar.high >= target:
+            if target_reached(favourable_price, target, direction):
                 exit_price, exit_time, exit_reason = target, bar.end_time, "PROFIT_TARGET"
                 break
+            trailing_locks_profit = (
+                gross_return_bps(limit, resolved_trailing, direction)
+                >= trailing_activation_bps
+            )
+            if (
+                trailing_rate > 0
+                and trailing_locks_profit
+                and trailing_breached(
+                    adverse_price, resolved_trailing, limit, direction
+                )
+            ):
+                exit_price, exit_time, exit_reason = (
+                    resolved_trailing,
+                    bar.end_time,
+                    "TRAILING_STOP",
+                )
+                break
+            watermark = favourable_watermark(
+                watermark, favourable_price, direction
+            )
             exit_price, exit_time = bar.close, bar.end_time
-        gross = exit_price / limit - 1
+        if (
+            exit_reason == "MAX_HOLDING_TIME"
+            and exit_time.timestamp() < deadline
+        ):
+            # The stored series ended or crossed a session gap before the
+            # strategy's own clock expired. Treating that last close as a time
+            # exit invents an outcome the live strategy would not have taken.
+            exit_reason = "FUTURE_WINDOW_CENSORED"
+        gross_bps = gross_return_bps(limit, exit_price, direction)
         cost = self.cost_engine.estimate(
             symbol=plan.symbol,
             market=market,
@@ -101,8 +172,13 @@ class EventDrivenFillSimulator:
             expected_exit_price=exit_price,
             quantity=plan.proposed_quantity,
         )
-        mae = min((low / limit - 1 for low in lows), default=0.0)
-        mfe = max((high / limit - 1 for high in highs), default=0.0)
+        if direction is PositionDirection.LONG:
+            mae_bps = min((low / limit - 1 for low in lows), default=0.0) * 10_000
+            mfe_bps = max((high / limit - 1 for high in highs), default=0.0) * 10_000
+        else:
+            mae_bps = min((1 - high / limit for high in highs), default=0.0) * 10_000
+            mfe_bps = max((1 - low / limit for low in lows), default=0.0) * 10_000
+        cost_bps = cost.total_cost_rate * 10_000
         return CounterfactualOutcome(
             as_of=as_of,
             symbol=plan.symbol,
@@ -114,11 +190,11 @@ class EventDrivenFillSimulator:
             entry_price=limit,
             exit_price=exit_price,
             exit_reason=exit_reason,
-            gross_return_bps=gross * 10_000,
-            cost_bps=cost.total_cost_rate * 10_000,
-            net_return_bps=cost.net_expected_return * 10_000,
-            mae_bps=mae * 10_000,
-            mfe_bps=mfe * 10_000,
+            gross_return_bps=gross_bps,
+            cost_bps=cost_bps,
+            net_return_bps=gross_bps - cost_bps,
+            mae_bps=mae_bps,
+            mfe_bps=mfe_bps,
             holding_seconds=max(
                 0.0, (exit_time - entry_bar.start_time).total_seconds()
             ),

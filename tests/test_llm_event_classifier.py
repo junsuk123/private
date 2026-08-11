@@ -76,6 +76,31 @@ class LLMEventClassifierTest(unittest.TestCase):
         self.assertNotIn("AI", event.tickers)
         self.assertNotIn("TV", event.tickers)
 
+    def test_regulatory_acronyms_do_not_become_three_letter_tickers(self) -> None:
+        event = classify_text_event(
+            title="USA filing API includes CIK and PDS fields",
+            body="The SEC documentation describes API access and CIK identifiers.",
+            source=source_now("unit", "local://ticker-filter", "ticker-filter:acronyms"),
+            known_tickers={
+                "USA": "Liberty All-Star Equity Fund",
+                "API": "Agora Inc",
+                "CIK": "Credit Suisse Asset Management Income Fund",
+                "PDS": "Precision Drilling Corporation",
+            },
+        )
+
+        self.assertEqual(event.tickers, ())
+
+    def test_ambiguous_acronym_is_allowed_when_explicitly_marked_as_ticker(self) -> None:
+        event = classify_text_event(
+            title="$API reports quarterly results",
+            body="Agora Inc reported quarterly results.",
+            source=source_now("unit", "local://ticker-filter", "ticker-filter:explicit"),
+            known_tickers={"API": "Agora Inc"},
+        )
+
+        self.assertEqual(event.tickers, ("API",))
+
     def test_llm_classification_overrides_keyword_fallback_and_extracts_facts(self) -> None:
         classifier = JsonEventLLMClassifier(
             FakeLLMClient(

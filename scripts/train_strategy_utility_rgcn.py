@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from app.data.investor_flow_store import InvestorFlowStore
+from app.features.strategy_graph_context import STRATEGY_GRAPH_CONTEXT_SCHEMA
 from app.evaluation.stored_counterfactual import (
     EvaluationConfig,
     build_labels,
@@ -26,7 +27,10 @@ def main() -> None:
     args = parser.parse_args()
     labels = build_labels(
         load_minute_bars(args.database),
-        EvaluationConfig(feature_schema_name="realtime_strategy_graph_v4_market"),
+        EvaluationConfig(
+            feature_schema_name=STRATEGY_GRAPH_CONTEXT_SCHEMA,
+            align_strategy_horizons=True,
+        ),
         microstructure_by_symbol=load_minute_microstructure(args.database),
         investor_flow_by_symbol=InvestorFlowStore().load_all(),
         news_by_ticker=load_news_sentiment(),
@@ -34,7 +38,7 @@ def main() -> None:
     report = train_counterfactual_checkpoint(
         labels,
         args.output,
-        input_feature_schema="realtime_strategy_graph_v4_market",
+        input_feature_schema=STRATEGY_GRAPH_CONTEXT_SCHEMA,
         authorize_live_shadow=True,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))

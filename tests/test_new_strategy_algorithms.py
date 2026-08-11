@@ -6,6 +6,7 @@ from app.strategy.catalog import STRATEGY_IDS
 from app.strategy.exit_geometry import all_geometries, exit_bps, exit_geometry, max_holding_seconds
 from app.technical.signals import TechnicalFeatureSet
 from app.technical.strategy_algorithms import (
+    _DEFAULTS,
     ALGORITHM_IDS,
     AlgorithmConfig,
     ElectionContext,
@@ -75,10 +76,27 @@ def test_vwap_zscore_normalises_displacement_by_volatility():
     assert _features(realized_volatility=None, realized_volatility_10s=None).vwap_zscore is None
 
 
+def test_sparse_tick_signal_uses_completed_minute_volatility_for_edge():
+    algorithm = get_algorithm("intraday_momentum")
+    decision = algorithm.entry(
+        _features(
+            tick_count_5s=2.0,
+            realized_volatility_10s=0.0,
+            realized_volatility=0.01,
+            ema_fast=70_100.0,
+            ema_slow=70_000.0,
+            macd_histogram=1.0,
+        ),
+        _context("intraday_momentum"),
+    )
+    assert decision.triggered is True
+    assert decision.expected_edge_bps > 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Catalog / deployment                                                         #
 # --------------------------------------------------------------------------- #
-def test_new_strategies_are_registered_and_shadow_only():
+def test_new_strategies_are_registered_and_live_authorized():
     added = (
         "residual_relative_strength",
         "adaptive_anchored_vwap_reversion",
@@ -88,10 +106,100 @@ def test_new_strategies_are_registered_and_shadow_only():
     registry = build_algorithm_registry()
     for strategy_id in added:
         assert strategy_id in registry
-        # Shadow first: they must accumulate per-regime samples before the
-        # conservative bandit can give them a positive lower bound.
-        assert strategy_live_authorized(strategy_id) is False
+        assert strategy_live_authorized(strategy_id) is True
         assert strategy_shadow_authorized(strategy_id) is True
+
+
+def test_completed_bar_vwap_recovery_is_registered_and_live_authorized():
+    strategy_id = "bar_confirmed_vwap_recovery"
+    assert strategy_id in STRATEGY_IDS
+    assert strategy_id in ALGORITHM_IDS
+    assert strategy_live_authorized(strategy_id) is True
+    assert strategy_shadow_authorized(strategy_id) is True
+    assert strategy_id in all_geometries()
+
+
+def test_every_catalogued_strategy_is_at_least_shadow_authorized():
+    """Nothing may be catalogued and then silently inert.
+
+    This used to demand LIVE authority from every catalogued strategy, which
+    contradicts the deployment pattern the catalogue itself documents — a new
+    thesis ships in SHADOW and earns live authority from forward, out-of-sample
+    outcomes — and contradicted
+    ``test_not_live_authorized_until_it_has_evidence`` directly. The invariant
+    worth holding is that every strategy is at least evaluated and journaled, so
+    a shadow-only one keeps accumulating the evidence its promotion needs.
+    """
+    assert [
+        strategy_id
+        for strategy_id in STRATEGY_IDS
+        if not strategy_shadow_authorized(strategy_id)
+    ] == []
+
+
+def test_shadow_only_strategies_declare_it_rather_than_defaulting_to_it():
+    """A strategy is shadow-only because it SAYS so, never by omission."""
+    shadow_only = [
+        strategy_id
+        for strategy_id in STRATEGY_IDS
+        if not strategy_live_authorized(strategy_id)
+    ]
+    for strategy_id in shadow_only:
+        assert "live_authorized" in _DEFAULTS[strategy_id], (
+            f"{strategy_id} is not live-authorized but never declares the knob"
+        )
+
+
+def test_completed_bar_vwap_recovery_ignores_cold_tick_window():
+    algorithm = get_algorithm("bar_confirmed_vwap_recovery")
+    decision = algorithm.entry(
+        _features(
+            symbol="INTC",
+            price=98.50,
+            vwap=100.0,
+            vwap_distance_bps=-150.0,
+            realized_volatility=0.0015,
+            second_data_ready=0.0,
+            tick_count_5s=0.0,
+            return_1s=None,
+            return_5s=None,
+            return_10s=None,
+            aggressor_imbalance_5s=None,
+            orderbook_imbalance_change_5s=None,
+            ema_fast=98.40,
+            macd_histogram=0.08,
+            rsi=35.0,
+            momentum_persistence=0.60,
+            liquidity_score=0.80,
+            spread_bps=10.0,
+        ),
+        _context("bar_confirmed_vwap_recovery"),
+    )
+    assert decision.triggered, decision.reason_codes
+    assert "BAR_CONFIRMED_VWAP_RECOVERY" in decision.reason_codes
+    assert "TICK_WINDOW_NOT_READY" not in decision.reason_codes
+
+
+def test_completed_bar_vwap_recovery_waits_for_fast_ema_reclaim():
+    algorithm = get_algorithm("bar_confirmed_vwap_recovery")
+    decision = algorithm.entry(
+        _features(
+            symbol="INTC",
+            price=98.20,
+            vwap=100.0,
+            vwap_distance_bps=-180.0,
+            realized_volatility=0.002,
+            ema_fast=98.40,
+            macd_histogram=0.08,
+            rsi=35.0,
+            momentum_persistence=0.60,
+            liquidity_score=0.80,
+            spread_bps=10.0,
+        ),
+        _context("bar_confirmed_vwap_recovery"),
+    )
+    assert not decision.triggered
+    assert "BAR_VWAP_FAST_EMA_NOT_RECLAIMED" in decision.reason_codes
 
 
 def test_residual_strength_is_a_relative_strength_family_not_momentum():
@@ -110,6 +218,14 @@ def test_residual_strength_is_a_relative_strength_family_not_momentum():
             "adaptive_anchored_vwap_reversion",
             ("mean_reversion", "vwap_reversion"),
             ("momentum",),
+        )
+        is True
+    )
+    assert (
+        macro_strategy_permitted(
+            "bar_confirmed_vwap_recovery",
+            ("momentum",),
+            (),
         )
         is True
     )
@@ -464,5 +580,5 @@ def test_algorithm_config_exposes_the_new_sections():
         "adaptive_anchored_vwap_reversion",
         "ofi_microprice_exhaustion_reversal",
     ):
-        assert resolved[strategy_id]["live_authorized"] == 0.0
+        assert resolved[strategy_id]["live_authorized"] == 1.0
         assert resolved[strategy_id]["shadow_enabled"] == 1.0

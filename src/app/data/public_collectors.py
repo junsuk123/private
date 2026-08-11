@@ -140,6 +140,7 @@ class RssNewsCollector:
         max_llm_items: int | None = None,
         fetch_articles: bool = False,
         article_limit: int | None = None,
+        event_type: EventType = EventType.NEWS,
     ) -> RssCollectionResult:
         response = self.client.get_text(feed_url)
         root = ET.fromstring(response.text)
@@ -170,7 +171,7 @@ class RssNewsCollector:
                     title=title,
                     body=body,
                     source=source,
-                    event_type=EventType.NEWS,
+                    event_type=event_type,
                     known_tickers=known_tickers,
                     event_date=_parse_rss_date(_xml_text(item, "pubDate")),
                     llm_classifier=llm_classifier if max_llm_items is None or index < max_llm_items else None,

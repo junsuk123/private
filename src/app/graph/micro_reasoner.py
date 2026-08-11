@@ -410,6 +410,25 @@ class MicroSymbolReasoner:
         measured_diagnostics = (
             dict(frame_diagnostics) if isinstance(frame_diagnostics, Mapping) else {}
         )
+        features = data.technical_features
+        frame_context_reader = getattr(data.live_feature_frame, "as_context_dict", None)
+        frame_context = frame_context_reader() if callable(frame_context_reader) else {}
+        slow_bar_count = frame_context.get("slow_technical:bar_count")
+        if features is not None:
+            measured_diagnostics.update(
+                {
+                    "technical_source": (
+                        "completed_1m_bars" if slow_bar_count else "realtime_tick_window"
+                    ),
+                    "technical_bar_count": int(slow_bar_count or 0),
+                    "price": features.price,
+                    "spread_bps": features.spread_bps,
+                    "vwap_distance_bps": features.vwap_distance_bps,
+                    "volume_spike_ratio": features.volume_spike_ratio,
+                    "realized_volatility": features.realized_volatility,
+                    "liquidity_score": features.liquidity_score,
+                }
+            )
         return MicroReasoningResult(
             timestamp=data.timestamp,
             symbol=data.symbol,

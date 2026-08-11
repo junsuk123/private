@@ -96,6 +96,31 @@ def create_short_strategy_router(
             payload["ok"] = True
             payload["catalogued_short_strategies"] = list(SHORT_STRATEGY_IDS)
             payload["long_counterparts"] = dict(SHORT_LONG_COUNTERPART)
+            payload["operator_live_full_override"] = bool(
+                controller.config.operator_live_full_override
+            )
+            # ``controller.status`` includes the promotion store's historical
+            # rung. Under an explicit operator override the execution layer uses
+            # ``authorized_state`` instead, so report both rather than showing a
+            # stale SHADOW badge while real deployment is LIVE_FULL.
+            for arm in payload.get("arms", []):
+                key = _resolve_key(
+                    str(arm.get("strategy_id") or ""),
+                    str(arm.get("market") or "KR"),
+                )
+                effective = controller.authorized_state(key)
+                permitted, permission_reasons = controller.may_submit_orders(key)
+                arm["persisted_state"] = arm.get("state")
+                arm["state"] = str(effective)
+                arm["effective_state"] = str(effective)
+                arm["submits_orders"] = bool(effective.submits_orders and permitted)
+                arm["deployment_override_active"] = bool(
+                    controller.config.operator_live_full_override
+                )
+                arm["deployment_permission_reasons"] = list(permission_reasons)
+                if arm["deployment_override_active"]:
+                    arm["next_state"] = None
+                    arm["remaining_conditions"] = []
             # Stated explicitly so an operator never has to infer it from the state
             # name: this is the set of arms that can currently place a real order.
             payload["order_authorized_arms"] = [

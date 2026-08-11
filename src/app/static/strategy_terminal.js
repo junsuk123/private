@@ -17,6 +17,9 @@ const terminalState = {
   gnnGraph: null,
   gnnStateBusy: false,
   gnnInference: null,
+  gnnGraphRequestId: 0,
+  gnnStateRequestId: 0,
+  ontologySignature: null,
 };
 
 // Visualization is an operator preference only. Training and inference remain
@@ -31,7 +34,55 @@ const gnnGraphView = {
   filter: 'all', zoom: 1, panX: 0, panY: 0, nodes: [], nodeMap: new Map(),
   hovered: null, selected: null, dragging: false, moved: false, lastX: 0, lastY: 0,
   frame: null, signature: null, lastPaint: 0,
+  // Travelling waves currently crossing the threads. Each entry is one REAL
+  // event -- see queueGnnWave. An empty list means nothing happened, and the
+  // graph then sits still on purpose.
+  waves: [],
+  lastInferenceAt: null,
+  lastCheckpointHash: null,
 };
+
+// Golden angle. Successive nodes placed at this turn never line up into rings or
+// spokes, which is what makes a sunflower head look evenly filled.
+const GNN_GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+// How long one wave takes to cross a thread, and how wide its packet is as a
+// fraction of the span.
+const GNN_WAVE_MS = 1150;
+const GNN_WAVE_WIDTH = 0.17;
+
+// Rope resolution in the 3D view. Six segments is enough for a droop to read as
+// a curve; each one costs two vertices per edge, so this is the memory knob.
+const GNN3D_EDGE_SEGMENTS = 6;
+// Ceiling on how many ropes are re-solved every frame.
+const GNN3D_MAX_DYNAMIC_EDGES = 700;
+
+/**
+ * Write one hanging rope into a LineSegments position buffer.
+ *
+ * The curve is a parabola through both endpoints with its low point at the
+ * middle -- the standard small-sag approximation of a catenary, and visually
+ * indistinguishable from one at this scale. Sag is applied along local -Y, so
+ * the ropes hang relative to the graph itself and keep hanging correctly while
+ * it is rotated.
+ */
+function writeGnn3dEdgeCurve(positions, edgeIndex, spring, sag) {
+  const S = GNN3D_EDGE_SEGMENTS;
+  const { source, target } = spring;
+  const base = edgeIndex * S * 2 * 3;
+  let px = source.x, py = source.y, pz = source.z;
+  for (let segment = 0; segment < S; segment += 1) {
+    const t = (segment + 1) / S;
+    const droop = 4 * t * (1 - t);            // 0 at both ends, 1 at the middle
+    const qx = source.x + (target.x - source.x) * t;
+    const qy = source.y + (target.y - source.y) * t - sag * droop;
+    const qz = source.z + (target.z - source.z) * t;
+    const offset = base + segment * 6;
+    positions[offset] = px; positions[offset + 1] = py; positions[offset + 2] = pz;
+    positions[offset + 3] = qx; positions[offset + 4] = qy; positions[offset + 5] = qz;
+    px = qx; py = qy; pz = qz;
+  }
+}
 
 const gnnClusterStyle = {
   input_context: { label: '41-D INPUT FEATURES', color: '#8178ff', x: 120, y: 335, radius: 145 },
@@ -54,25 +105,166 @@ const gnnRelationStyle = {
   owns_output_head: { color: '#a7f3d0', label: '전략 출력 소유 관계' },
 };
 
+// The end-to-end pipeline, in the order a candidate actually walks it. Names and
+// order come from SelectionStage in technical/selection_diagnostics.py; the
+// counts come from /api/strategy-selection/diagnostics. Nothing here is invented
+// on the client -- a stage with no measurement renders as unmeasured, not as
+// zero, because "nothing was rejected here" and "we never looked" are different
+// facts and only one of them is good news.
+const GNN_PIPELINE_STAGES = [
+  { id: 'RAW_CANDIDATE', label: '① 수집 · 원시 후보', color: 0x8178ff },
+  { id: 'FEATURE_UNAVAILABLE', label: '② 특징 생성', color: 0x8fa4ff },
+  { id: 'STRATEGY_TRIGGER_FALSE', label: '③ 전략 트리거', color: 0xf6d778 },
+  { id: 'GROSS_EDGE_NON_POSITIVE', label: '④ 총엣지', color: 0xffc46b },
+  { id: 'HORIZON_COST_UNVIABLE', label: '⑤ 호라이즌·비용', color: 0xffa457 },
+  { id: 'MODEL_NOT_RELIABLE', label: '⑥ 모델 신뢰', color: 0xff8fb0 },
+  { id: 'MODEL_DISAGREEMENT', label: '⑦ 모델 합치', color: 0xff7a9c },
+  { id: 'FUSED_NET_NON_POSITIVE', label: '⑧ 순엣지', color: 0xff6f91 },
+  { id: 'COST_FLOOR_REJECTED', label: '⑨ 비용 하한', color: 0xe86a9d },
+  { id: 'PROFITABILITY_REJECTED', label: '⑩ 수익성 게이트', color: 0xc86ec0 },
+  { id: 'MACRO_BLOCKED', label: '⑪ 거시 판정', color: 0x9f7bd8 },
+  { id: 'ONTOLOGY_BLOCKED', label: '⑫ 온톨로지 게이트', color: 0x7d8ce8 },
+  { id: 'SHADOW_ONLY', label: '⑬ 섀도우 전용', color: 0x5fa8e0 },
+  { id: 'LIVE_NOT_AUTHORIZED', label: '⑭ 실거래 권한', color: 0x46c9d6 },
+  { id: 'SELECTED', label: '⑮ 채택 · 주문', color: 0x5eead4 },
+];
+
+/**
+ * Physics constants replaced by market state.
+ *
+ * Every term below is read from a field the engine already publishes; nothing is
+ * synthesised. When a field is absent the force falls back to its neutral value
+ * and is reported as unobserved, because a graph that hangs "normally" because
+ * the market is calm and one that hangs normally because we could not read the
+ * market look identical otherwise.
+ *
+ *   gravity   <- macro regime + index trend   : which way and how hard the tape pulls
+ *   tension   <- learned edge strength        : a strong relation is a taut rope
+ *   inertia   <- training rows behind a node  : evidence is mass, it resists moving
+ *   elasticity<- change-point probability     : a regime about to break rings faster
+ *   damping   <- 1 - change-point probability : a stable regime settles quickly
+ */
+const GNN_NEUTRAL_FORCES = {
+  gravity: 1, tension: 1, inertia: 1, elasticity: 1, damping: 1,
+  marketEnergy: 0, direction: 0, activity: 0, liquidityStress: 0,
+  regime: null, indexTrend: null, changePoint: null, halted: false, observed: false,
+};
+
+// Regimes that pull the tape down. A rope in a falling market hangs heavier.
+const GNN_HEAVY_REGIMES = new Set(['TREND_DOWN', 'STRONG_TREND_DOWN', 'HIGH_VOL_TRENDING_DOWN', 'RISK_OFF', 'BEAR']);
+const GNN_LIGHT_REGIMES = new Set(['TREND_UP', 'STRONG_TREND_UP', 'HIGH_VOL_TRENDING_UP', 'RISK_ON', 'BULL']);
+
+function gnnMarketForcesFrom(session, market = null) {
+  if ((!session || typeof session !== 'object') && (!market || typeof market !== 'object')) {
+    return { ...GNN_NEUTRAL_FORCES };
+  }
+  session = session && typeof session === 'object' ? session : {};
+  market = market && typeof market === 'object' ? market : {};
+  const regime = typeof session.macro_regime === 'string' ? session.macro_regime : null;
+  const changePoint = Number.isFinite(Number(session.change_point_probability))
+    ? Math.min(1, Math.max(0, Number(session.change_point_probability)))
+    : null;
+  // index_trend is carried inside the macro explanation the reasoner emitted.
+  let indexTrend = null;
+  (session.explanation_paths || []).forEach((path) => {
+    const value = Number(path?.features?.index_trend);
+    if (Number.isFinite(value)) indexTrend = value;
+  });
+  const halted = String(session.halt_level || 'NONE') !== 'NONE';
+  const micro = market.microstructure || {};
+  const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const clamp = (value, low = 0, high = 1) => Math.max(low, Math.min(high, value));
+  const return1s = finite(micro.return_1s);
+  const return5s = finite(micro.return_5s);
+  const return10s = finite(micro.return_10s);
+  const aggressor = clamp(finite(micro.aggressor_imbalance_5s), -1, 1);
+  const bookShift = clamp(finite(micro.orderbook_imbalance_change_5s), -1, 1);
+  const spreadShift = Math.abs(finite(micro.spread_change_5s_bps));
+  const activity = clamp(finite(micro.tick_count_5s) / 24);
+  const volatility = clamp(
+    Math.abs(return1s) * 220 + Math.abs(return5s) * 140
+      + Math.abs(return10s) * 80 + spreadShift / 12,
+  );
+  const liquidityStress = clamp(spreadShift / 8 + (market.orderbook_stale ? .25 : 0));
+  const direction = clamp(
+    return5s * 180 + return10s * 90 + aggressor * .42 + bookShift * .28,
+    -1,
+    1,
+  );
+  const marketEnergy = clamp(volatility * .52 + Math.abs(aggressor) * .23 + activity * .25);
+
+  // Trend is a small number (order 1e-3), so it is scaled into a visible range
+  // and clamped: one violent print must not make every rope hit the floor.
+  const trendPull = indexTrend === null ? -direction : Math.max(-1, Math.min(1, -indexTrend * 400));
+  const regimePull = regime && GNN_HEAVY_REGIMES.has(regime) ? .45
+    : regime && GNN_LIGHT_REGIMES.has(regime) ? -.3 : 0;
+  return {
+    gravity: Math.max(.45, Math.min(2.2, 1 + trendPull * .55 + regimePull + liquidityStress * .18)),
+    tension: Math.max(.55, Math.min(2.1, .72 + activity * .42 + volatility * .38 + liquidityStress * .48)),
+    inertia: 1,
+    elasticity: 1 + (changePoint || 0) * 1.4 + marketEnergy * 1.25,
+    damping: Math.max(.3, 1 - (changePoint || 0) * .55 - marketEnergy * .42),
+    marketEnergy, direction, activity, liquidityStress,
+    regime, indexTrend, changePoint, halted,
+    observed: Boolean(regime || changePoint !== null || indexTrend !== null || micro.ready),
+  };
+}
+
+async function fetchGnnMarketForces() {
+  try {
+    const response = await fetch('/api/realtime-trading/status', { cache: 'no-store' });
+    if (!response.ok) return { ...GNN_NEUTRAL_FORCES };
+    const payload = await response.json();
+    return gnnMarketForcesFrom(
+      (payload?.status || {}).strategy_session,
+      terminalState.data?.market || null,
+    );
+  } catch (error) {
+    // Unreadable market state must leave the graph neutral, not frozen.
+    return { ...GNN_NEUTRAL_FORCES };
+  }
+}
+
+async function fetchGnnPipeline() {
+  try {
+    const response = await fetch('/api/strategy-selection/diagnostics', { cache: 'no-store' });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return payload && payload.available === false
+      ? { unavailable: payload.reason || 'UNAVAILABLE', stages: payload.stages }
+      : payload;
+  } catch (error) {
+    // A missing funnel must not take the graph down with it.
+    return null;
+  }
+}
+
 async function fetchGnnGraph() {
   if (!gnnVisualizationEnabled) return;
   if (terminalState.gnnGraphBusy) return;
   terminalState.gnnGraphBusy = true;
+  const requestId = ++terminalState.gnnGraphRequestId;
   try {
     const response = await fetch('/api/account/gnn-graph', { cache: 'no-store' });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const data = await response.json();
-    if (!gnnVisualizationEnabled) return;
+    if (!gnnVisualizationEnabled || requestId !== terminalState.gnnGraphRequestId) return;
+    // Fetched with the graph so the funnel ribbon and the model layers always
+    // describe the same moment.
+    data.pipeline = await fetchGnnPipeline();
+    data.forces = await fetchGnnMarketForces();
+    if (!gnnVisualizationEnabled || requestId !== terminalState.gnnGraphRequestId) return;
     terminalState.gnnGraph = data;
     renderGnnGraphSummary(data);
     prepareGnnGraph(data);
   } catch (error) {
+    if (requestId !== terminalState.gnnGraphRequestId) return;
     const status = document.getElementById('gnn-model-status');
     status.textContent = 'LOAD ERROR';
     status.className = 'status-chip blocked';
     document.getElementById('gnn-model-summary').textContent = `GNN 그래프를 불러오지 못했습니다: ${error.message}`;
   } finally {
-    terminalState.gnnGraphBusy = false;
+    if (requestId === terminalState.gnnGraphRequestId) terminalState.gnnGraphBusy = false;
   }
 }
 
@@ -80,18 +272,29 @@ async function fetchGnnState() {
   if (!gnnVisualizationEnabled) return;
   if (terminalState.gnnStateBusy) return;
   terminalState.gnnStateBusy = true;
+  const requestId = ++terminalState.gnnStateRequestId;
   try {
     const response = await fetch('/api/account/gnn-state', { cache: 'no-store' });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     const inference = await response.json();
-    if (!gnnVisualizationEnabled) return;
+    if (!gnnVisualizationEnabled || requestId !== terminalState.gnnStateRequestId) return;
     terminalState.gnnInference = inference;
     renderGnnLiveState(terminalState.gnnInference);
   } catch (_error) {
+    if (requestId !== terminalState.gnnStateRequestId) return;
     renderGnnLiveState({ state: 'OFFLINE', active: false, age_seconds: null });
   } finally {
-    terminalState.gnnStateBusy = false;
+    if (requestId === terminalState.gnnStateRequestId) terminalState.gnnStateBusy = false;
   }
+}
+
+function refreshGnnMarketForces() {
+  if (!gnnVisualizationEnabled || !terminalState.gnnGraph || !terminalState.data) return;
+  terminalState.gnnGraph.forces = gnnMarketForcesFrom(
+    terminalState.data.strategy_session || {},
+    terminalState.data.market || {},
+  );
+  if (gnn3dState?.updateData) gnn3dState.updateData(terminalState.gnnGraph);
 }
 
 function renderGnnLiveState(state) {
@@ -175,7 +378,29 @@ function renderGnnGraphSummary(data) {
 }
 
 function prepareGnnGraph(data) {
-  const signature = `${data.model?.checkpoint_hash || ''}:${data.counts?.nodes || 0}:${data.counts?.links || 0}:${data.inference?.latest_at || ''}`;
+  // Only topology changes may recreate the WebGL scene. The previous signature
+  // included the latest inference timestamp and live market forces, so every
+  // normal poll destroyed the canvas and constructed it again. That looked like
+  // data from two cycles flashing over each other. Dynamic facts are updated in
+  // place by updateData() below.
+  const nodeSignature = (data.nodes || []).map((node) => node.id).join(',');
+  const linkSignature = (data.links || []).map((link) =>
+    `${link.source}>${link.target}:${link.kind || ''}:${link.relation || ''}`).join(',');
+  const signature = `${data.model?.checkpoint_hash || ''}|${nodeSignature}|${linkSignature}`;
+  // Waves are events, not decoration. One fires only when the backend reports
+  // something genuinely new: a fresh inference timestamp is a forward pass, a
+  // new checkpoint hash is a retrain. If neither changed since the last poll the
+  // threads just hang -- the honest picture of an idle model.
+  const inferenceAt = data.inference?.latest_at || null;
+  const checkpointHash = data.model?.checkpoint_hash || null;
+  if (inferenceAt && gnnGraphView.lastInferenceAt && inferenceAt !== gnnGraphView.lastInferenceAt) {
+    queueGnnWave('forward');
+  }
+  if (checkpointHash && gnnGraphView.lastCheckpointHash && checkpointHash !== gnnGraphView.lastCheckpointHash) {
+    queueGnnWave('backward');
+  }
+  gnnGraphView.lastInferenceAt = inferenceAt;
+  gnnGraphView.lastCheckpointHash = checkpointHash;
   const previous = new Map(gnnGraphView.nodes.map((node) => [node.id, node]));
   gnnGraphView.nodes = [];
   const groups = new Map();
@@ -195,10 +420,15 @@ function prepareGnnGraph(data) {
     const style = isOutput
       ? { ...(gnnClusterStyle[family] || gnnClusterStyle.specialist), ...(outputCenters[family] || outputCenters.specialist), radius: items.length > 16 ? 82 : 58 }
       : (gnnClusterStyle[family] || gnnClusterStyle.specialist);
+    // Phyllotaxis. sqrt(t) spaces nodes by equal AREA rather than equal radius,
+    // so a 40-node cluster fills its disc as evenly as a 4-node one instead of
+    // crowding the rim. The golden angle keeps successive nodes from lining up,
+    // which removes the concentric banding the old two-ring rule made.
+    const count = Math.max(1, items.length);
     items.forEach((node, index) => {
-      const angle = -Math.PI / 2 + index / Math.max(1, items.length) * Math.PI * 2 + seededGraphUnit(node.id) * .25;
-      const ringFactor = items.length > 20 && index % 2 ? .82 : .48;
-      const ring = style.radius * (ringFactor + .12 * seededGraphUnit(`${node.id}:radius`));
+      const t = (index + .5) / count;
+      const ring = style.radius * (.26 + .72 * Math.sqrt(t));
+      const angle = index * GNN_GOLDEN_ANGLE + seededGraphUnit(node.id) * .22;
       const old = previous.get(node.id);
       gnnGraphView.nodes.push({ ...node, x: old?.x ?? style.x + Math.cos(angle) * ring, y: old?.y ?? style.y + Math.sin(angle) * ring });
     });
@@ -239,8 +469,7 @@ async function loadGnnThree() {
 async function startGnn3d(data, signature) {
   if (!gnnVisualizationEnabled) return;
   if (gnn3dState?.signature === signature) {
-    gnn3dState.data = data;
-    gnn3dState.rebuildEdges();
+    gnn3dState.updateData(data);
     return;
   }
   const THREE = await loadGnnThree();
@@ -302,8 +531,74 @@ async function startGnn3d(data, signature) {
     detailed: new THREE.SphereGeometry(1, 18, 18),
     simple: new THREE.SphereGeometry(1, 10, 10),
   };
+  const contextLayer = new THREE.Group();
+  root.add(contextLayer);
+  const pipelineSignatureFor = (payload) => payload?.stage_counts
+    ? GNN_PIPELINE_STAGES.map((stage) => payload.stage_counts[stage.id] || 0).join(',')
+    : (payload?.unavailable || 'none');
+  const forceSignatureFor = (payload) => {
+    const f = payload || GNN_NEUTRAL_FORCES;
+    return `${f.regime || '-'}|${Number(f.gravity || 1).toFixed(2)}|${Number(f.tension || 1).toFixed(2)}`
+      + `|${Number(f.elasticity || 1).toFixed(2)}|${Number(f.damping || 1).toFixed(2)}`
+      + `|${Number(f.marketEnergy || 0).toFixed(2)}|${f.halted ? 'halt' : 'run'}`;
+  };
+  let contextSignature = '';
+  function disposeObject(object) {
+    object.traverse?.((child) => {
+      child.geometry?.dispose();
+      if (child.material) (Array.isArray(child.material) ? child.material : [child.material]).forEach((material) => {
+        material.map?.dispose(); material.dispose();
+      });
+    });
+  }
+  function rebuildContext(payload) {
+    while (contextLayer.children.length) disposeObject(contextLayer.children.pop());
+    contextLayer.add(buildGnnPipelineRibbon(THREE, payload.pipeline));
+    // The physics legend. Without it the ropes are just pretty: an operator has
+    // no way to distinguish a heavy market from an arbitrary visual setting.
+    const f = payload.forces || GNN_NEUTRAL_FORCES;
+    const text = f.observed
+      ? `중력 ${f.gravity.toFixed(2)} · 장력 ${f.tension.toFixed(2)} · 탄성 ${f.elasticity.toFixed(2)}`
+        + ` · 감쇠 ${f.damping.toFixed(2)} · 시장에너지 ${(f.marketEnergy * 100).toFixed(0)}%`
+        + ` (${f.regime || '-'}${f.indexTrend === null ? '' : `, 지수추세 ${(f.indexTrend * 100).toFixed(3)}%`})`
+        + `${f.changePoint === null ? '' : ` (국면전환 ${(f.changePoint * 100).toFixed(1)}%)`}`
+        + `${f.halted ? ' · HALT' : ''}`
+      : '시장 물리 · 측정 없음 (중립값으로 렌더링)';
+    const legend = createGnn3dLabel(THREE, text, f.observed ? 0xffd58a : 0x8aa1b7);
+    legend.scale.set(360, 34, 1);
+    legend.position.set(0, 300, 0);
+    legend.material.opacity = f.observed ? .78 : .45;
+    contextLayer.add(legend);
+    contextSignature = `${pipelineSignatureFor(payload.pipeline)}|${forceSignatureFor(f)}`;
+  }
+  rebuildContext(data);
+  const layout = gnn3dLayout(data.nodes || []);
+  // One translucent disc and caption per functional layer, so the pipeline
+  // stages are visible as places rather than something you infer from colour.
+  GNN3D_LAYERS.forEach((layer) => {
+    if (!(data.nodes || []).some((node) => gnn3dLayerFor(node) === layer)) return;
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(layer.radius * .99, layer.radius, 84),
+      new THREE.MeshBasicMaterial({ color: layer.color, transparent: true, opacity: .3, side: THREE.DoubleSide, depthWrite: false }),
+    );
+    const disc = new THREE.Mesh(
+      new THREE.CircleGeometry(layer.radius, 64),
+      new THREE.MeshBasicMaterial({ color: layer.color, transparent: true, opacity: .035, side: THREE.DoubleSide, depthWrite: false }),
+    );
+    [ring, disc].forEach((mesh) => {
+      mesh.rotation.y = Math.PI / 2;   // face down the pipeline axis
+      mesh.position.x = layer.x;
+      root.add(mesh);
+    });
+    const caption = createGnn3dLabel(THREE, layer.label, layer.color);
+    caption.scale.set(150, 33, 1);
+    caption.position.set(layer.x, layer.radius + 34, 0);
+    caption.material.opacity = .6;
+    root.add(caption);
+  });
+
   (data.nodes || []).forEach((node) => {
-    const position = gnn3dNodePosition(node);
+    const position = gnn3dNodePosition(node, layout);
     const color = new THREE.Color(gnn3dNodeColor(node));
     const radius = node.kind === 'strategy' ? 7.2 : node.kind === 'hidden' ? 4.1 : node.kind === 'feature' ? 2.8 : 2.4;
     const material = new THREE.MeshStandardMaterial({
@@ -336,6 +631,12 @@ async function startGnn3d(data, signature) {
   let glowLine = null;
   let glowColors = null;
   let activeEdgeIndexes = [];
+  // Rope state, rebuilt with the edge set. `edgePositions` is the shared buffer
+  // both the base and glow lines read, so animating a rope moves its glow too.
+  let edgeSprings = [];
+  let dynamicEdges = [];
+  let edgePositions = null;
+  let edgePositionAttribute = null;
   // Declared here because rebuildEdges() runs before the animation block and
   // marks activation stale; a `let` further down would still be in its TDZ.
   let activationDirty = true;
@@ -356,27 +657,77 @@ async function startGnn3d(data, signature) {
       const child = group.children.pop(); child.geometry?.dispose(); child.material?.dispose();
     }
   }
+  function edgeSignatureFor(payload) {
+    return `${gnnGraphView.filter}|${(payload.links || []).map((link) =>
+      `${link.source}>${link.target}:${Number(link.learned_strength || 0).toFixed(6)}`).join(',')}`;
+  }
+  let edgeSignature = '';
   function rebuildEdges() {
+    // Market state at the moment this edge set was built. Falls back to neutral
+    // (all 1.0, observed: false) rather than freezing when it cannot be read.
+    const forces = (gnn3dState?.data?.forces || data.forces) || GNN_NEUTRAL_FORCES;
     clearGroup(edgeLayer); clearGroup(glowLayer);
     glowLine = null; glowColors = null; activeEdgeIndexes = [];
     visibleEdges = filteredLinks().filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
     // Positions are written once into a typed array sized exactly for the edge
     // set, and the glow layer REUSES them: same buffer, second material.
-    const vertexCount = visibleEdges.length * 2;
+    // Each edge is a hanging rope, not a chord: SEGMENTS+1 sampled points joined
+    // as segment pairs. A straight line between two spheres carries no sense of
+    // connection strength; a rope's droop does, and droop is the inverse of the
+    // learned weight, so a strong edge is visibly taut.
+    const S = GNN3D_EDGE_SEGMENTS;
+    const vertexCount = visibleEdges.length * S * 2;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
     const reusable = new THREE.Color();
+    edgeSprings = new Array(visibleEdges.length);
+    dynamicEdges = [];
     visibleEdges.forEach((link, index) => {
       const source = nodeMap.get(link.source).position;
       const target = nodeMap.get(link.target).position;
-      const offset = index * 6;
-      positions[offset] = source.x; positions[offset + 1] = source.y; positions[offset + 2] = source.z;
-      positions[offset + 3] = target.x; positions[offset + 4] = target.y; positions[offset + 5] = target.z;
-      reusable.set(gnn3dEdgeColor(link)).multiplyScalar(.22 + Number(link.learned_strength || 0) * .78);
-      colors[offset] = reusable.r; colors[offset + 1] = reusable.g; colors[offset + 2] = reusable.b;
-      colors[offset + 3] = reusable.r; colors[offset + 4] = reusable.g; colors[offset + 5] = reusable.b;
+      const strength = Math.min(1, Math.max(0, Number(link.learned_strength || 0)));
+      const seed = seededGraphUnit(`${link.source}->${link.target}`);
+      const span = source.distanceTo(target);
+      // Inertia is EVIDENCE: a node trained on many filled rows resists being
+      // swung around, one trained on almost nothing whips about. Read off the
+      // heavier of the two ends, since a rope is only as sluggish as its anchor.
+      const rows = Math.max(
+        Number(nodeMap.get(link.source)?.userData?.training_filled_rows || 0),
+        Number(nodeMap.get(link.target)?.userData?.training_filled_rows || 0),
+      );
+      const inertia = 1 + Math.min(1.6, Math.log10(1 + rows) * .55);
+      const spring = {
+        source, target,
+        // Rest droop. TENSION is the learned weight (slack = 1 - strength) and
+        // GRAVITY is the tape: a falling index pulls every rope down harder.
+        baseSag: Math.min(150, span * (.06 + .20 * (1 - strength))) * (.7 + .6 * seed),
+        // ELASTICITY rises with the change-point probability -- a regime about
+        // to break rings faster -- and INERTIA slows it back down.
+        baseOmega: (.0011 + seed * .0016) / inertia,
+        phase: seed * Math.PI * 2,
+        // DAMPING shrinks the swing in a stable regime.
+        baseAmplitude: .10 + .22 * (1 - strength),
+      };
+      spring.sag = spring.baseSag * forces.gravity / Math.max(.35, forces.tension || 1);
+      spring.omega = spring.baseOmega * forces.elasticity;
+      spring.amplitude = spring.baseAmplitude * (.35 + (forces.marketEnergy || 0) * 1.9)
+        * (1.25 - (forces.damping || 1) * .55);
+      edgeSprings[index] = spring;
+      if (!link.kind || link.kind === 'topology') dynamicEdges.push(index);
+      writeGnn3dEdgeCurve(positions, index, spring, spring.sag);
+      reusable.set(gnn3dEdgeColor(link)).multiplyScalar(.22 + strength * .78);
+      for (let vertex = 0; vertex < S * 2; vertex += 1) {
+        const offset = (index * S * 2 + vertex) * 3;
+        colors[offset] = reusable.r; colors[offset + 1] = reusable.g; colors[offset + 2] = reusable.b;
+      }
     });
+    // The dense parameter layer is thousands of ropes; animating all of them
+    // costs far more than it shows. Topology ropes swing, the rest hang still.
+    if (dynamicEdges.length > GNN3D_MAX_DYNAMIC_EDGES) dynamicEdges.length = GNN3D_MAX_DYNAMIC_EDGES;
+    edgePositions = positions;
     const positionAttribute = new THREE.Float32BufferAttribute(positions, 3);
+    positionAttribute.setUsage(THREE.DynamicDrawUsage);
+    edgePositionAttribute = positionAttribute;
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', positionAttribute);
     geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
@@ -393,6 +744,19 @@ async function startGnn3d(data, signature) {
       blending: THREE.AdditiveBlending, depthWrite: false,
     }));
     glowLayer.add(glowLine);
+    edgeSignature = edgeSignatureFor(gnn3dState?.data || data);
+    activationDirty = true;
+  }
+
+  function updateData(nextData) {
+    gnn3dState.data = nextData;
+    (nextData.nodes || []).forEach((node) => {
+      const mesh = nodeMap.get(node.id);
+      if (mesh) Object.assign(mesh.userData, node);
+    });
+    const nextContextSignature = `${pipelineSignatureFor(nextData.pipeline)}|${forceSignatureFor(nextData.forces)}`;
+    if (nextContextSignature !== contextSignature) rebuildContext(nextData);
+    if (edgeSignatureFor(nextData) !== edgeSignature) rebuildEdges();
     activationDirty = true;
   }
 
@@ -454,7 +818,7 @@ async function startGnn3d(data, signature) {
     scene.traverse((object) => { object.geometry?.dispose(); if (object.material) (Array.isArray(object.material) ? object.material : [object.material]).forEach((material) => { material.map?.dispose(); material.dispose(); }); });
     renderer.dispose();
   }
-  gnn3dState = { signature, data, renderer, scene, root, stop: false, rebuildEdges, resetView, cleanup };
+  gnn3dState = { signature, data, renderer, scene, root, stop: false, rebuildEdges, updateData, resetView, cleanup };
   rebuildEdges(); resize(); window.addEventListener('resize', resize, { passive: true });
 
   /*
@@ -501,19 +865,35 @@ async function startGnn3d(data, signature) {
     activeEdgeIndexes.length = 0;
     if (glowColors) {
       glowColors.fill(0);
+      const forces = gnn3dState?.data?.forces || GNN_NEUTRAL_FORCES;
+      const ambientEnergy = Number(forces.marketEnergy || 0);
       visibleEdges.forEach((link, index) => {
         const sourceIntensity = nodeIntensity[nodeIndex.get(link.source)] || 0;
         const targetIntensity = nodeIntensity[nodeIndex.get(link.target)] || 0;
         // An edge is only as active as the quieter end: a live strategy node does
         // not make its whole upstream fan light up.
-        const edgeIntensity = Math.min(sourceIntensity, targetIntensity)
+        const inferenceIntensity = Math.min(sourceIntensity, targetIntensity)
           * (.35 + Number(link.learned_strength || 0) * .65);
+        // Market glow is deliberately restricted to topology edges. It shows
+        // measured tape energy without pretending that every learned parameter
+        // was traversed by the GNN inference.
+        const marketIntensity = (!link.kind || link.kind === 'topology')
+          ? ambientEnergy * (.16 + Number(link.learned_strength || 0) * .24)
+          : 0;
+        const edgeIntensity = Math.max(inferenceIntensity, marketIntensity);
         if (edgeIntensity <= 0.02) return;
         activeEdgeIndexes.push(index);
         glowColor.set(gnn3dEdgeColor(link)).multiplyScalar(Math.min(1, edgeIntensity));
-        const offset = index * 6;
-        glowColors[offset] = glowColor.r; glowColors[offset + 1] = glowColor.g; glowColors[offset + 2] = glowColor.b;
-        glowColors[offset + 3] = glowColor.r; glowColors[offset + 4] = glowColor.g; glowColors[offset + 5] = glowColor.b;
+        // An edge owns SEGMENTS*2 vertices now that it is a rope rather than a
+        // chord. Writing only the first pair would light one sixth of the rope
+        // AND scribble into the next edge's vertices.
+        const vertices = GNN3D_EDGE_SEGMENTS * 2;
+        for (let vertex = 0; vertex < vertices; vertex += 1) {
+          const offset = (index * vertices + vertex) * 3;
+          glowColors[offset] = glowColor.r;
+          glowColors[offset + 1] = glowColor.g;
+          glowColors[offset + 2] = glowColor.b;
+        }
       });
       glowLine.geometry.attributes.color.needsUpdate = true;
     }
@@ -538,8 +918,10 @@ async function startGnn3d(data, signature) {
       resolved = resolveActivation();
     }
     const { live, peak } = resolved;
+    const forces = gnn3dState?.data?.forces || GNN_NEUTRAL_FORCES;
+    const marketEnergy = Number(forces.marketEnergy || 0);
 
-    if (!dragging) rotationY += live ? .0016 : .00045;
+    if (!dragging) rotationY += .00035 + marketEnergy * .00125 + (live ? .00035 : 0);
     root.rotation.x += (rotationX - root.rotation.x) * .12;
     root.rotation.y += (rotationY - root.rotation.y) * .12;
     camera.position.z += (cameraTarget - camera.position.z) * .09;
@@ -551,29 +933,63 @@ async function startGnn3d(data, signature) {
       const mesh = meshes[index];
       const intensity = nodeIntensity[index];
       if (intensity <= 0) {
-        mesh.material.emissiveIntensity = mesh.userData.baseEmissive;
-        mesh.scale.setScalar(mesh.userData.baseRadius);
+        const ambient = marketEnergy * (.08 + pulse * .08);
+        mesh.material.emissiveIntensity = mesh.userData.baseEmissive + ambient;
+        mesh.scale.setScalar(mesh.userData.baseRadius * (1 + ambient * .025));
         continue;
       }
       mesh.material.emissiveIntensity = mesh.userData.baseEmissive + intensity * (1.1 + pulse * 1.3);
       mesh.scale.setScalar(mesh.userData.baseRadius * (1 + intensity * (.06 + pulse * .16)));
     }
-    if (glowLine) glowLine.material.opacity = activeEdgeIndexes.length ? .35 + pulse * .45 : 0;
+    // Ropes swing. Each is an independent oscillator about its own rest droop;
+    // an active edge is driven harder, so the graph visibly stirs where the
+    // inference actually went instead of everywhere at once.
+    if (edgePositions && dynamicEdges.length) {
+      const activeSet = activeEdgeIndexes.length ? new Set(activeEdgeIndexes) : null;
+      for (let index = 0; index < dynamicEdges.length; index += 1) {
+        const edgeIndex = dynamicEdges[index];
+        const spring = edgeSprings[edgeIndex];
+        if (!spring) continue;
+        // These coefficients are read every frame so a new tick bends and
+        // accelerates existing ropes smoothly; no edge buffers or scene are
+        // destroyed just because the market moved.
+        spring.sag = spring.baseSag * Number(forces.gravity || 1)
+          / Math.max(.35, Number(forces.tension || 1));
+        spring.omega = spring.baseOmega * Number(forces.elasticity || 1);
+        spring.amplitude = spring.baseAmplitude * (.35 + marketEnergy * 1.9)
+          * (1.25 - Number(forces.damping || 1) * .55);
+        const driven = activeSet && activeSet.has(edgeIndex) ? 2.1 : 1;
+        const swing = Math.sin(now * spring.omega + spring.phase) * spring.amplitude * driven;
+        writeGnn3dEdgeCurve(edgePositions, edgeIndex, spring, spring.sag * (1 + swing));
+      }
+      if (edgePositionAttribute) edgePositionAttribute.needsUpdate = true;
+    }
+    if (glowLine) glowLine.material.opacity = activeEdgeIndexes.length
+      ? Math.min(.9, .12 + marketEnergy * .48 + pulse * (.12 + marketEnergy * .18))
+      : 0;
     labels.forEach((label) => {
       const intensity = nodeIntensity[nodeIndex.get(label.userData.id)] || 0;
       label.material.opacity = .55 + Math.min(.45, intensity * .45);
     });
 
-    particles.material.opacity = activeEdgeIndexes.length ? .35 + pulse * .4 : 0;
+    particles.material.opacity = activeEdgeIndexes.length
+      ? Math.min(.78, marketEnergy * (.28 + pulse * .42) + peak * .3)
+      : 0;
     if (activeEdgeIndexes.length) {
       for (let index = 0; index < particleCount; index += 1) {
-        const link = visibleEdges[activeEdgeIndexes[index % activeEdgeIndexes.length]];
+        const edgeIndex = activeEdgeIndexes[index % activeEdgeIndexes.length];
+        const link = visibleEdges[edgeIndex];
+        const spring = edgeSprings[edgeIndex];
         const source = nodeMap.get(link.source).position;
         const target = nodeMap.get(link.target).position;
         const t = (now * .00038 + particleOffsets[index]) % 1;
         const offset = index * 3;
+        // Ride the rope, not the chord. A particle travelling straight between
+        // two endpoints visibly leaves a sagging edge, which makes the droop
+        // look like a drawing rather than the path the signal takes.
+        const sag = spring ? spring.sag * (1 + Math.sin(now * spring.omega + spring.phase) * spring.amplitude) : 0;
         particleArray[offset] = source.x + (target.x - source.x) * t;
-        particleArray[offset + 1] = source.y + (target.y - source.y) * t;
+        particleArray[offset + 1] = source.y + (target.y - source.y) * t - sag * 4 * t * (1 - t);
         particleArray[offset + 2] = source.z + (target.z - source.z) * t;
       }
       particleGeometry.attributes.position.needsUpdate = true;
@@ -592,19 +1008,167 @@ async function startGnn3d(data, signature) {
   requestAnimationFrame(animate);
 }
 
-function gnn3dNodePosition(node) {
-  const index = Number(node.feature_index ?? node.hidden_index ?? node.channel_index ?? node.checkpoint_index ?? 0);
-  const unitA = seededGraphUnit(`${node.id}:a`), unitB = seededGraphUnit(`${node.id}:b`);
-  const sphere = (center, radius) => {
-    const theta = unitA * Math.PI * 2, phi = Math.acos(2 * unitB - 1), spread = radius * (.45 + seededGraphUnit(`${node.id}:r`) * .55);
-    return { x: center[0] + Math.sin(phi) * Math.cos(theta) * spread, y: center[1] + Math.cos(phi) * spread, z: center[2] + Math.sin(phi) * Math.sin(theta) * spread };
-  };
-  if (node.kind === 'feature') return sphere([-315, 0, 0], 145);
-  if (node.kind === 'hidden') return sphere([-105, 0, 0], 90);
-  const familyCenters = { momentum: [85, 115, 35], breakout: [145, 15, -85], reversion: [70, -125, 30], relative_strength: [190, -100, 105], specialist: [140, 0, 100] };
-  if (node.kind === 'strategy') return sphere(familyCenters[node.cluster] || familyCenters.specialist, 48);
-  const outputCenters = { momentum: [345, 135, 20], breakout: [370, 35, -95], reversion: [345, -130, 15], relative_strength: [410, -90, 110], specialist: [380, 0, 100] };
-  return sphere(outputCenters[node.family] || outputCenters.specialist, 88 + (index % 3) * 6);
+// Functional layers, ordered the way the pipeline runs: collected features ->
+// the relation message the ontology's topology defines -> the strategy nodes it
+// scores -> the output heads the election reads. Depth (X) is therefore stage,
+// not decoration, and a node's plane says which part of the system it is in.
+const GNN3D_LAYERS = [
+  { id: 'ingest', kinds: ['feature'], x: -430, radius: 200, color: 0x8178ff, label: '① 수집 · 입력 특징' },
+  { id: 'message', kinds: ['hidden'], x: -150, radius: 120, color: 0xf6d778, label: '② R-GCN 메시지' },
+  { id: 'strategy', kinds: ['strategy'], x: 160, radius: 190, color: 0xff8fb0, label: '③ 전략 노드 · 온톨로지 위상' },
+  { id: 'head', kinds: ['output'], x: 460, radius: 215, color: 0x5eead4, label: '④ 출력 헤드 · 선택 근거' },
+];
+
+function gnn3dLayerFor(node) {
+  return GNN3D_LAYERS.find((layer) => layer.kinds.includes(node.kind)) || GNN3D_LAYERS[3];
+}
+
+/**
+ * Deterministic layered layout: id -> {x, y, z, layer}.
+ *
+ * Replaces a per-node random spherical scatter that made every layer a fuzzy
+ * ball; because each node also drew its own random radius, density fell off
+ * toward the middle -- the opposite of an evenly filled disc.
+ *
+ * Families keep their own sub-disc so a cluster still reads as a cluster, and
+ * nodes inside a family are placed by golden-angle phyllotaxis with a sqrt
+ * radius, which fills by equal AREA. Everything is seeded off the node id.
+ */
+function gnn3dLayout(nodes) {
+  const layout = new Map();
+  GNN3D_LAYERS.forEach((layer) => {
+    const members = (nodes || []).filter((node) => gnn3dLayerFor(node) === layer);
+    if (!members.length) return;
+    const families = new Map();
+    members.forEach((node) => {
+      const key = node.family || node.cluster || 'specialist';
+      if (!families.has(key)) families.set(key, []);
+      families.get(key).push(node);
+    });
+    const familyKeys = [...families.keys()].sort();
+    const single = familyKeys.length === 1;
+    familyKeys.forEach((key, familyIndex) => {
+      const items = families.get(key);
+      const familyAngle = (familyIndex / familyKeys.length) * Math.PI * 2;
+      const familyRing = single ? 0 : layer.radius * .52;
+      const cy = Math.cos(familyAngle) * familyRing;
+      const cz = Math.sin(familyAngle) * familyRing;
+      const discRadius = single ? layer.radius * .92 : layer.radius * .42;
+      const count = Math.max(1, items.length);
+      items.forEach((node, index) => {
+        const t = (index + .5) / count;
+        const ring = discRadius * (count === 1 ? 0 : .2 + .8 * Math.sqrt(t));
+        const angle = index * GNN_GOLDEN_ANGLE + seededGraphUnit(node.id) * .2;
+        layout.set(node.id, {
+          // A shallow deterministic depth ripple: a perfectly flat plane reads
+          // as a printed diagram and hides which node is in front on rotation.
+          x: layer.x + (seededGraphUnit(`${node.id}:x`) - .5) * 26,
+          y: cy + Math.cos(angle) * ring,
+          z: cz + Math.sin(angle) * ring,
+          layer,
+        });
+      });
+    });
+  });
+  return layout;
+}
+
+function gnn3dNodePosition(node, layout) {
+  const placed = layout?.get(node.id);
+  if (placed) return placed;
+  const layer = gnn3dLayerFor(node);
+  return { x: layer.x, y: 0, z: 0, layer };
+}
+
+/**
+ * The selection funnel as a ribbon under the model graph.
+ *
+ * One marker per pipeline stage, left to right in the order a candidate walks
+ * them, joined by hanging ropes. Marker size is how many candidates STOPPED at
+ * that stage, so it shows where the pipeline actually kills things -- which is
+ * what "why did nothing trade" reduces to.
+ *
+ * Unmeasured is drawn as a hollow outline, never as a zero-size marker: a stage
+ * nobody reached and a stage that rejected nothing have nothing in common.
+ */
+function buildGnnPipelineRibbon(THREE, pipeline) {
+  const group = new THREE.Group();
+  const y = -330;
+  const spanX = 1120;
+  const stageCounts = (pipeline && pipeline.stage_counts) || null;
+  const unavailable = !pipeline || pipeline.unavailable || !stageCounts;
+  // The SERVER's stage order wins when it sends one. SelectionStage is the
+  // authority on what the pipeline is; a hardcoded client copy would silently
+  // desync the moment a stage is added. The local table only supplies labels
+  // and colours, and an unknown stage is still drawn under its raw id.
+  const order = Array.isArray(pipeline?.stages) && pipeline.stages.length
+    ? pipeline.stages.map((id) => (
+      GNN_PIPELINE_STAGES.find((stage) => stage.id === id) || { id, label: id, color: 0x8aa1b7 }
+    ))
+    : GNN_PIPELINE_STAGES;
+  const maxCount = stageCounts
+    ? Math.max(1, ...order.map((stage) => Number(stageCounts[stage.id] || 0)))
+    : 1;
+
+  const banner = createGnn3dLabel(
+    THREE,
+    unavailable
+      ? `수집→판별 파이프라인 · 측정 없음 (${(pipeline && pipeline.unavailable) || 'NO_DATA'})`
+      : '수집 → 전략 판별 파이프라인 (단계별 탈락 수)',
+    unavailable ? 0x8aa1b7 : 0x5eead4,
+  );
+  banner.scale.set(320, 40, 1);
+  banner.position.set(0, y + 132, 0);
+  banner.material.opacity = .72;
+  group.add(banner);
+
+  const points = [];
+  order.forEach((stage, index) => {
+    const x = -spanX / 2 + (spanX * index) / Math.max(1, order.length - 1);
+    const count = stageCounts ? Number(stageCounts[stage.id] || 0) : null;
+    // sqrt keeps one huge stage from flattening every other marker to a dot.
+    const radius = count === null ? 13 : 9 + 26 * Math.sqrt(count / maxCount);
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(radius * .82, radius, 40),
+      new THREE.MeshBasicMaterial({
+        color: stage.color, transparent: true,
+        opacity: count === null ? .22 : .55, side: THREE.DoubleSide, depthWrite: false,
+      }),
+    );
+    ring.position.set(x, y, 0);
+    group.add(ring);
+    if (count) {
+      const disc = new THREE.Mesh(
+        new THREE.CircleGeometry(radius * .82, 32),
+        new THREE.MeshBasicMaterial({ color: stage.color, transparent: true, opacity: .16, side: THREE.DoubleSide, depthWrite: false }),
+      );
+      disc.position.set(x, y, 0);
+      group.add(disc);
+    }
+    const caption = createGnn3dLabel(
+      THREE,
+      count === null ? `${stage.label} · —` : `${stage.label} · ${count}`,
+      stage.color,
+    );
+    caption.scale.set(126, 27, 1);
+    // Alternate the caption height so 15 labels in a row stay readable.
+    caption.position.set(x, y - 44 - (index % 2) * 26, 0);
+    caption.material.opacity = count === null ? .4 : .72;
+    group.add(caption);
+    points.push({ x, y, z: 0 });
+  });
+
+  const S = GNN3D_EDGE_SEGMENTS;
+  const positions = new Float32Array(Math.max(1, points.length - 1) * S * 2 * 3);
+  for (let index = 0; index < points.length - 1; index += 1) {
+    writeGnn3dEdgeCurve(positions, index, { source: points[index], target: points[index + 1] }, 16);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  group.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+    color: 0x5eead4, transparent: true, opacity: unavailable ? .1 : .3, depthWrite: false,
+  })));
+  return group;
 }
 
 function gnn3dNodeColor(node) {
@@ -628,6 +1192,63 @@ function updateGnn3dTooltip(canvas, node, pointer) {
   tooltip.hidden = false; tooltip.style.left = `${Math.min(rect.width - 245, Math.max(8, (pointer.x + 1) * rect.width / 2 + 12))}px`;
   tooltip.style.top = `${Math.min(rect.height - 70, Math.max(8, (-pointer.y + 1) * rect.height / 2 + 12))}px`;
   tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${escapeHtml(String(node.layer || node.kind || '').toUpperCase())} · 3D compute node`;
+}
+
+function queueGnnWave(direction) {
+  gnnGraphView.waves.push({ direction, start: performance.now() });
+  // A tab left open for hours polls continuously; bound the list so waves that
+  // will never be drawn cannot accumulate.
+  if (gnnGraphView.waves.length > 6) {
+    gnnGraphView.waves.splice(0, gnnGraphView.waves.length - 6);
+  }
+}
+
+function gnnQuadPoint(a, c, b, t) {
+  const mt = 1 - t;
+  return {
+    x: mt * mt * a.x + 2 * mt * t * c.x + t * t * b.x,
+    y: mt * mt * a.y + 2 * mt * t * c.y + t * t * b.y,
+  };
+}
+
+function drawGnnThreadWave(ctx, a, c, b, waves, color, timestamp, gain) {
+  const STEPS = 22;
+  waves.forEach((wave) => {
+    const progress = (timestamp - wave.start) / GNN_WAVE_MS;
+    if (progress < 0 || progress > 1) return;
+    // Backpropagation runs the other way. This reversal is the ONLY visual
+    // difference between "data arrived" and "the model was corrected", and the
+    // two mean opposite things, so it must not be cosmetic.
+    const head = wave.direction === 'backward' ? 1 - progress : progress;
+    const envelope = Math.sin(Math.PI * progress);
+    const lo = Math.max(0, head - GNN_WAVE_WIDTH * 3);
+    const hi = Math.min(1, head + GNN_WAVE_WIDTH * 3);
+    if (hi - lo < 1e-3) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10;
+    ctx.globalAlpha = Math.min(1, .9 * envelope * gain);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let step = 0; step <= STEPS; step += 1) {
+      const t = lo + (hi - lo) * (step / STEPS);
+      const base = gnnQuadPoint(a, c, b, t);
+      const mt = 1 - t;
+      const tx = 2 * (mt * (c.x - a.x) + t * (b.x - c.x));
+      const ty = 2 * (mt * (c.y - a.y) + t * (b.y - c.y));
+      const length = Math.hypot(tx, ty) || 1;
+      const offset = t - head;
+      const packet = Math.exp(-(offset * offset) / (2 * GNN_WAVE_WIDTH * GNN_WAVE_WIDTH));
+      // The thread is plucked, not lit: displacement, not just brightness.
+      const amplitude = packet * Math.sin(offset * 42) * 7.5 * envelope * gain;
+      const x = base.x - (ty / length) * amplitude;
+      const y = base.y + (tx / length) * amplitude;
+      if (step === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  });
 }
 
 function drawGnnGraph(timestamp) {
@@ -667,6 +1288,11 @@ function drawGnnGraph(timestamp) {
   ctx.font = `${Math.max(8, 9 * scale)}px Consolas, monospace`;
   ctx.fillText('104 STRATEGY HEAD OUTPUTS', ox + 855 * scale, oy + 30 * scale);
 
+  // Expire finished waves once per frame rather than per link, so every thread
+  // in this frame is plucked by exactly the same set.
+  gnnGraphView.waves = gnnGraphView.waves.filter((wave) => timestamp - wave.start < GNN_WAVE_MS);
+  const waves = gnnGraphView.waves;
+
   const visibleLinks = (data.links || []).filter((link) => {
     if (gnnGraphView.filter === 'all') return true;
     if (gnnGraphView.filter === 'learned_parameter') return link.kind === 'learned_parameter';
@@ -678,21 +1304,40 @@ function drawGnnGraph(timestamp) {
     if (!source || !target) return;
     const a = point(source), b = point(target);
     const dx = b.x - a.x, dy = b.y - a.y, distance = Math.hypot(dx, dy) || 1;
-    const direction = seededGraphUnit(`${link.source}:${link.target}`) > .5 ? 1 : -1;
-    const bend = direction * Math.min(34, distance * .11);
-    const cx = (a.x + b.x) / 2 - dy / distance * bend;
-    const cy = (a.y + b.y) / 2 + dx / distance * bend;
+    const seed = seededGraphUnit(`${link.source}:${link.target}`);
+    const strength = Math.min(1, Math.max(0, Number(link.learned_strength || 0)));
+    // A thread hangs. Sag is always toward screen +y and grows with the span,
+    // which is the cue that reads as physical rope rather than a drawn arc. It
+    // also carries meaning: slack is the INVERSE of learned strength. (A
+    // quadratic dips half its control offset, so this is doubled to make the
+    // number mean the visible sag.)
+    const slack = 1 - strength;
+    const sag = Math.min(58, distance * (.05 + .17 * slack)) * (.75 + .5 * seed) * 2;
+    const sway = Math.sin(timestamp / 1600 + seed * 6.283) * sag * .1;
+    // Kept from the old bend, reduced: threads sharing both endpoints would
+    // otherwise be drawn exactly on top of one another.
+    const spread = (seed > .5 ? 1 : -1) * Math.min(16, distance * .05);
+    const cx = (a.x + b.x) / 2 - dy / distance * spread;
+    const cy = (a.y + b.y) / 2 + dx / distance * spread + sag + sway;
     const relationKey = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
     const relation = gnnRelationStyle[relationKey] || { color: '#8aa1b7' };
     const active = source.active || target.active;
     ctx.save();
     ctx.strokeStyle = relation.color;
     const parameter = link.kind === 'learned_parameter';
-    ctx.globalAlpha = (parameter ? .018 + Number(link.learned_strength || 0) * .075 : .055 + Number(link.learned_strength || 0) * .16) * (active ? 2.15 : 1);
-    ctx.lineWidth = parameter ? .25 + Number(link.learned_strength || 0) * .48 : .45 + Number(link.learned_strength || 0) * 1.05;
+    ctx.globalAlpha = (parameter ? .018 + strength * .075 : .055 + strength * .16) * (active ? 2.15 : 1);
+    ctx.lineWidth = parameter ? .25 + strength * .48 : .45 + strength * 1.05;
     if (active) { ctx.shadowBlur = 7; ctx.shadowColor = relation.color; }
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(cx, cy, b.x, b.y); ctx.stroke();
     ctx.restore();
+    // Waves ride the topology and whatever is currently firing. Plucking every
+    // parameter edge each frame would cost far more than it shows.
+    if (waves.length && (active || !parameter)) {
+      drawGnnThreadWave(
+        ctx, a, { x: cx, y: cy }, b, waves, relation.color, timestamp,
+        active ? 1 : .45 + strength * .35,
+      );
+    }
   });
 
   const pulse = .5 + Math.sin(timestamp / 240) * .5;
@@ -838,6 +1483,7 @@ const strategyLabels = {
   intraday_momentum: '장중 모멘텀',
   breakout_volume: '거래량 돌파',
   vwap_mean_reversion: 'VWAP 평균회귀',
+  bar_confirmed_vwap_recovery: '1분봉 확인 VWAP 회복',
   liquidity_shock_reversal: '유동성 충격 반전',
   event_momentum: '이벤트 모멘텀',
   cross_sectional_relative_strength: '횡단면 상대강도',
@@ -858,6 +1504,7 @@ async function fetchMarketView(symbol = null) {
     terminalState.data = data;
     terminalState.symbol = data.symbol;
     registerSecondBarArrival(data.market || {}, Boolean(symbolChanged));
+    refreshGnnMarketForces();
     renderTerminal(data);
   } catch (error) {
     document.getElementById('feed-state').textContent = `데이터 오류 · ${error.message}`;
@@ -903,6 +1550,7 @@ async function fetchMarketStream() {
     };
     terminalState.data.generated_at = stream.generated_at || terminalState.data.generated_at;
     registerSecondBarArrival(terminalState.data.market);
+    refreshGnnMarketForces();
     renderHeader(terminalState.data, terminalState.data.market);
     renderInstrument(
       terminalState.symbol,
@@ -1315,7 +1963,7 @@ function renderTerminal(data) {
   const algorithm = data.algorithm || null;
   renderHeader(data, market);
   renderLiveOwner(data);
-  renderCandidates(data.candidates || []);
+  renderCandidates(data.candidates || [], data.strategy_session || {});
   renderInstrument(data.symbol, market, selection, algorithm);
   renderTradingChart(market, algorithm);
   renderSecondAnalysis(market);
@@ -1408,15 +2056,48 @@ function registerSecondBarArrival(market, reset = false) {
   }
 }
 
-function renderCandidates(rows) {
+function renderCandidates(rows, session = {}) {
   const container = document.getElementById('candidate-list');
-  container.innerHTML = rows.length ? rows.map((row) => `
-    <button type="button" class="candidate ${row.selected ? 'selected' : ''}" data-symbol="${escapeHtml(row.symbol)}">
-      <strong>${escapeHtml(row.symbol)}</strong>
-      <em>${row.ontology_allowed ? 'ALLOWED' : 'WATCH'}</em>
-      <small>${escapeHtml(strategyLabels[row.strategy_id] || row.strategy_id || row.action || 'NO_TRADE')}</small>
+  const rankings = Array.isArray(session.bandit_evaluations)
+    ? session.bandit_evaluations.slice(0, 12)
+    : [];
+  const selectedSymbol = String(session.selected_symbol || '');
+  const selectedStrategy = String(session.selected_strategy || '');
+  const selectedDirection = String(session.selected_direction || 'LONG');
+  if (rankings.length) {
+    container.innerHTML = rankings.map((row, index) => {
+      const strategyId = String(row.arm || '').split(':', 1)[0];
+      const direction = String(row.direction || 'LONG');
+      const edge = Number(row.conservative_edge_bps);
+      const selected = row.symbol === selectedSymbol
+        && strategyId === selectedStrategy
+        && direction === selectedDirection;
+      const verdict = selected
+        ? 'SELECTED'
+        : row.shadow_only
+          ? 'SHADOW'
+          : row.admissible
+            ? 'ELIGIBLE'
+            : 'REJECTED';
+      return `
+    <button type="button" class="candidate joint-candidate ${selected ? 'selected' : ''} ${row.admissible ? 'admissible' : 'rejected'}" data-symbol="${escapeHtml(row.symbol)}">
+      <span class="candidate-rank">#${index + 1}</span>
+      <strong>${escapeHtml(row.symbol || '-')}</strong>
+      <em>${escapeHtml(verdict)}</em>
+      <small>${escapeHtml(strategyLabels[strategyId] || strategyId || 'NO_TRADE')}</small>
+      <span class="candidate-meta">${escapeHtml(direction)} · ${Number.isFinite(edge) ? `${edge >= 0 ? '+' : ''}${edge.toFixed(1)}bp` : '-'}</span>
     </button>
-  `).join('') : '<span class="tape-empty">온톨로지 후보를 기다리고 있습니다.</span>';
+  `;
+    }).join('');
+  } else {
+    container.innerHTML = rows.length ? rows.map((row) => `
+      <button type="button" class="candidate ${row.selected ? 'selected' : ''}" data-symbol="${escapeHtml(row.symbol)}">
+        <strong>${escapeHtml(row.symbol)}</strong>
+        <em>${row.ontology_allowed ? 'ALLOWED' : 'WATCH'}</em>
+        <small>${escapeHtml(strategyLabels[row.strategy_id] || row.strategy_id || row.action || 'NO_TRADE')}</small>
+      </button>
+    `).join('') : '<span class="tape-empty">공동 순위에 올릴 종목·전략 조합을 기다리고 있습니다.</span>';
+  }
   container.querySelectorAll('.candidate').forEach((button) => {
     button.addEventListener('click', () => fetchMarketView(button.dataset.symbol));
   });
@@ -1860,6 +2541,19 @@ function renderDecisionOntology(trace) {
   const algorithms = trace.algorithms || [];
   const ontology = trace.ontology_selection || {};
   const finalDecision = trace.final_decision || {};
+  // generated_at/fresh change on every poll but do not change the graph. Keep
+  // those badges live without destroying and recreating the SVG node tree.
+  const graphSignature = JSON.stringify({
+    filter: terminalState.ontologyFilter,
+    sources: sources.map(({ updated_at: _updatedAt, ...source }) => source),
+    indicators,
+    algorithms,
+    ontology,
+    finalDecision,
+  });
+  renderDecisionOntologyMeta(trace, ontology, finalDecision);
+  if (terminalState.ontologySignature === graphSignature) return;
+  terminalState.ontologySignature = graphSignature;
   const activeAlgorithm = algorithms.find((item) => item.ontology_selected);
   const activeIndicatorIds = new Set(
     (activeAlgorithm?.requirements || []).map((item) => item.indicator_id),
@@ -2052,14 +2746,6 @@ function renderDecisionOntology(trace) {
   edges.forEach((edge) => drawOntologyEdge(svg, positions, edge));
   [...svg.querySelectorAll('.graph-node')].forEach((node) => svg.appendChild(node));
 
-  const allowedName = strategyLabels[ontology.strategy_id] || ontology.strategy_id || '선택 없음';
-  document.getElementById('decision-ontology-summary').textContent =
-    `온톨로지: ${allowedName} ${ontology.allowed ? '허용' : '차단'} · 최종: ${finalDecision.action || 'NO_TRADE'} (${String(finalDecision.path || '-').toUpperCase()})`;
-  const liveBadge = document.getElementById('decision-ontology-live');
-  liveBadge.textContent = `${trace.fresh ? 'LIVE' : 'STALE'} · ${shortClock(trace.generated_at)}`;
-  liveBadge.className = trace.fresh ? 'status-chip' : 'status-chip blocked';
-  document.getElementById('ontology-provenance').textContent =
-    `${trace.provenance?.warning || ''} 결정 출처: ${trace.provenance?.decision || '-'} · 지표 출처: ${trace.provenance?.indicators || '-'}`;
   document.getElementById('algorithm-catalog').innerHTML = algorithms.map((item) => {
     const failed = (item.requirements || []).filter((rule) => rule.passed === false).length;
     const unknown = (item.requirements || []).filter((rule) => rule.passed === null).length;
@@ -2077,6 +2763,17 @@ function renderDecisionOntology(trace) {
       renderDecisionOntology(trace);
     };
   });
+}
+
+function renderDecisionOntologyMeta(trace, ontology, finalDecision) {
+  const allowedName = strategyLabels[ontology.strategy_id] || ontology.strategy_id || '선택 없음';
+  document.getElementById('decision-ontology-summary').textContent =
+    `온톨로지: ${allowedName} ${ontology.allowed ? '허용' : '차단'} · 최종: ${finalDecision.action || 'NO_TRADE'} (${String(finalDecision.path || '-').toUpperCase()})`;
+  const liveBadge = document.getElementById('decision-ontology-live');
+  liveBadge.textContent = `${trace.fresh ? 'LIVE' : 'STALE'} · ${shortClock(trace.generated_at)}`;
+  liveBadge.className = trace.fresh ? 'status-chip' : 'status-chip blocked';
+  document.getElementById('ontology-provenance').textContent =
+    `${trace.provenance?.warning || ''} 결정 출처: ${trace.provenance?.decision || '-'} · 지표 출처: ${trace.provenance?.indicators || '-'}`;
 }
 
 function createSvgElement(name, attributes = {}) {
@@ -2395,6 +3092,12 @@ function applyGnnVisualizationState() {
     fetchGnnState();
     return;
   }
+  // Invalidate responses that were started before the operator switched the
+  // visualization off. They must never repaint a newly enabled, newer scene.
+  terminalState.gnnGraphRequestId += 1;
+  terminalState.gnnStateRequestId += 1;
+  terminalState.gnnGraphBusy = false;
+  terminalState.gnnStateBusy = false;
   if (gnn3dState?.cleanup) gnn3dState.cleanup();
   gnn3dState = null;
   if (gnnGraphView.frame) cancelAnimationFrame(gnnGraphView.frame);

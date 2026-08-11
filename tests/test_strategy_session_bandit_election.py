@@ -132,6 +132,277 @@ def test_cold_arm_is_armed_as_a_flagged_exploration(tmp_path):
     assert "BANDIT_EXPLORATION_ARM_SELECTED" in state["bandit_reason_codes"]
 
 
+def test_joint_election_compares_every_symbol_strategy_pair(tmp_path):
+    """A strategy discarded by each symbol's old first pass may win globally."""
+    store = _store(tmp_path)
+    for index in range(30):
+        store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=-35.0,
+            recorded_at=NOW - timedelta(minutes=index),
+        )
+        store.record(
+            strategy_id="breakout_volume",
+            symbol="000660",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=75.0,
+            recorded_at=NOW - timedelta(minutes=index),
+        )
+
+    def row(symbol, breakout_edge):
+        return {
+            "as_of": NOW.isoformat(),
+            # The old per-symbol router selected momentum and discarded breakout.
+            "decisions": [
+                {
+                    "path": "cpu_gnn",
+                    "action": "ACTIVATE_STRATEGY",
+                    "strategy_id": "intraday_momentum",
+                    "reason_codes": ["GNN_REALTIME_TRUST_PASSED"],
+                    "expected_net_return_bps": 40.0,
+                    "expected_cost_bps": 28.0,
+                }
+            ],
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "intraday_momentum",
+                    "utility": 1.0,
+                    "probability_success": 0.7,
+                    "expected_net_return_bps": 40.0,
+                    "expected_cost_bps": 28.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_PASSED"],
+                },
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "breakout_volume",
+                    "utility": 0.8,
+                    "probability_success": 0.65,
+                    "expected_net_return_bps": breakout_edge,
+                    "expected_cost_bps": 28.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_PASSED"],
+                },
+            ],
+        }
+
+    evidence = {
+        "005930": row("005930", 10.0),
+        "000660": row("000660", 55.0),
+    }
+    macro = _macro(allowed_micro_strategies=("momentum", "breakout"))
+    manager = _manager(tmp_path, store=store, evidence=evidence)
+
+    state = manager.evaluate(
+        _account(),
+        ("005930", "000660"),
+        _bundle(macro=macro),
+        NOW,
+    )
+
+    evaluated_pairs = {
+        (item["symbol"], item["arm"])
+        for item in state["bandit_evaluations"]
+    }
+    assert evaluated_pairs == {
+        ("005930", "intraday_momentum"),
+        ("005930", "breakout_volume"),
+        ("000660", "intraday_momentum"),
+        ("000660", "breakout_volume"),
+    }
+    assert state["selected_symbol"] == "000660"
+    assert state["selected_strategy"] == "breakout_volume"
+    assert state["selection_source"] == "GNN_JOINT_SYMBOL_STRATEGY_ELECTION"
+
+
+def test_untrusted_full_vector_is_retained_as_non_executable_shadow_arm(tmp_path):
+    evidence = {
+        "005930": {
+            "as_of": NOW.isoformat(),
+            "mark_price": 70_000.0,
+            "decisions": [],
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "cross_sectional_relative_strength",
+                    "utility": 0.7,
+                    "probability_success": 0.61,
+                    "expected_net_return_bps": 25.0,
+                    "expected_cost_bps": 18.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                }
+            ],
+        }
+    }
+    manager = _manager(tmp_path, evidence=evidence)
+    manager._journal_shadow_proposals = lambda proposals, now, **_kwargs: None
+    bundle = SimpleNamespace(
+        ranked_trade_intents=(),
+        buy_candidates=(),
+        sell_reduce_candidates=(),
+        blocked_candidates=(),
+        micro_results=(),
+        macro_result=_macro(allowed_micro_strategies=("relative_strength",)),
+    )
+
+    state = manager.evaluate(_account(), ("005930",), bundle, NOW)
+
+    assert state["phase"] == "SCANNING"
+    assert state["selected_strategy"] is None
+    assert any(
+        row["arm"].startswith("cross_sectional_relative_strength")
+        for row in state["bandit_evaluations"]
+    )
+    assert "cross_sectional_relative_strength" in state["bandit_shadow_arms"]
+
+
+def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_path):
+    evidence = {
+        "005930": {
+            "as_of": NOW.isoformat(),
+            "mark_price": 70_000.0,
+            "decisions": [],
+            "technical_features": {
+                "symbol": "005930",
+                "price": 70_000.0,
+                "second_data_ready": 1.0,
+                "tick_count_5s": 9.0,
+                "return_5s": 0.0008,
+                "aggressor_imbalance_5s": 0.35,
+                "realized_volatility_10s": 0.0025,
+                "macd_histogram": 0.4,
+                "ema_fast": 70_010.0,
+                "ema_slow": 70_000.0,
+            },
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "intraday_momentum",
+                    "expected_net_return_bps": 25.0,
+                    "expected_cost_bps": 28.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                }
+            ],
+        }
+    }
+    manager = _manager(tmp_path, evidence=evidence)
+    manager._journal_shadow_proposals = lambda proposals, now, **_kwargs: None
+    bundle = SimpleNamespace(
+        ranked_trade_intents=(), buy_candidates=(), sell_reduce_candidates=(),
+        blocked_candidates=(), micro_results=(), macro_result=_macro(),
+    )
+
+    state = manager.evaluate(_account(), ("005930",), bundle, NOW)
+
+    assert state["phase"] == "ARMED"
+    assert state["selected_strategy"] == "intraday_momentum"
+    assert state["bandit_is_exploration"] is True
+    assert "BANDIT_EXPLORATION_ARM_SELECTED" in state["bandit_reason_codes"]
+
+
+def test_validation_vector_cannot_create_outcome_without_algorithm_trigger(tmp_path):
+    evidence = {
+        "005930": {
+            "as_of": NOW.isoformat(),
+            "mark_price": 70_000.0,
+            "decisions": [],
+            "technical_features": {
+                "symbol": "005930",
+                "price": 70_000.0,
+                "second_data_ready": 0.0,
+                "tick_count_5s": 0.0,
+            },
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": "intraday_momentum",
+                    "expected_net_return_bps": 100.0,
+                    "expected_cost_bps": 28.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                }
+            ],
+        }
+    }
+    manager = _manager(tmp_path, evidence=evidence)
+    manager._journal_shadow_proposals = lambda proposals, now, **_kwargs: None
+    bundle = SimpleNamespace(
+        ranked_trade_intents=(), buy_candidates=(), sell_reduce_candidates=(),
+        blocked_candidates=(), micro_results=(), macro_result=_macro(),
+    )
+
+    state = manager.evaluate(_account(), ("005930",), bundle, NOW)
+
+    assert state["bandit_evaluations"] == []
+    assert state["algorithm_evaluations"][0]["triggered"] is False
+    assert "TICK_WINDOW_NOT_READY" in state["algorithm_evaluations"][0]["reason_codes"]
+
+
+def test_bar_confirmed_vwap_recovery_is_a_regular_gnn_bandit_arm(tmp_path):
+    strategy_id = "bar_confirmed_vwap_recovery"
+    evidence = {
+        "005930": {
+            "as_of": NOW.isoformat(),
+            "mark_price": 98.50,
+            "decisions": [],
+            "technical_features": {
+                "symbol": "005930",
+                "price": 98.50,
+                "vwap": 100.0,
+                "vwap_distance_bps": -150.0,
+                "realized_volatility": 0.0015,
+                # Prove the strategy is independent of the sparse tick blockers.
+                "second_data_ready": 0.0,
+                "tick_count_5s": 0.0,
+                "ema_fast": 98.40,
+                "macd_histogram": 0.08,
+                "rsi": 35.0,
+                "momentum_persistence": 0.60,
+                "liquidity_score": 0.80,
+                "spread_bps": 10.0,
+            },
+            "validation_candidates": [
+                {
+                    "path": "cpu_gnn_validation",
+                    "action": "VALIDATE_ONLY",
+                    "strategy_id": strategy_id,
+                    "utility": 0.8,
+                    "probability_success": 0.65,
+                    "expected_net_return_bps": 20.0,
+                    "expected_cost_bps": 18.0,
+                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                }
+            ],
+        }
+    }
+    manager = _manager(tmp_path, evidence=evidence)
+    manager._journal_shadow_proposals = lambda proposals, now, **_kwargs: None
+    bundle = SimpleNamespace(
+        ranked_trade_intents=(), buy_candidates=(), sell_reduce_candidates=(),
+        blocked_candidates=(), micro_results=(),
+        macro_result=_macro(
+            allowed_micro_strategies=("vwap_reversion", "mean_reversion")
+        ),
+    )
+
+    state = manager.evaluate(_account(), ("005930",), bundle, NOW)
+
+    assert state["phase"] == "ARMED"
+    assert state["selected_strategy"] == strategy_id
+    assert state["selected_deployment_state"] == "LIVE_FULL"
+    assert any(
+        row["arm"].startswith(strategy_id) for row in state["bandit_evaluations"]
+    )
+    assert strategy_id not in state["bandit_shadow_arms"]
+
+
 def test_demonstrated_edge_is_armed_as_exploitation_not_exploration(tmp_path):
     store = _store(tmp_path)
     for index in range(40):

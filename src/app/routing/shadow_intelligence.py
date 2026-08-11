@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
-import math
 import os
 from pathlib import Path
 from typing import Any
@@ -11,6 +10,14 @@ from typing import Any
 import numpy as np
 
 from app.cost import TradingCostEngine
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_DIM,
+    STRATEGY_GRAPH_CONTEXT_FIELDS,
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+    as_context_mapping,
+    build_strategy_graph_context,
+    context_index,
+)
 from app.models.strategy_utility import (
     FixedShapeStrategyUtilityModel,
     StrategyUtilityModelConfig,
@@ -36,6 +43,7 @@ from app.routing.shadow_comparison import (
 )
 from app.routing.gnn_realtime_trust import GnnRealtimeTrust, GnnRealtimeTrustEvaluator
 from app.routing.strategy_router import StrategyRouter
+from app.strategy.catalog import is_short_strategy
 from app.strategy.catalog import STRATEGY_IDS
 from app.trading.contracts import StrategyUtilityEvidence
 
@@ -52,6 +60,15 @@ class SlowIntelligenceSnapshot:
     tradable: bool
     allowed_strategy_ids: tuple[str, ...]
     feature_schema_name: str = "unspecified"
+    #: Price the cost estimate is anchored on, in the instrument's own currency.
+    #:
+    #: Carried explicitly because the context vector no longer contains one. v4
+    #: put the raw close in slot 0 and the cost engine read
+    #: ``features[0] * 100_000`` — so removing the price level (an instrument
+    #: identity leak) would silently have turned the reference price into
+    #: whatever landed in slot 0. Zero means "not supplied", and the legacy
+    #: derivation below still applies for pre-v5 snapshots.
+    reference_price: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -71,72 +88,35 @@ def slow_snapshot_from_live_feature_frame(
     """Adapt the production live feature frame to the trained GNN contract.
 
     US daytime quotes can arrive through the REST fast-poll path rather than
-    the event-driven websocket runtime.  Building the 28-field graph context
-    here lets both ingestion paths feed the same ontology+GNN pipeline without
-    inventing a second feature schema.
+    the event-driven websocket runtime.  Building the graph context here lets
+    both ingestion paths feed the same ontology+GNN pipeline without inventing a
+    second feature schema.
+
+    The fields come from ``graph:``-prefixed entries the frame builder computes
+    from completed minute bars, and they are read STRICTLY. The previous version
+    assembled the vector here out of ``values.get(name, default)`` against the
+    live model's feature dictionary; when that schema dropped columns, five slots
+    silently became 0.0 at serving time while training kept supplying real values
+    for the same positions. A raise (caught per symbol by the caller and recorded
+    as a shadow error) is the correct response to an unbuildable context.
     """
     frame.validate()
-    values = frame.as_feature_dict()
     symbol = str(frame.symbol or "").strip().upper()
     as_of = frame.decision_time
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
     price = max(0.0, float(frame.mark_price or 0.0))
-    price_scale = 100_000.0
-    scaled_price = price / price_scale
-    distance_from_vwap = float(values.get("distance_from_vwap", 0.0) or 0.0)
-    vwap = (
-        price / (1.0 + distance_from_vwap)
-        if price > 0 and math.isfinite(distance_from_vwap)
-        and abs(1.0 + distance_from_vwap) > 1e-9
-        else price
+    values = (
+        frame.as_context_dict()
+        if hasattr(frame, "as_context_dict")
+        else frame.as_feature_dict()
     )
-    aggressor = max(
-        -1.0,
-        min(1.0, float(values.get("aggressor_imbalance_5s", 0.0) or 0.0)),
-    )
-    volume_5s = max(
-        0.0,
-        math.expm1(max(0.0, float(values.get("volume_5s_log", 0.0) or 0.0))),
-    )
-    signed_flow = aggressor * volume_5s
-
-    def finite(name: str, default: float = 0.0) -> float:
-        raw = float(values.get(name, default) or 0.0)
-        return raw if math.isfinite(raw) else default
-
-    rvgi_box = (
-        finite("rvgi_available"),
-        finite("rvgi"),
-        finite("rvgi_signal"),
-        finite("rvgi_diff"),
-        finite("rvgi_slope"),
-        finite("rvgi_bullish_cross"),
-        finite("box_available"),
-        finite("box_high") / max(price, 1e-12),
-        finite("box_low") / max(price, 1e-12),
-        finite("box_mid") / max(price, 1e-12),
-        finite("box_width_pct"),
-        finite("box_position"),
-        finite("breakout_distance_bps") / 100.0,
-        finite("box_previous_close") / max(price, 1e-12),
-        1.0 if finite("box_context_timestamp_epoch") > 0 else 0.0,
-    )
-    context = (
-        scaled_price,
-        scaled_price,
-        finite("spread_bps") / 100.0,
-        scaled_price,
-        finite("orderbook_imbalance"),
-        signed_flow / 10_000.0,
-        aggressor,
-        vwap / price_scale,
-        finite("realized_volatility_3m") * 100.0,
-        1.0,
-        0.0,
-        1.0,
-        *rvgi_box,
-        1.0 if symbol.isdigit() and len(symbol) == 6 else 0.0,
+    context = build_strategy_graph_context(
+        {
+            name: values[f"graph:{name}"]
+            for name in STRATEGY_GRAPH_CONTEXT_FIELDS
+            if f"graph:{name}" in values
+        }
     )
     tick_record_ids = tuple(
         getattr(frame.provenance, "tick_record_ids", ()) or ()
@@ -154,11 +134,15 @@ def slow_snapshot_from_live_feature_frame(
         feature_snapshot_id=(
             f"live:{frame.feature_schema_hash}:{record_id}"
         ),
-        features=tuple(float(item) for item in context),
+        features=context,
         data_fresh=True,
-        tradable=price > 0 and finite("spread_bps", -1.0) >= 0.0,
+        tradable=(
+            price > 0
+            and context[context_index("spread_bps_scaled")] >= 0.0
+        ),
         allowed_strategy_ids=allowed_strategy_ids,
-        feature_schema_name="realtime_strategy_graph_v4_market",
+        feature_schema_name=STRATEGY_GRAPH_CONTEXT_SCHEMA,
+        reference_price=price,
     )
 
 
@@ -174,7 +158,12 @@ class ShadowIntelligenceService:
         comparison_path: str | Path = "logs/refactor-shadow-comparison.jsonl",
     ) -> None:
         self.context_feature_dim = feature_dim
-        self.graph_mode = feature_dim in {27, 28}
+        # Graph mode is keyed off the width the strategy-graph contract declares,
+        # not a hardcoded set of historical widths. The v3/v4 widths (27/28) stay
+        # recognised so an operator running an old checkpoint still gets graph
+        # mode and the schema check below, rather than silently degrading to the
+        # single-node path.
+        self.graph_mode = feature_dim in {27, 28, STRATEGY_GRAPH_CONTEXT_DIM}
         config = StrategyUtilityModelConfig(
             batch_size=1,
             time_steps=1,
@@ -239,6 +228,7 @@ class ShadowIntelligenceService:
         #: a checkpoint that never reported its supervision cannot be read as
         #: having proved any.
         self.upside_supervised_strategy_ids: tuple[str, ...] = ()
+        self.upside_authorized_strategy_markets: dict[str, tuple[str, ...]] = {}
         self.live_authorized = False
         self.authorization_scope = "none"
         self.checkpoint_hash: str | None = None
@@ -270,6 +260,9 @@ class ShadowIntelligenceService:
                 )
                 self.upside_supervised_strategy_ids = (
                     _upside_supervised_strategy_ids(metadata)
+                )
+                self.upside_authorized_strategy_markets = (
+                    _upside_authorized_strategy_markets(metadata)
                 )
             except (OSError, ValueError, json.JSONDecodeError):
                 self.model_input_schema = "unknown"
@@ -419,6 +412,7 @@ class ShadowIntelligenceService:
             validation_candidates=_validation_candidates(
                 cpu_evidence,
                 checkpoint_hash=self.checkpoint_hash,
+                realtime_trust=realtime_trust,
             ),
         )
         return ShadowIntelligenceResult(
@@ -533,10 +527,7 @@ class ShadowIntelligenceService:
     def _evidence(self, snapshot, ontology, output, version):
         values = []
         is_krx = snapshot.symbol.isdigit() and len(snapshot.symbol) == 6
-        reference_price = max(
-            1e-9,
-            float(snapshot.features[0]) * 100_000.0,
-        )
+        reference_price = max(1e-9, _reference_price(snapshot))
         baseline_cost = self.cost_engine.estimate(
             symbol=snapshot.symbol,
             market="KR" if is_krx else "US",
@@ -578,7 +569,10 @@ class ShadowIntelligenceService:
             # ``StrategyUtilityEvidence`` requires net == gross - cost, and a gross
             # forecast carrying an unsupported upside is exactly as fabricated as
             # the net one. Both numbers have to shed it together.
-            if strategy_id not in self.upside_supervised_strategy_ids:
+            market_key = "KRX" if is_krx else "US"
+            if market_key not in self.upside_authorized_strategy_markets.get(
+                strategy_id, ()
+            ):
                 gross -= probability * mfe
             values.append(
                 StrategyUtilityEvidence(
@@ -649,9 +643,10 @@ COMPATIBILITY_UNAVAILABLE_REASONS: dict[str, str] = {
     # separates this from plain VWAP reversion; the snapshot carries only the
     # rolling VWAP proxy.
     "adaptive_anchored_vwap_reversion": "CONTEXT_UNAVAILABLE:VWAP_ANCHOR",
-    # The depth fields in this contract are neutral placeholders (the causal
-    # minute-bar proxy has no L2), so microprice OFI cannot be formed. Inventing
-    # one from bar range would be a fabricated relation, not a weak one.
+    # The contract carries a bar-level ``orderbook_imbalance`` but no bid/ask
+    # depth or microprice: the historical path has the persisted per-bar columns
+    # and nothing finer, so an OFI microprice cannot be formed on both sides.
+    # Inventing one at serving time only would be a fabricated relation.
     "ofi_microprice_exhaustion_reversal": "CONTEXT_UNAVAILABLE:L2_MICROPRICE",
 }
 
@@ -663,7 +658,7 @@ def compatibility_coverage() -> dict[str, str]:
     added to the catalogue with neither a relation nor a documented reason shows
     up here as ``UNDECLARED`` and fails the contract test.
     """
-    computed = set(_strategy_compatibility(tuple([0.0] * 28)))
+    computed = set(_strategy_compatibility(tuple([0.0] * STRATEGY_GRAPH_CONTEXT_DIM)))
     coverage: dict[str, str] = {}
     for strategy_id in STRATEGY_IDS:
         if strategy_id in COMPATIBILITY_UNAVAILABLE_REASONS:
@@ -684,6 +679,109 @@ def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
     contract cannot supply are an explicit 0.0 carrying a reason in
     ``COMPATIBILITY_UNAVAILABLE_REASONS``, so "unreachable" is a reported state
     rather than a missing dictionary key.
+
+    Reads by NAME on the aligned contract. The previous version indexed
+    ``features[4]`` and ``features[6]`` directly and went on scoring after those
+    slots came to hold different quantities in training and in serving.
+
+    A snapshot of any other width is a legacy schema (the 12-field quantile
+    vector, or v3/v4). Those keep their historical positional reading — changing
+    what a deployed checkpoint's priors mean is a separate decision from fixing
+    the contract — and are routed to :func:`_legacy_positional_compatibility`.
+    """
+    if len(features) != STRATEGY_GRAPH_CONTEXT_DIM:
+        return _legacy_positional_compatibility(features)
+    named = as_context_mapping(features)
+
+    def value(name: str, default: float = 0.0) -> float:
+        raw = float(named.get(name, default))
+        return raw if np.isfinite(raw) else default
+
+    def unit(raw: float) -> float:
+        return max(0.0, min(1.0, raw))
+
+    # Execution quality is UNKNOWN, not perfect, when the minute carried no book
+    # sample. Without the availability factor a missing spread reads as 0.0 and
+    # ``1 - 0/10`` scores it as the best possible book -- so the priors would peak
+    # exactly where the least is known, on roughly nine of ten KRX minutes. A
+    # relation whose facts are absent is worth 0.0 here, which is the same
+    # closed-world convention as COMPATIBILITY_UNAVAILABLE_REASONS.
+    microstructure_known = unit(value("microstructure_available"))
+    spread_quality = microstructure_known * unit(
+        1.0 - abs(value("spread_bps_scaled")) / 10.0
+    )
+    order_imbalance = value("orderbook_imbalance")
+    # v4 used ``aggressor_imbalance_5s`` here, which the historical path cannot
+    # produce; the scaled bar return is the directional-pressure measure both
+    # sides actually share.
+    momentum = value("return_1m_scaled")
+    trend_strength = unit(0.5 + 0.5 * momentum)
+    breakout_pressure = unit(
+        0.5
+        + 0.25 * order_imbalance
+        + 0.25 * momentum
+    )
+    vwap_deviation = abs(value("distance_from_vwap"))
+    mean_reversion_context = unit(vwap_deviation * 100.0) * spread_quality
+    volatility = unit(abs(value("realized_volatility_30m")) / 2.0)
+    rvgi_available = unit(value("rvgi_available"))
+    rvgi_cross = unit(value("rvgi_bullish_cross"))
+    box_available = unit(value("box_available"))
+    box_position = unit(value("box_position"))
+    rvgi_box = (
+        rvgi_available
+        * box_available
+        * unit(0.45 * rvgi_cross + 0.35 * box_position + 0.20 * breakout_pressure)
+    )
+    computed = {
+        "intraday_momentum": trend_strength * spread_quality,
+        "breakout_volume": breakout_pressure * spread_quality,
+        "vwap_mean_reversion": mean_reversion_context,
+        # Same first-class ontology/model mask as every other strategy. The
+        # relation expresses only the coarse thesis: a liquid VWAP displacement
+        # with positive completed-minute pressure. Exact EMA/MACD/RSI thresholds
+        # remain the owned algorithm's point-in-time responsibility.
+        "bar_confirmed_vwap_recovery": (
+            mean_reversion_context * unit(0.5 + 0.5 * momentum)
+        ),
+        "liquidity_shock_reversal": volatility * unit(abs(order_imbalance)),
+        "rvgi_box_breakout": rvgi_box,
+    }
+    # Closed world, stated explicitly: every remaining catalogue id is present
+    # with a 0.0 whose reason is declared, so a strategy is never silently
+    # excluded by absence from this dictionary.
+    for strategy_id in STRATEGY_IDS:
+        computed.setdefault(strategy_id, 0.0)
+    return computed
+
+
+def _reference_price(snapshot) -> float:
+    """Price the cost estimate is anchored on.
+
+    Prefers the explicit field. Pre-v5 snapshots do not carry one, and for those
+    the price really is in slot 0 as ``close / 100_000`` — so the old derivation
+    is kept for exactly those widths rather than applied blindly to a vector
+    whose slot 0 is now ``microstructure_available``.
+    """
+    explicit = float(getattr(snapshot, "reference_price", 0.0) or 0.0)
+    if explicit > 0 and np.isfinite(explicit):
+        return explicit
+    features = snapshot.features
+    if len(features) == STRATEGY_GRAPH_CONTEXT_DIM:
+        # v5 carries no price. A missing reference is reported as zero so the
+        # caller's clamp makes the cost estimate obviously wrong rather than
+        # quietly plausible.
+        return 0.0
+    return float(features[0]) * 100_000.0 if features else 0.0
+
+
+def _legacy_positional_compatibility(features: tuple[float, ...]) -> dict[str, float]:
+    """Priors for the pre-v5 schemas, read positionally as they always were.
+
+    Kept verbatim so an operator still running a v3/v4 or 12-field checkpoint
+    gets the behaviour that checkpoint was calibrated against. New work belongs
+    in the named path above; this exists only so the contract fix does not
+    quietly re-score deployed artifacts.
     """
 
     def value(index: int, default: float = 0.0) -> float:
@@ -700,35 +798,31 @@ def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
     order_imbalance = value(4)
     aggressor = value(6)
     trend_strength = unit(0.5 + 0.5 * aggressor)
-    breakout_pressure = unit(
-        0.5
-        + 0.25 * order_imbalance
-        + 0.25 * aggressor
-    )
+    breakout_pressure = unit(0.5 + 0.25 * order_imbalance + 0.25 * aggressor)
     price = value(0)
     vwap = value(7)
     vwap_deviation = abs(price - vwap) / max(abs(vwap), 1e-9)
     mean_reversion_context = unit(vwap_deviation * 100.0) * spread_quality
     volatility = unit(abs(value(8)) / 2.0)
-    rvgi_available = unit(value(12))
-    rvgi_cross = unit(value(17))
-    box_available = unit(value(18))
-    box_position = unit(value(23))
     rvgi_box = (
-        rvgi_available
-        * box_available
-        * unit(0.45 * rvgi_cross + 0.35 * box_position + 0.20 * breakout_pressure)
+        unit(value(12))
+        * unit(value(18))
+        * unit(0.45 * unit(value(17)) + 0.35 * unit(value(23)) + 0.20 * breakout_pressure)
     )
+    # Signed, unlike ``vwap_deviation``: a carry needs the close to be ABOVE the
+    # session VWAP, and an absolute displacement cannot tell that from below it.
+    vwap_premium = (price - vwap) / max(abs(vwap), 1e-9)
+    closing_drive = unit(0.5 + 0.5 * aggressor) * unit(0.5 + 50.0 * vwap_premium)
     computed = {
         "intraday_momentum": trend_strength * spread_quality,
         "breakout_volume": breakout_pressure * spread_quality,
         "vwap_mean_reversion": mean_reversion_context,
         "liquidity_shock_reversal": volatility * unit(abs(order_imbalance)),
         "rvgi_box_breakout": rvgi_box,
+        # Buyers in control at the close, on a name whose volatility can carry a
+        # gap worth the round trip, in a book tight enough to get out of.
+        "overnight_gap_carry": closing_drive * volatility * spread_quality,
     }
-    # Closed world, stated explicitly: every remaining catalogue id is present
-    # with a 0.0 whose reason is declared, so a strategy is never silently
-    # excluded by absence from this dictionary.
     for strategy_id in STRATEGY_IDS:
         computed.setdefault(strategy_id, 0.0)
     return computed
@@ -747,7 +841,9 @@ def _shadow_route(
         realtime_trust is not None
         and realtime_trust.passed
         and selected is not None
-        and selected.strategy_id in realtime_trust.trusted_strategy_ids
+        and _strategy_market_trusted(
+            realtime_trust, selected.strategy_id, selected.symbol
+        )
     )
     reason_codes = tuple(route.reason_codes)
     if realtime_trust is not None:
@@ -867,19 +963,106 @@ def _upside_supervised_strategy_ids(metadata: dict) -> tuple[str, ...]:
     return ()
 
 
+def _upside_authorized_strategy_markets(
+    metadata: dict,
+) -> dict[str, tuple[str, ...]]:
+    """Markets where a strategy's upside head is both taught and profitable.
+
+    A globally trained head may see KRX and US examples, but their round-trip
+    costs are radically different.  A strategy with positive KRX outcomes must
+    not lend that permission to US forecasts, and US losses must not suppress a
+    KRX edge.  Old checkpoints without per-market reports retain the previous
+    all-market behaviour for strategies that explicitly declared supervision.
+    """
+    by_market = metadata.get("label_outcomes_by_market")
+    if not isinstance(by_market, dict) or not by_market:
+        return {
+            strategy_id: ("KRX", "US")
+            for strategy_id in _upside_supervised_strategy_ids(metadata)
+        }
+    minimum_fills = max(
+        10,
+        int(os.getenv("GNN_MIN_MARKET_UPSIDE_FILLED_ROWS", "20")),
+    )
+    minimum_mean_net_bps = max(
+        0.0, float(os.getenv("GNN_MIN_MARKET_MEAN_NET_BPS", "5.0"))
+    )
+    authorized: dict[str, list[str]] = {}
+    for market, outcomes in by_market.items():
+        market_key = str(market or "").upper()
+        if market_key not in {"KRX", "US"} or not isinstance(outcomes, dict):
+            continue
+        for strategy_id, row in outcomes.items():
+            if not isinstance(row, dict):
+                continue
+            filled = int(row.get("filled") or 0)
+            mean_net = row.get("mean_net_return_bps_when_filled")
+            try:
+                positive_expectancy = float(mean_net) >= minimum_mean_net_bps
+            except (TypeError, ValueError):
+                positive_expectancy = False
+            if filled >= minimum_fills and positive_expectancy:
+                authorized.setdefault(str(strategy_id), []).append(market_key)
+    return {
+        strategy_id: tuple(sorted(set(markets)))
+        for strategy_id, markets in authorized.items()
+    }
+
+
+def _strategy_market_trusted(
+    trust: GnnRealtimeTrust,
+    strategy_id: str,
+    symbol: str,
+) -> bool:
+    market = "KRX" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US"
+    configured = trust.trusted_strategy_markets.get(str(strategy_id), ())
+    return market in configured
+
+
 def _validation_candidates(
     evidence: tuple[StrategyUtilityEvidence, ...],
     *,
     checkpoint_hash: str | None,
+    realtime_trust: GnnRealtimeTrust | None = None,
 ) -> tuple[ShadowDecision, ...]:
-    """Persist forecasts for forward validation without granting order rights."""
+    """Persist every admissible strategy forecast for validation and joint ranking.
+
+    These rows still grant no order permission.  Per-strategy trust is carried so
+    the downstream election can compare all valid ``(symbol, strategy)`` pairs
+    without mistaking a model-wide pass for strategy-specific authorization.
+    """
     return tuple(
         ShadowDecision(
             path="cpu_gnn_validation",
             action="VALIDATE_ONLY",
             strategy_id=item.strategy_id,
             utility=item.utility,
-            reason_codes=("ORDER_PERMISSION_NOT_GRANTED",),
+            reason_codes=tuple(
+                dict.fromkeys(
+                    (
+                        "ORDER_PERMISSION_NOT_GRANTED",
+                        (
+                            "GNN_REALTIME_TRUST_PASSED"
+                            if (
+                                realtime_trust is not None
+                                and realtime_trust.passed
+                                and _strategy_market_trusted(
+                                    realtime_trust,
+                                    item.strategy_id,
+                                    item.symbol,
+                                )
+                            )
+                            else (
+                                "GNN_REALTIME_MODEL_TRUST_PASSED"
+                                if realtime_trust is not None
+                                and realtime_trust.passed
+                                else "GNN_REALTIME_TRUST_NOT_READY"
+                            )
+                        ),
+                        *(realtime_trust.reason_codes if realtime_trust else ()),
+                    )
+                )
+            ),
             probability_success=item.probability_success,
             expected_net_return_bps=item.expected_net_return_bps,
             expected_cost_bps=item.expected_cost_bps,
@@ -890,6 +1073,9 @@ def _validation_candidates(
             ontology_compatibility=item.compatibility_score,
             validation_strategy_id=item.strategy_id,
             checkpoint_hash=checkpoint_hash,
+            position_direction=(
+                "SHORT" if is_short_strategy(item.strategy_id) else "LONG"
+            ),
         )
         for item in evidence
         if (

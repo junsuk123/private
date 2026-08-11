@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 from typing import Mapping
 from uuid import uuid4
 
@@ -51,6 +52,22 @@ class ExpertConfig:
     max_holding_seconds: int = 300
     max_entry_slippage_bps: float = 5.0
     entry_ttl_seconds: int = 5
+    minimum_trailing_net_bps: float = 5.0
+
+
+# Thresholds are strategy parameters, not a universal knob. Stored replay found
+# that VWAP reversion only cleared costs once both displacement and recovery were
+# moderately tightened; applying the same 0.85/0.75 pair to momentum or relative
+# strength made them materially worse, so their defaults remain unchanged.
+_STRATEGY_THRESHOLD_DEFAULTS: dict[str, tuple[float, float]] = {
+    "vwap_mean_reversion": (0.85, 0.75),
+}
+_STRATEGY_MIN_TRAILING_NET_BPS: dict[str, float] = {
+    "intraday_momentum": 15.0,
+    "cross_sectional_relative_strength": 30.0,
+    "residual_relative_strength": 15.0,
+    "opening_range_breakout": 15.0,
+}
 
 
 def _geometry_config(strategy_id: str, **overrides: float) -> ExpertConfig:
@@ -63,11 +80,33 @@ def _geometry_config(strategy_id: str, **overrides: float) -> ExpertConfig:
     :mod:`app.strategy.exit_geometry`.
     """
     geometry = exit_geometry(strategy_id)
+    normalized = strategy_id.upper().replace("-", "_")
+    default_entry, default_confirmation = _STRATEGY_THRESHOLD_DEFAULTS.get(
+        strategy_id, (0.8, 0.65)
+    )
+
+    def threshold(field: str, default: float) -> float:
+        raw = os.getenv(
+            f"STRATEGY_{normalized}_{field.upper()}",
+            os.getenv(f"STRATEGY_{field.upper()}", str(default)),
+        )
+        try:
+            return max(0.5, min(0.99, float(raw)))
+        except (TypeError, ValueError):
+            return default
+
     return ExpertConfig(
+        entry_quantile=threshold("entry_quantile", default_entry),
+        confirmation_quantile=threshold(
+            "confirmation_quantile", default_confirmation
+        ),
         stop_bps=geometry.stop_loss_bps,
         profit_bps=geometry.take_profit_bps,
         trailing_bps=geometry.trailing_bps,
         max_holding_seconds=geometry.max_holding_seconds,
+        minimum_trailing_net_bps=_STRATEGY_MIN_TRAILING_NET_BPS.get(
+            strategy_id, 5.0
+        ),
         **overrides,
     )
 
@@ -118,7 +157,10 @@ class StrategyExpert:
                 ),
                 "bps": self.config.profit_bps,
             },
-            trailing_policy={"bps": self.config.trailing_bps},
+            trailing_policy={
+                "bps": self.config.trailing_bps,
+                "minimum_net_bps": self.config.minimum_trailing_net_bps,
+            },
             max_holding_seconds=self.config.max_holding_seconds,
             invalidation_conditions=(
                 ("DATA_STALE", "ONTOLOGY_BLOCKED", "THESIS_INVALIDATED")
@@ -153,9 +195,10 @@ class IntradayMomentumExpert(StrategyExpert):
     default_config = _geometry_config("intraday_momentum")
 
     def admissible(self, c: ExpertContext) -> bool:
-        return c.q("return") >= self.config.entry_quantile and c.q(
-            "volume"
-        ) >= self.config.confirmation_quantile
+        return (
+            c.q("return") >= self.config.entry_quantile
+            and c.q("volume") >= self.config.confirmation_quantile
+        )
 
 
 class BreakoutVolumeExpert(StrategyExpert):
@@ -164,9 +207,16 @@ class BreakoutVolumeExpert(StrategyExpert):
     default_config = _geometry_config("breakout_volume")
 
     def admissible(self, c: ExpertContext) -> bool:
-        return c.q("breakout") >= self.config.entry_quantile and c.q(
-            "volume"
-        ) >= self.config.entry_quantile
+        return (
+            c.q("breakout") >= self.config.entry_quantile
+            and c.q("volume") >= self.config.entry_quantile
+            # A one-bar range break in a thin book was the dominant losing
+            # pattern in the stored replay.  Require both directional follow-
+            # through and an executable spread/depth state before calling it a
+            # breakout rather than a transient print.
+            and c.q("return") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
 
 
 class VwapMeanReversionExpert(StrategyExpert):
@@ -197,6 +247,11 @@ class LiquidityShockReversalExpert(StrategyExpert):
             c.q("liquidity_shock") >= self.config.entry_quantile
             and c.q("price_drop") >= self.config.entry_quantile
             and c.q("recovery") >= self.config.confirmation_quantile
+            # The thesis is specifically a *temporary* shock. Price bouncing
+            # while the spread is still blown out is adverse selection, not
+            # normalization, and its apparent gross edge did not survive costs.
+            and c.q("liquidity_recovery") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
         )
 
 
@@ -228,9 +283,11 @@ class GapContextExpert(StrategyExpert):
     default_config = _geometry_config("gap_context")
 
     def admissible(self, c: ExpertContext) -> bool:
-        return c.q("gap") >= self.config.entry_quantile and c.q(
-            "opening_confirmation"
-        ) >= self.config.confirmation_quantile
+        return (
+            c.q("gap") >= self.config.entry_quantile
+            and c.q("opening_confirmation") >= self.config.confirmation_quantile
+            and c.q("gap_entry_window") >= self.config.entry_quantile
+        )
 
 
 class RvgiBoxBreakoutExpert(StrategyExpert):
@@ -241,9 +298,13 @@ class RvgiBoxBreakoutExpert(StrategyExpert):
     def admissible(self, c: ExpertContext) -> bool:
         return (
             c.q("rvgi_diff") >= self.config.confirmation_quantile
+            # A persistent positive RVGI state produced more samples but a
+            # negative gross edge in replay. Keep the causal cross as the timing
+            # event and solve its fragility with execution quality, not looseness.
             and c.q("rvgi_cross") >= self.config.entry_quantile
             and c.q("box_position") >= self.config.entry_quantile
             and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
             and c.q("false_breakout_risk") <= 1 - self.config.confirmation_quantile
         )
 
@@ -433,6 +494,52 @@ class ResidualRelativeWeaknessExpert(ShortStrategyExpert):
         )
 
 
+class BarConfirmedVwapRecoveryExpert(StrategyExpert):
+    strategy_id = "bar_confirmed_vwap_recovery"
+    thesis = "deep VWAP displacement recovers after a completed one-minute trend turn"
+    default_config = _geometry_config("bar_confirmed_vwap_recovery")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # The robust-quantile expert is the model-side admissibility contract.
+        # Exact point-in-time thresholds (EMA reclaim, MACD turn, spread and
+        # liquidity) are independently enforced by the owned algorithm before
+        # any proposal can be armed.
+        return (
+            c.q("vwap_deviation") <= 1 - self.config.entry_quantile
+            and c.q("reversion") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class OvernightGapCarryExpert(StrategyExpert):
+    strategy_id = "overnight_gap_carry"
+    thesis = "a closing drive on a volatile day carries through the overnight gap"
+    default_config = _geometry_config("overnight_gap_carry")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # Every quantile here already exists, deliberately: a new thesis must not
+        # widen the model's input schema, or the checkpoint contract breaks for a
+        # reason that has nothing to do with the thesis.
+        return (
+            # The carry is a decision about the close, so only near it. The window
+            # is now the SYMBOL's exchange clock, which is what makes this thesis
+            # expressible on US names at all.
+            c.q("overnight_carry_window") >= self.config.entry_quantile
+            # Closing at the top of its own recent range: the observable form of
+            # "buyers ended the day in control". Deliberately NOT ``vwap_deviation``
+            # -- that key is the reversion family's displacement, where strength is
+            # a LOW value, and borrowing it would have this thesis read the sign
+            # backwards. The serving-side algorithm states the same condition as a
+            # positive VWAP premium plus buy-side aggressor flow.
+            and c.q("breakout") >= self.config.entry_quantile
+            # A quiet day's gap does not clear a 51bps round trip. This is the
+            # cost condition and the thesis condition at once.
+            and c.q("first_half_hour_volatility") >= self.config.confirmation_quantile
+            and c.q("momentum_persistence_long") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
 ALL_EXPERT_TYPES = (
     IntradayMomentumExpert,
     BreakoutVolumeExpert,
@@ -450,6 +557,8 @@ ALL_EXPERT_TYPES = (
     MarketIntradayMomentumShortExpert,
     OpeningRangeBreakdownExpert,
     ResidualRelativeWeaknessExpert,
+    BarConfirmedVwapRecoveryExpert,
+    OvernightGapCarryExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS

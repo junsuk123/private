@@ -226,6 +226,7 @@ class DemotionThresholds:
 @dataclass(frozen=True)
 class ShortStrategyPromotionConfig:
     enabled: bool = True
+    operator_live_full_override: bool = False
     evaluation_interval_seconds: int = 300
     default_initial_state: StrategyDeploymentState = StrategyDeploymentState.SHADOW
     strategies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
@@ -292,6 +293,9 @@ class ShortStrategyPromotionConfig:
         strategies = raw.get("strategies") if isinstance(raw.get("strategies"), Mapping) else {}
         return cls(
             enabled=bool(raw.get("enabled", True)),
+            operator_live_full_override=bool(
+                raw.get("operator_live_full_override", False)
+            ),
             evaluation_interval_seconds=max(
                 30, int(raw.get("evaluation_interval_seconds", 300) or 300)
             ),
@@ -1299,6 +1303,10 @@ class ShortStrategyPromotionController:
 
     def authorized_state(self, key: DirectionalStrategyKey) -> StrategyDeploymentState:
         """The committed state, defaulting to SHADOW when unknown."""
+        if self.config.operator_live_full_override and self.config.strategy_enabled(
+            key.strategy_id
+        ):
+            return StrategyDeploymentState.LIVE_FULL
         return self.state_store.state_of(key)
 
     def may_submit_orders(self, key: DirectionalStrategyKey) -> tuple[bool, tuple[str, ...]]:
@@ -1308,6 +1316,10 @@ class ShortStrategyPromotionController:
         but authoritative in the sense that a False here is final. Both layers must
         agree before an order exists.
         """
+        if self.config.operator_live_full_override and self.config.strategy_enabled(
+            key.strategy_id
+        ):
+            return True, ("OPERATOR_LIVE_FULL_OVERRIDE",)
         record = self.state_store.get(key)
         if record is None:
             return False, (ShortReasonCodes.SHADOW_ONLY,)

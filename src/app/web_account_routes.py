@@ -396,7 +396,7 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="log-panel" id="account-logs"></div>
     </details>
   </main>
-  <script src="/static/account_dashboard.js?v=20260730-expenses-gnn-trust"></script>
+  <script src="/static/account_dashboard.js?v=20260810-macro-context-split-v1"></script>
 </body>
 </html>
 """
@@ -409,7 +409,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260804-gnn-activation-1" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260810-market-physics-3" />
   <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
   <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
@@ -510,8 +510,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           </div>
           <div class="ops-progress"><i id="ops-gnn-progress"></i></div>
           <div class="ops-mini-metrics">
-            <span>양수 순효율 <b id="ops-gnn-positive">-</b></span>
-            <span>평균 순효율 <b id="ops-gnn-net">-</b></span>
+            <span title="양의 GNN 예측을 방향별 실제 목표·손절·트레일링·시간 종료 정책으로 재현한 승률">정책 재현 승률 <b id="ops-gnn-positive">-</b></span>
+            <span title="모든 전략의 단순 평균이 아닌, 양의 예측 표본을 실행 정책으로 재현한 전체 실현 순효율">정책 재현 순효율 <b id="ops-gnn-net">-</b></span>
             <span>불확실성 <b id="ops-gnn-uncertainty">-</b></span>
           </div>
           <div class="ops-strategy-list" id="ops-strategy-list"></div>
@@ -523,6 +523,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
             <div><span>세션 단계</span><strong id="ops-session-phase">-</strong></div>
             <div><span>선택 전략</span><strong id="ops-selected-strategy">-</strong></div>
             <div><span>매수 후보</span><strong id="ops-buy-candidates">-</strong></div>
+            <div><span>시장 컨텍스트</span><strong id="ops-market-context">-</strong></div>
             <div><span>주문 / 오류</span><strong id="ops-order-errors">-</strong></div>
           </div>
           <p class="ops-card-note" id="ops-engine-note">전략 세션 상태 확인 중</p>
@@ -731,7 +732,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
     <section class="selection-strip">
       <div class="section-label">
         <span>01</span>
-        <div><b>온톨로지 후보</b><small>전략 게이트가 평가한 종목</small></div>
+        <div><b>종목·전략 공동 순위</b><small>모든 유효 조합을 같은 기준으로 비교 · 최종 1개 또는 NO TRADE</small></div>
       </div>
       <div class="candidate-list" id="candidate-list"></div>
     </section>
@@ -882,8 +883,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260804-gnn-activation-1"></script>
-  <script src="/static/operations_overview.js?v=20260730-entry-trust-v2"></script>
+  <script src="/static/strategy_terminal.js?v=20260810-market-physics-3"></script>
+  <script src="/static/operations_overview.js?v=20260810-macro-context-split-v1"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->
   <script src="/static/terminal_layout.js?v=20260802-movable-frames-2"></script>

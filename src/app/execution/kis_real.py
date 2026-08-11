@@ -245,8 +245,12 @@ class KisEndpointSet:
     # buy-to-cover as a cash BUY, which *succeeds* and leaves the account long the
     # stock while still owing the borrow.
     def credit_tr_id_for_order(self, side: OrderSide) -> str:
-        """대주매도 신규 (SELL) / 융자·대주 상환 매수 (BUY)."""
-        return "TTTC0053U" if side == OrderSide.SELL else "TTTC0051U"
+        """KIS domestic credit order: SELL / BUY.
+
+        These ids are the ones published by KIS in ``order_credit.py``.  They are
+        side ids, not credit-product ids; ``CRDT_TYPE`` carries the latter.
+        """
+        return "TTTC0051U" if side == OrderSide.SELL else "TTTC0052U"
 
     @property
     def credit_order_revise_cancel_tr_id(self) -> str:
@@ -255,7 +259,7 @@ class KisEndpointSet:
     @property
     def credit_borrowable_tr_id(self) -> str:
         """대주 가능 종목 조회."""
-        return "CTSC0271R"
+        return "CTSC2702R"
 
     @property
     def credit_borrow_quantity_tr_id(self) -> str:
@@ -395,8 +399,8 @@ class KisDevelopersApiClient:
     # ------------------------------------------------------------------ #
     # 대주 (credit borrow / short) — read-only surface                     #
     # ------------------------------------------------------------------ #
-    # VERIFICATION STATUS, from read-only probes against the live account
-    # (2026-08-02). Three availability endpoints were tried and all three were wrong:
+    # VERIFICATION STATUS. Three guessed endpoints were disproven on 2026-08-02, but
+    # KIS subsequently published the actual company inventory endpoint:
     #
     #   TTTC8909R  /trading/inquire-credit-psamount  -> "조회종목은 신용종목이
     #       아닙니다.(융자신규매수)" — the TR exists but reports 융자 (margin BUY)
@@ -406,17 +410,118 @@ class KisDevelopersApiClient:
     #   CTRP6504R  /trading/inquire-credit-balance   -> HTTP 404 — the path does
     #       not exist.
     #
-    # Those three were GUESSED, and guessing a fourth would repeat the mistake. So the
-    # availability query is no longer a KIS method at all: it lives behind
-    # ``app.trading.borrow_source.BorrowDataSource``, whose default reports "no source
-    # configured" and whose working implementation reads an operator-maintained file.
-    # For a retail account the 대주 list is checked on the broker's web UI anyway, so a
-    # file is an honest source rather than a stopgap.
+    #   CTSC2702R  /quotations/lendable-by-company -> official [domestic-stock-195]
+    #       inventory query. It is company inventory, not a guarantee of the final
+    #       account-sized order; account/risk limits remain separate gates.
     #
-    # What IS verified is the balance read below. It reuses the SAME
+    # The balance read below reuses the SAME
     # ``inquire-balance`` / TTTC8434R call the portfolio path already makes every cycle
     # in production, so it introduces no new endpoint — 대주 lots are simply the rows
     # carrying credit metadata.
+    def get_lendable_by_company(self, symbol: str) -> dict[str, Any]:
+        """Return a normalized point-in-time KIS borrow inventory answer.
+
+        ``CTSC2702R`` has no account parameters: it reports inventory KIS can make
+        available, while the account and strategy gates independently reduce the
+        eventual order size.  A successful but schema-incompatible response raises
+        instead of fabricating a no-locate.
+        """
+        code = str(symbol or "").strip().upper()
+        if not code:
+            raise ValueError("borrow inventory lookup requires a symbol")
+        response = self._get(
+            "/uapi/domestic-stock/v1/quotations/lendable-by-company",
+            tr_id=self.endpoints.credit_borrowable_tr_id,
+            params={
+                "EXCG_DVSN_CD": "00",
+                "PDNO": code,
+                "THCO_STLN_PSBL_YN": "Y",
+                "INQR_DVSN_1": "0",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK100": "",
+            },
+        )
+        self._ensure_success(response, "KIS lendable inventory lookup failed")
+
+        rows: list[dict[str, Any]] = []
+        for key in ("output1", "output2", "output"):
+            value = response.get(key)
+            if isinstance(value, dict):
+                rows.append(dict(value))
+            elif isinstance(value, list):
+                rows.extend(dict(item) for item in value if isinstance(item, dict))
+
+        matching = [
+            row
+            for row in rows
+            if str(row.get("pdno") or row.get("PDNO") or "").strip().upper() == code
+        ]
+        # KIS splits this response: output1 may carry the overall Y/N flag while
+        # output2 carries the per-symbol quantity. Preserve metadata rows without a
+        # PDNO, plus the exact symbol row; never borrow fields from another symbol.
+        metadata = [
+            row for row in rows if not str(row.get("pdno") or row.get("PDNO") or "").strip()
+        ]
+        candidates = metadata + matching
+        if not candidates:
+            # An exact-symbol query with an empty successful result is an explicit
+            # absence from KIS's lendable inventory, not a transport failure.
+            return {
+                "symbol": code,
+                "available": False,
+                "available_quantity": 0,
+                "reject_reason": "KIS_BORROW_SYMBOL_NOT_LISTED",
+                "raw": response,
+            }
+
+        possible: str | None = None
+        quantity: int | None = None
+        selected: dict[str, Any] = {}
+        for row in candidates:
+            selected.update(row)
+            for key in ("psbl_yn", "thco_stln_psbl_yn", "PSBL_YN", "THCO_STLN_PSBL_YN"):
+                if key in row and str(row.get(key) or "").strip():
+                    possible = str(row.get(key)).strip().upper()
+                    break
+            # Requestable quantity is the executable inventory field identified by
+            # KIS. trad_psbl_qty2 is retained as a documented fallback.
+            for key in ("rqst_psbl_qty", "RQST_PSBL_QTY", "trad_psbl_qty2", "TRAD_PSBL_QTY2"):
+                if key in row and str(row.get(key) or "").strip() != "":
+                    quantity = _to_int(row.get(key))
+                    break
+
+        if not matching and quantity == 0 and str(response.get("msg_cd") or "") == "KIOK0560":
+            # Actual KIS contract for an exact symbol absent from inventory:
+            # rt_cd=0, msg_cd=KIOK0560 ("조회할 내용이 없습니다"), empty output1,
+            # and an output2 aggregate whose quantities are all zero.
+            return {
+                "symbol": code,
+                "available": False,
+                "available_quantity": 0,
+                "reject_reason": "KIS_BORROW_SYMBOL_NOT_LISTED",
+                "raw": selected,
+            }
+        if possible not in {"Y", "N"}:
+            raise KisApiError(
+                f"KIS lendable response for {code} omitted PSBL_YN",
+                response,
+            )
+        if possible == "Y" and quantity is None:
+            raise KisApiError(
+                f"KIS lendable response for {code} omitted requestable quantity",
+                response,
+            )
+        resolved_quantity = max(0, int(quantity or 0))
+        return {
+            "symbol": code,
+            "available": possible == "Y" and resolved_quantity > 0,
+            "available_quantity": resolved_quantity,
+            "reject_reason": (
+                "" if possible == "Y" and resolved_quantity > 0 else "KIS_BORROW_INVENTORY_EMPTY"
+            ),
+            "raw": selected,
+        }
+
     def get_borrow_balance(self) -> tuple[dict[str, Any], ...]:
         """Open 대주 positions as the BROKER sees them, one row per loan lot.
 
@@ -575,7 +680,9 @@ class KisDevelopersApiClient:
     def cancel_credit_order(self, order_id: str, order: FinalOrder) -> MockKisOrderReceipt:
         self._ensure_enabled()
         body = self._revise_cancel_body(order_id, order, revise=False)
-        body["CRDT_TYPE"] = order.credit_type or "05"
+        body["CRDT_TYPE"] = order.credit_type or (
+            "26" if order.side == OrderSide.BUY else "22"
+        )
         if order.loan_date:
             body["LOAN_DT"] = str(order.loan_date)
         response = self._post(
@@ -633,11 +740,13 @@ class KisDevelopersApiClient:
         )
 
     def _credit_order_body(self, order: FinalOrder, *, repay: bool) -> dict[str, str]:
+        # Official KIS codes: 22=유통대주신규(SELL), 26=유통대주상환(BUY).
+        default_credit_type = "26" if repay else "22"
         body = {
             "CANO": self.credentials.account_no,
             "ACNT_PRDT_CD": self.credentials.account_product_code,
             "PDNO": order.ticker,
-            "CRDT_TYPE": order.credit_type or "05",
+            "CRDT_TYPE": order.credit_type or default_credit_type,
             "ORD_DVSN": _domestic_order_division_code(),
             "ORD_QTY": str(int(order.quantity)),
             "ORD_UNPR": str(int(round(order.limit_price))),
@@ -2216,6 +2325,12 @@ def _require_credit_contract(
         raise ValueError(
             f"credit order for {order.ticker} declares {direction}/{effect} but carries "
             f"broker side {order.side}; expected {side}"
+        )
+    expected_credit_type = "22" if effect.upper() == "OPEN" else "26"
+    if str(order.credit_type or "").strip() != expected_credit_type:
+        raise ValueError(
+            f"credit order for {order.ticker} must use KIS CRDT_TYPE "
+            f"{expected_credit_type} for SHORT/{effect.upper()}"
         )
     if order.quantity <= 0:
         raise ValueError(f"credit order for {order.ticker} must have positive quantity")

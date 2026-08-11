@@ -134,7 +134,7 @@ function opsPrimaryBlocker(diag, reliability, gnn, trading) {
   };
 }
 
-function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
+function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro }) {
   const market = reliability?.components?.market_data || {};
   const healthy = market.healthy || {};
   const ws = diag?.flows?.market_data?.subscription?.overseas_websocket || {};
@@ -234,7 +234,8 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
   opsText(
     'ops-gnn-trusted',
     `진입 허용 ${trusted.length ? trusted.join(', ') : '없음'} · 보정 통과 ${calibrated.length}`
-      + ` · 상승 학습 ${upsideSupervised}/${strategyRows.length || '-'}`,
+      + ` · 상승 학습 ${upsideSupervised}/${strategyRows.length || '-'}`
+      + ` · ${gnn?.outcome_validation_method === 'directional_strategy_policy_replay_v2' ? '방향별 실행정책 재현' : '구형 예측 검증'}`,
   );
   const progress = Math.min(100, Math.max(0, Number(gnn?.sample_count || 0) / Math.max(1, Number(gnn?.minimum_samples || 1)) * 100));
   const progressNode = document.getElementById('ops-gnn-progress');
@@ -248,7 +249,7 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
   );
   opsText(
     'ops-gnn-positive',
-    positiveForecasts ? `${opsPercent(gnn?.positive_net_rate)} (${positiveForecasts}건)` : '양엣지 예보 없음',
+    positiveForecasts ? `${opsPercent(gnn?.positive_net_rate)} (${positiveForecasts}건)` : '양의 예측 표본 없음',
   );
   opsText(
     'ops-gnn-net',
@@ -256,9 +257,18 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
   );
   opsText('ops-gnn-uncertainty', opsNumber(gnn?.mean_uncertainty, 3));
   const strategyMetrics = gnn?.strategy_metrics || {};
+  const trainingMarketMetrics = gnn?.training_strategy_market_metrics || {};
+  const liveMarketMetrics = gnn?.strategy_market_metrics || {};
   const strategyList = document.getElementById('ops-strategy-list');
   if (strategyList) {
-    const rows = Object.entries(strategyMetrics);
+    // Include strategies present only in the latest training checkpoint. A
+    // strategy with no current live sample still needs to expose whether it is
+    // profitable, cost-bound, under-sampled, or structurally unreachable.
+    const strategyIds = Array.from(new Set([
+      ...Object.keys(trainingMarketMetrics),
+      ...Object.keys(strategyMetrics),
+    ])).sort();
+    const rows = strategyIds.map((strategyId) => [strategyId, strategyMetrics[strategyId] || {}]);
     strategyList.innerHTML = rows.length
       ? rows.map(([strategyId, metrics]) => {
           // Three outcomes that used to collapse into one "보정 통과" badge:
@@ -268,10 +278,25 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
           const unsupervised = metrics.upside_supervised === false;
           const rowsTaught = metrics.upside_training_rows;
           const minimum = Number(gnn?.minimum_upside_supervision_rows || 20);
+          const hasLiveMetrics = Object.prototype.hasOwnProperty.call(strategyMetrics, strategyId);
+          const trainedMarkets = trainingMarketMetrics[strategyId] || {};
           let cls = 'warn';
           let label = '보정 통과';
           let hint = '실시간 양엣지 표본 대기';
-          if (metrics.entry_authorized) {
+          if (!hasLiveMetrics) {
+            const trainedRows = Object.values(trainedMarkets);
+            const positiveMarket = trainedRows.find((row) => (
+              Number(row.filled || 0) >= minimum
+              && Number(row.mean_net_return_bps_when_filled || 0) > 0
+            ));
+            const unreachable = trainedRows.length && trainedRows.every((row) => (
+              String(row.performance_diagnosis || '').startsWith('STRUCTURALLY_UNREACHABLE')
+              || Number(row.filled || 0) === 0
+            ));
+            cls = positiveMarket ? 'warn' : 'block';
+            label = positiveMarket ? '학습 양엣지·운영 대기' : (unreachable ? '컨텍스트 부족' : '학습 순손실/표본 부족');
+            hint = '체크포인트 진단만 존재하며 실시간 전방 검증 표본은 아직 없음';
+          } else if (metrics.entry_authorized) {
             cls = 'pass';
             label = '진입 허용';
             hint = '양엣지 검증 통과';
@@ -286,12 +311,42 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
           } else if (metrics.execution_validation_stage === 'POSITIVE_EDGE_VALIDATION_FAILED') {
             cls = 'block';
             label = '양엣지 검증 실패';
-            hint = `양엣지 예보 ${Number(metrics.trade_sample_count || 0)}건의 실현 순효율 ${opsNumber(metrics.mean_realized_net_bps, 1)}bp`;
+            hint = `양의 예측 ${Number(metrics.trade_sample_count || 0)}건을 방향별 목표·손절·트레일링·시간 종료로 재현한 순효율 ${opsNumber(metrics.mean_realized_net_bps, 1)}bp`;
           }
+          const marketEvidence = liveMarketMetrics[strategyId] || trainingMarketMetrics[strategyId] || {};
+          const marketSummary = ['KRX', 'US']
+            .filter((market) => marketEvidence[market])
+            .map((market) => {
+              const row = marketEvidence[market];
+              const net = row.mean_realized_net_bps ?? row.mean_net_return_bps_when_filled;
+              const count = row.trade_sample_count ?? row.filled ?? 0;
+              return `${market} ${net == null ? '-' : `${opsNumber(net, 1)}bp`}(${Number(count)}건)`;
+            })
+            .join(' · ');
+          const marketDiagnostics = ['KRX', 'US']
+            .filter((market) => marketEvidence[market])
+            .map((market) => {
+              const row = marketEvidence[market];
+              const gross = row.mean_gross_return_bps_when_filled;
+              const cost = row.mean_cost_bps_when_filled;
+              const win = row.positive_net_rate_when_filled;
+              const factor = row.profit_factor_when_filled;
+              const exits = row.exit_reason_counts
+                ? Object.entries(row.exit_reason_counts).map(([reason, count]) => `${reason} ${count}`).join('/')
+                : '청산 표본 대기';
+              return `${market}: 총 ${gross == null ? '-' : `${opsNumber(gross, 1)}bp`} · 비용 ${cost == null ? '-' : `${opsNumber(cost, 1)}bp`} · 승률 ${win == null ? '-' : opsPercent(win)} · PF ${factor == null ? '-' : opsNumber(factor, 2)} · ${exits}`;
+            })
+            .join(' | ');
+          const authorizedMarkets = metrics.upside_authorized_markets
+            || gnn?.upside_authorized_strategy_markets?.[strategyId]
+            || [];
+          const marketHint = marketSummary
+            ? `${marketSummary} · ${marketDiagnostics} · 양의 헤드 허용 ${authorizedMarkets.length ? authorizedMarkets.join('/') : '없음'}`
+            : '시장별 실행 표본 대기';
           return `
-          <div class="ops-strategy-row" title="${hint}">
+          <div class="ops-strategy-row" title="${hint} · ${marketHint}">
             <b title="${strategyId}">${strategyId}</b>
-            <span>${Number(metrics.sample_count || 0)}표본</span>
+            <span>${marketSummary || `${Number(metrics.sample_count || 0)}표본`}</span>
             <span class="${cls}">${label}</span>
           </div>
         `;
@@ -308,6 +363,16 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode }) {
   opsText('ops-selected-strategy', session.selected_strategy || '미선택');
   const candidates = summary.buy_candidate_sample || [];
   opsText('ops-buy-candidates', candidates.length ? candidates.join(' · ') : '없음');
+  const contextSymbols = Array.isArray(macro?.market_context_symbols)
+    ? macro.market_context_symbols
+    : [];
+  const contextCount = Number(macro?.market_context_symbol_count || contextSymbols.length || 0);
+  opsText(
+    'ops-market-context',
+    contextCount
+      ? `${opsNumber(contextCount)}종목 · 후보와 독립`
+      : '앵커 데이터 대기',
+  );
   opsText('ops-order-errors', `${opsNumber(trading?.status?.submitted || 0)} / ${opsNumber(trading?.status?.errors || 0)}`);
   opsText(
     'ops-engine-note',
@@ -337,15 +402,16 @@ async function refreshOperationsOverview() {
   if (operationsOverviewState.busy) return;
   operationsOverviewState.busy = true;
   try {
-    const [diag, reliability, trading, gnn, mode, blockade] = await Promise.all([
+    const [diag, reliability, trading, gnn, mode, blockade, macro] = await Promise.all([
       opsFetchJson('/api/system-diagnostics'),
       opsFetchJson('/api/auto-reliability/status'),
       opsFetchJson('/api/realtime-trading/status'),
       opsFetchJson('/api/gnn/realtime-trust'),
       opsFetchJson('/api/operation-mode/status'),
       opsFetchJson('/api/realtime-trading/entry-blockade'),
+      opsFetchJson('/api/account/macro-micro'),
     ]);
-    renderOperationsOverview({ diag, reliability, trading, gnn, mode });
+    renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro });
     renderEntryBlockade(blockade);
   } catch (error) {
     renderOperationsOverviewError(error);
@@ -402,14 +468,37 @@ function blockadeTags(link) {
     if (Array.isArray(data.sample)) parts.push(...data.sample.slice(0, 6));
   }
   if (link.stage === 'micro_buy_intents' && Array.isArray(data.blocking_reason_codes)) {
-    parts.push(...data.blocking_reason_codes.slice(0, 6));
+    const counts = data.reason_code_counts || {};
+    parts.push(...data.blocking_reason_codes.slice(0, 6).map((code) => (
+      counts[code] > 1 ? `${code} ×${counts[code]}` : code
+    )));
+    if (Array.isArray(data.hard_blocked_symbols) && data.hard_blocked_symbols.length) {
+      parts.push(`하드 차단: ${data.hard_blocked_symbols.join(', ')}`);
+    }
   }
   if (link.stage === 'strategy_election') {
+    if (typeof data.algorithm_evaluated_count === 'number') {
+      parts.push(`실제 트리거 ${data.algorithm_triggered_count || 0}/${data.algorithm_evaluated_count}`);
+    }
+    if (data.best_pair) {
+      parts.push(`최상위 ${data.best_pair.symbol}×${data.best_pair.arm}`);
+    }
+    if (typeof data.change_point_probability === 'number') {
+      parts.push(`변화점 ${(data.change_point_probability * 100).toFixed(1)}%`);
+    }
     if (typeof data.conservative_edge_bps === 'number') {
-      parts.push(`보수적 엣지 ${data.conservative_edge_bps.toFixed(1)}bp`);
+      // Under GNN-direct election this field is the model's raw forward edge,
+      // not a pessimistic bound -- see the same guard in account_dashboard.js.
+      const direct = (data.reason_codes || []).includes('GNN_DIRECT_ELECTION');
+      const label = direct ? 'GNN 예측 엣지(무보정)' : '보수적 엣지';
+      parts.push(`${label} ${data.conservative_edge_bps.toFixed(1)}bp`);
     }
     if (data.is_exploration) parts.push('탐색 진입(최소 비중)');
     (data.reason_codes || []).slice(0, 4).forEach((code) => parts.push(code));
+    Object.entries(data.algorithm_rejection_counts || {})
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .forEach(([code, count]) => parts.push(`${code} ×${count}`));
     if (data.session_last_reason) parts.push(data.session_last_reason);
   }
   if (link.stage === 'position' && data.last_reason) parts.push(data.last_reason);

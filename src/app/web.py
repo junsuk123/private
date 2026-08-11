@@ -46,6 +46,7 @@ from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
 from app.config.refactor_flags import RefactorFeatureFlags
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
+from app.features.strategy_graph_context import STRATEGY_GRAPH_CONTEXT_DIM
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.models.model_staleness import ModelTrustLevel
 from app.models.live_training_pipeline import (
@@ -85,6 +86,7 @@ from app.schemas.domain import (
 )
 from app.storage import LocalResearchStore, ModelArtifactStore, StoredResearch
 from app.strategy import build_goal_execution_plan
+from app.web_access_guard import AccessGuardMiddleware
 from app.trading import run_mock_trading_cycle
 from app.trading.live_runtime_guard import env_bool as live_env_bool, evaluate_live_runtime_gates
 from app.trading.trading_policy import TradingPolicySnapshot
@@ -175,6 +177,12 @@ def _ensure_starlette_router_event_compatibility() -> None:
 _ensure_starlette_router_event_compatibility()
 
 app = FastAPI(title="개인 투자 분석 시스템")
+# Installed unconditionally but inert unless APP_ACCESS_TOKEN is set, so the
+# loopback-only default is byte-for-byte the behaviour it always had. It only
+# starts challenging requests once the operator opts into an external bind,
+# which is the same moment this app's 22 unauthenticated state-changing
+# endpoints stop being reachable only from this keyboard.
+app.add_middleware(AccessGuardMiddleware)
 _gnn_realtime_trust_evaluator = GnnRealtimeTrustEvaluator(
     stale_while_refresh=True,
 )
@@ -841,12 +849,26 @@ def _principal_config_with_live_account_basis(config: PrincipalProtectionConfig)
   basis = _last_live_account_basis()
   if basis is None:
     return config
-  principal_cash = max(0.0, float(basis.get("cash") or 0.0))
-  if principal_cash <= 0:
+  # ``initial_principal`` is a capital baseline, not the current KRW wallet.
+  # Rewriting it whenever cash is converted to USD made a currency conversion
+  # look like a principal withdrawal.  Existing installations need one explicit
+  # migration from that legacy KRW-only basis to reconciled total equity; after
+  # the marker is written the baseline stays immutable unless the operator edits
+  # the config endpoint.
+  state_payload = _load_principal_state_payload()
+  basis_version = str(state_payload.get("equity_basis_version") or "")
+  current_equity = max(
+      0.0,
+      float(basis.get("cash_equivalent_krw") or 0.0)
+      + float(basis.get("invested_value") or 0.0),
+  )
+  if current_equity <= 0:
     return config
-  if abs(float(config.initial_principal or 0.0) - principal_cash) < 1.0:
+  if basis_version == _PRINCIPAL_EQUITY_BASIS_VERSION and config.initial_principal > 0:
     return config
-  updated = _principal_config_from_payload({**asdict(config), "initial_principal": principal_cash})
+  updated = _principal_config_from_payload(
+      {**asdict(config), "initial_principal": current_equity}
+  )
   _save_principal_protection_config(updated)
   return updated
 
@@ -872,13 +894,26 @@ def _principal_config_from_payload(payload: dict[str, Any]) -> PrincipalProtecti
   return PrincipalProtectionConfig(**values)
 
 
-def _load_principal_high_watermark(current_equity: float, config: PrincipalProtectionConfig) -> float | None:
+_PRINCIPAL_EQUITY_BASIS_VERSION = "reconciled_live_equity_v2"
+
+
+def _load_principal_state_payload() -> dict[str, Any]:
   path = _principal_state_path()
   if not path.exists():
-    return max(float(current_equity), float(config.initial_principal or 0.0))
+    return {}
   try:
     payload = json.loads(path.read_text(encoding="utf-8"))
   except (OSError, json.JSONDecodeError):
+    return {}
+  return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _load_principal_high_watermark(current_equity: float, config: PrincipalProtectionConfig) -> float | None:
+  payload = _load_principal_state_payload()
+  # High-water marks produced by the legacy broker-total basis can contain an
+  # integrated-margin cash bucket twice.  Never carry that corrupted peak into
+  # the reconciled basis: migrate once to the observable account equity.
+  if payload.get("equity_basis_version") != _PRINCIPAL_EQUITY_BASIS_VERSION:
     return max(float(current_equity), float(config.initial_principal or 0.0))
   try:
     return max(float(payload.get("high_watermark", 0.0)), float(current_equity), float(config.initial_principal or 0.0))
@@ -889,7 +924,11 @@ def _load_principal_high_watermark(current_equity: float, config: PrincipalProte
 def _save_principal_high_watermark(high_watermark: float) -> None:
   path = _principal_state_path()
   path.parent.mkdir(parents=True, exist_ok=True)
-  payload = {"high_watermark": high_watermark, "updated_at": datetime.now(timezone.utc).isoformat()}
+  payload = {
+      "high_watermark": high_watermark,
+      "equity_basis_version": _PRINCIPAL_EQUITY_BASIS_VERSION,
+      "updated_at": datetime.now(timezone.utc).isoformat(),
+  }
   path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -989,6 +1028,33 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   invested = _number_or_zero(connection.get("invested_value") or 0)
   if cash_equivalent_krw <= 0:
     cash_equivalent_krw = cash + foreign_cash_krw
+  positions = list(connection.get("positions") or ())
+  broker_reported_equity = equity
+  component_equity = cash_equivalent_krw + invested
+  equity_reconciliation: dict[str, Any] = {
+      "broker_reported_equity_krw": broker_reported_equity,
+      "component_equity_krw": component_equity,
+      "corrected": False,
+  }
+  unexplained = equity - component_equity
+  duplicate_tolerance = max(100.0, foreign_cash_krw * 0.02)
+  duplicate_foreign_cash = (
+      foreign_cash_krw > 0
+      and abs(unexplained - foreign_cash_krw) <= duplicate_tolerance
+  )
+  # A flat account cannot have stock value outside cash components.  KIS's
+  # integrated overseas summary has been observed to add converted foreign cash
+  # once more to ``tot_asst_amt``. Correct only the diagnostic fingerprint of
+  # that exact duplication; do not erase genuine settlement receivables.
+  if not positions and invested <= 0.005 and duplicate_foreign_cash:
+    equity = component_equity
+    equity_reconciliation.update(
+        {
+            "corrected": True,
+            "reason": "FOREIGN_CASH_DUPLICATED_IN_BROKER_TOTAL",
+            "removed_duplicate_krw": unexplained,
+        }
+    )
   if equity > 0:
     # The broker integrated total is authoritative. Component fields may include
     # integrated-margin buying power, so explanatory cash buckets must not exceed
@@ -1025,7 +1091,8 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
       "cash_weight": max(0.0, min(1.0, cash / equity)) if equity > 0 else 0.0,
       "source": "kis_live_account",
       "account_suffix": connection.get("account_suffix") or "",
-      "positions": list(connection.get("positions") or ()),
+      "positions": positions,
+      "equity_reconciliation": equity_reconciliation,
       # Broker-authoritative realized (settled) P&L for today, sourced from the
       # KIS period trade-profit inquiry in the account probe. Passed through so
       # the dashboard's realized-P&L field updates as sells settle.
@@ -3074,7 +3141,10 @@ def _with_upside_supervision(payload: dict) -> dict:
   upside evidence and will not produce one until it is retrained". Two states that
   demand opposite responses — wait vs. retrain — must not render identically.
   """
-  from app.routing.shadow_intelligence import _upside_supervised_strategy_ids
+  from app.routing.shadow_intelligence import (
+      _upside_authorized_strategy_markets,
+      _upside_supervised_strategy_ids,
+  )
 
   try:
     metadata = json.loads(
@@ -3102,6 +3172,26 @@ def _with_upside_supervision(payload: dict) -> dict:
     return None
 
   payload["upside_supervised_strategy_ids"] = sorted(supervised)
+  authorized_markets = _upside_authorized_strategy_markets(metadata)
+  payload["upside_authorized_strategy_markets"] = {
+      strategy_id: list(markets)
+      for strategy_id, markets in sorted(authorized_markets.items())
+  }
+  # Preserve the checkpoint's cost-aware, market-specific replay in the API.
+  # This is diagnostic evidence only; live entry authority still comes solely
+  # from the forward evaluator above.
+  by_market = metadata.get("label_outcomes_by_market")
+  training_market_metrics: dict[str, dict[str, dict]] = {}
+  if isinstance(by_market, dict):
+    for market, market_rows in by_market.items():
+      if not isinstance(market_rows, dict):
+        continue
+      for strategy_id, row in market_rows.items():
+        if isinstance(row, dict):
+          training_market_metrics.setdefault(str(strategy_id), {})[
+              str(market)
+          ] = dict(row)
+  payload["training_strategy_market_metrics"] = training_market_metrics
   payload["minimum_upside_supervision_rows"] = minimum
   metrics = payload.get("strategy_metrics")
   if isinstance(metrics, dict):
@@ -3110,6 +3200,9 @@ def _with_upside_supervision(payload: dict) -> dict:
         continue
       row["upside_supervised"] = strategy_id in supervised
       row["upside_training_rows"] = upside_rows(strategy_id)
+      row["upside_authorized_markets"] = list(
+          authorized_markets.get(strategy_id, ())
+      )
   return payload
 
 
@@ -3420,6 +3513,12 @@ def realtime_runtime() -> JSONResponse:
             ),
             "live_training": training_status,
             "short_horizon_policy": risk_policy,
+            # What discovery refused on instrument-eligibility grounds, so a universe
+            # smaller than the ranking reads as a policy decision rather than a fault.
+            "universe_exclusions": dict(_universe_exclusion_report),
+            # Why the universe is ordered as it is: per-symbol headroom between the
+            # strategy's cost-sized target and what that chart typically moves.
+            "universe_feasibility": dict(_feasibility_report),
             "operation_mode": _operation_mode_state.get("active"),
             "resource_allocation": {
                 "model_inference": os.getenv("LLM_EVENT_DEVICE", "NPU"),
@@ -4625,7 +4724,15 @@ def _intelligence_lineage_payload(
       ((getattr(research_result, "diagnostics", None) or {}).get("reason") or "")
   )
   collection_active = research_reason != "live_trading_fast_path"
-  ready = bool(events and event_graph_links)
+  macro_event_count = int(macro_diag.get("macro_event_count") or 0)
+  # The live macro reasoner consumes typed macro evidence directly; an issuer
+  # graph link is not required for a ticker-less central-bank release. Either
+  # lineage path is sufficient, while both absent remains degraded.
+  # The live reasoner can consume the bounded event-store projection before the
+  # heavyweight analysis context has finished rebuilding. Do not report the GUI
+  # lineage as degraded merely because ``context.events`` is still empty when
+  # the active macro bundle already contains real event evidence.
+  ready = bool((events and event_graph_links) or macro_event_count)
   return {
       "ready": ready,
       "status": "ready" if ready else "degraded",
@@ -4640,7 +4747,7 @@ def _intelligence_lineage_payload(
       "labeled_events": labeled_events,
       "events_with_key_facts": fact_events,
       "ontology_event_links": event_graph_links,
-      "macro_event_evidence": int(macro_diag.get("macro_event_count") or 0),
+      "macro_event_evidence": macro_event_count,
       "micro_event_evidence": micro_event_evidence,
       "synthetic_event_count": sum(
           1
@@ -5601,6 +5708,9 @@ _HOLD_REASON_TEXT = {
     "LIQUIDITY_TOO_LOW": "유동성 부족으로 보류",
     "SLIPPAGE_RISK_HIGH": "슬리피지 위험 과다",
     "PROFITABILITY_GATE_REJECTED": "수익성 게이트 거부(순기대수익 부족)",
+    "PROFITABILITY_GATE_OVERRULED": "⚠ 수익성 게이트 거부를 무시하고 진행(GNN 직결)",
+    "GNN_DIRECT_ELECTION": "GNN 직결 채택(밴딧 하한·NO_TRADE 미적용)",
+    "GNN_ESTIMATE_UNAVAILABLE_RANKED_LAST": "⚠ GNN 예측 없이 채택(단독 후보)",
     "RECENT_LOSS_SYMBOL_COOLDOWN": "최근 손실 종목 재매수 대기",
     "NO_SELLABLE_QUANTITY": "매도 가능 수량 없음",
     "OPEN_ORDER_OR_SETTLEMENT_LOCK": "미체결 주문/결제 잠금",
@@ -6268,15 +6378,50 @@ def _entry_blockade_chain() -> list[dict]:
     item for item in diagnostics
     if str(item.get("selected_strategy") or "").lower() not in {"", "hold", "sell", "reduce_risk"}
   ]
+  # A generic micro HOLD is not a reason to prevent the joint (symbol,strategy)
+  # election.  It only says that the legacy composite has no immediate entry
+  # trigger.  The actual strategy algorithms must still receive the symbol so
+  # the global evaluator can compare every pair.  Only data/execution/risk vetoes
+  # remove a symbol before that comparison.
+  hard_micro_codes = {
+      "MARKET_DATA_NOT_LIVE_BUY_ELIGIBLE",
+      "MICRO_SIGNAL_UNAVAILABLE",
+      "MICRO_TECHNICAL_HISTORY_INSUFFICIENT",
+      "STALE_QUOTE",
+      "LOW_LIQUIDITY_TECHNICAL_BLOCK",
+      "HIGH_VOLATILITY_TECHNICAL_BLOCK",
+      "SPREAD_CONSUMES_TECHNICAL_ALPHA",
+      "EXECUTION_QUALITY_BLOCK",
+      "MICRO_NEGATIVE_EVENT_RISK",
+  }
+  hard_blocked: list[dict] = []
+  pair_eligible: list[dict] = []
+  reason_counts: dict[str, int] = {}
+  for item in diagnostics:
+    codes = {str(code) for code in tuple(item.get("reason_codes") or ())}
+    for code in codes:
+      reason_counts[code] = reason_counts.get(code, 0) + 1
+    blocked = bool(codes & hard_micro_codes)
+    blocked = blocked or str(item.get("execution_quality") or "").upper() == "BLOCKED"
+    (hard_blocked if blocked else pair_eligible).append(item)
+  micro_detail = "마이크로 결과 없음"
+  if diagnostics:
+    micro_detail = (
+      f"종목×전략 동시평가 가능 {len(pair_eligible)}/{len(diagnostics)}"
+      f" · 즉시 기술 매수신호 {len(actionable)}"
+    )
   _link(
     "micro_buy_intents",
-    bool(actionable),
-    f"실행 가능한 마이크로 전략 {len(actionable)}/{len(diagnostics)}"
-    if diagnostics
-    else "마이크로 결과 없음",
-    {"blocking_reason_codes": sorted(
-      {code for item in diagnostics for code in (item.get("reason_codes") or ())}
-    )[:12]},
+    bool(pair_eligible),
+    micro_detail,
+    {
+      "pair_eligible_count": len(pair_eligible),
+      "immediate_signal_count": len(actionable),
+      "hard_blocked_symbols": [str(item.get("symbol") or "") for item in hard_blocked],
+      "blocking_reason_codes": sorted(reason_counts)[:12],
+      "reason_code_counts": dict(sorted(reason_counts.items())),
+      "candidate_diagnostics": diagnostics[:8],
+    },
   )
 
   # The bandit fields exist only on the post-refactor build, so their absence
@@ -6290,14 +6435,63 @@ def _entry_blockade_chain() -> list[dict]:
   if bandit_present:
     arm = session.get("bandit_selected_arm")
     picked = bool(arm) and arm != "no_trade"
+    bandit_reasons = list(session.get("bandit_reason_codes") or ())
+    evaluations = list(session.get("bandit_evaluations") or ())
+    algorithm_evaluations = list(session.get("algorithm_evaluations") or ())
+    triggered_algorithms = [
+      row for row in algorithm_evaluations if bool(row.get("triggered"))
+    ]
+    algorithm_rejection_counts: dict[str, int] = {}
+    for row in algorithm_evaluations:
+      for code in tuple(row.get("reason_codes") or ()):
+        code = str(code)
+        algorithm_rejection_counts[code] = algorithm_rejection_counts.get(code, 0) + 1
+    ranked_evaluations = sorted(
+      evaluations,
+      key=lambda row: float(row.get("conservative_edge_bps") or -1e12),
+      reverse=True,
+    )
+    best_pair = ranked_evaluations[0] if ranked_evaluations else None
+    change_probability = session.get("change_point_probability")
+    if picked:
+      election_detail = f"선택된 종목×전략: {arm}"
+    elif "BANDIT_CHANGE_POINT_STAND_DOWN" in bandit_reasons:
+      probability_text = (
+        f" {float(change_probability) * 100:.1f}%"
+        if isinstance(change_probability, (int, float))
+        else ""
+      )
+      election_detail = f"시장 레짐 변화점{probability_text} 감지 → 신규 진입 일시 보류"
+    elif best_pair is not None:
+      election_detail = (
+        f"최상위 종목×전략 {best_pair.get('symbol')}×{best_pair.get('arm')} · "
+        f"보수적 순엣지 {float(best_pair.get('conservative_edge_bps') or 0.0):.1f}bp → NO_TRADE"
+      )
+    elif algorithm_evaluations:
+      election_detail = (
+        f"전략별 실제 진입 트리거 {len(triggered_algorithms)}/{len(algorithm_evaluations)}"
+        " · 미충족 조합은 성과 표본에서 제외"
+      )
+    else:
+      election_detail = "평가 가능한 종목×전략 arm 없음 → NO_TRADE"
     _link(
       "strategy_election",
       picked,
-      f"선택된 arm: {arm}" if picked else "보수적 하단값이 양수인 전략 없음 → NO_TRADE",
-      {"conservative_edge_bps": session.get("bandit_conservative_edge_bps"),
+      election_detail,
+      {"conservative_edge_bps": (
+          best_pair.get("conservative_edge_bps")
+          if best_pair is not None
+          else session.get("bandit_conservative_edge_bps")
+       ),
        "is_exploration": session.get("bandit_is_exploration"),
-       "reason_codes": session.get("bandit_reason_codes"),
-       "evaluations": session.get("bandit_evaluations")},
+       "reason_codes": bandit_reasons,
+       "change_point_probability": change_probability,
+       "best_pair": best_pair,
+       "algorithm_triggered_count": len(triggered_algorithms),
+       "algorithm_evaluated_count": len(algorithm_evaluations),
+       "algorithm_rejection_counts": dict(sorted(algorithm_rejection_counts.items())),
+       "algorithm_evaluations": algorithm_evaluations[:48],
+       "evaluations": evaluations},
     )
   else:
     _link(
@@ -8371,6 +8565,7 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
   observed_at = datetime.now(timezone.utc)
   frames: dict[str, Any] = {}
   try:
+    from dataclasses import asdict
     from app.features.live_feature_frame import LiveFeatureFrameBuilder
 
     builder = LiveFeatureFrameBuilder(RealtimeMarketDataStore())
@@ -8419,6 +8614,17 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
         features = technical_feature_set_from_live_frame(frame, symbol)
       except Exception:
         continue
+      # Point-in-time reference used only to score validation/shadow proposals.
+      # Without it an untrusted strategy vector cannot be journalled, which makes
+      # it impossible for that strategy to accumulate the forward evidence needed
+      # to become trusted later.
+      row["mark_price"] = float(getattr(frame, "mark_price", 0.0) or 0.0) or None
+      row["mark_price_as_of"] = observed_at.isoformat()
+      # The GNN vector proposes symbol×strategy pairs; the strategy's own
+      # mechanical algorithm remains the entry authority.  Carry the exact
+      # point-in-time features so StrategySessionManager can run that trigger
+      # before a pair is journalled, scored, or allowed to affect performance.
+      row["technical_features"] = asdict(features)
       box_width_ok = (
           features.box_width_pct is not None
           and 0.002 <= features.box_width_pct <= 0.04
@@ -8522,7 +8728,7 @@ def _refresh_live_candidate_shadow(
       except (TypeError, ValueError):
         interval = 5.0
       _live_shadow_service = ShadowIntelligenceService(
-          feature_dim=28,
+          feature_dim=STRATEGY_GRAPH_CONTEXT_DIM,
           minimum_interval_seconds=interval,
           enable_npu_comparison=flags.npu_inference,
       )
@@ -9161,11 +9367,32 @@ def _live_event_evidence(
     ttl_hours = max(1, int(os.getenv("LIVE_EVENT_EVIDENCE_TTL_HOURS", "24")))
   except (TypeError, ValueError):
     ttl_hours = 24
+  try:
+    macro_ttl_hours = max(
+        ttl_hours,
+        int(os.getenv("LIVE_MACRO_EVENT_EVIDENCE_TTL_HOURS", "96")),
+    )
+  except (TypeError, ValueError):
+    macro_ttl_hours = max(ttl_hours, 96)
   cutoff = decision_time - timedelta(hours=ttl_hours)
+  macro_cutoff = decision_time - timedelta(hours=macro_ttl_hours)
   symbol_set = {str(symbol or "").upper().strip() for symbol in symbols}
   with _live_lock:
     context = _live_state.get("context")
-  events = tuple(getattr(context, "events", ()) or ()) if context is not None else ()
+  context_events = tuple(getattr(context, "events", ()) or ()) if context is not None else ()
+  # Research collection runs more frequently than the heavyweight analysis
+  # context rebuild. Read the bounded event-only view so a fresh headline is
+  # eligible on the next macro cycle instead of waiting for the next full graph
+  # refresh (or disappearing entirely on the live fast path).
+  try:
+    stored_events = LocalResearchStore(root=_get_store_root()).load_recent_events(limit=500)
+  except Exception:  # noqa: BLE001 - context events remain a safe fallback.
+    stored_events = ()
+  events_by_id = {
+      str(getattr(event, "event_id", "") or id(event)): event
+      for event in (*context_events, *stored_events)
+  }
+  events = tuple(events_by_id.values())
   macro: list[dict[str, Any]] = []
   by_symbol: dict[str, list[dict[str, Any]]] = {symbol: [] for symbol in symbol_set}
 
@@ -9175,7 +9402,15 @@ def _live_event_evidence(
       continue
     if event_at.tzinfo is None:
       event_at = event_at.replace(tzinfo=timezone.utc)
-    if event_at < cutoff or event_at > decision_time + timedelta(minutes=5):
+    event_type = str(
+        getattr(getattr(event, "event_type", None), "value", getattr(event, "event_type", ""))
+    )
+    # Issuer news is short-lived, while central-bank and economic-release
+    # context legitimately spans weekends and holidays. Keep macro observations
+    # for four days, but retain the same three-hour severity half-life below so
+    # an old release remains visible without retaining blocking power.
+    effective_cutoff = macro_cutoff if event_type.upper() == "MACRO" else cutoff
+    if event_at < effective_cutoff or event_at > decision_time + timedelta(minutes=5):
       continue
     sentiment = str(
         getattr(getattr(event, "sentiment", None), "value", getattr(event, "sentiment", ""))
@@ -9186,9 +9421,6 @@ def _live_event_evidence(
     )
     age_seconds = max(0.0, (decision_time - event_at).total_seconds())
     classification_model = str(getattr(event, "classification_model", "") or "")
-    event_type = str(
-        getattr(getattr(event, "event_type", None), "value", getattr(event, "event_type", ""))
-    )
     # Severity is NOT the classifier's confidence. Confidence says how sure the
     # model is about the *label*; it says nothing about how material the event
     # is. Decay it with age and discount degraded classifier paths so a single
@@ -9284,16 +9516,53 @@ def _build_macro_micro_observer(decision_engine):
         for s, h in holdings_by_symbol.items()
         if getattr(h, "sector", None)
     }
-    universe = tuple(dict.fromkeys((*candidates, *holdings_by_symbol.keys())))
+    # Market-state measurement must not depend on whether a symbol already
+    # survived the BUY-candidate filters. Otherwise a quiet auction (or a
+    # temporary lack of orderable depth) empties ``candidates`` and the macro
+    # layer incorrectly concludes that the market itself is invisible even
+    # while breadth anchors are streaming normally.
+    selection_universe = tuple(dict.fromkeys(str(s) for s in candidates if str(s)))
+    context_lookback_minutes = max(
+        10,
+        _auto_reliability_int("REALTIME_MACRO_CONTEXT_LOOKBACK_MINUTES", 30, 10),
+    )
+    context_limit = max(
+        4,
+        _auto_reliability_int("REALTIME_MACRO_CONTEXT_SYMBOL_LIMIT", 32, 4),
+    )
+    context_symbols: list[str] = [
+        *selection_universe,
+        *holdings_by_symbol.keys(),
+        *_realtime_session_anchor_symbols(),
+    ]
+    store = getattr(decision_engine, "store", None)
+    if store is not None and hasattr(store, "active_symbols"):
+        try:
+            context_symbols.extend(
+                store.active_symbols(
+                    decision_time - timedelta(minutes=context_lookback_minutes),
+                    limit=context_limit * 2,
+                )
+            )
+        except Exception:  # noqa: BLE001 - anchors still provide safe context.
+            pass
+    context_universe = tuple(
+        dict.fromkeys(str(symbol) for symbol in context_symbols if str(symbol))
+    )[:context_limit]
     macro_event_evidence, symbol_event_evidence = _live_event_evidence(
-        universe,
+        context_universe,
         decision_time,
     )
     macro_kwargs: dict = {}
     try:
-        store = getattr(decision_engine, "store", None)
         if store is not None:
-            frame = macro_feature_frame_from_store(store, universe, now=decision_time, sector_of=sector_of)
+            frame = macro_feature_frame_from_store(
+                store,
+                context_universe,
+                now=decision_time,
+                lookback_minutes=context_lookback_minutes,
+                sector_of=sector_of,
+            )
             macro_kwargs = frame.as_macro_kwargs()
             # Per-symbol residuals feed the REAL within-sector ranking (which
             # replaced the arbiter's global BUY rank) and the residual
@@ -9333,9 +9602,15 @@ def _build_macro_micro_observer(decision_engine):
     macro_input = MacroReasoningInput(
         timestamp=decision_time,
         market=reasoning_market,
-        candidate_universe=tuple(candidates),
+        candidate_universe=selection_universe,
         macro_news_evidence=macro_event_evidence,
-        provenance={"sector_of": sector_of},
+        provenance={
+            "sector_of": sector_of,
+            "market_context_symbols": context_universe,
+            "market_context_symbol_count": len(context_universe),
+            "trading_candidate_input_count": len(selection_universe),
+            "market_context_source": "session_anchors_and_active_streams",
+        },
         **macro_kwargs,
     )
 
@@ -9873,7 +10148,26 @@ def _recent_affordable_us_watchlist(
     limit: int,
     database: Path | None = None,
 ) -> tuple[str, ...]:
-  """Rank affordable US symbols by sustained, execution-usable market activity."""
+  """Rank affordable US symbols by sustained, execution-usable market activity.
+
+  Density, not presence, decides the ranking. Every mechanical entry trigger in
+  ``app.technical.strategy_algorithms`` fires on the sub-second window, which
+  ``second_data_ready`` only opens when a symbol printed at least twice within
+  ten seconds in two distinct seconds. A name printing three times in six hours
+  clears the activity floor below and can never clear that one: measured on the
+  live store, AVS (0.35 prints/min) held a realtime subscription slot while every
+  one of its evaluations returned TICK_WINDOW_NOT_READY, and the same held for
+  AKAM, ACDC, AXTI, ARQT, ALRS and AMDD -- nine of fifteen candidate slots
+  producing nothing, because the old ordering led on observed price range, which
+  a sparse sample inflates rather than penalises.
+
+  A pure density filter would deadlock instead: an unsubscribed symbol has no
+  prints to be measured on, so the set that has data would be the only set that
+  can ever get data. The pool is therefore split -- most slots go to measured
+  density, and ``REALTIME_US_WATCHLIST_EXPLORATION_SLOTS`` are reserved for names
+  that have not earned one yet, rotating a different candidate in on each refresh
+  so it gets a real subscription window to prove itself on.
+  """
   cash_usd = _account_available_cash(account, "USD")
   if cash_usd <= 0 or limit <= 0:
     return ()
@@ -9887,6 +10181,20 @@ def _recent_affordable_us_watchlist(
       now
       - timedelta(hours=max(1.0, _env_float_web("REALTIME_US_WATCHLIST_LOOKBACK_HOURS", 6.0)))
   ).isoformat()
+  density_window_seconds = max(
+      60.0,
+      _env_float_web("REALTIME_US_WATCHLIST_DENSITY_WINDOW_SEC", 600.0),
+  )
+  density_since = (now - timedelta(seconds=density_window_seconds)).isoformat()
+  # 10 prints/minute is the point where the ten-second window the triggers read
+  # is populated often enough to be worth a slot: at that rate a Poisson tape
+  # carries two or more prints in a given ten seconds ~59% of the time, against
+  # ~3% at the 0.35/min the discarded names were running.
+  minimum_ticks_per_minute = max(
+      0.0,
+      _env_float_web("REALTIME_US_WATCHLIST_MIN_TICKS_PER_MINUTE", 10.0),
+  )
+  minimum_dense_ticks = minimum_ticks_per_minute * density_window_seconds / 60.0
   fresh_since = (
       now
       - timedelta(
@@ -9921,6 +10229,7 @@ def _recent_affordable_us_watchlist(
             select
               symbol,
               count(*) as tick_count,
+              sum(case when received_at >= ? then 1 else 0 end) as dense_tick_count,
               max(received_at) as latest_tick_at,
               sum(price * max(volume, 1)) as observed_notional,
               min(price) as minimum_price,
@@ -9950,6 +10259,7 @@ def _recent_affordable_us_watchlist(
             stats.symbol,
             prices.latest_price,
             stats.latest_tick_at,
+            stats.dense_tick_count,
             stats.tick_count,
             stats.observed_notional,
             coalesce(books.book_count, 0) as book_count,
@@ -9963,8 +10273,10 @@ def _recent_affordable_us_watchlist(
             and stats.latest_tick_at >= ?
             and prices.latest_price <= ?
           order by
+            case when stats.dense_tick_count >= ? then 0 else 1 end asc,
             case when coalesce(books.average_spread_bps, 1000000.0) <= 60.0
               then 0 else 1 end asc,
+            stats.dense_tick_count desc,
             observed_range_bps desc,
             book_count desc,
             average_spread_bps asc,
@@ -9976,18 +10288,21 @@ def _recent_affordable_us_watchlist(
           (
               since,
               sample_rows,
+              density_since,
               since,
               minimum_ticks,
               fresh_since,
               cash_usd,
+              minimum_dense_ticks,
               max(limit * 8, limit),
           ),
       ).fetchall()
   except sqlite3.Error:
     return ()
-  selected: list[str] = []
   excluded = _held_or_recent_buy_tickers(account)
-  for symbol, _price, _received_at, *_quality in rows:
+  dense: list[str] = []
+  sparse: list[str] = []
+  for symbol, _price, _received_at, dense_ticks, *_quality in rows:
     ticker = str(symbol or "").upper().strip()
     if (
         not ticker
@@ -9996,10 +10311,47 @@ def _recent_affordable_us_watchlist(
         or not _is_live_buy_candidate_symbol(ticker, "US")
     ):
       continue
-    selected.append(ticker)
+    bucket = dense if float(dense_ticks or 0.0) >= minimum_dense_ticks else sparse
+    bucket.append(ticker)
+  return _blend_watchlist_exploration(dense, sparse, limit=limit)
+
+
+def _blend_watchlist_exploration(
+    dense: list[str],
+    sparse: list[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+  """Fill most slots from measured print density, a few from untested names.
+
+  Reserving nothing locks the subscription set to whatever already has data;
+  reserving everything spends the whole budget on names that have never shown
+  they can feed a sub-second trigger. Each call advances the exploration cursor
+  so a different untested candidate takes the reserved slot on the next refresh,
+  and either bucket backfills the other when it runs short, so the pool is never
+  smaller than it was before.
+  """
+  # Never more than a third of the budget: on a two-slot pool a reserved slot is
+  # half the live feed spent on an unproven name, which is the opposite trade.
+  reserve = max(0, _auto_reliability_int("REALTIME_US_WATCHLIST_EXPLORATION_SLOTS", 1, 0))
+  reserve = min(reserve, max(0, int(limit) // 3))
+  exploit = dense[: max(0, limit - reserve)]
+  explored: list[str] = []
+  if reserve and sparse:
+    with _live_lock:
+      cursor = int(_us_learning_watchlist_cache.get("exploration_index") or 0)
+      _us_learning_watchlist_cache["exploration_index"] = (cursor + reserve) % len(sparse)
+    explored = [
+        sparse[(cursor + offset) % len(sparse)]
+        for offset in range(min(reserve, len(sparse)))
+    ]
+  selected = list(dict.fromkeys((*exploit, *explored)))
+  for symbol in (*dense, *sparse):
     if len(selected) >= limit:
       break
-  return tuple(selected)
+    if symbol not in selected:
+      selected.append(symbol)
+  return tuple(selected[:limit])
 
 
 def _liquid_affordable_us_seed_symbols(
@@ -10098,17 +10450,48 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
     previous_index = int(
         _us_learning_watchlist_cache.get("rotation_index") or 0
     )
-  if pool_multiplier > 1 and len(pool_result) > safe_limit:
+  # Pin the head of the pool; rotate only what is left.
+  #
+  # ``_recent_affordable_us_watchlist`` returns measured print density first, so
+  # the head is the set that can actually feed a sub-second trigger. Rotating the
+  # WHOLE pool walked those names out of the subscription every few minutes: with
+  # a pool multiplier of 3, two of every three refreshes subscribed a slice made
+  # entirely of sparse tail names, which is the PFE/DYN/LFST/KLIC/MLTX/DSGX state
+  # seen live. It also destroys the session-boxed strategies, which need the SAME
+  # symbol observed at the opening range and again in the last continuous half
+  # hour — six and a half hours apart for a US name.
+  anchors = max(
+      1,
+      min(
+          safe_limit,
+          _auto_reliability_int(
+              "REALTIME_US_SESSION_ANCHOR_SLOTS",
+              max(1, safe_limit // 2),
+              1,
+          ),
+      ),
+  )
+  pinned = pool_result[:anchors]
+  rotating = pool_result[anchors:]
+  rotating_slots = max(0, safe_limit - len(pinned))
+  if pool_multiplier > 1 and rotating and rotating_slots:
     rotation_index = (
         previous_index + 1
         if previous_pool == pool_result and cached_symbols
         else 0
     )
-    start = (rotation_index * safe_limit) % len(pool_result)
+    start = (rotation_index * rotating_slots) % len(rotating)
     result = tuple(
-        pool_result[(start + offset) % len(pool_result)]
-        for offset in range(min(safe_limit, len(pool_result)))
-    )
+        dict.fromkeys(
+            (
+                *pinned,
+                *(
+                    rotating[(start + offset) % len(rotating)]
+                    for offset in range(min(rotating_slots, len(rotating)))
+                ),
+            )
+        )
+    )[:safe_limit]
   else:
     rotation_index = 0
     result = pool_result[:safe_limit]
@@ -10854,6 +11237,98 @@ def _env_float_web(name: str, default: float) -> float:
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
 _domestic_ranking_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
 
+#: Last set of discovery candidates refused on instrument-eligibility grounds.
+#: Kept so "the universe is smaller than the ranking" has a visible answer instead of
+#: looking like a broken feed. Read by /api/realtime/runtime.
+_universe_exclusion_report: dict[str, Any] = {}
+
+
+#: Feasibility is a scan of stored minute bars for every ranking candidate, so it is
+#: cached on the same cadence as the ranking rather than recomputed per call.
+_feasibility_cache: dict[str, Any] = {"at": 0.0, "key": (), "value": {}}
+
+#: Last feasibility ranking, exposed on /api/realtime/runtime so a reordered universe
+#: is explainable rather than mysterious.
+_feasibility_report: dict[str, Any] = {}
+
+
+def _cached_symbol_feasibility(symbols: tuple[str, ...]) -> dict[str, Any]:
+  """Headroom per symbol, recomputed at most once per ranking TTL."""
+  if not symbols:
+    return {}
+  ttl = float(os.getenv("FEASIBILITY_TTL_SEC", os.getenv("REALTIME_KRX_RANKING_TTL_SEC", "300")))
+  key = tuple(sorted(symbols))
+  now = time.monotonic()
+  with _live_lock:
+    if (
+        _feasibility_cache.get("key") == key
+        and now - float(_feasibility_cache.get("at") or 0.0) < ttl
+    ):
+      return dict(_feasibility_cache.get("value") or {})
+  try:
+    from app.trading.strategy_feasibility import measure
+
+    value = measure(symbols)
+  except Exception:  # noqa: BLE001 - discovery must survive a measurement failure.
+    value = {}
+  with _live_lock:
+    _feasibility_cache["at"] = now
+    _feasibility_cache["key"] = key
+    _feasibility_cache["value"] = value
+  return value
+
+
+def _record_feasibility_ranking(feasibility: dict[str, Any], decision: Any) -> None:
+  """Publish why the universe is ordered the way it is."""
+  try:
+    from app.trading.strategy_feasibility import summary
+
+    chosen = tuple(decision.symbols or ())
+    report = dict(summary(feasibility))
+    report["at"] = datetime.now(timezone.utc).isoformat()
+    report["universe"] = [
+      feasibility[symbol].as_dict()
+      for symbol in chosen
+      if symbol in feasibility
+    ]
+    report["note"] = (
+      "회전율 랭킹을 '전략 목표가 이 차트에서 도달 가능한가'로 재정렬함. "
+      "UNKNOWN(분봉 부족)은 중립 점수라 신규 종목도 진입 가능. "
+      "FEASIBILITY_MINIMUM_HORIZON_WINDOWS 로 조정."
+    )
+    with _live_lock:
+      _feasibility_report.clear()
+      _feasibility_report.update(report)
+  except Exception:  # noqa: BLE001 - reporting must never break discovery.
+    pass
+
+
+def _record_universe_exclusions(decision: Any, ranking_result: dict[str, Any]) -> None:
+  """Publish what discovery refused, and why, alongside the resulting universe."""
+  try:
+    rows = list(decision.excluded or ())
+    counts: dict[str, int] = {}
+    for row in rows:
+      category = str(row.get("category") or "UNKNOWN")
+      counts[category] = counts.get(category, 0) + 1
+    report = {
+      "at": datetime.now(timezone.utc).isoformat(),
+      "counts": counts,
+      "excluded": rows[:40],
+      "universe_size": len(decision.symbols),
+      "purged_incumbents": list(decision.dropped or ()),
+      "ranking_excluded_counts": dict(ranking_result.get("excluded_counts") or {}),
+      "note": (
+        "기본예탁금·사전교육이 필요한 레버리지/인버스 ETP 및 파생상품은 후보에서 제외됨. "
+        "RISK_LEVERAGE_ETF_ALLOWED / RISK_DERIVATIVES_ALLOWED 로 재허용."
+      ),
+    }
+    with _live_lock:
+      _universe_exclusion_report.clear()
+      _universe_exclusion_report.update(report)
+  except Exception:  # noqa: BLE001 - reporting must never break discovery.
+    pass
+
 
 def _cached_volume_surge_symbols() -> tuple[str, ...]:
   """KIS 해외주식 거래량급증 종목을 TTL 캐시로 받아 매수 후보에 더한다(미국장 개장 시).
@@ -10910,6 +11385,7 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
       save_state,
       universe_size,
     )
+    from app.trading.strategy_feasibility import rank_by_feasibility
 
     # Turnover ranking only by default. The movers lists are the least stable input
     # available and they select wide-spread names, which is the wrong direction when
@@ -10917,14 +11393,47 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
     raw_sources = os.getenv("REALTIME_KRX_RANKING_SOURCES", "volume_rank")
     sources = tuple(item.strip().lower() for item in raw_sources.split(",") if item.strip())
     size = universe_size()
-    result = fetch_domestic_ranking_symbols(sources=sources, max_symbols=size * 3)
+    # A turnover ranking is where leveraged and inverse ETPs concentrate, and this
+    # account has neither the 기본예탁금 nor the 사전 의무교육 that makes them
+    # orderable. The flags are the account-level ones on RiskRules, so completing
+    # those requirements and flipping them re-admits the instruments with no code
+    # change. Both default False, matching RiskRules' own defaults.
+    derivatives_allowed = _env_flag("RISK_DERIVATIVES_ALLOWED", False)
+    leverage_etf_allowed = _env_flag("RISK_LEVERAGE_ETF_ALLOWED", False)
+    result = fetch_domestic_ranking_symbols(
+      sources=sources,
+      max_symbols=size * 3,
+      derivatives_allowed=derivatives_allowed,
+      leverage_etf_allowed=leverage_etf_allowed,
+    )
+    # Reorder the turnover ranking by whether any strategy's cost-sized target is
+    # actually reachable on that chart. Turnover stays the liquidity/cost
+    # prerequisite that produced the list and still breaks ties; what it no longer
+    # does on its own is decide which names occupy the session's slots.
+    #
+    # Grounding, measured 2026-08-11: of 61 symbols with enough stored bars to judge,
+    # 12 could reach the barrier. The six US names that produced 775 of the 776
+    # realized outcomes at a -123bps mean scored -64 to -155 — the worst in the set —
+    # using no outcome data, only bar dispersion against a cost-derived target.
+    permitted = tuple(result.get("symbols") or ())
+    feasibility = _cached_symbol_feasibility(permitted)
+    ranked_symbols = (
+      rank_by_feasibility(permitted, feasibility) if feasibility else permitted
+    )
     decision = resolve_universe(
-      tuple(result.get("symbols") or ()),
+      ranked_symbols,
       state=load_state(),
       size=size,
+      names=dict(result.get("names") or {}),
+      derivatives_allowed=derivatives_allowed,
+      leverage_etf_allowed=leverage_etf_allowed,
     )
+    if feasibility:
+      _record_feasibility_ranking(feasibility, decision)
     if decision.source in {"reselected", "session_locked"}:
       save_state(decision)
+    if decision.excluded:
+      _record_universe_exclusions(decision, result)
     symbols = decision.symbols
   except Exception:  # noqa: BLE001 - best-effort; never break candidate discovery.
     symbols = ()
@@ -11868,6 +12377,8 @@ def _refresh_live_cache() -> None:
         research_result = _load_default_research()
         _set_live_progress(48, "storage", "Saving research records")
         stored_counts = store.save_research_result(research_result)
+        with _live_lock:
+          _live_state["research_last_collected_at"] = datetime.now(timezone.utc)
       _set_live_progress(64, "analysis", "Building indicators, ontology graph, and reasoning paths")
       live_account = _live_account_snapshot_for_analysis() if active_mode == "live_trading" else None
       live_risk_rules = (
@@ -13186,6 +13697,7 @@ def _live_snapshot() -> dict[str, Any]:
     return {
       "context": _live_state["context"],
       "research_result": _live_state["research_result"],
+      "research_last_collected_at": _live_state.get("research_last_collected_at"),
       "context_mode": _live_state.get("context_mode"),
       "store_summary": dict(_live_state["store_summary"]),
       "stored_new_records": dict(_live_state["stored_new_records"]),
@@ -14261,6 +14773,15 @@ HTML = """
     .ontology-panel strong { display: block; font-size: 15px; margin-bottom: 6px; color: #fff; }
     .ontology-panel .muted { color: #cbd5e1; }
     #ontologyCanvas { width: 100%; height: 760px; display: block; }
+    /* Full-window graph. The two buttons swap so only the applicable one is ever
+       visible, and the selectors carry an extra class so they outrank the
+       viewport-specific #ontologyCanvas heights further down. */
+    #exitOntologyFullscreen { display: none; }
+    .ontology-scene.is-fullscreen { position: fixed; inset: 0; z-index: 60; margin: 0; width: 100vw; height: 100vh; min-height: 100vh; max-width: none; border-radius: 0; overflow: hidden; }
+    .ontology-scene.is-fullscreen #ontologyCanvas { height: 100vh; }
+    .ontology-scene.is-fullscreen #enterOntologyFullscreen { display: none; }
+    .ontology-scene.is-fullscreen #exitOntologyFullscreen { display: inline-flex; align-items: center; }
+    body.ontology-fullscreen { overflow: hidden; }
     #ontologyTooltip { position: absolute; z-index: 3; pointer-events: none; min-width: 160px; max-width: 260px; padding: 8px 10px; border-radius: 6px; background: rgba(15,23,42,.92); color: #fff; border: 1px solid rgba(255,255,255,.18); font-size: 12px; transform: translate(12px, 12px); display: none; }
     @media (min-width: 901px) {
       .shell { grid-template-columns: 300px minmax(0, 1fr); }
@@ -14443,6 +14964,8 @@ HTML = """
           <div class="ontology-toolbar">
             <span class="ontology-badge">실시간 3D GNN 네트워크</span>
             <span class="ontology-badge" id="ontologyCounts">노드 - | 관계 -</span>
+            <button id="enterOntologyFullscreen" type="button">전체 창으로 보기</button>
+            <button id="exitOntologyFullscreen" type="button">원래 크기로</button>
             <button id="resetGraph" type="button">전체 그래프 맞춤</button>
             <button id="toggleLabels" type="button">라벨 켜기</button>
             <button id="toggleReasoning" type="button">추론 일시정지</button>
@@ -14789,6 +15312,34 @@ HTML = """
       } catch (error) {
         console.error('ontology graph load failed', error);
       }
+    }
+
+    function setOntologyFullscreen(on) {
+      const scene = document.querySelector('.ontology-scene');
+      if (!scene) return;
+      scene.classList.toggle('is-fullscreen', on);
+      document.body.classList.toggle('ontology-fullscreen', on);
+      // Both renderers (WebGL and the 2D fallback) size themselves from the
+      // canvas rect on 'resize', so replaying that event is what makes the graph
+      // fill the new box. Two frames: the first lets the class change lay out,
+      // the second guarantees the new rect is readable.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+      });
+    }
+
+    function setupOntologyFullscreen() {
+      const enter = document.getElementById('enterOntologyFullscreen');
+      const exit = document.getElementById('exitOntologyFullscreen');
+      if (enter) enter.addEventListener('click', () => setOntologyFullscreen(true));
+      if (exit) exit.addEventListener('click', () => setOntologyFullscreen(false));
+      // Escape is what a full-window overlay is expected to answer to; without it
+      // the only way back is a button that the graph itself may be covering.
+      document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const scene = document.querySelector('.ontology-scene');
+        if (scene && scene.classList.contains('is-fullscreen')) setOntologyFullscreen(false);
+      });
     }
 
     async function loadOntologyLiveTrace() {
@@ -15932,6 +16483,18 @@ HTML = """
     }
 
     const HOLD_REASON_TEXT = {
+      BAR_VWAP_RECOVERY_INPUTS_MISSING: '1분봉 회복 판단 데이터 부족',
+      BAR_VWAP_DISPLACEMENT_TOO_SMALL: 'VWAP 하락 이격이 진입 기준보다 작음',
+      BAR_VWAP_VOLATILITY_SCALE_MISSING: '변동성 정규화 값 부족',
+      BAR_VWAP_DISLOCATION_TOO_EXTREME: '정상 회귀보다 구조적 재가격 가능성이 큼',
+      BAR_VWAP_NOT_OVERSOLD: '과매도 조건 미충족',
+      BAR_VWAP_FAST_EMA_NOT_RECLAIMED: '완료 1분봉이 단기 EMA를 아직 회복하지 못함',
+      BAR_VWAP_MACD_NOT_TURNED: 'MACD 회복 전환 미확인',
+      BAR_VWAP_RECOVERY_NOT_PERSISTENT: '1분봉 회복 지속성 부족',
+      BAR_VWAP_LIQUIDITY_TOO_LOW: '회복 거래에 필요한 유동성 부족',
+      BAR_VWAP_SPREAD_TOO_WIDE: '스프레드가 넓어 회복 기대수익 잠식',
+      BAR_CONFIRMED_VWAP_RECOVERY: '완료 1분봉 기준 VWAP 회복 진입 확인',
+      COMPLETED_MINUTE_TREND_TURNED: '완료 1분봉 추세가 상승 전환',
       HOLD_BELOW_PROFIT_TARGET: '아직 목표 수익 미달 → 보유',
       WIDE_SPREAD: '호가 스프레드가 넓어 매수 보류',
       LOW_LIQUIDITY: '유동성 부족으로 보류',
@@ -15955,6 +16518,9 @@ HTML = """
       LIQUIDITY_TOO_LOW: '유동성 부족으로 보류',
       SLIPPAGE_RISK_HIGH: '슬리피지 위험 과다',
       PROFITABILITY_GATE_REJECTED: '수익성 게이트 거부(순기대수익 부족)',
+      PROFITABILITY_GATE_OVERRULED: '⚠ 수익성 게이트 거부를 무시하고 진행(GNN 직결)',
+      GNN_DIRECT_ELECTION: 'GNN 직결 채택(밴딧 하한·NO_TRADE 미적용)',
+      GNN_ESTIMATE_UNAVAILABLE_RANKED_LAST: '⚠ GNN 예측 없이 채택(단독 후보)',
       RECENT_LOSS_SYMBOL_COOLDOWN: '최근 손실 종목 재매수 대기',
       NO_SELLABLE_QUANTITY: '매도 가능 수량 없음',
       OPEN_ORDER_OR_SETTLEMENT_LOCK: '미체결 주문/결제 잠금',
@@ -18029,6 +18595,7 @@ HTML = """
     loadRealtimeRuntime();
     loadOperationModeStatus().catch(() => {});
     loadDiagnostics();
+    setupOntologyFullscreen();
     loadOntologyGraph();
     loadMockPerformance();
     refreshLiveSnapshot();

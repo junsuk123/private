@@ -94,7 +94,26 @@ TARGET_NET_REWARD_RISK = 1.5
 # Typical KRX top-of-book spread. A stop must clear several of these or it is
 # triggered by bid-ask bounce rather than by the thesis failing.
 TYPICAL_SPREAD_BPS = 20.0
-MINIMUM_STOP_BPS = 3.0 * TYPICAL_SPREAD_BPS
+STOP_SPREAD_MULTIPLE = 3.0
+MINIMUM_STOP_BPS = STOP_SPREAD_MULTIPLE * TYPICAL_SPREAD_BPS
+
+# Strategies whose horizon IS the thesis rather than a leash on it. Their clock is
+# session structure (last continuous half-hour; the overnight carry itself), so it
+# must never be stretched to make room for a larger target — doing so would carry
+# the position past the auction the thesis is defined against.
+_TIME_BOXED_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "market_intraday_momentum",
+        "market_intraday_momentum_short",
+        "overnight_gap_carry",
+    }
+)
+
+# A bigger target needs more time to be reachable, but not without bound: past
+# this multiple the "trade" is a position, and past the absolute cap it crosses a
+# session boundary the intraday theses are not defined across.
+_MAX_HOLDING_SCALE = 3.0
+_ABSOLUTE_MAX_HOLDING_SECONDS = 21_600
 
 
 @dataclass(frozen=True)
@@ -109,6 +128,14 @@ class StrategyExitGeometry:
     take_profit_bps: float
     trailing_bps: float
     max_holding_seconds: int
+    # Round-trip cost these barriers were actually sized against. Defaults to the
+    # KRX reference so a table lookup keeps reading exactly as it always did; a
+    # geometry resolved from a live cost estimate carries that estimate instead,
+    # which is what makes ``net_reward_risk_ratio()`` answerable per venue rather
+    # than only at the reference constant.
+    resolved_cost_bps: float = REFERENCE_ROUND_TRIP_COST_BPS
+    # True when a measurement (cost and/or spread) shaped these numbers.
+    cost_relative: bool = False
 
     @property
     def reward_risk_ratio(self) -> float:
@@ -137,6 +164,15 @@ class StrategyExitGeometry:
             "reward_risk_ratio": round(self.reward_risk_ratio, 3),
             "net_reward_risk_ratio": round(self.net_reward_risk_ratio(), 3),
             "reference_round_trip_cost_bps": REFERENCE_ROUND_TRIP_COST_BPS,
+            "resolved_cost_bps": round(self.resolved_cost_bps, 3),
+            # The ratio at the cost these barriers were sized against, which is the
+            # one that decides whether they compound. Reading only the reference
+            # ratio is how a KRX-sized table passed its own test while delivering
+            # 0.83 on the US tape it was actually being measured on.
+            "resolved_net_reward_risk_ratio": round(
+                self.net_reward_risk_ratio(self.resolved_cost_bps), 3
+            ),
+            "cost_relative": self.cost_relative,
         }
 
     def as_label_barriers(self) -> dict[str, float]:
@@ -156,6 +192,7 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     "intraday_momentum": (60.0, 160.0, 30.0, 3600),
     "breakout_volume": (60.0, 160.0, 30.0, 4500),
     "vwap_mean_reversion": (60.0, 160.0, 30.0, 3600),
+    "bar_confirmed_vwap_recovery": (70.0, 175.0, 35.0, 5400),
     "liquidity_shock_reversal": (65.0, 170.0, 35.0, 2400),
     "event_momentum": (75.0, 185.0, 40.0, 5400),
     "cross_sectional_relative_strength": (60.0, 160.0, 30.0, 5400),
@@ -213,6 +250,17 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     "market_intraday_momentum_short": (60.0, 180.0, 30.0, 1500),
     "opening_range_breakdown": (60.0, 180.0, 30.0, 3600),
     "residual_relative_weakness": (65.0, 190.0, 32.0, 2700),
+    # --- The one thesis that crosses a session boundary ---------------------- #
+    # An overnight gap JUMPS; it does not fill through a stop. The stored US tape
+    # puts the median absolute overnight move at 69.1bps, so a 60bps stop is
+    # inside the typical gap and would be jumped rather than executed — the same
+    # mistake the first generation of this table made against the bid-ask spread,
+    # one horizon up. 90bps sits outside it, and the target follows the table's
+    # own rule so the net reward:risk invariant still holds:
+    #     28 + 1.5 x (90 + 28) = 205
+    # The 18-hour clock is the carry itself: entered near the close, exited into
+    # the next session's opening liquidity.
+    "overnight_gap_carry": (90.0, 205.0, 45.0, 64800),
     # Unknown / adopted position. It gets the tightest admissible stop and the
     # shortest leash — but its target must still clear cost, which the previous
     # 40bps value did not: it was below the 28bps round trip plus any spread.
@@ -245,6 +293,119 @@ def exit_geometry(strategy_id: str | None) -> StrategyExitGeometry:
         max_holding_seconds=max(
             30, int(_override(resolved_key, "max_holding_seconds", float(holding)))
         ),
+    )
+
+
+def _measured(value: float | None) -> float | None:
+    """A finite, strictly positive measurement, or ``None``.
+
+    Zero is rejected along with None. A zero spread or a zero cost is what an
+    absent measurement looks like after a failed parse, and sizing a stop against
+    it would produce the tightest possible barrier from the least possible
+    information — exactly backwards.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0.0 else None
+
+
+def _round_up_5(value: float) -> float:
+    return math.ceil(max(0.0, value) / 5.0) * 5.0
+
+
+def resolve_exit_geometry(
+    strategy_id: str | None,
+    *,
+    round_trip_cost_bps: float | None = None,
+    spread_bps: float | None = None,
+) -> StrategyExitGeometry:
+    """Geometry sized against the cost and spread actually measured for this trade.
+
+    Why this exists
+    ---------------
+    ``_GEOMETRY`` is one market-agnostic table, and the module docstring is explicit
+    that it was sized for KRX: stop >= 3 x a *typical KRX* 20bps spread, target =
+    c_ref + 1.5 x (stop + c_ref) at c_ref = 28bps. Every consumer then applied it
+    unchanged to whatever venue the symbol happened to live on.
+
+    Measured against the stored shadow tape that is the system's entire evidence
+    base, that is not a small approximation. US round-trip cost came in at a median
+    of 63.2bps (p90 125.2) against the 28bps the table assumes, so the invariant the
+    whole table is built on — net reward:risk of 1.5 — delivered 0.83 in practice::
+
+        (170 - 28) / (65 + 28) = 1.53      <- asserted by the unit test
+        (170 - 63) / (65 + 63) = 0.83      <- what the tape actually paid
+
+    A geometry with net R:R 0.83 needs a 55% win rate to break even while the table
+    was designed to need 40%. Validating a strategy against it cannot return a pass,
+    which is why repeated validation on that tape could only ever emit NO_TRADE.
+
+    So the barriers are derived here instead of read:
+
+    * ``stop``   = max(table stop, 3 x the *measured* spread) — the same "outside
+      the spread" rule the table states, against this symbol's spread rather than
+      against a KRX constant.
+    * ``target`` = c + 1.5 x (stop + c) at the *measured* round-trip cost, which is
+      the table's own formula with the reference constant replaced by a fact.
+    * ``holding`` scales with the target, because a larger target needs more time
+      to be reachable — except for the time-boxed theses, whose clock is the thesis.
+
+    Passing neither measurement returns the table verbatim, so every existing call
+    site, label and test keeps its current numbers until it opts in.
+
+    Note the honest consequence: on a venue whose cost genuinely cannot be cleared
+    by the available move, this returns a target that will not be reached. That is
+    the arithmetic becoming visible rather than being absorbed into a stream of
+    small losses, and the upstream cost-aware edge floor is what should refuse it.
+    """
+    base = exit_geometry(strategy_id)
+    cost = _measured(round_trip_cost_bps)
+    spread = _measured(spread_bps)
+    if cost is None and spread is None:
+        return base
+
+    key = base.strategy_id
+    # Floored at the strategy's own reference, and for a short that reference
+    # carries the borrow leg. A measured cost that omitted borrow would size the
+    # target as if the position were a long, which is the precise arithmetic error
+    # the table's docstring records: cost is additive against BOTH barriers, so
+    # under-counting it compresses net reward:risk from both ends. Flooring also
+    # keeps the estimate on the conservative side — both terms are estimates, and
+    # equality with cost is a loss.
+    resolved_cost = max(
+        cost if cost is not None else 0.0, reference_round_trip_cost_bps(key)
+    )
+
+    stop = base.stop_loss_bps
+    if spread is not None:
+        stop = max(stop, STOP_SPREAD_MULTIPLE * spread)
+    stop = _round_up_5(stop)
+
+    target = _round_up_5(resolved_cost + TARGET_NET_REWARD_RISK * (stop + resolved_cost))
+
+    # Trailing stays at ~half the stop and outside one spread, and must remain
+    # strictly inside the stop or it would pre-empt it on every trade.
+    spread_floor = (spread if spread is not None else TYPICAL_SPREAD_BPS) * 1.5
+    trailing = max(1.0, min(stop - 1.0, max(0.5 * stop, spread_floor)))
+
+    holding = base.max_holding_seconds
+    if key not in _TIME_BOXED_STRATEGIES and target > base.take_profit_bps:
+        scale = min(_MAX_HOLDING_SCALE, target / max(1e-9, base.take_profit_bps))
+        holding = int(min(base.max_holding_seconds * scale, _ABSOLUTE_MAX_HOLDING_SECONDS))
+        holding = max(base.max_holding_seconds, holding)
+
+    return StrategyExitGeometry(
+        strategy_id=base.strategy_id,
+        stop_loss_bps=stop,
+        take_profit_bps=target,
+        trailing_bps=round(trailing, 1),
+        max_holding_seconds=max(30, holding),
+        resolved_cost_bps=resolved_cost,
+        cost_relative=True,
     )
 
 

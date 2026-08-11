@@ -35,7 +35,18 @@ class StrategyFactoryConfig:
     enable_intraday_momentum: bool = True
     enable_technical_rule: bool = True
     enable_pair_relative_value: bool = True
-    target_net_return: float = 0.003
+    # 0.0, not 0.003. ProfitabilityGate is the single authority on the required
+    # net return: it already computes a market floor plus volatility, liquidity and
+    # small-account buffers. A hard-coded 30bps here stacked ON TOP of that (the
+    # gate treats target_net_return as an additional tightening, never a
+    # loosening), so a candidate had to clear ~30bps of unvalidated hurdle that no
+    # measurement supports. That is a second, silent gate -- exactly the duplicate
+    # blocking this factory was meant to stop having.
+    #
+    # A strategy may still pass its own target via the candidate feature below;
+    # that one is strategy-specific and can be empirically justified. This default
+    # simply stops inventing a floor for strategies that never asked for one.
+    target_net_return: float = 0.0
     max_cost_to_alpha_ratio: float = 0.5
     max_spread_rate: float = 0.0015
     min_liquidity_score: float = 0.5
@@ -260,7 +271,13 @@ class StrategyCandidateFactory:
 
         ontology_score = _ontology_score(candidate.ontology_tags)
         risk_adjustment = _risk_adjustment(candidate, cost, spread_rate)
-        excess_return_after_cost = cost.net_expected_return - target_net_return
+        # Rank on surplus over the bar the GATE actually applied, not over a
+        # per-strategy target. Two candidates carrying different targets were being
+        # ordered on numbers that did not mean the same thing; required_min_net_return
+        # is the same quantity for every candidate in the same market and regime.
+        excess_return_after_cost = (
+            decision.net_expected_return - decision.required_min_net_return
+        )
         ranking_score = (
             excess_return_after_cost
             * candidate.confidence

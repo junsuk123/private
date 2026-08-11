@@ -2,8 +2,10 @@
 
 Why this is a pluggable source and not a KIS method
 ---------------------------------------------------
-It was a KIS method. Three endpoints were guessed and all three were wrong, proven by
-read-only probes against the live account on 2026-08-02:
+Three endpoints were originally guessed and all three were wrong. KIS now publishes
+the actual inventory query, ``CTSC2702R /lendable-by-company``.  It reports KIS-wide
+lendable inventory rather than an account-specific final order quantity, so account,
+collateral and strategy limits still reduce size downstream.
 
 * ``TTTC8909R`` / ``inquire-credit-psamount`` — exists, but answers 융자 (margin BUY)
   purchasing power, not 대주 (stock-loan) availability;
@@ -20,9 +22,8 @@ consequences worth stating:
 * **Nothing silently degrades.** :class:`NullBorrowSource` reports unavailability with a
   reason, rather than returning ``available=False`` — which would look like a normal
   market state and hide the fact that no source exists at all.
-* **The ladder is still exercisable.** :class:`FileBorrowSource` reads an
-  operator-maintained file. For a retail account the 대주 list is checked on the
-  broker's web UI anyway, so a file is an honest primary source, not a stopgap.
+* :class:`KisBorrowSource` is the production default when KIS credentials exist.
+* :class:`FileBorrowSource` remains an explicit operator/testing override.
 
 Every source returns a :class:`~app.trading.borrow.BorrowSnapshot`, so the freshness,
 quantity and fee rules in ``evaluate_borrow`` apply identically no matter where the
@@ -54,6 +55,12 @@ REASON_NO_SOURCE = "BORROW_SOURCE_NOT_CONFIGURED"
 REASON_SOURCE_UNREADABLE = "BORROW_SOURCE_UNREADABLE"
 REASON_SYMBOL_ABSENT = "BORROW_SYMBOL_NOT_LISTED"
 REASON_SOURCE_STALE = "BORROW_SOURCE_STALE"
+
+# KIS's public credit policy currently quotes 4.5% for KOSPI200 and 6.0% for other
+# names.  Unknown index membership deliberately receives the higher rate.  The values
+# remain environment-overridable so a policy change can be deployed without code.
+DEFAULT_KIS_KOSPI200_FEE_BPS_ANNUALISED = 450.0
+DEFAULT_KIS_OTHER_FEE_BPS_ANNUALISED = 600.0
 
 
 class BorrowDataSource(Protocol):
@@ -281,6 +288,124 @@ class CallableBorrowSource:
         }
 
 
+class KisBorrowSource:
+    """Live KIS inventory backed by the official ``CTSC2702R`` query.
+
+    The API answer is deliberately combined only with a *conservative public policy
+    fee*.  It is not treated as account-specific buying power.  The account/risk
+    gates continue to cap the requested quantity, and KIS remains the final authority
+    when the credit order is submitted.
+    """
+
+    name = "kis"
+
+    def __init__(
+        self,
+        client: Any | None = None,
+        *,
+        kospi200_symbols: Sequence[str] | None = None,
+        kospi200_fee_bps_annualised: float | None = None,
+        other_fee_bps_annualised: float | None = None,
+    ) -> None:
+        if client is None:
+            from app.execution.kis_real import KisDevelopersApiClient
+
+            client = KisDevelopersApiClient(enabled=False)
+        self._client = client
+        self._kospi200 = {
+            str(item).strip().upper() for item in (kospi200_symbols or ()) if str(item).strip()
+        }
+        self._kospi200_fee = float(
+            kospi200_fee_bps_annualised
+            if kospi200_fee_bps_annualised is not None
+            else os.getenv(
+                "KIS_BORROW_KOSPI200_FEE_BPS_ANNUALISED",
+                str(DEFAULT_KIS_KOSPI200_FEE_BPS_ANNUALISED),
+            )
+        )
+        self._other_fee = float(
+            other_fee_bps_annualised
+            if other_fee_bps_annualised is not None
+            else os.getenv(
+                "KIS_BORROW_OTHER_FEE_BPS_ANNUALISED",
+                str(DEFAULT_KIS_OTHER_FEE_BPS_ANNUALISED),
+            )
+        )
+        self._last_error = ""
+        self._last_observed_at: datetime | None = None
+        self._last_symbol = ""
+        self._known_borrowable: set[str] = set()
+
+    def available(self) -> bool:
+        credentials = getattr(self._client, "credentials", None)
+        if credentials is None:
+            return self._client is not None
+        return bool(
+            getattr(credentials, "app_key", "")
+            and getattr(credentials, "app_secret", "")
+            and getattr(credentials, "account_no", "")
+        )
+
+    def snapshot(self, symbol: str, *, now: datetime) -> BorrowSnapshot | None:
+        del now  # Observation time is the broker response time, never caller-supplied.
+        code = str(symbol or "").strip().upper()
+        if not code or not self.available():
+            return None
+        try:
+            answer = self._client.get_lendable_by_company(code)
+        except Exception as exc:  # noqa: BLE001 - unanswered must remain distinct from no.
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("KIS borrow inventory failed for %s: %s", code, exc)
+            return None
+
+        observed_at = datetime.now(timezone.utc)
+        available = bool(answer.get("available"))
+        quantity = answer.get("available_quantity")
+        if available and quantity is not None and int(quantity) > 0:
+            self._known_borrowable.add(code)
+        else:
+            self._known_borrowable.discard(code)
+        self._last_error = ""
+        self._last_observed_at = observed_at
+        self._last_symbol = code
+        fee = self._kospi200_fee if code in self._kospi200 else self._other_fee
+        raw = answer.get("raw") if isinstance(answer.get("raw"), Mapping) else answer
+        return BorrowSnapshot(
+            symbol=code,
+            observed_at=observed_at,
+            available=available,
+            available_quantity=(None if quantity is None else max(0, int(quantity))),
+            borrow_fee_bps_annualised=fee,
+            source="kis:CTSC2702R+public-credit-policy",
+            source_payload_hash=BorrowSnapshot.payload_hash(raw),
+            reject_reason=str(answer.get("reject_reason") or ""),
+        )
+
+    def universe(self) -> tuple[str, ...]:
+        # Demand-driven queries populate this cache. An empty cache means "not queried
+        # yet", not a broker declaration that no name is lendable.
+        return tuple(sorted(self._known_borrowable))
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "available": self.available(),
+            "reason": self._last_error,
+            "endpoint": "/uapi/domestic-stock/v1/quotations/lendable-by-company",
+            "tr_id": "CTSC2702R",
+            "last_observed_at": (
+                self._last_observed_at.isoformat() if self._last_observed_at else None
+            ),
+            "last_symbol": self._last_symbol or None,
+            "known_borrowable_count": len(self._known_borrowable),
+            "fee_policy": {
+                "kospi200_bps_annualised": self._kospi200_fee,
+                "other_bps_annualised": self._other_fee,
+                "unknown_membership_uses": "other",
+            },
+        }
+
+
 def _parse_iso(value: Any) -> datetime | None:
     if not value:
         return None
@@ -298,27 +423,43 @@ _DEFAULT_SOURCE_LOCK = threading.Lock()
 def default_borrow_source() -> BorrowDataSource:
     """The configured source, or :class:`NullBorrowSource`.
 
-    Resolution order is deliberately short and explicit: a file if one is configured
-    AND readable, otherwise nothing. There is no "try the broker and fall back",
-    because a silent fallback is how an operator ends up believing a data path exists
-    when it does not.
+    ``BORROW_SOURCE`` may force ``kis``, ``file`` or ``none``. In ``auto`` mode the
+    verified KIS source wins when credentials exist; a readable file is retained only
+    as a development/operator fallback.
     """
     global _DEFAULT_SOURCE
     if _DEFAULT_SOURCE is None:
         with _DEFAULT_SOURCE_LOCK:
             if _DEFAULT_SOURCE is None:
-                candidate = FileBorrowSource()
-                if candidate.available():
-                    logger.info("borrow source: %s", candidate.status())
-                    _DEFAULT_SOURCE = candidate
+                requested = str(os.getenv("BORROW_SOURCE", "auto") or "auto").strip().lower()
+                if requested in {"none", "null", "off", "disabled"}:
+                    _DEFAULT_SOURCE = NullBorrowSource(reason=REASON_NO_SOURCE)
                 else:
-                    logger.info(
-                        "borrow source unavailable (%s); short strategies stay inert",
-                        candidate.status().get("reason") or REASON_NO_SOURCE,
-                    )
-                    _DEFAULT_SOURCE = NullBorrowSource(
-                        reason=candidate.status().get("reason") or REASON_NO_SOURCE
-                    )
+                    kis = KisBorrowSource()
+                    file_source = FileBorrowSource()
+                    candidate: BorrowDataSource | None = None
+                    if requested == "file":
+                        candidate = file_source if file_source.available() else None
+                    elif requested == "kis":
+                        candidate = kis if kis.available() else None
+                    else:
+                        candidate = (
+                            kis if kis.available() else file_source if file_source.available() else None
+                        )
+                    if candidate is not None:
+                        logger.info("borrow source: %s", candidate.status())
+                        _DEFAULT_SOURCE = candidate
+                    else:
+                        reason = (
+                            f"BORROW_SOURCE_{requested.upper()}_UNAVAILABLE"
+                            if requested != "auto"
+                            else file_source.status().get("reason") or REASON_NO_SOURCE
+                        )
+                        logger.info(
+                            "borrow source unavailable (%s); short strategies stay inert",
+                            reason,
+                        )
+                        _DEFAULT_SOURCE = NullBorrowSource(reason=str(reason))
     return _DEFAULT_SOURCE
 
 

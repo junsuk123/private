@@ -18,6 +18,7 @@ from app.technical.strategy_algorithms import (
     reset_cost_floor_cache,
     round_trip_cost_bps,
 )
+from app.technical.signals import TechnicalFeatureSet
 
 
 @pytest.fixture(autouse=True)
@@ -118,3 +119,24 @@ def test_unreadable_cost_config_falls_back_rather_than_treating_cost_as_zero(
     # A missing cost model must never read as "free".
     assert diagnostics["floor_basis"] == "cost_config_unreadable"
     assert floor == algorithm.config.shared("min_expected_edge_bps")
+
+
+def test_us_cost_feasible_horizon_keeps_real_cost_floor() -> None:
+    from app.technical.strategy_algorithms import LiquidityShockReversalAlgorithm
+
+    algorithm = LiquidityShockReversalAlgorithm()
+    features = TechnicalFeatureSet(
+        symbol="PFE",
+        realized_volatility=0.003,
+    )
+    edge, horizon = algorithm._cost_feasible_volatility_edge(
+        features,
+        base_horizon_seconds=600,
+        maximum_horizon_seconds=3600,
+        capture_fraction=0.35,
+    )
+    floor, _ = algorithm.entry_floor_bps("PFE")
+
+    assert 600 <= horizon <= 3600
+    assert edge >= floor
+    assert floor > 45.0

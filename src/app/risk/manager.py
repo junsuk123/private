@@ -9,6 +9,10 @@ import math
 
 from app.audit import AuditLogger
 from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
+from app.data.instrument_eligibility import CATEGORY_DERIVATIVE as INSTRUMENT_DERIVATIVE
+from app.data.instrument_eligibility import CATEGORY_ETN as INSTRUMENT_ETN
+from app.data.instrument_eligibility import CATEGORY_LEVERAGED_ETP as INSTRUMENT_LEVERAGED_ETP
+from app.data.instrument_eligibility import classify as classify_instrument
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report
 from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
@@ -94,6 +98,38 @@ class RiskManager:
             and not self.rules.derivatives_allowed
             and not self.rules.leverage_etf_allowed
         )
+        # The per-order half the comment above used to say was impossible. It is now
+        # possible because ``app.data.instrument_eligibility`` can classify a listing
+        # from its code and name, so the two product flags finally bind on what the
+        # order actually buys instead of on a global assertion.
+        #
+        # This is a backstop, not the filter: discovery already removes these
+        # instruments in ``fetch_domestic_ranking_symbols`` / ``resolve_universe``.
+        # It exists because a candidate can also arrive from a held position, the
+        # static collection list, or a manual intent, and none of those pass through
+        # discovery. A leveraged ETP reaching this point is not a worse trade — it is
+        # an order the account is not authorised to place at all.
+        # The name lives on the market snapshot, not the intent. When it is absent the
+        # classifier reports UNKNOWN and permits — see its module docstring on why
+        # refusing every unnamed instrument is the wrong failure mode here.
+        instrument = classify_instrument(
+            str(getattr(intent, "ticker", "") or ""),
+            str(getattr(market, "company_name", "") or "") or None,
+            market=str(getattr(intent, "market", "") or getattr(market, "market", "") or "") or None,
+        )
+        metadata["instrument_category"] = instrument.category
+        if instrument.tradable:
+            checks["instrument_permitted"] = True
+        elif instrument.category == INSTRUMENT_LEVERAGED_ETP:
+            checks["instrument_permitted"] = bool(self.rules.leverage_etf_allowed)
+        elif instrument.category in {INSTRUMENT_DERIVATIVE, INSTRUMENT_ETN}:
+            checks["instrument_permitted"] = bool(self.rules.derivatives_allowed)
+        else:
+            # An unsupported code shape is not a permission question: the execution
+            # layer cannot construct the order whatever the account may hold.
+            checks["instrument_permitted"] = False
+        if not checks["instrument_permitted"]:
+            metadata["instrument_reason_codes"] = list(instrument.reason_codes)
         # These two are the real gates, and they only bind on an order that needs them.
         # A SHORT EXIT is deliberately NOT gated: refusing to cover a short because the
         # account-level short flag was turned off would trap an open, unbounded-loss
@@ -304,7 +340,7 @@ class RiskManager:
                     position_direction="SHORT",
                     position_effect="OPEN",
                     execution_product="CREDIT_BORROW",
-                    credit_type="05",
+                    credit_type="22",
                 )
                 approved = final_order is not None
         elif approved and is_short_exit:
@@ -336,7 +372,7 @@ class RiskManager:
                     position_direction="SHORT",
                     position_effect="CLOSE",
                     execution_product="CREDIT_BORROW",
-                    credit_type="05",
+                    credit_type="26",
                     loan_date=loan_date,
                 )
                 approved = final_order is not None
@@ -612,7 +648,23 @@ class RiskManager:
             from app.trading.directional import ShortReasonCodes
 
             requested_quantity = max(1, int(meta.get("intended_quantity") or 1))
-            snapshot = default_borrow_store().latest(symbol, as_of=now)
+            store = default_borrow_store()
+            snapshot = store.latest(symbol, as_of=now)
+            # Inventory can disappear between periodic polling and submission. Do a
+            # demand-driven JIT refresh here, at the final risk gate. If it fails, the
+            # old snapshot is evaluated against the same short TTL and therefore
+            # fails closed rather than becoming a silent fallback.
+            jit_max_age = max(
+                1.0,
+                float(os.getenv("KIS_BORROW_JIT_MAX_AGE_SECONDS", "5.0")),
+            )
+            if snapshot is None or not snapshot.is_fresh(now, jit_max_age):
+                from app.trading.borrow_source import default_borrow_source
+
+                refreshed = default_borrow_source().snapshot(symbol, now=now)
+                if refreshed is not None:
+                    store.record(refreshed)
+                    snapshot = refreshed
             verdict = evaluate_borrow(
                 snapshot,
                 quantity=requested_quantity,
@@ -621,7 +673,10 @@ class RiskManager:
                     meta.get("max_borrow_fee_bps_annualised")
                     or DEFAULT_MAX_BORROW_FEE_BPS_ANNUALISED
                 ),
-                max_age_seconds=rules.min_borrow_snapshot_freshness_seconds,
+                max_age_seconds=min(
+                    rules.min_borrow_snapshot_freshness_seconds,
+                    jit_max_age,
+                ),
                 min_hours_before_deadline=rules.min_hours_before_recall_deadline,
             )
             verdict_reasons = verdict.reason_codes

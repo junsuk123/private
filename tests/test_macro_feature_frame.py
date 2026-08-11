@@ -119,3 +119,32 @@ class TestStoreAdapter:
 
         f = macro_feature_frame_from_store(_Store(), ["KR1", "US1"], now=_now())
         assert f.symbol_count == 1 and "US1" in f.per_symbol_return
+
+    def test_incomplete_bar_warmup_uses_causal_ten_second_tick_closes(self):
+        start = _now() - timedelta(minutes=2)
+
+        class _Store:
+            def recent_minute_bars(self, symbol, since, limit=120):
+                return tuple(
+                    SimpleNamespace(close=100.0 + i, volume=100)
+                    for i in range(3)
+                )
+
+            def recent_ticks(self, symbol, since):
+                return tuple(
+                    SimpleNamespace(
+                        price=100.0 + i * 0.1,
+                        volume=10,
+                        received_at=start + timedelta(seconds=i * 10),
+                        exchange_timestamp=start + timedelta(seconds=i * 10 - 3),
+                    )
+                    for i in range(8)
+                )
+
+            def recent_orderbooks(self, symbol, since):
+                return ()
+
+        frame = macro_feature_frame_from_store(_Store(), ["WARM"], now=_now())
+
+        assert frame.index_trend is not None and frame.index_trend > 0
+        assert frame.symbol_count == 1

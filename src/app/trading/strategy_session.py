@@ -24,6 +24,7 @@ from app.strategy.exit_geometry import FALLBACK_GEOMETRY_KEY
 from app.strategy.exit_geometry import exit_bps as _strategy_exit_bps
 from app.strategy.exit_geometry import exit_geometry as _exit_geometry
 from app.strategy.exit_geometry import max_holding_seconds as _strategy_max_holding_seconds
+from app.strategy.exit_geometry import resolve_exit_geometry as _resolve_exit_geometry
 from app.trading.conservative_bandit import (
     BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE,
     ArmCandidate,
@@ -78,6 +79,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Marks a plan journaled for an arm that WAS order-authorised but lost the
+# election. The signal is real and the measurement is real; the fill is simulated,
+# which is why these land as ``evaluation_source=shadow`` and never as live
+# evidence for the promotion ladder.
+_COUNTERFACTUAL_REASON_CODE = "COUNTERFACTUAL_UNSELECTED_ARM"
+
+
 def _cost_aware_profit_bps(
     model_evidence: Mapping[str, Any] | None,
     configured_profit_bps: float,
@@ -99,33 +107,98 @@ def _cost_aware_profit_bps(
     )
 
 
+def _measured_spread_bps(micro_result: Any, evidence_row: Mapping[str, Any] | None) -> float | None:
+    """This symbol's top-of-book spread at decision time, if anything measured it.
+
+    Returns ``None`` rather than a default. A stop is sized at three spreads, so
+    substituting the KRX typical value for an unmeasured one would put the barrier
+    inside the real spread on any wider name — the exact failure the geometry
+    module was rewritten to eliminate.
+    """
+    diagnostics = getattr(micro_result, "diagnostics", None)
+    if isinstance(diagnostics, Mapping):
+        value = _optional_float(diagnostics.get("spread_bps"))
+        if value is not None:
+            return value
+    value = _optional_float(getattr(micro_result, "spread_bps", None))
+    if value is not None:
+        return value
+    if isinstance(evidence_row, Mapping):
+        return _optional_float(evidence_row.get("spread_bps"))
+    return None
+
+
+def _resolved_geometry(
+    strategy_id: str,
+    *,
+    expected_cost_bps: float | None,
+    micro_result: Any = None,
+    evidence_row: Mapping[str, Any] | None = None,
+):
+    """Exit barriers sized against THIS trade's measured cost and spread.
+
+    The table in :mod:`app.strategy.exit_geometry` is sized for a 28bps KRX round
+    trip. Applying it unchanged to a venue that charges 63bps drops net reward:risk
+    from the 1.5 it asserts to 0.83, which no win rate the strategies actually
+    achieve can pay for. Passing the measurement in restores the invariant per
+    venue; passing nothing returns the table exactly as before.
+    """
+    return _resolve_exit_geometry(
+        strategy_id,
+        round_trip_cost_bps=expected_cost_bps,
+        spread_bps=_measured_spread_bps(micro_result, evidence_row),
+    )
+
+
+def _minimum_trailing_net_bps(strategy_id: str | None) -> float:
+    continuation = {
+        "intraday_momentum",
+        "cross_sectional_relative_strength",
+        "residual_relative_strength",
+        "opening_range_breakout",
+    }
+    normalized = str(strategy_id or "")
+    default = (
+        30.0
+        if normalized == "cross_sectional_relative_strength"
+        else 15.0
+        if normalized in continuation
+        else 5.0
+    )
+    return max(
+        0.0,
+        _env_float("STRATEGY_SESSION_MIN_TRAILING_NET_BPS", default),
+    )
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat() if value is not None else None
 
 
 _KST = timezone(timedelta(hours=9))
-# KRX continuous trading ends at 15:20; 15:20-15:30 is a closing single-price
-# auction with different matching, which this system does not model.
-_KRX_CONTINUOUS_CLOSE_MINUTE = 15 * 60 + 20
-_KRX_LAST_CONTINUOUS_HALF_HOUR_START = _KRX_CONTINUOUS_CLOSE_MINUTE - 30
 
 
-def _session_structure_context(now: datetime) -> dict[str, Any]:
-    """Clock-derived KRX session structure the session-boxed strategies need.
+def _session_structure_context(now: datetime, symbol: str) -> dict[str, Any]:
+    """Clock-derived session structure the session-boxed strategies need.
 
     Only the parts the clock can answer. ``in_last_continuous_half_hour`` and
     ``minutes_to_continuous_close`` are pure calendar facts, so withholding them
     would leave the strategies fail-closed for no reason; the price-derived fields
     (opening range, first-half-hour return) still require a producer and stay absent
     until one supplies them.
+
+    The window is the symbol's OWN market. Reading the KRX close for every symbol
+    put a US name's "last continuous half hour" at 14:50-15:20 Seoul — the middle
+    of the New York night — so ``market_intraday_momentum`` and
+    ``opening_range_breakout`` rejected every US tick with ``*_OUTSIDE_ENTRY_WINDOW``
+    and could never fire on the market whose costs most need a once-a-day thesis.
     """
-    local = now.astimezone(_KST)
-    minute_of_day = local.hour * 60 + local.minute
-    remaining = (_KRX_CONTINUOUS_CLOSE_MINUTE - minute_of_day) - local.second / 60.0
+    from app.features.session_structure import regular_session
+
+    session = regular_session(symbol)
+    remaining = session.minutes_to_continuous_close(now)
     return {
-        "in_last_continuous_half_hour": bool(
-            _KRX_LAST_CONTINUOUS_HALF_HOUR_START <= minute_of_day < _KRX_CONTINUOUS_CLOSE_MINUTE
-        ),
+        "in_last_continuous_half_hour": session.in_last_continuous_half_hour(now),
         # Negative after the continuous close, which reads as "no time left" to every
         # consumer rather than wrapping around to a large positive number.
         "minutes_to_continuous_close": round(remaining, 3),
@@ -535,6 +608,15 @@ class StrategySessionConfig:
         default_factory=lambda: os.getenv("STRATEGY_SESSION_RECORD_OUTCOMES", "true").strip().lower()
         not in {"0", "false", "no", "off"}
     )
+    # Shadow observations must be independent enough to count as samples.  The
+    # old loop wrote the same symbol/strategy every few seconds, creating many
+    # overlapping plans that resolved on the same quote and falsely looked like
+    # independent evidence.
+    shadow_signal_cooldown_seconds: int = field(
+        default_factory=lambda: max(
+            60, _env_int("STRATEGY_SHADOW_SIGNAL_COOLDOWN_SECONDS", 300)
+        )
+    )
     # Round-trip cost assumed when the election evidence carried no estimate.
     # KRX round trip (sell tax + fees + spread) is ~25-30bps; 28 is the measured
     # per-strategy average in the R-GCN model card.
@@ -542,6 +624,29 @@ class StrategySessionConfig:
         default_factory=lambda: max(
             0.0, _env_float("STRATEGY_SESSION_FALLBACK_COST_BPS", 28.0)
         )
+    )
+    # --- GNN-direct election (operator posture, 2026-08-08) ------------------ #
+    # The GNN's own ranking becomes the selection, full stop: highest predicted
+    # net edge is armed, with no pessimistic re-scoring and no NO_TRADE arm. Set
+    # by an operator who holds that a model trained to pick the best strategy
+    # should not then have its pick second-guessed by the layers below it.
+    #
+    # This overrides ``bandit_enabled``. What it gives up, stated plainly because
+    # the flag cannot state it at runtime:
+    #   * the pessimistic lower bound -- a cold arm is armed on its own optimism;
+    #   * NO_TRADE as a selectable outcome -- if any proposal exists, one is armed;
+    #   * the realized-history posterior and the BOCPD regime discount.
+    #
+    # Measured before this was switched on (2026-08-08, forward validation of GNN
+    # elections on live ticks): 107 samples, positive_net_rate 0.0, mean realized
+    # net -62.08bps, and the success head scored 61.8% on realized cells against
+    # an 84.6% constant-predictor baseline. Those are the numbers this posture
+    # accepts. Revert by unsetting the variable; no code path is deleted.
+    gnn_direct_election: bool = field(
+        default_factory=lambda: os.getenv(
+            "STRATEGY_SESSION_GNN_DIRECT_ELECTION", "false"
+        ).strip().lower()
+        in {"1", "true", "yes", "on"}
     )
 
 
@@ -606,6 +711,10 @@ class StrategySessionState:
     gnn_reason_codes: list[str] = field(default_factory=list)
     explanation_paths: list[dict[str, Any]] = field(default_factory=list)
     candidate_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Every actual strategy trigger checked this cycle, including rejected ones.
+    # This is distinct from bandit_evaluations: the latter contains only pairs
+    # that first passed their strategy's own mechanical entry algorithm.
+    algorithm_evaluations: list[dict[str, Any]] = field(default_factory=list)
     # Slow context captured at election time and handed to the owning
     # algorithm. Fields the electing layer cannot supply stay absent, and the
     # algorithms that need them fail closed rather than assume a value.
@@ -917,6 +1026,17 @@ class StrategySessionManager:
             payload["single_position_enforced"] = self.config.enabled
             payload["require_live_gnn"] = self.config.require_live_gnn
             payload["bandit_enabled"] = self.config.bandit_enabled
+            # Publish the posture, because ``bandit_enabled`` alone now lies. The
+            # direct-election path overrides the bandit without switching that
+            # flag off, so a reader of this snapshot would see bandit_enabled
+            # true and conclude a pessimistic bound and a NO_TRADE option were in
+            # play when neither is.
+            payload["gnn_direct_election"] = self.config.gnn_direct_election
+            payload["selection_authority"] = (
+                "GNN_DIRECT" if self.config.gnn_direct_election
+                else "CONSERVATIVE_BANDIT" if self.config.bandit_enabled
+                else "FIRST_ADMISSIBLE"
+            )
             return payload
 
     def _reconcile_position(
@@ -1124,13 +1244,29 @@ class StrategySessionManager:
             if watermark
             else 0.0
         )
+        trailing_locked_gross_bps = _directional_gross_bps(
+            average_price, resolved_trailing, direction
+        )
+        trailing_required_gross_bps = max(
+            0.0,
+            float(
+                state.expected_cost_bps
+                if state.expected_cost_bps is not None
+                else self.config.fallback_round_trip_cost_bps
+            ),
+        ) + _minimum_trailing_net_bps(state.selected_strategy)
 
         reason: str | None = None
         if target_reached(last_price, state.target_price, direction):
             reason = "STRATEGY_PROFIT_TARGET"
         elif stop_breached(last_price, resolved_stop, direction):
             reason = "STRATEGY_STOP_LOSS"
-        elif trailing_breached(last_price, resolved_trailing, average_price, direction):
+        elif (
+            trailing_locked_gross_bps >= trailing_required_gross_bps
+            and trailing_breached(
+                last_price, resolved_trailing, average_price, direction
+            )
+        ):
             reason = "STRATEGY_TRAILING_STOP"
         # A borrow recall is an exit reason with no long-side analogue: the position
         # must be covered whether or not the price thesis still holds, and waiting for
@@ -1217,6 +1353,7 @@ class StrategySessionManager:
                     or ""
                 ),
                 "reason_codes": list(getattr(result, "reason_codes", ()) or ()),
+                "diagnostics": dict(getattr(result, "diagnostics", {}) or {}),
             }
             for result in tuple(getattr(bundle, "micro_results", ()) or ())[:8]
         ]
@@ -1263,6 +1400,7 @@ class StrategySessionManager:
         proposals.extend(
             self._evidence_proposals(tradable_candidates, evidence, bundle, now)
         )
+        proposals = self._deduplicate_joint_proposals(proposals)
 
         # Journal every SHADOW-state proposal before selection runs. This is how a
         # short accumulates the forward evidence it needs: the signal fired, the
@@ -1275,15 +1413,43 @@ class StrategySessionManager:
         # dashboard can show what they WOULD have done) while making them structurally
         # unable to win.
         executable = [proposal for proposal in proposals if proposal.submits_orders]
-        if proposals and self.config.bandit_enabled:
+        selected: "_ElectionProposal | None" = None
+        decided = False
+        if executable and self.config.gnn_direct_election:
+            # Operator posture: the GNN's ranking IS the election. See
+            # ``StrategySessionConfig.gnn_direct_election`` for what this gives up.
+            selected = self._gnn_direct_choice(executable)
+            decided = True
+        elif proposals and self.config.bandit_enabled:
             selected = self._bandit_choice(proposals, macro, now)
-            if selected is not None:
-                self._arm(selected, now, macro)
-            return
-        if executable:
+            decided = True
+        elif executable:
             # Bandit disabled: preserve the historical first-admissible behaviour,
             # over the order-authorised subset only.
-            self._arm(executable[0], now, macro)
+            selected = executable[0]
+            decided = True
+
+        # ...and journal the order-authorised arms that did NOT win. Without this the
+        # evidence channel is wired backwards: a SHADOW arm accumulates a posterior
+        # every cycle while a LIVE_FULL arm only ever produces a sample by winning an
+        # election, and it can only win on a posterior it has no way to build. The
+        # result was an absorbing state — after the first losing outcome the arm is
+        # neither explorable (loss streak) nor exploitable (negative posterior), and
+        # no further sample can arrive to change either. The whole funded KR side sat
+        # in it: 1,650 shadow plans on record, every one of them US.
+        #
+        # These are counterfactuals, tagged as such and landing as
+        # ``evaluation_source=shadow``, so promotion still weights them below a real
+        # fill and cannot mistake a simulation for execution.
+        self._journal_shadow_proposals(
+            executable, now, counterfactual=True, exclude=selected
+        )
+
+        if selected is not None:
+            self._arm(selected, now, macro)
+            return
+        if decided:
+            # A selector ran and chose nothing; it owns the reason string.
             return
         if proposals:
             self._state.last_reason = (
@@ -1387,9 +1553,6 @@ class StrategySessionManager:
                 )
                 if favourable:
                     target_rate = max(target_rate, abs(expected_exit / entry_price - 1.0))
-            stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(selected_strategy)
-            profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
-            target_rate = max(target_rate, profit_bps / 10_000.0)
             micro_result = next(
                 (
                     result
@@ -1398,6 +1561,30 @@ class StrategySessionManager:
                 ),
                 None,
             )
+            geometry = _resolved_geometry(
+                selected_strategy,
+                expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
+                micro_result=micro_result,
+                evidence_row=row if isinstance(row, Mapping) else None,
+            )
+            stop_bps = geometry.stop_loss_bps
+            profit_bps = geometry.take_profit_bps
+            trailing_bps = geometry.trailing_bps
+            profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
+            target_rate = max(target_rate, profit_bps / 10_000.0)
+            mechanical = self._mechanical_entry_verdict(
+                symbol=symbol,
+                strategy_id=selected_strategy,
+                evidence_row=row if isinstance(row, Mapping) else None,
+                now=now,
+                macro=getattr(bundle, "macro_result", None),
+                intent=intent,
+                micro_result=micro_result,
+                candidate_count=len(intents),
+                borrow_snapshot=borrow_snapshot,
+            )
+            if mechanical is not None and not mechanical.get("triggered", False):
+                continue
             proposals.append(
                 _ElectionProposal(
                     symbol=symbol,
@@ -1415,7 +1602,7 @@ class StrategySessionManager:
                     target_return_rate=target_rate,
                     stop_loss_rate=stop_bps / 10_000.0,
                     trailing_stop_rate=trailing_bps / 10_000.0,
-                    max_holding_seconds=_strategy_max_holding_seconds(selected_strategy),
+                    max_holding_seconds=geometry.max_holding_seconds,
                     score=float(getattr(intent, "score", 0.0) or 0.0),
                     confidence=float(getattr(intent, "confidence", 0.0) or 0.0),
                     expected_net_return_bps=_optional_float(
@@ -1451,18 +1638,21 @@ class StrategySessionManager:
         bundle: Any,
         now: datetime,
     ) -> list["_ElectionProposal"]:
-        """Shadow-evidence path: an explicit ACTIVATE_STRATEGY or a trusted GNN.
+        """Build every admissible ``(symbol, strategy, direction)`` proposal.
 
-        Election and entry timing stay separate responsibilities. A fresh
-        admissibility decision may arm a strategy whose tick trigger is not ready;
-        the owned strategy executor then waits in ARMED without placing an order.
+        The GNN already emits a vector for every strategy.  Older code discarded
+        that vector after choosing one strategy inside each symbol, then compared
+        only those per-symbol winners.  That nested ranking used a different
+        objective from the final bandit and could therefore discard the global
+        winner.  Validation rows carry the full vector without order authority;
+        this method converts them into proposals and leaves the one final choice to
+        the global bandit.
         """
         proposals: list[_ElectionProposal] = []
-        claimed = set()
+        ranked_intents = tuple(getattr(bundle, "ranked_trade_intents", ()) or ())
+        micro_results = tuple(getattr(bundle, "micro_results", ()) or ())
         for symbol in candidates:
             normalized = str(symbol or "").upper()
-            if normalized in claimed:
-                continue
             row = evidence.get(normalized) if isinstance(evidence, Mapping) else None
             if not isinstance(row, Mapping) or not self._fresh_evidence(row, now):
                 continue
@@ -1498,80 +1688,319 @@ class StrategySessionManager:
                 and is_known_strategy(gnn_strategy)
                 and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
             )
-            if not gnn_actionable and (
-                self.config.require_live_gnn and not self.config.bandit_enabled
+            strategy_rows = [
+                item
+                for item in tuple(row.get("validation_candidates") or ())
+                if isinstance(item, Mapping)
+                and str(item.get("path") or "") == "cpu_gnn_validation"
+                and is_known_strategy(str(item.get("strategy_id") or ""))
+            ]
+            # Backward compatibility for logs written before full-vector rows were
+            # persisted.  New rows normally take the branch above.
+            if not strategy_rows and gnn_strategy:
+                strategy_rows = [gnn]
+            if ontology_actionable and not any(
+                str(item.get("strategy_id") or "") == ontology_strategy
+                for item in strategy_rows
             ):
-                continue
-            if not gnn_actionable and not ontology_actionable:
-                continue
-            selected_strategy = (
-                gnn_strategy if gnn_actionable else ontology_strategy
+                strategy_rows.append(ontology)
+
+            intent = next(
+                (
+                    item
+                    for item in ranked_intents
+                    if str(getattr(item, "symbol", "") or "").upper() == normalized
+                ),
+                None,
             )
-            if not selected_strategy:
-                continue
-            direction, product, deployment_state, borrow_snapshot, borrow_reasons = (
-                self._resolve_direction_context(selected_strategy, normalized, now)
+            micro_result = next(
+                (
+                    item
+                    for item in micro_results
+                    if str(getattr(item, "symbol", "") or "").upper() == normalized
+                ),
+                None,
             )
-            if deployment_state is StrategyDeploymentState.DISABLED:
-                self._state.last_reason = (
-                    f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
+            for strategy_row in strategy_rows:
+                selected_strategy = str(strategy_row.get("strategy_id") or "")
+                if not selected_strategy:
+                    continue
+                row_reasons = list(strategy_row.get("reason_codes") or ())
+                row_trusted = "GNN_REALTIME_TRUST_PASSED" in row_reasons
+                row_path = str(strategy_row.get("path") or "")
+                row_is_gnn = row_path.startswith("cpu_gnn")
+                row_is_validation = row_path == "cpu_gnn_validation"
+                row_actionable = row_is_gnn and row_trusted
+                # Full-vector rows are evidence, not permission.  Keep untrusted
+                # rows as SHADOW proposals so they are compared and journalled,
+                # but force their deployment state below to SHADOW.  The previous
+                # ``continue`` made the trust gate self-locking: no proposal meant
+                # no forward outcome, hence no strategy could ever earn trust.
+                # A legacy untrusted winner row is not a full-vector validation
+                # sample and retains the historical hard skip.
+                if row_is_gnn and not row_actionable and not row_is_validation:
+                    continue
+                direction, product, deployment_state, borrow_snapshot, borrow_reasons = (
+                    self._resolve_direction_context(selected_strategy, normalized, now)
                 )
-                continue
-            # Preserve non-authorised and no-locate arms as SHADOW evidence.
-            # Order capability is derived separately by ``submits_orders``.
-            # The shadow evidence path does not know the macro regime, so it
-            # would happily arm a strategy family the macro layer has blocked.
-            # The supervisor would then flag it every cycle; refuse it here.
-            if _macro_permits(bundle, selected_strategy) is False:
-                self._state.last_reason = (
-                    f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
+                # An untrusted validation vector has no MODEL order authority,
+                # but it must not revoke an algorithm's independent deployment
+                # authorization.  The mechanical trigger supplies the forward
+                # edge below and the bandit's cold-start exploration policy keeps
+                # sizing conservative. Deployment-gated strategies remain SHADOW
+                # because _resolve_direction_context already returned SHADOW.
+                if deployment_state is StrategyDeploymentState.DISABLED:
+                    self._state.last_reason = (
+                        f"{ShortReasonCodes.DEPLOYMENT_DISABLED}:{selected_strategy}"
+                    )
+                    continue
+                if _macro_permits(bundle, selected_strategy) is False:
+                    self._state.last_reason = (
+                        f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
+                    )
+                    continue
+                geometry = _resolved_geometry(
+                    selected_strategy,
+                    expected_cost_bps=_optional_float(
+                        strategy_row.get("expected_cost_bps")
+                    ),
+                    micro_result=micro_result,
+                    evidence_row=row if isinstance(row, Mapping) else None,
                 )
-                continue
-            stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(selected_strategy)
-            profit_bps = _cost_aware_profit_bps(gnn, profit_bps)
-            claimed.add(normalized)
-            proposals.append(
-                _ElectionProposal(
+                stop_bps = geometry.stop_loss_bps
+                profit_bps = geometry.take_profit_bps
+                trailing_bps = geometry.trailing_bps
+                profit_bps = _cost_aware_profit_bps(strategy_row, profit_bps)
+                entry_price = _optional_float(
+                    getattr(intent, "expected_entry_price", None)
+                )
+                if entry_price is None:
+                    entry_price = _optional_float(row.get("mark_price"))
+                expected_exit = _optional_float(
+                    getattr(intent, "expected_exit_price", None)
+                )
+                target_rate = max(
+                    self.config.fallback_target_return_rate,
+                    profit_bps / 10_000.0,
+                )
+                if entry_price and expected_exit:
+                    favourable = (
+                        expected_exit > entry_price
+                        if direction is PositionDirection.LONG
+                        else expected_exit < entry_price
+                    )
+                    if favourable:
+                        target_rate = max(
+                            target_rate,
+                            abs(expected_exit / entry_price - 1.0),
+                        )
+                mechanical = self._mechanical_entry_verdict(
                     symbol=normalized,
                     strategy_id=selected_strategy,
-                    source=(
-                        "GNN_STRATEGY_ELECTION"
-                        if gnn_actionable
-                        else "ONTOLOGY_STRATEGY_ELECTION"
-                    ),
-                    entry_price=None,
-                    target_return_rate=max(
-                        self.config.fallback_target_return_rate,
-                        profit_bps / 10_000.0,
-                    ),
-                    stop_loss_rate=stop_bps / 10_000.0,
-                    trailing_stop_rate=trailing_bps / 10_000.0,
-                    max_holding_seconds=_strategy_max_holding_seconds(selected_strategy),
-                    score=0.0,
-                    confidence=0.0,
-                    expected_net_return_bps=_optional_float(gnn.get("expected_net_return_bps")),
-                    expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
-                    gnn_actionable=gnn_actionable,
-                    gnn_action=gnn_action,
-                    gnn_reason_codes=gnn_reason_codes,
-                    ontology_reason_codes=list(ontology.get("reason_codes") or ()),
-                    macro_regime=self._state.macro_regime or "",
-                    micro_regime="",
-                    explanation_paths=[],
-                    intent=None,
-                    candidate_count=None,
-                    micro_result=None,
                     evidence_row=row,
-                    last_reason="STRATEGY_ELECTED_WAITING_FOR_ENTRY_TRIGGER",
-                    direction=direction,
-                    position_effect=PositionEffect.OPEN,
-                    execution_product=product,
-                    deployment_state=deployment_state,
+                    now=now,
+                    macro=getattr(bundle, "macro_result", None),
+                    intent=intent,
+                    micro_result=micro_result,
+                    candidate_count=len(candidates),
                     borrow_snapshot=borrow_snapshot,
-                    borrow_reason_codes=borrow_reasons,
+                    predicted_net_edge_bps=_optional_float(
+                        strategy_row.get("expected_net_return_bps")
+                    ),
                 )
-            )
+                if mechanical is not None and not mechanical.get("triggered", False):
+                    continue
+                # Historical/replay rows can lack the feature vector required to
+                # prove an algorithm trigger.  Keep those untrusted validation
+                # rows for posterior measurement, but never let the absence of a
+                # verdict become live order authority.  A cold-start live probe is
+                # possible only when the owned algorithm actually fired above.
+                if row_is_gnn and not row_actionable and mechanical is None:
+                    deployment_state = StrategyDeploymentState.SHADOW
+                expected_cost = _optional_float(strategy_row.get("expected_cost_bps"))
+                model_net = _optional_float(strategy_row.get("expected_net_return_bps"))
+                # An untrusted GNN vector proposes a pair but cannot define its
+                # forward edge.  For a real mechanical trigger, use the strategy's
+                # own measured gross move less point-in-time cost. Trusted rows keep
+                # the trained model estimate.
+                if mechanical is not None and not row_actionable:
+                    mechanical_gross = _optional_float(mechanical.get("expected_edge_bps"))
+                    if mechanical_gross is not None:
+                        model_net = mechanical_gross - (
+                            expected_cost
+                            if expected_cost is not None
+                            else self.config.fallback_round_trip_cost_bps
+                        )
+                proposals.append(
+                    _ElectionProposal(
+                        symbol=normalized,
+                        strategy_id=selected_strategy,
+                        source=(
+                            "GNN_JOINT_SYMBOL_STRATEGY_ELECTION"
+                            if row_is_gnn
+                            else "ONTOLOGY_STRATEGY_ELECTION"
+                        ),
+                        entry_price=entry_price,
+                        target_return_rate=target_rate,
+                        stop_loss_rate=stop_bps / 10_000.0,
+                        trailing_stop_rate=trailing_bps / 10_000.0,
+                        max_holding_seconds=geometry.max_holding_seconds,
+                        score=_optional_float(strategy_row.get("utility")) or 0.0,
+                        confidence=(
+                            _optional_float(strategy_row.get("probability_success"))
+                            or 0.0
+                        ),
+                        expected_net_return_bps=model_net,
+                        expected_cost_bps=expected_cost,
+                        gnn_actionable=row_actionable,
+                        gnn_action=(
+                            "ACTIVATE_STRATEGY" if row_actionable else gnn_action
+                        ),
+                        gnn_reason_codes=row_reasons,
+                        ontology_reason_codes=list(
+                            ontology.get("reason_codes") or ()
+                        ),
+                        macro_regime=self._state.macro_regime or "",
+                        micro_regime=str(
+                            getattr(
+                                getattr(micro_result, "micro_regime", None),
+                                "value",
+                                getattr(micro_result, "micro_regime", ""),
+                            )
+                            or ""
+                        ),
+                        explanation_paths=[],
+                        intent=intent,
+                        candidate_count=len(candidates),
+                        micro_result=micro_result,
+                        evidence_row=row,
+                        last_reason="JOINT_SYMBOL_STRATEGY_ARMED",
+                        direction=direction,
+                        position_effect=PositionEffect.OPEN,
+                        execution_product=product,
+                        deployment_state=deployment_state,
+                        borrow_snapshot=borrow_snapshot,
+                        borrow_reason_codes=borrow_reasons,
+                    )
+                )
         return proposals
+
+    def _mechanical_entry_verdict(
+        self,
+        *,
+        symbol: str,
+        strategy_id: str,
+        evidence_row: Mapping[str, Any] | None,
+        now: datetime,
+        macro: Any,
+        intent: Any,
+        micro_result: Any,
+        candidate_count: int,
+        borrow_snapshot: Any,
+        predicted_net_edge_bps: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Run the strategy's own entry trigger before scoring or journalling.
+
+        ``None`` preserves old/replay fixtures that have no point-in-time feature
+        snapshot. Production evidence always has one. A concrete HOLD is retained
+        for diagnostics but cannot become a proposal, shadow outcome, posterior
+        sample, or live order.
+        """
+        raw_features = (
+            evidence_row.get("technical_features")
+            if isinstance(evidence_row, Mapping)
+            else None
+        )
+        if not isinstance(raw_features, Mapping):
+            return None
+        try:
+            from app.technical.signals import TechnicalFeatureSet
+            from app.technical.strategy_algorithms import ElectionContext, get_algorithm
+
+            feature_names = TechnicalFeatureSet.__dataclass_fields__.keys()
+            features = TechnicalFeatureSet(
+                **{key: value for key, value in raw_features.items() if key in feature_names}
+            )
+            algorithm = get_algorithm(strategy_id)
+            if algorithm is None:
+                decision = {
+                    "strategy_id": strategy_id,
+                    "triggered": False,
+                    "score": 0.0,
+                    "confidence": 0.0,
+                    "expected_edge_bps": 0.0,
+                    "horizon_seconds": 0,
+                    "reason_codes": ["STRATEGY_IMPLEMENTATION_MISSING"],
+                    "diagnostics": {},
+                }
+            else:
+                context = self._election_context(
+                    strategy_id,
+                    now,
+                    intent=intent,
+                    candidate_count=candidate_count,
+                    micro_result=micro_result,
+                    evidence_row=evidence_row,
+                    macro=macro,
+                    symbol=symbol,
+                    change_point_probability=self._state.change_point_probability,
+                    borrow_snapshot=borrow_snapshot,
+                )
+                if predicted_net_edge_bps is not None:
+                    context["expected_net_return_bps"] = float(predicted_net_edge_bps)
+                allowed = ElectionContext.__dataclass_fields__.keys()
+                payload = {
+                    key: value
+                    for key, value in context.items()
+                    if key in allowed and key != "elected_at"
+                }
+                payload["strategy_id"] = strategy_id
+                payload["elected_at"] = now
+                decision = algorithm.entry(
+                    features,
+                    ElectionContext(**payload),
+                ).as_dict()
+        except Exception as exc:  # noqa: BLE001 - malformed live evidence fails closed.
+            decision = {
+                "strategy_id": strategy_id,
+                "triggered": False,
+                "score": 0.0,
+                "confidence": 0.0,
+                "expected_edge_bps": 0.0,
+                "horizon_seconds": 0,
+                "reason_codes": [f"STRATEGY_ENTRY_EVALUATION_ERROR:{type(exc).__name__}"],
+                "diagnostics": {},
+            }
+        self._state.algorithm_evaluations.append({"symbol": symbol, **decision})
+        return decision
+
+    @staticmethod
+    def _deduplicate_joint_proposals(
+        proposals: list["_ElectionProposal"],
+    ) -> list["_ElectionProposal"]:
+        """Keep one rich proposal for each global election arm."""
+        selected: dict[tuple[str, str, PositionDirection], _ElectionProposal] = {}
+        for proposal in proposals:
+            key = (proposal.symbol, proposal.strategy_id, proposal.direction)
+            incumbent = selected.get(key)
+            if incumbent is None:
+                selected[key] = proposal
+                continue
+            incumbent_quality = (
+                incumbent.intent is not None,
+                incumbent.gnn_actionable,
+                incumbent.expected_net_return_bps is not None,
+                incumbent.confidence,
+            )
+            proposal_quality = (
+                proposal.intent is not None,
+                proposal.gnn_actionable,
+                proposal.expected_net_return_bps is not None,
+                proposal.confidence,
+            )
+            if proposal_quality > incumbent_quality:
+                selected[key] = proposal
+        return list(selected.values())
 
     @staticmethod
     def _deployment_authorized(strategy_id: str) -> tuple[bool, str]:
@@ -1665,13 +2094,29 @@ class StrategySessionManager:
 
     # -- shadow journaling -------------------------------------------------- #
     def _journal_shadow_proposals(
-        self, proposals: list["_ElectionProposal"], now: datetime
+        self,
+        proposals: list["_ElectionProposal"],
+        now: datetime,
+        *,
+        counterfactual: bool = False,
+        exclude: "_ElectionProposal | None" = None,
     ) -> None:
-        """Write a :class:`ShadowTradePlan` for every non-order-authorised proposal.
+        """Write a :class:`ShadowTradePlan` for proposals that produced no order.
 
-        This is the mechanism by which a SHADOW short earns its way to LIVE_PROBE, and
-        the reason a SHADOW arm is evaluated at all rather than skipped. Three
-        properties are load-bearing:
+        Two callers, one mechanism:
+
+        * ``counterfactual=False`` (before selection) journals the non-order-authorised
+          proposals. This is how a SHADOW short earns its way to LIVE_PROBE.
+        * ``counterfactual=True`` (after selection) journals the order-authorised
+          proposals that lost the election, ``exclude`` being the winner. Its outcome
+          is recorded from the real fill instead, so journaling it here would score
+          the same trade twice against the same arm.
+
+        The second case exists because without it the evidence channel only feeds arms
+        that are forbidden from trading. An arm allowed to trade produced a sample only
+        by winning, and could only win on a posterior it had no way to accumulate.
+
+        Three properties are load-bearing:
 
         * The plan is written NOW, with the entry reference, barriers and borrow
           observation frozen. Scoring happens later, from later data only.
@@ -1695,7 +2140,12 @@ class StrategySessionManager:
         recorded: list[str] = []
         pending: list[Any] = []
         for proposal in proposals:
-            if proposal.submits_orders:
+            if counterfactual:
+                # The winner's outcome comes from its real fill; journaling it here
+                # would enter the same trade twice into the same arm's posterior.
+                if not proposal.submits_orders or proposal is exclude:
+                    continue
+            elif proposal.submits_orders:
                 continue
             entry_reference = proposal.entry_price
             if not entry_reference or entry_reference <= 0:
@@ -1704,9 +2154,20 @@ class StrategySessionManager:
                 # this whole module exists to prevent.
                 continue
             try:
+                key = proposal.directional_key(market_for_symbol(proposal.symbol))
+                spacing_seconds = max(
+                    self.config.shadow_signal_cooldown_seconds,
+                    min(int(proposal.max_holding_seconds), 900),
+                )
+                recent_reader = getattr(store, "has_recent_plan", None)
+                if callable(recent_reader) and recent_reader(
+                    key, proposal.symbol,
+                    since=now - timedelta(seconds=spacing_seconds),
+                ):
+                    continue
                 plan = ShadowTradePlan(
                     plan_id="",
-                    key=proposal.directional_key(market_for_symbol(proposal.symbol)),
+                    key=key,
                     symbol=proposal.symbol,
                     signal_at=now,
                     entry_reference_price=float(entry_reference),
@@ -1725,7 +2186,11 @@ class StrategySessionManager:
                     ),
                     predicted_success_probability=proposal.confidence or None,
                     regime=self._state.macro_regime or "UNKNOWN",
-                    signal_reason_codes=tuple(proposal.ontology_reason_codes),
+                    signal_reason_codes=(
+                        (*proposal.ontology_reason_codes, _COUNTERFACTUAL_REASON_CODE)
+                        if counterfactual
+                        else tuple(proposal.ontology_reason_codes)
+                    ),
                     borrow_snapshot=proposal.borrow_snapshot,
                     borrow_reason_codes=proposal.borrow_reason_codes,
                     deployment_state=str(proposal.deployment_state),
@@ -1736,13 +2201,24 @@ class StrategySessionManager:
                 recorded.append(plan.plan_id)
                 pending.append(plan)
         if recorded:
-            self._state.shadow_plan_ids = recorded[:16]
+            # Extend rather than replace: the counterfactual pass runs after the
+            # SHADOW pass in the same cycle, and overwriting here would drop the
+            # shorts' plan ids from the state the dashboard reads.
+            self._state.shadow_plan_ids = (
+                [*self._state.shadow_plan_ids, *recorded][:16]
+                if counterfactual
+                else recorded[:16]
+            )
         # Hand the plan objects to the evaluation service so its barrier walk starts on
         # the NEXT quote. Passing objects rather than ids keeps the frozen borrow
         # snapshot intact — a re-read from the journal would have to re-resolve it, and
         # that is the one place a fresher locate could sneak in.
         if pending:
-            self._pending_shadow_plans = pending
+            self._pending_shadow_plans = (
+                [*(self._pending_shadow_plans or []), *pending]
+                if counterfactual
+                else pending
+            )
 
     # -- bandit scoring ---------------------------------------------------- #
     def _reset_bandit_diagnostics(self) -> None:
@@ -1755,6 +2231,62 @@ class StrategySessionManager:
         self._state.bandit_shadow_arms = []
         self._state.bandit_evaluated_at = None
         self._state.directional_comparison = {}
+        self._state.algorithm_evaluations = []
+
+    def _gnn_direct_choice(
+        self,
+        executable: list["_ElectionProposal"],
+        _now: datetime | None = None,
+    ) -> "_ElectionProposal":
+        """Arm the GNN's own top pick. Always returns a proposal -- never NO_TRADE.
+
+        Ranking mirrors ``StrategyRouter``: highest forward net edge first, then
+        the model's score and confidence, then the id so the choice is stable
+        across cycles. ``gnn_actionable`` proposals outrank ones the model could
+        not speak to at all -- honouring the model's pick presupposes it made one.
+
+        No pessimistic bound, no realized-history posterior, no regime discount:
+        the edge is taken at face value, which is the whole point of the posture.
+        """
+        self._reset_bandit_diagnostics()
+
+        def key(proposal: "_ElectionProposal") -> tuple[int, float, float, float, str]:
+            edge = proposal.predicted_net_edge_bps(
+                # No absence penalty: this posture does not dock a candidate for
+                # the model's silence, it simply ranks silent ones last.
+                0.0,
+                self.config.fallback_round_trip_cost_bps,
+            )
+            return (
+                1 if proposal.gnn_actionable else 0,
+                float(edge) if edge is not None else float("-inf"),
+                float(proposal.score or 0.0),
+                float(proposal.confidence or 0.0),
+                proposal.strategy_id,
+            )
+
+        chosen = max(executable, key=key)
+        edge = chosen.predicted_net_edge_bps(
+            0.0, self.config.fallback_round_trip_cost_bps
+        )
+        self._state.bandit_evaluated_at = _iso(_now or datetime.now(timezone.utc))
+        self._state.bandit_selected_arm = chosen.strategy_id
+        self._state.bandit_conservative_edge_bps = (
+            float(edge) if edge is not None else None
+        )
+        # Not exploration: this is a conviction pick, and labelling it otherwise
+        # would let an operator read a loss as a deliberate probe.
+        self._state.bandit_is_exploration = False
+        self._state.bandit_reason_codes = [
+            "GNN_DIRECT_ELECTION",
+            (
+                "GNN_ESTIMATE_PRESENT"
+                if chosen.gnn_actionable
+                else "GNN_ESTIMATE_UNAVAILABLE_RANKED_LAST"
+            ),
+            f"CANDIDATES:{len(executable)}",
+        ]
+        return chosen
 
     def _bandit_choice(
         self,
@@ -2141,8 +2673,10 @@ class StrategySessionManager:
             # Both legs of each session-boxed thesis read the same clock facts.
             "market_intraday_momentum_short",
             "opening_range_breakdown",
+            # The carry is entered from the same clock facts, one session later.
+            "overnight_gap_carry",
         }:
-            context.update(_session_structure_context(now))
+            context.update(_session_structure_context(now, symbol))
             if isinstance(diagnostics, Mapping):
                 for key in (
                     "opening_range_high",

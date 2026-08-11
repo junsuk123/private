@@ -21,6 +21,28 @@ from app.data.realtime_types import (
 MarketEvent: TypeAlias = RealtimeTradeTick | RealtimeOrderbookSnapshot
 
 
+def _paired_feed_key(meta: FeedMetadata) -> tuple[object, ...]:
+    """Identity shared by the trade and orderbook TRs for one logical feed.
+
+    ``FeedMetadata.stream_id`` deliberately contains ``tr_id`` because persisted
+    trade and book rows are separate physical streams (H0STCNT0 vs H0STASP0).
+    A minute bar, however, needs the matching book from the same venue/feed.
+    Everything except the transport TR must agree before the two are paired.
+    """
+    return (
+        meta.market_group,
+        str(meta.exchange or "").upper(),
+        meta.venue,
+        meta.session,
+        str(meta.currency or "").upper(),
+        meta.feed_scope,
+        str(meta.subscription_key or "").upper(),
+        bool(meta.is_consolidated),
+        bool(meta.is_tradeable),
+        bool(meta.metadata_inferred),
+    )
+
+
 def _minute_bar_refresh_interval_seconds() -> float:
     raw = os.getenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "2.0")
     try:
@@ -284,7 +306,11 @@ class IncrementalMinuteBarBuilder:
     _volume: int = 0
     _notional: float = 0.0
     _count: int = 0
+    _price_sum: float = 0.0
+    _price_square_sum: float = 0.0
     _source_ids: list[str] = field(default_factory=list)
+    _latest_book: RealtimeOrderbookSnapshot | None = None
+    _latest_received_at: datetime | None = None
 
     def update(self, tick: RealtimeTradeTick) -> RealtimeMinuteBar | None:
         minute = tick.exchange_timestamp.replace(second=0, microsecond=0)
@@ -298,12 +324,50 @@ class IncrementalMinuteBarBuilder:
             self._volume += max(0, tick.volume)
             self._notional += tick.price * max(0, tick.volume)
             self._count += 1
+            self._price_sum += tick.price
+            self._price_square_sum += tick.price * tick.price
             self._source_ids.append(tick.record_id)
+            self._latest_received_at = max(
+                self._latest_received_at or tick.received_at,
+                tick.received_at,
+            )
         return completed
+
+    def update_orderbook(self, book: RealtimeOrderbookSnapshot) -> bool:
+        """Attach a same-minute book from the paired feed without crossing venues."""
+        if self._minute_start is None:
+            return False
+        if _paired_feed_key(book.meta) != _paired_feed_key(self._meta):
+            return False
+        minute = book.exchange_timestamp.replace(second=0, microsecond=0)
+        if minute != self._minute_start:
+            return False
+        if (
+            self._latest_book is not None
+            and book.exchange_timestamp < self._latest_book.exchange_timestamp
+        ):
+            return False
+        self._latest_book = book
+        self._latest_received_at = max(
+            self._latest_received_at or book.received_at,
+            book.received_at,
+        )
+        return True
 
     def current_bar(self) -> RealtimeMinuteBar | None:
         if self._minute_start is None:
             return None
+        variance = max(
+            0.0,
+            self._price_square_sum / max(1, self._count)
+            - (self._price_sum / max(1, self._count)) ** 2,
+        )
+        now = datetime.now(timezone.utc)
+        last_update_age_ms = (
+            max(0.0, (now - self._latest_received_at).total_seconds() * 1000)
+            if self._latest_received_at is not None
+            else 0.0
+        )
         return RealtimeMinuteBar(
             symbol=self.symbol,
             minute_start=self._minute_start,
@@ -314,11 +378,13 @@ class IncrementalMinuteBarBuilder:
             volume=self._volume,
             vwap=self._notional / self._volume if self._volume else self._close,
             trade_count=self._count,
-            spread_bps=0.0,
-            orderbook_imbalance=0.0,
-            liquidity_score=0.0,
-            volatility=0.0,
-            last_update_age_ms=0.0,
+            spread_bps=self._latest_book.spread_bps if self._latest_book else 0.0,
+            orderbook_imbalance=self._latest_book.imbalance if self._latest_book else 0.0,
+            # Keep the established minute-bar definition used by the historical
+            # rebuild path: traded volume, capped to [0, 1].
+            liquidity_score=min(1.0, self._volume / 100_000.0),
+            volatility=variance**0.5,
+            last_update_age_ms=last_update_age_ms,
             source_record_ids=tuple(self._source_ids),
             meta=self._meta,
         )
@@ -330,7 +396,11 @@ class IncrementalMinuteBarBuilder:
         self._volume = max(0, tick.volume)
         self._notional = tick.price * self._volume
         self._count = 1
+        self._price_sum = tick.price
+        self._price_square_sum = tick.price * tick.price
         self._source_ids = [tick.record_id]
+        self._latest_book = None
+        self._latest_received_at = tick.received_at
 
 
 @dataclass(frozen=True)
@@ -355,7 +425,8 @@ class EventDrivenMarketRuntime:
         self.bus = bus
         self.store = store
         self.state = MarketState()
-        self._bars: dict[str, IncrementalMinuteBarBuilder] = {}
+        self._bars: dict[tuple[str, str], IncrementalMinuteBarBuilder] = {}
+        self._pending_books: dict[tuple[str, tuple[object, ...]], RealtimeOrderbookSnapshot] = {}
         self._persistence: asyncio.Queue[
             tuple[MarketEvent, RealtimeMinuteBar | None]
         ] = asyncio.Queue(maxsize=persistence_capacity)
@@ -380,11 +451,17 @@ class EventDrivenMarketRuntime:
         if isinstance(event, RealtimeTradeTick):
             # builder 는 (symbol, stream) 단위다. 스트림을 섞으면 venue 가 다른 체결이
             # 한 bar 로 합산되고 거래량이 이중 계산된다.
+            builder_key = (event.symbol, event.meta.stream_id)
             builder = self._bars.setdefault(
-                (event.symbol, event.meta.stream_id),
+                builder_key,
                 IncrementalMinuteBarBuilder(event.symbol),
             )
             completed_bar = builder.update(event)
+            pending = self._pending_books.get(
+                (event.symbol, _paired_feed_key(event.meta))
+            )
+            if pending is not None:
+                builder.update_orderbook(pending)
             if completed_bar is None:
                 # 진행 중인 분도 주기적으로 저장한다.
                 #
@@ -397,7 +474,20 @@ class EventDrivenMarketRuntime:
                 # (초기 구현이 그랬다) 6GB 규모 DB 에서 심볼당 2초마다 조회+upsert 가
                 # 발생해 lock 경합으로 조용히 실패하고, 틱은 계속 쌓이는데 bar 만
                 # 사라지는 상태가 된다.
-                completed_bar = self._current_bar_if_due(event, builder)
+                completed_bar = self._current_bar_if_due(builder_key, builder)
+        else:
+            pending_key = (event.symbol, _paired_feed_key(event.meta))
+            previous = self._pending_books.get(pending_key)
+            if previous is None or event.exchange_timestamp >= previous.exchange_timestamp:
+                self._pending_books[pending_key] = event
+            for builder_key, builder in self._bars.items():
+                if builder_key[0] != event.symbol or not builder.update_orderbook(event):
+                    continue
+                # Persist the enriched in-progress bar even when the next trade
+                # is quiet. The same debounce used for trade flushes prevents a
+                # busy orderbook from turning every snapshot into a DB upsert.
+                if completed_bar is None:
+                    completed_bar = self._current_bar_if_due(builder_key, builder)
         if self.store is not None:
             try:
                 self._persistence.put_nowait((event, completed_bar))
@@ -439,10 +529,11 @@ class EventDrivenMarketRuntime:
         )
 
     def _current_bar_if_due(
-        self, event: RealtimeTradeTick, builder: "IncrementalMinuteBarBuilder"
+        self,
+        key: tuple[str, str],
+        builder: "IncrementalMinuteBarBuilder",
     ) -> RealtimeMinuteBar | None:
         """진행 중인 분 bar 를 최소 간격마다 한 번씩 내보낸다 (메모리에서, DB 조회 없음)."""
-        key = (event.symbol, event.meta.stream_id)
         interval = _minute_bar_refresh_interval_seconds()
         stamp = time.monotonic()
         previous = self._minute_bar_flushed.get(key)

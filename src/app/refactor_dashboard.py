@@ -1081,6 +1081,7 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "market_intraday_momentum_short": ["First 30m Return", "First 30m Volatility", "Borrow"],
         "opening_range_breakdown": ["Opening Range High", "Opening Range Low", "Sell Flow", "Borrow"],
         "residual_relative_weakness": ["Sector Rank", "Residual Return", "Borrow"],
+        "overnight_gap_carry": ["Close Clock", "VWAP Premium", "Day Volatility"],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
 
@@ -1168,7 +1169,7 @@ def _decision_ontology(
         if sector_rank is not None and sector_size is not None and sector_size > 1
         else None
     )
-    session_values = _dashboard_session_context(bars)
+    session_values = _dashboard_session_context(bars, symbol)
     rvgi_result = None
     box_result = None
     try:
@@ -1385,6 +1386,11 @@ def _decision_ontology(
         ],
         "opening_range_breakdown": [("opening_range", "<=", .2), ("volume", ">=", .65)],
         "residual_relative_weakness": [("relative_strength", "<=", .2), ("liquidity", ">=", .65)],
+        "overnight_gap_carry": [
+            ("overnight_carry_window", ">=", .8),
+            ("vwap_deviation", ">=", .8),
+            ("first_half_hour_volatility", ">=", .65),
+        ],
     }
     ontology_strategy = str(
         selection.get("ontology_strategy_id") or selection.get("strategy_id") or ""
@@ -1487,8 +1493,14 @@ def _decision_ontology(
     }
 
 
-def _dashboard_session_context(bars: list[dict[str, Any]]) -> dict[str, Any]:
-    """Reconstruct price session facts with the same causal authority as serving."""
+def _dashboard_session_context(
+    bars: list[dict[str, Any]], symbol: str = ""
+) -> dict[str, Any]:
+    """Reconstruct price session facts with the same causal authority as serving.
+
+    ``symbol`` selects the exchange clock; without it the KRX window would be
+    applied to US bars, which is the mismatch this replay exists to detect.
+    """
     parsed: list[tuple[datetime, dict[str, Any]]] = []
     for row in bars:
         raw = row.get("time") or row.get("minute_start")
@@ -1502,12 +1514,20 @@ def _dashboard_session_context(bars: list[dict[str, Any]]) -> dict[str, Any]:
     if not parsed:
         return {"price_complete": False, "price_field_count": 0}
     parsed.sort(key=lambda item: item[0])
-    kst = timezone(timedelta(hours=9))
-    latest_day = parsed[-1][0].astimezone(kst).date()
+    session = session_structure.regular_session(symbol)
+    kst = session.zone
+    now = parsed[-1][0] + timedelta(minutes=1)
+    latest_day = session.trading_day(now)
     current = [row for start, row in parsed if start.astimezone(kst).date() == latest_day]
     prior = [(start, row) for start, row in parsed if start.astimezone(kst).date() < latest_day]
-    session_open = datetime(latest_day.year, latest_day.month, latest_day.day, 9, 0, tzinfo=kst)
-    now = parsed[-1][0] + timedelta(minutes=1)
+    session_open = datetime(
+        latest_day.year,
+        latest_day.month,
+        latest_day.day,
+        session.open_time.hour,
+        session.open_time.minute,
+        tzinfo=kst,
+    )
     observed = session_structure.opening_range(
         current, session_open=session_open, minutes=30, now=now
     )
@@ -1531,7 +1551,14 @@ def _dashboard_session_context(bars: list[dict[str, Any]]) -> dict[str, Any]:
     prior_days = sorted({start.astimezone(kst).date() for start, _ in prior})
     for day in prior_days:
         day_bars = [row for start, row in prior if start.astimezone(kst).date() == day]
-        day_open = datetime(day.year, day.month, day.day, 9, 0, tzinfo=kst)
+        day_open = datetime(
+            day.year,
+            day.month,
+            day.day,
+            session.open_time.hour,
+            session.open_time.minute,
+            tzinfo=kst,
+        )
         past = session_structure.opening_range(
             day_bars, session_open=day_open, minutes=30,
             now=day_open + timedelta(days=1),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,9 @@ class ShadowDecision:
     realtime_trust_samples: int | None = None
     validation_strategy_id: str | None = None
     checkpoint_hash: str | None = None
+    # Direction is part of an executable arm.  Persist it with validation rows so
+    # forward outcome replay never has to treat a short forecast as a long one.
+    position_direction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,9 +44,41 @@ class ShadowComparison:
 class ShadowComparisonRecorder:
     """Comparison-only telemetry. It deliberately exposes no broker dependency."""
 
-    def __init__(self, path: str | Path = "logs/refactor-shadow-comparison.jsonl") -> None:
+    def __init__(
+        self,
+        path: str | Path = "logs/refactor-shadow-comparison.jsonl",
+        *,
+        max_bytes: int | None = None,
+        backup_count: int = 3,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = max(
+            1,
+            int(
+                max_bytes
+                if max_bytes is not None
+                else os.getenv("SHADOW_COMPARISON_MAX_BYTES", str(256 * 1024 * 1024))
+            ),
+        )
+        self.backup_count = max(1, int(backup_count))
+        self._write_lock = threading.Lock()
+
+    def _rotate_if_needed(self, incoming_bytes: int) -> None:
+        try:
+            current_bytes = self.path.stat().st_size
+        except FileNotFoundError:
+            return
+        if current_bytes + incoming_bytes <= self.max_bytes:
+            return
+
+        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.backup_count - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            if source.exists():
+                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
+        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
 
     def compare(
         self,
@@ -67,6 +104,9 @@ class ShadowComparisonRecorder:
         )
         payload = asdict(comparison)
         payload["as_of"] = as_of.isoformat()
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        line = json.dumps(payload, sort_keys=True) + "\n"
+        with self._write_lock:
+            self._rotate_if_needed(len(line.encode("utf-8")))
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
         return comparison

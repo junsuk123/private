@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.data.event_pipeline import (
@@ -10,7 +11,9 @@ from app.data.event_pipeline import (
     IncrementalMinuteBarBuilder,
     MarketState,
 )
+from app.data.market_capabilities import FeedScope, MarketGroup, SessionId, Venue
 from app.data.realtime_types import (
+    FeedMetadata,
     KIS_REALTIME_SOURCE,
     OrderbookLevel,
     RealtimeOrderbookSnapshot,
@@ -44,6 +47,20 @@ def _book(second: int, bid: float, ask: float, sequence: int) -> RealtimeOrderbo
         source=KIS_REALTIME_SOURCE,
         levels=(OrderbookLevel(bid, 120, ask, 80),),
         sequence_key=f"book-{sequence}",
+    )
+
+
+def _krx_meta(tr_id: str, *, venue: Venue = Venue.KRX) -> FeedMetadata:
+    return FeedMetadata(
+        market_group=MarketGroup.KR,
+        exchange=venue.value,
+        venue=venue,
+        session=SessionId.KRX_REGULAR if venue is Venue.KRX else SessionId.NXT_REGULAR,
+        currency="KRW",
+        feed_scope=FeedScope.VENUE_SPECIFIC,
+        tr_id=tr_id,
+        subscription_key="005930",
+        is_tradeable=True,
     )
 
 
@@ -117,6 +134,86 @@ def test_incremental_bar_emits_closed_minute_without_history_recompute() -> None
     )
     assert completed.volume == 20
     assert completed.trade_count == 2
+
+
+def test_incremental_bar_attaches_paired_orderbook_microstructure() -> None:
+    builder = IncrementalMinuteBarBuilder("005930")
+    tick = _tick(0, 70000, 1).with_meta(_krx_meta("H0STCNT0"))
+    book = _book(1, 69900, 70100, 1).with_meta(_krx_meta("H0STASP0"))
+
+    assert builder.update(tick) is None
+    assert builder.update_orderbook(book)
+    bar = builder.current_bar()
+
+    assert bar is not None
+    assert bar.stream_id == tick.meta.stream_id
+    assert bar.spread_bps == book.spread_bps
+    assert bar.orderbook_imbalance == book.imbalance
+    assert bar.liquidity_score == 10 / 100_000
+
+
+def test_incremental_bar_rejects_orderbook_from_another_venue() -> None:
+    builder = IncrementalMinuteBarBuilder("005930")
+    tick = _tick(0, 70000, 1).with_meta(_krx_meta("H0STCNT0"))
+    nxt_book = _book(1, 69900, 70100, 1).with_meta(
+        _krx_meta("H0NXASP0", venue=Venue.NXT)
+    )
+
+    builder.update(tick)
+
+    assert not builder.update_orderbook(nxt_book)
+    assert builder.current_bar().spread_bps == 0.0  # type: ignore[union-attr]
+
+
+def test_runtime_pairs_book_arriving_after_trade_despite_different_tr_ids(
+    monkeypatch,
+) -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.bars = []
+
+        def save_ticks(self, _values):
+            pass
+
+        def save_orderbooks(self, _values):
+            pass
+
+        def save_minute_bars(self, values):
+            self.bars.extend(values)
+
+    async def scenario() -> Store:
+        monkeypatch.setenv("REALTIME_MINUTE_BAR_REBUILD_SEC", "0")
+        bus = BoundedMarketEventBus(capacity=4)
+        store = Store()
+        runtime = EventDrivenMarketRuntime(bus, store=store)
+        await bus.publish(_tick(0, 70000, 1).with_meta(_krx_meta("H0STCNT0")))
+        await runtime.process_one()
+        await bus.publish(_book(1, 69900, 70100, 1).with_meta(_krx_meta("H0STASP0")))
+        await runtime.process_one()
+        await runtime.persist_one()
+        return store
+
+    store = asyncio.run(scenario())
+
+    assert store.bars[-1].spread_bps > 0.0
+    assert store.bars[-1].orderbook_imbalance == 0.2
+
+
+def test_runtime_retains_book_that_arrives_before_first_trade() -> None:
+    async def scenario():
+        bus = BoundedMarketEventBus(capacity=4)
+        runtime = EventDrivenMarketRuntime(bus)
+        await bus.publish(_book(0, 69900, 70100, 1).with_meta(_krx_meta("H0STASP0")))
+        await runtime.process_one()
+        await bus.publish(_tick(1, 70000, 1).with_meta(_krx_meta("H0STCNT0")))
+        await runtime.process_one()
+        return next(iter(runtime._bars.values())).current_bar()
+
+    bar = asyncio.run(scenario())
+
+    assert bar is not None
+    assert bar.spread_bps > 0.0
+    assert bar.orderbook_imbalance == 0.2
 
 
 def test_fast_path_does_not_wait_for_persistence_and_reports_overflow() -> None:
@@ -241,3 +338,31 @@ def test_slow_shadow_worker_continues_after_one_inference_failure() -> None:
         return service.calls
 
     assert asyncio.run(scenario()) == 2
+
+
+def test_event_runtime_builds_current_strategy_graph_context(monkeypatch) -> None:
+    from app.data import event_runtime
+    from app.features import live_feature_frame
+    from app.features.strategy_graph_context import (
+        STRATEGY_GRAPH_CONTEXT_DIM,
+        STRATEGY_GRAPH_CONTEXT_FIELDS,
+    )
+
+    runtime = SimpleNamespace(store=object())
+    monkeypatch.setattr(live_feature_frame, "_rvgi_box_columns", lambda *a: {})
+    monkeypatch.setattr(live_feature_frame, "_slow_context_bars", lambda *a: (object(), ()))
+    monkeypatch.setattr(
+        live_feature_frame,
+        "_strategy_graph_context_columns",
+        lambda *a, **k: {name: 0.0 for name in STRATEGY_GRAPH_CONTEXT_FIELDS},
+    )
+
+    context = event_runtime._runtime_strategy_graph_context(
+        runtime,
+        "005930",
+        datetime.now(timezone.utc),
+        70_000.0,
+    )
+
+    assert context is not None
+    assert len(context) == STRATEGY_GRAPH_CONTEXT_DIM

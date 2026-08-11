@@ -43,7 +43,34 @@ STRATEGY_IDS: tuple[str, ...] = (
     "market_intraday_momentum_short",
     "opening_range_breakdown",
     "residual_relative_weakness",
+    # Completed one-minute reversal after a deep session-VWAP displacement.
+    # Appended to preserve every existing output index while giving this thesis
+    # a first-class GNN head, ontology mask, bandit arm and execution identity.
+    "bar_confirmed_vwap_recovery",
+    # The first thesis in this catalogue whose horizon crosses a session boundary.
+    #
+    # Added on cost grounds, from measurement rather than preference. A US round
+    # trip through this account is 51.2bps (settlement-verified), so an entry must
+    # expect ~61bps to be worth taking, and the median absolute move on the stored
+    # US tape is 6.7bps over 3 minutes, 16.4 over 30 and 79 over a full session.
+    # Every other long thesis here is boxed inside a horizon where that number
+    # cannot be reached, which is exactly what the strategy-utility checkpoint
+    # reports: EXECUTION_COST_EXCEEDS_GROSS_EDGE on every US strategy that fires.
+    # The overnight gap is the first window whose move clears the round trip —
+    # median 69.1bps, P(|move| > 51.2bps) = 0.62 — and it costs one round trip.
+    #
+    # It ships SHADOW-only. Magnitude is measured; DIRECTION is not: the stored
+    # sample gives an unconditional overnight mean of +15.6bps over 55 symbol-days
+    # (below cost), and the subsample carrying every price point this thesis needs
+    # is 21 rows, on which that same mean flips to -49.8. Nothing in that data can
+    # authorize a live order, so promotion is left where it belongs — forward,
+    # out-of-sample outcomes through app.trading.short_strategy_promotion's ladder.
+    "overnight_gap_carry",
 )
+
+# Compatibility alias for callers that explicitly ask for the complete catalog.
+# There is only one tier: every member is a first-class strategy.
+ALL_STRATEGY_IDS: tuple[str, ...] = STRATEGY_IDS
 
 # Catalogued strategies whose thesis is short-side. Direction is a property of the
 # STRATEGY here (each of these only ever opens SHORT), while the tradable ARM

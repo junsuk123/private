@@ -9,7 +9,7 @@ from typing import Iterable
 from app.cost.trading_cost_engine import TradingCostEngine
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.live_feature_frame import LiveFeatureFrame
-from app.strategy.exit_geometry import exit_geometry
+from app.strategy.exit_geometry import exit_geometry, resolve_exit_geometry
 from app.technical.feature_builder import technical_feature_set_from_live_frame
 from app.technical.strategy_algorithms import ElectionContext, get_algorithm
 from app.trading.directional import DirectionalStrategyKey
@@ -112,33 +112,75 @@ class MechanicalShadowCollector:
                 if previous is not None and now - previous < timedelta(seconds=self.cooldown_seconds):
                     continue
 
-                geometry = exit_geometry(self.strategy_id)
+                base_geometry = exit_geometry(self.strategy_id)
                 quantity = max(1, int(self.notional_usd / book.best_ask))
+                orderbook_snapshot = {
+                    "bid_price": book.best_bid,
+                    "ask_price": book.best_ask,
+                }
+
+                def _cost_bps(target_rate: float) -> float:
+                    estimate = self.cost_engine.estimate(
+                        symbol=symbol,
+                        market="US",
+                        venue="NASD",
+                        instrument_type="overseas_stock",
+                        entry_price=book.best_ask,
+                        expected_exit_price=book.best_ask * (1.0 + target_rate),
+                        quantity=quantity,
+                        orderbook_snapshot=orderbook_snapshot,
+                    )
+                    return estimate.total_cost_rate * 10_000.0
+
+                # Two passes, because cost and target are mutually dependent: the
+                # cost estimate needs an exit price, and the target is sized against
+                # the cost. Seed with the table's target, resolve the geometry from
+                # the resulting measurement, then re-price against the real target.
+                #
+                # This is the fix for the pathology this journal kept recording: the
+                # barriers were the KRX-sized table (65/170, built at a 28bps round
+                # trip) applied to a US tape whose median measured round trip is
+                # 63bps. Net reward:risk was 0.83, not the 1.5 the table asserts, so
+                # every arm evaluated here was being scored against a geometry that
+                # could not pay — 0.4% of 775 fills reached the target.
+                geometry = resolve_exit_geometry(
+                    self.strategy_id,
+                    round_trip_cost_bps=_cost_bps(
+                        base_geometry.take_profit_bps / 10_000.0
+                    ),
+                    spread_bps=book.spread_bps,
+                )
                 target_rate = geometry.take_profit_bps / 10_000.0
                 stop_rate = geometry.stop_loss_bps / 10_000.0
+                cost_bps = _cost_bps(target_rate)
                 # A raw absorption match can be rejected by the live expected-edge
                 # floor. That rejection carries the base algorithm horizon (120s),
                 # not the absorption thesis horizon. Shadow evaluation must still
                 # measure the configured 600-second thesis rather than silently
                 # truncating it to the unrelated shock horizon.
-                holding_seconds = min(
-                    geometry.max_holding_seconds,
+                #
+                # The horizon stretches with the target for the same reason the
+                # geometry does — a 260bps target is not reachable in the 600s a
+                # 170bps target assumed — but never past the submode's own
+                # configured maximum. With no measurement the stretch is 1.0 and
+                # this resolves to the unchanged 600s.
+                absorption_base = min(
+                    base_geometry.max_holding_seconds,
                     max(1, int(algorithm.p("absorption_horizon_seconds"))),
                 )
-                cost = self.cost_engine.estimate(
-                    symbol=symbol,
-                    market="US",
-                    venue="NASD",
-                    instrument_type="overseas_stock",
-                    entry_price=book.best_ask,
-                    expected_exit_price=book.best_ask * (1.0 + target_rate),
-                    quantity=quantity,
-                    orderbook_snapshot={
-                        "bid_price": book.best_bid,
-                        "ask_price": book.best_ask,
-                    },
+                absorption_cap = max(
+                    absorption_base, int(algorithm.p("max_absorption_horizon_seconds"))
                 )
-                cost_bps = cost.total_cost_rate * 10_000.0
+                stretch = geometry.take_profit_bps / max(
+                    1e-9, base_geometry.take_profit_bps
+                )
+                holding_seconds = int(
+                    min(
+                        absorption_cap,
+                        geometry.max_holding_seconds,
+                        max(absorption_base, absorption_base * stretch),
+                    )
+                )
                 plan = ShadowTradePlan(
                     plan_id="",
                     key=DirectionalStrategyKey.for_long(self.strategy_id, "US"),
@@ -171,8 +213,9 @@ class MechanicalShadowCollector:
                         "return_30s_bps": (features.return_30s or 0.0) * 10_000.0,
                         "orderbook_imbalance": features.orderbook_imbalance,
                         "spread_change_5s": features.spread_change_5s,
-                        "target_basis": "strategy_exit_geometry",
-                        "stop_basis": "strategy_exit_geometry",
+                        "target_basis": "cost_relative_exit_geometry",
+                        "stop_basis": "cost_relative_exit_geometry",
+                        "exit_geometry": geometry.as_dict(),
                     },
                 )
                 if not self.shadow_store.record_plan(plan):

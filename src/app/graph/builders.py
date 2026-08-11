@@ -4,7 +4,7 @@ import os
 
 from app.graph import KnowledgeGraph
 from app.market_affordability import affordability_for_market
-from app.schemas.domain import AccountSnapshot, ClassifiedEvent, IndicatorSnapshot, MarketSnapshot, SentimentDirection
+from app.schemas.domain import AccountSnapshot, ClassifiedEvent, EventType, IndicatorSnapshot, MarketSnapshot, SentimentDirection
 from app.graph.event_mapper import add_events_to_graph
 from app.graph.npu_classifier import get_ontology_npu_classifier
 from app.features.news_sentiment_store import NewsSentimentStore
@@ -137,7 +137,16 @@ def _scope_events(
         max_events = 20
     counts: dict[str, int] = {}
     selected: list[ClassifiedEvent] = []
+    macro_count = 0
     for event in sorted(events, key=lambda item: item.event_date, reverse=True):
+        # Macro/market events are intentionally ticker-less. Dropping every
+        # ticker-less event here made the dedicated macro feed invisible to both
+        # the graph and diagnostics even though it had been collected and stored.
+        if event.event_type in (EventType.MACRO, EventType.MARKET):
+            if macro_count < max_events:
+                selected.append(event)
+                macro_count += 1
+            continue
         related = tuple(ticker for ticker in event.tickers if ticker in candidate_tickers)
         if not related:
             continue

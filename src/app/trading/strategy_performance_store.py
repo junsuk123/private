@@ -45,7 +45,7 @@ import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
@@ -189,6 +189,15 @@ class StrategyPosterior:
     # is a bug rather than a wider view — see :meth:`StrategyPerformanceStore.posterior`.
     direction: str = "ALL"
     reason_codes: tuple[str, ...] = ()
+    # --- Symbol conditioning ------------------------------------------------- #
+    # The pair, not the strategy, is what gets adopted, so the score has to know
+    # which symbol it is scoring. These record how much of ``posterior_mean_net_bps``
+    # came from this symbol's own history rather than from the strategy's pooled
+    # history — ``symbol_weight`` 0.0 means "no symbol evidence, pure strategy mean".
+    symbol: str = ""
+    symbol_sample_count: int = 0
+    symbol_mean_net_bps: float | None = None
+    symbol_weight: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -208,6 +217,14 @@ class StrategyPosterior:
             "mean_slippage_error_bps": round(self.mean_slippage_error_bps, 3),
             "mean_prediction_error_bps": round(self.mean_prediction_error_bps, 3),
             "reason_codes": list(self.reason_codes),
+            "symbol": self.symbol,
+            "symbol_sample_count": self.symbol_sample_count,
+            "symbol_mean_net_bps": (
+                round(self.symbol_mean_net_bps, 3)
+                if self.symbol_mean_net_bps is not None
+                else None
+            ),
+            "symbol_weight": round(self.symbol_weight, 4),
         }
 
 
@@ -229,6 +246,35 @@ class PosteriorConfig:
     # Consecutive losses each add this much penalty (capped at 5 losses).
     loss_streak_penalty_bps: float = 8.0
     window: int = 60
+    # How far back evidence stays relevant. Without this the window only advances
+    # when a NEW outcome arrives, so an arm that stops producing outcomes keeps its
+    # last verdict forever — and since a negative verdict is exactly what stops it
+    # producing outcomes, the state is absorbing. Ageing makes the arm go cold
+    # again instead of staying condemned by a tape that no longer exists.
+    #
+    # 21 days is chosen against the trading calendar, not statistically: it is long
+    # enough to span a regime and short enough that a quarter-old result cannot
+    # veto a strategy on its own.
+    max_age_days: float = 21.0
+    # --- Symbol conditioning (partial pooling) -------------------------------- #
+    # Pseudo-observations of the STRATEGY mean that a symbol's own history must
+    # out-vote before it dominates. This is the empirical-Bayes shrinkage constant
+    # k = within-symbol variance / between-symbol variance, and it is measured, not
+    # chosen. From the 733 stored liquidity_shock_reversal outcomes across 19 symbols
+    # (2026-08-11):
+    #
+    #     within-symbol sd            131.2 bps
+    #     observed between-symbol sd   39.1 bps   (means of the 19 symbols)
+    #     expected from sampling noise 29.8 bps   (mean of sd/sqrt(n_i))
+    #     => true symbol effect sd     25.2 bps
+    #     => k = 131.2^2 / 25.2^2   ~= 27
+    #
+    # So a symbol needs ~27 of its own outcomes before its mean carries half the
+    # weight. Setting it much lower would let three unlucky fills on one name veto a
+    # strategy there; much higher discards a symbol effect that is demonstrably real.
+    #
+    # 0 disables symbol conditioning and restores the pooled strategy posterior.
+    symbol_shrinkage_weight: float = 27.0
 
     @classmethod
     def from_env(cls) -> "PosteriorConfig":
@@ -245,6 +291,14 @@ class PosteriorConfig:
                 0.0, _env_float("STRATEGY_POSTERIOR_LOSS_STREAK_PENALTY_BPS", cls.loss_streak_penalty_bps)
             ),
             window=max(5, _env_int("STRATEGY_POSTERIOR_WINDOW", cls.window)),
+            # 0 disables ageing and restores the previous unbounded behaviour.
+            max_age_days=max(0.0, _env_float("STRATEGY_POSTERIOR_MAX_AGE_DAYS", cls.max_age_days)),
+            symbol_shrinkage_weight=max(
+                0.0,
+                _env_float(
+                    "STRATEGY_POSTERIOR_SYMBOL_SHRINKAGE_WEIGHT", cls.symbol_shrinkage_weight
+                ),
+            ),
         )
 
 
@@ -253,6 +307,7 @@ POSTERIOR_BELOW_MIN_SAMPLES = "STRATEGY_POSTERIOR_BELOW_MIN_SAMPLES"
 POSTERIOR_LOSS_STREAK = "STRATEGY_POSTERIOR_LOSS_STREAK"
 POSTERIOR_REGIME_HISTORY_DISCOUNTED = "STRATEGY_POSTERIOR_REGIME_HISTORY_DISCOUNTED"
 POSTERIOR_REGIME_FALLBACK = "STRATEGY_POSTERIOR_REGIME_HISTORY_UNAVAILABLE"
+POSTERIOR_SYMBOL_CONDITIONED = "STRATEGY_POSTERIOR_SYMBOL_CONDITIONED"
 
 
 class StrategyPerformanceStore:
@@ -431,6 +486,14 @@ class StrategyPerformanceStore:
             if evaluation_sources
             else None
         )
+        # Evidence older than this is not wrong, it is no longer about this market.
+        # Bucketed to the hour so the cache key is stable across calls within a
+        # cycle instead of missing on every microsecond.
+        max_age_days = max(0.0, float(self.posterior_config.max_age_days))
+        cutoff: str | None = None
+        if max_age_days > 0.0:
+            moment = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            cutoff = moment.replace(minute=0, second=0, microsecond=0).isoformat()
         key = (
             "outcomes",
             str(strategy_id),
@@ -441,6 +504,7 @@ class StrategyPerformanceStore:
             str(execution_product).strip().upper() if execution_product else None,
             sources,
             bool(executable_only),
+            cutoff,
         )
         cached = self._cached(key)
         if cached is not None:
@@ -467,6 +531,9 @@ class StrategyPerformanceStore:
             # 1, but a NULL from a partially applied migration must not be silently
             # dropped from a LONG posterior that predates the column.
             clauses.append("(signal_executable is null or signal_executable != 0)")
+        if cutoff is not None:
+            clauses.append("recorded_at >= ?")
+            params.append(cutoff)
         params.append(window)
         sql = (
             "select recorded_at, strategy_id, market, regime, symbol, realized_net_bps, "
@@ -647,6 +714,7 @@ class StrategyPerformanceStore:
         limit: int | None = None,
         direction: str | None = None,
         execution_product: str | None = None,
+        symbol: str | None = None,
     ) -> StrategyPosterior:
         """Shrunk posterior with an explicit pessimistic lower bound.
 
@@ -660,6 +728,24 @@ class StrategyPerformanceStore:
         the long arm's realized series. Borrowing the long side's evidence is
         precisely how an unvalidated short would inherit a positive lower bound it
         has not earned.
+
+        ``symbol`` does NOT partition the history — it *conditions* it. What gets
+        adopted is a (symbol, strategy) pair, so scoring the pair against a mean
+        pooled over every symbol the strategy ever touched throws away a real effect:
+        across the 19 symbols with enough liquidity_shock_reversal fills to measure,
+        the per-symbol means span -205 to -54 bps, and 25.2 bps of that spread
+        survives after subtracting what sampling noise alone would produce.
+
+        Partitioning would be the wrong response. Per-symbol posteriors are far too
+        thin — only one strategy in the store has even three symbols with eight fills
+        each — and splitting would make every arm cold again, which is the deadlock
+        the cold-start rules exist to avoid. So the symbol mean is blended toward the
+        strategy mean in proportion to its own sample count
+        (``symbol_shrinkage_weight``, itself measured rather than chosen). A symbol
+        with two bad fills moves the score by ~7%; a symbol with sixty moves it by
+        ~69%. The strategy-level ``sample_count`` and ``loss_streak`` are deliberately
+        left un-conditioned, because those drive the exploration gate and one unlucky
+        name must not suspend the arm everywhere.
         """
         cfg = self.posterior_config
         resolved_market = normalize_market(market) if market else None
@@ -712,6 +798,31 @@ class StrategyPerformanceStore:
             if denominator > 0
             else cfg.prior_mean_net_bps
         )
+        # --- Symbol conditioning ---------------------------------------------- #
+        # Blend this symbol's own mean toward the strategy mean by its sample count.
+        # Applied to ``posterior_mean`` only: the strategy-level count, streak and
+        # standard error keep driving the pessimism and exploration machinery, so a
+        # thin symbol cannot suspend an arm and an unseen one cannot be penalised
+        # into unreachability.
+        resolved_symbol = str(symbol or "").strip().upper()
+        symbol_count = 0
+        symbol_mean: float | None = None
+        symbol_weight = 0.0
+        if resolved_symbol and cfg.symbol_shrinkage_weight > 0.0:
+            symbol_samples = [
+                outcome.realized_net_bps
+                for outcome in outcomes
+                if str(outcome.symbol or "").strip().upper() == resolved_symbol
+            ]
+            symbol_count = len(symbol_samples)
+            if symbol_count:
+                symbol_mean = sum(symbol_samples) / symbol_count
+                symbol_weight = symbol_count / (symbol_count + cfg.symbol_shrinkage_weight)
+                posterior_mean = (
+                    (1.0 - symbol_weight) * posterior_mean + symbol_weight * symbol_mean
+                )
+                reasons.append(POSTERIOR_SYMBOL_CONDITIONED)
+
         standard_error = stdev / math.sqrt(max(1.0, effective_count))
         penalty = cfg.pessimism_z * standard_error
         if effective_count < cfg.minimum_samples:
@@ -760,6 +871,10 @@ class StrategyPerformanceStore:
             ),
             direction=resolved_direction or "ALL",
             reason_codes=tuple(dict.fromkeys(reasons)),
+            symbol=resolved_symbol,
+            symbol_sample_count=symbol_count,
+            symbol_mean_net_bps=symbol_mean,
+            symbol_weight=symbol_weight,
         )
 
     def posterior_for_key(

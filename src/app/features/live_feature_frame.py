@@ -35,6 +35,17 @@ class LiveFeatureFrame:
     mark_price: float = 0.0
     mark_source: str = "unknown"
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    #: Named quantities the builder computed but the model schema does not carry.
+    #:
+    #: ``values`` is positional against ``schema.feature_names``, so anything not
+    #: in that list was previously computed and dropped on the floor. The GNN
+    #: context adapter then re-read those names out of ``as_feature_dict()`` and
+    #: got a silent default: ``box_high``, ``box_low``, ``box_mid``,
+    #: ``box_previous_close`` and ``realized_volatility_3m`` were all being
+    #: served as 0.0 while training supplied real values for the same slots.
+    #: Keeping them here costs nothing (they are already computed) and lets a
+    #: second consumer read them BY NAME instead of by a lucky schema position.
+    extras: Mapping[str, float] = field(default_factory=dict)
 
     @property
     def feature_schema_hash(self) -> str:
@@ -42,6 +53,17 @@ class LiveFeatureFrame:
 
     def as_feature_dict(self) -> dict[str, float]:
         return dict(zip(self.schema.feature_names, self.values, strict=True))
+
+    def as_context_dict(self) -> dict[str, float]:
+        """Schema values plus the named extras, for non-model consumers.
+
+        Schema values win on a name collision: the vector the live model scored
+        is the authority for anything that is in it.
+        """
+        return {
+            **{str(name): float(value) for name, value in self.extras.items()},
+            **self.as_feature_dict(),
+        }
 
     def validate(self) -> None:
         if len(self.values) != len(self.schema.feature_names):
@@ -178,7 +200,7 @@ class LiveFeatureFrameBuilder:
         depth_ratio = bid_depth / max(1.0, ask_depth)
         technical = _technical_columns(prices, volumes)
         # ONE minute-bar fetch per frame, shared by every slow-context consumer.
-        slow_bars = _slow_context_bars(self.store, symbol, decision_time)
+        slow_bars, slow_rows = _slow_context_bars(self.store, symbol, decision_time)
         rvgi_box = _rvgi_box_columns(
             slow_bars,
             symbol,
@@ -194,6 +216,20 @@ class LiveFeatureFrameBuilder:
             ticks,
             orderbooks,
             decision_time,
+        )
+        # The entry/strategy horizon is measured in minutes, so its technical
+        # context must come from completed one-minute bars.  The old mapper used
+        # indicators calculated from the trailing three-minute tick window.  That
+        # is fine for a websocket, but a US REST feed contributes only a handful
+        # of observations and therefore emitted the synthetic neutral tuple
+        # (EMA gap 0, RSI 50, volume ratio 1, volatility unavailable) for every
+        # symbol.  Preserve the fast columns for the short-horizon model and carry
+        # a separate causal slow context for micro/strategy election.
+        slow_technical = _slow_technical_columns(
+            slow_bars,
+            symbol=symbol,
+            orderbook=orderbook,
+            price=float(prices[-1]),
         )
         # Slow indicator families, computed from COMPLETED fixed-time bars only.
         # Placed after second_features so aggressor flow can join the volume family.
@@ -226,6 +262,30 @@ class LiveFeatureFrameBuilder:
             **rvgi_box,
         }
         values = tuple(float(feature_dict[name]) for name in self.schema.feature_names)
+        # Everything computed above that the model schema does not carry, kept by
+        # name instead of discarded, plus the bar-derived GNN context contract.
+        # The strategy-graph fields are namespaced so they can never collide with
+        # a tick-window column of a similar name: ``spread_bps`` (instantaneous
+        # book) and ``graph:spread_bps_scaled`` (last completed bar) are different
+        # measurements, and conflating them is the class of bug this fixes.
+        graph_context = _strategy_graph_context_columns(
+            slow_bars,
+            slow_rows,
+            symbol=symbol,
+            rvgi_box=rvgi_box,
+        )
+        schema_names = set(self.schema.feature_names)
+        extras = {
+            name: float(value)
+            for name, value in feature_dict.items()
+            if name not in schema_names
+        }
+        extras.update(
+            {f"graph:{name}": float(value) for name, value in graph_context.items()}
+        )
+        extras.update(
+            {f"slow_technical:{name}": float(value) for name, value in slow_technical.items()}
+        )
         provenance = FeatureProvenance(
             symbol=symbol,
             decision_time=decision_time,
@@ -246,6 +306,7 @@ class LiveFeatureFrameBuilder:
             float(prices[-1]),
             "tick" if ticks else "orderbook_mid",
             session_diagnostics,
+            extras,
         )
         frame.validate()
         # Book depth is journalled as QUALITY metadata, deliberately outside
@@ -405,8 +466,7 @@ def _safe_return(current: float, previous: float) -> float:
 
 
 def _window_return(ticks: tuple, decision_time: datetime, *, seconds: int) -> float:
-    cutoff = decision_time - timedelta(seconds=seconds)
-    visible = tuple(tick for tick in ticks if tick.exchange_timestamp >= cutoff)
+    visible = _events_in_window(ticks, decision_time, seconds)
     if len(visible) < 2:
         return 0.0
     return _safe_return(visible[-1].price, visible[0].price)
@@ -428,15 +488,16 @@ def _second_level_features(
     tick_10s = _events_in_window(ticks, decision_time, 10)
     books_5s = _events_in_window(orderbooks, decision_time, 5)
     returns_10s = _returns([float(tick.price) for tick in tick_10s])
+    classified = _classified_trade_directions(tick_5s, orderbooks)
     buy_volume = sum(
         max(0.0, float(tick.volume))
-        for tick in tick_5s
-        if str(tick.trade_direction or "").upper() in {"BUY", "B"}
+        for tick, direction in classified
+        if direction == "BUY"
     )
     sell_volume = sum(
         max(0.0, float(tick.volume))
-        for tick in tick_5s
-        if str(tick.trade_direction or "").upper() in {"SELL", "S"}
+        for tick, direction in classified
+        if direction == "SELL"
     )
     directed_volume = buy_volume + sell_volume
     spread_change = 0.0
@@ -447,7 +508,7 @@ def _second_level_features(
         ) / 100.0
         imbalance_change = float(books_5s[-1].imbalance) - float(books_5s[0].imbalance)
     unique_seconds = {
-        tick.exchange_timestamp.replace(microsecond=0)
+        tick.received_at.replace(microsecond=0)
         for tick in tick_10s
     }
     return {
@@ -464,8 +525,59 @@ def _second_level_features(
         "realized_volatility_10s": _stdev(returns_10s),
         "spread_change_5s": spread_change,
         "orderbook_imbalance_change_5s": imbalance_change,
-        "second_data_ready": 1.0 if len(tick_10s) >= 3 and len(unique_seconds) >= 2 and books_5s else 0.0,
+        "source_latency_ms_10s": (
+            max(float(getattr(tick, "latency_ms", 0.0) or 0.0) for tick in tick_10s)
+            if tick_10s
+            else 0.0
+        ),
+        "ingestion_span_seconds_10s": (
+            max(0.0, (tick_10s[-1].received_at - tick_10s[0].received_at).total_seconds())
+            if len(tick_10s) >= 2
+            else 0.0
+        ),
+        # Overseas HDFSCNT0 is event-driven but quiet names commonly print only
+        # twice in five seconds. Two distinct prints plus a contemporaneous book
+        # resolve direction/return; volatility edge falls back to completed 1m
+        # history when a third print is absent.
+        "second_data_ready": 1.0 if len(tick_10s) >= 2 and len(unique_seconds) >= 2 and books_5s else 0.0,
     }
+
+
+def _classified_trade_directions(ticks: tuple, orderbooks: tuple) -> tuple[tuple[Any, str | None], ...]:
+    """Broker direction, then causal quote test, then tick rule.
+
+    HDFSCNT0 labels only trades at/through its bid or ask. Prints inside the
+    spread therefore arrived as directionless and every flow strategy saw an
+    aggressor imbalance of exactly zero. The quote/tick rule is causal: only a
+    book at or before the trade and only the preceding trade are consulted.
+    """
+    books = sorted(orderbooks, key=lambda item: item.exchange_timestamp)
+    ordered_ticks = sorted(ticks, key=lambda item: item.exchange_timestamp)
+    result: list[tuple[Any, str | None]] = []
+    book_index = 0
+    latest_book = None
+    previous_price: float | None = None
+    for tick in ordered_ticks:
+        while (
+            book_index < len(books)
+            and books[book_index].exchange_timestamp <= tick.exchange_timestamp
+        ):
+            latest_book = books[book_index]
+            book_index += 1
+        raw = str(tick.trade_direction or "").upper()
+        direction = "BUY" if raw in {"BUY", "B"} else "SELL" if raw in {"SELL", "S"} else None
+        price = float(tick.price)
+        if direction is None and latest_book is not None:
+            bid = float(latest_book.best_bid)
+            ask = float(latest_book.best_ask)
+            mid = (bid + ask) / 2.0 if bid > 0 and ask >= bid else 0.0
+            if mid > 0:
+                direction = "BUY" if price > mid else "SELL" if price < mid else None
+        if direction is None and previous_price is not None:
+            direction = "BUY" if price > previous_price else "SELL" if price < previous_price else None
+        result.append((tick, direction))
+        previous_price = price
+    return tuple(result)
 
 
 def _slow_context_bars(store, symbol: str, decision_time: datetime):
@@ -476,6 +588,13 @@ def _slow_context_bars(store, symbol: str, decision_time: datetime):
     WAL contention with the ingest writers. Adding a second independent fetch for
     the indicator families stalled the trading loop hard enough to wedge the
     server twice; the arithmetic on the bars was never the expensive part.
+
+    Returns the completed-bar set AND the rows it was built from. ``completed_bars``
+    projects each row down to OHLCV, dropping the ``spread_bps`` /
+    ``orderbook_imbalance`` / ``liquidity_score`` columns that
+    ``realtime_minute_bars`` persists -- the very columns the historical labelling
+    path reads. Returning the rows lets the GNN context read the same persisted
+    numbers instead of re-deriving a proxy from the bar range.
     """
     from app.technical.causal_bars import completed_bars
 
@@ -487,13 +606,127 @@ def _slow_context_bars(store, symbol: str, decision_time: datetime):
         )
     except Exception:  # noqa: BLE001 - slow context fails closed, never raises.
         rows = ()
-    return completed_bars(
+    bar_set = completed_bars(
         rows,
         symbol=symbol,
         as_of=decision_time,
         timeframe_minutes=1,
         warmup_required=64,
     )
+    return bar_set, tuple(rows or ())
+
+
+def _strategy_graph_context_columns(
+    bar_set,
+    rows: tuple[Any, ...],
+    *,
+    symbol: str,
+    rvgi_box: Mapping[str, float],
+) -> dict[str, float]:
+    """The GNN context contract, computed from completed one-minute bars.
+
+    Deliberately independent of the tick window that feeds the live short-horizon
+    model. The historical labelling path has minute bars and nothing else, so a
+    tick-derived quantity here could never be trained -- which is exactly how v4
+    ended up serving ``aggressor_imbalance_5s`` into a slot fitted on a clipped
+    bar return. Every field below is computed from the same source table, over
+    the same window, by the same estimator as
+    :func:`app.evaluation.stored_counterfactual._label_features`.
+
+    Returns an empty mapping when there is not enough completed history; the
+    caller records that as an unavailable context rather than serving zeros.
+    """
+    # ``_as_utc`` is reused rather than reimplemented: the bar timestamps this
+    # keys against were normalised by that exact function inside ``completed_bars``,
+    # and a second near-copy is how a lookup starts missing on tz-naive rows.
+    from app.technical.causal_bars import _as_utc
+    from app.features import strategy_graph_context as ctx
+
+    bars = tuple(getattr(bar_set, "bars", ()) or ())
+    if len(bars) < 2:
+        return {}
+    current = bars[-1]
+    history = bars[max(0, len(bars) - 1 - ctx.CONTEXT_HISTORY_BARS) : -1]
+    if not history:
+        return {}
+    price = float(current.close)
+    if not math.isfinite(price) or price <= 0:
+        return {}
+
+    closes = [float(bar.close) for bar in history]
+    volumes = [float(bar.volume) for bar in history]
+    returns = [
+        closes[position] / closes[position - 1] - 1.0
+        for position in range(1, len(closes))
+        if closes[position - 1] > 0
+    ]
+    bar_return = (
+        price / closes[-1] - 1.0 if closes and closes[-1] > 0 else 0.0
+    )
+    vwap = ctx.volume_weighted_close(closes, volumes)
+
+    # Persisted microstructure of the bar the decision is anchored on. Keyed by
+    # minute_start, matching how the labelling path keys its own lookup, so a
+    # gap in the store yields "no context" rather than another bar's numbers.
+    micro = {
+        _as_utc(getattr(row, "minute_start", None)): row
+        for row in rows
+        if getattr(row, "minute_start", None) is not None
+    }.get(current.as_of)
+    if micro is None:
+        return {}
+
+    box_available = float(rvgi_box.get("box_available", 0.0) or 0.0)
+    box_high = float(rvgi_box.get("box_high", 0.0) or 0.0)
+    return {
+        **ctx.microstructure_columns(
+            _optional_column(micro, "spread_bps"),
+            _optional_column(micro, "orderbook_imbalance"),
+            _optional_column(micro, "liquidity_score"),
+        ),
+        "return_1m_scaled": ctx.scaled_return(bar_return),
+        "realized_volatility_30m": ctx.realized_volatility(returns),
+        "distance_from_vwap": ctx.safe_ratio(price, vwap) - 1.0 if vwap else 0.0,
+        "volume_spike_ratio": ctx.volume_spike_ratio(float(current.volume), volumes),
+        "is_krx": ctx.is_krx_symbol(symbol),
+        "rvgi_available": float(rvgi_box.get("rvgi_available", 0.0) or 0.0),
+        "rvgi": float(rvgi_box.get("rvgi", 0.0) or 0.0),
+        "rvgi_signal": float(rvgi_box.get("rvgi_signal", 0.0) or 0.0),
+        "rvgi_diff": float(rvgi_box.get("rvgi_diff", 0.0) or 0.0),
+        "rvgi_slope": float(rvgi_box.get("rvgi_slope", 0.0) or 0.0),
+        "rvgi_bullish_cross": float(rvgi_box.get("rvgi_bullish_cross", 0.0) or 0.0),
+        "box_available": box_available,
+        "box_high_ratio": ctx.safe_ratio(box_high, price),
+        "box_low_ratio": ctx.safe_ratio(rvgi_box.get("box_low"), price),
+        "box_mid_ratio": ctx.safe_ratio(rvgi_box.get("box_mid"), price),
+        "box_width_pct": float(rvgi_box.get("box_width_pct", 0.0) or 0.0),
+        "box_position": float(rvgi_box.get("box_position", 0.0) or 0.0),
+        # (price / box_high - 1) * 100. The live column is in true bps, the
+        # contract is in percent.
+        "breakout_distance_pct": (
+            float(rvgi_box.get("breakout_distance_bps", 0.0) or 0.0) / 100.0
+        ),
+        "box_previous_close_ratio": ctx.safe_ratio(
+            rvgi_box.get("box_previous_close"), price
+        ),
+        "box_context_available": (
+            1.0
+            if float(rvgi_box.get("box_context_timestamp_epoch", 0.0) or 0.0) > 0
+            else 0.0
+        ),
+    }
+
+
+def _optional_column(row: Any, name: str) -> float | None:
+    """A persisted microstructure column, or ``None`` when it is absent."""
+    value = getattr(row, name, None)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _indicator_family_columns(
@@ -528,6 +761,53 @@ def _indicator_family_columns(
         return compact_model_features(bars, bundle)
     except Exception:  # noqa: BLE001 - families fail closed to an all-zero mask.
         return compact_model_features((), build_families(()))
+
+
+def _slow_technical_columns(
+    bar_set,
+    *,
+    symbol: str,
+    orderbook: object,
+    price: float,
+) -> dict[str, float]:
+    """Causal minute-horizon technical inputs for strategy election.
+
+    These stay outside the model schema: changing them must not invalidate the
+    seconds-model artifact, and the raw fields are intended for rule/strategy
+    consumers rather than pooled cross-symbol learning.
+    """
+    from app.technical.feature_builder import build_technical_feature_set
+
+    bars = tuple(getattr(bar_set, "bars", ()) or ())
+    if not bars:
+        return {}
+    features = build_technical_feature_set(
+        bars,
+        symbol=symbol,
+        orderbook=orderbook,
+        price=price,
+        # Absolute volume normalisation is instrument-identifying and was removed
+        # from the model schema.  Spread/depth remain the live execution-quality
+        # evidence; do not turn a low raw share count into a universal liquidity
+        # veto here.
+        liquidity_score=None,
+    )
+    names = (
+        "ema_fast", "ema_slow", "macd", "macd_signal", "macd_histogram",
+        "short_return", "momentum_persistence", "rsi", "bb_percent_b",
+        "bb_bandwidth", "vwap", "vwap_distance_bps", "vwap_slope",
+        "relative_volume", "volume_spike_ratio", "donchian_high",
+        "donchian_low", "breakout_strength", "donchian_low_distance",
+        "false_breakout_risk", "atr_pct", "realized_volatility",
+        "volatility_expansion",
+    )
+    result: dict[str, float] = {}
+    for name in names:
+        value = getattr(features, name, None)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            result[name] = float(value)
+    result["bar_count"] = float(len(bars))
+    return result
 
 
 def _rvgi_box_columns(
@@ -606,7 +886,11 @@ def _session_structure_diagnostics(
     *,
     minimum_samples: int = 3,
 ) -> dict[str, Any]:
-    """Measured KRX opening context from completed bars, absent when unanswerable."""
+    """Measured opening context from completed bars, absent when unanswerable.
+
+    The session clock comes from ``session_structure.regular_session`` so a US
+    symbol is anchored to 09:30 America/New_York rather than to 09:00 Asia/Seoul.
+    """
     try:
         raw = store.recent_minute_bars(
             symbol,
@@ -620,11 +904,12 @@ def _session_structure_diagnostics(
         for bar in raw
         if bar.minute_start + timedelta(minutes=1) <= decision_time
     )
-    local = decision_time.astimezone(_KST)
-    session_open = local.replace(hour=9, minute=0, second=0, microsecond=0)
-    current_day = local.date()
+    session = session_structure.regular_session(symbol)
+    zone = session.zone
+    session_open = session.session_open(decision_time)
+    current_day = session.trading_day(decision_time)
     current_bars = tuple(
-        bar for bar in bars if bar.minute_start.astimezone(_KST).date() == current_day
+        bar for bar in bars if bar.minute_start.astimezone(zone).date() == current_day
     )
     observed = session_structure.opening_range(
         current_bars,
@@ -636,7 +921,7 @@ def _session_structure_diagnostics(
         return {}
 
     previous = tuple(
-        bar for bar in bars if bar.minute_start.astimezone(_KST).date() < current_day
+        bar for bar in bars if bar.minute_start.astimezone(zone).date() < current_day
     )
     previous_close = float(previous[-1].close) if previous else 0.0
     opening_return = session_structure.first_half_hour_return_bps(
@@ -649,11 +934,18 @@ def _session_structure_diagnostics(
 
     by_day: dict[Any, list[Any]] = {}
     for bar in previous:
-        day = bar.minute_start.astimezone(_KST).date()
+        day = bar.minute_start.astimezone(zone).date()
         by_day.setdefault(day, []).append(bar)
     historical_volatility: list[float] = []
     for day, day_bars in sorted(by_day.items()):
-        day_open = datetime(day.year, day.month, day.day, 9, 0, tzinfo=_KST)
+        day_open = datetime(
+            day.year,
+            day.month,
+            day.day,
+            session.open_time.hour,
+            session.open_time.minute,
+            tzinfo=zone,
+        )
         prior_range = session_structure.opening_range(
             day_bars,
             session_open=day_open,
@@ -680,12 +972,24 @@ def _session_structure_diagnostics(
 
 
 def _events_in_window(events: tuple, decision_time: datetime, seconds: int) -> tuple:
+    """Return events observable inside the point-in-time ingestion window.
+
+    Exchange timestamps describe when a venue says an event happened; they do
+    not describe when this process could act on it.  KIS can deliver a burst
+    several seconds later, so cutting by exchange time incorrectly produced an
+    empty window despite fresh records. ``received_at`` is the causal clock and
+    is also the clock used by market-data health.
+    """
+
     cutoff = decision_time - timedelta(seconds=seconds)
-    return tuple(
-        event
-        for event in events
-        if cutoff <= event.exchange_timestamp <= decision_time
-    )
+    return tuple(sorted(
+        (
+            event
+            for event in events
+            if cutoff <= event.received_at <= decision_time
+        ),
+        key=lambda event: (event.received_at, event.exchange_timestamp),
+    ))
 
 
 def _event_window_return(ticks: tuple) -> float:
