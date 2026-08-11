@@ -719,7 +719,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <aside class="gnn-model-inspector" id="gnn-model-inspector">
           <span>MODEL INSPECTOR</span>
           <h3>전략 노드를 선택하세요</h3>
-          <p>노드 크기는 학습된 출력 헤드 강도, 선의 밝기는 관계별 메시지 가중치를 나타냅니다.</p>
+          <p>메시지 코어를 중심으로 묶인 계입니다. 궤도 반경은 학습된 결합 강도, 노드 크기는 학습 증거(체결 행), 이심률은 학습 수익 신뢰도, 연결선의 늘어짐은 시장 중력 ÷ 연결별 장력입니다. 드래그로 회전, 휠로 확대합니다.</p>
         </aside>
       </div>
       <div class="gnn-relation-legend">
@@ -883,7 +883,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260810-market-physics-3"></script>
+  <script src="/static/strategy_terminal.js?v=20260811-orbital-system-1"></script>
   <script src="/static/operations_overview.js?v=20260810-macro-context-split-v1"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->

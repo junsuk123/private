@@ -134,6 +134,67 @@ arm을 열면 안 됩니다.
 
 상세는 [short_selling_deployment.md](short_selling_deployment.md).
 
+#### L5-E — eligibility 엔진: 실제 strategy id 기준 hard/soft 분리
+
+`app.ontology.strategy_eligibility.StrategyEligibilityEngine` 은 L5 를 **선택 계층용으로** 다시
+구성한 것입니다. V2 파이프라인에서 온톨로지의 출력은 이것뿐입니다 — 전략을 고르지도, 순위를
+매기지도, 아무것도 승인하지도 않습니다.
+
+**고친 결함: 온톨로지 어휘가 실행 어휘와 달랐습니다.** 미시 추론기는 generic METHODOLOGY
+(`momentum` / `breakout` / `mean_reversion` / `vwap_reversion`)를 내보내고
+`catalog.METHODOLOGY_STRATEGY_ALIASES` 가 그것을 실행 가능한 id 로 번역했습니다. 그 표의 주석이
+문제를 그대로 기록합니다 — `mean_reversion → vwap_mean_reversion` 은 "the loosest fit" 이고,
+generic 논지는 볼린저 중심선으로 회귀하는데 카탈로그 전략은 VWAP 으로 회귀합니다. **한 가설에
+대한 온톨로지 판정이 다른 가설을 인가**했고, 19개 논지의 카탈로그가 4개 이름으로만 주소 지정
+가능했습니다. 이제 모든 관계가 구체적 `strategy_id` 를 지목합니다. methodology enum 은 거친
+family 허용/차단 목록(`MACRO_FAMILY_BY_STRATEGY`) 이라는, 그것이 올바르게 할 수 있는 한 가지
+역할로만 남습니다.
+
+관계 타입은 두 부류이고 **hard 만 마스크를 0으로 만들 수 있습니다.**
+
+| hard (mask 0 가능) | 판정 근거 |
+|---|---|
+| `requires` | 논지가 없으면 정의되지 않는 `MarketContext` field |
+| `requiresFeature` | `entry()` 가 실제로 참조하는 `TechnicalFeatureSet` field |
+| `requiresLiquidity` | 선언된 유동성 하한 / 스프레드 상한 |
+| `requiresSession` | 신규 진입이 정의되는 세션 국면 |
+| `requiresHistory` | 지표가 필요한 완성봉 개수 |
+| `requiresDataQuality` | tick window / 호가 표본 / completeness 하한 |
+| `allowedMarket` | 논지가 admissible 한 시장 |
+| `forbiddenUnder` | 논지가 아예 무효인 시장 상태 |
+
+| soft (절대 block 못 함) | 용도 |
+|---|---|
+| `worksWellUnder`, `prefers`, `supportedBy`, `historicallyCompatibleWith` | 적합도 **증거**. `[-1, 1]` 가중 평균이 효용의 `O_s` 항이 됨 |
+
+분리의 이유: **선호를 차단으로 표현하면 순위만 낮춰야 할 후보를 잃습니다.** 예로
+`app.technical.signals` 는 하락 추세에서 평균회귀를 하드 비활성화하는데, 여기서는 같은 사실이
+페널티입니다 — 회귀 논지는 하락 테이프에서 *때때로* 맞고, 거부해 버리면 언제 맞는지 알아낼 증거가
+사라집니다.
+
+soft 관계는 각 논지와 **이미 코드에 있는 게이팅**에서 도출했습니다 (`signals.py` 의 하락추세
+평균회귀 비활성화와 브레이크아웃 거래량 요구, `MACRO_FAMILY_BY_STRATEGY` 가 기록한
+"`residual_relative_strength` 는 `TREND_DOWN` 에서도 유효" 등). **실현 성과에 fit 한 것은
+하나도 없습니다** — 관계를 과거 결과로 점수화하면 온톨로지가 backtest 가 됩니다.
+
+fail-closed 이지만 예외가 하나 있습니다. 결측 *요구사항* 은 차단하고, 결측 *시장 상태 라벨* 은
+차단하지 않습니다. `forbiddenUnder` 와 no-entry 집합은 실제로 존재하는 라벨에만 발화합니다 —
+미해석 레짐은 답하지 못한 질문이고, 기존 코드도 답할 수 없는 권한 검사를 철회로 읽지 않습니다
+(`strategy_algorithms.macro_strategy_permitted`). 신뢰할 수 없을 만큼 빈 컨텍스트는
+data-quality 관계가 명시적으로 잡습니다.
+
+출력은 전략별 두 개의 독립된 수 입니다.
+
+| 필드 | 의미 |
+|---|---|
+| `eligible` / `mask` | hard 판정. `False`/`0.0` 이면 효용 랭킹에서 완전히 제외 |
+| `compatibility_score` | soft 증거 `[-1, 1]`. 발화한 관계의 가중 평균. 매칭 관계가 없으면 `0.0` — **중립이며 페널티가 아님**, 증거의 부재는 증거가 아니기 때문 |
+| `hard_block_reasons` | 결정론적 사유 코드 (`ONTO_ELIG_*`) |
+| `supporting_relations` | 발화한 soft 관계 |
+
+`long_only` 인 동안 SHORT 방향은 hard block 입니다. 이는 3중 잠금의 세 번째이며 유일한 잠금이
+아닙니다 — 상세는 [strategy_selection_v2.md](strategy_selection_v2.md) §4.2.
+
 ### L6 — 거시 → 미시 추론
 
 계층형 추론 레이어(`app.graph.*`)는 가격을 직접 예측하지 않습니다. 예측·리스크 신호를 **구조화**하고 **전략을 선택**합니다.
@@ -273,6 +334,32 @@ no_trade  = sigmoid(no_trade_head · Z),  마스킹된 노드는 1.0
 
 성공/실패 크기를 하나의 평균 gross 회귀로 뭉개지 않고 hurdle expectation으로 계산합니다. 희소한 수익 구간이 다수 손실 구간에 묻혀 모든 후보가 음수가 되던 문제를 피하되, 성공확률과 조건부 손익은 실현 데이터로 각각 검증합니다. `NoTrade`는 오류나 결측 예측이 아니라 **일급 행동이자 학습 라벨**입니다.
 
+#### 비용 채널은 선택 계층에서 쓰지 않습니다 (V2)
+
+위 디코더는 `cost_bps = softplus(raw2) × 10` 을 **예측**하고 그것을 `utility` 에 접습니다. 결과가
+두 가지였습니다.
+
+1. 수수료·세금·FX 정책을 바꾸면 **재학습**이 필요했습니다. selector 가 쓰는 비용이
+   `config/trading_costs.json` 이 아니라 체크포인트 안에 살았기 때문입니다.
+2. downside 와 uncertainty 가 수익과 어떻게 교환되는지를 **모델이** 결정했으므로, 그 가중치는
+   감사할 수도 없고 새 체크포인트 없이 바꿀 수도 없었습니다.
+
+V2 선택 계층(`app.routing.strategy_utility`)은 모델에서 **모델만 알 수 있는 것**을 받습니다 —
+성공확률, gross 기대 이동, downside, duration, uncertainty. 비용은 `TradingCostEngine` 이 주고
+net 은 항등식입니다.
+
+```text
+expected_net_return_bps = expected_gross_return_bps − expected_cost_bps
+```
+
+`GnnUtilityAdapter` 는 모델의 `expected_cost_bps` 를 **gross 복원에만** 씁니다 (행이 net 만 담고
+있을 때). 거래 비용으로는 절대 쓰지 않습니다. 항별 가중치 `lambda_*` 는
+`config/strategy_selector_v2.yaml` 로 나왔습니다.
+
+기존 `StrategyRouter` 경로는 그대로 모델의 비용 채널을 사용합니다 — V2가 SHADOW이거나 자동
+강등된 때 필요한 legacy fallback이 거기에 의존하므로, 함께 바꾸면 fallback이 깨집니다. 두 경로의 상태는
+[strategy_selection_v2.md](strategy_selection_v2.md) §7 에 분류돼 있습니다.
+
 ### 라우팅
 
 `app.routing.strategy_router.StrategyRouter`가 허용 전략 중 실행 순효율 하한과 불확실성 제한을 통과한 효용 최대 전략을 고르고, 그렇지 않으면 `NO_TRADE`를 반환합니다. 출력은 `StrategyUtilityEvidence`로, ontology snapshot id·feature snapshot id·model version·explanation path를 포함합니다.
@@ -285,6 +372,18 @@ no_trade  = sigmoid(no_trade_head · Z),  마스킹된 노드는 1.0
 검증은 전략별 20~60분 horizon을 사용하며, 마지막 가격만 비교하지 않고 실거래와 같은 목표가/손절가 중 먼저 도달한 가격을 청산가로 사용합니다. 동일 horizon 버킷에서는 최초의 실행 가능한 양수 예측을 보존하고, 양수 예측이 없으면 최초 음수 예측을 보정 표본으로 남깁니다.
 
 `StrategySessionManager`는 선택된 종목과 전략을 잠그고, 열린 포지션에는 새 소유자를 만들지 않습니다. 포지션은 진입부터 청산까지 `origin_strategy_id`/`strategy_instance_id`가 durable하게 소유합니다.
+
+**V2 는 초기에는 이 라우팅 옆에서 비교하고, 검증 후에는 선택 권한만 단계적으로 인수합니다.**
+`StrategySelectorV2` 는 같은 GNN 벡터를 받아
+비용을 분리하고, 온톨로지 hard mask 를 곱하고, downside/uncertainty/soft-score/bandit 보정을 항별로
+더한 뒤 NO_TRADE 와 비교합니다. Windows 런처에서는 초기 SHADOW 및 자동 승격으로 실행되며,
+보수적 forward 검증을 통과하기 전 결과는 telemetry입니다. `trusted_strategy_ids` /
+`calibrated_strategy_ids` 의 권한 분리는 그대로 유효하고, V2 는 그 사실을 예측의
+`reason_codes` (`UTILITY_GNN_UNTRUSTED`)로 옮겨 담아 **거부가 아니라 uncertainty 로** 처리합니다 —
+신뢰되지 않은 추정기는 여전히 추정기이고, 버리면 신뢰를 얻을 증거가 쌓이지 않기 때문입니다.
+
+승격 후에도 V2는 실행 계층을 import하지 않습니다. 세션 계층이 독립적으로 live 승인된 proposal과
+일치하는 선택만 채택하므로 GNN trust, 전략 배포 권한, 비용·리스크 게이트는 그대로 유지됩니다.
 
 ### Shadow 서비스
 

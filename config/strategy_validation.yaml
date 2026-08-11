@@ -1,0 +1,56 @@
+# Strategy validation: evidence weighting and promotion gates.
+#
+# READ THIS BEFORE EDITING
+# ------------------------
+# Nothing in this file can promote a strategy on its own. Promotion goes through
+# app.strategy_validation.registry, whose transition graph is a WHITELIST (one rung at a
+# time, RESEARCH -> VALIDATED -> SHADOW -> LIVE_PROBE -> LIVE) and which refuses a promotion
+# with no attached StrategyValidationRecord. Lowering a threshold here does not retroactively
+# promote anything.
+
+# How much each evidence source counts toward a weighted aggregate.
+#
+# THESE ARE INITIAL DESIGN VALUES, NOT MEASUREMENTS. They must be recalibrated once enough
+# paired shadow/live outcomes exist to estimate how well a simulated fill predicts a real
+# one. Until then, treat any weighted number as an estimate and the live-only number as the
+# fact.
+evidence_weights:
+  live: 1.0
+  # A probe is a real fill at minimum size, so it is real evidence — but a minimum-size fill
+  # experiences less market impact than a full one, which is why it is below 1.0.
+  live_probe: 0.7
+  # A shadow fill is an ASSUMPTION about liquidity at a modelled price. Weighted low and
+  # never sufficient on its own: see require_live_evidence_for_live below.
+  shadow: 0.3
+  # 0.0 = prior only. A backtest contributes to no aggregate here. Kept as a number rather
+  # than an exclusion so the choice is visible.
+  backtest: 0.0
+
+# Bars a promotion into a TRADING state must clear. Only LIVE_PROBE and LIVE are gated;
+# transitions between non-trading states are bookkeeping.
+promotion_gates:
+  minimum_samples: 30
+  # The primary criterion, in bps: a positive LOWER confidence bound after cost, not a
+  # positive mean.
+  minimum_lower_bound_bps: 0.0
+  # The edge must survive costs being 1.25x what was measured. An edge that dies at 1.05x is
+  # not tradable, whatever its mean says.
+  minimum_break_even_cost_multiple: 1.25
+  # Fraction of walk-forward windows whose out-of-sample net EV is positive. Catches the
+  # strategy whose overall mean is carried by one exceptional window.
+  minimum_out_of_sample_stability: 0.6
+  require_parameter_stability: true
+  # Shadow evidence cannot promote to LIVE. A strategy may not be promoted on trades it never
+  # took.
+  require_live_evidence_for_live: true
+
+# Audit thresholds (app.strategy_validation.audit_runner).
+audit:
+  minimum_samples: 30
+  # Retiring is irreversible in practice — a strategy nobody runs accumulates no evidence to
+  # come back on — so it needs twice the sample.
+  retire_samples: 60
+  # |mean| inside this band (bps) is treated as indistinguishable from zero.
+  neutral_band_bps: 5.0
+  walk_forward_windows: 4
+  purged_folds: 5

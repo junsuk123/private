@@ -9,6 +9,10 @@
 - **모든 신규 진입은 단 하나의 순수익 게이트(`ProfitabilityGate`)로 판단합니다.**
 - **모든 청산은 단 하나의 동적 청산 정책(`DynamicExitPolicy`)으로 판단합니다.**
 
+이 문서는 **"이 주문을 안전하게·수익성 있게 낼 수 있는가"** 를 다룹니다. **"어떤 전략인가"** 는
+다른 질문이고 [strategy_selection_v2.md](strategy_selection_v2.md) 에 있습니다. 두 질문이 한
+클래스에 섞여 있던 것이 그 리팩터의 출발점이므로, 여기서도 섞지 않습니다.
+
 두 규칙은 이제 **effect 기준**이며 broker side 기준이 아닙니다. 숏이 추가된 뒤 `action != "BUY"`로
 게이트 여부를 판정하면 양방향으로 위험합니다 — 숏 진입(side=SELL)은 게이트를 **건너뛰어** 음의
 기대값으로 열릴 수 있고, 숏 청산(side=BUY)은 진입으로 오인되어 **차단**될 수 있습니다. 손실 중인
@@ -28,6 +32,14 @@
 6. 승인된 `FinalOrder` limit 주문만 `LiveExecutionCoordinator`로 제출합니다.
 
 `SharedLiveDecisionEngine.consume_bundle`은 거시–미시 번들(이미 SELL/REDUCE 우선 정렬됨)을 받아 같은 `evaluate_exit_for_holding` / `evaluate_buy` 경로로 라우팅하는 어댑터입니다. 게이트 흐름은 바뀌지 않습니다.
+
+4단계와 5단계 사이에 **전략 선택**이 들어갑니다. V2는 같은 입력으로 초기 SHADOW 평가를 하고,
+보수적 forward 증거를 충족하면 `LIVE_PROBE`, 실체결 증거까지 충족하면 `LIVE` 권한을 자동으로
+얻습니다. 그전에는 legacy `_bandit_choice`가 권한을 유지합니다. 어느 선택기가 고르든 선택이
+끝난 뒤에야 이 문서의 비용·리스크·주문 게이트들이 시작합니다 — **선택은 승인이 아닙니다.**
+
+V2 권한 자동화와 개별 전략 배포 권한도 별개입니다. 승격된 V2는 이미 실주문 승인된 proposal만
+고를 수 있으므로, `live_authorized=false`, 숏 `SHADOW`, 대주 불가 상태를 우회할 수 없습니다.
 
 ## 2. 자문 레이어: 기술적 예측
 
@@ -330,6 +342,34 @@ legacy 저널과 idempotency 파일은 롤백/비교를 위해 손대지 않습�
 | 뉴스·공시 이벤트 | macro risk level과 시장 전체 BUY 차단, event-momentum 적격성과 TTL 만료, reasoning path의 semantic 리스크 근거 |
 | 모델·온톨로지 출력 | 온톨로지 전략 적격 마스크, 학습된 관계 가중치와 조건부 기대 순효율, 전략별 실시간 진입 권한, 기대 청산가(정직한 추정치 위로 부풀리지 않음) |
 
+### 7.1 컴포넌트별 단일 질문
+
+각 컴포넌트가 답하는 질문을 한 줄로 고정해 둡니다. 두 컴포넌트가 같은 질문에 답하고 있으면
+그것이 책임 중복이고, 이 표는 그것을 찾기 위한 것입니다.
+
+| 컴포넌트 | 답하는 질문 |
+| --- | --- |
+| `MarketContext` | 지금 시장·종목·미시구조·이벤트·시간·데이터 품질 상태는 무엇인가 |
+| `StrategyEligibilityEngine` | 이 전략이 **적용 가능한가** (hard) / 얼마나 어울리는가 (soft) |
+| `StrategyAlgorithm.entry` | 이 논지의 **진입 조건이 지금 충족됐는가** |
+| utility 예측기 | 이 컨텍스트에서 이 전략이 **얼마나 좋은가** (gross / downside / duration / uncertainty) |
+| `TradingCostEngine` | 왕복 비용이 얼마인가 |
+| `StrategyBanditAdapter` | 이 전략이 **최근 더 좋아졌거나 나빠졌는가** (±20bps 유계) |
+| `NoTradePolicy` | **아무것도 하지 않는 것이 더 나은가** |
+| `StrategySelectorV2` | 위를 종합해 **무엇을 고르는가** (NO_TRADE 포함) |
+| `StrategySessionManager` | V2 결과를 **실주문 승인 proposal에 매칭**하고, 고른 (종목, 전략)의 소유권을 유지하는가 |
+| `LiveSignalPredictor` | 지금이 **집행 타이밍**으로 적절한가 |
+| `ProfitabilityGate` | 비용과 최소 엣지를 **넘는가** |
+| `PositionSizer` | 얼마나 살 수 있는가 |
+| `RiskManager` | 얼마나 위험을 **감당해도 되는가** |
+| `ExecutionQualityEngine` | 엣지를 파괴하지 않고 **집행 가능한가** |
+| `LiveExecutionCoordinator` | 승인된 이 주문이 **실제로 KIS 로 나가도 되는가** |
+
+V2가 SHADOW인 동안에는 `StrategySessionManager`의 legacy 선출이 fallback 권한입니다. V2가
+자동 승격되면 세션은 V2가 고른 전략·종목을 기존 proposal 집합에서 찾고, 일치하지 않거나
+실주문 승인이 없으면 NO_TRADE로 처리합니다. 따라서 선택 수식은 V2가 소유하고 실행 계약·세션
+소유권은 매니저가 소유합니다 ([strategy_selection_v2.md](strategy_selection_v2.md) §5).
+
 ## 8. Before / after
 
 ![Before/after net-profitability gate](diagrams/profitability_before_after.svg)
@@ -422,6 +462,35 @@ arm 식별자가 `strategy_id`에서 `DirectionalStrategyKey`
 "숏이 있었으면 도움이 됐을까"를 사후에 답할 수 있고, 그것이 사다리를 올라갈 증거입니다.
 `BOTH_DIRECTIONS_NEGATIVE`는 "양방향을 봤고 둘 다 안 된다"는 발견이며 방향 하나만 있었던
 커버리지 공백과 구분됩니다.
+
+#### 9.3.2 V2 에서 bandit 의 역할 변경 — `app.routing.bandit_adapter`
+
+위의 `ConservativeStrategyBandit` 은 현재 **최종 선택기 그 자체**입니다 — arm별 하단값을 계산하고
+NO_TRADE 를 결정하고 승자를 반환합니다. V2 에서 그 책임은 `StrategySelectorV2` 로 옮겨가고, bandit
+은 더 좁은 질문 하나에 답합니다: **이 전략이 효용 모델이 생각하는 것보다 최근 더 좋아졌거나
+나빠졌는가.**
+
+```
+B_s = (posterior_mean_net_bps − predicted_net_bps) × confidence,  clamp ±max_correction_bps
+```
+
+저장소·shrinkage·비관은 그대로 재사용합니다 (`StrategyPerformanceStore.posterior` 는 이미 symbol
+평균을 strategy 평균으로 블렌딩하고 `change_point_probability` 로 유효 표본을 할인합니다).
+**용도만** 바뀝니다.
+
+경계가 필요한 이유는 이 리팩터가 되돌리려는 결함의 **반대편**입니다. 유계가 아니면 실현 이력이
+모델을 완전히 덮어써서, 나쁜 체결 몇 건을 가진 arm 하나가 모든 컨텍스트 신호를 영구히 지배합니다.
+기본값은 ±20bps 이고 `config/bandit_adapter.yaml` 에 있으며, **clamp 되었다는 사실이 보고됩니다**
+(`BANDIT_CORRECTION_CLAMPED`) — 경계보다 커지려 했던 보정이 조용히 잘리지 않습니다.
+
+이력이 없으면 보정은 정확히 `0.0` 입니다. cold arm 을 두 번 벌하지 않기 위해서입니다 —
+uncertainty 항이 이미 그 일을 합니다.
+
+context key 는 `(strategy_id, market, regime_cluster, volatility_bucket)` 이고 **symbol 이 없습니다.**
+심볼별 posterior 는 너무 얇습니다 — 저장소에서 8건 이상 체결된 심볼이 3개 이상인 전략은 하나뿐이라
+symbol 로 분할하면 모든 arm 이 다시 cold 가 됩니다. symbol 은 저장소의 측정된 shrinkage 로
+**조건화**만 합니다. 부모 컨텍스트로 넓힐 때도 market 과 direction 은 절대 넓히지 않습니다 —
+KR 28bps 대 US 51-70bps 이고, 숏 이력을 롱에서 빌리면 미검증 arm 이 벌지 않은 엣지를 물려받습니다.
 
 ### 9.4 CostCoverageRatio — `app.cost.cost_coverage`
 

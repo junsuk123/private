@@ -54,33 +54,205 @@ const GNN_WAVE_WIDTH = 0.17;
 // Rope resolution in the 3D view. Six segments is enough for a droop to read as
 // a curve; each one costs two vertices per edge, so this is the memory knob.
 const GNN3D_EDGE_SEGMENTS = 6;
-// Ceiling on how many ropes are re-solved every frame.
-const GNN3D_MAX_DYNAMIC_EDGES = 700;
+// Per-frame rope budget. While the system is in motion EVERY visible rope has to
+// be re-solved, because a rope whose endpoint moved and whose vertices did not is
+// visibly detached from its own node. Above this count the orbits stop instead of
+// the ropes going stale: a still system is honest, a broken one is not.
+const GNN3D_MAX_DYNAMIC_EDGES = 5400;
 
 /**
  * Write one hanging rope into a LineSegments position buffer.
  *
  * The curve is a parabola through both endpoints with its low point at the
  * middle -- the standard small-sag approximation of a catenary, and visually
- * indistinguishable from one at this scale. Sag is applied along local -Y, so
- * the ropes hang relative to the graph itself and keep hanging correctly while
- * it is rotated.
+ * indistinguishable from one at this scale.
+ *
+ * Sag is a VECTOR, not a fixed -Y offset. Every rope hangs toward the body that
+ * actually binds it (the message core for a system-wide edge, the parent strategy
+ * for one of its own head moons), so the droop points where gravity points in
+ * this layout and keeps doing so while the view is dragged. A negative sag
+ * magnitude bows the rope the other way, which is how an inhibitory parameter --
+ * a negative checkpoint weight, or a contrasting-methodology relation -- is drawn.
  */
-function writeGnn3dEdgeCurve(positions, edgeIndex, spring, sag) {
+function writeGnn3dEdgeCurve(positions, edgeIndex, source, target, sx, sy, sz) {
   const S = GNN3D_EDGE_SEGMENTS;
-  const { source, target } = spring;
   const base = edgeIndex * S * 2 * 3;
   let px = source.x, py = source.y, pz = source.z;
   for (let segment = 0; segment < S; segment += 1) {
     const t = (segment + 1) / S;
     const droop = 4 * t * (1 - t);            // 0 at both ends, 1 at the middle
-    const qx = source.x + (target.x - source.x) * t;
-    const qy = source.y + (target.y - source.y) * t - sag * droop;
-    const qz = source.z + (target.z - source.z) * t;
+    const qx = source.x + (target.x - source.x) * t + sx * droop;
+    const qy = source.y + (target.y - source.y) * t + sy * droop;
+    const qz = source.z + (target.z - source.z) * t + sz * droop;
     const offset = base + segment * 6;
     positions[offset] = px; positions[offset + 1] = py; positions[offset + 2] = pz;
     positions[offset + 3] = qx; positions[offset + 4] = qy; positions[offset + 5] = qz;
     px = qx; py = qy; pz = qz;
+  }
+}
+
+/*
+ * The graph is laid out as ONE gravitationally bound system instead of four flat
+ * discs stacked along an axis.
+ *
+ * The mapping is not decorative -- it is the checkpoint's own dependency
+ * structure, which is radial: every path through the model passes through the
+ * 16-D message vector, so that vector is the star, and everything else is bound
+ * to it at a distance set by how strongly it is coupled.
+ *
+ *   core   <- hidden units      : the message vector, a churning nucleus
+ *   planet <- strategy nodes    : orbit radius = 1 - learned head strength
+ *   moon   <- output channels   : orbit their OWN strategy, radius = 1 - column norm
+ *   belt   <- input features    : an outer belt, radius = 1 - encoder norm
+ *
+ * Radii therefore say "how tightly is this bound", inclination separates
+ * methodology families onto their own orbital planes so 250-odd nodes fill the
+ * volume instead of crowding four planes, and the reference plane is deliberately
+ * wide and shallow (like a real system's ecliptic) because the panel is ~2:1.
+ */
+const GNN3D_SYSTEM = {
+  core: { radius: 58, inclination: 1.45 },
+  planet: { inner: 205, outer: 388, inclination: .52 },
+  moon: { inner: 18, outer: 40, inclination: .72 },
+  belt: { inner: 452, outer: 648, contextTilt: .17, identityTilt: .38 },
+  // Kepler's third law: omega proportional to a^-1.5 about the message core, and
+  // about a strategy for its own head moons. A tightly bound (strongly learned)
+  // body visibly circulates faster, so the period is a second reading of the same
+  // learned quantity rather than an arbitrary animation speed.
+  keplerSystem: 372,
+  keplerMoon: 47,
+  maxOmega: .24,
+  maxMoonOmega: .4,
+};
+
+const GNN3D_TWO_PI = Math.PI * 2;
+// Deepest droop any rope may reach, as a fraction of its own span. Approached
+// asymptotically, never hit, so a rope's bow can never swing back past its ends.
+const GNN3D_SAG_LIMIT = .42;
+
+// Home view. Tilted, because a head-on camera flattens the orbital planes that
+// separate the methodology families back into the 2.5-D picture this replaced.
+const GNN3D_HOME_DISTANCE = 1010;
+const GNN3D_HOME_PITCH = -.34;
+const GNN3D_HOME_YAW = .46;
+// What the home view has to contain: the system's own extent (about 670 wide and
+// 231 tall from the measured layout) plus the legend above it and the selection
+// ribbon with its two caption rows below.
+const GNN3D_FRAME_HALF_WIDTH = 700;
+const GNN3D_FRAME_HALF_HEIGHT = 470;
+
+/*
+ * Orbital clock.
+ *
+ * How fast the whole system revolves is the one global thing the tape drives:
+ * a quiet book barely drifts, a violent one visibly spins up, and a halted
+ * session nearly stops. The floor is a property of the LAYOUT (a bound system
+ * always moves a little) and not a claim about the market, so the resulting
+ * multiplier is printed in the legend -- otherwise a fast graph and a fast market
+ * would be indistinguishable.
+ */
+const GNN3D_CLOCK_FLOOR = .26;
+
+function gnnSystemClock(forces) {
+  const f = forces || GNN_NEUTRAL_FORCES;
+  if (f.halted) return GNN3D_CLOCK_FLOOR * .3;
+  return GNN3D_CLOCK_FLOOR
+    + Number(f.activity || 0) * .55
+    + Number(f.marketEnergy || 0) * 1.25
+    + Math.max(0, Number(f.elasticity || 1) - 1) * .18;
+}
+
+/**
+ * Market terms every rope is solved against, coerced once per frame.
+ *
+ * Per-rope code runs thousands of times a frame; reading and coercing the same six
+ * fields inside that loop is work whose answer cannot change within the frame.
+ */
+function gnn3dMarketRopeTerms(forces) {
+  const f = forces || GNN_NEUTRAL_FORCES;
+  return {
+    gravity: Number(f.gravity || 1),
+    tension: Math.max(.35, Number(f.tension || 1)),
+    energy: Number(f.marketEnergy || 0),
+    damping: Number(f.damping || 1),
+    stress: Number(f.liquidityStress || 0),
+  };
+}
+
+/**
+ * How far ONE rope sags right now: its own tension worked against market gravity.
+ *
+ *   tension   = this rope's stiffness (learned magnitude, relation norm, evidence,
+ *               supervision, live net-edge forecast -- see edgeStiffnessFor)
+ *               x market tension (tape activity, volatility, spread stress)
+ *               x its own live traffic: a rope carrying data is pulled taut
+ *   pull      = market gravity (macro regime + index trend) x the rope's own mass,
+ *               which is the filled training rows behind its heavier endpoint
+ *   swing     = a damped oscillator, rung faster by the change-point probability
+ *               and harder by market energy, and driven further when the rope is
+ *               active. Its clock is integrated by the caller so a change in rate
+ *               does not teleport the phase.
+ *   across    = how perpendicular the pull is to the rope; a radial spoke keeps a
+ *               quarter of its droop so its tension stays readable
+ *   polarity  = -1 for an inhibitory parameter, which bows the rope outward
+ *
+ * Two ropes therefore reach different lengths under the same tape, and one market
+ * move bends the whole graph by a different amount edge by edge.
+ */
+function gnn3dRopeSag(spring, span, across, market, swingClock) {
+  const tension = Math.max(.1, spring.stiffness * market.tension
+    * (1 + spring.activation * .9) * (1 - market.stress * .28));
+  const pull = market.gravity * (1 + spring.mass * .34);
+  const swing = Math.sin(swingClock * spring.omega + spring.phase)
+    * spring.amplitude * (.35 + market.energy * 1.7) * (1.3 - market.damping * .55)
+    * (1 + spring.activation * .5);
+  // The swing is a driving factor INSIDE the saturation, not a multiplier outside
+  // it: a hot tape can drive a slack rope's oscillation past 1.0, and applying that
+  // after the ceiling let the bow reach three quarters of the rope's own span. The
+  // floor keeps an overshooting swing from inverting the rope -- only polarity, a
+  // real property of the parameter, may do that.
+  const raw = (.045 + .3 / (.55 + tension)) * pull * spring.seed * Math.max(.12, 1 + swing);
+  // Soft ceiling instead of a hard clamp. A hard min() PINNED every slack rope at
+  // the limit -- a weakly-learned edge sat at maximum droop in a calm market and
+  // then did not move at all when the tape turned heavy, which is precisely the
+  // reading the sag is supposed to carry. tanh keeps the response monotonic
+  // forever: every rope always stretches a little more under more gravity, and none
+  // can pass the limit that would bow it back over its own endpoints.
+  return span * GNN3D_SAG_LIMIT * Math.tanh(raw / GNN3D_SAG_LIMIT)
+    * (.25 + .75 * across) * spring.polarity;
+}
+
+/** Resolve one orbit's cartesian position from its current true anomaly. */
+function gnn3dOrbitPosition(orbit) {
+  const e = orbit.e;
+  const r = orbit.a * (1 - e * e) / (1 + e * Math.cos(orbit.theta));
+  const inPlaneX = r * Math.cos(orbit.theta);
+  const inPlaneY = r * Math.sin(orbit.theta);
+  const cosNode = Math.cos(orbit.ascending), sinNode = Math.sin(orbit.ascending);
+  const cosTilt = Math.cos(orbit.inclination), sinTilt = Math.sin(orbit.inclination);
+  // Orthonormal basis of the orbital plane: the ascending-node direction lies in
+  // the reference (XZ) plane, the second axis is tilted out of it by inclination.
+  orbit.r = r;
+  orbit.x = cosNode * inPlaneX - sinNode * cosTilt * inPlaneY + (orbit.parent ? orbit.parent.x : 0);
+  orbit.y = sinTilt * inPlaneY + (orbit.parent ? orbit.parent.y : 0);
+  orbit.z = sinNode * inPlaneX + cosNode * cosTilt * inPlaneY + (orbit.parent ? orbit.parent.z : 0);
+}
+
+/**
+ * Advance every orbit by one frame. Parents are ordered before their children, so
+ * a moon reads its planet's already-updated position in the same pass.
+ */
+function gnn3dAdvanceOrbits(orbits, dt, clock) {
+  for (let index = 0; index < orbits.length; index += 1) {
+    const orbit = orbits[index];
+    if (dt > 0 && orbit.omega) {
+      // Equal areas in equal times: d(theta) scales with 1/r^2, so an eccentric
+      // orbit runs fast at perihelion and drags at aphelion. That is what makes a
+      // strategy whose training payoff was unreliable look unsteady in its lane.
+      const sweep = orbit.r > 0 ? Math.min(3, (orbit.a / orbit.r) ** 2) : 1;
+      orbit.theta = (orbit.theta + orbit.omega * orbit.direction * dt * clock * sweep) % GNN3D_TWO_PI;
+    }
+    gnn3dOrbitPosition(orbit);
   }
 }
 
@@ -485,8 +657,8 @@ async function startGnn3d(data, signature) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x02050b);
   scene.fog = new THREE.FogExp2(0x02050b, 0.00105);
-  const camera = new THREE.PerspectiveCamera(48, 1, .1, 3000);
-  camera.position.set(0, 0, 820);
+  const camera = new THREE.PerspectiveCamera(48, 1, .1, 4000);
+  camera.position.set(0, 0, GNN3D_HOME_DISTANCE);
   let renderer;
   try {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
@@ -505,10 +677,22 @@ async function startGnn3d(data, signature) {
   scene.add(new THREE.HemisphereLight(0xbfe8ff, 0x080617, 1.25));
   const keyLight = new THREE.PointLight(0x38e8ff, 52, 1400); keyLight.position.set(80, 220, 420); scene.add(keyLight);
   const rimLight = new THREE.PointLight(0xb45cff, 40, 1200); rimLight.position.set(-360, -180, -250); scene.add(rimLight);
+  // The message core lights the system it binds. Its output is driven by measured
+  // inference liveness and tape energy in the frame loop, so the whole scene dims
+  // when nothing is being decoded rather than staying evenly lit.
+  const coreLight = new THREE.PointLight(0xffe6b0, 18, 1100);
+  root.add(coreLight);
+  const glowTexture = createGnn3dGlowTexture(THREE);
+  const coreHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTexture, color: 0xffd58a, transparent: true, opacity: .16,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  coreHalo.scale.set(320, 320, 1);
+  root.add(coreHalo);
 
   const starPositions = [];
   for (let index = 0; index < 700; index += 1) {
-    const radius = 600 + seededGraphUnit(`gnn-star:${index}`) * 850;
+    const radius = 900 + seededGraphUnit(`gnn-star:${index}`) * 1100;
     const theta = seededGraphUnit(`gnn-star-t:${index}`) * Math.PI * 2;
     const phi = Math.acos(2 * seededGraphUnit(`gnn-star-p:${index}`) - 1);
     starPositions.push(radius * Math.sin(phi) * Math.cos(theta), radius * Math.sin(phi) * Math.sin(theta), radius * Math.cos(phi));
@@ -523,7 +707,13 @@ async function startGnn3d(data, signature) {
   // 1.5M per pass on this graph.
   const nodeIndex = new Map();
   const meshes = [];
+  // Parallel to `meshes`: the orbit each body rides, or null for a body the layout
+  // could not place. The frame loop copies orbit -> mesh.position through this, so
+  // no per-frame Map lookup is needed for 250-odd bodies.
+  const meshOrbits = [];
   const labels = [];
+  const halos = [];
+  const orbitRings = [];
   // Two shared unit spheres instead of one geometry per node. The previous build
   // allocated a SphereGeometry per node — 252 separate vertex buffers for a graph
   // whose nodes differ only in radius, which mesh.scale already expresses.
@@ -560,50 +750,47 @@ async function startGnn3d(data, signature) {
     const text = f.observed
       ? `중력 ${f.gravity.toFixed(2)} · 장력 ${f.tension.toFixed(2)} · 탄성 ${f.elasticity.toFixed(2)}`
         + ` · 감쇠 ${f.damping.toFixed(2)} · 시장에너지 ${(f.marketEnergy * 100).toFixed(0)}%`
+        + ` · 궤도클럭 ×${gnnSystemClock(f).toFixed(2)}`
         + ` (${f.regime || '-'}${f.indexTrend === null ? '' : `, 지수추세 ${(f.indexTrend * 100).toFixed(3)}%`})`
         + `${f.changePoint === null ? '' : ` (국면전환 ${(f.changePoint * 100).toFixed(1)}%)`}`
         + `${f.halted ? ' · HALT' : ''}`
-      : '시장 물리 · 측정 없음 (중립값으로 렌더링)';
-    const legend = createGnn3dLabel(THREE, text, f.observed ? 0xffd58a : 0x8aa1b7);
-    legend.scale.set(360, 34, 1);
-    legend.position.set(0, 300, 0);
+      : `시장 물리 · 측정 없음 (중립값으로 렌더링 · 궤도클럭 ×${gnnSystemClock(f).toFixed(2)})`;
+    const legend = createGnn3dLabel(THREE, text, f.observed ? 0xffd58a : 0x8aa1b7, { height: 30 });
+    legend.position.set(0, 316, 0);
     legend.material.opacity = f.observed ? .78 : .45;
     contextLayer.add(legend);
+    // What the physics MEANS. Every quantity below is a measurement, and an
+    // operator who cannot tell which is which is looking at decoration.
+    const mapping = createGnn3dLabel(
+      THREE,
+      '궤도반경 = 학습 결합도 · 이심률 = 학습 수익 신뢰도 · 공전 = 케플러(a^1.5) · 늘어짐 = 중력 ÷ 연결장력(강도·증거·순엣지) · 대조/음수 가중치는 바깥으로 휨',
+      0x8aa1b7,
+      { height: 24 },
+    );
+    mapping.position.set(0, 286, 0);
+    mapping.material.opacity = .5;
+    contextLayer.add(mapping);
     contextSignature = `${pipelineSignatureFor(payload.pipeline)}|${forceSignatureFor(f)}`;
   }
   rebuildContext(data);
-  const layout = gnn3dLayout(data.nodes || []);
-  // One translucent disc and caption per functional layer, so the pipeline
-  // stages are visible as places rather than something you infer from colour.
-  GNN3D_LAYERS.forEach((layer) => {
-    if (!(data.nodes || []).some((node) => gnn3dLayerFor(node) === layer)) return;
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(layer.radius * .99, layer.radius, 84),
-      new THREE.MeshBasicMaterial({ color: layer.color, transparent: true, opacity: .3, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    const disc = new THREE.Mesh(
-      new THREE.CircleGeometry(layer.radius, 64),
-      new THREE.MeshBasicMaterial({ color: layer.color, transparent: true, opacity: .035, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    [ring, disc].forEach((mesh) => {
-      mesh.rotation.y = Math.PI / 2;   // face down the pipeline axis
-      mesh.position.x = layer.x;
-      root.add(mesh);
-    });
-    const caption = createGnn3dLabel(THREE, layer.label, layer.color);
-    caption.scale.set(150, 33, 1);
-    caption.position.set(layer.x, layer.radius + 34, 0);
-    caption.material.opacity = .6;
-    root.add(caption);
-  });
+  const layout = gnn3dLayout(data.nodes || [], data.links || [], data.model || null);
+  const orbits = layout.orbits;
 
   (data.nodes || []).forEach((node) => {
     const position = gnn3dNodePosition(node, layout);
+    const metric = layout.metrics.get(node.id) || { size: 2.4, mass: 0, strength: null };
     const color = new THREE.Color(gnn3dNodeColor(node));
-    const radius = node.kind === 'strategy' ? 7.2 : node.kind === 'hidden' ? 4.1 : node.kind === 'feature' ? 2.8 : 2.4;
+    const radius = metric.size;
+    // An unsupervised head is not a trained one. Its emissive floor is cut so it
+    // reads as an unlit body even while the arm around it is being evaluated --
+    // the runtime suppresses its positive-edge forecast, and the graph should not
+    // present it as a working part of the model.
+    const unsupervised = node.kind === 'strategy' && node.upside_supervised === false;
+    const emissive = (node.kind === 'strategy' ? .3 + .28 * (metric.strength || 0) : .13)
+      * (unsupervised ? .35 : 1);
     const material = new THREE.MeshStandardMaterial({
-      color, emissive: color, emissiveIntensity: node.kind === 'strategy' ? .36 : .13,
-      roughness: .32, metalness: .16,
+      color, emissive: color, emissiveIntensity: emissive,
+      roughness: node.kind === 'strategy' ? .3 : .42, metalness: .16,
     });
     const mesh = new THREE.Mesh(
       node.kind === 'strategy' ? sharedSphere.detailed : sharedSphere.simple,
@@ -611,14 +798,60 @@ async function startGnn3d(data, signature) {
     );
     mesh.scale.setScalar(radius);
     mesh.position.set(position.x, position.y, position.z);
-    mesh.userData = { ...node, baseEmissive: material.emissiveIntensity, baseRadius: radius };
+    mesh.userData = {
+      ...node, baseEmissive: emissive, baseRadius: radius,
+      orbitRadius: layout.placements.get(node.id)?.a ?? null,
+      orbitEccentricity: layout.placements.get(node.id)?.e ?? null,
+      parameterNorm: metric.strength,
+    };
     nodeIndex.set(node.id, meshes.length);
+    meshOrbits.push(layout.placements.get(node.id) || null);
     root.add(mesh); meshes.push(mesh); nodeMap.set(node.id, mesh);
     if (node.kind === 'strategy') {
-      const label = createGnn3dLabel(THREE, shortGnnLabel(node.label), color.getHex());
-      label.position.set(position.x + 11, position.y + 10, position.z);
-      label.userData = node; root.add(label); labels.push(label);
+      const label = createGnn3dLabel(THREE, shortGnnLabel(node.label), color.getHex(), { height: 17 });
+      label.userData = node;
+      root.add(label);
+      labels.push({ sprite: label, meshIndex: meshes.length - 1 });
+      // One additive halo per planet. Its size and opacity are that arm's measured
+      // activation, so "which strategy is the pass actually working on" is legible
+      // from across the panel instead of from a 6-pixel emissive change.
+      const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTexture, color, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      root.add(halo);
+      halos.push({ sprite: halo, meshIndex: meshes.length - 1, unsupervised });
     }
+  });
+
+  // Real orbit paths, drawn from each planet's own elements. These replace the
+  // four translucent stage discs: a ring here is where a body actually travels,
+  // and its brightness tracks that arm's live activation.
+  layout.planetOrbits.forEach((orbit, strategyId) => {
+    const mesh = nodeMap.get(strategyId);
+    if (!mesh) return;
+    const ring = buildGnn3dOrbitPath(THREE, orbit, gnn3dNodeColor(mesh.userData), .12);
+    root.add(ring);
+    orbitRings.push({ line: ring, meshIndex: nodeIndex.get(strategyId), base: .12 });
+  });
+  layout.beltRings.forEach((belt) => {
+    const ring = buildGnn3dOrbitPath(
+      THREE,
+      { a: belt.a, e: 0, inclination: belt.inclination, ascending: 0, theta: 0, parent: null },
+      belt.cluster === 'input_identity' ? gnnClusterStyle.input_identity.color : gnnClusterStyle.input_context.color,
+      belt.cluster === 'input_identity' ? .14 : .08,
+    );
+    root.add(ring);
+    orbitRings.push({ line: ring, meshIndex: null, base: belt.cluster === 'input_identity' ? .14 : .08 });
+  });
+
+  // Shell captions, stacked clear of the bodies on the right. Each carries its own
+  // population count, so an empty or truncated layer is visible as such.
+  layout.shells.forEach((shell, index) => {
+    const caption = createGnn3dLabel(THREE, `${shell.label} · ${shell.count}`, shell.color, { height: 24 });
+    caption.position.set(596, 224 - index * 32, 0);
+    caption.material.opacity = .58;
+    root.add(caption);
   });
 
   const edgeLayer = new THREE.Group();
@@ -631,12 +864,23 @@ async function startGnn3d(data, signature) {
   let glowLine = null;
   let glowColors = null;
   let activeEdgeIndexes = [];
+  // Parallel to activeEdgeIndexes: the measured intensity of each active rope,
+  // which is what the packet budget is shared out by.
+  const activeEdgeIntensity = [];
   // Rope state, rebuilt with the edge set. `edgePositions` is the shared buffer
   // both the base and glow lines read, so animating a rope moves its glow too.
   let edgeSprings = [];
-  let dynamicEdges = [];
   let edgePositions = null;
   let edgePositionAttribute = null;
+  // Whether the bodies are allowed to move this build. Motion requires re-solving
+  // EVERY visible rope each frame; over the budget the system holds still instead
+  // of leaving ropes hanging off nodes that have drifted away from them.
+  let orbitsAnimated = true;
+  // Render/solve cadence. Measured at 0.6 ms to solve the full 4,500-rope build, so
+  // 30fps is comfortable there and the slower beat is reserved for a graph several
+  // times denser, where the per-frame buffer upload rather than the solve is the
+  // limit. A slower beat is always preferable to dropping a subset of the ropes.
+  let framePace = 2;
   // Declared here because rebuildEdges() runs before the animation block and
   // marks activation stale; a `let` further down would still be in its TDZ.
   let activationDirty = true;
@@ -662,10 +906,68 @@ async function startGnn3d(data, signature) {
       `${link.source}>${link.target}:${Number(link.learned_strength || 0).toFixed(6)}`).join(',')}`;
   }
   let edgeSignature = '';
+  /*
+   * Per-rope tension. This is where the graph stops being decoration.
+   *
+   * Sag used to be one global expression: every rope took the same market gravity
+   * over the same market tension, and the only thing that differed between two
+   * ropes was the learned weight and a hash. So the whole picture moved as one
+   * sheet, and "this connection is strong" and "the tape is heavy" produced the
+   * same droop.
+   *
+   * Each rope now carries its OWN stiffness, assembled from what is actually known
+   * about that specific connection:
+   *
+   *   learned_strength   the parameter's normalised magnitude
+   *   relation_strength  the learned Frobenius norm of that relation's tensor
+   *   prior_weight       1 / in-degree: a message split many ways pulls less
+   *   filled rows        evidence behind the endpoints (also its inertia)
+   *   upside_supervised  an unsupervised head cannot hold a rope taut
+   *   latest_probability the arm's most recent decoded success probability
+   *   expected_net_bps   its most recent net-edge forecast -- signed, so a
+   *                      negative forecast visibly SLACKENS its own ropes
+   *
+   * Market terms then scale that per-rope stiffness rather than replacing it, so a
+   * regime change bends 4,500 ropes by 4,500 different amounts.
+   */
+  function edgeStiffnessFor(link, sourceNode, targetNode, rows) {
+    const model = (gnn3dState?.data?.model || data.model) || {};
+    const relationStrength = model.relation_strength || {};
+    const strength = Math.min(1, Math.max(0, Number(link.learned_strength || 0)));
+    const relationKey = String(link.relation || '').startsWith('relation_encoder:')
+      ? String(link.relation).slice('relation_encoder:'.length)
+      : String(link.relation || '');
+    const relationNorm = Number.isFinite(Number(relationStrength[relationKey]))
+      ? Math.min(1, Math.max(0, Number(relationStrength[relationKey])))
+      : null;
+    const evidence = rows > 0 ? Math.min(1, Math.log10(1 + rows) / 4.2) : 0;
+    const owner = sourceNode.kind === 'strategy' ? sourceNode
+      : targetNode.kind === 'strategy' ? targetNode
+        : nodeMap.get(String(link.strategy_id || targetNode.strategy_id || ''))?.userData || null;
+    const probability = owner && owner.latest_probability !== null && owner.latest_probability !== undefined
+      ? Math.min(1, Math.max(0, Number(owner.latest_probability)))
+      : null;
+    const netBps = owner && owner.latest_expected_net_bps !== null && owner.latest_expected_net_bps !== undefined
+      ? Number(owner.latest_expected_net_bps)
+      : null;
+    const netUnit = netBps === null || !Number.isFinite(netBps)
+      ? 0
+      : Math.max(-1, Math.min(1, netBps / 14));
+    const supervised = owner ? owner.upside_supervised : null;
+    let stiffness = .26
+      + strength * 1.15
+      + (relationNorm === null ? 0 : relationNorm * .55)
+      + evidence * .42
+      + (probability === null ? 0 : (probability - .5) * .5)
+      + netUnit * .3
+      - (supervised === false ? .34 : 0);
+    // prior_weight is 1 / in-degree for that relation: a rope carrying a smaller
+    // share of the incoming message is a slacker rope.
+    const prior = Number(link.prior_weight);
+    if (Number.isFinite(prior)) stiffness *= .62 + Math.min(1, prior) * .75;
+    return Math.max(.12, Math.min(3.4, stiffness));
+  }
   function rebuildEdges() {
-    // Market state at the moment this edge set was built. Falls back to neutral
-    // (all 1.0, observed: false) rather than freezing when it cannot be read.
-    const forces = (gnn3dState?.data?.forces || data.forces) || GNN_NEUTRAL_FORCES;
     clearGroup(edgeLayer); clearGroup(glowLayer);
     glowLine = null; glowColors = null; activeEdgeIndexes = [];
     visibleEdges = filteredLinks().filter((link) => nodeMap.has(link.source) && nodeMap.has(link.target));
@@ -673,57 +975,56 @@ async function startGnn3d(data, signature) {
     // set, and the glow layer REUSES them: same buffer, second material.
     // Each edge is a hanging rope, not a chord: SEGMENTS+1 sampled points joined
     // as segment pairs. A straight line between two spheres carries no sense of
-    // connection strength; a rope's droop does, and droop is the inverse of the
-    // learned weight, so a strong edge is visibly taut.
+    // connection strength; a rope's droop does.
     const S = GNN3D_EDGE_SEGMENTS;
     const vertexCount = visibleEdges.length * S * 2;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
     const reusable = new THREE.Color();
     edgeSprings = new Array(visibleEdges.length);
-    dynamicEdges = [];
+    orbitsAnimated = visibleEdges.length <= GNN3D_MAX_DYNAMIC_EDGES;
+    framePace = visibleEdges.length > 12000 ? 3 : 2;
     visibleEdges.forEach((link, index) => {
-      const source = nodeMap.get(link.source).position;
-      const target = nodeMap.get(link.target).position;
+      const sourceMesh = nodeMap.get(link.source);
+      const targetMesh = nodeMap.get(link.target);
       const strength = Math.min(1, Math.max(0, Number(link.learned_strength || 0)));
-      const seed = seededGraphUnit(`${link.source}->${link.target}`);
-      const span = source.distanceTo(target);
+      const seed = seededGraphUnit(`${link.source}->${link.target}:${link.relation || ''}`);
       // Inertia is EVIDENCE: a node trained on many filled rows resists being
       // swung around, one trained on almost nothing whips about. Read off the
       // heavier of the two ends, since a rope is only as sluggish as its anchor.
       const rows = Math.max(
-        Number(nodeMap.get(link.source)?.userData?.training_filled_rows || 0),
-        Number(nodeMap.get(link.target)?.userData?.training_filled_rows || 0),
+        Number(sourceMesh.userData.training_filled_rows || 0),
+        Number(targetMesh.userData.training_filled_rows || 0),
       );
       const inertia = 1 + Math.min(1.6, Math.log10(1 + rows) * .55);
-      const spring = {
-        source, target,
-        // Rest droop. TENSION is the learned weight (slack = 1 - strength) and
-        // GRAVITY is the tape: a falling index pulls every rope down harder.
-        baseSag: Math.min(150, span * (.06 + .20 * (1 - strength))) * (.7 + .6 * seed),
-        // ELASTICITY rises with the change-point probability -- a regime about
-        // to break rings faster -- and INERTIA slows it back down.
-        baseOmega: (.0011 + seed * .0016) / inertia,
+      const weight = Number(link.weight);
+      edgeSprings[index] = {
+        source: sourceMesh.position,
+        target: targetMesh.position,
+        // A head moon is bound to its planet, not to the system core, so its rope
+        // hangs toward the strategy that owns it.
+        center: link.relation === 'owns_output_head' ? sourceMesh.position : null,
+        stiffness: edgeStiffnessFor(link, sourceMesh.userData, targetMesh.userData, rows),
+        mass: rows > 0 ? Math.min(1, Math.log10(1 + rows) / 4.2) : 0,
+        // An inhibitory parameter pushes instead of pulling. A negative checkpoint
+        // weight and a contrasting-methodology relation both bow outward, away from
+        // the body that binds the rope.
+        polarity: (Number.isFinite(weight) && weight < 0) || link.relation === 'contrasting_methodology' ? -1 : 1,
+        seed: .78 + seed * .44,
+        // ELASTICITY (change-point probability) scales this in the solver, INERTIA
+        // slows it here.
+        omega: (.0011 + seed * .0016) / inertia,
         phase: seed * Math.PI * 2,
-        // DAMPING shrinks the swing in a stable regime.
-        baseAmplitude: .10 + .22 * (1 - strength),
+        amplitude: .1 + .22 * (1 - strength),
+        activation: 0,
+        sx: 0, sy: 0, sz: 0,
       };
-      spring.sag = spring.baseSag * forces.gravity / Math.max(.35, forces.tension || 1);
-      spring.omega = spring.baseOmega * forces.elasticity;
-      spring.amplitude = spring.baseAmplitude * (.35 + (forces.marketEnergy || 0) * 1.9)
-        * (1.25 - (forces.damping || 1) * .55);
-      edgeSprings[index] = spring;
-      if (!link.kind || link.kind === 'topology') dynamicEdges.push(index);
-      writeGnn3dEdgeCurve(positions, index, spring, spring.sag);
       reusable.set(gnn3dEdgeColor(link)).multiplyScalar(.22 + strength * .78);
       for (let vertex = 0; vertex < S * 2; vertex += 1) {
         const offset = (index * S * 2 + vertex) * 3;
         colors[offset] = reusable.r; colors[offset + 1] = reusable.g; colors[offset + 2] = reusable.b;
       }
     });
-    // The dense parameter layer is thousands of ropes; animating all of them
-    // costs far more than it shows. Topology ropes swing, the rest hang still.
-    if (dynamicEdges.length > GNN3D_MAX_DYNAMIC_EDGES) dynamicEdges.length = GNN3D_MAX_DYNAMIC_EDGES;
     edgePositions = positions;
     const positionAttribute = new THREE.Float32BufferAttribute(positions, 3);
     positionAttribute.setUsage(THREE.DynamicDrawUsage);
@@ -760,7 +1061,7 @@ async function startGnn3d(data, signature) {
     activationDirty = true;
   }
 
-  const particleCount = 220;
+  const particleCount = 260;
   const particleArray = new Float32Array(particleCount * 3);
   // Phase offsets are fixed per particle, so they are hashed ONCE. The previous
   // loop rebuilt a string key and hashed it for every particle on every frame —
@@ -769,6 +1070,12 @@ async function startGnn3d(data, signature) {
   for (let index = 0; index < particleCount; index += 1) {
     particleOffsets[index] = seededGraphUnit(`particle:${index}`);
   }
+  // Which rope each packet rides and how fast. Both are assigned from measured
+  // edge intensity when activation is resolved, not round-robin: the rope the
+  // inference actually ran down carries visibly more traffic than one lit only by
+  // ambient tape energy. -1 parks the packet.
+  const particleEdge = new Int32Array(particleCount).fill(-1);
+  const particleSpeed = new Float32Array(particleCount).fill(1);
   const particleGeometry = new THREE.BufferGeometry();
   particleGeometry.setAttribute('position', new THREE.BufferAttribute(particleArray, 3));
   const particles = new THREE.Points(particleGeometry, new THREE.PointsMaterial({
@@ -778,7 +1085,9 @@ async function startGnn3d(data, signature) {
   root.add(particles);
 
   let dragging = false, moved = false, lastX = 0, lastY = 0;
-  let rotationX = -.1, rotationY = .18, cameraTarget = 820;
+  // A tilted home view. The system is volumetric now, and a near-flat camera hid
+  // the orbital planes that separate the methodology families.
+  let rotationX = GNN3D_HOME_PITCH, rotationY = GNN3D_HOME_YAW, cameraTarget = GNN3D_HOME_DISTANCE;
   const pointer = new THREE.Vector2(9, 9), raycaster = new THREE.Raycaster();
   const controller = new AbortController();
   function updatePointer(event) {
@@ -805,21 +1114,38 @@ async function startGnn3d(data, signature) {
     }
   }, { signal: controller.signal });
   canvas.addEventListener('wheel', (event) => {
-    event.preventDefault(); cameraTarget = Math.max(390, Math.min(1250, cameraTarget + event.deltaY * .6));
+    event.preventDefault(); cameraTarget = Math.max(180, Math.min(2100, cameraTarget + event.deltaY * .7));
   }, { passive: false, signal: controller.signal });
 
   function resize() {
     const rect = canvas.getBoundingClientRect();
     renderer.setSize(rect.width, rect.height, false); camera.aspect = rect.width / Math.max(1, rect.height); camera.updateProjectionMatrix();
   }
-  function resetView() { rotationX = -.1; rotationY = .18; cameraTarget = 820; }
+  /**
+   * Distance at which the whole system fits THIS canvas. A fixed distance cropped
+   * the outer belt on a tall-narrow panel, where the limit is width rather than
+   * height. Resizing does not call this: once the operator has zoomed, the zoom is
+   * theirs to keep.
+   */
+  function homeDistance() {
+    const rect = canvas.getBoundingClientRect();
+    const aspect = rect.width > 0 && rect.height > 0 ? rect.width / rect.height : 1.9;
+    const halfTan = Math.tan((camera.fov / 2) * Math.PI / 180);
+    return Math.max(GNN3D_HOME_DISTANCE, Math.min(2100, Math.max(
+      GNN3D_FRAME_HALF_HEIGHT / halfTan,
+      GNN3D_FRAME_HALF_WIDTH / (halfTan * Math.max(.5, aspect)),
+    )));
+  }
+  function resetView() {
+    rotationX = GNN3D_HOME_PITCH; rotationY = GNN3D_HOME_YAW; cameraTarget = homeDistance();
+  }
   function cleanup() {
     controller.abort(); window.removeEventListener('resize', resize); gnn3dState.stop = true;
     scene.traverse((object) => { object.geometry?.dispose(); if (object.material) (Array.isArray(object.material) ? object.material : [object.material]).forEach((material) => { material.map?.dispose(); material.dispose(); }); });
     renderer.dispose();
   }
   gnn3dState = { signature, data, renderer, scene, root, stop: false, rebuildEdges, updateData, resetView, cleanup };
-  rebuildEdges(); resize(); window.addEventListener('resize', resize, { passive: true });
+  rebuildEdges(); resize(); resetView(); window.addEventListener('resize', resize, { passive: true });
 
   /*
    * Activation is RESOLVED, not sequenced. Every node's intensity comes from the
@@ -863,6 +1189,7 @@ async function startGnn3d(data, signature) {
     }
 
     activeEdgeIndexes.length = 0;
+    activeEdgeIntensity.length = 0;
     if (glowColors) {
       glowColors.fill(0);
       const forces = gnn3dState?.data?.forces || GNN_NEUTRAL_FORCES;
@@ -881,8 +1208,14 @@ async function startGnn3d(data, signature) {
           ? ambientEnergy * (.16 + Number(link.learned_strength || 0) * .24)
           : 0;
         const edgeIntensity = Math.max(inferenceIntensity, marketIntensity);
+        // Activation is also a MECHANICAL term, not only a colour: a rope the pass
+        // is pushing data down is pulled taut in the solver. Recorded for every
+        // edge, including the quiet ones, so a rope that just went quiet relaxes.
+        const spring = edgeSprings[index];
+        if (spring) spring.activation = Math.min(1, edgeIntensity);
         if (edgeIntensity <= 0.02) return;
         activeEdgeIndexes.push(index);
+        activeEdgeIntensity.push(edgeIntensity);
         glowColor.set(gnn3dEdgeColor(link)).multiplyScalar(Math.min(1, edgeIntensity));
         // An edge owns SEGMENTS*2 vertices now that it is a rope rather than a
         // chord. Writing only the first pair would light one sixth of the rope
@@ -897,16 +1230,116 @@ async function startGnn3d(data, signature) {
       });
       glowLine.geometry.attributes.color.needsUpdate = true;
     }
+    allocateParticles();
     return { live, peak };
+  }
+
+  /*
+   * Hand out the packet budget in proportion to measured edge intensity.
+   *
+   * Round-robin over the active set spread the same traffic down a rope the
+   * inference actually traversed and a rope merely lit by ambient tape energy, so
+   * "data is moving here" was the one thing the exchange animation could not say.
+   */
+  function allocateParticles() {
+    if (!activeEdgeIndexes.length) { particleEdge.fill(-1); return; }
+    let total = 0;
+    for (let index = 0; index < activeEdgeIntensity.length; index += 1) total += activeEdgeIntensity[index];
+    if (total <= 0) { particleEdge.fill(-1); return; }
+    let cursor = 0;
+    let carried = activeEdgeIntensity[0];
+    for (let index = 0; index < particleCount; index += 1) {
+      const target = ((index + .5) / particleCount) * total;
+      while (carried < target && cursor < activeEdgeIntensity.length - 1) {
+        cursor += 1;
+        carried += activeEdgeIntensity[cursor];
+      }
+      particleEdge[index] = activeEdgeIndexes[cursor];
+      // A busier rope also moves its packets faster, so throughput reads as speed
+      // as well as density.
+      particleSpeed[index] = .55 + Math.min(1, activeEdgeIntensity[cursor]) * 1.7;
+    }
+  }
+
+  /*
+   * Solve every visible rope for this instant.
+   *
+   * Both terms of the droop are measurements. The magnitude is this rope's own
+   * stiffness (see edgeStiffnessFor) worked against the market's gravity, and the
+   * DIRECTION is the line to whatever body binds the rope -- the message core, or
+   * the parent strategy for one of its head moons -- so the whole picture hangs
+   * radially like a bound system instead of everything drooping toward -Y.
+   */
+  function solveRopes(swingClock, forces) {
+    if (!edgePositions || !edgeSprings.length) return;
+    const market = gnn3dMarketRopeTerms(forces);
+    for (let index = 0; index < edgeSprings.length; index += 1) {
+      const spring = edgeSprings[index];
+      if (!spring) continue;
+      const source = spring.source, target = spring.target;
+      const dx = target.x - source.x, dy = target.y - source.y, dz = target.z - source.z;
+      const span = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      // Direction of the pull: the line from the rope's midpoint to the body that
+      // binds it. `center` null means the message core at the origin.
+      const cx = spring.center ? spring.center.x : 0;
+      const cy = spring.center ? spring.center.y : 0;
+      const cz = spring.center ? spring.center.z : 0;
+      let gx = cx - (source.x + target.x) * .5;
+      let gy = cy - (source.y + target.y) * .5;
+      let gz = cz - (source.z + target.z) * .5;
+      const reach = Math.sqrt(gx * gx + gy * gy + gz * gz);
+      if (reach < 1e-3) { gx = 0; gy = -1; gz = 0; } else { gx /= reach; gy /= reach; gz /= reach; }
+      // A rope cannot sag along its own axis, so only the component of the pull
+      // ACROSS the rope bends it. That is why a spoke running straight out from the
+      // core stays taut while a rope strung sideways between two bodies droops: the
+      // length of this projection is the sine of the angle between them.
+      const ux = dx / span, uy = dy / span, uz = dz / span;
+      const along = gx * ux + gy * uy + gz * uz;
+      let px = gx - along * ux, py = gy - along * uy, pz = gz - along * uz;
+      let across = Math.sqrt(px * px + py * py + pz * pz);
+      if (across < 1e-3) {
+        // Perfectly radial: gravity has no across-rope component to bend it with.
+        // Bow it along the tangential direction instead, at a fraction of the
+        // droop, so its tension is still readable rather than the rope going dead.
+        // cross(rope, Z), or cross(rope, X) when the rope is itself along Z.
+        px = uy; py = -ux; pz = 0;
+        let tangent = Math.sqrt(px * px + py * py);
+        if (tangent < 1e-3) { px = 0; py = uz; pz = -uy; tangent = Math.sqrt(py * py + pz * pz) || 1; }
+        px /= tangent; py /= tangent; pz /= tangent;
+        across = 0;
+      } else {
+        px /= across; py /= across; pz /= across;
+      }
+      const magnitude = gnn3dRopeSag(spring, span, across, market, swingClock);
+      spring.sx = px * magnitude; spring.sy = py * magnitude; spring.sz = pz * magnitude;
+      writeGnn3dEdgeCurve(edgePositions, index, source, target, spring.sx, spring.sy, spring.sz);
+    }
+    if (edgePositionAttribute) edgePositionAttribute.needsUpdate = true;
   }
 
   let resolved = { live: false, peak: 0 };
   let frame = 0;
+  let lastSolvedAt = 0;
+  let ropesDirty = true;
+  let lastForceSignature = '';
+  let pulsePhase = 0;
+  // Integrated clocks. Every rate in this loop is market-driven, so none of them may
+  // be applied as a multiplier on the wall clock: each is accumulated at its current
+  // rate, which lets a rate change alter the speed without moving the phase.
+  let swingClock = 0;
+  let flowClock = 0;
 
   function animate(now) {
     if (!gnn3dState || gnn3dState.stop) return;
     requestAnimationFrame(animate);
     frame += 1;
+    // Solve and draw on the same beat. Solving a rope we will not draw is pure
+    // cost, and solving on a different beat than we draw makes the sag stutter.
+    // The beat is fixed rather than raised while the model is busy: a live pass is
+    // exactly when thousands of ropes are moving and the frame is most expensive.
+    if (frame % framePace !== 0) return;
+    const dt = lastSolvedAt ? Math.min(.25, (now - lastSolvedAt) / 1000) : 0;
+    lastSolvedAt = now;
 
     const state = terminalState.gnnInference || {};
     // Re-resolve only when the record actually changed. The signature is the
@@ -916,19 +1349,38 @@ async function startGnn3d(data, signature) {
       activationSignature = signature;
       activationDirty = false;
       resolved = resolveActivation();
+      ropesDirty = true;
     }
     const { live, peak } = resolved;
     const forces = gnn3dState?.data?.forces || GNN_NEUTRAL_FORCES;
     const marketEnergy = Number(forces.marketEnergy || 0);
+    const forceSignature = forceSignatureFor(forces);
+    if (forceSignature !== lastForceSignature) { lastForceSignature = forceSignature; ropesDirty = true; }
 
-    if (!dragging) rotationY += .00035 + marketEnergy * .00125 + (live ? .00035 : 0);
+    // No automatic rotation. The camera belongs to the operator: the frame only
+    // turns when they drag it. Everything that moves in this picture is now a
+    // body on its own orbit or a rope under its own tension, and both carry data —
+    // a slowly spinning frame carried none and set every reading adrift with it.
     root.rotation.x += (rotationX - root.rotation.x) * .12;
     root.rotation.y += (rotationY - root.rotation.y) * .12;
     camera.position.z += (cameraTarget - camera.position.z) * .09;
 
+    const clock = gnnSystemClock(forces);
+    if (orbitsAnimated && dt > 0) {
+      gnn3dAdvanceOrbits(orbits, dt, clock);
+      for (let index = 0; index < meshes.length; index += 1) {
+        const orbit = meshOrbits[index];
+        if (orbit) meshes[index].position.set(orbit.x, orbit.y, orbit.z);
+      }
+      ropesDirty = true;
+    }
+
     // One oscillator, scaled per node by that node's own intensity. The pulse is
-    // the carrier; the amplitude is the data.
-    const pulse = .5 + Math.sin(now / 480) * .5;
+    // the carrier; the amplitude is the data. Its RATE is the tape, integrated
+    // rather than divided into the clock so a change in market energy speeds the
+    // breathing up smoothly instead of jumping its phase.
+    pulsePhase = (pulsePhase + dt * (1.35 + marketEnergy * 3.4)) % GNN3D_TWO_PI;
+    const pulse = .5 + Math.sin(pulsePhase) * .5;
     for (let index = 0; index < meshes.length; index += 1) {
       const mesh = meshes[index];
       const intensity = nodeIntensity[index];
@@ -941,143 +1393,371 @@ async function startGnn3d(data, signature) {
       mesh.material.emissiveIntensity = mesh.userData.baseEmissive + intensity * (1.1 + pulse * 1.3);
       mesh.scale.setScalar(mesh.userData.baseRadius * (1 + intensity * (.06 + pulse * .16)));
     }
-    // Ropes swing. Each is an independent oscillator about its own rest droop;
-    // an active edge is driven harder, so the graph visibly stirs where the
-    // inference actually went instead of everywhere at once.
-    if (edgePositions && dynamicEdges.length) {
-      const activeSet = activeEdgeIndexes.length ? new Set(activeEdgeIndexes) : null;
-      for (let index = 0; index < dynamicEdges.length; index += 1) {
-        const edgeIndex = dynamicEdges[index];
-        const spring = edgeSprings[edgeIndex];
-        if (!spring) continue;
-        // These coefficients are read every frame so a new tick bends and
-        // accelerates existing ropes smoothly; no edge buffers or scene are
-        // destroyed just because the market moved.
-        spring.sag = spring.baseSag * Number(forces.gravity || 1)
-          / Math.max(.35, Number(forces.tension || 1));
-        spring.omega = spring.baseOmega * Number(forces.elasticity || 1);
-        spring.amplitude = spring.baseAmplitude * (.35 + marketEnergy * 1.9)
-          * (1.25 - Number(forces.damping || 1) * .55);
-        const driven = activeSet && activeSet.has(edgeIndex) ? 2.1 : 1;
-        const swing = Math.sin(now * spring.omega + spring.phase) * spring.amplitude * driven;
-        writeGnn3dEdgeCurve(edgePositions, edgeIndex, spring, spring.sag * (1 + swing));
-      }
-      if (edgePositionAttribute) edgePositionAttribute.needsUpdate = true;
-    }
+    // Elastic time: the change-point probability sets how fast the ropes ring, and
+    // integrating it here is what lets that rate change without shifting the phase
+    // of 4,500 ropes at once.
+    swingClock += dt * 1000 * Number(forces.elasticity || 1);
+    if (orbitsAnimated || ropesDirty) { solveRopes(swingClock, forces); ropesDirty = false; }
     if (glowLine) glowLine.material.opacity = activeEdgeIndexes.length
       ? Math.min(.9, .12 + marketEnergy * .48 + pulse * (.12 + marketEnergy * .18))
       : 0;
-    labels.forEach((label) => {
-      const intensity = nodeIntensity[nodeIndex.get(label.userData.id)] || 0;
-      label.material.opacity = .55 + Math.min(.45, intensity * .45);
-    });
+    for (let index = 0; index < labels.length; index += 1) {
+      const { sprite, meshIndex } = labels[index];
+      const mesh = meshes[meshIndex];
+      const intensity = nodeIntensity[meshIndex] || 0;
+      sprite.position.set(mesh.position.x + 11, mesh.position.y + mesh.userData.baseRadius + 9, mesh.position.z);
+      sprite.material.opacity = .5 + Math.min(.45, intensity * .45);
+    }
+    for (let index = 0; index < halos.length; index += 1) {
+      const halo = halos[index];
+      const mesh = meshes[halo.meshIndex];
+      const intensity = nodeIntensity[halo.meshIndex] || 0;
+      halo.sprite.position.copy(mesh.position);
+      const size = mesh.userData.baseRadius * (5 + intensity * 7 + pulse * intensity * 4);
+      halo.sprite.scale.set(size, size, 1);
+      halo.sprite.material.opacity = Math.min(.6, .04 + intensity * .5 + marketEnergy * .06)
+        * (halo.unsupervised ? .3 : 1);
+    }
+    // Orbit paths brighten with the arm that rides them, which makes the lane the
+    // election is currently working in readable at a glance.
+    for (let index = 0; index < orbitRings.length; index += 1) {
+      const ring = orbitRings[index];
+      const intensity = ring.meshIndex === null ? 0 : nodeIntensity[ring.meshIndex] || 0;
+      ring.line.material.opacity = ring.base + intensity * .38 + marketEnergy * .05;
+    }
+    // The core is the system's star: it brightens with decoded output and tape
+    // energy, and goes dim when nothing is being inferred.
+    coreHalo.material.opacity = .08 + (live ? .12 : 0) + marketEnergy * .2 + peak * .14;
+    coreLight.intensity = 14 + marketEnergy * 24 + peak * 22;
 
     particles.material.opacity = activeEdgeIndexes.length
       ? Math.min(.78, marketEnergy * (.28 + pulse * .42) + peak * .3)
       : 0;
+    // Flow rate is measured tape speed: tick activity plus energy. A still book
+    // leaves the packets nearly stationary rather than implying throughput. Also
+    // integrated, so a quickening tape accelerates the packets already in flight.
+    flowClock += dt * (.16 + Number(forces.activity || 0) * .4 + marketEnergy * .55);
     if (activeEdgeIndexes.length) {
       for (let index = 0; index < particleCount; index += 1) {
-        const edgeIndex = activeEdgeIndexes[index % activeEdgeIndexes.length];
-        const link = visibleEdges[edgeIndex];
-        const spring = edgeSprings[edgeIndex];
-        const source = nodeMap.get(link.source).position;
-        const target = nodeMap.get(link.target).position;
-        const t = (now * .00038 + particleOffsets[index]) % 1;
+        const edgeIndex = particleEdge[index];
+        const spring = edgeIndex >= 0 ? edgeSprings[edgeIndex] : null;
         const offset = index * 3;
-        // Ride the rope, not the chord. A particle travelling straight between
-        // two endpoints visibly leaves a sagging edge, which makes the droop
-        // look like a drawing rather than the path the signal takes.
-        const sag = spring ? spring.sag * (1 + Math.sin(now * spring.omega + spring.phase) * spring.amplitude) : 0;
-        particleArray[offset] = source.x + (target.x - source.x) * t;
-        particleArray[offset + 1] = source.y + (target.y - source.y) * t - sag * 4 * t * (1 - t);
-        particleArray[offset + 2] = source.z + (target.z - source.z) * t;
+        if (!spring) { particleArray[offset] = particleArray[offset + 1] = particleArray[offset + 2] = 0; continue; }
+        const t = (flowClock * particleSpeed[index] + particleOffsets[index]) % 1;
+        const droop = 4 * t * (1 - t);
+        // Ride the rope, not the chord, using the sag the solver just applied: a
+        // packet travelling straight between two endpoints visibly leaves its own
+        // edge, which makes the droop look drawn rather than travelled.
+        particleArray[offset] = spring.source.x + (spring.target.x - spring.source.x) * t + spring.sx * droop;
+        particleArray[offset + 1] = spring.source.y + (spring.target.y - spring.source.y) * t + spring.sy * droop;
+        particleArray[offset + 2] = spring.source.z + (spring.target.z - spring.source.z) * t + spring.sz * droop;
       }
       particleGeometry.attributes.position.needsUpdate = true;
     }
 
-    // Picking every frame allocated an intersection array 60x a second for a
-    // pointer that moves far slower than that.
-    if (frame % 4 === 0) {
+    // Picking on every solved frame allocated an intersection array for a pointer
+    // that moves far slower than that.
+    if (frame % 8 === 0) {
       raycaster.setFromCamera(pointer, camera);
       const hit = raycaster.intersectObjects(meshes, false)[0];
       if (hit && !dragging) updateGnn3dTooltip(canvas, hit.object.userData, pointer);
       else if (tooltipElement) tooltipElement.hidden = true;
     }
-    if (peak > 0 || frame % 2 === 0) renderer.render(scene, camera);
+    renderer.render(scene, camera);
   }
   requestAnimationFrame(animate);
 }
 
-// Functional layers, ordered the way the pipeline runs: collected features ->
-// the relation message the ontology's topology defines -> the strategy nodes it
-// scores -> the output heads the election reads. Depth (X) is therefore stage,
-// not decoration, and a node's plane says which part of the system it is in.
-const GNN3D_LAYERS = [
-  { id: 'ingest', kinds: ['feature'], x: -430, radius: 200, color: 0x8178ff, label: '① 수집 · 입력 특징' },
-  { id: 'message', kinds: ['hidden'], x: -150, radius: 120, color: 0xf6d778, label: '② R-GCN 메시지' },
-  { id: 'strategy', kinds: ['strategy'], x: 160, radius: 190, color: 0xff8fb0, label: '③ 전략 노드 · 온톨로지 위상' },
-  { id: 'head', kinds: ['output'], x: 460, radius: 215, color: 0x5eead4, label: '④ 출력 헤드 · 선택 근거' },
-];
-
-function gnn3dLayerFor(node) {
-  return GNN3D_LAYERS.find((layer) => layer.kinds.includes(node.kind)) || GNN3D_LAYERS[3];
+/**
+ * One shared radial-gradient sprite texture for every halo in the scene.
+ *
+ * A halo per body would otherwise mean a texture per body; this is allocated once
+ * and tinted per sprite, which is what makes a per-planet glow affordable.
+ */
+function createGnn3dGlowTexture(THREE) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  const gradient = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gradient.addColorStop(0, 'rgba(255,255,255,.95)');
+  gradient.addColorStop(.28, 'rgba(255,255,255,.34)');
+  gradient.addColorStop(.62, 'rgba(255,255,255,.08)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, 128, 128);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
 }
 
 /**
- * Deterministic layered layout: id -> {x, y, z, layer}.
+ * The closed path a body actually travels, sampled from its own orbital elements.
  *
- * Replaces a per-node random spherical scatter that made every layer a fuzzy
- * ball; because each node also drew its own random radius, density fell off
- * toward the middle -- the opposite of an evenly filled disc.
- *
- * Families keep their own sub-disc so a cluster still reads as a cluster, and
- * nodes inside a family are placed by golden-angle phyllotaxis with a sqrt
- * radius, which fills by equal AREA. Everything is seeded off the node id.
+ * Only bodies orbiting the system barycentre get one. A moon's path would have to
+ * follow its moving parent, and 104 of them would bury the graph they are meant to
+ * explain.
  */
-function gnn3dLayout(nodes) {
-  const layout = new Map();
-  GNN3D_LAYERS.forEach((layer) => {
-    const members = (nodes || []).filter((node) => gnn3dLayerFor(node) === layer);
-    if (!members.length) return;
-    const families = new Map();
-    members.forEach((node) => {
-      const key = node.family || node.cluster || 'specialist';
-      if (!families.has(key)) families.set(key, []);
-      families.get(key).push(node);
+function buildGnn3dOrbitPath(THREE, orbit, color, opacity) {
+  const steps = 128;
+  const positions = new Float32Array(steps * 3);
+  const probe = { ...orbit, x: 0, y: 0, z: 0, r: orbit.a, parent: null };
+  for (let index = 0; index < steps; index += 1) {
+    probe.theta = (index / steps) * GNN3D_TWO_PI;
+    gnn3dOrbitPosition(probe);
+    positions[index * 3] = probe.x;
+    positions[index * 3 + 1] = probe.y;
+    positions[index * 3 + 2] = probe.z;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  return new THREE.LineLoop(geometry, new THREE.LineBasicMaterial({
+    color, transparent: true, opacity, depthWrite: false,
+  }));
+}
+
+// Functional layers, now shells of one bound system rather than planes along an
+// axis. `kinds` maps a payload node onto its layer, which is what the inspector
+// and the phase chips read; `label` is the caption the 3D view draws.
+const GNN3D_LAYERS = [
+  { id: 'ingest', kinds: ['feature'], color: 0x8178ff, label: '① 입력 특징 벨트 · 인코더 노름 = 반경' },
+  { id: 'message', kinds: ['hidden'], color: 0xf6d778, label: '② R-GCN 메시지 코어 (계 중심)' },
+  { id: 'strategy', kinds: ['strategy'], color: 0xff8fb0, label: '③ 전략 행성 · 헤드 강도 = 결합도' },
+  { id: 'head', kinds: ['output'], color: 0x5eead4, label: '④ 출력 헤드 위성 · 전략에 종속' },
+];
+
+/**
+ * Deterministic orbital layout: id -> orbit, plus the per-node measurements the
+ * renderer sizes and lights each body by.
+ *
+ * Replaces four flat discs stacked along X. That layout wasted the volume (every
+ * node sat within 26 units of its own plane, so the view was 2.5-D whichever way
+ * you dragged it) and, worse, spent its one free spatial axis on a stage index the
+ * colour and the captions already carried.
+ *
+ * Here every distance is a measurement:
+ *
+ *   - a feature's orbit radius is its ENCODER NORM, summed from the checkpoint's
+ *     own self- and relation-weight tensors, so a feature the model leans on sits
+ *     closer in. Identity features keep a separate tilted band.
+ *   - a strategy's orbit radius is 1 - its learned head strength, and its
+ *     eccentricity is 1 - the rate at which its filled training rows actually paid.
+ *   - an output channel orbits its OWN strategy at 1 - its head column norm, and
+ *     runs retrograde when that column sums negative.
+ *   - a hidden unit's depth in the core is how much encoder mass it receives.
+ *
+ * Anything the checkpoint does not carry is placed mid-band and flagged
+ * `observed: false` rather than being given an invented extreme.
+ */
+function gnn3dLayout(nodes, links, model = null) {
+  const list = Array.isArray(nodes) ? nodes : [];
+  const orbits = [];
+  const placements = new Map();
+  const metrics = new Map();
+
+  // Per-node parameter norms, accumulated once from the tensors the payload
+  // already ships. Encoder and head weights live on different scales, so they are
+  // normalised within their own tensor family and never mixed.
+  const featureNorm = new Map();
+  const hiddenNorm = new Map();
+  const outputNorm = new Map();
+  const outputSigned = new Map();
+  (links || []).forEach((link) => {
+    const weight = Number(link.weight);
+    if (!Number.isFinite(weight) || weight === 0) return;
+    const relation = String(link.relation || '');
+    const magnitude = Math.abs(weight);
+    if (relation === 'self_encoder_weight' || relation.startsWith('relation_encoder:')) {
+      featureNorm.set(link.source, (featureNorm.get(link.source) || 0) + magnitude);
+      hiddenNorm.set(link.target, (hiddenNorm.get(link.target) || 0) + magnitude);
+    } else if (relation === 'strategy_head_weight') {
+      outputNorm.set(link.target, (outputNorm.get(link.target) || 0) + magnitude);
+      outputSigned.set(link.target, (outputSigned.get(link.target) || 0) + weight);
+    }
+  });
+  // Min-max within the kind, not value-over-maximum. A parameter norm is a sum of
+  // 16-64 weights, so the raw norms of 41 features sit within a few percent of each
+  // other: dividing by the maximum put every feature on the inner rim of its belt
+  // and threw away the band it was given. Scaling across the observed range spends
+  // the whole band on the spread that actually exists, and a node's position still
+  // means "where this one sits between the weakest and strongest of its kind".
+  const unitOf = (map) => {
+    let max = -Infinity, min = Infinity;
+    map.forEach((value) => {
+      if (value > max) max = value;
+      if (value < min) min = value;
     });
-    const familyKeys = [...families.keys()].sort();
-    const single = familyKeys.length === 1;
-    familyKeys.forEach((key, familyIndex) => {
-      const items = families.get(key);
-      const familyAngle = (familyIndex / familyKeys.length) * Math.PI * 2;
-      const familyRing = single ? 0 : layer.radius * .52;
-      const cy = Math.cos(familyAngle) * familyRing;
-      const cz = Math.sin(familyAngle) * familyRing;
-      const discRadius = single ? layer.radius * .92 : layer.radius * .42;
-      const count = Math.max(1, items.length);
-      items.forEach((node, index) => {
-        const t = (index + .5) / count;
-        const ring = discRadius * (count === 1 ? 0 : .2 + .8 * Math.sqrt(t));
-        const angle = index * GNN_GOLDEN_ANGLE + seededGraphUnit(node.id) * .2;
-        layout.set(node.id, {
-          // A shallow deterministic depth ripple: a perfectly flat plane reads
-          // as a printed diagram and hides which node is in front on rotation.
-          x: layer.x + (seededGraphUnit(`${node.id}:x`) - .5) * 26,
-          y: cy + Math.cos(angle) * ring,
-          z: cz + Math.sin(angle) * ring,
-          layer,
-        });
-      });
+    const range = max - min;
+    return (id) => {
+      if (!map.has(id)) return null;
+      if (!(range > 1e-12)) return .5;   // one member, or all identical
+      return Math.min(1, Math.max(0, (map.get(id) - min) / range));
+    };
+  };
+  const featureUnit = unitOf(featureNorm);
+  const hiddenUnit = unitOf(hiddenNorm);
+  const outputUnit = unitOf(outputNorm);
+
+  // Mass is EVIDENCE: the filled training rows behind a node, log-scaled against
+  // the best-evidenced node in this checkpoint.
+  let heaviestRows = 0;
+  list.forEach((node) => {
+    const rows = Number(node.training_filled_rows || 0);
+    if (rows > heaviestRows) heaviestRows = rows;
+  });
+  const massOf = (node) => {
+    const rows = Number(node.training_filled_rows || 0);
+    if (rows <= 0 || heaviestRows <= 0) return 0;
+    return Math.min(1, Math.log10(1 + rows) / Math.log10(1 + heaviestRows));
+  };
+
+  const makeOrbit = (spec) => {
+    const orbit = { ...spec, direction: spec.direction || 1, x: 0, y: 0, z: 0, r: spec.a };
+    gnn3dOrbitPosition(orbit);
+    orbits.push(orbit);
+    return orbit;
+  };
+  const keplerAbout = (a) => Math.min(GNN3D_SYSTEM.maxOmega, GNN3D_SYSTEM.keplerSystem / (a ** 1.5));
+
+  // ---- the core: hidden message units, a churning nucleus ----
+  const coreOmega = keplerAbout(GNN3D_SYSTEM.core.radius);
+  list.filter((node) => node.kind === 'hidden').forEach((node) => {
+    const unit = hiddenUnit(node.id);
+    const depth = unit === null ? .5 : unit;
+    const orbit = makeOrbit({
+      a: GNN3D_SYSTEM.core.radius * (.58 + .55 * (1 - depth)),
+      e: 0,
+      inclination: (seededGraphUnit(`${node.id}:i`) * 2 - 1) * GNN3D_SYSTEM.core.inclination,
+      ascending: seededGraphUnit(node.id) * GNN3D_TWO_PI,
+      theta: seededGraphUnit(`${node.id}:t`) * GNN3D_TWO_PI,
+      omega: coreOmega,
+      // Mixed directions: the nucleus churns instead of turning as one dial.
+      direction: seededGraphUnit(`${node.id}:d`) > .5 ? 1 : -1,
+      parent: null,
+    });
+    placements.set(node.id, orbit);
+    metrics.set(node.id, {
+      size: 3 + 2.3 * depth, strength: unit, mass: depth,
     });
   });
-  return layout;
+
+  // ---- the belt: input features ----
+  const belt = GNN3D_SYSTEM.belt;
+  list.filter((node) => node.kind === 'feature').forEach((node, index) => {
+    const unit = featureUnit(node.id);
+    const bound = unit === null ? .5 : unit;
+    const identity = node.cluster === 'input_identity';
+    const a = belt.outer - (belt.outer - belt.inner) * bound;
+    const orbit = makeOrbit({
+      a,
+      e: .02 + seededGraphUnit(`${node.id}:e`) * .06,
+      // Identity features share one clearly tilted plane; context features spread
+      // through a shallow band. The eight identity slots are the known leak
+      // channel, and a separate plane is the cheapest way to keep them countable.
+      inclination: identity
+        ? belt.identityTilt * (.82 + .3 * seededGraphUnit(`${node.id}:i`))
+        : (seededGraphUnit(`${node.id}:i`) * 2 - 1) * belt.contextTilt,
+      ascending: (index * GNN_GOLDEN_ANGLE) % GNN3D_TWO_PI,
+      theta: seededGraphUnit(`${node.id}:t`) * GNN3D_TWO_PI,
+      omega: keplerAbout(a),
+      parent: null,
+    });
+    placements.set(node.id, orbit);
+    metrics.set(node.id, {
+      size: 1.7 + 2.2 * bound, strength: unit, mass: bound,
+    });
+  });
+
+  // ---- the planets: strategy nodes ----
+  const strategies = list.filter((node) => node.kind === 'strategy');
+  const familyKeys = [...new Set(strategies.map((node) => node.family || node.cluster || 'specialist'))].sort();
+  const planetOrbits = new Map();
+  strategies.forEach((node, index) => {
+    const seed = seededGraphUnit(node.id);
+    const strength = Math.min(1, Math.max(0, Number(node.learned_strength || 0)));
+    const familyIndex = Math.max(0, familyKeys.indexOf(node.family || node.cluster || 'specialist'));
+    const lane = familyKeys.length > 1 ? (familyIndex + .5) / familyKeys.length * 2 - 1 : 0;
+    const rate = node.training_positive_net_rate;
+    const reliability = rate === null || rate === undefined
+      ? null
+      : Math.min(1, Math.max(0, Number(rate)));
+    const a = GNN3D_SYSTEM.planet.inner
+      + (GNN3D_SYSTEM.planet.outer - GNN3D_SYSTEM.planet.inner) * (1 - strength);
+    const orbit = makeOrbit({
+      a,
+      // Eccentricity is how reliable the payoff was. An arm that paid on most of
+      // its filled rows runs a near-circle; one that rarely did visibly wobbles.
+      e: reliability === null ? .12 + seed * .06 : .05 + .28 * (1 - reliability),
+      // One orbital plane per methodology family, so a family reads as a family
+      // from any camera angle instead of only from the front.
+      inclination: lane * GNN3D_SYSTEM.planet.inclination + (seed - .5) * .1,
+      ascending: (index * GNN_GOLDEN_ANGLE) % GNN3D_TWO_PI,
+      theta: seededGraphUnit(`${node.id}:t`) * GNN3D_TWO_PI,
+      omega: keplerAbout(a),
+      parent: null,
+    });
+    planetOrbits.set(node.id, orbit);
+    placements.set(node.id, orbit);
+    metrics.set(node.id, {
+      size: 5.2 + 5.2 * massOf(node),
+      strength, mass: massOf(node),
+    });
+  });
+
+  // ---- the moons: output head channels, bound to their own strategy ----
+  const heads = Math.max(1, Number(model?.head_channels || 0) || 8);
+  list.filter((node) => node.kind === 'output').forEach((node) => {
+    const parent = planetOrbits.get(node.strategy_id) || null;
+    const unit = outputUnit(node.id);
+    const bound = unit === null ? .5 : unit;
+    const seed = seededGraphUnit(node.id);
+    const channel = Number(node.channel_index || 0);
+    const a = GNN3D_SYSTEM.moon.inner
+      + (GNN3D_SYSTEM.moon.outer - GNN3D_SYSTEM.moon.inner) * (1 - bound);
+    const orbit = makeOrbit({
+      a,
+      e: .04 + seed * .14,
+      // The eight channels fan out in inclination, so a strategy's heads form a
+      // shell around it and stay individually pickable at any camera angle.
+      inclination: (heads > 1 ? (channel + .5) / heads * 2 - 1 : 0) * GNN3D_SYSTEM.moon.inclination,
+      ascending: (channel * GNN_GOLDEN_ANGLE + seed * .4) % GNN3D_TWO_PI,
+      theta: seed * GNN3D_TWO_PI,
+      omega: Math.min(GNN3D_SYSTEM.maxMoonOmega, GNN3D_SYSTEM.keplerMoon / (a ** 1.5)),
+      // A head column that sums negative subtracts from its channel, and is drawn
+      // retrograde: the sign of the parameter is visible in the motion.
+      direction: (outputSigned.get(node.id) || 0) < 0 ? -1 : 1,
+      parent,
+    });
+    placements.set(node.id, orbit);
+    metrics.set(node.id, {
+      size: 1.5 + 2 * bound, strength: unit, mass: bound,
+    });
+  });
+
+  // Reference rings for the two feature bands, at each band's mean radius and tilt.
+  // Planet orbits are drawn from their own real elements; moons are not (their ring
+  // would have to follow a moving parent, and 104 of them would bury the graph).
+  const beltRings = ['input_context', 'input_identity'].map((cluster) => {
+    const members = list.filter((node) => node.kind === 'feature' && node.cluster === cluster);
+    if (!members.length) return null;
+    let sumA = 0, sumTilt = 0;
+    members.forEach((node) => {
+      const orbit = placements.get(node.id);
+      sumA += orbit.a; sumTilt += orbit.inclination;
+    });
+    return { cluster, a: sumA / members.length, inclination: sumTilt / members.length };
+  }).filter(Boolean);
+
+  const shells = GNN3D_LAYERS.map((layer) => ({
+    label: layer.label, color: layer.color,
+    count: list.filter((node) => layer.kinds.includes(node.kind)).length,
+  })).filter((shell) => shell.count > 0);
+
+  return { placements, orbits, metrics, shells, beltRings, planetOrbits };
 }
 
 function gnn3dNodePosition(node, layout) {
-  const placed = layout?.get(node.id);
-  if (placed) return placed;
-  const layer = gnn3dLayerFor(node);
-  return { x: layer.x, y: 0, z: 0, layer };
+  const placed = layout?.placements?.get(node.id);
+  return placed ? { x: placed.x, y: placed.y, z: placed.z } : { x: 0, y: 0, z: 0 };
 }
 
 /**
@@ -1093,7 +1773,9 @@ function gnn3dNodePosition(node, layout) {
  */
 function buildGnnPipelineRibbon(THREE, pipeline) {
   const group = new THREE.Group();
-  const y = -330;
+  // Clear of the system's southern bodies: the outer belt reaches about -150 in Y
+  // and an inclined planet with its moons about -230.
+  const y = -352;
   const spanX = 1120;
   const stageCounts = (pipeline && pipeline.stage_counts) || null;
   const unavailable = !pipeline || pipeline.unavailable || !stageCounts;
@@ -1116,9 +1798,9 @@ function buildGnnPipelineRibbon(THREE, pipeline) {
       ? `수집→판별 파이프라인 · 측정 없음 (${(pipeline && pipeline.unavailable) || 'NO_DATA'})`
       : '수집 → 전략 판별 파이프라인 (단계별 탈락 수)',
     unavailable ? 0x8aa1b7 : 0x5eead4,
+    { height: 30 },
   );
-  banner.scale.set(320, 40, 1);
-  banner.position.set(0, y + 132, 0);
+  banner.position.set(0, y + 78, 0);
   banner.material.opacity = .72;
   group.add(banner);
 
@@ -1149,10 +1831,10 @@ function buildGnnPipelineRibbon(THREE, pipeline) {
       THREE,
       count === null ? `${stage.label} · —` : `${stage.label} · ${count}`,
       stage.color,
+      { height: 22 },
     );
-    caption.scale.set(126, 27, 1);
     // Alternate the caption height so 15 labels in a row stay readable.
-    caption.position.set(x, y - 44 - (index % 2) * 26, 0);
+    caption.position.set(x, y - 40 - (index % 2) * 24, 0);
     caption.material.opacity = count === null ? .4 : .72;
     group.add(caption);
     points.push({ x, y, z: 0 });
@@ -1161,7 +1843,7 @@ function buildGnnPipelineRibbon(THREE, pipeline) {
   const S = GNN3D_EDGE_SEGMENTS;
   const positions = new Float32Array(Math.max(1, points.length - 1) * S * 2 * 3);
   for (let index = 0; index < points.length - 1; index += 1) {
-    writeGnn3dEdgeCurve(positions, index, { source: points[index], target: points[index + 1] }, 16);
+    writeGnn3dEdgeCurve(positions, index, points[index], points[index + 1], 0, -16, 0);
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
@@ -1178,20 +1860,86 @@ function gnn3dEdgeColor(link) {
   const key = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
   return (gnnRelationStyle[key] || { color: '#7187a0' }).color;
 }
-function createGnn3dLabel(THREE, text, color) {
-  const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 72;
-  const ctx = canvas.getContext('2d'); ctx.fillStyle = 'rgba(3,7,13,.78)'; ctx.fillRect(0, 8, 320, 46);
-  ctx.strokeStyle = `#${color.toString(16).padStart(6, '0')}`; ctx.strokeRect(1, 9, 318, 44);
-  ctx.fillStyle = '#e9fbff'; ctx.font = 'bold 21px Inter, sans-serif'; ctx.fillText(text, 10, 39);
+const GNN3D_LABEL_FONT = 'bold 21px Inter, sans-serif';
+let gnn3dLabelMeasure = null;
+
+/**
+ * A caption sprite whose texture is sized to the text it holds.
+ *
+ * The fixed 320px canvas silently clipped every long caption -- the market-physics
+ * legend has always run past it -- and callers then stretched a 320px texture to an
+ * arbitrary width, so identical text rendered at different letter widths depending
+ * on which call site drew it. Width now follows the measured string and `height`
+ * sets the scale, so every caption in the scene has the same glyph size.
+ */
+function createGnn3dLabel(THREE, text, color, { height = 20 } = {}) {
+  const label = String(text ?? '');
+  if (!gnn3dLabelMeasure) {
+    gnn3dLabelMeasure = document.createElement('canvas').getContext('2d');
+  }
+  gnn3dLabelMeasure.font = GNN3D_LABEL_FONT;
+  const width = Math.max(72, Math.ceil(gnn3dLabelMeasure.measureText(label).width) + 22);
+  const canvas = document.createElement('canvas');
+  canvas.width = width; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(3,7,13,.78)'; ctx.fillRect(0, 8, width, 46);
+  ctx.strokeStyle = `#${color.toString(16).padStart(6, '0')}`; ctx.strokeRect(1, 9, width - 2, 44);
+  ctx.fillStyle = '#e9fbff'; ctx.font = GNN3D_LABEL_FONT; ctx.fillText(label, 11, 39);
   const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
   const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, opacity: .72, depthWrite: false }));
-  sprite.scale.set(82, 18, 1); return sprite;
+  sprite.scale.set((width / 64) * height, height, 1);
+  return sprite;
 }
 function updateGnn3dTooltip(canvas, node, pointer) {
-  const tooltip = document.getElementById('gnn-model-tooltip'), rect = canvas.getBoundingClientRect();
-  tooltip.hidden = false; tooltip.style.left = `${Math.min(rect.width - 245, Math.max(8, (pointer.x + 1) * rect.width / 2 + 12))}px`;
-  tooltip.style.top = `${Math.min(rect.height - 70, Math.max(8, (-pointer.y + 1) * rect.height / 2 + 12))}px`;
-  tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${escapeHtml(String(node.layer || node.kind || '').toUpperCase())} · 3D compute node`;
+  const tooltip = document.getElementById('gnn-model-tooltip');
+  if (!tooltip) return;
+  const rect = canvas.getBoundingClientRect();
+  tooltip.hidden = false;
+  tooltip.style.left = `${Math.min(rect.width - 245, Math.max(8, (pointer.x + 1) * rect.width / 2 + 12))}px`;
+  tooltip.style.top = `${Math.min(rect.height - 108, Math.max(8, (-pointer.y + 1) * rect.height / 2 + 12))}px`;
+  tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${gnn3dHoverDetail(node)}`;
+}
+
+/**
+ * What a hovered body actually is. The tooltip used to say "3D compute node",
+ * which told an operator nothing they could not see -- while every number the
+ * layout positioned that body by was already on the node.
+ */
+function gnn3dHoverDetail(node) {
+  const lines = [];
+  const norm = node.parameterNorm;
+  const radius = node.orbitRadius === null || node.orbitRadius === undefined
+    ? '-'
+    : Number(node.orbitRadius).toFixed(0);
+  if (node.kind === 'strategy') {
+    lines.push(`전략 행성 · ${(gnnClusterStyle[node.cluster] || gnnClusterStyle.specialist).label}`);
+    lines.push(`헤드 강도 ${Number(node.learned_strength || 0).toFixed(3)} → 궤도 ${radius}`);
+    lines.push(`학습 체결 ${formatInteger(node.training_filled_rows)}행 (질량)`);
+    lines.push(node.training_positive_net_rate == null
+      ? '학습 양수 순효율 미기록 → 이심률 기본값'
+      : `양수 순효율 ${(Number(node.training_positive_net_rate) * 100).toFixed(1)}% → 이심률 ${Number(node.orbitEccentricity || 0).toFixed(2)}`);
+    if (node.upside_supervised === false) lines.push('상승 학습 부족 → 양엣지 예보 억제');
+  } else if (node.kind === 'output') {
+    lines.push(`출력 헤드 위성 · ${node.channel || '-'}`);
+    lines.push(`소속 전략 ${node.strategy_id || '-'}`);
+    lines.push(norm === null || norm === undefined
+      ? '헤드 열 노름 미측정 → 중간 궤도'
+      : `헤드 열 노름 ${Number(norm).toFixed(3)} → 궤도 ${radius}`);
+  } else if (node.kind === 'hidden') {
+    lines.push('R-GCN 메시지 코어 유닛');
+    lines.push(norm === null || norm === undefined
+      ? '수신 인코더 노름 미측정'
+      : `수신 인코더 노름 ${Number(norm).toFixed(3)}`);
+    lines.push('활성 미계측 (HIDDEN_STATE_NOT_LOGGED)');
+  } else {
+    lines.push(node.cluster === 'input_identity' ? '입력 특징 · 종목 정체성 밴드' : '입력 특징 · 컨텍스트 밴드');
+    lines.push(norm === null || norm === undefined
+      ? '인코더 노름 미측정 → 중간 궤도'
+      : `인코더 노름 ${Number(norm).toFixed(3)} → 궤도 ${radius}`);
+    lines.push('활성 미계측 (ENCODER_INPUT_NOT_LOGGED)');
+  }
+  return lines.map((line) => escapeHtml(line)).join('<br>');
 }
 
 function queueGnnWave(direction) {

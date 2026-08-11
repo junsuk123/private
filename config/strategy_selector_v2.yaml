@@ -1,0 +1,35 @@
+# StrategySelectorV2 utility weights.
+#
+#   U_s = M_s * (mu_gross_s - C_s - lambda_d*D_s - lambda_u*sigma_s
+#                + lambda_o*O_s + lambda_b*B_s)
+#
+# Every term arrives in BASIS POINTS except O_s, which is a unit-less compatibility score
+# in [-1, 1] and is converted by lambda_ontology_bps. Keeping the lambdas here rather than
+# in the model or the optimizer is deliberate: a change to how downside trades off against
+# return is a policy decision that should show up in a config diff.
+#
+# READ BEFORE TUNING
+# ------------------
+# These are starting values, not fitted ones. Fitting them to realized outcomes would make
+# the selector a backtest of itself, and the whole reason the utility is decomposed is so
+# each term can be validated separately (see app/strategy_validation/).
+
+weights:
+  # Expected downside (bps) charged at half weight. NOT 1.0: the downside is CONDITIONAL on
+  # failure while mu_gross is an expectation over both outcomes, so charging it in full
+  # double-counts the loss the probability term already prices.
+  lambda_downside: 0.5
+
+  # Prediction uncertainty charged in full. This is what makes the ranking pessimistic: two
+  # candidates with the same expected net edge are separated by how much the estimator
+  # actually knows, and the wider one loses.
+  lambda_uncertainty: 1.0
+
+  # Converts the ontology compatibility score into bps. 8bps of swing between "this thesis
+  # fits the tape" (+1) and "it does not" (-1). Sized to be meaningful against a ~28bps KRX
+  # round trip without being able to rescue a negative net edge on its own.
+  lambda_ontology_bps: 8.0
+
+  # The bandit correction is already in bps and already bounded (see bandit_adapter.yaml),
+  # so this stays at 1.0 unless the bound itself is being re-scaled.
+  lambda_bandit: 1.0

@@ -401,7 +401,10 @@ range_support_reversion:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  # Stored tradable-universe evidence is negative and statistically inconclusive.
+  # Keep collecting counterfactual outcomes, but do not let an operator-added thesis
+  # bypass the same positive-net validation required from every other strategy.
+  live_authorized: false
   max_low_distance_bps: 10.0
   horizon_seconds: 3600.0
   min_attainable_bps: 160.0
@@ -425,3 +428,22 @@ overnight_gap_carry:
   stop_volatility_multiple: 3.0
   trailing_bps: 45.0
   horizon_seconds: 64800.0
+
+# Multi-hour, completed-bar continuation. It intentionally does not read 1s/5s
+# ticks, so sparse pre/after-market sessions can produce honest shadow outcomes.
+bar_trend_continuation:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  min_ema_separation_bps: 12.0
+  min_vwap_premium_bps: 8.0
+  min_momentum_persistence: 0.60
+  min_relative_volume: 1.20
+  min_liquidity_score: 0.50
+  max_spread_bps: 35.0
+  max_change_point_probability: 0.55
+  target_capture_fraction: 0.60
+  stop_volatility_multiple: 2.5
+  trailing_bps: 40.0
+  horizon_seconds: 10800.0

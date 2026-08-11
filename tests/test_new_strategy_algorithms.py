@@ -119,6 +119,33 @@ def test_completed_bar_vwap_recovery_is_registered_and_live_authorized():
     assert strategy_id in all_geometries()
 
 
+def test_bar_trend_continuation_is_tick_independent_and_shadow_only():
+    strategy_id = "bar_trend_continuation"
+    algorithm = get_algorithm(strategy_id)
+    decision = algorithm.entry(
+        _features(
+            symbol="INTC",
+            second_data_ready=0.0,
+            tick_count_5s=0.0,
+            price=100.0,
+            ema_fast=99.7,
+            ema_slow=99.4,
+            macd_histogram=0.2,
+            vwap_distance_bps=60.0,
+            momentum_persistence=0.75,
+            relative_volume=2.0,
+            atr_pct=0.003,
+            liquidity_score=0.85,
+            spread_bps=8.0,
+        ),
+        _context(strategy_id, change_point_probability=0.2),
+    )
+
+    assert decision.triggered is True, decision.reason_codes
+    assert strategy_shadow_authorized(strategy_id) is True
+    assert strategy_live_authorized(strategy_id) is False
+
+
 def test_every_catalogued_strategy_is_at_least_shadow_authorized():
     """Nothing may be catalogued and then silently inert.
 

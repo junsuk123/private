@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -156,6 +158,32 @@ def test_refactor_dashboard_reads_strategy_ownership_without_mutation(tmp_path: 
     assert result["lifecycle"]["instances"] == 1
     assert result["lifecycle"]["open_positions"] == 1
     assert result["lifecycle"]["positions"][0]["strategy_id"] == "intraday_momentum"
+
+
+def test_refactor_dashboard_does_not_treat_stale_readiness_as_current(tmp_path: Path) -> None:
+    _write_json(
+        tmp_path / "config/refactor_profile.example.json",
+        {
+            "mode": "shadow",
+            "broker_submission_enabled": False,
+            "maximum_order_notional": 0,
+            "allowed_symbols": [],
+            "flags": {},
+        },
+    )
+    report = tmp_path / "data/reports/live_readiness_20260803_000000.json"
+    _write_json(report, {"failures": {"model": "old failure"}})
+    old = datetime(2026, 8, 3, tzinfo=timezone.utc).timestamp()
+    os.utime(report, (old, old))
+
+    result = build_refactor_dashboard(tmp_path)
+
+    assert result["readiness_report"]["fresh"] is False
+    assert result["readiness_report"]["reason"] == "STALE_READINESS_REPORT"
+    assert result["runtime_scope"] == "refactor_shadow"
+    assert result["authoritative_for_live_orders"] is False
+    policy = next(g for g in result["promotion_gates"] if g["value"] == "STALE_REPORT")
+    assert policy["passed"] is False
 
 
 def test_account_page_and_refactor_api_expose_new_console() -> None:
@@ -344,6 +372,7 @@ def test_strategy_market_view_returns_candles_and_execution_stages(tmp_path: Pat
         "market_intraday_momentum_short",
         "opening_range_breakdown",
         "residual_relative_weakness",
+        "bar_trend_continuation",
     ):
         algorithm = next(item for item in trace["algorithms"] if item["id"] == strategy_id)
         assert algorithm["requirements"]

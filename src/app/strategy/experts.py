@@ -563,6 +563,20 @@ class RangeSupportReversionExpert(StrategyExpert):
         )
 
 
+class BarTrendContinuationExpert(StrategyExpert):
+    strategy_id = "bar_trend_continuation"
+    thesis = "persistent completed-bar strength above VWAP continues over hours"
+    default_config = _geometry_config("bar_trend_continuation")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            c.q("return") >= self.config.entry_quantile
+            and c.q("momentum_persistence_long") >= self.config.confirmation_quantile
+            and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
 ALL_EXPERT_TYPES = (
     IntradayMomentumExpert,
     BreakoutVolumeExpert,
@@ -583,6 +597,7 @@ ALL_EXPERT_TYPES = (
     BarConfirmedVwapRecoveryExpert,
     OvernightGapCarryExpert,
     RangeSupportReversionExpert,
+    BarTrendContinuationExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS

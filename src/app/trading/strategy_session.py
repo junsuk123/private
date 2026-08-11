@@ -664,6 +664,11 @@ class StrategySessionState:
     selection_source: str | None = None
     selection_score: float | None = None
     selection_confidence: float | None = None
+    # Populated only when Selector V2 actually owns the election.  The context id
+    # links the broker-realized outcome back to the exact shadow comparison group.
+    selector_v2_context_id: str | None = None
+    selector_v2_authority_state: str | None = None
+    selector_v2_order_size_fraction: float = 1.0
     selected_at: str | None = None
     entry_submitted_at: str | None = None
     position_opened_at: str | None = None
@@ -769,6 +774,33 @@ class StrategySessionState:
     directional_comparison: dict[str, Any] = field(default_factory=dict)
 
 
+def _selector_v2_snapshot(runner: Any, symbol: str | None) -> dict[str, Any]:
+    """Read the V2 runner's telemetry without letting it break ``snapshot()``."""
+    try:
+        return dict(runner.snapshot(symbol=symbol))
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": True, "error": f"{type(exc).__name__}"}
+
+
+def _build_selector_v2_runner() -> Any | None:
+    """Construct the V2 observer/authority runner when enabled; ``None`` otherwise.
+
+    Fails to ``None`` on any error, leaving legacy authority in place. Runtime promotion
+    failures are handled by the controller and cannot grant authority without durable state.
+    """
+    try:
+        from app.config.selector_v2_flags import SelectorV2Flags
+
+        flags = SelectorV2Flags.from_env()
+        if not flags.enabled:
+            return None
+        from app.routing.selector_v2_shadow import SelectorV2ShadowRunner
+
+        return SelectorV2ShadowRunner(flags=flags)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class StrategySessionManager:
     """Persistent closed-world ownership state machine for the live engine."""
 
@@ -779,6 +811,7 @@ class StrategySessionManager:
         selection_evidence_provider: Callable[[tuple[str, ...]], Mapping[str, Any]] | None = None,
         performance_store: StrategyPerformanceStore | None = None,
         bandit: ConservativeStrategyBandit | None = None,
+        selector_v2_runner: Any | None = None,
     ) -> None:
         self.config = config or StrategySessionConfig()
         self.selection_evidence_provider = selection_evidence_provider
@@ -792,6 +825,12 @@ class StrategySessionManager:
         # ``ShadowEvaluationService``. Drained rather than accumulated so a cycle whose
         # plans nobody collects cannot grow without bound.
         self._pending_shadow_plans: list[Any] = []
+        # StrategySelectorV2, starting in SHADOW next to the live election. ``None`` unless
+        # ``STRATEGY_SELECTOR_V2_ENABLED`` is set. Construct once rather than per cycle;
+        # invalid configuration leaves the runner off and legacy authority intact.
+        self._selector_v2: Any | None = selector_v2_runner
+        if self._selector_v2 is None:
+            self._selector_v2 = _build_selector_v2_runner()
 
     def evaluate(
         self,
@@ -885,6 +924,16 @@ class StrategySessionManager:
             if self._state.selected_symbol != str(symbol or "").upper():
                 return None
             return self._state.selected_direction
+
+    def entry_order_size_fraction(self, symbol: str) -> float:
+        """Maximum entry size granted by the selector authority rung."""
+        with self._lock:
+            if self._state.selected_symbol != str(symbol or "").upper():
+                return 0.0
+            return max(
+                0.0,
+                min(1.0, float(self._state.selector_v2_order_size_fraction or 0.0)),
+            )
 
     def order_contract_for(self, symbol: str, *, closing: bool = False) -> dict[str, Any] | None:
         """The (direction, effect, product, loan_date) contract for an order.
@@ -1036,6 +1085,15 @@ class StrategySessionManager:
                 "GNN_DIRECT" if self.config.gnn_direct_election
                 else "CONSERVATIVE_BANDIT" if self.config.bandit_enabled
                 else "FIRST_ADMISSIBLE"
+            )
+            runner = self._selector_v2
+            # V2 telemetry includes configured posture and effective earned authority.
+            # It is published even when disabled so the dashboard can distinguish OFF
+            # from an unknown state.
+            payload["selector_v2"] = (
+                _selector_v2_snapshot(runner, self._state.selected_symbol)
+                if runner is not None
+                else {"enabled": False, "reason": "STRATEGY_SELECTOR_V2_DISABLED"}
             )
             return payload
 
@@ -1190,6 +1248,20 @@ class StrategySessionManager:
             signal_executable=True,
         )
         state.outcome_recorded = bool(recorded)
+        if recorded and state.selector_v2_context_id and self._selector_v2 is not None:
+            try:
+                self._selector_v2.record_live_outcome(
+                    context_id=state.selector_v2_context_id,
+                    strategy_id=strategy,
+                    net_return_bps=gross_bps - float(cost_bps) - borrow_bps,
+                    evidence_source=(
+                        EVALUATION_SOURCE_LIVE_PROBE
+                        if state.selector_v2_authority_state == "LIVE_PROBE"
+                        else EVALUATION_SOURCE_LIVE
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - evidence linkage cannot break exits.
+                pass
 
     def _evaluate_exit(self, holding: Any, bundle: Any, now: datetime) -> None:
         state = self._state
@@ -1445,11 +1517,32 @@ class StrategySessionManager:
             executable, now, counterfactual=True, exclude=selected
         )
 
+        legacy_selected = selected
+        v2_results = self._observe_selector_v2(
+            tradable_candidates, evidence, bundle, now, legacy_selected
+        )
+        v2_context_id: str | None = None
+        if self._selector_v2_live_authority():
+            selected, v2_context_id = self._selector_v2_live_choice(v2_results, proposals)
+            decided = True
+
         if selected is not None:
             self._arm(selected, now, macro)
+            if v2_context_id:
+                runner = self._selector_v2
+                self._state.selector_v2_context_id = v2_context_id
+                self._state.selector_v2_authority_state = str(
+                    getattr(runner, "authority_state", "SHADOW")
+                )
+                self._state.selector_v2_order_size_fraction = max(
+                    0.0, min(1.0, float(getattr(runner, "order_size_fraction", 0.0) or 0.0))
+                )
+                self._state.selection_source = "SELECTOR_V2"
             return
         if decided:
             # A selector ran and chose nothing; it owns the reason string.
+            if self._selector_v2_live_authority():
+                self._state.last_reason = "SELECTOR_V2_NO_TRADE"
             return
         if proposals:
             self._state.last_reason = (
@@ -1459,6 +1552,93 @@ class StrategySessionManager:
             return
 
         self._state.last_reason = self._no_election_reason(evidence, intents)
+
+    # -- StrategySelectorV2 observation and authority ----------------------- #
+    def _observe_selector_v2(
+        self,
+        candidates: tuple[str, ...],
+        evidence: Mapping[str, Any],
+        bundle: Any,
+        now: datetime,
+        selected: "_ElectionProposal | None",
+    ) -> tuple[Any, ...]:
+        """Run StrategySelectorV2 over the same point-in-time inputs.
+
+        Legacy first constructs its candidate proposal set; V2 then sees the identical
+        ``evidence`` mapping. In SHADOW the result is comparison-only. Once the persisted
+        controller grants authority, the caller may resolve the result only to one of those
+        independently order-authorised proposals. Three properties keep this safe:
+
+        * it is skipped entirely unless ``STRATEGY_SELECTOR_V2_ENABLED`` is set (default off);
+        * the runner catches its own exceptions, and this call catches anything that escapes.
+          That double guard is not belt-and-braces: the engine wraps
+          ``strategy_session_manager.evaluate`` in a handler that DISABLES BUYS on error, so
+          an exception leaking from telemetry would stop trading;
+        * the runner has no import path to the execution layer and cannot create an order;
+          the session boundary can only select an existing authorised proposal.
+        """
+        runner = self._selector_v2
+        if runner is None:
+            return ()
+        try:
+            return tuple(runner.observe(
+                candidates=candidates,
+                evidence=evidence,
+                bundle=bundle,
+                now=now,
+                legacy_strategy=selected.strategy_id if selected is not None else None,
+                legacy_symbol=selected.symbol if selected is not None else None,
+                legacy_reason=self._state.last_reason,
+            ))
+        except Exception:  # noqa: BLE001 - see the docstring: a raise here stops trading.
+            return ()
+
+    def _selector_v2_live_authority(self) -> bool:
+        runner = self._selector_v2
+        return bool(runner is not None and getattr(runner, "live_authority", False))
+
+    @staticmethod
+    def _selector_v2_live_choice(
+        results: tuple[Any, ...], proposals: list["_ElectionProposal"]
+    ) -> tuple["_ElectionProposal | None", str | None]:
+        """Resolve V2's cross-symbol recommendation to an executable proposal.
+
+        V2 is a selector, not an order builder.  It may only choose a proposal the live
+        session independently constructed and marked order-authorised.  A missing match
+        becomes NO_TRADE rather than inventing an execution contract.
+        """
+        selected_results = [
+            item
+            for item in results
+            if str(getattr(item, "decision", "")).upper() == "SELECT"
+            and getattr(item, "selected_strategy", None)
+        ]
+        if not selected_results:
+            return None, None
+        result = max(
+            selected_results,
+            key=lambda item: (
+                float(getattr(item, "utility"))
+                if getattr(item, "utility", None) is not None
+                else -float("inf")
+            ),
+        )
+        winner = next(
+            (
+                proposal
+                for proposal in proposals
+                if proposal.strategy_id == str(result.selected_strategy)
+                and proposal.symbol == str(getattr(result, "symbol", "")).upper()
+                and proposal.submits_orders
+            ),
+            None,
+        )
+        return winner, str(getattr(result, "context_id", "") or "") or None
+
+    @property
+    def selector_v2(self) -> Any | None:
+        """The V2 observer/authority runner, or ``None`` when disabled."""
+        return self._selector_v2
 
     # -- proposal construction --------------------------------------------- #
     def _intent_proposals(

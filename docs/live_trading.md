@@ -190,6 +190,73 @@ forward 검증은 전략별 horizon 안에서 목표가/손절가 중 먼저 도
 
 **"이벤트 LLM 대기/timeout"** 은 Ollama가 실행 중이 아니라는 뜻입니다. LLM 자동 감지는 기동 시 1회이므로 Ollama를 켠 뒤 앱을 재시작해야 합니다.
 
+### 5.1 "왜 그 전략이었나"를 항별로 보기
+
+위 사유 코드는 **선출이 실패한 이유**를 말합니다. 선출이 성공했을 때 **왜 그 전략인지**는
+`GET /api/refactor/dashboard` 의 `strategy_session` 안에서 봅니다.
+
+legacy 경로는 V2가 아직 SHADOW일 때 실주문 선택 권한을 유지하며 `bandit_evaluations`에 arm별
+보수적 엣지·표본 수·연속 손실을 남깁니다. `bandit_evaluated_at`이 `null`이면 **이번 사이클에
+bandit이 돌지 않았다**는 뜻이고,
+그때 `bandit_*` 필드는 다른 세션의 값일 수 있습니다 — 이 필드가 없어서 "미국 정규장에 마감된 국내
+종목 arm 을 평가한다"는 오진이 실제로 났습니다.
+
+Python 프로세스의 안전 기본값은 V2 off입니다. 수동 실행에서 자동 수집·승격을 쓰려면 다음처럼
+켭니다. `run.ps1`은 이 값을 이미 기본으로 설정하므로 사용자가 증거를 확인해 flag를 수기로
+바꿀 필요가 없습니다.
+
+```powershell
+$env:STRATEGY_SELECTOR_V2_ENABLED = "1"
+$env:STRATEGY_SELECTOR_V2_SHADOW_ONLY = "1"  # 안전한 초기 posture 유지
+$env:STRATEGY_SELECTOR_V2_AUTO_PROMOTE = "1" # 증거 기반 자동 권한 전환
+$env:STRATEGY_UTILITY_GNN_ENABLED = "1"      # 선택: 기존 GNN 벡터 사용
+```
+
+자동 사다리는 다음과 같습니다.
+
+```text
+SHADOW
+  └─ forward context 120+, 실제 선택 context 40+, 10일+, 4개 시간창 중 3개 양수,
+     95% 순수익 하단 ≥ +3bps, 추가 왕복비용 5bps 후에도 양수,
+     평균 regret ≤ 15bps, 오레짐 거래율 ≤ 15%, top-1 hit ≥ 40%
+     위 조건을 3회 연속 통과
+     → LIVE_PROBE (원래 승인 수량의 10%, 양수 수량은 최소 1주)
+       └─ 실체결 LIVE_PROBE context 30+, 10일+, 실현 순수익 95% 하단 ≥ 0bps
+          위 조건을 3회 연속 통과 → LIVE (100%)
+```
+
+live 상태에서 context가 20개 이상이고 보수적 하단이 `−5bps` 이하이거나 오레짐 거래율이 25%를
+넘으면 즉시 SHADOW로 자동 강등됩니다. 평가 오류는 `SUSPENDED`, 권한 상태 파일 저장 실패는
+승격 거부입니다. 상태·증거·최근 전이는 `data/store/selector-v2-promotion.json`에 저장됩니다.
+
+그러면 `GET /api/realtime-trading/status`의 `strategy_session.selector_v2`에 다음이 실립니다.
+
+| 키 | 읽는 법 |
+| --- | --- |
+| `enabled` / `configured_shadow_only` | 실행 여부와 설정상 안전 초기 posture |
+| `shadow_only` / `live_authority` / `order_size_fraction` | 승격 컨트롤러까지 반영한 실효 권한과 최대 진입 비율 |
+| `auto_promotion.state` | `SHADOW`, `LIVE_PROBE`, `LIVE`, `SUSPENDED` 중 현재 상태 |
+| `auto_promotion.metrics` / `evidence_rows` | 각 승격 기준의 현재 측정값과 영속 증거 수 |
+| `auto_promotion.recent_transitions` | 자동 승격·강등·중단 이력과 당시 지표 |
+| `latest_selection.context_id` | 이 판단이 본 스냅샷 id. 모든 proposal·outcome 이 이 id 를 참조 |
+| `latest_selection.blocked` | 전략별 온톨로지 hard-block 사유 (`ONTO_ELIG_*`). 전략이 목록에 **없는** 이유가 여기 있음 |
+| `latest_selection.ranked_candidates[]` | 후보별 `expected_gross_return_bps` − `expected_cost_bps` − `downside_penalty_bps` − `uncertainty_penalty_bps` + `ontology_adjustment_bps` + `bandit_adjustment_bps` = `final_utility_bps`. 합이 맞는지 테스트로 고정돼 있음 |
+| `latest_selection.no_trade` | `no_trade_utility_bps` (넘어야 할 bar), `best_candidate_utility_bps`, `margin_bps`, 사유 |
+| `comparisons[]` | legacy 와의 일치/불일치 (`SAME_STRATEGY` / `DIFFERENT_STRATEGY` / `V2_DECLINED` / `V2_TRADED` / `BOTH_NO_TRADE`) |
+| `coverage_gaps` | 반복 관측되는데 검증된 전략이 없는 컨텍스트 버킷 |
+| `last_error` | 관측 오류. SHADOW에서는 legacy가 계속하고, 권한 평가 오류는 자동 `SUSPENDED`로 fail-closed |
+
+후보의 `utility_source` 가 `UTILITY_SOURCE_HEURISTIC` 이면 학습된 효용 모델이 아니라 규칙 기반
+placeholder 가 그 후보를 채점했다는 뜻입니다 — 예측을 그만큼 낮게 신뢰해야 합니다.
+`cost_measured=false` 는 비용이 fallback 값이라는 뜻이고, NO_TRADE bar 가 그만큼 올라갑니다.
+
+상세는 [strategy_selection_v2.md](strategy_selection_v2.md) §5.2.
+
+> 관측 스냅샷(2026-08-11 23:09:33 KST): `state=SHADOW`, `configured_shadow_only=true`,
+> `live_authority=false`, `order_size_fraction=0`, 영속 context 66개·실제 전략 선택 context 0개입니다.
+> 이는 자동화가 꺼진 것이 아니라 아직 승격 최소 표본에 도달하지 않았다는 뜻입니다.
+> 수치는 live cycle마다 증가하므로 최신값은 위 API에서 확인합니다.
+
 ## 6. 종료 버튼
 
 `/account`의 종료 버튼 순서:
@@ -296,7 +363,7 @@ dwell이 필요한 이유: 구독은 **연속** 분봉을 만들어야 값을 �
 | `logs/live-orders.jsonl` | live 주문 저널 |
 | `logs/live-feature-frames.jsonl` | feature frame 저널 |
 | `logs/refactor-shadow-comparison.jsonl` | legacy/ontology/CPU/NPU 판단 비교 |
-| `data/models/strategy_utility/rgcn_shadow.json/.npz` | 8전략 R-GCN 모델 카드와 체크포인트 |
+| `data/models/strategy_utility/rgcn_shadow.json/.npz` | 전략별 head R-GCN 모델 카드와 체크포인트 (현재 16전략) |
 | `data/store/account_dashboard.sqlite3` | 계좌 대시보드 스토어 |
 | `data/store/realtime_market_data.sqlite3` | 실시간 시장 스토어 |
 | `data/store/causal-order-journal.jsonl` | intent → verdict → order 인과 저널 |
@@ -328,7 +395,16 @@ dwell이 필요한 이유: 구독은 **연속** 분봉을 만들어야 값을 �
 python -m pytest
 python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
 python -m pytest tests/test_directional_short_ladder.py   # 숏 사다리 안전 속성 76건
+python -m pytest tests/test_strategy_selector_v2.py       # 전략 선택 V2 + 실행 계층 격리 31건
 python scripts/run_live_trading_test_suite.py
+```
+
+읽기 전용 진단 리포트 (주문 없음):
+
+```powershell
+python scripts/report_strategy_selection_v2.py            # 전략 audit 표 + coverage 매트릭스
+python scripts/diagnose_strategy_selection.py             # 선출 경로 진단
+python scripts/check_market_session_readiness.py          # 세션·venue 능력
 ```
 
 **live 주문 테스트는 금지입니다.** 숏도 예외가 아닙니다 — 대주 조회(`get_shortable_symbols`,

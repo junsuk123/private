@@ -26,7 +26,14 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
     counterfactual = _json(base / "data/reports/refactor_counterfactual_evaluation.json")
     benchmark = _json(base / "data/reports/strategy_utility_openvino.json")
     gnn_training = _json(base / "data/models/strategy_utility/rgcn_shadow.json")
-    readiness = _latest_json(base / "data/reports", "live_readiness_*.json")
+    readiness, readiness_meta = _latest_json_with_freshness(
+        base / "data/reports",
+        "live_readiness_*.json",
+        max_age_seconds=max(
+            60.0,
+            _env_float("REFACTOR_READINESS_MAX_AGE_SEC", 900.0),
+        ),
+    )
     lifecycle = _lifecycle(base / "data/store/trading-lifecycle.sqlite3")
     shadow = _shadow(base / "logs/refactor-shadow-comparison.jsonl")
     journal = _journal(base / "data/store/causal-order-journal.jsonl")
@@ -40,7 +47,11 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
     )
     data_promoted = bool(counterfactual.get("promotion_eligible"))
     npu_promoted = bool(benchmark.get("promotion_eligible"))
-    policy_ready = bool(readiness) and not bool(readiness.get("failures"))
+    policy_ready = (
+        bool(readiness)
+        and bool(readiness_meta.get("fresh"))
+        and not bool(readiness.get("failures"))
+    )
     execution_ready = bool(flags.get("strategy_owned_execution"))
     live_enabled = bool(flags.get("live_enabled"))
 
@@ -71,8 +82,16 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
         _gate(
             "거래 위험 정책",
             policy_ready,
-            _readiness_reason(readiness),
-            "READY" if policy_ready else "BLOCKED",
+            _readiness_reason(readiness, readiness_meta),
+            (
+                "READY"
+                if policy_ready
+                else (
+                    "STALE_REPORT"
+                    if readiness_meta.get("available") and not readiness_meta.get("fresh")
+                    else "BLOCKED"
+                )
+            ),
         ),
         _gate(
             "전략 소유 실행",
@@ -84,6 +103,8 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
+        "runtime_scope": "refactor_shadow" if mode == "shadow" else "refactor_execution",
+        "authoritative_for_live_orders": bool(mode in {"canary", "live"}),
         "profile_valid": profile_error is None,
         "profile_error": profile_error,
         "broker_submission_enabled": broker_submission,
@@ -95,6 +116,7 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
             and all(gate["passed"] for gate in gates)
         ),
         "flags": flags,
+        "readiness_report": readiness_meta,
         "pipeline": [
             {
                 "id": "market",
@@ -277,6 +299,56 @@ def _latest_json(directory: Path, pattern: str) -> dict[str, Any]:
     return _json(candidates[-1]) if candidates else {}
 
 
+def _latest_json_with_freshness(
+    directory: Path,
+    pattern: str,
+    *,
+    max_age_seconds: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the newest report plus provenance; an old file is never current state."""
+    try:
+        candidates = sorted(directory.glob(pattern), key=lambda path: path.stat().st_mtime)
+    except OSError:
+        candidates = []
+    if not candidates:
+        return {}, {
+            "available": False,
+            "fresh": False,
+            "reason": "READINESS_REPORT_MISSING",
+            "max_age_seconds": float(max_age_seconds),
+        }
+    latest = candidates[-1]
+    try:
+        modified_at = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return {}, {
+            "available": False,
+            "fresh": False,
+            "reason": "READINESS_REPORT_UNREADABLE",
+            "path": str(latest),
+            "max_age_seconds": float(max_age_seconds),
+        }
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - modified_at).total_seconds())
+    payload = _json(latest)
+    fresh = bool(payload) and age_seconds <= float(max_age_seconds)
+    return payload, {
+        "available": bool(payload),
+        "fresh": fresh,
+        "reason": "CURRENT" if fresh else "STALE_READINESS_REPORT",
+        "path": str(latest),
+        "modified_at": modified_at.isoformat(),
+        "age_seconds": round(age_seconds, 3),
+        "max_age_seconds": float(max_age_seconds),
+    }
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _lifecycle(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"available": False, "instances": 0, "open_positions": 0, "states": {}}
@@ -395,7 +467,19 @@ def _gate(label: str, passed: bool, reason: str, value: str) -> dict[str, Any]:
     return {"label": label, "passed": passed, "reason": reason, "value": value}
 
 
-def _readiness_reason(readiness: dict[str, Any]) -> str:
+def _readiness_reason(
+    readiness: dict[str, Any],
+    meta: dict[str, Any] | None = None,
+) -> str:
+    report_meta = meta or {}
+    if report_meta.get("available") and not report_meta.get("fresh"):
+        age = float(report_meta.get("age_seconds") or 0.0)
+        return (
+            f"준비도 보고서가 {age / 60.0:.1f}분 전 자료라 현재 장애 판정에 사용하지 않습니다. "
+            "현재 LIVE_TRADING 상태는 운영 진단 API에서 별도로 확인해야 합니다."
+        )
+    if not readiness:
+        return "현재 유효한 준비도 보고서가 없습니다."
     failures = readiness.get("failures") or {}
     if failures:
         return " / ".join(str(value) for value in failures.values())
@@ -1084,6 +1168,7 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "residual_relative_weakness": ["Sector Rank", "Residual Return", "Borrow"],
         "overnight_gap_carry": ["Close Clock", "VWAP Premium", "Day Volatility"],
         "range_support_reversion": ["20-bar Range Low", "Range Mid", "ATR", "Volume"],
+        "bar_trend_continuation": ["EMA Fast/Slow", "MACD", "VWAP", "Relative Volume"],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
 
@@ -1399,6 +1484,11 @@ def _decision_ontology(
         # opposite of the condition the algorithm actually applies.
         "range_support_reversion": [
             ("box_position", "<=", .2),
+            ("liquidity", ">=", .65),
+        ],
+        "bar_trend_continuation": [
+            ("return", ">=", .8),
+            ("volume", ">=", .65),
             ("liquidity", ">=", .65),
         ],
     }

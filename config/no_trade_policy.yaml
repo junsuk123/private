@@ -1,0 +1,49 @@
+# NO_TRADE as a first-class action: what doing nothing is worth.
+#
+# A strategy wins only by clearing this bar. The bar is per MARKET because the round trip
+# is not the same everywhere — settlement-verified figures from this account are ~28bps on
+# KRX and 51-70bps on US — and per HORIZON because a short horizon cannot attain a large
+# move: the stored US tape puts the median absolute move at 6.7bps over 3 minutes against a
+# 51.2bps round trip.
+#
+# The bar is edge OVER AND ABOVE cost. Cost is already subtracted before the comparison.
+#
+# Environment overrides (highest precedence):
+#   NO_TRADE_MIN_EDGE_BPS_KR / _US / _DEFAULT
+#   NO_TRADE_UNMEASURED_PENALTY_BPS
+#   NO_TRADE_MIN_FEATURE_COMPLETENESS
+
+minimum_edge_bps:
+  # Mirrors strategy_algorithms.yaml `shared.min_net_buffer_bps` (10bps), so the algorithm
+  # layer's entry floor and the selector's NO_TRADE bar agree about what "worth taking"
+  # means. Two layers with different answers is how a strategy fires on an edge the next
+  # layer then rejects.
+  KR: 10.0
+  # Doubled for US. The buffer is the same idea but a 10bps cushion on a 51-70bps round
+  # trip is a much thinner margin of safety than on 28bps.
+  US: 20.0
+  # Applied to a market neither of the above names. Between the two, deliberately: an
+  # unrecognised venue should not be treated as the cheap one.
+  default: 15.0
+
+# Extra bar charged when the cost estimate was a FALLBACK rather than a measurement. A cost
+# the system guessed and one it computed are different evidence, and the guess should have
+# to clear a higher bar.
+unmeasured_penalty_bps: 5.0
+
+# Contexts below this feature completeness are NO_TRADE regardless of edge. This is a floor
+# against an essentially empty context (a symbol with no tape), not a quality target — the
+# per-strategy requiresFeature relations enforce quality field by field.
+minimum_feature_completeness: 0.25
+
+# Require net - uncertainty > bar, not net > bar.
+#
+# This is the load-bearing line in the file. Comparing a MEAN against cost is how a strategy
+# with a wide error band and a slightly positive mean keeps trading: half its distribution
+# is below cost, and cost is paid on every trade.
+require_positive_lower_bound: true
+
+# Horizons shorter than this get an extra bar added, because the attainable move over the
+# window is smaller. Set short_horizon_seconds to 0 to disable.
+short_horizon_seconds: 300.0
+short_horizon_extra_bps: 5.0

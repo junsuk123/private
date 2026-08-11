@@ -99,6 +99,11 @@ STRATEGY_IDS: tuple[str, ...] = (
     #     proximity alone measured t=3.01; combining them did not beat the floor
     #     condition on its own.
     "range_support_reversion",
+    # Completed-bar trend continuation for sessions where a causal 1s/5s print
+    # window is unavailable. This is a distinct, multi-hour hypothesis using
+    # minute-bar trend, VWAP location, persistence and relative volume. It ships
+    # SHADOW-only and must earn positive net counterfactual evidence before use.
+    "bar_trend_continuation",
 )
 
 # Compatibility alias for callers that explicitly ask for the complete catalog.

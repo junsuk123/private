@@ -891,8 +891,20 @@ class RealtimeTradingEngine:
                 continue
             _record_technical_decision(symbol, "BUY", result)
             if result.approved and result.final_order is not None:
+                final_order = result.final_order
+                if self.strategy_session_manager is not None:
+                    fraction = self.strategy_session_manager.entry_order_size_fraction(symbol)
+                    if fraction <= 0.0:
+                        summary["buy_rejected"] += 1
+                        self._append_rejection(
+                            summary, symbol, "BUY", ("SELECTOR_V2_AUTHORITY_NOT_ORDERABLE",)
+                        )
+                        continue
+                    original_quantity = max(1, int(getattr(final_order, "quantity", 1) or 1))
+                    capped_quantity = max(1, min(original_quantity, math.floor(original_quantity * fraction)))
+                    final_order = replace(final_order, quantity=capped_quantity)
                 priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
-                    symbol, "BUY", result.final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
+                    symbol, "BUY", final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
                 )
                 if not exec_ok or priced_order is None:
                     summary["buy_rejected"] += 1
@@ -941,20 +953,32 @@ class RealtimeTradingEngine:
         candidates: tuple[str, ...],
         decision_time: datetime,
     ) -> None:
-        """Keeps the short deployment ladder fed and moving.
+        """Advances selector evidence and the short deployment ladder.
 
-        Four jobs, none of which can create an order:
+        Five jobs, none of which can create an order:
 
-        1. poll 대주 availability for short-eligible candidates, so a locate EXISTS
+        1. walk Selector V2 counterfactuals and re-evaluate its persisted authority;
+        2. poll 대주 availability for short-eligible candidates, so a locate EXISTS
            when a short signal fires (without this the store stays empty and every
            short candidate is dropped before it becomes a proposal);
-        2. hand newly journaled shadow plans to the evaluation service;
-        3. walk those plans against the current book and persist resolved outcomes;
-        4. re-evaluate deployment states on the configured interval.
+        3. hand newly journaled shadow plans to the evaluation service;
+        4. walk those plans against the current book and persist resolved outcomes;
+        5. re-evaluate deployment states on the configured interval.
 
         Entirely wrapped in try/except: this is bookkeeping for a subsystem that
         submits nothing, and it must not be able to break the live LONG path.
         """
+        # Selector V2's counterfactual positions are independent of short selling.
+        # Feed them before the short feature toggle so a long-only account can still
+        # accumulate the evidence required for automatic selector promotion.
+        try:
+            selector_result = self._walk_selector_v2_evidence(candidates, decision_time)
+            if selector_result:
+                summary["selector_v2_evaluation"] = selector_result
+        except Exception as exc:  # noqa: BLE001 - the controller itself suspends fail-closed.
+            summary["selector_v2_evaluation"] = {
+                "error": f"{type(exc).__name__}: {exc}"
+            }
         if not _env_bool("SHORT_STRATEGY_CYCLE_ENABLED", True):
             return
         try:
@@ -1012,6 +1036,44 @@ class RealtimeTradingEngine:
         except Exception as exc:  # noqa: BLE001
             short_summary["promotion_error"] = f"{type(exc).__name__}: {exc}"
         summary["short_cycle"] = short_summary
+
+    def _walk_selector_v2_evidence(
+        self, candidates: tuple[str, ...], decision_time: datetime
+    ) -> dict[str, Any] | None:
+        manager = self.strategy_session_manager
+        runner = getattr(manager, "selector_v2", None) if manager is not None else None
+        if runner is None:
+            return None
+        resolved = 0
+        observed_symbols = tuple(
+            dict.fromkeys((*candidates, *tuple(getattr(runner, "open_symbols", ()) or ())))
+        )
+        quotes = self._short_cycle_quotes(observed_symbols, decision_time)
+        for symbol, quote in quotes.items():
+            bid = float(quote.get("bid_price") or 0.0)
+            ask = float(quote.get("ask_price") or 0.0)
+            if bid > 0.0 and ask >= bid:
+                resolved += int(
+                    runner.observe_quote(
+                        symbol, (bid + ask) / 2.0, quote.get("observed_at") or decision_time
+                    )
+                    or 0
+                )
+        resolved += int(runner.expire_stale(decision_time) or 0)
+
+        last = getattr(self, "_last_selector_promotion_eval_at", None)
+        # Persist a newly resolved context immediately.  The five-minute interval is
+        # only for unchanged evidence; delaying a fresh outcome would lose it on a
+        # process crash and make restart frequency part of the promotion statistic.
+        if (
+            resolved <= 0
+            and last is not None
+            and (decision_time - last).total_seconds() < 300
+        ):
+            return {"resolved": resolved} if resolved else None
+        self._last_selector_promotion_eval_at = decision_time
+        decision = runner.evaluate_authority(decision_time)
+        return {"resolved": resolved, "promotion": decision}
 
     def _short_cycle_quotes(
         self, candidates: tuple[str, ...], decision_time: datetime

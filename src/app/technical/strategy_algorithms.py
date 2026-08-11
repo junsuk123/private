@@ -493,6 +493,23 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "max_spread_bps": 30.0,
         "min_liquidity_score": 0.35,
     },
+    "bar_trend_continuation": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_ema_separation_bps": 12.0,
+        "min_vwap_premium_bps": 8.0,
+        "min_momentum_persistence": 0.60,
+        "min_relative_volume": 1.20,
+        "min_liquidity_score": 0.50,
+        "max_spread_bps": 35.0,
+        "max_change_point_probability": 0.55,
+        "target_capture_fraction": 0.60,
+        "stop_volatility_multiple": 2.5,
+        "trailing_bps": 40.0,
+        "horizon_seconds": 10800.0,
+    },
     "liquidity_shock_reversal": {
         # The new ask-heavy absorption branch is validated on two US sessions
         # only.  Keep the whole arm shadow-only until forward outcomes provide
@@ -3264,6 +3281,94 @@ class RangeSupportReversionAlgorithm(TradingAlgorithm):
         )
 
 
+class BarTrendContinuationAlgorithm(TradingAlgorithm):
+    """Multi-hour continuation using completed one-minute bars only.
+
+    This is the coverage strategy for sparse pre/after-market tapes. It never
+    substitutes quote changes for trades and never requires a 1s/5s window.
+    """
+
+    strategy_id = "bar_trend_continuation"
+    thesis = "persistent minute-bar strength above VWAP continues over a multi-hour horizon"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        if not _present(
+            f.price,
+            f.ema_fast,
+            f.ema_slow,
+            f.macd_histogram,
+            f.vwap_distance_bps,
+            f.momentum_persistence,
+            f.relative_volume,
+            f.atr_pct,
+            f.liquidity_score,
+            f.spread_bps,
+        ):
+            return self._reject(("BAR_TREND_INPUTS_MISSING",))
+
+        price = float(f.price)
+        ema_fast = float(f.ema_fast)
+        ema_slow = float(f.ema_slow)
+        separation_bps = (ema_fast / max(1e-9, ema_slow) - 1.0) * 10_000.0
+        if separation_bps < self.p("min_ema_separation_bps"):
+            return self._reject(("BAR_TREND_EMA_SEPARATION_WEAK",), ema_separation_bps=separation_bps)
+        if price < ema_fast or float(f.macd_histogram) <= 0.0:
+            return self._reject(("BAR_TREND_DIRECTION_NOT_CONFIRMED",))
+        if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
+            return self._reject(("BAR_TREND_NOT_ABOVE_VWAP",), vwap_distance_bps=f.vwap_distance_bps)
+        if float(f.momentum_persistence) < self.p("min_momentum_persistence"):
+            return self._reject(("BAR_TREND_NOT_PERSISTENT",), momentum_persistence=f.momentum_persistence)
+        if float(f.relative_volume) < self.p("min_relative_volume"):
+            return self._reject(("BAR_TREND_VOLUME_NOT_CONFIRMED",), relative_volume=f.relative_volume)
+        if float(f.liquidity_score) < self.p("min_liquidity_score"):
+            return self._reject(("BAR_TREND_LIQUIDITY_TOO_LOW",), liquidity_score=f.liquidity_score)
+        if float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(("BAR_TREND_SPREAD_TOO_WIDE",), spread_bps=f.spread_bps)
+        change_point = context.change_point_probability
+        if change_point is not None and change_point > self.p("max_change_point_probability"):
+            return self._reject(("BAR_TREND_STRUCTURAL_BREAK",), change_point_probability=change_point)
+
+        horizon_minutes = max(1.0, self.horizon_seconds / 60.0)
+        attainable_bps = float(f.atr_pct) * math.sqrt(horizon_minutes) * 10_000.0
+        edge = attainable_bps * self.p("target_capture_fraction")
+        score = _clamp(
+            0.30 * _clamp(separation_bps / 50.0)
+            + 0.25 * _clamp((float(f.momentum_persistence) - 0.5) * 2.0)
+            + 0.25 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
+            + 0.20 * float(f.liquidity_score)
+        )
+        return self._fire(
+            symbol=f.symbol,
+            score=score,
+            confidence=_clamp(0.30 + 0.45 * score + 0.20 * float(f.liquidity_score)),
+            edge_bps=edge,
+            reasons=("BAR_TREND_CONTINUATION", "COMPLETED_MINUTE_TREND_CONFIRMED"),
+            ema_separation_bps=round(separation_bps, 3),
+            vwap_distance_bps=round(float(f.vwap_distance_bps), 3),
+            relative_volume=round(float(f.relative_volume), 3),
+            attainable_bps=round(attainable_bps, 3),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        edge = float(f.atr_pct or 0.0) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
+            target_price=entry_price * (1.0 + edge * self.p("target_capture_fraction") / 10_000.0),
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=self.horizon_seconds,
+            stop_basis="completed_bar_volatility_multiple",
+            target_basis="multi_hour_bar_volatility_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        if f.ema_fast is not None and f.ema_slow is not None and f.ema_fast <= f.ema_slow:
+            return ("BAR_TREND_EMA_CROSSED_DOWN",)
+        if f.macd_histogram is not None and f.macd_histogram < 0:
+            return ("BAR_TREND_MACD_REVERSED",)
+        return ()
+
+
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     IntradayMomentumAlgorithm,
     BreakoutVolumeAlgorithm,
@@ -3285,6 +3390,7 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     BarConfirmedVwapRecoveryAlgorithm,
     OvernightGapCarryAlgorithm,
     RangeSupportReversionAlgorithm,
+    BarTrendContinuationAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -3319,6 +3425,7 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     # Pure location thesis with no trend component, so mean_reversion only. Leaving
     # it out entirely would make the macro layer read it as never permitted.
     "range_support_reversion": ("mean_reversion",),
+    "bar_trend_continuation": ("momentum",),
     # --- SHORT theses -------------------------------------------------------- #
     # Mapped to SHORT-side families so the macro allow/block lists can permit a
     # falling-tape short without simultaneously permitting a long momentum entry.

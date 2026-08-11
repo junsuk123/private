@@ -1,0 +1,33 @@
+# Automatic StrategySelectorV2 authority ladder.
+#
+# SHADOW -> LIVE_PROBE is based only on forward, point-in-time shadow outcomes.
+# LIVE_PROBE -> LIVE additionally requires real broker outcomes.  The controller
+# advances at most one rung per evaluation and persists every context and transition.
+
+minimum_contexts: 120
+minimum_traded_contexts: 40
+minimum_distinct_days: 10
+minimum_chronological_windows: 4
+minimum_positive_windows: 3
+
+# 95% lower confidence bound of selected, after-cost returns.
+minimum_lower_bound_net_bps: 3.0
+# The same lower bound must remain positive after this extra round-trip cost shock.
+additional_cost_stress_bps: 5.0
+
+maximum_mean_regret_bps: 15.0
+maximum_wrong_regime_trade_rate: 0.15
+minimum_top1_hit_rate: 0.40
+required_consecutive_passes: 3
+
+# Full authority cannot be earned from simulation.
+minimum_live_probe_contexts: 30
+minimum_live_probe_days: 10
+live_minimum_lower_bound_net_bps: 0.0
+
+# Demotion is deliberately faster than promotion.
+demotion_lower_bound_bps: -5.0
+demotion_wrong_regime_trade_rate: 0.25
+
+state_path: data/store/selector-v2-promotion.json
+maximum_evidence_rows: 4000

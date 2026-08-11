@@ -1,0 +1,44 @@
+# The bandit as a BOUNDED correction to the utility model, not as the selector.
+#
+# B_s = (posterior_mean_net_bps - predicted_net_bps) * confidence, clamped to
+# +/- max_correction_bps.
+#
+# Environment overrides (highest precedence):
+#   BANDIT_ADAPTER_MAX_CORRECTION_BPS
+#   BANDIT_ADAPTER_MINIMUM_SAMPLES
+#   BANDIT_ADAPTER_HALF_LIFE_SECONDS
+#   BANDIT_ADAPTER_MAX_AGE_SECONDS
+
+# Symmetric cap, in bps.
+#
+# WHY A CAP AT ALL: an unbounded posterior term lets realized history override every context
+# signal, which reproduces the failure this refactor is unwinding from the other side — one
+# arm with a handful of bad fills would dominate the ranking forever. The clamp is REPORTED
+# (BANDIT_CORRECTION_CLAMPED), so a correction that wanted to be larger is visible instead
+# of silently truncated.
+#
+# 20 is a starting value to be recalibrated against measured disagreement between the model
+# and realized outcomes. It is not a measurement.
+max_correction_bps: 20.0
+
+# Effective samples at which the correction reaches full strength. Below this it is shrunk
+# linearly toward zero — the same shape the performance store already uses to blend a symbol
+# mean toward a strategy mean.
+minimum_samples: 8
+
+# Recency decay. A strategy that deteriorated last week should not keep its old posterior at
+# full strength; a one-week half-life means month-old fills carry about 1/16 the weight of
+# fresh ones. Set to 0 to disable decay entirely.
+half_life_seconds: 604800
+
+# Outcomes older than this are dropped from the correction regardless of decay, so a
+# posterior cannot be carried by a market that no longer exists.
+max_age_seconds: 5184000
+
+# Context key: (strategy_id, market, regime_cluster, volatility_bucket).
+#
+# SYMBOL IS DELIBERATELY ABSENT. Per-symbol posteriors are far too thin — only one strategy
+# in the store has three symbols with eight fills each — so partitioning by symbol would make
+# every arm cold again. Symbol still CONDITIONS the estimate through the performance store's
+# own measured shrinkage.
+volatility_buckets: [0.33, 0.66]

@@ -12,6 +12,10 @@
 - GNN 선택은 실시간 모델 보정과 전략별 양수 순효율 검증을 통과한 경우에만 신규 진입 권한을 얻습니다. LLM과 NPU 장치 자체에는 주문 권한이 없습니다.
 - 주문을 만들 수 있는 것은 `RiskManager`를 통과한 `FinalOrder`뿐이고, 실제 제출은 `LiveExecutionCoordinator`의 limit order 경로만 가능합니다.
 - OpenVINO/NPU는 숫자 evidence 가속일 뿐이며, 실패하면 동일 스키마로 CPU fallback합니다. NPU 출력은 주문 권한이 아닙니다.
+- **선택과 실행 승인은 다른 질문입니다.** "어떤 전략인가"는 선택 계층이, "이 주문을 안전하게
+  낼 수 있는가"는 실행 계층이 답합니다. 두 층이 한 클래스에 섞여 있던 것이
+  [strategy_selection_v2.md](strategy_selection_v2.md) 리팩터의 출발점이며, 새 선택 계층은
+  `app.execution`/`app.risk`를 **import 할 수 없도록** 만들어 두었습니다(AST 테스트로 고정).
 
 데이터가 어떤 단계를 거쳐 어떤 판단에 쓰이는지는 [data → process → decision map](diagrams/data_to_decision_flow.svg)에, 온톨로지/GNN 계층 구조는 [ontology and GNN layers](diagrams/ontology_gnn_layers.svg)에 정리되어 있습니다.
 
@@ -72,6 +76,29 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
   → /account · /display 대시보드 · audit log · 재학습 artifact
 ```
 
+`StrategySessionManager` 는 위 경로에서 선출과 주문 가능한 proposal 소유권을 함께 관리합니다.
+**선택 계층을 분리한 V2 파이프라인은 SHADOW에서 시작해 증거 기반으로 권한을 자동 획득할 수
+있습니다.** 클래스 자체 기본값은 비활성이지만 Windows `run.ps1`은 V2와 자동 승격을 켭니다:
+
+```text
+(위와 동일한 evidence 를 그대로 재사용)
+  → MarketContextBuilder            (symbol, cycle)당 스냅샷 1개 + context_id
+  → StrategyEligibilityEngine       실제 strategy id 기준 hard mask M_s + soft score O_s
+  → StrategyProposalEngine          mask 통과분만 알고리즘 실행 → StrategyProposal
+  → utility predictor               gross / downside / duration / uncertainty (비용 제외)
+  → TradingCostAdapter              C_s = TradingCostEngine 왕복 비용
+  → StrategyBanditAdapter           B_s = 실현이력 보정, ±20bps 유계
+  → StrategySelectorV2              U_s 랭킹 + NO_TRADE 비교 → StrategySelectionResult
+  → CoverageAnalyzer · CounterfactualEngine   (telemetry / 반사실 표본)
+  → SelectorPromotionController     SHADOW → LIVE_PROBE → LIVE / 자동 강등
+  → StrategySessionManager          권한 보유 시 기존의 실주문 승인 proposal에만 선택 결과 매칭
+```
+
+V2 모듈은 주문을 만들거나 broker를 호출하지 않습니다. 승격된 선택 결과도 세션 계층이 이미
+`submits_orders=true`로 승인한 proposal과 일치할 때만 채택되고, 이후 비용·리스크·최종 주문 게이트를
+그대로 통과해야 합니다. 자세한 계약과 항별 권한은
+[strategy_selection_v2.md](strategy_selection_v2.md).
+
 ## 4. 모듈 지도
 
 | 경로 | 역할 |
@@ -80,11 +107,20 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
 | `src/app/web_account_routes.py`, `account_dashboard.py` | `/account` 라우트와 payload 구성 |
 | `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, **세션·capability 단일 권한 (`market_capabilities.py`)**, REST fallback |
 | `src/app/features/` | indicator engine, live feature frame, short-horizon/semantic feature, provenance |
+| `src/app/context/` | **통합 MarketContext 단일 생성 권한.** (symbol, cycle)당 스냅샷 1개, `context_id`, field별 source/freshness. IO 없음 |
 | `src/app/technical/` | 근거 기반 기술적 예측 레이어 (regime, 방법론, 예측, 리플레이) — 자문 전용 |
 | `src/app/graph/` | custom KnowledgeGraph, FactTable, RDF/OWL/SHACL 레이어, 거시–미시 추론, theory vote, NPU evidence scorer |
-| `src/app/ontology/` | TTL 스키마와 closed-world 운영 게이트, trading domain reasoner |
+| `src/app/ontology/` | TTL 스키마와 closed-world 운영 게이트, trading domain reasoner, **전략 eligibility (hard mask + soft score, 실제 strategy id 기준)** |
 | `src/app/models/` | 라벨링, 학습 파이프라인, artifact registry, CPU/OpenVINO backend, strategy-utility R-GCN |
-| `src/app/strategy/`, `routing/` | 카탈로그 전략 expert(롱 13 + 숏 3), 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
+| `src/app/strategy/`, `routing/` | 카탈로그 전략 expert(롱 17 + 숏 3, `STRATEGY_IDS` 기준), 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
+| `src/app/strategy/spec.py`, `registry.py` | 전략 선언 계약(`StrategySpec`)과 실코드 파생 registry. lifecycle 권고는 migration flag 로만 적용 |
+| `src/app/strategy/proposal.py`, `proposal_engine.py` | `StrategyProposal` (수량·side·venue field 부재) 과 mask 이후 실행되는 proposal 생성기 |
+| `src/app/strategy/coverage.py` | 6축 context 버킷과 `STRATEGY_COVERAGE_GAP` 집계 |
+| `src/app/routing/strategy_selector.py` 외 | `StrategySelectorV2`, 효용 예측/비용 adapter, ontology mask adapter, bandit adapter, NO_TRADE 정책, observer/authority runner |
+| `src/app/routing/selector_v2_promotion.py` | V2 자동 권한 사다리, 보수적 통계 게이트, 빠른 강등, 원자적 상태·증거·전이 영속화 |
+| `src/app/evaluation/` | 이벤트 시뮬레이터 평가, purged walk-forward, reality check, **반사실 shadow 포지션·selector regret·증거원 분리** |
+| `src/app/monitoring/` | strategy / context / model drift 모니터. 강등을 **제안**만 하고 적용은 별도 |
+| `src/app/strategy_validation/` | 단일 audit runner, purged CV, 비용 스트레스, 파라미터 안정성, 레짐 분해, lifecycle 원장 |
 | `src/app/cost/`, `risk/` | TradingCostEngine, ProfitabilityGate, position sizing, principal protection, RiskManager |
 | `src/app/trading/` | realtime engine, shared decision engine, dynamic exit policy, execution policy, runtime guard |
 | `src/app/trading/directional.py` | 방향 축 계약: `PositionDirection`/`PositionEffect`/`ExecutionProduct`/`StrategyDeploymentState`, `DirectionalStrategyKey`, 방향별 exit geometry, 전이 화이트리스트 |
@@ -97,9 +133,9 @@ KIS 실시간 체결/호가 (WebSocket) + KIS REST 계좌·주문·해외시세 
 | `src/app/trading/short_strategy_promotion.py` | 배포 사다리 authority: confidence score, hard gate, 자동 승격/강등, 원자적 상태+audit 기록 |
 | `src/app/ontology/short_rules.py` | 숏 closed-world 사실 평가와 레짐별 방향 허용 마스크 |
 | `src/app/execution/` | KIS adapter(국내/해외), 주문 가격 정책, 거래소 라우팅, live coordinator, 저널, idempotency |
-| `src/app/backtesting/`, `evaluation/` | 이벤트 시뮬레이터, purged walk-forward, reality check, counterfactual 평가 |
+| `src/app/backtesting/` | 이벤트 시뮬레이터, 가속 리플레이, 스트리밍 데모 |
 | `src/app/storage/` | local store, lifecycle store, model store, 마이그레이션 |
-| `config/` | 수익성·청산·사이징·비용·리스크·거시미시·기술예측 정책과 런타임 프로파일 |
+| `config/` | 수익성·청산·사이징·비용·리스크·거시미시·기술예측 정책, **전략 선택 V2 정책 6종**, 런타임 프로파일 |
 | `packaging/raspberrypi/` | Pi CPU-only 설치/실행/서비스/키오스크 스크립트 |
 
 ## 5. 저장소 레이아웃
@@ -114,10 +150,18 @@ data/store/strategy-deployment.sqlite3    arm별 배포 상태 + promotion_audit
 data/store/borrow-snapshots.sqlite3       대주 locate append-only 저널 (과거 시점 조회용)
 data/store/directional-shadow.sqlite3     shadow plan과 채점된 forward outcome
 data/store/causal-order-journal.jsonl     intent → verdict → order 인과 저널
+data/store/strategy-coverage.json         V2 coverage 버킷 tally (호스트별, 명시적 flush)
+data/store/strategy-validation.json       lifecycle 원장 + validation record + 전이 이력
+data/store/selector-v2-promotion.json     V2 권한 상태 + context별 증거 + 최근 전이
 data/models/<family>/                     버전 artifact + <model>.latest.json
 data/reports/                             readiness, 벤치마크, counterfactual 리포트
 logs/                                     서버 로그, live-orders.jsonl, feature frame 저널
 ```
+
+뒤의 두 JSON 파일이 sqlite 가 아닌 것은 의도입니다. 실시간 writer 가 sqlite 파일을 소유하고 있고,
+그쪽의 대형 read 가 writer 를 방해한다는 것이 이미 측정된 사실이기 때문입니다. `MarketContext`
+자체는 아예 영속화하지 않고 in-memory LRU(기본 512개 / 3600초)에만 둡니다 — 컨텍스트는 분 단위로
+가치가 있고, 판단의 영속 기록은 `context_id` 와 항별 분해를 담은 selection 행입니다.
 
 `LocalResearchStore`는 `(kind, record_key)` 기반 dedup과 `RESEARCH_RETENTION_DAYS` 정리를 수행하고, synthetic/simulated 레코드를 거부합니다. `ModelArtifactStore`도 simulated artifact를 거부합니다. audit logger는 credential/token/계좌번호/broker secret을 재귀적으로 마스킹합니다.
 
@@ -138,9 +182,9 @@ logs/                                     서버 로그, live-orders.jsonl, feat
 | `GET /api/account/asset-history?range=1D\|1W\|1M\|3M` | 분 단위 총자산 히스토리 |
 | `GET /api/account/technical` | 기술적 예측 패널 (자문) |
 | `GET /api/account/macro-micro` | 거시–미시 온톨로지 패널 (자문) |
-| `GET /api/realtime-trading/status` | 실시간 엔진 상태, 최근 이벤트, 거부 사유 분포 |
-| `GET /api/refactor/dashboard` | 전략 소유 경로의 프로파일·게이트·shadow 상태 |
-| `GET /api/refactor/market-view?symbol={symbol}&limit=180` | 로컬 차트/마켓 뷰 |
+| `GET /api/realtime-trading/status` | 실시간 엔진 상태, 최근 이벤트, 거부 사유 분포. 최상위 `strategy_session.selector_v2`에 V2 실효 권한·랭킹·항별 분해·NO_TRADE·legacy 비교가 실림 |
+| `GET /api/refactor/dashboard` | 정적 프로파일·게이트·legacy/ontology/GNN shadow 비교. live strategy session의 권위 소스는 아님 |
+| `GET /api/refactor/market-view?symbol={symbol}&limit=180` | 로컬 차트/마켓 뷰 + 현재 live `strategy_session` overlay |
 | `POST /api/live-trading/terminate?shutdown=true` | BUY 차단 → 청산 SELL 제출 → 서버 종료 예약 |
 | `GET /api/trade-explanations` | `/display`용 사람이 읽는 판단 카드 |
 | `GET /api/ontology/graph`, `/api/ontology/runtime` | 그래프 payload, 온톨로지 런타임 상태 |
@@ -187,6 +231,29 @@ stored counterfactual은 모두 이 모듈의 30분 시초 범위, 전일 종가
 
 런타임 플래그는 `RefactorFeatureFlags.from_env()`가 환경변수에서 읽습니다. 기본값은 legacy 경로만 활성이며, 잘못된 조합(예: ontology router 없이 GNN rerank)은 로드 시점에 실패합니다.
 
+전략 선택 V2 는 별도 flag 집합(`SelectorV2Flags.from_env()`)을 씁니다. Python 클래스 기본값은
+**전체 무동작**이고, Windows 런처는 `enabled=true`, `shadow_only=true`, `auto_promote=true`를
+설정합니다. 즉 설정상 shadow-only는 안전한 **초기 상태**이며, 실효 권한은 영속화된 승격
+컨트롤러가 결정합니다. `validate()`는 안전하지 않은 조합을 로드 시점에 거부합니다.
+
+| 플래그 | 기본 | 의미 |
+| --- | --- | --- |
+| `STRATEGY_SELECTOR_V2_ENABLED` | `false` | 끄면 모듈이 아예 돌지 않음 |
+| `STRATEGY_SELECTOR_V2_SHADOW_ONLY` | `true` | 운영자 강제 live 권한을 막고 초기 SHADOW를 보장 |
+| `STRATEGY_SELECTOR_V2_AUTO_PROMOTE` | `false` (`run.ps1`: `true`) | 측정된 증거로 실효 권한을 `SHADOW → LIVE_PROBE → LIVE` 자동 전환 |
+| `STRATEGY_ONTOLOGY_MASK_V2_ENABLED` | `true` | 실제 id 기준 hard mask. live 모드에서 필수 |
+| `STRATEGY_NO_TRADE_ENABLED` | `true` | NO_TRADE 1급 arm. live 모드에서 필수 |
+| `STRATEGY_COUNTERFACTUAL_ENABLED` | `true` | 반사실 표본. live 모드에서 필수 (regret 측정 유지) |
+| `STRATEGY_BANDIT_ADAPTER_ENABLED` | `true` | 유계 실현이력 보정 |
+| `STRATEGY_UTILITY_GNN_ENABLED` | `false` | 켜면 기존 GNN 벡터가 gross/downside/uncertainty 공급 |
+| `STRATEGY_LIFECYCLE_APPLY_RECOMMENDATIONS` | `false` | lifecycle 권고를 **실제로 적용**. 낮추는 방향만 |
+
+`shadow_only=false`로 강제 권한을 주거나 `auto_promote=true`로 자동 승격을 허용하려면
+mask·NO_TRADE·counterfactual이 모두 켜져 있어야 하고, 아니면 `ValueError`로 기동이 실패합니다.
+권장 운영은 `shadow_only=true`를 유지한 채 자동 승격 컨트롤러가 권한을 결정하게 하는 것입니다.
+상세는
+[strategy_selection_v2.md](strategy_selection_v2.md) §5.
+
 ## 8. 가속 경계
 
 | 단계 | 장치 | 비고 |
@@ -211,6 +278,18 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
 - margin, leverage, derivatives, short selling, credit loan, leveraged ETF는 거부 대상입니다.
 - live 주문은 `LiveExecutionCoordinator`를 통해 limit order로만 제출됩니다.
 - audit log는 credential/token/계좌번호/broker secret을 재귀적으로 마스킹합니다.
+- **전략 선택 V2 계층은 실행 계층을 import 할 수 없습니다.** `app.execution`, `app.risk`,
+  `app.cost.profitability_gate`, realtime engine, shared decision engine 어느 것도 import 하지
+  않으며 이것은 관례가 아니라 AST 테스트로 강제됩니다
+  (`tests/test_strategy_selector_v2.py::test_selection_layer_cannot_reach_execution`).
+  import 경로가 없는 코드는 리스크 게이트를 우회할 수 없습니다.
+- **반사실(shadow) 포지션은 산술일 뿐입니다.** `app.evaluation.shadow_position`에는 broker 경로가
+  없고, V2가 선택한 전략의 live outcome은 실체결에서 별도로 받습니다 — 시뮬레이션을 같은 arm의
+  posterior에 두 번 넣지 않기 위한 구조입니다.
+- **오류 처리도 권한 상태를 따릅니다.** SHADOW 관측 오류는 legacy 판단을 막지 않습니다. 반면
+  승격 평가 오류는 컨트롤러를 `SUSPENDED`로 만들고, 승격 상태 영속화 실패는 권한 부여를
+  취소합니다. V2가 이미 권한을 가진 사이클에서 선택 결과가 없으면 BUY는 NO_TRADE로 fail-closed
+  처리됩니다.
 
 ## 10. 알려진 구조적 한계
 
@@ -236,8 +315,21 @@ Windows 성능 카운터는 이 워크로드의 NPU 사용을 별도 엔진으�
    수집기는 대기하므로, 미국장 시간대에는 KRX feature frame이 0이고 그 반대도 같습니다.
    장 마감 시간대에 학습 표본이 사실상 멈추는 이유입니다.
 10. 숏 전략 3개는 코드에 존재하지만 **전량 `SHADOW`이며 실주문 권한이 없습니다.** 승격에는 최소 20 거래일의 forward 표본이 필요하므로 정상 상태입니다. 또한 KIS 대주 조회 TR id와 응답 필드명은 실계좌 응답으로 검증되지 않았고(read-only 경로), GNN 방향별 utility head는 미구현입니다 — 숏 arm은 현재 realized posterior와 규칙 신호로만 평가됩니다. 상세는 [short_selling_deployment.md](short_selling_deployment.md) §15.
+11. **라이브 카탈로그가 실체결 1건 위에 서 있습니다.** 2026-08-11 첫 통합 audit 결과: LIVE
+    권한을 가진 전략 13개 중 **9개가 관측 0건**이고, 표본이 있는 유일한 전략
+    (`liquidity_shock_reversal`, 약 740건이며 계속 증가)은 평균 순 약 −120bps 로 손실 중이며 walk-forward 창 중
+    양수가 0개입니다. 그 행 전부가 shadow·US 이므로 시뮬레이션 증거이고, 그래서 audit 은
+    RETIRE 가 아니라 RESEARCH 로 분류합니다. 권고 2건은 기록됐고 적용은
+    `STRATEGY_LIFECYCLE_APPLY_RECOMMENDATIONS` 를 요구합니다 (그중 하나는 config 변경으로 이미
+    충족). 수치와 범위는 [validation.md](validation.md) §1.1, 방법은
+    [strategy_selection_v2.md](strategy_selection_v2.md) §6.
+12. **전략 선택 경로가 둘 있습니다.** V2가 SHADOW인 동안 legacy(`_bandit_choice`)가 권한을
+    유지하고, V2가 자동 승격되면 세션 경계가 V2 결과를 승인 proposal에 매칭합니다. 강등 시 즉시
+    legacy fallback이 다시 필요하므로 두 구현은 아직 함께 존재합니다. `StrategySessionManager`는
+    큰 소유권·실행 계약 경계이고, generic methodology alias(`METHODOLOGY_STRATEGY_ALIASES`)도
+    legacy fallback 때문에 남아 있습니다.
 
-관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [live_trading.md](live_trading.md) · [short_selling_deployment.md](short_selling_deployment.md) · [validation.md](validation.md)
+관련 문서: [ontology_and_gnn.md](ontology_and_gnn.md) · [decision_and_risk.md](decision_and_risk.md) · [strategy_selection_v2.md](strategy_selection_v2.md) · [live_trading.md](live_trading.md) · [short_selling_deployment.md](short_selling_deployment.md) · [validation.md](validation.md)
 
 
 ## 세션·거래소 capability 계층 (국내·미국 전 세션)

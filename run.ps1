@@ -431,6 +431,16 @@ Set-DefaultEnv "REALTIME_US_ROTATION_POOL_MULTIPLIER" "3"
 # Keep each window for one full model-label horizon before rotating it.
 Set-DefaultEnv "REALTIME_US_WATCHLIST_RECHECK_SEC" "600"
 Set-DefaultEnv "GNN_TRUST_HORIZON_SECONDS" "1800"
+# Run the new context/utility selector beside the legacy authority. This records
+# Starts in SHADOW and gathers coverage/counterfactual outcomes. The persisted controller
+# may later grant V2 LIVE_PROBE/LIVE selection authority; order construction and every
+# downstream profitability/risk/broker gate remain outside V2.
+Set-DefaultEnv "STRATEGY_SELECTOR_V2_ENABLED" "true"
+Set-DefaultEnv "STRATEGY_SELECTOR_V2_SHADOW_ONLY" "true"
+Set-DefaultEnv "STRATEGY_SELECTOR_V2_AUTO_PROMOTE" "true"
+Set-DefaultEnv "STRATEGY_COUNTERFACTUAL_ENABLED" "true"
+Set-DefaultEnv "STRATEGY_NO_TRADE_ENABLED" "true"
+Set-DefaultEnv "STRATEGY_ONTOLOGY_MASK_V2_ENABLED" "true"
 Set-DefaultEnv "STRATEGY_SESSION_MIN_NET_TARGET_BPS" "25"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.0"
 Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"

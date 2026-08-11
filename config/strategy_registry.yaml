@@ -1,0 +1,100 @@
+# Strategy lifecycle: what this file can and cannot do.
+#
+# THIS FILE DOES NOT SET LIFECYCLE STATE.
+#
+# Operating lifecycle state is derived in app/strategy/registry.py from the code that
+# actually gates trading:
+#   * strategy_algorithms.strategy_live_authorized()  -> LIVE
+#   * strategy_algorithms.strategy_shadow_authorized() -> SHADOW
+#   * everything else                                  -> RESEARCH
+# and per-arm short authorisation stays with ShortStrategyPromotionController.
+#
+# Deriving rather than declaring is deliberate. A YAML lifecycle field would be a second
+# source of truth next to `live_authorized` in config/strategy_algorithms.yaml, and those two
+# WOULD drift — this codebase has already had that exact failure, where a hand-maintained set
+# of "deployment gated" strategies fell out of sync and two deliberately shadow-only
+# strategies were treated as live-tradable.
+#
+# What lives here is the AUDIT TRAIL: recommendations the registry reports, and the migration
+# flag that applies them.
+
+# ---------------------------------------------------------------------------
+# Lifecycle recommendations (advisory unless the migration flag is set)
+# ---------------------------------------------------------------------------
+# Set STRATEGY_LIFECYCLE_APPLY_RECOMMENDATIONS=1 to make the registry apply these. They can
+# only LOWER a state; an upgrade must come from measured forward outcomes through
+# app/strategy_validation/registry.py, never from a table.
+recommendations:
+  range_support_reversion:
+    recommended_state: SHADOW
+    status: SATISFIED_BY_CONFIG
+    current_authorisation: >
+      live_authorized: false (config/strategy_algorithms.yaml). Was 1.0 when this
+      recommendation was written; the config change went one rung FURTHER than the
+      recommendation, so the derived lifecycle is already SHADOW and applying this changes
+      nothing.
+    evidence: >
+      Screened over the full stored KRX minute tape it scored -2.3bps against a -28.2bps
+      unconditional baseline (n=207, t=3.01) and was the only one of nine candidate conditions
+      to survive a Bonferroni correction. Restricted to instruments THIS ACCOUNT CAN ORDER —
+      leveraged and inverse ETPs excluded — it falls to t=1.56, and to t=0.65 on the sub-period
+      where the data actually lives. The significance was substantially carried by 2X inverse
+      ETFs; the two most liquid tradable names in the sample (005930, 000660) were the two
+      worst. A later three-way comparison across horizons and barrier geometries put every
+      condition tested, including this one, within |t| <= 1.02 of buying at random.
+    note: >
+      Kept after being satisfied, deliberately. Deleting it would erase why the config says
+      what it says, and a recommendation can only ever LOWER a state, so it cannot become a
+      route back up.
+
+  liquidity_shock_reversal:
+    recommended_state: SHADOW
+    status: NOT_SATISFIED
+    current_authorisation: live_authorized (config/strategy_algorithms.yaml 1.0) — still LIVE
+    evidence: >
+      739 outcomes over the stored performance data (2026-08-11): mean net -119.6bps, median
+      -94.7, one-sided 95% lower bound -127.5bps, and not one positive walk-forward window
+      (out-of-sample stability 0.00). The break-even cost multiple is negative, meaning the
+      GROSS edge is negative too — this is a strategy problem, not a cost problem.
+    scope: >
+      Every one of those rows is evaluation_source=shadow and every one is US. A large
+      SIMULATED sample on one market is ample reason to stop trading the thesis and no reason
+      to close the file on it, which is why the recommendation is SHADOW rather than RETIRED
+      and why the audit runner refuses to retire on shadow-only evidence.
+
+# ---------------------------------------------------------------------------
+# Short strategies
+# ---------------------------------------------------------------------------
+# LONG_ONLY. This account cannot trade 대주/공매도 or derivatives — the 기본예탁금 and 사전
+# 의무교육 a 파생상품 account requires are not in place.
+#
+# Three independent locks, none of which this file controls:
+#   1. config/short_strategy_deployment.yaml `enabled: false` stops the promotion controller
+#      entirely, and each short arm is individually disabled there as well.
+#   2. app/strategy/registry.py pins every short strategy's lifecycle at RESEARCH regardless
+#      of the `live_authorized: 1.0` in its algorithm defaults.
+#   3. app/ontology/strategy_eligibility.py hard-blocks SHORT direction while long_only is
+#      set, so no short proposal reaches the utility ranking.
+#
+# The specs are still REPORTED so coverage analysis can show what a falling tape would have
+# had available. Reporting is not permission.
+short_strategies:
+  posture: DISABLED_LONG_ONLY
+  ids:
+    - market_intraday_momentum_short
+    - opening_range_breakdown
+    - residual_relative_weakness
+
+# ---------------------------------------------------------------------------
+# Strategy identity contract
+# ---------------------------------------------------------------------------
+# STRATEGY_IDS in app/strategy/catalog.py is APPEND-ONLY. Persisted model output indices,
+# stored strategy masks and the R-GCN's per-strategy heads all depend on that order staying
+# byte-stable. A new strategy is appended; nothing is ever inserted or reordered.
+identity:
+  source_of_truth: src/app/strategy/catalog.py::STRATEGY_IDS
+  ordering: append-only
+  index_dependents:
+    - app/models/strategy_utility/rgcn.py (per-strategy heads)
+    - app/models/strategy_utility/strategy_graph.py (adjacency, diagonal mask)
+    - persisted GNN checkpoints and strategy masks

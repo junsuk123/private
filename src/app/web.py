@@ -4966,7 +4966,11 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       or int(market_counts.get("realtime_ticks") or 0) > 0
       or int(market_counts.get("live_us_realtime_bridge_ticks") or 0) > 0
   )
-  current_mode = str(reliability.get("mode") or learning.get("mode") or "")
+  # OperationModeManager is the authority for whether the application is in
+  # LIVE_TRADING. The reliability controller and the collection worker each
+  # carry their own temporary ``mode`` values; exposing either one at the top
+  # made a live, buy-enabled engine appear to be in learning mode after restart.
+  current_mode = _active_operation_mode()
   if trading_running and current_mode == "live_trading" and bool(reliability.get("ready")):
     headline = "실시간 거래 엔진이 실행 중입니다."
     summary = "전략 판단과 주문 게이트가 실시간으로 평가되고 있습니다."
@@ -4990,7 +4994,9 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       "generated_at": now.isoformat(),
       "headline": headline,
       "summary": summary,
-      "mode": reliability.get("mode") or learning.get("mode"),
+      "mode": current_mode,
+      "controller_mode": reliability.get("mode"),
+      "collection_mode": learning.get("mode"),
       "score": float(reliability.get("score") or 0.0),
       "threshold": float(reliability.get("threshold") or 0.9),
       "ready": bool(reliability.get("ready")),
@@ -5137,6 +5143,10 @@ def _system_diagnostics_payload() -> dict[str, Any]:
 @app.get("/api/system-diagnostics")
 def system_diagnostics() -> JSONResponse:
   payload = _cached_system_diagnostics_payload()
+  # The expensive body is intentionally stale-while-revalidate, but the mode is
+  # control-plane state and must never lag a promotion/demotion by up to two cache
+  # windows. Override that one field on every cheap request from its authority.
+  payload["mode"] = _active_operation_mode()
   payload["market_session_capabilities"] = _market_session_capability_payload()
   return _json(payload)
 
@@ -8713,6 +8723,19 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
       # point-in-time features so StrategySessionManager can run that trigger
       # before a pair is journalled, scored, or allowed to affect performance.
       row["technical_features"] = asdict(features)
+      # V2's ontology has real per-strategy history requirements (20/30 bars).
+      # The frame already computed the completed-bar count, but dropping it here
+      # forced the adapter to infer a hard-coded minimum of 20 from Donchian
+      # availability. Symbols with hundreds of bars were therefore falsely
+      # blocked as 20<30, including every longer-horizon coverage strategy.
+      frame_extras = getattr(frame, "extras", None)
+      if isinstance(frame_extras, Mapping):
+        bar_count = frame_extras.get("slow_technical:bar_count")
+        if bar_count is not None:
+          try:
+            row["history_bar_count"] = max(0, int(float(bar_count)))
+          except (TypeError, ValueError):
+            pass
       box_width_ok = (
           features.box_width_pct is not None
           and 0.002 <= features.box_width_pct <= 0.04
@@ -8889,6 +8912,18 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   except Exception:
     fresh = ()
   fresh_set = {str(symbol or "").upper() for symbol in fresh}
+  # ``active_symbols`` is a trailing-window query. A US name can remain in it for
+  # minutes after the scarce overseas websocket slot has rotated away, yet every
+  # sub-second strategy then evaluates that stale name and reports
+  # TICK_WINDOW_NOT_READY. The collector's active subscription set is the authority
+  # for what is streaming *now*. Held names still remain first-class because the
+  # overseas symbol provider always pins them into this set.
+  with _live_lock:
+    subscribed_us = {
+        str(symbol or "").upper().strip()
+        for symbol in tuple(_kis_overseas_realtime_state.get("symbols") or ())
+        if str(symbol or "").strip()
+    }
   try:
     account = _realtime_engine_account_snapshot()
     store = RealtimeMarketDataStore()
@@ -8908,11 +8943,14 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   )
   selected: list[str] = []
   for symbol in ordered:
-    if str(symbol or "").upper() not in fresh_set:
+    normalized = str(symbol or "").upper()
+    if normalized not in fresh_set:
       continue
     if not _is_live_buy_candidate_symbol(symbol) or not _is_open_live_market_ticker(symbol):
       continue
     group = _ticker_market_group_for_live_trading(symbol)
+    if group == "US" and subscribed_us and normalized not in subscribed_us:
+      continue
     if group == "KRX" and not _is_live_market_core_open("KRX"):
       continue
     if (

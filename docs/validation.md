@@ -28,6 +28,64 @@
 | 스키마 인식 승격 | 프로덕션 적용 | `OBSOLETE_SCHEMA_INCUMBENT_REPLACED`, `tests/test_model_training_artifacts.py` |
 | KIS 구독 티어링 (depth / trade-only) | 코드 적용, **KRX 미검증** | KR 세션을 아직 만나지 않음. §12.3 |
 | KR 단기 모델 라이브 적격 | **미달** | precision@k 0.333 vs 임계 0.35 |
+| 전략 선택 V2 (context/eligibility/utility/NO_TRADE 분리) | 프로덕션 초기 `SHADOW`, **자동 승격 활성** | §14, `selector_v2_promotion.py`, 안전·회귀 묶음 286건 통과 |
+| V2 자동 권한 사다리 | 코드 적용, 아직 승격 전 | `SHADOW → LIVE_PROBE(10%) → LIVE`, 영속화·빠른 강등·오류 중단 |
+| V2 반사실 표본 (selector regret) | **자동 수집 중, 66 context 관측·거래 선택 0** | 2026-08-11 23:09:33 KST 영속 스냅샷. 최소 120 context·선택 거래 40·10일 전에는 권한 없음 |
+| 전략 audit 프레임워크 (단일 evaluator) | 코드 적용, 첫 실행 완료 | §1.1, `scripts/report_strategy_selection_v2.py` |
+| **카탈로그 라이브 권한의 증거** | **거의 없음 — 아래 §1.1** | 실체결 1건. LIVE 권한 전략 9개가 관측 0건 |
+| strategy-conditioned utility GNN 재학습 | **미착수** | 현재는 기존 벡터의 adapter. §14.2 |
+
+### 1.1 라이브 카탈로그가 실체결 1건 위에 서 있다
+
+`scripts/report_strategy_selection_v2.py`, 2026-08-11. 저장된 성과 데이터 전량에 대해 **모든 전략을
+같은 evaluator 로** 처음 통과시킨 결과입니다. 이 문서의 다른 어떤 수치보다 먼저 읽어야 합니다.
+
+| 전략 | lifecycle | n | 증거원 | net bps | 하단 | break-even cost × | OOS 안정성 | 분류 |
+|---|---|--:|---|--:|--:|--:|--:|---|
+| liquidity_shock_reversal | LIVE | ~740 | shadow, US 전용 | **≈−120** | ≈−127 | −0.43 | 0.00 | **RESEARCH** |
+| vwap_mean_reversion | LIVE | 2 | shadow | −143.7 | −168.9 | −1.98 | — | SHADOW_ONLY |
+| breakout_volume | LIVE | 1 | shadow | −171.3 | — | −3.84 | — | SHADOW_ONLY |
+| intraday_momentum | LIVE | 1 | **live** | +72.1 | — | 3.58 | — | SHADOW_ONLY |
+| 나머지 9개 | **LIVE** | **0** | 없음 | — | — | — | — | INSUFFICIENT_DATA |
+| SHADOW 4종 (market_intraday_momentum, overnight_gap_carry, range_support_reversion, bar_trend_continuation) | SHADOW | 0 | 없음 | — | — | — | — | INSUFFICIENT_DATA |
+| 숏 3종 | RESEARCH | 0 | 없음 | — | — | — | — | INSUFFICIENT_DATA |
+
+`liquidity_shock_reversal` 의 n 은 shadow 평가기가 계속 채점하므로 늘어납니다. 위 수치는
+2026-08-11 실행값이고, 현재 값은 스크립트를 다시 돌려 확인하세요.
+
+**표본이 있는 유일한 전략이 손실 중입니다.** 약 740관측, 평균 순 ≈−120bps, 중위 ≈−95, 단측 95%
+하단 ≈−127bps, walk-forward 창 중 양수 **0개**. break-even cost multiple 이 음수라는 것은 gross
+엣지도 음수라는 뜻이므로 **비용 문제가 아니라 전략 문제**입니다.
+
+주장의 범위: 그 행 전부 `evaluation_source=shadow` 이고 전부 US 입니다. 즉 한 시장에 대한 큰
+**시뮬레이션** 표본입니다. 이 논지의 거래를 멈출 근거로는 충분하고 파일을 닫을 근거로는 부족하므로
+audit 은 RETIRE 가 아니라 RESEARCH 로 분류합니다 — RETIRE 는 실질적으로 되돌릴 수 없고
+(아무도 돌리지 않는 전략은 복귀 증거를 못 쌓음), runner 는 **shadow 전용 증거로 retire 하지
+않습니다.**
+
+**관측 0건으로 LIVE 권한을 가진 전략이 9개입니다:** `event_momentum`,
+`cross_sectional_relative_strength`, `gap_context`, `rvgi_box_breakout`,
+`residual_relative_strength`, `adaptive_anchored_vwap_reversion`,
+`ofi_microprice_exhaustion_reversal`, `opening_range_breakout`, `bar_confirmed_vwap_recovery`.
+
+**아무것도 바꾸지 않았습니다.** 권고 2건을 측정치와 함께 기록했고 둘 다
+`STRATEGY_LIFECYCLE_APPLY_RECOMMENDATIONS=1` 까지는 권고입니다.
+
+| 전략 | 권고 | 현재 상태 | 증거 |
+|---|---|---|---|
+| `range_support_reversion` | SHADOW | **SHADOW — 이미 충족** | 거래가능 유니버스 t=1.56 (하위기간 t=0.65). 유의성을 이 계좌가 주문할 수 없는 2X 인버스 ETF 가 상당 부분 지탱. `config/strategy_algorithms.yaml` 이 `live_authorized: false` 로 바뀌어 권고보다 더 나아갔음 |
+| `liquidity_shock_reversal` | SHADOW | **LIVE — 미충족** | 위 ~740행 |
+
+권고는 상태를 **낮추는 방향으로만** 작동합니다 — 이미 충족된 항목을 지우지 않고 남기는 이유는
+지우면 config 가 왜 그렇게 되어 있는지가 사라지기 때문이고, 낮추기 전용이므로 되돌아가는 경로가
+되지도 않습니다. 올리는 것은 §14.3 의 전이 화이트리스트와 승격 게이트를 통과해야 합니다.
+
+재실행:
+
+```powershell
+python scripts/report_strategy_selection_v2.py
+python scripts/report_strategy_selection_v2.py --json data/reports/strategy_audit.json
+```
 
 ## 2. 수익성 리팩터 리플레이
 
@@ -440,3 +498,169 @@ feature set 하나를 바꾸자 세 곳이 **모두 조용히** 실패했습니�
 세 번째가 가장 위험했습니다: 프레임 저널의 `values`는 **정확히 모델 feature 벡터**이므로,
 품질 게이트가 거기서 값을 읽는 순간 "모델 입력 변경"이 "데이터 무결성 검사 무력화"가 됩니다.
 깊이는 모델 입력이 아니라 "이 호가창이 정상인가" 검사이므로 별 필드로 옮겼습니다.
+
+## 14. 검증 프레임워크 — `app.strategy_validation`
+
+§1.1 의 표를 만든 도구입니다. 존재 이유는 하나입니다: **모든 전략이 같은 evaluator 를 통과해야
+서로 비교 가능합니다.** 이전에는 각 전략의 증거가 있는 곳에서 왔습니다 — 하나는 저장된 분봉
+스크리닝, 하나는 체크포인트의 시뮬레이션 체결, 하나는 아무것도 — 그리고 그것들이 같은 측정처럼
+비교됐습니다.
+
+**모든 지표는 데이터가 답할 수 없으면 `None` 을 반환합니다.** 빈 셀이 0으로 읽히는 검증
+프레임워크는 측정한 적 없는 전략에 대해 자신 있는 판정을 내리고, 이 카탈로그에는 그런 전략이
+여럿 있습니다.
+
+### 14.1 유효 표본 수는 행 수가 아니다
+
+시간이 겹치는 거래는 독립 관측이 아닙니다. 이 프로젝트는 그 오차의 크기를 이미 측정했습니다 —
+`stride < horizon` 이 표본 수를 **56배** 뻥튀겼습니다. 그래서:
+
+* `effective_sample_count` — 각 거래는 같은 심볼의 이전 거래가 덮지 않은 horizon 비율만 기여
+* `purged_cv` — 테스트 폴드와 **겹치는** 학습 거래는 purge, 그 직후 구간은 embargo.
+  embargo 기본값은 **표본의 중위 horizon** 입니다. 150초 스캘프와 64,800초 오버나이트 캐리에
+  같은 상수를 쓰면 최소한 한쪽은 틀립니다
+* `combinatorial_splits` — CPCV. 잘라낸 조합 수 상한(`max_paths`)에 걸리면 **더 적은 split 을
+  반환**해서 부분 스윕이 전체 스윕처럼 보이지 않게 합니다
+* 신뢰구간은 행 수가 아니라 유효 표본 수로 계산하고, 할인이 컸다면
+  `METRICS_OVERLAPPING_TRADES_DISCOUNTED` 로 보고합니다
+
+### 14.2 비용 스트레스와 파라미터 안정성
+
+**`break_even_cost_multiple`** — 비용이 측정치보다 몇 배 나빠질 때까지 엣지가 살아남는가.
+1.05배에서 죽는 엣지는 평균이 뭐라 하든 거래 불가입니다. 이 프로젝트는 US 왕복 비용이 KRX 기준
+표의 28bps 가정 대비 중위 63.2bps (p90 125.2) 로 들어온 것을 이미 측정했으므로, 평균 측정 비용만
+쓰는 검증은 거래 가능성에 대해 아무 말도 하지 않습니다.
+
+스프레드 충격은 rate 배수가 아니라 **가산 bps** 로 넣습니다 — 충격은 요율을 스케일하지 않고
+basis point 를 더하며, 하필 전략이 청산하려는 순간에 벌어집니다.
+
+**파라미터 안정성** — 결과가 논지의 속성인지 임계값 하나의 속성인지. `range_support_reversion` 은
+10bps 에서 t=3.01, 25bps 에서 t=2.91 (평지) 이지만 확인 필터를 넣자 −2.3bps → −35.8bps 로
+무너지고 표본이 207 → 38 로 줄었습니다(절벽). 그 둘을 구분하는 것이 이 모듈이고,
+**최적화는 일부러 하지 않습니다** — "최적값은 X" 를 보고하면 노브를 X 로 옮기라는 초대가 되고
+그것이 단계만 늘린 curve fitting 입니다.
+
+**레짐 분해** — 구간별 평균과 **하단**을 함께 내고, 최고/최저 구간의 신뢰구간이 겹치지 않을 때만
+`discriminates=True` 입니다. 8건 표본 두 개로 "TREND_UP 에서는 되고 RANGE_BOUND 에서는 안 된다"는
+이야기를 만들지 않기 위한 것입니다.
+
+**증거원 가중** (`config/strategy_validation.yaml`) — LIVE 1.0 / LIVE_PROBE 0.7 / SHADOW 0.3 /
+BACKTEST 0.0. **이 값들은 측정치가 아니라 초기 설계값입니다.** shadow-live 짝 outcome 이 쌓이면
+재캘리브레이션해야 합니다. 가중 평균과 **live 전용** 평균을 나란히 보고하는 이유는 둘이 다른
+질문에 답하기 때문입니다 — 가중 평균은 최선의 추정치, live 전용은 승격이 근거로 삼을 수 있는
+유일한 값입니다.
+
+### 14.3 lifecycle 원장 — 전이는 화이트리스트다
+
+`app.strategy_validation.registry` 는 `app.trading.directional.ALLOWED_TRANSITIONS` 와 같은 정신입니다.
+rank 비교가 아니라 화이트리스트인 이유: rank 비교는 `RESEARCH → LIVE` 를 "4칸 상승" 으로 조용히
+허용하고, 그것이 이 서브시스템이 존재하는 이유 그 자체입니다.
+
+```text
+RESEARCH → VALIDATED → SHADOW → LIVE_PROBE → LIVE     (한 칸씩만)
+DEGRADED → SHADOW                                      (drift 강등에서 복귀)
+```
+
+승격에는 `StrategyValidationRecord` 첨부가 **필수**입니다. record 없는 승격은 거부되므로
+"괜찮을 것 같다" 가 권한이 될 수 없습니다. LIVE_PROBE / LIVE 로 가는 두 전이만 게이트를 받습니다.
+
+| 게이트 | 기본 | 이유 |
+|---|---|---|
+| `minimum_samples` | 30 | — |
+| `minimum_lower_bound_bps` | 0.0 | **1차 기준은 양수 평균이 아니라 양수 하단**입니다. 평균을 비용과 비교하면, 오차 폭이 넓고 평균이 살짝 양수인 전략이 계속 거래합니다 — 분포의 절반이 비용 아래인데 비용은 매번 지불됩니다 |
+| `minimum_break_even_cost_multiple` | 1.25 | 측정 비용의 1.25배까지 살아남아야 함 |
+| `minimum_out_of_sample_stability` | 0.6 | walk-forward 창 중 양수 비율. 예외적인 한 창이 전체 평균을 지탱하는 전략을 잡음 |
+| `require_parameter_stability` | true | — |
+| `require_live_evidence_for_live` | true | **shadow 증거로는 LIVE 에 갈 수 없습니다.** 하지 않은 거래로 승격할 수 없습니다 |
+
+**강등은 승격보다 쉽습니다.** 하향 전이는 증거를 요구하지 않습니다 — 완성된 연구 없이는 강등을
+거부하는 것이 망가진 전략이 계속 거래하는 방식입니다. drift 모니터의 자동 강등은 `actor` 를
+기록하므로 사람이 한 것과 자동인 것을 구분할 수 있습니다.
+
+### 14.4 drift 강등은 한 번의 손실로 발화하지 않는다
+
+`app.monitoring.strategy_drift` 의 강등 제안은 **최소 표본 + rolling net EV 음수 + 하단 음수**를
+동시에 요구합니다. 셋 중 하나만으로는 노이즈입니다 — −60bps 체결 하나가 12표본 평균을 5bps
+움직이는데 그건 추정기 자체 오차 안입니다.
+
+한 칸씩만 강등합니다 (`LIVE → DEGRADED → SHADOW`). `LIVE → SHADOW` 엣지는 없습니다. 두 칸
+낙하는 "측정은 되지만 거래는 안 하는" 상태를 건너뛰고, 다음 판단의 증거가 바로 거기서 나옵니다.
+
+비용/드로다운 플래그 단독은 **검토 신호이고 강등이 아닙니다** — 해법이 horizon 이나 거래 venue 일
+수 있고 전략 자체가 아닐 수 있습니다.
+
+모니터는 **제안만** 합니다 (`DemotionProposal`). 적용은 §14.3 의 원장을 통한 별개 행위입니다.
+모니터가 lifecycle 을 조용히 다시 쓸 수 있으면 운영 설정을 검토할 수 없게 됩니다.
+
+### 14.5 전략 문제와 selector 문제 분리
+
+`app.evaluation.selector_evaluator` 가 명세의 진단 표를 구현합니다. 검사 **순서**가 임의가
+아닙니다 — 비용/horizon 검사가 **먼저** 돕니다. gross 양수 net 음수 전략은 net 숫자만 보면
+죽은 논지와 구별되지 않는데, 해법은 완전히 다릅니다(horizon 을 바꾸거나 그 venue 를 그만두는
+것이지 논지를 버리는 것이 아님).
+
+| oracle (적격·발화한 컨텍스트 전체) | router-selected (selector 가 실제로 고른 시점) | 판정 |
+|---|---|---|
+| gross 양수, net 음수 | — | `COST_OR_HORIZON_PROBLEM` |
+| 컨텍스트별 부호가 뒤바뀜 | — | `CONTEXT_MODELLING_PROBLEM` |
+| 음수 | 무관 | `STRATEGY_PROBLEM` |
+| 양수 | 음수 | `SELECTOR_PROBLEM` |
+
+`selector_regret = best_available_outcome − selected_outcome` 이고 **NO_TRADE 가 경쟁자**입니다.
+selector 가 거절했을 때 실현 결과는 0.0 이며(노출 없음, 비용은 거래에만 발생), 모든 대안이 손실인
+그룹에서 regret 은 **음수**가 됩니다 — 거절이 어떤 거래보다 나았다는 뜻이고, 그것이 표현
+가능해야 거절이 보상받을 수 있습니다.
+
+regret 은 **행 단위가 아니라 컨텍스트 단위**로 계산한 뒤 컨텍스트에 대해 평균합니다. 한 컨텍스트의
+대안들은 같은 가격 경로를 다른 barrier 로 자른 것이라 독립이 아니고, 행 평균은 대안 9개인
+컨텍스트를 대안 1개인 컨텍스트보다 9배 무겁게 셉니다.
+
+**데이터 수집은 시작됐지만 승격 증거로는 아직 부족합니다.** 2026-08-11 23:09:33 KST 영속
+스냅샷은 해소된 context 66개, 실제 전략 선택 context 0개, distinct day 1개입니다. 모두 NO_TRADE라 선택
+순수익과 regret은 0이고, 이는 양의 수익 표본이 아닙니다. Windows 런처가 V2와 자동 승격을 켜므로
+라이브 세션 동안 계속 누적됩니다. 최신값은 §14.6의 API에서 확인합니다.
+
+### 14.6 커버리지 — 시장이 있는 상태에 전략이 존재하는가
+
+`app.strategy.coverage` 가 컨텍스트를 6축 4,800 셀로 버킷하고 셀마다 적격 수 / 발화 수 /
+**선택 가능(검증된) 수**를 셉니다. 세 번째가 중요한 숫자입니다 — 전략이 발화하지만 선택 가능한 것이
+없는 셀은 시스템이 희망으로 거래하는 셀입니다.
+
+`validated_positive_strategy_count == 0` 이면 `STRATEGY_COVERAGE_GAP` 을 기록하고 그 셀은
+NO_TRADE 로 해소합니다. **가장 가까운 기존 전략을 강제 실행하지 않습니다** — 그것이
+`forced_selection` 결함이고, 미검증 유사 전략으로 공백을 메우는 것은 전략 추가 정책의 금지
+항목입니다. 반복되는 공백은 연구 후보로 집계되며, 그것이 카탈로그가 커지는 정당한 경로입니다.
+
+이 경로로 추가된 첫 전략이 `bar_trend_continuation`입니다. 1초/5초 체결창이 준비되지 않은
+세션에서 완성된 1분봉 추세, VWAP 위치, 추세 지속성, 상대거래량을 사용합니다. 현재 lifecycle은
+SHADOW이며 다른 전략과 똑같이 비용 차감 후 양의 forward 하단을 입증해야 합니다. coverage gap
+탐지는 새 전략의 **연구 필요성**을 자동 발견하지만, 검증되지 않은 코드를 자동 생성하거나 곧바로
+실주문 권한을 주지는 않습니다.
+
+따라서 시스템의 목표는 모든 시장·거래 상태를 분류하고 가장 나은 **검증된** action을 고르는
+것입니다. 그 action에는 `NO_TRADE`도 포함됩니다. 현재 수익 가능한 알고리즘이 없다는 사실은 새
+지표·horizon·venue 전략을 연구할 신호이지, 손실 예상 거래를 강제로 만드는 근거가 아닙니다.
+
+coverage는 V2가 켜진 live cycle마다 자동 누적됩니다. 정확한 현재 수치는
+`GET /api/realtime-trading/status`의 `strategy_session.selector_v2.coverage`에서 확인합니다. 권한 승격은
+coverage 셀 수가 아니라 별도의 context별 수익·안정성 기준으로 결정됩니다.
+
+### 14.7 테스트 표면
+
+| 파일 | 건수 | 무엇을 고정하는가 |
+|---|--:|---|
+| `test_market_context.py` | 11 | 결정론적 생성, 0 스프레드는 결측(측정된 0 아님), field별 provenance |
+| `test_strategy_spec_registry.py` | 12 | append-only 순서, 선언된 요구사항이 모두 실제 field, 숏 RESEARCH 고정, 권고는 낮추기만 |
+| `test_strategy_proposal_contract.py` | 12 | 주문 field 부재, 방향 인식 target/stop, 알고리즘 예외는 not-ready proposal |
+| `test_ontology_strategy_eligibility.py` | 15 | hard/soft 분할, generic methodology 주소 불가, 미해석 레짐은 block 아님 |
+| `test_strategy_selector_v2.py` | 31 | 항 분해 합 = 총합, NO_TRADE 정상 결과, 양수 평균도 하단 규칙으로 거부, **AST 로 실행 계층 import 금지** |
+| `test_bandit_adapter_bounds.py` | 9 | clamp 와 보고, 이력 0이면 보정 0, 얇은 표본 축소, context key 에 symbol 없음 |
+| `test_counterfactual_and_regret.py` | 17 | barrier 보수적 우선순위, 선택 전략은 sink 로 안 나감, shadow 는 LIVE 로 셀 수 없음, NO_TRADE 경쟁 |
+| `test_strategy_coverage_and_validation.py` | 26 | 중첩 표본 할인, 2칸 승격 거부, 증거 없는 승격 거부, shadow 만으론 LIVE 불가, 1회 손실로 강등 안 함 |
+| `test_selector_v2_shadow_integration.py` | 12 | 라이브 evidence 모양으로 통과, 진단 payload 완비, 잘못된 입력에도 raise 안 함, live 권한은 안전 sub-flag 요구 |
+| `test_selector_v2_auto_promotion.py` | 5 | 자동 단계 승격, full-live 실체결 요구, 빠른 강등, 영속화, 설정상 shadow와 실효 권한 분리, 단일 표본 안전성 |
+
+자동 권한 변경 후 V2·세션·실시간 엔진·실행 안전 관련 회귀 묶음 **286건 통과**
+(2026-08-11). 전체 저장소 테스트 수는 계속 변하므로 고정 총계로 승격 상태를 판단하지 않습니다.
+
+상세 설계와 첫 audit 결과는 [strategy_selection_v2.md](strategy_selection_v2.md).

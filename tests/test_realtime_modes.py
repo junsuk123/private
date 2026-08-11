@@ -1467,6 +1467,32 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(candidates, ("HST", "HUYA"))
         broker_discovery.assert_not_called()
 
+    def test_realtime_engine_us_candidates_match_current_overseas_subscriptions(self) -> None:
+        with (
+            patch("app.web.RealtimeMarketDataStore") as store_cls,
+            patch("app.web._cached_context_buy_candidates", return_value=("AXTI", "INTC")),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch(
+                "app.web._prioritize_realtime_buy_candidates",
+                side_effect=lambda symbols, **_: tuple(symbols),
+            ),
+            patch("app.web._is_live_buy_candidate_symbol", return_value=True),
+            patch("app.web._is_open_live_market_ticker", return_value=True),
+            patch("app.web._ticker_market_group_for_live_trading", return_value="US"),
+        ):
+            store_cls.return_value.active_symbols.return_value = ("AXTI", "INTC")
+            with web_module._live_lock:
+                previous = dict(web_module._kis_overseas_realtime_state)
+                web_module._kis_overseas_realtime_state["symbols"] = ("INTC",)
+            try:
+                candidates = web_module._realtime_engine_buy_candidates()
+            finally:
+                with web_module._live_lock:
+                    web_module._kis_overseas_realtime_state.clear()
+                    web_module._kis_overseas_realtime_state.update(previous)
+
+        assert candidates == ("INTC",)
+
     def test_web_macro_observer_uses_live_us_market_context(self) -> None:
         now = datetime.now(timezone.utc)
 

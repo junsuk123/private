@@ -266,6 +266,21 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     # measurement, the training labels and the executor all describe the same trade.
     # Tuning either barrier here would silently make the screened result inapplicable.
     "range_support_reversion": (60.0, 160.0, 30.0, 3600),
+    # Multi-hour trend continuation. Same barrier triple as ``event_momentum`` and
+    # ``adaptive_anchored_vwap_reversion`` (75/185/40); only the holding clock is longer.
+    #
+    # This row was first written as 75/265/40, sized so the target would clear a US round
+    # trip on its own. That broke the invariant this whole table is built on and
+    # ``test_krx_reference_measurement_reproduces_the_table`` caught it: at the KRX
+    # reference the rule gives 28 + 1.5 x (75 + 28) = 182.5 -> 185, and 265 corresponds to
+    # a ~60bps cost reference instead of 28.
+    #
+    # Widening for a costlier venue is NOT the table's job — it is
+    # ``resolve_exit_geometry``'s, which re-derives the target from the cost actually
+    # measured for the trade (a US median of 63.2bps yields 275 here). Baking a US-sized
+    # target into the KRX table would have mis-sized every KRX fill of this thesis in the
+    # other direction, demanding 265bps where 185 is what compounds at 1.5 net R:R.
+    "bar_trend_continuation": (75.0, 185.0, 40.0, 10800),
     # Unknown / adopted position. It gets the tightest admissible stop and the
     # shortest leash — but its target must still clear cost, which the previous
     # 40bps value did not: it was below the 28bps round trip plus any spread.

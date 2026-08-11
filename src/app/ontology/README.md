@@ -12,6 +12,12 @@ existing trading pipeline. It does **not** replace numerical scoring or trading 
 | `trading_core.ttl` | Core RDFS/OWL vocabulary: classes, class hierarchy, object/data properties, `rdfs:domain`/`rdfs:range`, property hierarchy (`rdfs:subPropertyOf`), and disjointness axioms. |
 | `trading_rules.ttl` | OWL 2 RL classification axioms (`owl:hasValue` restriction classes) that let the reasoner infer semantic class memberships from asserted facts. Imports `trading_core.ttl`. |
 | `trading_shapes.ttl` | SHACL shapes for closed-world operational validation (required fields, positive prices, stale/synthetic blocking, account/order structure, approved-vs-rejected conflict, final-order preconditions). |
+| `macro_market_ontology.ttl`, `micro_symbol_ontology.ttl` | Macro/micro reasoning vocabularies for the hierarchical reasoners in `app.graph`. |
+| `operational_gate.py` | `ClosedWorldOntologyGate` — point-in-time fact snapshot → allowed strategy ids + hard-block reasons + soft compatibility. |
+| `short_rules.py` | Short-side closed-world facts and the per-regime directional allow mask. |
+| `strategy_ontology.py` | Strategy relations keyed on **real strategy ids**: 8 hard relation types, 4 soft ones. |
+| `strategy_eligibility.py` | `StrategyEligibilityEngine` — the boolean mask `M_s(x)` and the soft score `O_s(x)` consumed by `StrategySelectorV2`. |
+| `trading_domain_ontology.py`, `trading_reasoner.py`, `trading_rules.py`, `trading_fact_builder.py` | Deterministic decision ontology: vocabulary, reasoner, YAML-backed rules, fact builder. |
 | `README.md` | This file. |
 
 ## Namespaces
@@ -48,6 +54,55 @@ RiskManager  -> the SOLE final execution gate.
   principal-protection amount is encoded as an OWL axiom.
 - **OWL/SHACL never grant permission to trade.** An inferred `tr:TradeEligibleAsset` or
   `tr:BuyCandidate` is a *semantic label*; the RiskManager still decides.
+
+## Strategy eligibility (`strategy_eligibility.py`)
+
+The ontology's ONLY output in the V2 selection pipeline. It does not pick a strategy, does not
+rank, and cannot authorise anything — those were the overlapping responsibilities the
+strategy-selection refactor separated.
+
+Relations are keyed on **concrete `strategy_id`s**. Before the refactor the hard mask was keyed on
+a generic METHODOLOGY name (`momentum` / `breakout` / `mean_reversion` / `vwap_reversion`) and an
+alias table translated it into an executable id. That table's own comment records the problem —
+`mean_reversion → vwap_mean_reversion` is "the loosest fit", because the generic thesis reverts to
+a Bollinger midline while the catalogued strategy reverts to VWAP. An ontology verdict about one
+hypothesis was authorising a different one, and a catalogue of 19 theses was addressable through 4
+names. The methodology enum survives only as coarse macro permission tokens
+(`MACRO_FAMILY_BY_STRATEGY`), which is the one job it can do correctly.
+
+```
+HARD (may zero the mask)                SOFT (evidence only, never blocks)
+  requires              a MarketContext field    worksWellUnder
+  requiresFeature       a TechnicalFeatureSet    prefers
+  requiresLiquidity     floor / spread ceiling   supportedBy
+  requiresSession       session phases           historicallyCompatibleWith
+  requiresHistory       completed bars
+  requiresDataQuality   tick window / book
+  allowedMarket
+  forbiddenUnder        state where invalid
+```
+
+Two independent numbers come out per strategy: `eligible` (the hard verdict, `0.0`/`1.0` as
+`mask`) and `compatibility_score` (soft evidence in `[-1, 1]`, the weighted mean of the relations
+that fired). A strategy with no matching soft relation scores `0.0` — **neutral, not penalised**,
+because absence of evidence is not evidence.
+
+Why the split is load-bearing: **a preference expressed as a block loses candidates that should
+merely have ranked lower.** `app.technical.signals` hard-disables mean reversion in a downtrend;
+here the same fact is a penalty, because the reversion thesis is *sometimes* right in a falling
+tape and vetoing it removes the evidence needed to find out when.
+
+Fail-closed with one deliberate exception: a missing *requirement* blocks, but a missing *market
+state label* does not. `forbiddenUnder` and the no-entry set fire only on a label that is actually
+present — an unresolved regime is an unanswered question, and the existing code already treats an
+unanswerable permission check as "not a withdrawal"
+(`strategy_algorithms.macro_strategy_permitted`). The data-quality relations are what catch a
+context too empty to trust, and they block explicitly.
+
+The soft relations are derived from each thesis and from gating that already exists in the code.
+**None is fitted to realized performance** — scoring relations from past results would make the
+ontology a backtest. See [docs/strategy_selection_v2.md](../../../docs/strategy_selection_v2.md)
+and [docs/ontology_and_gnn.md](../../../docs/ontology_and_gnn.md) L5-E.
 
 ## How classification works (OWL RL)
 
@@ -97,3 +152,9 @@ separately from the asserted set.
    Python policy scorer and the deterministic engines.
 5. Map any new emitted predicate/object string in `app.graph.rdf_adapter` and add a test in
    `tests/test_ontology_*.py`.
+6. When adding a **strategy relation** to `strategy_ontology.py`, decide hard vs soft first and
+   name a concrete `strategy_id` — never a methodology name. A relation that expresses a
+   *preference* must be soft: a hard relation removes the strategy from the ranking entirely, and
+   that is only correct when the thesis is genuinely undefined in that state. Record the rationale
+   on the relation (`SoftRelation.rationale`); `tests/test_ontology_strategy_eligibility.py`
+   asserts that only catalogued ids are addressable and that soft relations cannot block.

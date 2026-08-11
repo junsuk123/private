@@ -89,6 +89,11 @@ DISABLED ──► SHADOW ──► LIVE_PROBE ──► LIVE_LIMITED ──► 
 | `LIVE_FULL` | ✓ | 정책 허용 범위 내 정상 거래 (오버나이트는 여전히 금지) |
 | `SUSPENDED` | ✗ | 성능 저하·대주 오류·상태 불일치. 사다리의 칸이 아니라 **고장 상태** |
 
+이 arm별 숏 배포 사다리와 `StrategySelectorV2`의 전역 선택 권한 사다리는 독립입니다. V2가
+`LIVE_PROBE` 또는 `LIVE`로 자동 승격돼도, 숏 arm 자체가 이 표의 live 상태가 아니거나 fresh locate가
+없으면 세션 계층에 실주문 승인 proposal이 존재하지 않습니다. 따라서 V2 승격으로 숏 `SHADOW`나
+대주 fail-closed 규칙을 우회할 수 없습니다.
+
 ### 4.1 금지 전이는 화이트리스트로 불가능하게 만든다
 
 `ALLOWED_TRANSITIONS`는 랭크 비교가 아니라 **명시적 화이트리스트**입니다. 랭크 비교

@@ -1,0 +1,77 @@
+# MarketContext bucketing and drift thresholds.
+#
+# These values are READ AS DOCUMENTATION of what the code already does — the cut points live
+# in app/strategy/coverage.py and app/monitoring/context_drift.py, where they are needed
+# without an IO dependency on the trading hot path. This file exists so the choices are
+# reviewable in one place and so a future move to config-driven bins has a home.
+#
+# Every cut point below was chosen to sit on a threshold the code ALREADY treats as
+# meaningful, so a context crossing one is a context the strategies actually feel.
+
+coverage_dimensions:
+  # trend_strength, in bps of price (EMA separation / price). +/-10bps is about one typical
+  # KRX top-of-book spread, so "flat" means "inside the noise".
+  trend:
+    field: trend_strength
+    cuts: [-40.0, -10.0, 10.0, 40.0]
+    labels: [strong_down, weak_down, flat, weak_up, strong_up]
+  # realized_volatility as a per-observation FRACTION. 0.001 = 10bps; 0.005 = 50bps, which on
+  # a one-minute bar is an extreme tape.
+  volatility:
+    field: realized_volatility
+    cuts: [0.001, 0.0025, 0.005]
+    labels: [low, medium, high, extreme]
+  # 0.35 / 0.65 are the min_liquidity_score floors strategies in the catalogue declare.
+  liquidity:
+    field: liquidity_score
+    cuts: [0.35, 0.65]
+    labels: [low, medium, high]
+  session:
+    derived_from: [session_phase, is_opening_window, is_closing_window, minutes_from_open]
+    labels: [open, morning, midday, close, overnight]
+  event:
+    derived_from: [positive_event_score, negative_event_score, event_uncertainty]
+    labels: [none, positive, negative, uncertain]
+  # orderflow_imbalance in [-1, 1]. +/-0.15 matches the lowest min_aggressor_imbalance any
+  # algorithm in the catalogue fires on. A liquidity shock is detected separately, from
+  # spread per unit of capturable volatility.
+  microstructure:
+    field: orderflow_imbalance
+    cuts: [-0.15, 0.15]
+    labels: [sell_pressure, balanced, buy_pressure]
+    shock_price_impact: 3.0
+
+# Population stability index thresholds. The conventional reading: <0.1 stable,
+# 0.1-0.25 moderate, >0.25 significant.
+#
+# Bins are FIXED, never quantile-derived from the live window. Quantile bins move with the
+# distribution they are supposed to be measuring, which is how a drift monitor reports
+# stability straight through a regime change.
+context_drift:
+  minimum_samples: 200
+  moderate_psi: 0.10
+  significant_psi: 0.25
+  monitored_fields:
+    - trend_strength
+    - realized_volatility
+    - liquidity_score
+    - spread_bps
+    - orderflow_imbalance
+    - vwap_distance_bps
+    - short_term_price_impact
+    - change_point_probability
+    - market_regime
+    - session_phase
+
+# Data-quality floors used by the ontology's requiresDataQuality relations.
+#
+# minimum_feature_completeness is a floor against an essentially empty context, NOT a quality
+# target: the per-strategy requiresFeature relations enforce quality field by field, which is
+# strictly better than an aggregate.
+data_quality:
+  minimum_feature_completeness: 0.25
+  # A ZERO SPREAD IS AN ABSENT SAMPLE, not a market state: best_bid == best_ask cannot happen
+  # in a live book. Measured over the current store only 10.5% of KRX minute bars carry a real
+  # book sample, so treating the zero as measured would teach every consumer that nine of ten
+  # KRX minutes had a free round trip.
+  treat_zero_spread_as_missing: true
