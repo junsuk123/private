@@ -261,6 +261,11 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     # The 18-hour clock is the carry itself: entered near the close, exited into
     # the next session's opening liquidity.
     "overnight_gap_carry": (90.0, 205.0, 45.0, 64800),
+    # Range-floor reversion. The standard 60/160 pair at the 3600s horizon the
+    # condition was measured at — deliberately unchanged from the table so the
+    # measurement, the training labels and the executor all describe the same trade.
+    # Tuning either barrier here would silently make the screened result inapplicable.
+    "range_support_reversion": (60.0, 160.0, 30.0, 3600),
     # Unknown / adopted position. It gets the tightest admissible stop and the
     # shortest leash — but its target must still clear cost, which the previous
     # 40bps value did not: it was below the 28bps round trip plus any spread.

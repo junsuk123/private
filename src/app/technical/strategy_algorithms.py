@@ -464,6 +464,35 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # knob existed — raising it is a deliberate tuning decision, not a repair.
         "max_horizon_seconds": 5400.0,
     },
+    "range_support_reversion": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        # Operator decision of 2026-08-11, taken against the measurement rather than
+        # on the strength of it: on the tradable universe this thesis scores t=1.56
+        # (t=0.65 on the sub-period holding the data), i.e. it is not distinguishable
+        # from buying at random. The bandit's pessimistic lower bound is what actually
+        # governs whether it ever trades — with no realized history it is reachable
+        # only through cold-start exploration at minimum size.
+        "live_authorized": 1.0,
+        # 10 bps above the 20-bar channel floor. This is the measured threshold: the
+        # 25bps variant scored marginally better on the full set (t=2.91 vs 3.01) but
+        # 10bps is the tighter statement of "pressed against the floor" and was the
+        # variant carried through the tradable-only and per-symbol checks.
+        "max_low_distance_bps": 10.0,
+        # The horizon the condition was measured at. Changing it voids the
+        # measurement — the same condition at 120m and 240m fell to |t| ~ 1.0 with a
+        # sample too small to interpret.
+        "horizon_seconds": 3600.0,
+        # sigma_1m * sqrt(60) must at least reach the geometry's own target, or the
+        # location is irrelevant because the trade cannot pay its round trip.
+        "min_attainable_bps": 160.0,
+        "target_capture_fraction": 0.5,
+        "stop_volatility_multiple": 2.0,
+        "trailing_bps": 30.0,
+        "max_spread_bps": 30.0,
+        "min_liquidity_score": 0.35,
+    },
     "liquidity_shock_reversal": {
         # The new ask-heavy absorption branch is validated on two US sessions
         # only.  Keep the whole arm shadow-only until forward outcomes provide
@@ -3126,6 +3155,115 @@ class OvernightGapCarryAlgorithm(TradingAlgorithm):
         return ()
 
 
+class RangeSupportReversionAlgorithm(TradingAlgorithm):
+    """Buy price pressed against its own 20-bar range floor.
+
+    One condition, deliberately. See ``app.strategy.catalog`` for the measurement
+    this came from and — more importantly — for the two ways it fails to hold on the
+    tradable universe. Two things that look like missing gates are measured
+    omissions: no confirmation of an upturn (requiring one moved the result from
+    -2.3bps to -35.8bps and cut the sample from 207 to 38), and no RSI filter (the
+    range-floor proximity carried the whole effect on its own).
+
+    Bar-based, like ``bar_confirmed_vwap_recovery``: the Donchian channel comes from
+    completed one-minute bars, so a thin name with a live book but too few prints for
+    a causal sub-second window can still be evaluated. No tick, aggressor or
+    order-book-delta term participates in the entry.
+    """
+
+    strategy_id = "range_support_reversion"
+    thesis = "price pressed against its 20-bar range floor reverts before it breaks"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        if not _present(f.price, f.donchian_low, f.donchian_low_distance, f.atr_pct):
+            return self._reject(("RANGE_SUPPORT_INPUTS_MISSING",))
+
+        # ``donchian_low_distance`` is (price - min(low[-20:])) / price, i.e. how far
+        # above its own range floor the price is, as a FRACTION. This is the exact
+        # quantity the screen measured; the box-width-normalised ``box_position`` is a
+        # different number (5% of a wide box is far from the floor in bps) and using
+        # it here would ship a thesis the measurement never covered.
+        distance_bps = float(f.donchian_low_distance) * 10_000.0
+        if distance_bps > self.p("max_low_distance_bps"):
+            return self._reject(
+                ("RANGE_FLOOR_NOT_REACHED",), donchian_low_distance_bps=round(distance_bps, 3)
+            )
+        # A floor that is already broken is not support. Rejecting a price BELOW the
+        # channel low is not a filter on the thesis — it is the thesis: the condition
+        # is "pressed against", not "through".
+        if float(f.price) < float(f.donchian_low):
+            return self._reject(
+                ("RANGE_FLOOR_BROKEN",),
+                price=round(float(f.price), 6),
+                donchian_low=round(float(f.donchian_low), 6),
+            )
+        # Cost admissibility, applied here rather than assumed: a floor touch on a
+        # name whose own volatility cannot carry the target is not tradable however
+        # good the location is. ``atr_pct`` over the horizon is the available move.
+        horizon_minutes = max(1.0, self.horizon_seconds / 60.0)
+        attainable_bps = float(f.atr_pct) * 10_000.0 * math.sqrt(horizon_minutes)
+        if attainable_bps < self.p("min_attainable_bps"):
+            return self._reject(
+                ("RANGE_SUPPORT_MOVE_CANNOT_PAY_COST",),
+                attainable_bps=round(attainable_bps, 2),
+            )
+        if f.spread_bps is not None and float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(
+                ("RANGE_SUPPORT_SPREAD_TOO_WIDE",), spread_bps=round(float(f.spread_bps), 3)
+            )
+        if f.liquidity_score is not None and float(f.liquidity_score) < self.p(
+            "min_liquidity_score"
+        ):
+            return self._reject(
+                ("RANGE_SUPPORT_LIQUIDITY_TOO_LOW",),
+                liquidity_score=round(float(f.liquidity_score), 3),
+            )
+
+        # The edge is the distance back into the range, capped by what the symbol can
+        # actually travel in the horizon. Nothing here invents an alpha floor.
+        span = None
+        if f.donchian_high is not None and f.donchian_low is not None:
+            span = (float(f.donchian_high) - float(f.donchian_low)) / max(1e-9, float(f.price))
+        edge = min(
+            attainable_bps * self.p("target_capture_fraction"),
+            (span * 10_000.0 * self.p("target_capture_fraction")) if span else attainable_bps,
+        )
+        # Closer to the floor is a better location, and that is the only thing this
+        # thesis claims to know.
+        score = _clamp(1.0 - distance_bps / max(1e-9, self.p("max_low_distance_bps")))
+        return self._fire(
+            symbol=f.symbol,
+            score=score,
+            confidence=_clamp(0.30 + 0.35 * score),
+            edge_bps=edge,
+            reasons=(rc.MEAN_REVERSION_CANDIDATE, "RANGE_FLOOR_SUPPORT_TOUCH"),
+            donchian_low=round(float(f.donchian_low), 6),
+            donchian_low_distance_bps=round(distance_bps, 3),
+            attainable_bps=round(attainable_bps, 2),
+            range_span_bps=round(span * 10_000.0, 2) if span else None,
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        # Structural target: the middle of the range the entry was taken at the floor
+        # of. Falls back to the geometry target when the channel is unavailable.
+        target = None
+        if f.donchian_high is not None and f.donchian_low is not None:
+            mid = (float(f.donchian_high) + float(f.donchian_low)) / 2.0
+            if mid > entry_price:
+                target = entry_price + self.p("target_capture_fraction") * (mid - entry_price)
+        return ExitRule(
+            strategy_id=self.strategy_id,
+            stop_price=self._volatility_stop(
+                entry_price, f, self.p("stop_volatility_multiple")
+            ),
+            target_price=target,
+            trailing_bps=self.p("trailing_bps"),
+            max_holding_seconds=int(self.horizon_seconds),
+            stop_basis="volatility_multiple",
+            target_basis="range_mid" if target is not None else "geometry_target",
+        )
+
+
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     IntradayMomentumAlgorithm,
     BreakoutVolumeAlgorithm,
@@ -3146,6 +3284,7 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     # Appended so every existing GNN/catalogue output index remains unchanged.
     BarConfirmedVwapRecoveryAlgorithm,
     OvernightGapCarryAlgorithm,
+    RangeSupportReversionAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -3177,6 +3316,9 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "residual_relative_strength": ("relative_strength",),
     "adaptive_anchored_vwap_reversion": ("vwap_reversion", "mean_reversion"),
     "ofi_microprice_exhaustion_reversal": ("mean_reversion",),
+    # Pure location thesis with no trend component, so mean_reversion only. Leaving
+    # it out entirely would make the macro layer read it as never permitted.
+    "range_support_reversion": ("mean_reversion",),
     # --- SHORT theses -------------------------------------------------------- #
     # Mapped to SHORT-side families so the macro allow/block lists can permit a
     # falling-tape short without simultaneously permitting a long momentum entry.

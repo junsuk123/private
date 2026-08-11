@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -1819,7 +1820,8 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertLessEqual(len(symbols), 5)
 
     def _collector_symbols_with(
-        self, *, breadth, affordable, budget="40", held=(), anchor_max=None, depth_floor=None
+        self, *, breadth, affordable, budget="40", held=(), anchor_max=None,
+        depth_floor=None, universe=(),
     ):
         account = AccountSnapshot(
             cash=100000.0,
@@ -1833,7 +1835,7 @@ class RealtimeModesTest(unittest.TestCase):
             patch("app.web._live_account_snapshot_for_analysis", return_value=account),
             patch("app.web._load_realtime_collection_symbols", return_value=tuple(breadth)),
             patch("app.web._live_affordable_buy_candidate_symbols", return_value=tuple(affordable)),
-            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=tuple(universe)),
             patch("app.web._pending_krx_buy_candidate_warmup_symbols", return_value=()),
             patch("app.web._dashboard_krx_watch_symbols", return_value=()),
             patch.dict(
@@ -1847,6 +1849,78 @@ class RealtimeModesTest(unittest.TestCase):
             ),
         ):
             return web_module._kis_realtime_collector_symbols()
+
+    def test_session_universe_is_pinned_and_gets_depth(self) -> None:
+        # The universe is the set strategies are evaluated on, and
+        # app.trading.domestic_universe holds it for the whole session precisely so a
+        # name can accumulate the bars it will be judged on. Leaving it inside the
+        # rotating subscription pool undid that one layer down.
+        #
+        # Measured 2026-08-11 before this fix: 7 of 23 universe members were not
+        # subscribed at all, 12 had received no orderbook all day, and 363
+        # non-universe symbols had. A trade-only universe member cannot produce a
+        # LiveFeatureFrame (MISSING_SOURCE_RECORDS) so it can never become a
+        # candidate — it holds an evaluated-set slot it can never pay for.
+        universe = tuple(f"{index:06d}" for index in range(200, 216))
+        breadth = tuple(f"{index:06d}" for index in range(700, 760))
+        symbols = self._collector_symbols_with(
+            breadth=breadth, affordable=(), budget="40", universe=universe
+        )
+        missing = [s for s in universe if s not in symbols]
+        self.assertEqual(missing, [], "every universe member must be subscribed")
+        without_depth = [
+            s for s in universe if not web_module._kis_realtime_symbol_wants_orderbook(s)
+        ]
+        self.assertEqual(
+            without_depth, [], "a trade-only universe member can never be a candidate"
+        )
+
+    def test_held_positions_still_outrank_the_pinned_universe(self) -> None:
+        # A position with no live feed cannot be priced to exit, so pinning the
+        # universe must not be able to starve one.
+        universe = tuple(f"{index:06d}" for index in range(300, 330))
+        symbols = self._collector_symbols_with(
+            breadth=(), affordable=(), budget="6", held=("005930",), universe=universe
+        )
+        self.assertIn("005930", symbols)
+        self.assertTrue(web_module._kis_realtime_symbol_wants_orderbook("005930"))
+
+    def test_universe_size_is_derived_from_the_depth_budget(self) -> None:
+        # The two were sized independently — a 30-name universe against a
+        # 40-registration budget where depth costs two each — so the universe was
+        # over-committed by construction and its surplus members could never be fed.
+        with patch.dict(
+            "os.environ",
+            {"KIS_REALTIME_MAX_SUBSCRIPTIONS": "40", "REALTIME_UNIVERSE_RESERVED_DEPTH_SLOTS": "4"},
+        ), patch("app.web._kis_realtime_effective_subscription_capacity", return_value=None):
+            self.assertEqual(web_module._krx_depth_feedable_universe_size(), 16)
+        # Every member of a universe that size fits with depth, with the reserve left
+        # over for held positions, the dashboard watch and the session anchors.
+        self.assertLessEqual(16 * 2 + 4 * 2, 40)
+
+    def test_derived_universe_size_follows_a_smaller_observed_capacity(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"KIS_REALTIME_MAX_SUBSCRIPTIONS": "40", "REALTIME_UNIVERSE_RESERVED_DEPTH_SLOTS": "4"},
+        ), patch("app.web._kis_realtime_effective_subscription_capacity", return_value=20):
+            self.assertEqual(web_module._krx_depth_feedable_universe_size(), 6)
+
+    def test_derived_universe_size_never_collapses_below_a_usable_floor(self) -> None:
+        # Cross-sectional ranking needs a cross-section; at that point the right
+        # response is to fix the budget, not to shrink the universe further.
+        with patch.dict("os.environ", {"KIS_REALTIME_MAX_SUBSCRIPTIONS": "4"}), patch(
+            "app.web._kis_realtime_effective_subscription_capacity", return_value=None
+        ):
+            self.assertEqual(web_module._krx_depth_feedable_universe_size(), 4)
+
+    def test_operator_override_still_wins_over_the_derived_size(self) -> None:
+        from app.trading.domestic_universe import universe_size
+
+        with patch.dict("os.environ", {"REALTIME_KRX_UNIVERSE_SIZE": "9"}):
+            self.assertEqual(universe_size(default=16), 9)
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("REALTIME_KRX_UNIVERSE_SIZE", None)
+            self.assertEqual(universe_size(default=16), 16)
 
     def test_depth_floor_is_filled_before_any_trade_only_breadth(self) -> None:
         # Depth is the scarcer resource: without an orderbook a symbol can produce

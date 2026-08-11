@@ -1730,13 +1730,57 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
   }
 
 
+#: KR sessions that match orders by CONTINUOUS auction, i.e. that produce a stream of
+#: trade prints. Everything else on the KR calendar (the opening and closing call
+#: auctions, the after-hours single-price auction, pre-open) collects orders and
+#: matches them at one instant, so the trade channel is silent by design.
+_KR_CONTINUOUS_SESSIONS: frozenset[str] = frozenset({"KRX_REGULAR", "NXT_REGULAR"})
+
+
+def _kr_trading_is_continuous(now: datetime) -> bool:
+  """Is KR matching orders continuously right now?
+
+  Load-bearing for readiness: during the 15:20-15:30 closing auction the trade
+  channel goes silent for ten minutes with a perfectly healthy quote feed, and
+  reading that as a data outage is how the process demotes itself every afternoon
+  under a reason that is factually false.
+  """
+  try:
+    from app.data.market_capabilities import MarketGroup, default_service
+
+    active = default_service().active_capabilities(MarketGroup.KR, now)
+  except Exception:  # noqa: BLE001 - unknown session: keep the stricter requirement.
+    return True
+  return any(
+      str(getattr(item.session, "value", item.session)) in _KR_CONTINUOUS_SESSIONS
+      for item in active
+  )
+
+
 def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any]:
   minimum = _auto_reliability_int("AUTO_RELIABILITY_MIN_HEALTHY_SYMBOLS", 2)
   minimum_by_market = {
       "KRX": _auto_reliability_int("AUTO_RELIABILITY_KRX_MIN_HEALTHY_SYMBOLS", 1),
       "US": _auto_reliability_int("AUTO_RELIABILITY_US_MIN_HEALTHY_SYMBOLS", minimum),
   }
-  kr_age = _auto_reliability_int("AUTO_RELIABILITY_KRX_MAX_AGE_SECONDS", 20)
+  # How long the KRX quote stream may be silent before the PROCESS is called
+  # unhealthy. Measured from the stream's own cadence over 174,609 websocket
+  # orderbook rows on 2026-08-11 (09:00-15:20):
+  #
+  #     p50 0.0s   p90 0.2s   p99 1.8s   p99.9 16.1s   p99.99 42.0s   max 102.6s
+  #
+  # The previous 20s sat *inside* that distribution — at roughly its p99.9 — so
+  # ordinary quiet tripped it 153 times, covering 86.8 minutes, 22.8% of the
+  # session. Each trip demoted the whole process to learning mode and disabled buys
+  # under "MARKET_DATA_NOT_READY", which was false: the feed was healthy and simply
+  # had nothing to say about a handful of thin names for half a minute.
+  #
+  # 120s clears the observed maximum with margin and produced zero trips on the same
+  # day's data. It does not loosen order safety: per-order quote freshness is a
+  # separate and much tighter gate (RiskRules.max_quote_age_seconds, and the 2-20s
+  # quote TTL the execution policy derives). This threshold governs MODE, not
+  # whether a stale quote can be traded on.
+  kr_age = _auto_reliability_int("AUTO_RELIABILITY_KRX_MAX_AGE_SECONDS", 120)
   kr_trade_activity_age = _auto_reliability_int(
       "AUTO_RELIABILITY_KRX_TRADE_ACTIVITY_MAX_AGE_SECONDS",
       120,
@@ -1765,8 +1809,14 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
     }
   if not database.exists():
     return {"ok": False, "healthy": healthy, "minimum_per_market": minimum, "reason": "MARKET_DATA_STORE_MISSING"}
+  kr_continuous = _kr_trading_is_continuous(now)
   try:
-    with sqlite3.connect(database, timeout=5.0) as connection:
+    # ``closing`` and not a bare ``with sqlite3.connect(...)``: the connection's own
+    # context manager commits or rolls back the TRANSACTION and leaves the connection
+    # open. This function runs on every reliability cycle (~30s), so the bare form
+    # leaked a handle per cycle — several hundred over a session — against a 6GB
+    # market-data file. Found by a test whose temp directory could not be deleted.
+    with closing(sqlite3.connect(database, timeout=5.0)) as connection:
       for group in groups:
         age_seconds = us_age if group == "US" else kr_age
         book_cutoff = (now - timedelta(seconds=age_seconds)).isoformat()
@@ -1812,7 +1862,17 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
         # KRX stream proves the trade channel is alive; fresh per-symbol books then
         # prove those symbols are quote-ready. Per-order symbol freshness remains a
         # stricter gate in SharedLiveDecisionEngine.
-        healthy[group] = sorted(books if group == "KRX" and ticks else ticks & books)
+        #
+        # During a CALL AUCTION the trade channel is silent by design — the 15:20
+        # closing auction collects orders for ten minutes and prints once — so
+        # requiring a recent trade there turns a normal session boundary into
+        # "MARKET_DATA_NOT_READY". The quote feed keeps publishing throughout (11
+        # symbols were fresh within 20s while this was being diagnosed), and it is
+        # the quote feed that proves the connection is alive.
+        if group == "KRX":
+          healthy[group] = sorted(books if (ticks or not kr_continuous) else ticks & books)
+        else:
+          healthy[group] = sorted(ticks & books)
   except sqlite3.Error as exc:
     return {
         "ok": False,
@@ -1837,6 +1897,10 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
       "ready_markets": ready_markets,
       "partial": bool(ready_markets and missing),
       "missing_markets": missing,
+      # Reported so "not ready" can be read without guessing which of the two very
+      # different situations produced it: a silent feed, or a session that is not
+      # matching continuously and therefore has nothing to print.
+      "kr_continuous_session": kr_continuous,
       "max_age_seconds": {
           "KRX": kr_age,
           "KRX_TRADE_ACTIVITY": kr_trade_activity_age,
@@ -4844,7 +4908,7 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       **dict((latest_training or {}).get("counts") or {}),
   }
   try:
-    with sqlite3.connect("data/store/live_training_rows.sqlite3") as conn:
+    with closing(sqlite3.connect("data/store/live_training_rows.sqlite3")) as conn:
       training_counts["materialized_training_rows"] = int(
           conn.execute(
               """
@@ -6236,8 +6300,14 @@ def _buy_candidate_warmup_detail() -> dict:
     store = RealtimeMarketDataStore()
     now = datetime.now(timezone.utc)
     since = now - timedelta(seconds=120)
+    # "Active" is measured over a 120-second trade window, which goes empty during a
+    # call auction even though every symbol has hundreds of completed bars. Reporting
+    # that as "0/20 bars, ~20 minutes to go" sent the operator looking for a warm-up
+    # that had finished hours earlier: on 2026-08-11 at 15:28 the ten live universe
+    # names held 200-315 bars each while this panel read 0.
+    active = tuple(store.active_symbols(since, limit=32))
     best_symbol, best_bars = "", 0
-    for symbol in tuple(store.active_symbols(since, limit=32)):
+    for symbol in active:
       try:
         bars = store.recent_minute_bars(
             symbol, now - timedelta(minutes=max(120, required * 3)), limit=max(120, required)
@@ -6252,7 +6322,7 @@ def _buy_candidate_warmup_detail() -> dict:
     # KRW orderable 0원 with 073240 at 7,220원, while the only funded currency
     # (USD 67.57) belonged to a closed market.
     cheapest_symbol, cheapest_ask = "", 0.0
-    for symbol in tuple(store.active_symbols(since, limit=32)):
+    for symbol in active:
       try:
         book = store.latest_orderbook(symbol)
       except Exception:  # noqa: BLE001
@@ -6268,12 +6338,18 @@ def _buy_candidate_warmup_detail() -> dict:
     except Exception:  # noqa: BLE001 - cash lookup is diagnostic only.
       krw_orderable = 0.0
     unaffordable = bool(cheapest_ask > 0 and krw_orderable < cheapest_ask)
+    # No symbol traded in the last 120 seconds, so there is nothing to be warming up
+    # AND nothing to report a shortfall against. Saying so is the difference between
+    # "wait 20 minutes" and "the market is not printing right now".
+    no_recent_activity = not active
     return {
-        "warming_up": best_bars < required,
+        "warming_up": bool(active) and best_bars < required,
+        "no_recent_trade_activity": no_recent_activity,
+        "kr_continuous_session": _kr_trading_is_continuous(now),
         "best_symbol": best_symbol,
         "best_bars": best_bars,
         "required_bars": required,
-        "eta_minutes": max(0, required - best_bars),
+        "eta_minutes": 0 if no_recent_activity else max(0, required - best_bars),
         "krw_orderable": krw_orderable,
         "cheapest_candidate": cheapest_symbol,
         "cheapest_ask": cheapest_ask,
@@ -6357,7 +6433,19 @@ def _entry_blockade_chain() -> list[dict]:
   # difference between waiting and debugging.
   warmup = _buy_candidate_warmup_detail() if count == 0 else {}
   detail = f"매수 후보 {count}개"
-  if count == 0 and warmup.get("warming_up"):
+  if count == 0 and warmup.get("no_recent_trade_activity"):
+    # Checked BEFORE warm-up: with no trades in the window there is no "best
+    # symbol" to be short of bars, and the warm-up branch would have rendered
+    # 0/20 with a 20-minute ETA for names that have been fully warm all day.
+    detail = (
+      "후보 0개 — 최근 120초간 체결 없음"
+      + (
+        " (동시호가 등 연속매매 아님 — 정상)"
+        if not warmup.get("kr_continuous_session")
+        else " (연속매매 중인데 체결이 없음 — 구독/피드 확인 필요)"
+      )
+    )
+  elif count == 0 and warmup.get("warming_up"):
     detail = (
       f"후보 0개 — 분봉 워밍업 중 "
       f"({warmup['best_symbol']} {warmup['best_bars']}/{warmup['required_bars']}개, "
@@ -11358,6 +11446,35 @@ def _cached_volume_surge_symbols() -> tuple[str, ...]:
   return symbols
 
 
+def _krx_depth_feedable_universe_size() -> int:
+  """How many KRX names the realtime budget can actually feed WITH DEPTH.
+
+  The universe and the subscription budget were sized independently — 30 names
+  against a 40-registration budget where depth costs two registrations each — so the
+  universe was over-committed by construction. Measured 2026-08-11: of 23 members, 7
+  were never subscribed and 12 received no orderbook all day.
+
+  Depth is the binding resource, not the symbol count: a name without a fresh
+  orderbook cannot produce a LiveFeatureFrame and can never pass ok_for_live_buy, so
+  it cannot become a candidate however long it is held. Hence budget // 2, less the
+  slots that outrank the universe (held positions, dashboard watch, session anchors)
+  and which it must never starve.
+  """
+  try:
+    configured = max(2, int(os.getenv("KIS_REALTIME_MAX_SUBSCRIPTIONS", "40")))
+  except (TypeError, ValueError):
+    configured = 40
+  observed = _kis_realtime_effective_subscription_capacity()
+  budget = min(configured, observed) if observed else configured
+  try:
+    reserved = max(0, int(os.getenv("REALTIME_UNIVERSE_RESERVED_DEPTH_SLOTS", "4")))
+  except (TypeError, ValueError):
+    reserved = 4
+  # Never below 4: a universe that small cannot support cross-sectional ranking, and
+  # at that point the right response is to fix the budget, not to shrink further.
+  return max(4, budget // 2 - reserved)
+
+
 def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
   """KIS domestic ranking APIs supply fresh KRX buy-discovery candidates."""
   if os.getenv("REALTIME_USE_KRX_RANKING_API", "true").lower() in {"0", "false", "no", "off"}:
@@ -11392,7 +11509,8 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
     # a KRX round trip already costs ~28bps.
     raw_sources = os.getenv("REALTIME_KRX_RANKING_SOURCES", "volume_rank")
     sources = tuple(item.strip().lower() for item in raw_sources.split(",") if item.strip())
-    size = universe_size()
+    # Sized to what the subscription budget can feed with depth, not to a bare 30.
+    size = universe_size(default=_krx_depth_feedable_universe_size())
     # A turnover ranking is where leveraged and inverse ETPs concentrate, and this
     # account has neither the 기본예탁금 nor the 사전 의무교육 that makes them
     # orderable. The flags are the account-level ones on RiskRules, so completing
@@ -11643,7 +11761,17 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
   #   2. dashboard watch — the operator is looking at it right now.
   #   3. session anchors — placed ABOVE the rotating pool so they survive rotation,
   #      but below the two above so they can never starve them.
-  #   4. affordable/pending candidates, which get the remaining scarce quote+trade
+  #   4. the SESSION UNIVERSE — the set strategies are actually evaluated on, held for
+  #      the whole session by app.trading.domestic_universe for exactly the same
+  #      reason the anchors are pinned: a name has to survive long enough to
+  #      accumulate the bars it will be judged on. Leaving it in the rotating pool
+  #      undid that at the layer below. Measured 2026-08-11: 7 of the 23 universe
+  #      members were not subscribed at all, and 12 had received no orderbook all
+  #      day, while 363 non-universe symbols had. A universe member with no depth
+  #      cannot produce a LiveFeatureFrame (MISSING_SOURCE_RECORDS) and therefore
+  #      cannot become a candidate — it occupies a universe slot and can never pay
+  #      for it.
+  #   5. affordable/pending candidates, which get the remaining scarce quote+trade
   #      pairs before static blue chips the account may not be able to buy. Within
   #      this group, symbols already warming up are preferred (see below).
   #
@@ -11666,6 +11794,8 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
               *held_domestic,
               *dashboard_watch,
               *anchors,
+              # Pinned, not rotated: see priority note above.
+              *kr_ranked,
               *pool_ordered,
           ]
       )
@@ -11680,6 +11810,14 @@ def _kis_realtime_collector_symbols() -> tuple[str, ...]:
       *dashboard_watch,
       *pending_warmup,
       *kr_extra,
+      # The session universe needs depth BY DEFINITION: it is the set strategies are
+      # evaluated on, and a trade-only symbol cannot produce a LiveFeatureFrame at
+      # all. Relying on the depth_floor top-up below to reach it was order-dependent
+      # and did not: with a 23-member universe, 12 got depth and 11 stayed trade-only
+      # — subscribed, streaming prints, and still structurally unable to become a
+      # candidate. The universe is sized to this budget by
+      # ``_krx_depth_feedable_universe_size`` so the two cannot disagree again.
+      *kr_ranked,
   }
   # Depth is the SCARCER resource, not the luxury. A trade-only symbol produces
   # minute bars (macro breadth) but cannot produce a LiveFeatureFrame at all --

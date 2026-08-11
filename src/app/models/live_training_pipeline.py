@@ -1270,7 +1270,7 @@ class _FramePriceLookup:
         if not record_ids:
             return
         try:
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 self._load_tick_prices(conn, record_ids)
                 missing = record_ids - set(self._prices)
                 if missing:

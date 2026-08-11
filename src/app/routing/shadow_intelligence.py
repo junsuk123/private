@@ -746,6 +746,13 @@ def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
         ),
         "liquidity_shock_reversal": volatility * unit(abs(order_imbalance)),
         "rvgi_box_breakout": rvgi_box,
+        # Low IN the box is the whole relation, so it is 1 - box_position and not
+        # box_position: rvgi_box_breakout above reads the SAME feature the other way
+        # up for the opposite thesis. Gated on box_available for the closed-world
+        # reason stated above — an absent box must score 0.0, not "at the floor".
+        "range_support_reversion": (
+            box_available * unit(1.0 - box_position) * spread_quality
+        ),
     }
     # Closed world, stated explicitly: every remaining catalogue id is present
     # with a 0.0 whose reason is declared, so a strategy is never silently

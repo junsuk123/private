@@ -350,6 +350,67 @@ indicator_families:
 # 30, and 69.1 over the overnight gap against a 51.2bps round trip. Magnitude is
 # measured; DIRECTION is not (unconditional overnight mean +15.6bps, below cost),
 # so this is shadow-only until forward outcomes say otherwise.
+# --- SHORT theses: disabled at the ALGORITHM layer too ----------------------- #
+# Operator instruction 2026-08-11: this account cannot trade derivatives or leveraged
+# products, and short selling (공매도/대주) sits behind the same separate
+# authorisation. The system is LONG-ONLY.
+#
+# config/short_strategy_deployment.yaml already stops the promotion controller and
+# disables each arm, and RiskRules.short_selling_allowed is false. This is the third
+# layer, and it is not redundant: the deployment ladder governs the tradable ARM while
+# these flags govern the ALGORITHM, and leaving the algorithm authorised meant
+# `strategy_live_authorized()` still answered True for all three.
+market_intraday_momentum_short:
+  enabled: false
+  shadow_enabled: false
+  paper_enabled: false
+  live_authorized: false
+opening_range_breakdown:
+  enabled: false
+  shadow_enabled: false
+  paper_enabled: false
+  live_authorized: false
+residual_relative_weakness:
+  enabled: false
+  shadow_enabled: false
+  paper_enabled: false
+  live_authorized: false
+
+# Range-floor reversion. ONE condition: price within 10bps of its own 20-bar
+# Donchian floor. Long-only, bar-based, no tick term.
+#
+# Read the evidence before tuning anything here. From a screen of nine candidate LONG
+# conditions over the full stored KRX minute tape, scored against the unconditional
+# first-touch baseline on these same barriers:
+#
+#   all stored symbols        n=207  -2.3bps vs -28.2 baseline   t=3.01
+#   tradable instruments only n=119 -10.7bps vs -27.7 baseline   t=1.56
+#   tradable, data-rich half  n=108  -8.0bps vs -15.7 baseline   t=0.65
+#
+# The significance was carried substantially by leveraged and inverse ETPs, which this
+# account cannot order. On tradable names it is not distinguishable from buying at
+# random, and it is still NEGATIVE in absolute terms. It is live by operator decision,
+# not because it was validated.
+#
+# Two apparent omissions are measured, not oversights:
+#   * no upturn confirmation — requiring close>open moved it to -35.8bps (n 207->38)
+#   * no RSI gate — oversold alone was t=1.48; the floor proximity alone was t=3.01
+#
+# Changing max_low_distance_bps or horizon_seconds voids the measurement above.
+range_support_reversion:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: true
+  max_low_distance_bps: 10.0
+  horizon_seconds: 3600.0
+  min_attainable_bps: 160.0
+  target_capture_fraction: 0.5
+  stop_volatility_multiple: 2.0
+  trailing_bps: 30.0
+  max_spread_bps: 30.0
+  min_liquidity_score: 0.35
+
 overnight_gap_carry:
   enabled: true
   shadow_enabled: true

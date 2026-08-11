@@ -45,6 +45,8 @@ _REVERSION = {
     "liquidity_shock_reversal",
     "adaptive_anchored_vwap_reversion",
     "ofi_microprice_exhaustion_reversal",
+    # Pure location thesis: low in its own range, no trend term.
+    "range_support_reversion",
 }
 _RELATION_NAMES = (
     "same_methodology_family",

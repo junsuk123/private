@@ -540,6 +540,29 @@ class OvernightGapCarryExpert(StrategyExpert):
         )
 
 
+class RangeSupportReversionExpert(StrategyExpert):
+    strategy_id = "range_support_reversion"
+    thesis = "price pressed against its 20-bar range floor reverts before it breaks"
+    default_config = _geometry_config("range_support_reversion")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # ``box_position`` is the RAW position inside the 20-bar box (0 = at the floor,
+        # 1 = at the ceiling), not a percentile. So the low-in-range condition reads
+        # ``<= 1 - entry_quantile``, the same inversion ``vwap_deviation`` uses. The
+        # breakout expert reads the SAME key with ``>=`` for the opposite thesis, which
+        # is exactly the sign collision to avoid here.
+        return (
+            c.q("box_position") <= 1 - self.config.entry_quantile
+            # A floor touch on an illiquid name cannot be exited at the modelled
+            # price. Both keys already exist: a new thesis must not widen the input
+            # schema, or the checkpoint contract breaks for reasons unrelated to it.
+            and c.q("liquidity") >= self.config.confirmation_quantile
+            # Deliberately NOT requiring ``recovery`` or ``reversion``. Measured: any
+            # upturn confirmation moved the outcome from -2.3bps to -35.8bps and cut
+            # the sample from 207 to 38. The effect is in the unconfirmed touch.
+        )
+
+
 ALL_EXPERT_TYPES = (
     IntradayMomentumExpert,
     BreakoutVolumeExpert,
@@ -559,6 +582,7 @@ ALL_EXPERT_TYPES = (
     ResidualRelativeWeaknessExpert,
     BarConfirmedVwapRecoveryExpert,
     OvernightGapCarryExpert,
+    RangeSupportReversionExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS

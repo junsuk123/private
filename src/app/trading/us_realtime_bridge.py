@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -576,7 +577,7 @@ def _touch_latest_rows(symbols: tuple[str, ...]) -> dict[str, int]:
     touched: dict[str, int] = {}
     now = datetime.now(timezone.utc).isoformat()
 
-    with sqlite3.connect(STORE_PATH) as conn:
+    with closing(sqlite3.connect(STORE_PATH)) as conn:
         tables = {str(row[0]) for row in conn.execute("select name from sqlite_master where type='table'").fetchall()}
 
         for table in ("realtime_ticks", "realtime_orderbook"):

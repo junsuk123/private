@@ -261,8 +261,24 @@ def resolve_universe(
     )
 
 
-def universe_size() -> int:
+def universe_size(default: int | None = None) -> int:
+    """How many KRX names to hold for a session.
+
+    ``default`` lets the caller supply a value derived from what the realtime
+    subscription budget can actually feed with DEPTH. That matters because a KRX
+    name without a fresh orderbook cannot produce a LiveFeatureFrame at all — six of
+    the model's inputs are depth-derived, and ``live_feature_frame`` raises
+    MISSING_SOURCE_RECORDS without one — so a universe larger than the depth budget
+    is over-committed by construction. Its surplus members hold slots in the
+    evaluated set while being structurally unable to produce a candidate.
+
+    Measured 2026-08-11 with the bare 30: 7 of 23 members were not subscribed at all
+    and 12 had received no orderbook all day, while 363 non-universe symbols had.
+
+    ``REALTIME_KRX_UNIVERSE_SIZE`` still wins when set, so an operator can override.
+    """
+    fallback = DEFAULT_UNIVERSE_SIZE if default is None else max(1, int(default))
     try:
-        return max(1, int(float(os.getenv("REALTIME_KRX_UNIVERSE_SIZE", str(DEFAULT_UNIVERSE_SIZE)))))
+        return max(1, int(float(os.getenv("REALTIME_KRX_UNIVERSE_SIZE", str(fallback)))))
     except ValueError:
-        return DEFAULT_UNIVERSE_SIZE
+        return fallback

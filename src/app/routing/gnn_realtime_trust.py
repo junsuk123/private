@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -394,10 +395,8 @@ class GnnRealtimeTrustEvaluator:
         last_error: sqlite3.Error | None = None
         for attempt in range(3):
             try:
-                with sqlite3.connect(
-                    database_uri,
-                    uri=True,
-                    timeout=30.0,
+                with closing(
+                    sqlite3.connect(database_uri, uri=True, timeout=30.0)
                 ) as connection:
                     connection.execute("pragma query_only = on")
                     connection.execute("pragma busy_timeout = 30000")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import re
@@ -537,7 +538,7 @@ def _event_feed_status(path: Path, symbol: str) -> dict[str, Any]:
     if not path.exists():
         return result
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             row = connection.execute(
                 "select count(*), max(observed_at) from news_sentiment where ticker = ?",
                 (symbol,),
@@ -1082,6 +1083,7 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "opening_range_breakdown": ["Opening Range High", "Opening Range Low", "Sell Flow", "Borrow"],
         "residual_relative_weakness": ["Sector Rank", "Residual Return", "Borrow"],
         "overnight_gap_carry": ["Close Clock", "VWAP Premium", "Day Volatility"],
+        "range_support_reversion": ["20-bar Range Low", "Range Mid", "ATR", "Volume"],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
 
@@ -1390,6 +1392,14 @@ def _decision_ontology(
             ("overnight_carry_window", ">=", .8),
             ("vwap_deviation", ">=", .8),
             ("first_half_hour_volatility", ">=", .65),
+        ],
+        # ``<=`` and not ``>=``: box_position is the raw position in the 20-bar box
+        # (0 = at the floor), and rvgi_box_breakout reads the same key the other way
+        # up. Displaying it with the wrong comparator would show the operator the
+        # opposite of the condition the algorithm actually applies.
+        "range_support_reversion": [
+            ("box_position", "<=", .2),
+            ("liquidity", ">=", .65),
         ],
     }
     ontology_strategy = str(

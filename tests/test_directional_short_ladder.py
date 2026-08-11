@@ -836,9 +836,28 @@ def test_yaml_overlay_tunes_one_threshold_without_zeroing_the_others() -> None:
     )
 
 
-def test_shipped_config_operator_override_authorizes_every_short_arm(tmp_path) -> None:
+def test_shipped_config_disables_every_short_arm(tmp_path) -> None:
+    """The shipped posture is LONG-ONLY, by operator instruction of 2026-08-11.
+
+    This account cannot trade derivatives or leveraged products — the 기본예탁금 and
+    사전 의무교육 a 파생상품 account requires are not in place — and short selling
+    (공매도/대주) sits behind the same kind of separate authorisation.
+
+    This test replaces one that asserted the OPPOSITE (an operator override putting
+    every short arm at LIVE_FULL). Both encode an operator decision rather than a
+    property of the code, which is exactly why it is pinned: the previous override
+    would promote arms straight past the ladder, so a silent revert must fail loudly.
+
+    Three independent layers must all say no, because a single flag is one edit away
+    from being wrong:
+      * ``enabled: false`` stops the promotion controller entirely;
+      * each strategy is individually disabled;
+      * ``operator_live_full_override`` is back to false, so re-enabling still has to
+        climb the ladder instead of skipping it.
+    """
     config = ShortStrategyPromotionConfig.load("config/short_strategy_deployment.yaml")
-    assert config.operator_live_full_override is True
+    assert config.enabled is False
+    assert config.operator_live_full_override is False
     controller = ShortStrategyPromotionController(
         config=config,
         state_store=DeploymentStateStore(tmp_path / "dep.sqlite3"),
@@ -847,10 +866,10 @@ def test_shipped_config_operator_override_authorizes_every_short_arm(tmp_path) -
         borrow_store=BorrowSnapshotStore(tmp_path / "borrow.sqlite3"),
     )
     for strategy_id in SHORT_STRATEGY_IDS:
-        assert config.strategy_enabled(strategy_id), strategy_id
+        assert not config.strategy_enabled(strategy_id), strategy_id
         key = DirectionalStrategyKey.for_short(strategy_id, "US")
-        assert controller.authorized_state(key) is StrategyDeploymentState.LIVE_FULL
-        assert controller.may_submit_orders(key)[0] is True
+        assert controller.authorized_state(key) is not StrategyDeploymentState.LIVE_FULL
+        assert controller.may_submit_orders(key)[0] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -1097,7 +1116,15 @@ def test_short_strategies_are_appended_never_inserted() -> None:
     # while still proving nothing was inserted before or among the shorts.
     later_appends = ("bar_confirmed_vwap_recovery", "overnight_gap_carry")
     assert STRATEGY_IDS[short_end : short_end + len(later_appends)] == later_appends
-    assert len(STRATEGY_IDS) == short_end + len(later_appends)
+    # Everything past the pinned prefix must be an APPEND: no duplicates, and no
+    # member of the pinned region reappearing later. The previous form asserted an
+    # exact total length, which contradicted the comment above — it made every new
+    # thesis fail a test whose stated purpose is to allow exactly that, while adding
+    # nothing about ordering that the prefix assertions do not already prove.
+    pinned = (*expected_long_prefix, *SHORT_STRATEGY_IDS, *later_appends)
+    tail = STRATEGY_IDS[short_end + len(later_appends) :]
+    assert not set(tail) & set(pinned), "an appended id must not repeat a pinned one"
+    assert len(set(STRATEGY_IDS)) == len(STRATEGY_IDS), "catalogue ids must be unique"
 
 
 def test_every_short_strategy_is_flagged_as_short() -> None:

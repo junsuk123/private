@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app.strategy.catalog import STRATEGY_IDS
+from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
 from app.strategy.exit_geometry import all_geometries, exit_bps, exit_geometry, max_holding_seconds
 from app.technical.signals import TechnicalFeatureSet
 from app.technical.strategy_algorithms import (
@@ -129,12 +129,39 @@ def test_every_catalogued_strategy_is_at_least_shadow_authorized():
     ``test_not_live_authorized_until_it_has_evidence`` directly. The invariant
     worth holding is that every strategy is at least evaluated and journaled, so
     a shadow-only one keeps accumulating the evidence its promotion needs.
+
+    SHORT theses are exempt as of 2026-08-11, and the exemption is precisely where the
+    invariant's own justification runs out: shadow evidence is worth collecting because
+    it is what promotion consumes, and this account cannot be granted short authority
+    at all (no 파생상품 기본예탁금 / 사전 의무교육, and RiskRules.short_selling_allowed
+    is false). Journaling forward outcomes for an arm that cannot be promoted spends
+    subscription and label budget on evidence nothing can act on — and that budget is
+    the system's binding constraint. If short authority is ever granted, re-enabling
+    these three in config/strategy_algorithms.yaml is what puts them back under the
+    invariant.
     """
     assert [
         strategy_id
         for strategy_id in STRATEGY_IDS
-        if not strategy_shadow_authorized(strategy_id)
+        if not is_short_strategy(strategy_id)
+        and not strategy_shadow_authorized(strategy_id)
     ] == []
+
+
+def test_short_theses_are_fully_disabled_while_the_account_cannot_trade_them():
+    """Long-only posture, asserted at the ALGORITHM layer.
+
+    Three layers must agree, because each governs a different object and any one of
+    them alone leaves a path open: this file's flags govern the ALGORITHM,
+    config/short_strategy_deployment.yaml governs the tradable ARM, and
+    RiskRules.short_selling_allowed governs the ORDER. Before this test the first
+    layer still answered True for all three shorts while the other two said no.
+    """
+    for strategy_id in STRATEGY_IDS:
+        if not is_short_strategy(strategy_id):
+            continue
+        assert not strategy_live_authorized(strategy_id), strategy_id
+        assert not strategy_shadow_authorized(strategy_id), strategy_id
 
 
 def test_shadow_only_strategies_declare_it_rather_than_defaulting_to_it():

@@ -403,3 +403,138 @@ def test_model_degraded_only_lifts_a_block_this_controller_placed() -> None:
     with patch.object(web_module, "_realtime_trading_engine", engine):
         web_module._auto_reliability_enter_model_degraded("MODEL_NOT_READY")
     assert len(calls) == 1 and calls[0].startswith("AUTO_RELIABILITY_MODEL_DEGRADED:")
+
+
+# --- KRX feed readiness vs. a market that is simply not printing --------------- #
+#
+# The defect these guard, measured on 2026-08-11 (09:00-15:20 KST):
+#
+#   * The KRX quote window was 20s while the stream's own inter-arrival p99.9 is
+#     16.1s and its maximum in a healthy session is 102.6s. Ordinary quiet tripped
+#     it 153 times covering 86.8 minutes — 22.8% of the session — and each trip
+#     demoted the whole process to learning mode and disabled buys under
+#     "MARKET_DATA_NOT_READY". Six such demotions were recorded that day, at 09:24,
+#     10:00, 10:29, 10:51, 12:45 and 15:24 KST.
+#   * The 15:20-15:30 closing auction stops trade prints by design, which emptied
+#     the tick set and collapsed the healthy list even though 11 symbols had
+#     orderbook updates inside 20 seconds.
+#
+# Neither is a data outage, and per-order quote freshness is gated separately and far
+# more tightly, so calling either one unhealthy blocked trading for no safety gain.
+
+
+def _market_data_db(path: Path, *, book_age_s: float, tick_age_s: float | None) -> Path:
+    """A store with one KRX symbol whose book and tick ages are controlled."""
+    import sqlite3
+    from contextlib import closing
+
+    now = datetime.now(timezone.utc)
+    database = path / "market.sqlite3"
+    # ``closing`` for the same reason the production call sites now use it: the
+    # connection's context manager ends the transaction, not the connection, and the
+    # open handle is what stops the temp directory from being removed on Windows.
+    with closing(sqlite3.connect(database)) as conn:
+        conn.execute(
+            "create table realtime_orderbook (symbol text, received_at text, source text)"
+        )
+        conn.execute(
+            "create table realtime_ticks (symbol text, received_at text, source text)"
+        )
+        conn.execute(
+            "insert into realtime_orderbook values (?,?,?)",
+            ("005930", (now - timedelta(seconds=book_age_s)).isoformat(), "kis_realtime_websocket"),
+        )
+        if tick_age_s is not None:
+            conn.execute(
+                "insert into realtime_ticks values (?,?,?)",
+                ("005930", (now - timedelta(seconds=tick_age_s)).isoformat(), "kis_realtime_websocket"),
+            )
+        # ``closing`` does NOT commit -- that is the other half of the gotcha. The
+        # connection's context manager commits without closing; ``closing`` closes
+        # without committing. A writer needs both.
+        conn.commit()
+    return database
+
+
+def _health(database: Path, *, continuous: bool, kr_age_s: int = 120) -> dict:
+    """Health verdict with the window pinned, so this tests logic not deployment.
+
+    ``AUTO_RELIABILITY_KRX_MAX_AGE_SECONDS`` is set in ``config/secrets/kis_api_keys.env``,
+    which product code copies into ``os.environ`` as soon as a KIS client is built —
+    so leaving it ambient would make these assertions depend on which other test ran
+    first, and on the operator's deployed value.
+    """
+    env = {
+        "REALTIME_MARKET_DATA_DB": str(database),
+        "AUTO_RELIABILITY_KRX_MAX_AGE_SECONDS": str(kr_age_s),
+        "AUTO_RELIABILITY_KRX_TRADE_ACTIVITY_MAX_AGE_SECONDS": "120",
+        "AUTO_RELIABILITY_KRX_MIN_HEALTHY_SYMBOLS": "1",
+    }
+    with patch.dict("os.environ", env), patch.object(
+        web_module, "_kr_trading_is_continuous", return_value=continuous
+    ):
+        return web_module._auto_market_health(datetime.now(timezone.utc), ("KRX",))
+
+
+def test_ordinary_quote_quiet_no_longer_reads_as_a_data_outage() -> None:
+    """A 45s-old book is inside the stream's normal cadence, not an outage."""
+    with tempfile.TemporaryDirectory() as tmp:
+        database = _market_data_db(Path(tmp), book_age_s=45.0, tick_age_s=45.0)
+        assert _health(database, continuous=True)["ok"] is True
+
+
+def test_a_genuinely_silent_feed_is_still_unhealthy() -> None:
+    """The window was widened, not removed: 5 minutes of silence must still fail."""
+    with tempfile.TemporaryDirectory() as tmp:
+        database = _market_data_db(Path(tmp), book_age_s=300.0, tick_age_s=300.0)
+        assert _health(database, continuous=True)["ok"] is False
+
+
+def test_call_auction_silence_on_the_trade_channel_is_not_an_outage() -> None:
+    """15:20-15:30 collects orders and prints once; the quote feed proves liveness."""
+    with tempfile.TemporaryDirectory() as tmp:
+        database = _market_data_db(Path(tmp), book_age_s=5.0, tick_age_s=None)
+        auction = _health(database, continuous=False)
+        assert auction["ok"] is True
+        assert auction["kr_continuous_session"] is False
+        # ...and during continuous trading the same silence IS a fault worth reporting.
+        assert _health(database, continuous=True)["ok"] is False
+
+
+def test_auction_waiver_still_requires_a_live_quote_feed() -> None:
+    """The waiver drops the trade requirement, not the connection requirement."""
+    with tempfile.TemporaryDirectory() as tmp:
+        database = _market_data_db(Path(tmp), book_age_s=600.0, tick_age_s=None)
+        assert _health(database, continuous=False)["ok"] is False
+
+
+def test_continuous_session_predicate_knows_the_auction_windows() -> None:
+    def at(iso: str) -> datetime:
+        return datetime.fromisoformat(iso)
+
+    # 09:30, 15:25, 08:50, 16:30 KST respectively.
+    assert web_module._kr_trading_is_continuous(at("2026-08-11T00:30:00+00:00")) is True
+    assert web_module._kr_trading_is_continuous(at("2026-08-11T06:25:00+00:00")) is False
+    assert web_module._kr_trading_is_continuous(at("2026-08-10T23:50:00+00:00")) is False
+    assert web_module._kr_trading_is_continuous(at("2026-08-11T07:30:00+00:00")) is False
+
+
+def test_no_recent_trades_is_not_reported_as_minute_bar_warmup() -> None:
+    """"0/20 bars, ~20 min to go" for names that have been warm since the open.
+
+    The warm-up panel measures "active" over a 120s trade window, so during a call
+    auction it saw nothing and rendered a shortfall against a symbol it never found.
+    """
+    store = SimpleNamespace(
+        active_symbols=lambda *args, **kwargs: (),
+        recent_minute_bars=lambda *args, **kwargs: (),
+        latest_orderbook=lambda *args, **kwargs: None,
+    )
+    with patch.object(web_module, "RealtimeMarketDataStore", lambda *a, **k: store), patch.object(
+        web_module, "_realtime_engine_account_snapshot", return_value=None
+    ):
+        detail = web_module._buy_candidate_warmup_detail()
+
+    assert detail["no_recent_trade_activity"] is True
+    assert detail["warming_up"] is False
+    assert detail["eta_minutes"] == 0

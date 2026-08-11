@@ -66,6 +66,39 @@ STRATEGY_IDS: tuple[str, ...] = (
     # authorize a live order, so promotion is left where it belongs — forward,
     # out-of-sample outcomes through app.trading.short_strategy_promotion's ladder.
     "overnight_gap_carry",
+    # --- Range-floor reversion ----------------------------------------------- #
+    # Added 2026-08-11 by operator instruction. Read the evidence before trusting it.
+    #
+    # The thesis is one condition: price pressed against its own 20-bar range floor.
+    # It came out of a screen of nine candidate LONG conditions over the full stored
+    # KRX minute tape, scored against the UNCONDITIONAL first-touch baseline on the
+    # executor's own barriers. Across ALL stored symbols it was the strongest result
+    # by a clear margin (-2.3bps vs a -28.2bps baseline, n=207, t=3.01) and the only
+    # one to survive a Bonferroni correction over the nine tests.
+    #
+    # It does NOT survive the constraint that matters. Restricted to instruments this
+    # account can actually order — leveraged and inverse ETPs excluded — it falls to
+    # t=1.56, and on the sub-period where the data actually lives, t=0.65. The
+    # significance was substantially carried by 2X inverse ETFs; the two most liquid
+    # tradable names in the sample (005930, 000660) were the two WORST. A later
+    # three-way comparison across horizons and barrier geometries put every condition
+    # tested, including this one, within |t| <= 1.02 of buying at random.
+    #
+    # So this is registered on an operator decision, not on demonstrated edge, and the
+    # honest expectation is that its forward outcomes will read as noise. What makes
+    # that acceptable rather than reckless: the conservative bandit scores it on a
+    # pessimistic lower bound with no realized history, so it can only be reached
+    # through cold-start exploration at minimum size, and ProfitabilityGate, the risk
+    # manager and the session gates all still bind. Its posterior will decide it.
+    #
+    # Two measured details that look like omissions and are not:
+    #   * There is no confirmation filter. Requiring the bar to turn up first (close >
+    #     open, or close > previous close) moved the result from -2.3 to -35.8bps and
+    #     cut the sample from 207 to 38. The effect lives in the unconfirmed touch.
+    #   * RSI is not in the entry. Oversold alone measured t=1.48; the range-floor
+    #     proximity alone measured t=3.01; combining them did not beat the floor
+    #     condition on its own.
+    "range_support_reversion",
 )
 
 # Compatibility alias for callers that explicitly ask for the complete catalog.

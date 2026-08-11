@@ -145,6 +145,14 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
         "squeeze_risk": 0.1,
         "borrow_available": 0.95,
     }
+    # Same reasoning one step finer: ``box_position`` is the raw position inside the
+    # 20-bar box, and the two theses that read it want OPPOSITE ends. The fixture holds
+    # it at 0.9 for rvgi_box_breakout ("at the ceiling"), so the range-floor thesis —
+    # whose favourable fact is "at the floor" — needs its own value on that one key.
+    # Inverting it globally would simply move the failure to the breakout expert.
+    per_strategy_quantiles = {
+        "range_support_reversion": {**quantiles, "box_position": 0.05},
+    }
 
     def _context(values: dict[str, float]) -> ExpertContext:
         return ExpertContext(
@@ -160,9 +168,12 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
     plans = tuple(
         expert_type().propose(
             _context(
-                short_quantiles
-                if expert_type.direction is PositionDirection.SHORT
-                else quantiles
+                per_strategy_quantiles.get(
+                    expert_type.strategy_id,
+                    short_quantiles
+                    if expert_type.direction is PositionDirection.SHORT
+                    else quantiles,
+                )
             )
         )
         for expert_type in ALL_EXPERT_TYPES
