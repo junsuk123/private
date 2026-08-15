@@ -42,12 +42,21 @@ class ModelArtifactRegistry:
     def __init__(self, root: str | Path = "data/models/live_short_horizon") -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        # In-memory cache of the parsed latest artifact, keyed by file mtime. The live
-        # predictor calls load_latest_live_eligible() once per candidate AND per holding
-        # every ~1s sweep; latest.json only changes on retrain (~300s), so re-reading and
-        # JSON-parsing the weights every call was pure per-cycle waste. Invalidated
-        # automatically when the file's mtime changes (training writes via os.replace).
-        self._cache_key: int | None = None
+        # In-memory cache of the parsed latest artifact, keyed by an identity triple
+        # for latest.json. The live predictor calls load_latest_live_eligible() once
+        # per candidate AND per holding every ~1s sweep; latest.json only changes on
+        # retrain (~300s), so re-reading and JSON-parsing the weights every call was
+        # pure per-cycle waste.
+        #
+        # The key is (mtime_ns, size, inode), not mtime_ns alone. A file timestamp is
+        # only as fine as the filesystem and the kernel's cached clock make it - on a
+        # 250Hz kernel that is 4ms even in the nanosecond field - so two writes inside
+        # one tick produce an IDENTICAL mtime_ns and the cache would keep serving the
+        # superseded model. Inode covers the production path exactly, because training
+        # publishes with os.replace and that always swaps in a new inode; size covers
+        # an in-place rewrite that changes length. Nothing here weakens the guarantee,
+        # it only closes the window where mtime alone could not see a change.
+        self._cache_key: tuple[int, int, int] | None = None
         self._cache_artifact: ModelArtifact | None = None
 
     @property
@@ -256,11 +265,16 @@ class ModelArtifactRegistry:
 
     def _load_latest_cached(self) -> ModelArtifact:
         try:
-            mtime = self.latest_path.stat().st_mtime_ns
+            status = self.latest_path.stat()
+            key: tuple[int, int, int] | None = (
+                status.st_mtime_ns,
+                status.st_size,
+                status.st_ino,
+            )
         except OSError:
-            mtime = None
+            key = None
         cached = self._cache_artifact
-        if mtime is not None and self._cache_key == mtime and cached is not None:
+        if key is not None and self._cache_key == key and cached is not None:
             return cached
         payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
         artifact = _artifact_from_payload(payload, self.latest_path)
@@ -268,7 +282,7 @@ class ModelArtifactRegistry:
         # key also sees the matching artifact (write is under the GIL; worst case is a
         # harmless redundant reload).
         self._cache_artifact = artifact
-        self._cache_key = mtime
+        self._cache_key = key
         return artifact
 
 

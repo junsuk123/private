@@ -12,7 +12,11 @@ from app.data.classifier import classify_text_event, source_now
 from app.data.public_collectors import RssNewsCollector
 from app.graph import OntologyReasoner
 from app.schemas.domain import EventType
-from app.graph.runtime import get_ontology_runtime, reset_ontology_runtime_cache
+from app.graph.runtime import (
+    OntologyRuntime,
+    get_ontology_runtime,
+    reset_ontology_runtime_cache,
+)
 from app.graph.builders import build_market_graph
 from app.indicators import build_sample_indicators
 from app.data.sample_collectors import collect_sample_market
@@ -186,8 +190,63 @@ class ResearchAndReasoningTest(unittest.TestCase):
         self.assertEqual(runtime.requested_backend, "NPU")
         self.assertEqual(runtime.active_backend, "CPU")
         self.assertFalse(runtime.uses_npu)
+        self.assertFalse(runtime.uses_accelerator)
         self.assertIsNotNone(runtime.fallback_reason)
         reset_ontology_runtime_cache()
+
+    def test_ontology_runtime_accepts_a_planned_gpu_placement(self) -> None:
+        """A GPU request must be honoured, not rejected as an unknown backend.
+
+        ``ONTOLOGY_ACCELERATOR`` is written from the per-workload device plan, and
+        ``ontology_candidate_scorer``'s ladder is (NPU, GPU, CPU) — so on a machine
+        with an Intel iGPU and no NPU the plan asks for GPU. Recognising only NPU
+        made that request fall through to "Unsupported ontology backend: GPU" and
+        silently drop the scorer to CPU rules while the plan still reported it as
+        accelerated.
+        """
+        reset_ontology_runtime_cache()
+        with patch.dict(os.environ, {"ONTOLOGY_ACCELERATOR": "GPU"}), patch(
+            "app.graph.runtime._openvino_runtime",
+            return_value=_openvino_stub("GPU", "GPU", ("CPU", "GPU")),
+        ):
+            runtime = get_ontology_runtime()
+
+        self.assertEqual(runtime.active_backend, "GPU")
+        self.assertFalse(runtime.uses_npu)
+        self.assertTrue(runtime.uses_accelerator)
+        self.assertIsNone(runtime.fallback_reason)
+        self.assertIn("uses_accelerator", runtime.as_dict())
+        reset_ontology_runtime_cache()
+
+    def test_ontology_runtime_reports_cpu_when_the_requested_device_is_absent(self) -> None:
+        reset_ontology_runtime_cache()
+        # OpenVINO is installed but this box has no NPU: the request cannot be
+        # honoured and must be reported as a fallback rather than as acceleration.
+        with patch.dict(os.environ, {"ONTOLOGY_ACCELERATOR": "NPU"}), patch(
+            "app.graph.runtime._openvino_runtime",
+            return_value=_openvino_stub("NPU", "CPU", ("CPU", "GPU"), "no NPU here"),
+        ):
+            runtime = get_ontology_runtime()
+
+        self.assertEqual(runtime.active_backend, "CPU")
+        self.assertFalse(runtime.uses_accelerator)
+        self.assertEqual(runtime.fallback_reason, "no NPU here")
+        reset_ontology_runtime_cache()
+
+
+def _openvino_stub(
+    requested: str,
+    active: str,
+    devices: tuple[str, ...],
+    fallback_reason: str | None = None,
+) -> OntologyRuntime:
+    return OntologyRuntime(
+        requested_backend=requested,
+        active_backend=active,
+        provider="openvino",
+        available_devices=devices,
+        fallback_reason=fallback_reason,
+    )
 
 
 if __name__ == "__main__":

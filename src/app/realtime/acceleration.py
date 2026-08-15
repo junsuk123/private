@@ -85,8 +85,16 @@ class RealtimeAccelerationPolicy:
         ]
         placements = self.placements()
         inventory = self._inventory
-        if not runtime.uses_npu:
+        # Advise on the NPU only when reasoning actually landed on CPU. A machine
+        # running the scorer on an Intel iGPU is accelerated; telling it to
+        # "install OpenVINO NPU runtime" reads as a defect report on a healthy box.
+        if not runtime.uses_accelerator:
             notes.append("Install/configure OpenVINO NPU runtime to move compatible inference graphs to NPU.")
+        elif not runtime.uses_npu:
+            notes.append(
+                f"Ontology reasoning is accelerated on {runtime.active_backend} via OpenVINO; "
+                "an NPU would be preferred where one exists."
+            )
         accelerated = [p for p in placements if p.device != CPU]
         notes.append(
             f"Device plan: {len(accelerated)}/{len(placements)} workloads accelerated; "

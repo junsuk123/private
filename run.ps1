@@ -1,3 +1,7 @@
+#!/usr/bin/env pwsh
+# The shebang makes `./run.ps1` work from a Linux shell. PowerShell treats it as
+# an ordinary comment, so Windows is unaffected, and a comment is allowed before
+# param().
 param(
   [switch]$Headless,
   # Stop a running server even when it is holding a position. A restart discards
@@ -15,6 +19,114 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# --- Platform -----------------------------------------------------------------
+# This launcher runs on two machines with the same script: the Windows notebook it
+# was written on and a Linux workstation. Everything platform-specific below goes
+# through the three helpers in this section, so the operational logic - when it is
+# safe to restart, how a server is asked to stop, what the finally block guarantees
+# - is written once and is identical on both.
+#
+# Windows PowerShell 5.1 does not define $IsWindows; PowerShell 7 defines all
+# three. An undefined variable therefore means 5.1, which only ever runs on
+# Windows.
+$script:OnWindows = if ($null -eq $IsWindows) { $true } else { [bool]$IsWindows }
+
+function Get-ProcessTable {
+  <#
+    pid / ppid / name / full command line for every visible process, on either OS.
+
+    Every process-matching decision in this script (is that listener ours? is that
+    an orphaned launcher? is the managed browser still open?) is made on the
+    command line, so both branches must return it in full. `ps -ww` is required for
+    that: without it ps truncates args at the terminal width and the "run.py" this
+    script matches on disappears from a long venv path.
+  #>
+  if ($script:OnWindows) {
+    return Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {
+      [pscustomobject]@{
+        ProcessId = [int]$_.ProcessId
+        ParentId  = if ($_.ParentProcessId) { [int]$_.ParentProcessId } else { 0 }
+        Name      = [string]$_.Name
+        Command   = [string]$_.CommandLine
+      }
+    }
+  }
+  $rows = @()
+  foreach ($line in (& ps -eww -o pid=,ppid=,comm=,args= 2>$null)) {
+    $parts = $line.Trim() -split '\s+', 4
+    if ($parts.Count -lt 4) { continue }
+    $rows += [pscustomobject]@{
+      ProcessId = [int]$parts[0]
+      ParentId  = [int]$parts[1]
+      Name      = [string]$parts[2]
+      Command   = [string]$parts[3]
+    }
+  }
+  return $rows
+}
+
+function Get-ListeningEntries {
+  <#
+    Port + owning pid for every TCP socket in LISTEN state bound to loopback or to
+    every interface. Ports outside the app's range are filtered by the callers.
+  #>
+  if ($script:OnWindows) {
+    return Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+      Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") } |
+      ForEach-Object {
+        [pscustomobject]@{ Port = [int]$_.LocalPort; ProcessId = [int]$_.OwningProcess }
+      }
+  }
+  $entries = @()
+  # -H drops the header, -p attaches the owning process. ss only reveals the pid
+  # for sockets this user owns, which is exactly the set this script may act on.
+  foreach ($line in (& ss -ltnpH 2>$null)) {
+    if ($line -notmatch '(?:^|\s)(\S+):(\d+)\s') { continue }
+    $address = $Matches[1]
+    $port = [int]$Matches[2]
+    # "*" is how ss renders the any-address; [::] is its IPv6 form, and a v6 any
+    # socket is reachable on 127.0.0.1 too, so it counts as a local listener.
+    if ($address -notin @("127.0.0.1", "0.0.0.0", "*", "[::]", "[::1]")) { continue }
+    $processId = 0
+    if ($line -match 'pid=(\d+)') { $processId = [int]$Matches[1] }
+    $entries += [pscustomobject]@{ Port = $port; ProcessId = $processId }
+  }
+  return $entries
+}
+
+function Test-ProcessAlive {
+  param([int]$ProcessId)
+  if (-not $ProcessId) { return $false }
+  return [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+}
+
+function Join-ProjectPath {
+  <#
+    Build a path under the project root from separate segments.
+
+    Join-Path with an embedded "a\b" is a Windows-only spelling: on Linux the
+    backslash is an ordinary filename character, so "data\runtime\openvino_cache"
+    became one directory with backslashes in its name instead of three nested ones.
+    Passing the segments separately lets each OS insert its own separator.
+    (PowerShell 7's multi-argument Join-Path would do this too, but Windows
+    PowerShell 5.1 has no such parameter and this script still has to run there.)
+  #>
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Segments)
+  $path = $PSScriptRoot
+  foreach ($segment in $Segments) { $path = Join-Path $path $segment }
+  return $path
+}
+
+# A separate venv per OS on purpose: this project directory is synchronised
+# between the Windows notebook and the Linux workstation, and a venv is portable
+# across neither the OS nor the interpreter it was built from. Sharing one .venv
+# would mean each machine silently breaking the other's interpreter.
+$script:VenvPython = if ($script:OnWindows) {
+  Join-ProjectPath ".venv" "Scripts" "python.exe"
+} else {
+  Join-ProjectPath ".venv-linux" "bin" "python"
+}
+
 function Set-DefaultEnv($Name, $Value) {
   if (-not [Environment]::GetEnvironmentVariable($Name, "Process")) {
     [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
@@ -26,22 +138,31 @@ function Set-RunEnv($Name, $Value) {
 }
 
 function Get-LocalAppServerListeners {
+  $processes = @{}
+  foreach ($row in Get-ProcessTable) { $processes[$row.ProcessId] = $row }
+
   $listeners = @()
-  $connections = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") -and $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 }
-  foreach ($connection in $connections) {
-    $ownerProcessId = $connection.OwningProcess
-    if (-not $ownerProcessId) { continue }
-    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerProcessId" -ErrorAction SilentlyContinue
-    if (-not $process -or -not $process.CommandLine) { continue }
-    $command = $process.CommandLine.ToLowerInvariant()
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($entry in Get-ListeningEntries) {
+    if ($entry.Port -lt 8000 -or $entry.Port -gt 8050) { continue }
+    if (-not $entry.ProcessId) { continue }
+    $process = $processes[$entry.ProcessId]
+    if (-not $process -or -not $process.Command) { continue }
+    $command = $process.Command.ToLowerInvariant()
+    # "python " also matches a POSIX "/…/bin/python ./run.py"; "python.exe" is the
+    # Windows form. Both interpreters are named in the command line, never inferred.
     $isPython = $command.Contains("python.exe") -or $command.Contains("python ")
     $isLocalApp = $command.Contains("run.py")
     if ($isPython -and $isLocalApp) {
+      # A dual-stack server answers on both a v4 and a v6 LISTEN row; without this
+      # the same pid would be stopped twice and the second attempt would look like
+      # a failure.
+      $key = "$($entry.Port)/$($entry.ProcessId)"
+      if (-not $seen.Add($key)) { continue }
       $listeners += [pscustomobject]@{
-        Port      = [int]$connection.LocalPort
-        ProcessId = [int]$ownerProcessId
-        ParentId  = if ($process.ParentProcessId) { [int]$process.ParentProcessId } else { 0 }
+        Port      = [int]$entry.Port
+        ProcessId = [int]$entry.ProcessId
+        ParentId  = [int]$process.ParentId
       }
     }
   }
@@ -49,8 +170,8 @@ function Get-LocalAppServerListeners {
 }
 
 function Test-PortRangeFree {
-  $stillListening = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-    Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") -and $_.LocalPort -ge 8000 -and $_.LocalPort -le 8050 }
+  $stillListening = Get-ListeningEntries |
+    Where-Object { $_.Port -ge 8000 -and $_.Port -le 8050 }
   return (-not $stillListening)
 }
 
@@ -62,9 +183,9 @@ function Stop-LocalAppServerProcessTree {
   # run.py spawns a child that owns the socket; killing only one leaves an orphan
   # holding the port, which then looks like "the new server failed to bind".
   if ($Listener.ParentId) {
-    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($Listener.ParentId)" -ErrorAction SilentlyContinue
-    if ($parent -and $parent.CommandLine) {
-      $parentCommand = $parent.CommandLine.ToLowerInvariant()
+    $parent = Get-ProcessTable | Where-Object { $_.ProcessId -eq [int]$Listener.ParentId } | Select-Object -First 1
+    if ($parent -and $parent.Command) {
+      $parentCommand = $parent.Command.ToLowerInvariant()
       $parentIsPython = $parentCommand.Contains("python.exe") -or $parentCommand.Contains("python ")
       if ($parentIsPython -and $parentCommand.Contains("run.py")) {
         [void]$processIdsToStop.Add([int]$parent.ProcessId)
@@ -92,13 +213,27 @@ function Stop-OrphanedSupervisors {
     orphan's finally is precisely the behaviour being prevented.
   #>
   $self = $PID
-  $orphans = Get-CimInstance Win32_Process -Filter "name = 'powershell.exe' or name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.ProcessId -ne $self -and
-      $_.CommandLine -and
-      $_.CommandLine -like '*-File*' -and
-      $_.CommandLine -like '*run.ps1*'
-    }
+  $table = Get-ProcessTable
+  $parentById = @{}
+  foreach ($row in $table) { $parentById[$row.ProcessId] = $row.ParentId }
+
+  # Never treat this launcher's own ancestry as an orphan. On Linux the ordinary
+  # invocation is `pwsh ./run.ps1` from an interactive pwsh or a wrapper, so a
+  # parent shell can carry "run.ps1" on its command line and would otherwise be
+  # killed by its own child - taking the terminal with it.
+  $ancestors = New-Object 'System.Collections.Generic.HashSet[int]'
+  [void]$ancestors.Add($self)
+  $walk = $parentById[$self]
+  while ($walk -and $walk -gt 1 -and $ancestors.Add([int]$walk)) {
+    $walk = $parentById[[int]$walk]
+  }
+
+  $orphans = $table | Where-Object {
+    -not $ancestors.Contains([int]$_.ProcessId) -and
+    $_.Command -and
+    ($_.Name -in @("powershell.exe", "pwsh.exe", "powershell", "pwsh")) -and
+    $_.Command -like '*run.ps1*'
+  }
   foreach ($orphan in $orphans) {
     Write-Host "  Stopping orphaned launcher (PID $($orphan.ProcessId))."
     Stop-Process -Id $orphan.ProcessId -Force -ErrorAction SilentlyContinue
@@ -204,12 +339,19 @@ function Stop-ExistingLocalAppServers {
 }
 
 function Stop-ProcessTree {
-  param([int]$RootProcessId)
+  param(
+    [int]$RootProcessId,
+    # Snapshot taken once by the caller. Re-reading the table at every recursion
+    # level races against the kills already issued, which on Linux showed up as
+    # children being missed because their parent had died first and reparented them.
+    [System.Collections.IEnumerable]$ProcessTable
+  )
 
   if (-not $RootProcessId) { return }
-  $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $RootProcessId" -ErrorAction SilentlyContinue
-  foreach ($child in $children) {
-    Stop-ProcessTree -RootProcessId ([int]$child.ProcessId)
+  if ($RootProcessId -eq $PID) { return }
+  if (-not $ProcessTable) { $ProcessTable = Get-ProcessTable }
+  foreach ($child in @($ProcessTable | Where-Object { $_.ParentId -eq $RootProcessId })) {
+    Stop-ProcessTree -RootProcessId ([int]$child.ProcessId) -ProcessTable $ProcessTable
   }
   Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
 }
@@ -217,34 +359,69 @@ function Stop-ProcessTree {
 function Stop-WorkspaceRunPyProcesses {
   $workspacePath = (Resolve-Path -LiteralPath $PSScriptRoot).Path.ToLowerInvariant()
   $currentProcessId = $PID
-  $processes = Get-CimInstance Win32_Process -Filter "name = 'python.exe'" -ErrorAction SilentlyContinue
-  foreach ($process in $processes) {
-    if (-not $process.CommandLine) { continue }
+  $table = Get-ProcessTable
+  foreach ($process in $table) {
+    if (-not $process.Command) { continue }
     if ([int]$process.ProcessId -eq [int]$currentProcessId) { continue }
-    $command = $process.CommandLine.ToLowerInvariant()
+    $name = ([string]$process.Name).ToLowerInvariant()
+    # Linux interpreters are python3, python3.12, or just the venv's "python";
+    # Windows is python.exe. Matching the prefix covers all of them, and the
+    # workspace check below is what actually narrows this to our own server.
+    if (-not $name.StartsWith("python")) { continue }
+    $command = $process.Command.ToLowerInvariant()
     $isWorkspaceRunPy = $command.Contains("run.py") -and (
-      $command.Contains($workspacePath.ToLowerInvariant()) -or
+      $command.Contains($workspacePath) -or
       $command.Contains(".\run.py") -or
       $command.Contains("./run.py")
     )
     if ($isWorkspaceRunPy) {
       Write-Host "Stopping existing workspace run.py process (PID $($process.ProcessId))"
-      Stop-ProcessTree -RootProcessId ([int]$process.ProcessId)
+      Stop-ProcessTree -RootProcessId ([int]$process.ProcessId) -ProcessTable $table
     }
   }
 }
 
 function Find-BrowserExecutable {
-  $candidates = @(
-    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
-    (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe")
-  )
-  foreach ($candidate in $candidates) {
-    if ($candidate -and (Test-Path $candidate)) { return $candidate }
+  <#
+    A Chromium-family browser, because managed mode needs --app and
+    --user-data-dir: the dashboard opens as its own window and closing that window
+    is the documented way to stop the server. Firefox supports neither, so a
+    Firefox-only machine correctly falls through to the plain-open path below
+    rather than getting a window whose close does nothing.
+  #>
+  if ($script:OnWindows) {
+    $candidates = @(
+      (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
+      (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
+      (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\msedge.exe"),
+      (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\msedge.exe")
+    )
+    foreach ($candidate in $candidates) {
+      if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    return $null
+  }
+  foreach ($name in @("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable")) {
+    $resolved = Get-Command $name -ErrorAction SilentlyContinue
+    if ($resolved) { return $resolved.Source }
   }
   return $null
+}
+
+function Open-DefaultBrowser {
+  param([string]$Url)
+  if ($script:OnWindows) {
+    Start-Process $Url | Out-Null
+    return
+  }
+  # Start-Process cannot hand a URL to the desktop on Linux; xdg-open is what does
+  # that. A headless box has neither, and that is not a failure worth stopping for.
+  $opener = Get-Command xdg-open -ErrorAction SilentlyContinue
+  if ($opener) {
+    Start-Process -FilePath $opener.Source -ArgumentList @($Url) | Out-Null
+  } else {
+    Write-Host "No xdg-open available; open $Url manually."
+  }
 }
 
 function Wait-LocalAppReady {
@@ -283,12 +460,16 @@ function Test-ManagedBrowserProfileRunning {
     $profileNeedle = $BrowserProfilePath.ToLowerInvariant()
   }
 
-  $browserProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.CommandLine -and
-      ($_.Name -ieq "chrome.exe" -or $_.Name -ieq "msedge.exe") -and
-      $_.CommandLine.ToLowerInvariant().Contains($profileNeedle)
-    }
+  # Matching on the profile directory rather than on the pid is deliberate and is
+  # what makes this work on Linux at all: `google-chrome` is a shell wrapper that
+  # execs the real binary, so the pid Start-Process returns exits immediately and
+  # would read as "the window was closed" the moment the browser finished starting.
+  $browserNames = @("chrome.exe", "msedge.exe", "chrome", "chromium", "chromium-browser", "msedge", "microsoft-edge")
+  $browserProcesses = Get-ProcessTable | Where-Object {
+    $_.Command -and
+    ($browserNames -contains ([string]$_.Name).ToLowerInvariant()) -and
+    $_.Command.ToLowerInvariant().Contains($profileNeedle)
+  }
   return [bool]$browserProcesses
 }
 
@@ -301,7 +482,34 @@ if (-not (Stop-ExistingLocalAppServers)) {
 # was invisible to the graceful path above.
 Stop-WorkspaceRunPyProcesses
 
-Set-DefaultEnv "PYTHONPATH" "src"
+# PYTHONPATH must CONTAIN src, which is not the same as being unset.
+#
+# This was Set-DefaultEnv, i.e. "src" only when nothing was set at all. On a
+# workstation that sources another toolchain's setup script (ROS 2 exports its
+# python3.10 site-packages this way) PYTHONPATH is already populated, so the
+# launcher quietly set nothing and left a different interpreter's packages on the
+# import path of this project's 3.12 venv. Prepending keeps a deliberately
+# configured PYTHONPATH working while guaranteeing our own source wins.
+$existingPythonPath = [Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
+$pathSeparator = [System.IO.Path]::PathSeparator
+$pythonPathParts = @("src")
+if ($existingPythonPath) {
+  foreach ($part in $existingPythonPath.Split($pathSeparator)) {
+    if ($part -and $part -ne "src" -and ($pythonPathParts -notcontains $part)) {
+      $pythonPathParts += $part
+    }
+  }
+}
+Set-RunEnv "PYTHONPATH" ($pythonPathParts -join $pathSeparator)
+# Foreign entries stay on the path (removing them could break a deliberate setup)
+# but they are named, because "module not found" or a version-mismatched import in
+# a venv that clearly has the package is otherwise a long thing to track down.
+$foreignPythonPaths = @($pythonPathParts | Where-Object { $_ -match 'python3\.\d+' -and $_ -notmatch '\.venv' })
+if ($foreignPythonPaths) {
+  Write-Host "NOTE: PYTHONPATH carries another interpreter's packages:" -ForegroundColor DarkYellow
+  foreach ($entry in $foreignPythonPaths) { Write-Host "  $entry" -ForegroundColor DarkGray }
+  Write-Host "  src is first, so this project's modules win. Unset PYTHONPATH if imports misbehave." -ForegroundColor DarkGray
+}
 Set-DefaultEnv "APP_ENV" "local"
 Set-DefaultEnv "APP_PORT" "8010"
 
@@ -491,20 +699,55 @@ Set-DefaultEnv "REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY" "false"
 Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_REDUCE_TRIGGER" "0.015"
 Set-DefaultEnv "REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER" "0.03"
 Set-DefaultEnv "REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT" "0.60"
-Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
+# --- Compute placement --------------------------------------------------------
+# This block used to pin ONTOLOGY_ACCELERATOR / OPENVINO_DEVICE / LLM_EVENT_DEVICE
+# to "NPU" unconditionally, which was right for exactly one machine: the Intel
+# notebook this project was written on. It is not a harmless over-request. The
+# names are read via os.environ.setdefault in
+# RealtimeAccelerationPolicy.apply_process_hints, so a value set here WINS over
+# the per-workload plan in app/realtime/device_plan.py — the launcher silently
+# overrode the code that probes what the machine actually has, and every consumer
+# then took a failed-compile fallback path instead of being told to use the
+# hardware that is present.
+#
+# So the rule is: only pin a device on a machine that is known to have it, and
+# otherwise say nothing and let probe_devices()/plan_devices() decide. Leaving a
+# variable unset is the instruction to plan; setting it is an override.
 Set-DefaultEnv "REALTIME_LATENCY_PROFILE" "low_latency"
-Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
 Set-DefaultEnv "OPENVINO_HINT_PERFORMANCE_MODE" "LATENCY"
 Set-DefaultEnv "OPENVINO_ENABLE_CPU_PINNING" "YES"
-Set-DefaultEnv "OPENVINO_CACHE_DIR" (Join-Path $PSScriptRoot "data\runtime\openvino_cache")
-Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "openvino"
-Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
+Set-DefaultEnv "OPENVINO_CACHE_DIR" (Join-ProjectPath "data" "runtime" "openvino_cache")
+if ($script:OnWindows) {
+  # The Core Ultra notebook: OpenVINO enumerates NPU (AI Boost) and an Intel iGPU,
+  # and the short-horizon path has been running on the NPU since it was written.
+  Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
+  Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
+  Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "openvino"
+  Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
+} else {
+  # The Linux workstation has no NPU. It has an NVIDIA GPU, which OpenVINO cannot
+  # target at all — OpenVINO's "GPU" plugin means the Intel iGPU — so the two
+  # accelerators are reached by two different runtimes and must be configured
+  # separately rather than through one "device" string:
+  #
+  #   * ONTOLOGY_ACCELERATOR / OPENVINO_DEVICE stay UNSET so device_plan places
+  #     each workload on whatever OpenVINO reports here (Intel iGPU if the driver
+  #     is loaded, otherwise CPU). Note that the decision-carrying workloads are
+  #     pinned to CPU in device_plan.py regardless, and that is not relaxed here.
+  #   * LLM_EVENT_* goes to the transformers backend with device "auto", which is
+  #     the path that reaches CUDA: llm_classifier passes device_map="auto" to
+  #     transformers, which places the model on the NVIDIA GPU when torch sees it
+  #     and on CPU when it does not. Asking for "openvino"/"NPU" here would instead
+  #     select a runtime that cannot use this machine's only real accelerator.
+  Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "transformers"
+  Set-DefaultEnv "LLM_EVENT_DEVICE" "auto"
+}
 
 # Shared local-LLM config (config/local_llm.env): the single place to set the
 # news/event sentiment model for both Windows and Raspberry Pi. Applied as
 # defaults (only if not already set), so it runs before the provider logic below
 # and lets one file pick the model for every machine.
-$localLlmConfig = Join-Path $PSScriptRoot "config\local_llm.env"
+$localLlmConfig = Join-ProjectPath "config" "local_llm.env"
 if (Test-Path $localLlmConfig) {
   foreach ($line in Get-Content -LiteralPath $localLlmConfig) {
     $trimmed = $line.Trim()
@@ -516,12 +759,12 @@ if (Test-Path $localLlmConfig) {
   }
 }
 
-$embeddedModelPath = Join-Path $PSScriptRoot "models\local-llm\event-classifier"
+$embeddedModelPath = Join-ProjectPath "models" "local-llm" "event-classifier"
 if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_PROVIDER", "Process")) {
   if (Test-Path $embeddedModelPath) {
     [Environment]::SetEnvironmentVariable("LLM_EVENT_PROVIDER", "embedded", "Process")
     [Environment]::SetEnvironmentVariable("LLM_EVENT_MODEL", $embeddedModelPath, "Process")
-    Set-DefaultEnv "LLM_EVENT_MODEL_CACHE_DIR" (Join-Path $PSScriptRoot "models\local-llm\cache")
+    Set-DefaultEnv "LLM_EVENT_MODEL_CACHE_DIR" (Join-ProjectPath "models" "local-llm" "cache")
     Set-DefaultEnv "LLM_EVENT_LOCAL_FILES_ONLY" "true"
     Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
   } else {
@@ -563,6 +806,7 @@ Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
 Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "300"
+Set-DefaultEnv "LIVE_TRAINING_STARTUP_DELAY_SECONDS" "90"
 # 투자자별 매매동향(개인/외국인/기관 순매수) 일일 갱신. KIS는 이 값을 영업일 단위로만
 # 제공하고, residual_relative_strength는 이 정보를 필수 조건으로 쓴다. 갱신이 멈추면
 # 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
@@ -634,12 +878,18 @@ Set-DefaultEnv "EXEC_SELL_EMERGENCY_FALLBACK_OFFSET_RATE" "0.003"
 Set-DefaultEnv "KIS_US_EXCHANGE_STRICT" "true"
 Set-DefaultEnv "KIS_ALLOW_DEFAULT_US_EXCHANGE_IN_LIVE" "false"
 
-$python = ".\.venv\Scripts\python.exe"
+$python = $script:VenvPython
 if (-not (Test-Path $python)) {
-  $python = "python"
+  # No venv for THIS OS. Falling back to a bare interpreter is deliberate — the
+  # project imports fine from any 3.11+ environment — but say which one is missing,
+  # because "python" resolving to a 3.10 system interpreter is the failure this
+  # message exists to shorten (app.schemas.domain uses enum.StrEnum, 3.11+).
+  Write-Host "No virtual environment at $python; falling back to the interpreter on PATH." -ForegroundColor Yellow
+  Write-Host "  Create one with:  ./setup.ps1" -ForegroundColor DarkGray
+  $python = if ($script:OnWindows) { "python" } else { "python3" }
 }
 
-$logsDir = Join-Path $PSScriptRoot "logs"
+$logsDir = Join-ProjectPath "logs"
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 $serverOutLog = Join-Path $logsDir "run-server.out.log"
 $serverErrLog = Join-Path $logsDir "run-server.err.log"
@@ -652,14 +902,21 @@ $browserProfile = $null
 $browserStartedAt = $null
 
 try {
-  $server = Start-Process `
-    -FilePath $python `
-    -ArgumentList @(".\run.py", "--skip-startup-checks", "--port", "$port", "--strict-port") `
-    -WorkingDirectory $PSScriptRoot `
-    -RedirectStandardOutput $serverOutLog `
-    -RedirectStandardError $serverErrLog `
-    -PassThru `
-    -WindowStyle Hidden
+  $serverArguments = @{
+    FilePath               = $python
+    # "run.py" without a leading .\ or ./ : -WorkingDirectory already puts the
+    # process in the project root, and the two prefixes are not interchangeable
+    # across the two shells.
+    ArgumentList           = @("run.py", "--skip-startup-checks", "--port", "$port", "--strict-port")
+    WorkingDirectory       = $PSScriptRoot
+    RedirectStandardOutput = $serverOutLog
+    RedirectStandardError  = $serverErrLog
+    PassThru               = $true
+  }
+  # -WindowStyle describes a Win32 window and throws PSNotSupportedException on
+  # Linux, where a redirected child has no window to style in the first place.
+  if ($script:OnWindows) { $serverArguments.WindowStyle = "Hidden" }
+  $server = Start-Process @serverArguments
 
   Write-Host "Starting local app server (PID $($server.Id))..."
   Wait-LocalAppReady -Url $url -ServerProcess $server
@@ -671,7 +928,7 @@ try {
     # The address a phone can actually open — "0.0.0.0" is not one. Printed with
     # the token attached because the first request from a browser cannot set a
     # header; the server turns that one query parameter into a cookie.
-    $lanAddress = (
+    $lanAddress = if ($script:OnWindows) {
       Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
           $_.IPAddress -notlike "127.*" -and
@@ -679,15 +936,33 @@ try {
           $_.PrefixOrigin -in @("Dhcp", "Manual")
         } |
         Select-Object -First 1 -ExpandProperty IPAddress
-    )
+    } else {
+      # Same three exclusions as the Windows branch: loopback, link-local, and
+      # (via `scope global`) anything that is not routable off this host.
+      $found = $null
+      foreach ($line in (& ip -4 -o addr show scope global 2>$null)) {
+        if ($line -match 'inet\s+(\d+\.\d+\.\d+\.\d+)') {
+          $candidate = $Matches[1]
+          if ($candidate -like "127.*" -or $candidate -like "169.254.*") { continue }
+          $found = $candidate
+          break
+        }
+      }
+      $found
+    }
     if ($lanAddress) {
       $token = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
       Write-Host ""
       Write-Host "Open this on the other device (same dashboard as here):" -ForegroundColor Cyan
       Write-Host "  http://${lanAddress}:${port}/account?token=$token" -ForegroundColor Cyan
       Write-Host ""
-      Write-Host "If it does not load, Windows Firewall is blocking the port. Allow it once:" -ForegroundColor DarkGray
-      Write-Host "  New-NetFirewallRule -DisplayName 'private app $port' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -Profile Private" -ForegroundColor DarkGray
+      if ($script:OnWindows) {
+        Write-Host "If it does not load, Windows Firewall is blocking the port. Allow it once:" -ForegroundColor DarkGray
+        Write-Host "  New-NetFirewallRule -DisplayName 'OBAITS app $port' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -Profile Private" -ForegroundColor DarkGray
+      } else {
+        Write-Host "If it does not load, the host firewall is blocking the port. Allow it once:" -ForegroundColor DarkGray
+        Write-Host "  sudo ufw allow $port/tcp" -ForegroundColor DarkGray
+      }
     } else {
       Write-Host "Could not determine a LAN address for this machine." -ForegroundColor Yellow
     }
@@ -697,7 +972,7 @@ try {
   if ($Headless) {
     Write-Host "Headless mode: server will keep running without a managed browser."
   } elseif ($browserExe) {
-    $browserProfile = Join-Path $PSScriptRoot "data\runtime\managed-browser-profile"
+    $browserProfile = Join-ProjectPath "data" "runtime" "managed-browser-profile"
     New-Item -ItemType Directory -Force -Path $browserProfile | Out-Null
     $browserStartedAt = Get-Date
     $browser = Start-Process `
@@ -712,7 +987,7 @@ try {
     Write-Host "Opened managed browser window (PID $($browser.Id))."
     Write-Host "Close that browser window to stop the server, or press Ctrl+C here to close both."
   } else {
-    Start-Process $launchUrl | Out-Null
+    Open-DefaultBrowser -Url $launchUrl
     Write-Host "No Chrome or Edge executable was found for managed mode."
     Write-Host "Press Ctrl+C here to stop the server."
   }
