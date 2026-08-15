@@ -1,4 +1,10 @@
-# systemd unit for the CPU-only (NPU-free) investment system on Raspberry Pi.
+# systemd unit for OBAITS (Ontology Based AI Trading System) running CPU-only on a
+# Raspberry Pi.
+#
+# The unit FILE NAME stays personal-investment.service on purpose. It is the
+# identity systemd already has for every Pi where this was enabled; renaming it
+# here would leave the old unit running on those boxes and the new one never
+# installed. The name is deployment state, not documentation.
 #
 # Install:
 #   1. Edit WorkingDirectory / User below to match your checkout and account.
@@ -8,7 +14,7 @@
 #   5. journalctl -u personal-investment.service -f
 #
 [Unit]
-Description=Personal Ontology-Based Investment System (Raspberry Pi, CPU-only)
+Description=OBAITS - Ontology Based AI Trading System (Raspberry Pi, CPU-only)
 After=network-online.target
 Wants=network-online.target
 

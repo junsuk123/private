@@ -1,6 +1,6 @@
 # Documentation
 
-현재 코드 기준의 운영 문서입니다. 최상위 개요는 [../README.md](../README.md)를 먼저 보세요.
+OBAITS(Ontology Based AI Trading System)의 현재 코드 기준 운영 문서입니다. 최상위 개요는 [../README.md](../README.md)를 먼저 보세요.
 
 문서는 8개로 유지합니다. 새 문서를 만들기 전에 기존 문서를 갱신할 수 있는지 먼저 확인하세요.
 
@@ -71,7 +71,7 @@ python scripts/gen_profitability_diagrams.py # profitability_* 4종
 2. 왜 거래가 안 나가는지 알고 싶다면 **`/account` 상단 ENTRY BLOCKADE 패널** (또는 `GET /api/realtime-trading/entry-blockade`)을 먼저 보세요. 처음 막힌 단계가 원인입니다 → 배경은 [decision_and_risk.md](decision_and_risk.md) §10 → 세부는 [live_trading.md](live_trading.md)의 "조용한 사이클 읽기"
 3. 추론 구조를 이해하려면 [ontology_and_gnn.md](ontology_and_gnn.md)
 4. **어떤 전략을 왜 골랐는지**(또는 왜 NO_TRADE 인지) 항별로 보려면
-   [strategy_selection_v2.md](strategy_selection_v2.md) §5. 짧은 답: Windows 런처는 V2를 초기
+   [strategy_selection_v2.md](strategy_selection_v2.md) §5. 짧은 답: `run.ps1` 런처는 V2를 초기
    `SHADOW`로 켜고 증거를 자동 수집합니다. 승격 기준 전에는 legacy가 권한을 유지하고, 기준을
    충족하면 V2가 `LIVE_PROBE`와 `LIVE` 권한을 자동으로 얻습니다.
 5. **숏 전략이 왜 거래하지 않는지** 알고 싶다면 `GET /api/short-strategies/status`를 먼저 보고,

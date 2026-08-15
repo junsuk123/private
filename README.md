@@ -1,6 +1,6 @@
-# Personal Investment Agent
+# Ontology Based AI Trading System (OBAITS)
 
-KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델, 결정론적 리스크 게이트를 묶은 개인용 자동 투자 분석/운영 시스템입니다. 대표 실행 경로는 Windows의 `run.ps1`이고, Raspberry Pi에서는 CPU-only 런타임과 LCD 키오스크 GUI를 별도로 제공합니다.
+KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델, 결정론적 리스크 게이트를 묶은 개인용 자동 투자 분석/운영 시스템입니다. 대표 실행 경로는 `run.ps1` 하나이며 **Windows와 Linux에서 같은 스크립트로 동작**합니다. Raspberry Pi에서는 CPU-only 런타임과 LCD 키오스크 GUI를 별도로 제공합니다.
 
 > **핵심 원칙:** 온톨로지는 허용 관계와 전략 집합을 정의하고, GNN은 그 관계의 데이터 기반 가중치와 전략 효용을 학습해 실제 전략 선택에 사용됩니다. 단, GNN의 모델 보정 신뢰도와 전략별 양수 순효율이 실시간 데이터로 검증되어야 진입 권한이 생깁니다. LLM/NPU는 주문 권한이 없고, 실제 주문은 제비용·원금보호·신선도·중복주문·KIS 런타임 게이트를 모두 통과한 `FinalOrder`만 제출합니다.
 
@@ -22,14 +22,14 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
 
 ## 현재 런타임 요약
 
-`run.ps1`은 로컬 Windows 운영용 표준 런처입니다. 기본 포트는 `8010`이고, 서버 준비 후 `http://127.0.0.1:8010/account`를 관리 브라우저 창으로 엽니다. 이 창을 닫으면 서버도 함께 종료됩니다.
+`run.ps1`은 로컬 운영용 표준 런처입니다. 기본 포트는 `8010`이고, 서버 준비 후 `http://127.0.0.1:8010/account`를 관리 브라우저 창으로 엽니다. 이 창을 닫으면 서버도 함께 종료됩니다. Windows(PowerShell 5.1/7)와 Linux(PowerShell 7)에서 동일하게 동작합니다 — 플랫폼 차이는 [실행 환경](#실행-환경)에 정리했습니다.
 
 시작 시 기본 수행:
 
 - KIS 실계좌 읽기, 잔고/현금/보유종목 스냅샷 갱신
 - KIS 실시간 체결가/호가 수집과 브로커 quote 갱신
 - 실시간 feature frame 생성과 live short-horizon 모델 주기 학습
-- 온톨로지 허용 전략 안에서 strategy-utility R-GCN 후보 평가 (롱 17 + 숏 3, 숏은 shadow 평가만)
+- 온톨로지 허용 전략 안에서 strategy-utility R-GCN 후보 평가 (롱 20 + 숏 3, 숏은 shadow 평가만)
 - 전략별 실시간 forward 검증과 `calibrated`/`entry_authorized` 권한 분리
 - 독립 실시간 자동거래 루프 시작
 - SELL/REDUCE 평가를 BUY보다 먼저 실행
@@ -42,9 +42,17 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
   1분봉 추세·VWAP·지속성·상대거래량을 쓰는 `bar_trend_continuation`을 추가했지만, 이 전략도
   SHADOW에서 양의 순수익을 입증하기 전에는 주문할 수 없습니다. “어떤 상태든 평가”와 “근거 없이
   항상 거래”는 같은 요구가 아닙니다.
+- **세 가지 레짐 전략을 추가했습니다.** `supertrend_dmi_continuation`은 강한 추세,
+  `keltner_volatility_breakout`은 압축 후 변동성 확장,
+  `choppiness_range_reversion`은 비방향성 횡보·과매도 구간을 담당합니다. 모두 TradingView 공식
+  계산 정의와 호환되는 완성 봉 지표를 쓰며 SHADOW로 시작합니다.
+- **롱 전략 권한도 자동 전환됩니다.** 설정의 `live_authorized=false`를 사람이 바꾸지 않습니다.
+  비용 차감 forward 표본 20개, 양수익 3개, 3거래일, 양의 보수적 하한을 모두 통과하면
+  `LIVE_PROBE(10%)`로 자동 승격되고 실제 체결 증거가 쌓이면 `LIVE_LIMITED(35%) → LIVE_FULL`로
+  올라갑니다. 연속 손실이나 하한 악화 시 자동 강등됩니다.
 - **LONG / SHORT / NO_TRADE를 같은 선택 공간에서 비교**하되, 숏 arm은 배포 상태가 live 칸이 아니면
   순위만 매겨지고 실행 후보가 되지 않습니다. 롱과 숏 posterior는 절대 합산하지 않습니다.
-- **항별로 분해된 선택기(V2)가 초기 SHADOW로 병행 실행**됩니다. Windows `run.ps1`은 이를
+- **항별로 분해된 선택기(V2)가 초기 SHADOW로 병행 실행**됩니다. `run.ps1`은 이를
   활성화하고 자동 승격을 켭니다. 같은 evidence로
   `MarketContext → eligibility mask → proposal → 효용 − 비용 − downside − uncertainty + 온톨로지
   + bandit → NO_TRADE 비교`를 계산해 forward 반사실 증거를 쌓습니다. 보수적 하단·비용 스트레스·
@@ -52,29 +60,63 @@ KIS 실시간 데이터, 온톨로지 기반 근거 추론, 단기 학습 모델
   `LIVE(100%)`로 **자동 전환**합니다. 기준 미달이나 악화 시 자동 강등되며 수동 변경은 필요하지
   않습니다 — [docs/strategy_selection_v2.md](docs/strategy_selection_v2.md).
 
-**Windows 기본값은 live-capable입니다.** `run.ps1`은 `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`, `AUTO_START_REALTIME_TRADING=true`를 프로세스 환경에 설정합니다. 안전성은 live flag를 끄는 방식이 아니라 계좌/시장 데이터 신뢰도와 최종 게이트에서 확보합니다. 끄는 방법은 [docs/live_trading.md](docs/live_trading.md)에 있습니다.
+**`run.ps1` 기본값은 live-capable입니다 — 플랫폼과 무관합니다.** `run.ps1`은 `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`, `AUTO_START_REALTIME_TRADING=true`를 프로세스 환경에 설정합니다. 안전성은 live flag를 끄는 방식이 아니라 계좌/시장 데이터 신뢰도와 최종 게이트에서 확보합니다. 끄는 방법은 [docs/live_trading.md](docs/live_trading.md)에 있습니다.
 
 ## 빠른 실행
 
+`setup.ps1`이 이 OS용 가상환경을 만들고 의존성을 설치한 뒤 실제로 import 되는지까지 확인합니다. 두 번 실행해도 안전합니다.
+
+Windows (PowerShell):
+
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
+.\setup.ps1 -All
 .\run.ps1
+```
+
+Linux (PowerShell 7):
+
+```bash
+./setup.ps1 -All -CudaWheels cu128   # NVIDIA GPU가 있으면 드라이버에 맞는 CUDA 휠로 고정
+./run.ps1
 ```
 
 수동 서버 실행:
 
-```powershell
-python .\run.py --host 127.0.0.1 --port 8010
+```bash
+.venv-linux/bin/python run.py --host 127.0.0.1 --port 8010   # Windows: .\.venv\Scripts\python.exe
 ```
 
 KIS 실계좌 연동 전에는 `config/secrets/kis_api_keys.env.example`을 `config/secrets/kis_api_keys.env`로 복사한 뒤 값을 채웁니다.
 
-```powershell
+```bash
 python scripts/check_kis_connection.py --account
 python scripts/live_readiness_check.py
 ```
+
+## 실행 환경
+
+Python **3.11 이상**이 필요합니다(`app/schemas/domain.py`가 `enum.StrEnum`을 씁니다). 가상환경은 OS별로 분리합니다 — 이 저장소 디렉터리는 기기 간 동기화되는데 venv는 OS도 인터프리터도 넘어가지 못하므로, 하나를 공유하면 서로의 인터프리터를 조용히 망가뜨립니다.
+
+| | Windows | Linux |
+| --- | --- | --- |
+| 셸 | PowerShell 5.1 또는 7 | PowerShell 7 (`pwsh`) |
+| 가상환경 | `.venv\Scripts\python.exe` | `.venv-linux/bin/python` |
+| 프로세스·포트 조회 | `Get-CimInstance`, `Get-NetTCPConnection` | `ps -eww`, `ss -ltnp` |
+| 관리 브라우저 | Chrome / Edge | google-chrome / chromium / edge |
+
+### 가속기 배치
+
+**가속 장치는 런처가 지정하지 않고 기기에서 탐지합니다.** `app/realtime/device_plan.py`가 워크로드별로 사다리를 내려가며 배치하고 항상 CPU에서 끝납니다. 이전 `run.ps1`은 `ONTOLOGY_ACCELERATOR`/`OPENVINO_DEVICE`/`LLM_EVENT_DEVICE`를 `NPU`로 무조건 고정했는데, 이 값들은 `os.environ.setdefault`로 읽히므로 **런처가 탐지 결과를 덮어써서** NPU가 없는 기기에서는 모든 소비자가 compile 실패 fallback 경로로 떨어졌습니다. 지금은 그 장치가 있다고 알려진 기기에서만 값을 고정합니다.
+
+| 기기 | 온톨로지 / R-GCN shadow | 이벤트 LLM |
+| --- | --- | --- |
+| Windows (Intel Core Ultra) | OpenVINO NPU | OpenVINO NPU |
+| Linux + NVIDIA GPU | 미고정 → OpenVINO가 보고하는 것(Intel iGPU 또는 CPU) | transformers `device_map="auto"` → CUDA |
+| Raspberry Pi | CPU | 비활성 |
+
+OpenVINO의 `GPU`는 **Intel GPU**를 뜻하며 NVIDIA GPU를 대상으로 삼을 수 없습니다. 그래서 두 가속기는 서로 다른 런타임으로 도달하고, 하나의 "device" 문자열이 아니라 따로 설정합니다. 판단을 만들어내는 워크로드는 어느 기기에서도 CPU에 고정되며(`device_plan.py`의 `accelerable=False`) 이 규칙은 완화되지 않습니다 — 어느 실리콘이 비어 있었는지에 따라 달라지는 판단은 몇 달 뒤에 설명할 수 없기 때문입니다.
+
+CUDA 휠은 드라이버에 맞춰야 합니다. PyPI 기본 torch 휠은 최신 CUDA 런타임으로 빌드되어 있어서, 드라이버가 낮으면 import는 성공하고 `torch.cuda.is_available()`만 조용히 `False`가 됩니다 — GPU가 아무 일도 안 하는데 겉보기에는 정상입니다. `setup.ps1 -CudaWheels cu128`이 휠 인덱스를 드라이버가 지원하는 CUDA 버전으로 고정하고, 검증 단계에서 실제 CUDA 가용 여부를 출력합니다.
 
 ## 웹 GUI
 
@@ -114,7 +156,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 ## 안전 모델
 
 - LLM 또는 LLM-like 컴포넌트는 주문을 실행하지 않습니다.
-- NPU/OpenVINO 출력은 숫자 근거 점수일 뿐 주문 승인 권한이 아닙니다.
+- 가속기(NPU/OpenVINO/CUDA) 출력은 숫자 근거 점수일 뿐 주문 승인 권한이 아닙니다. 판단을 만들어내는 워크로드는 어느 플랫폼에서도 CPU에 고정됩니다.
 - live short-horizon 모델은 기본 advisory-only입니다. `REALTIME_MODEL_AUXILIARY_ONLY=true`면 모델 단독 BUY는 거부됩니다.
 - strategy-utility R-GCN은 실제 전략 선택에 직접 참여합니다. 체크포인트 provenance, 온톨로지 허용 관계, 모델 보정 신뢰도, 전략별 실현 양수 순효율 검증 중 하나라도 실패하면 신규 진입 권한은 생기지 않습니다.
 - `GNN_REALTIME_MODEL_TRUST_PASSED`는 모델 보정 통과이고, `GNN_REALTIME_TRUST_PASSED`는 선택 전략의 실거래 진입 권한까지 통과했다는 뜻입니다.
@@ -158,7 +200,7 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | `src/app/features/`, `technical/` | 지표, live feature frame, 근거 기반 기술적 예측 레이어 |
 | `src/app/context/` | 통합 `MarketContext` 단일 생성 권한 — (종목, 사이클)당 스냅샷 1개 + `context_id` |
 | `src/app/graph/`, `ontology/` | KnowledgeGraph, FactTable, RDF/OWL/SHACL, 거시–미시 추론, closed-world 게이트, 전략 eligibility(hard mask + soft score) |
-| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, `StrategySelectorV2`, 전략 spec/registry/proposal/coverage, 전략 expert(롱 17 + 숏 3, `STRATEGY_IDS` 기준) |
+| `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, `StrategySelectorV2`, 전략 spec/registry/proposal/coverage, 전략 expert(롱 20 + 숏 3, `STRATEGY_IDS` 기준) |
 | `src/app/evaluation/`, `monitoring/`, `strategy_validation/` | 반사실 shadow 포지션·selector regret·증거원 분리, drift 모니터, 단일 audit runner·purged CV·비용 스트레스·lifecycle 원장 |
 | `src/app/cost/`, `risk/`, `trading/` | ProfitabilityGate, 사이징, 원금보호, RiskManager, 동적 청산, 실시간 엔진 |
 | `src/app/trading/directional.py`, `borrow.py`, `directional_shadow.py`, `short_strategy_promotion.py` | 방향 계약, 대주 point-in-time 저널, forward shadow 평가, 배포 사다리 authority |
@@ -170,17 +212,17 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | 문서 | 내용 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 런타임 구조, 모듈 지도, API, 운영 모드, 가속 경계, 알려진 한계 |
-| [docs/ontology_and_gnn.md](docs/ontology_and_gnn.md) | 온톨로지 계층, hard/soft eligibility 분리, 전략 효용 GNN, NPU/CPU 분할 |
+| [docs/ontology_and_gnn.md](docs/ontology_and_gnn.md) | 온톨로지 계층, hard/soft eligibility 분리, 전략 효용 GNN, 가속기/CPU 분할 |
 | [docs/decision_and_risk.md](docs/decision_and_risk.md) | 데이터→판단 매핑, 순수익 게이트, 동적 청산, 리스크와 실행, 컴포넌트별 단일 질문(§7.1), 레짐 변화 대응(§9), 진입 차단 진단(§10) |
 | [docs/strategy_selection_v2.md](docs/strategy_selection_v2.md) | 전략 선택 V2: 효용 수식, 자동 `SHADOW → LIVE_PROBE → LIVE` 권한 사다리, 현재 상태, audit와 기술 부채 |
-| [docs/live_trading.md](docs/live_trading.md) | 설치, 게이트, 운영, 비상 정지, arming, 런타임 프로파일 |
+| [docs/live_trading.md](docs/live_trading.md) | 설치, 게이트, 운영, 비상 정지, arming, 플랫폼별 런타임 프로파일 |
 | [docs/short_selling_deployment.md](docs/short_selling_deployment.md) | 숏 배포 사다리: 자동 승격/강등, 대주 fail-closed 규칙, forward shadow 누수 방어 |
 | [docs/raspberry_pi_deployment.md](docs/raspberry_pi_deployment.md) | Pi CPU-only 배포와 키오스크 |
 | [docs/validation.md](docs/validation.md) | 벤치마크, 리플레이 지표, 검증 프레임워크, 승격 판정 |
 
 ## 테스트
 
-```powershell
+```bash
 python -m pytest
 python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py tests/test_account_dashboard.py tests/test_kiosk_display_overview.py
 python -m pytest tests/test_directional_short_ladder.py   # 숏 사다리 안전 속성
@@ -190,9 +232,9 @@ python -m pytest tests/test_selector_v2_auto_promotion.py # 자동 승격·강�
 
 전략·계좌 audit 리포트(읽기 전용, 주문 없음):
 
-```powershell
+```bash
 python scripts/report_strategy_selection_v2.py            # 전략 audit 표 + coverage
 python scripts/diagnose_strategy_selection.py             # 선출 진단
 ```
 
-live 주문을 제출하는 테스트는 없습니다. 환경에 따라 OpenVINO/NPU, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 secrets 상태의 영향을 받습니다.
+live 주문을 제출하는 테스트는 없습니다. 환경에 따라 OpenVINO/NPU/CUDA, KIS 실계좌, 로컬 LLM 관련 테스트는 optional dependency나 가속기 유무, secrets 상태의 영향을 받습니다.

@@ -2,15 +2,21 @@
 
 설치, 게이트, 운영 절차, 비상 정지, 런타임 프로파일을 하나로 묶은 문서입니다.
 
-> **현재 posture:** `run.ps1`로 띄운 Windows 런타임은 **실주문을 제출할 수 있는 상태**입니다. `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`가 프로세스에 강제 설정됩니다. read-only 상태가 아닙니다.
+> **현재 posture:** `run.ps1`로 띄운 런타임은 Windows·Linux 어느 쪽이든 **실주문을 제출할 수 있는 상태**입니다. `TRADING_MODE=live_trading`, `LIVE_TRADING_ENABLED=true`, `KIS_LIVE_ENABLED=true`, `LIVE_ORDER_SUBMIT_ENABLED=true`, `REQUIRE_MANUAL_ARMING=false`가 프로세스에 강제 설정됩니다. read-only 상태가 아닙니다.
 
 ## 1. 설치
 
+`setup.ps1`이 현재 OS용 가상환경을 만들고(`Windows: .venv`, `Linux: .venv-linux`) 의존성을 설치한 뒤 import 가능 여부와 탐지된 가속 장치를 출력합니다. 재실행해도 안전합니다.
+
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+.\setup.ps1 -All                       # Windows
 ```
+
+```bash
+./setup.ps1 -All -CudaWheels cu128     # Linux + NVIDIA. 드라이버가 지원하는 CUDA 버전으로 고정
+```
+
+Python 3.11 이상이 필요합니다(`app/schemas/domain.py`가 `enum.StrEnum` 사용). Ubuntu 22.04의 기본 `python3`는 3.10이므로, PATH에 3.11+가 없으면 `setup.ps1`이 `uv`로 3.12를 받아옵니다.
 
 로컬 전용(ignored) 설정 파일 생성:
 
@@ -21,6 +27,8 @@ copy config\trading_costs.example.json config\trading_costs.json
 copy config\live_trading_safety.example.json config\live_trading_safety.json
 copy config\order_execution.example.json config\order_execution.json
 ```
+
+Linux에서는 `copy` 대신 `cp config/secrets/kis_api_keys.env.example config/secrets/kis_api_keys.env` 형태로 같은 다섯 파일을 만듭니다.
 
 채워야 하는 값: KIS app key/secret, 계좌번호와 상품코드, HTS ID와 고객유형, 초기 원금과 보호 하한, **직접 확인한 제비용 정책**(위탁매매 비용, 유관기관 비용, 세금, 환전·시장별 비용). 이 파일들은 커밋하지 않습니다.
 
@@ -47,15 +55,19 @@ python scripts/train_live_short_horizon_models.py --dataset data\training\live_s
 ## 3. 시작
 
 ```powershell
-.\run.ps1
+.\run.ps1     # Windows
+```
+
+```bash
+./run.ps1     # Linux (PowerShell 7)
 ```
 
 런처가 하는 일: 포트 `8010`의 기존 서버 종료 → live 프로세스 플래그 설정 → 자동 시작 서비스 설정 → `http://127.0.0.1:8010/account` 열기 → 관리 창이 닫히면 서버 종료.
 
 수동 실행:
 
-```powershell
-python .\run.py --host 127.0.0.1 --port 8010
+```bash
+.venv-linux/bin/python run.py --host 127.0.0.1 --port 8010   # Windows: .\.venv\Scripts\python.exe
 ```
 
 주요 화면:
@@ -306,11 +318,14 @@ python scripts/disarm_live_trading.py
 
 | 프로파일 | 파일 | 역할 |
 | --- | --- | --- |
-| Windows / Intel NPU (기본) | `run.ps1` env 기본값 | 전체 노드: OpenVINO NPU, 온톨로지, 학습, GUI |
+| Windows / Intel NPU | `run.ps1` env 기본값 | 전체 노드: OpenVINO NPU, 온톨로지, 학습, GUI |
+| Linux / NVIDIA GPU | `run.ps1` env 기본값 | 전체 노드: 가속기 자동 배치(OpenVINO는 Intel iGPU/CPU, 이벤트 LLM은 CUDA), 온톨로지, 학습, GUI |
 | 소액 계좌 | `config/runtime_profiles/small_account.env` | 보수적 net-edge 하한 + 사이징 |
 | Raspberry Pi (선택) | `config/runtime_profiles/raspberrypi.env` + `scripts/run_raspberrypi.sh` | 저전력 모니터 / 실행 가드 노드 |
 
-`run.ps1`은 Windows 전용(`Get-NetTCPConnection`, `Get-CimInstance`)이며 Intel NPU + OpenVINO를 가정합니다.
+`run.ps1`은 Windows와 Linux 양쪽에서 동작합니다. 프로세스·포트 조회는 Windows에서 `Get-CimInstance`/`Get-NetTCPConnection`, Linux에서 `ps -eww`/`ss -ltnp`를 쓰고, 나머지 운영 로직(재시작 안전성 판정, graceful shutdown, finally 보장)은 한 번만 작성되어 양쪽이 동일합니다.
+
+**가속 장치는 런처가 고정하지 않습니다.** Intel NPU가 있다고 알려진 Windows 노트북에서만 `ONTOLOGY_ACCELERATOR`/`OPENVINO_DEVICE`/`LLM_EVENT_DEVICE=NPU`를 설정하고, 그 외에는 값을 비워 `app/realtime/device_plan.py`의 탐지 결과가 이기게 둡니다. 이 값들은 `os.environ.setdefault`로 읽히므로 런처가 설정하면 탐지 결과를 덮어씁니다 — NPU 없는 기기에서 모든 소비자가 compile 실패 fallback으로 떨어지던 원인입니다. Linux + NVIDIA에서는 OpenVINO가 NVIDIA GPU를 대상으로 삼을 수 없으므로(OpenVINO의 `GPU`는 Intel GPU) 이벤트 LLM만 transformers `device_map="auto"` 경로로 CUDA에 올라갑니다.
 
 Pi 프로파일은 Intel NPU / OpenVINO / 로컬 LLM / 대규모 유니버스 스캔 / 고빈도 갱신을 끄고, `LIVE_ORDER_SUBMIT_ENABLED=false` + `REQUIRE_MANUAL_ARMING=true`를 유지합니다.
 
@@ -437,3 +452,27 @@ python scripts/check_market_session_readiness.py
 python scripts/check_market_session_readiness.py --at 2026-08-05T02:00:00+00:00
 python scripts/check_market_session_readiness.py --with-kis   # KIS_READINESS_ALLOW_NETWORK=1 필요
 ```
+
+## 계좌 정합성과 자동 전략 권한 (2026-08-12)
+
+계좌 잔고 API가 체결 직후 아직 갱신되지 않았을 때만 최근 broker 체결을 `pending_balance`로 화면에
+겹쳐 표시합니다. 이 합성 포지션은 안정 계좌 기준값에 저장하지 않습니다. 다음 정상 잔고 응답이 오면
+즉시 실제 현금·평가금·보유종목으로 교체됩니다. 최근 주문 원장은 BUY와 SELL을 시간순으로 상계하므로
+매수 후 매도 완료된 종목이 유령 롱 포지션으로 남지 않습니다. 주문 정합성 창의 기본값은 900초이며
+`ORDER_RECONCILIATION_MAX_AGE_SEC`로 더 짧게 조정할 수 있습니다.
+
+신규 롱 전략의 `shadow_only=true`, `live_authority=false`는 운영자가 수기로 바꾸는 값이 아닙니다.
+`LONG_STRATEGY_AUTO_PROMOTION_ENABLED=true`일 때 시스템이 durable after-cost outcome을 읽어 다음
+사다리를 자동 적용합니다.
+
+| 상태 | 필수 증거 | 주문 크기 상한 |
+|---|---|---:|
+| `SHADOW` | 기준 미달 또는 보수적 순엣지 ≤ 0 | 0% |
+| `LIVE_PROBE` | ≥20 표본, ≥3 양수익, ≥3 거래일, 보수적 순엣지 > 0 | 10% |
+| `LIVE_LIMITED` | 추가로 실제 체결 ≥30, ≥10 양수익, ≥10 거래일, live LCB > 0 | 35% |
+| `LIVE_FULL` | 실제 체결 ≥60, ≥20 양수익, ≥20 거래일, live LCB > 5bp | 100% |
+
+표본은 이미 수수료·세금·슬리피지·시장충격을 차감한 순수익입니다. 한 단계가 승격을 허용해도
+bandit, GNN trust, `ProfitabilityGate`, 리스크, 세션, 잔고, 주문 중복 검사가 독립적으로 다시
+승인해야 합니다. 최근 연속 손실이 3회가 되거나 보수적 하한이 0 이하로 내려가면 자동으로
+`SHADOW`로 복귀합니다.

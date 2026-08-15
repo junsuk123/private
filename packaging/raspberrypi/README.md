@@ -1,6 +1,6 @@
 # Raspberry Pi Package
 
-Raspberry Pi에서 전체 시스템을 CPU-only로 실행하기 위한 패키지입니다. OpenVINO/NPU 없이 동작하며, 기본값은 read-only라서 설치 직후에는 실주문이 제출되지 않습니다.
+Raspberry Pi에서 OBAITS(Ontology Based AI Trading System) 전체를 CPU-only로 실행하기 위한 패키지입니다. OpenVINO/NPU 없이 동작하며, 기본값은 read-only라서 설치 직후에는 실주문이 제출되지 않습니다.
 
 ## Install
 

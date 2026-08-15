@@ -11,7 +11,7 @@
 - 온톨로지는 도메인 관계와 허용 전략을 결정하고, strategy-utility GNN은 그 관계 가중치와 전략 효용을 학습하여 실제 전략 선택에 직접 참여합니다.
 - GNN 선택은 실시간 모델 보정과 전략별 양수 순효율 검증을 통과한 경우에만 신규 진입 권한을 얻습니다. LLM과 NPU 장치 자체에는 주문 권한이 없습니다.
 - 주문을 만들 수 있는 것은 `RiskManager`를 통과한 `FinalOrder`뿐이고, 실제 제출은 `LiveExecutionCoordinator`의 limit order 경로만 가능합니다.
-- OpenVINO/NPU는 숫자 evidence 가속일 뿐이며, 실패하면 동일 스키마로 CPU fallback합니다. NPU 출력은 주문 권한이 아닙니다.
+- 가속기(OpenVINO/NPU/CUDA)는 숫자 evidence 가속일 뿐이며, 실패하면 동일 스키마로 CPU fallback합니다. 가속기 출력은 주문 권한이 아닙니다. 판단을 만들어내는 워크로드는 `device_plan.py`에서 `accelerable=False`로 CPU에 고정됩니다.
 - **선택과 실행 승인은 다른 질문입니다.** "어떤 전략인가"는 선택 계층이, "이 주문을 안전하게
   낼 수 있는가"는 실행 계층이 답합니다. 두 층이 한 클래스에 섞여 있던 것이
   [strategy_selection_v2.md](strategy_selection_v2.md) 리팩터의 출발점이며, 새 선택 계층은
@@ -23,7 +23,8 @@
 
 | 진입점 | 역할 |
 | --- | --- |
-| `run.ps1` | Windows 표준 런처. 포트 `8010` 고정, live 프로세스 플래그 설정, 관리 브라우저 창 연결, 창 종료 시 서버 종료 |
+| `run.ps1` | 표준 런처(Windows·Linux 공용). 포트 `8010` 고정, live 프로세스 플래그 설정, 관리 브라우저 창 연결, 창 종료 시 서버 종료 |
+| `setup.ps1` | OS별 가상환경 생성·의존성 설치·import 검증(Windows `.venv`, Linux `.venv-linux`) |
 | `run.py` → `app.run:main` | `src`를 `sys.path`에 넣고 startup 점검 후 `uvicorn app.web:app` 기동 |
 | `packaging/raspberrypi/run.sh` | Pi CPU-only 런처 (read-only 기본값) |
 | `scripts/*.py` | readiness 점검, dry-run, 학습, 리플레이, 벤치마크, arming/disarming |
@@ -37,7 +38,7 @@ LIVE_ORDER_SUBMIT_ENABLED=true REQUIRE_MANUAL_ARMING=false
 REALTIME_BUY_ENABLED=true      LIVE_TERMINATION_SELL_ONLY_ON_START=false
 ```
 
-즉 **Windows 기본 실행은 실주문 제출이 가능한 상태**입니다. 안전성은 flag를 끄는 방식이 아니라 계좌/시세 신뢰도, 비용·리스크 게이트, KIS health check에서 확보합니다. 자세한 조작은 [live_trading.md](live_trading.md)를 참고하세요.
+즉 **`run.ps1` 기본 실행은 플랫폼과 무관하게 실주문 제출이 가능한 상태**입니다. 안전성은 flag를 끄는 방식이 아니라 계좌/시세 신뢰도, 비용·리스크 게이트, KIS health check에서 확보합니다. 자세한 조작은 [live_trading.md](live_trading.md)를 참고하세요.
 
 기타 startup 서비스(`Set-DefaultEnv`이므로 override 가능):
 

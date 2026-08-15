@@ -1,7 +1,7 @@
 # Trading Ontology (`src/app/ontology/`)
 
-Standards-based RDF/RDFS/OWL ontology and SHACL shapes for the Personal Multi-Agent
-Ontology-Based Automated Stock Investment System. This layer adds **semantic
+Standards-based RDF/RDFS/OWL ontology and SHACL shapes for OBAITS, the Ontology
+Based AI Trading System. This layer adds **semantic
 representation, logical inference, consistency checking, and explainability** on top of the
 existing trading pipeline. It does **not** replace numerical scoring or trading decisions.
 

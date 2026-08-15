@@ -2,7 +2,7 @@
 
 전략 선택 경로를 `MarketContext → Ontology Eligibility → Proposal → Utility → Cost →
 Bandit → Ranking → NO_TRADE` 로 재편한 리팩터의 문서입니다. **관측 상태(2026-08-11
-23:09:33 KST): `SHADOW`, 자동 승격 활성, 실효 live 권한 없음.** Windows `run.ps1`은 V2를
+23:09:33 KST): `SHADOW`, 자동 승격 활성, 실효 live 권한 없음.** `run.ps1`은 V2를
 활성화하되 설정상 `shadow_only=true`를 유지하고, 영속 증거 컨트롤러가 검증 결과에 따라
 `SHADOW → LIVE_PROBE → LIVE` 권한을 자동 전환합니다. 이 시각 영속 context는 66개이고 실제
 전략을 선택한 context는 0개라 아직 legacy 경로가 실주문 선택 권한을 유지합니다. 수치는 live
@@ -290,7 +290,7 @@ shadow 결과가 섞이지 않습니다.
 
 ### 5.1 안전 속성
 
-* Python 기본 posture는 무동작 — `STRATEGY_SELECTOR_V2_ENABLED=false`. Windows `run.ps1`은
+* Python 기본 posture는 무동작 — `STRATEGY_SELECTOR_V2_ENABLED=false`. `run.ps1`은
   `enabled=true`, `shadow_only=true`, `auto_promote=true`로 시작합니다.
 * `configured_shadow_only=true`는 운영자 강제 live 권한을 막는 초기 안전 설정입니다. 최상위
   `shadow_only`와 `live_authority`는 승격 컨트롤러까지 반영한 **실효 상태**입니다.
@@ -455,7 +455,7 @@ audit 자체는 아무것도 바꾸지 않습니다. `LIFECYCLE_RECOMMENDATIONS`
 권고는 상태를 낮출 수만 있습니다. 올리는 것은 `app.strategy_validation.registry` 를 통해야
 하고, 그 전이 그래프는 화이트리스트이며 승격에는 validation record 첨부가 필수입니다.
 
-coverage와 반사실 표본은 Windows 런처에서 자동 누적됩니다. coverage의 현재 수치는
+coverage와 반사실 표본은 `run.ps1` 런처에서 자동 누적됩니다. coverage의 현재 수치는
 `GET /api/realtime-trading/status`의 `strategy_session.selector_v2.coverage`에서, 권한용 해소
 context는 같은 payload의 `auto_promotion.evidence_rows`에서 확인합니다. 둘은 목적이 달라 coverage
 셀 수만으로 권한을 승격하지 않습니다.
@@ -495,7 +495,7 @@ V2 경로에는
 | 1 MarketContext + 계약 | 완료 |
 | 2 전략 audit | 완료 — runner 존재, 첫 실행 결과 §6 |
 | 3 실제 id 기준 온톨로지 eligibility | 완료 |
-| 4 legacy LIVE 옆 SelectorV2 SHADOW | 완료. Windows 런처에서 활성, 초기 SHADOW |
+| 4 legacy LIVE 옆 SelectorV2 SHADOW | 완료. `run.ps1` 런처에서 활성, 초기 SHADOW |
 | 5 counterfactual 수집 | 완료·영속 수집 중. 2026-08-11 23:09:33 KST context 66, 거래 선택 0 |
 | 6 utility GNN | adapter 완료 (기존 벡터 소비, 비용 제거). **strategy-conditioned 학습 파이프라인은 미구현** |
 | 7 bandit adapter | 완료 |
@@ -562,3 +562,25 @@ V2 경로에는
 [decision_and_risk.md](decision_and_risk.md) §7 무엇이 무엇을 결정하는가 ·
 [validation.md](validation.md) §1 승격 상태 · §14 검증 프레임워크 ·
 [short_selling_deployment.md](short_selling_deployment.md) 숏 3중 잠금
+
+---
+
+## 12. 롱 전략 자동 승격과 레짐 커버리지 (2026-08-12)
+
+Selector V2 권한과 개별 전략 권한은 별개입니다. V2가 LIVE여도 선택된 전략 arm이 SHADOW이면
+주문은 제출되지 않습니다. 개별 롱 arm은 `long_strategy_promotion.evaluate_long_promotion`이 매
+선택 사이클마다 비용 차감 성과를 다시 계산해 `SHADOW → LIVE_PROBE → LIVE_LIMITED → LIVE_FULL`
+상태를 부여합니다. 상태는 증거에서 재구성되므로 수동 토글이 필요 없고 성과 악화 시 즉시 더 안전한
+상태로 돌아갑니다. V2 주문 크기와 전략 상태의 크기 상한은 `min()`으로 결합됩니다.
+
+현재 카탈로그는 append-only 23개(롱 20, 숏 3)입니다. 새 레짐 커버리지:
+
+| 전략 | 담당 상태 | 기계적 확인 | 초기 권한 |
+|---|---|---|---|
+| `supertrend_dmi_continuation` | 강한 상승 추세 | Supertrend 상승, ADX/DMI+, VWAP, 상대거래량 | SHADOW |
+| `keltner_volatility_breakout` | 압축 후 상승 확장 | Keltner 상단 돌파, BB/KC 압축, 변동성·거래량 확장 | SHADOW |
+| `choppiness_range_reversion` | 횡보·과매도 | CHOP 고점, 낮은 ADX, Bollinger/RSI/VWAP 극단 | SHADOW |
+
+`NO_TRADE`는 계속 정상적인 최적 선택입니다. “모든 시장 상태를 분류하고 후보를 평가한다”는 것은
+“항상 주문한다”는 뜻이 아닙니다. 현재 상태에서 비용 이후 양의 보수적 순엣지를 가진 전략이 없으면
+현금 보유가 손실 전략보다 우월한 전략입니다.

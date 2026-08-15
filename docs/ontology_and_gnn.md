@@ -514,7 +514,7 @@ forward 표본에서 나와야 하는데 그 표본이 0입니다. `RuntimeHealt
 arm별(`DirectionalStrategyKey`)로 `data/store/strategy-deployment.sqlite3`에 기록되며, 모델
 보정과 전략 실거래 권한은 독립적인 주장입니다.
 
-## 4. NPU / CPU 경계
+## 4. 가속기 / CPU 경계
 
 | 단계 | 장치 | 비고 |
 | --- | --- | --- |
@@ -536,7 +536,7 @@ arm별(`DirectionalStrategyKey`)로 `data/store/strategy-deployment.sqlite3`에 
 
 | 변수 | 의미 |
 | --- | --- |
-| `OPENVINO_DEVICE` | 요청 OpenVINO 장치 (`run.ps1`은 `NPU`) |
+| `OPENVINO_DEVICE` | 요청 OpenVINO 장치. Intel NPU가 있는 Windows에서만 `run.ps1`이 `NPU`로 고정하고, 그 외에는 비워 두어 `device_plan.py`의 탐지 결과를 씁니다 |
 | `ONTOLOGY_ACCELERATOR` | 온톨로지 런타임 요청 장치 |
 | `ONTOLOGY_NPU_ENABLED` | 후보 스코어링 evidence 경로 활성 (기본 true) |
 | `ONTOLOGY_NPU_BATCH_SIZE` | `auto` 또는 512/1024/2048/4096 (`run.ps1`은 4096) |
@@ -595,3 +595,16 @@ python -c "import rdflib; [rdflib.Graph().parse(f, format='turtle') for f in \
 ```
 
 런타임에서는 `app.graph.rdf_graph.RdfTradingGraph.serialize(format="turtle" | "json-ld")`가 현재 assertion 그래프를 덤프하고, `app.graph.semantic_materializer`가 추론 트리플을 asserted 트리플과 분리해 반환합니다.
+
+## 6. 체크포인트 호환성과 실거래 권한 (2026-08-12)
+
+전략 카탈로그와 R-GCN 출력 head는 같은 append-only 순서를 사용합니다. 현재 계약은 23개 전략,
+23개 head, `max_nodes=23`, `feature_dim=47`입니다. 저장은 임시 파일에 모든 tensor와 메타데이터를
+완성한 뒤 원자적으로 교체하므로 학습 중인 부분 파일을 live loader가 읽지 않습니다. 카탈로그 수나
+순서가 다르면 추론은 fail-closed 됩니다.
+
+호환성과 권한은 다른 판정입니다. 체크포인트 shape가 정확해도 purged validation에서
+`selection_ranking_skill_established`와 `selection_net_edge_established`가 모두 참이 아니면
+`live_authorized=false`입니다. 2026-08-12 재학습 모델은 23개 head로 호환되지만 validation 선택
+평균 순수익이 -66.754bp이고 두 skill 판정이 모두 거짓이므로 SHADOW 추론만 수행합니다. 알고리즘
+후보는 독립 bandit·비용 게이트로 계속 평가되지만 GNN 자체는 주문 권한이 없습니다.
