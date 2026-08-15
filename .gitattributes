@@ -1,0 +1,34 @@
+# Line endings.
+#
+# This working tree is shared between a Windows notebook and a Linux workstation
+# through a synced folder. It was last written on Windows, so every text file on
+# disk carried CRLF while the repository stores LF — which made `git status` report
+# 5,000+ files as modified with nothing in them but line endings, burying real
+# changes. Declaring the normalisation here fixes it for every future checkout on
+# either machine instead of relying on each clone's core.autocrlf setting.
+* text=auto eol=lf
+
+# cmd.exe is the one consumer that has documented trouble with LF (multi-line
+# constructs and labels), so batch files keep CRLF in the working tree. They are
+# still stored as LF in the repository.
+*.bat text eol=crlf
+
+# Binary. Marked explicitly so git never applies eol conversion to them and never
+# tries to produce a text diff.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.npz   binary
+*.npy   binary
+*.onnx  binary
+*.bin   binary
+*.xz    binary
+*.gz    binary
+*.zip   binary
+*.sqlite3 binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary

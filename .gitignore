@@ -1,5 +1,10 @@
+# One virtual environment per OS: a venv is portable across neither the operating
+# system nor the interpreter that built it, and this tree is shared between
+# machines through a synced folder.
 .venv/
+.venv-linux/
 .venv-pi/
+src/*.egg-info/
 packaging/raspberrypi/pi.env
 __pycache__/
 *.pyc
@@ -10,6 +15,18 @@ data/raw/
 data/processed/
 data/store/
 data/legacy/**/store/
+
+# Rotating training artifacts, not source.
+#
+# The trainer writes one timestamped file per run - every few minutes while a
+# market is open - and 6,000+ of them had accumulated in the index, so every
+# commit re-diffed a directory that nothing reads from git. What IS read stays
+# tracked: the predictor loads only latest.json / deployment_state.json, and
+# ModelArtifactRegistry globs the timestamped ones off the local disk, where they
+# remain. Untracking them does not delete them.
+data/models/live_short_horizon/**/live_short_horizon.*.json
+data/models/realtime_supervised/realtime_supervised_trade_timing.*.json
+!data/models/realtime_supervised/realtime_supervised_trade_timing.latest.json
 *.sqlite3
 logs/
 # Runtime logs / build artifacts / editor backups must never be tracked.
@@ -36,3 +53,24 @@ config/model_training.json
 config/realtime_market_data.json
 config/order_execution.json
 config/local_llm.env
+
+# Local ChatGPT Work -> explicit Codex session receiver. Keep the script and
+# example config trackable; exclude real session IDs, reports, state and temps.
+.codex-monitor/receiver.env
+.codex-monitor/*.json
+.codex-monitor/*.md
+.codex-monitor/*.log
+.codex-monitor/.*
+.codex-monitor/incoming/
+.codex-monitor/queue/
+.codex-monitor/accepted/
+.codex-monitor/processed/
+.codex-monitor/rejected/
+.codex-monitor/failed/
+.codex-monitor/results/
+.codex-monitor/locks/
+!.codex-monitor/work_report_result.schema.json
+
+# Per-machine tool permissions, not project configuration. .claude/settings.json
+# is the shared one and stays tracked.
+.claude/settings.local.json
