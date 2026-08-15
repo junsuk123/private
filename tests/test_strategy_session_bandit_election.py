@@ -235,7 +235,10 @@ def test_untrusted_full_vector_is_retained_as_non_executable_shadow_arm(tmp_path
                     "probability_success": 0.61,
                     "expected_net_return_bps": 25.0,
                     "expected_cost_bps": 18.0,
-                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                    "reason_codes": [
+                        "GNN_REALTIME_TRUST_NOT_READY",
+                        "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED",
+                    ],
                 }
             ],
         }
@@ -287,7 +290,10 @@ def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_pa
                     "strategy_id": "intraday_momentum",
                     "expected_net_return_bps": 25.0,
                     "expected_cost_bps": 28.0,
-                    "reason_codes": ["GNN_REALTIME_TRUST_NOT_READY"],
+                    "reason_codes": [
+                        "GNN_REALTIME_TRUST_NOT_READY",
+                        "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED",
+                    ],
                 }
             ],
         }
@@ -303,8 +309,22 @@ def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_pa
 
     assert state["phase"] == "ARMED"
     assert state["selected_strategy"] == "intraday_momentum"
+    assert state["selection_source"] == "ALGORITHM_MECHANICAL_ELECTION"
     assert state["bandit_is_exploration"] is True
     assert "BANDIT_EXPLORATION_ARM_SELECTED" in state["bandit_reason_codes"]
+
+
+def test_string_macro_regime_is_preserved_for_posterior_context(tmp_path):
+    manager = _manager(tmp_path)
+
+    state = manager.evaluate(
+        _account(),
+        ("005930",),
+        _bundle(macro=_macro(market_regime="HIGH_VOL_TRENDING")),
+        NOW,
+    )
+
+    assert state["macro_regime"] == "HIGH_VOL_TRENDING"
 
 
 def test_validation_vector_cannot_create_outcome_without_algorithm_trigger(tmp_path):

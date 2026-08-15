@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import numpy as np
@@ -95,8 +96,9 @@ class FixedShapeStrategyUtilityModel:
     def save_checkpoint(self, path: str | Path) -> Path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.stem}.writing.npz")
         np.savez_compressed(
-            target,
+            temporary,
             config=np.asarray(
                 [
                     self.config.batch_size,
@@ -116,6 +118,10 @@ class FixedShapeStrategyUtilityModel:
             no_trade_head=self.no_trade_head,
             temporal_weights=self.temporal_weights,
         )
+        # Never expose a half-written checkpoint to the live loader. os.replace
+        # is atomic on the target filesystem and also safely replaces the prior
+        # compatible artifact only after every tensor has been serialized.
+        os.replace(temporary, target)
         return target
 
     @classmethod

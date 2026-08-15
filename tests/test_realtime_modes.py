@@ -37,6 +37,7 @@ class RealtimeModesTest(unittest.TestCase):
                 {
                     "at": 0.0,
                     "cash_usd": None,
+                    "price_cap_usd": None,
                     "symbols": (),
                     "pool": (),
                     "rotation_index": 0,
@@ -79,6 +80,57 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertIs(web_module._stabilize_account_basis(stable), stable)
         self.assertIs(web_module._stabilize_account_basis(partial), stable)
+
+    def test_account_stabilizer_accepts_corrected_cash_component_with_stable_equity(self) -> None:
+        boot_snapshot = {
+            "equity": 694_572.0,
+            "cash_equivalent_krw": 694_572.0,
+            "krw_cash": 500_010.0,
+            "foreign_cash_krw": 0.0,
+            "positions": [],
+        }
+        corrected = {
+            **boot_snapshot,
+            "cash_equivalent_krw": 500_010.0,
+        }
+
+        self.assertIs(web_module._stabilize_account_basis(boot_snapshot), boot_snapshot)
+        self.assertIs(web_module._stabilize_account_basis(corrected), corrected)
+
+    def test_account_stabilizer_audits_partial_episode_once(self) -> None:
+        stable = {
+            "equity": 200_000.0,
+            "cash_equivalent_krw": 150_000.0,
+            "krw_cash": 100_000.0,
+            "foreign_cash_krw": 50_000.0,
+            "positions": [{"ticker": "F", "quantity": 2}],
+        }
+        partial = {**stable, "positions": [], "cash_equivalent_krw": 100_000.0}
+
+        with patch.object(web_module.audit, "record") as record:
+            web_module._stabilize_account_basis(stable)
+            web_module._stabilize_account_basis(partial)
+            web_module._stabilize_account_basis(partial)
+
+        self.assertEqual(record.call_count, 1)
+
+    def test_realtime_cycle_compacts_repeated_strategy_vectors(self) -> None:
+        session = {
+            "phase": "SCANNING",
+            "last_reason": "BANDIT_NO_TRADE",
+            "candidate_diagnostics": [{"blob": "x" * 10_000}] * 8,
+            "algorithm_evaluations": [{"blob": "y" * 10_000}] * 5,
+            "bandit_evaluations": [{"blob": "z" * 10_000}] * 3,
+            "bandit_reason_codes": ["BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE"],
+        }
+
+        compact = web_module._compact_strategy_session(session)
+
+        self.assertEqual(compact["phase"], "SCANNING")
+        self.assertEqual(compact["candidate_diagnostics_count"], 8)
+        self.assertEqual(compact["algorithm_evaluations_count"], 5)
+        self.assertEqual(compact["bandit_evaluations_count"], 3)
+        self.assertNotIn("candidate_diagnostics", compact)
 
     def test_account_basis_merge_preserves_transiently_missing_orderable_cash(self) -> None:
         previous = {
@@ -1303,14 +1355,18 @@ class RealtimeModesTest(unittest.TestCase):
         from app.data.market_session import MarketPhase
 
         account = AccountSnapshot(cash=100000.0, holdings=(), cash_by_currency={"KRW": 100000.0})
+        fresh_item = SimpleNamespace(received_at=datetime.now(timezone.utc))
         with web_module._live_lock:
             previous_watch = dict(web_module._dashboard_krx_watch)
             web_module._dashboard_krx_watch.clear()
         try:
             with (
                 patch("app.data.market_session.market_phase", return_value=MarketPhase.REGULAR),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
                 patch("app.web._request_kis_realtime_collector_resubscribe") as request,
             ):
+                store_cls.return_value.latest_tick.return_value = fresh_item
+                store_cls.return_value.latest_orderbook.return_value = fresh_item
                 web_module._observe_dashboard_market_stream("396500")
                 web_module._observe_dashboard_market_stream("396500")
             request.assert_called_once_with("dashboard_stream", ("396500",))
@@ -1612,6 +1668,41 @@ class RealtimeModesTest(unittest.TestCase):
         recent.assert_called_once()
         discover.assert_not_called()
 
+    def test_us_learning_watchlist_collects_data_without_settled_usd(self) -> None:
+        account = AccountSnapshot(
+            cash=490_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 490_000.0},
+            orderable_cash_by_currency={"KRW": 490_000.0},
+        )
+        with (
+            patch("app.web._account_snapshot_from_live_basis", return_value=account),
+            patch("app.web._last_live_account_basis", return_value={}),
+            patch(
+                "app.web._recent_affordable_us_watchlist",
+                return_value=(),
+            ) as recent,
+            patch(
+                "app.web._liquid_us_collection_seed_symbols",
+                return_value=("F", "SOFI"),
+            ) as collection_seed,
+            patch(
+                "app.web._liquid_affordable_us_seed_symbols",
+                return_value=(),
+            ) as affordable_seed,
+            patch(
+                "app.web._live_affordable_buy_candidate_symbols",
+                return_value=(),
+            ) as buy_discovery,
+        ):
+            symbols = web_module._sticky_us_learning_symbols(2)
+
+        self.assertEqual(symbols, ("F", "SOFI"))
+        recent.assert_not_called()
+        collection_seed.assert_called_once_with(account, limit=2)
+        affordable_seed.assert_not_called()
+        buy_discovery.assert_not_called()
+
     def test_us_learning_watchlist_fills_only_missing_slots(self) -> None:
         account = AccountSnapshot(
             cash=0.0,
@@ -1800,6 +1891,22 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._us_learning_watchlist_cache.clear()
                 web_module._us_learning_watchlist_cache.update(previous)
+
+    def test_us_fast_poll_keeps_websocket_symbols_for_feature_collection(self) -> None:
+        with (
+            patch(
+                "app.web._us_fast_poll_target_symbols",
+                return_value=("F", "SOFI", "INTC"),
+            ),
+            patch(
+                "app.web._has_fresh_us_websocket_book",
+                side_effect=lambda symbol: symbol != "INTC",
+            ),
+        ):
+            feature_symbols, rest_symbols = web_module._us_fast_poll_symbol_sets(("F",))
+
+        self.assertEqual(feature_symbols, ("F", "SOFI", "INTC"))
+        self.assertEqual(rest_symbols, ("INTC",))
 
     def test_last_live_account_basis_prefers_stabilized_snapshot(self) -> None:
         stable = {
@@ -2413,7 +2520,80 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["pending_positions"][0]["ticker"], "288180")
         self.assertEqual(data["pending_positions"][0]["position_state"], "pending_balance")
         self.assertEqual(data["connection"]["holdings_count"], 2)
-        self.assertEqual([item["ticker"] for item in status["positions"]], ["012860", "288180"])
+        # The pending fill is response-local and must not replace the broker
+        # snapshot used by the rest of the dashboard.
+        self.assertEqual([item["ticker"] for item in status["positions"]], ["012860"])
+
+    def test_live_position_reconciliation_nets_a_later_filled_sell(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        journal = {
+            "submitted_orders": [
+                {
+                    "event_type": "live_order_status",
+                    "recorded_at": now,
+                    "ticker": "AXTI",
+                    "market": "NASD",
+                    "side": "BUY",
+                    "quantity": 1,
+                    "filled_quantity": 1,
+                    "average_fill_price": 74.81,
+                    "broker_order_id": "buy-1",
+                    "status": "FILLED",
+                },
+                {
+                    "event_type": "live_order_status",
+                    "recorded_at": now,
+                    "ticker": "AXTI",
+                    "market": "NASD",
+                    "side": "SELL",
+                    "quantity": 1,
+                    "filled_quantity": 1,
+                    "average_fill_price": 74.68,
+                    "broker_order_id": "sell-1",
+                    "status": "FILLED",
+                },
+            ]
+        }
+
+        positions, pending = web_module._reconciled_live_positions([], journal)
+
+        self.assertEqual(positions, [])
+        self.assertEqual(pending, [])
+
+    def test_real_broker_basis_replaces_a_synthetic_stable_basis_immediately(self) -> None:
+        synthetic = {
+            "equity": 694_613,
+            "cash_equivalent_krw": 500_010,
+            "krw_cash": 500_010,
+            "foreign_cash_krw": 0,
+            "positions": [
+                {
+                    "ticker": "AXTI",
+                    "quantity": 1,
+                    "position_state": "pending_balance",
+                }
+            ],
+        }
+        actual = {
+            "equity": 500_010,
+            "cash_equivalent_krw": 500_010,
+            "krw_cash": 500_010,
+            "foreign_cash_krw": 0,
+            "positions": [],
+        }
+        with web_module._live_lock:
+            previous = web_module._operation_mode_state.get("stable_account_basis")
+            web_module._operation_mode_state["stable_account_basis"] = synthetic
+        try:
+            accepted = web_module._stabilize_account_basis(actual)
+            self.assertEqual(accepted, actual)
+            with web_module._live_lock:
+                self.assertEqual(
+                    web_module._operation_mode_state["stable_account_basis"], actual
+                )
+        finally:
+            with web_module._live_lock:
+                web_module._operation_mode_state["stable_account_basis"] = previous
 
     def test_status_exposes_live_positions_for_gui_refresh(self) -> None:
         self._isolate_live_account_refresh()
@@ -2883,6 +3063,90 @@ class RealtimeModesTest(unittest.TestCase):
             targets = web_module._live_affordable_krx_discovery_targets(stored, account)
 
         self.assertEqual(len(targets), 300)
+
+    def test_system_diagnostics_overlays_current_reliability_on_stale_payload(self) -> None:
+        stale = {
+            "generated_at": "2026-08-12T09:00:00+00:00",
+            "mode": "learning",
+            "controller_mode": "learning",
+            "score": 0.8,
+            "ready": False,
+            "infrastructure_ready": False,
+            "blockers": [{"code": "MARKET_DATA_NOT_READY"}],
+            "flows": {
+                "market_data": {
+                    "active": False,
+                    "healthy": {"US": []},
+                    "latest": {"message": "preserved expensive detail"},
+                }
+            },
+        }
+        reliability = {
+            "evaluated_at": "2026-08-12T09:03:00+00:00",
+            "mode": "live_trading",
+            "score": 1.0,
+            "threshold": 0.9,
+            "ready": True,
+            "reasons": [],
+            "active_markets": ["US"],
+            "components": {
+                "market_data": {
+                    "healthy": {"US": ["BAC", "INTC"]},
+                    "ready_markets": ["US"],
+                    "required_markets": ["US"],
+                    "missing_markets": [],
+                    "partial": False,
+                }
+            },
+        }
+        worker = SimpleNamespace(is_alive=lambda: True)
+
+        with (
+            patch("app.web._auto_reliability_status", return_value=reliability),
+            patch("app.web._live_snapshot", return_value={"learning": {"mode": "learning"}}),
+            patch("app.web._active_operation_mode", return_value="live_trading"),
+            patch.object(web_module, "_realtime_trading_worker", worker),
+        ):
+            result = web_module._overlay_system_diagnostics_live_state(stale)
+
+        self.assertEqual(result["generated_at"], stale["generated_at"])
+        self.assertEqual(result["live_state_at"], reliability["evaluated_at"])
+        self.assertEqual(result["controller_mode"], "live_trading")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["flows"]["market_data"]["healthy"]["US"], ["BAC", "INTC"])
+        self.assertEqual(
+            result["flows"]["market_data"]["latest"],
+            {"message": "preserved expensive detail"},
+        )
+        self.assertIn("실시간 거래 엔진", result["headline"])
+
+    def test_live_session_selection_override_replaces_shadow_decision(self) -> None:
+        session = {
+            "phase": "SCANNING",
+            "last_evaluated_at": "2026-08-13T13:28:32+00:00",
+            "last_reason": "NO_CANDIDATE_SYMBOLS",
+            "ontology_reason_codes": ["MACRO_TREND_UP"],
+            "selected_strategy": None,
+        }
+
+        result = web_module._live_session_selection_override(
+            session,
+            {"last_cycle_at": "2026-08-13T13:28:32+00:00"},
+            active_owner=False,
+        )
+
+        self.assertEqual(result["action"], "NO_TRADE")
+        self.assertEqual(result["path"], "live_engine")
+        self.assertEqual(
+            result["reason_codes"],
+            ["NO_CANDIDATE_SYMBOLS", "MACRO_TREND_UP"],
+        )
+        self.assertEqual(
+            result["decision_source"],
+            "realtime_trading_engine.live_trace",
+        )
+        self.assertFalse(result["ontology_allowed"])
 
 
 if __name__ == "__main__":

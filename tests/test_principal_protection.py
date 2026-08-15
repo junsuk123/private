@@ -27,7 +27,7 @@ from app.schemas.domain import (
 
 
 class PrincipalProtectionTest(unittest.TestCase):
-    def test_flat_kis_account_removes_exact_foreign_cash_duplicate_from_equity(self) -> None:
+    def test_flat_kis_account_keeps_broker_integrated_equity_authoritative(self) -> None:
         basis = web_module._account_basis_from_kis_connection(
             {
                 "ok": True,
@@ -43,12 +43,13 @@ class PrincipalProtectionTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(basis)
-        self.assertEqual(basis["equity"], 500_010.0)
-        self.assertTrue(basis["equity_reconciliation"]["corrected"])
+        self.assertEqual(basis["equity"], 695_273.0)
+        self.assertFalse(basis["equity_reconciliation"]["corrected"])
         self.assertEqual(
             basis["equity_reconciliation"]["reason"],
-            "FOREIGN_CASH_DUPLICATED_IN_BROKER_TOTAL",
+            "BROKER_INTEGRATED_TOTAL_AUTHORITATIVE",
         )
+        self.assertEqual(basis["equity_reconciliation"]["difference_krw"], 195_263.0)
 
     def test_principal_basis_migrates_once_then_stays_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

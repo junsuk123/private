@@ -291,6 +291,7 @@ class ShadowOutcome:
     resolved_at: datetime
     outcome: str
     executable: bool
+    regime: str = "UNKNOWN"
     entry_price: float | None = None
     exit_price: float | None = None
     holding_seconds: float | None = None
@@ -325,6 +326,7 @@ class ShadowOutcome:
             "resolved_at": self.resolved_at.isoformat(),
             "outcome": self.outcome,
             "executable": self.executable,
+            "regime": self.regime,
             "scored": self.scored,
             "entry_price": self.entry_price,
             "exit_price": self.exit_price,
@@ -351,6 +353,7 @@ class _OpenWalk:
     entry_at: datetime | None = None
     best_price: float | None = None
     worst_price: float | None = None
+    last_exit_price: float | None = None
     fill_ratio: float = 1.0
     last_observed_at: datetime | None = None
 
@@ -398,6 +401,7 @@ class ShadowFillSimulator:
                 resolved_at=plan.signal_at,
                 outcome=OUTCOME_UNEXECUTABLE,
                 executable=False,
+                regime=plan.regime,
                 reason_codes=tuple(reasons) or (ShortReasonCodes.BORROW_UNAVAILABLE,),
             )
         self._open[plan.plan_id] = _OpenWalk(plan=plan)
@@ -476,15 +480,36 @@ class ShadowFillSimulator:
                         resolved_at=moment,
                         outcome=OUTCOME_UNFILLED,
                         executable=True,
+                        regime=plan.regime,
                         reason_codes=("SHADOW_ENTRY_NOT_FILLED_IN_HORIZON",),
                     )
                 )
+            elif walk.last_exit_price is None:
+                # An entry observation is not also an executable exit. If no later
+                # quote arrived, there is no honest round trip to score; charging
+                # cost against the entry price manufactured a loss from missing
+                # data and polluted the strategy posterior.
+                resolved.append(
+                    ShadowOutcome(
+                        plan_id=plan.plan_id,
+                        key=plan.key,
+                        symbol=plan.symbol,
+                        signal_at=plan.signal_at,
+                        resolved_at=moment,
+                        outcome=OUTCOME_EXPIRED,
+                        executable=True,
+                        regime=plan.regime,
+                        entry_price=walk.entry_price,
+                        reason_codes=("SHADOW_HORIZON_ELAPSED_NO_EXIT_QUOTE",),
+                    )
+                )
             else:
-                reference = walk.worst_price or walk.best_price or walk.entry_price
                 resolved.append(
                     self._settle(
                         walk,
-                        exit_price=reference,
+                        # The time-horizon exit is what was executable most recently,
+                        # not the most adverse quote seen anywhere in the walk.
+                        exit_price=walk.last_exit_price,
                         resolved_at=moment,
                         outcome=OUTCOME_EXPIRED,
                         reasons=("SHADOW_HORIZON_ELAPSED_NO_QUOTE",),
@@ -530,6 +555,7 @@ class ShadowFillSimulator:
             return None
 
         exit_reference = quote.exit_reference(direction)
+        walk.last_exit_price = exit_reference
         walk.best_price = _better(walk.best_price, exit_reference, direction)
         walk.worst_price = _worse(walk.worst_price, exit_reference, direction)
 
@@ -638,6 +664,7 @@ class ShadowFillSimulator:
             resolved_at=resolved_at,
             outcome=outcome,
             executable=True,
+            regime=plan.regime,
             entry_price=entry,
             exit_price=settled_exit,
             holding_seconds=holding,

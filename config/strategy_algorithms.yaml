@@ -447,3 +447,62 @@ bar_trend_continuation:
   stop_volatility_multiple: 2.5
   trailing_bps: 40.0
   horizon_seconds: 10800.0
+
+# TradingView-compatible regime strategies.  All three start in SHADOW and are
+# promoted automatically to a size-limited LIVE_PROBE only after the durable,
+# after-cost outcome store has at least 20 observations, 3 profitable outcomes,
+# and a positive pessimistic lower bound.  See docs/tradingview_regime_strategies.md.
+supertrend_dmi_continuation:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  min_adx: 25.0
+  min_dmi_spread: 5.0
+  min_supertrend_distance_bps: 5.0
+  min_vwap_premium_bps: 5.0
+  min_relative_volume: 1.15
+  min_momentum_persistence: 0.60
+  min_liquidity_score: 0.50
+  max_spread_bps: 35.0
+  max_change_point_probability: 0.55
+  target_capture_fraction: 0.60
+  stop_volatility_multiple: 2.5
+  trailing_bps: 40.0
+  horizon_seconds: 10800.0
+
+keltner_volatility_breakout:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  max_squeeze_ratio: 1.0
+  min_volatility_expansion: 1.20
+  min_adx: 22.0
+  min_relative_volume: 1.40
+  min_vwap_premium_bps: 5.0
+  min_liquidity_score: 0.55
+  max_spread_bps: 30.0
+  max_change_point_probability: 0.50
+  target_capture_fraction: 0.60
+  stop_volatility_multiple: 2.5
+  trailing_bps: 40.0
+  horizon_seconds: 7200.0
+
+choppiness_range_reversion:
+  enabled: true
+  shadow_enabled: true
+  paper_enabled: true
+  live_authorized: false
+  min_choppiness: 61.8
+  max_adx: 20.0
+  max_rsi: 35.0
+  max_percent_b: 0.10
+  min_vwap_discount_bps: 35.0
+  min_relative_volume: 0.70
+  min_liquidity_score: 0.50
+  max_spread_bps: 30.0
+  target_capture_fraction: 0.60
+  stop_volatility_multiple: 2.0
+  trailing_bps: 35.0
+  horizon_seconds: 3600.0

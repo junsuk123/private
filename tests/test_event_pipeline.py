@@ -276,6 +276,68 @@ def test_event_driven_collector_drains_async_persistence(monkeypatch) -> None:
     assert store.saved == 3
 
 
+def test_persistence_worker_survives_one_store_failure() -> None:
+    from app.data import event_runtime
+
+    class Store:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.saved = 0
+
+        def save_ticks(self, values) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("transient sqlite write failure")
+            self.saved += len(values)
+
+        def save_orderbooks(self, values) -> None:
+            self.saved += len(values)
+
+        def save_minute_bars(self, values) -> None:
+            self.saved += len(values)
+
+    async def scenario() -> tuple[int, object]:
+        bus = BoundedMarketEventBus(capacity=4)
+        store = Store()
+        runtime = EventDrivenMarketRuntime(bus, store=store)
+        worker = asyncio.create_task(event_runtime.runtime_persistence_worker(runtime))
+        try:
+            await bus.publish(_tick(0, 70000, 1))
+            await runtime.process_one()
+            for _ in range(100):
+                if store.attempts:
+                    break
+                await asyncio.sleep(0.001)
+            await bus.publish(_tick(1, 70100, 2))
+            await runtime.process_one()
+            for _ in range(100):
+                if store.saved:
+                    break
+                await asyncio.sleep(0.001)
+            return store.saved, runtime.stats()
+        finally:
+            if worker.done():
+                try:
+                    worker.result()
+                except OSError:
+                    pass
+            else:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+
+    saved, stats = asyncio.run(scenario())
+
+    assert saved == 1
+    assert stats.persistence_errors == 1
+    assert stats.persistence_completed == 1
+    assert stats.last_persistence_error_type == "OSError"
+    assert stats.last_persistence_error_at is not None
+    assert stats.last_persistence_success_at is not None
+
+
 def test_event_runtime_can_dispatch_slow_shadow_off_fast_path(monkeypatch, tmp_path) -> None:
     from app.data import event_runtime
 

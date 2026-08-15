@@ -144,3 +144,122 @@ def test_missing_bandit_fields_still_report_stale_code(monkeypatch: pytest.Monke
     # really is pre-refactor code.
     assert chain["strategy_election"]["ok"] is False
     assert "재시작" in chain["strategy_election"]["detail"]
+
+
+def test_candidate_affordability_diagnostic_never_compares_us_ask_to_krw() -> None:
+    summary = web._candidate_affordability_summary(
+        (("NIO", "USD", 4.50),),
+        {"KRW": 490_097.0, "USD": 0.0},
+    )
+
+    assert summary["unaffordable"] is True
+    assert summary["unaffordable_currencies"] == ["USD"]
+    assert summary["cheapest_by_currency"]["USD"] == {
+        "symbol": "NIO",
+        "ask": 4.5,
+    }
+    assert summary["orderable_cash_by_currency"]["USD"] == 0.0
+
+
+def test_candidate_blockade_exposes_same_cycle_filter_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _closed_market_status()
+    status["last_summary"] = {
+        "reason": "NO_CANDIDATE_SYMBOLS",
+        "buy_candidate_count": 0,
+        "buy_candidate_sample": [],
+        "live_armed": True,
+    }
+    status["live_trace"] = {"cycle_id": "2026-08-13T15:00:00+00:00"}
+    monkeypatch.setattr(
+        web,
+        "_realtime_candidate_filter_state",
+        {
+            "engine_cycle_id": "2026-08-13T15:00:00+00:00",
+            "input_count": 6,
+            "selected_count": 0,
+            "reason_counts": {"INSUFFICIENT_USD_ORDERABLE_CASH": 6},
+            "reason_samples": {"INSUFFICIENT_USD_ORDERABLE_CASH": ["F", "SOFI"]},
+        },
+        raising=False,
+    )
+
+    chain = _chain_for(monkeypatch, status)
+
+    data = chain["buy_candidates"]["data"]
+    assert data["engine_cycle_id"] == "2026-08-13T15:00:00+00:00"
+    assert data["candidate_filter_reason_counts"] == {
+        "INSUFFICIENT_USD_ORDERABLE_CASH": 6
+    }
+    assert data["candidate_filter_reason_samples"] == {
+        "INSUFFICIENT_USD_ORDERABLE_CASH": ["F", "SOFI"]
+    }
+
+
+def test_candidate_filter_diagnostics_do_not_add_a_dependency_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Store:
+        def active_symbols(self, *_args, **_kwargs):
+            return ("SOFI",)
+
+    monkeypatch.setattr(web, "RealtimeMarketDataStore", _Store)
+    monkeypatch.setattr(web, "_realtime_engine_account_snapshot", lambda: None)
+    monkeypatch.setattr(web, "_cached_context_buy_candidates", lambda **_kwargs: ("SOFI",))
+    monkeypatch.setattr(web, "_cached_domestic_ranking_symbols", lambda: ())
+    monkeypatch.setattr(
+        web,
+        "_prioritize_realtime_buy_candidates",
+        lambda symbols, **_kwargs: tuple(symbols),
+    )
+    monkeypatch.setattr(web, "_is_live_buy_candidate_symbol", lambda _symbol: True)
+    monkeypatch.setattr(web, "_is_open_live_market_ticker", lambda _symbol: True)
+    monkeypatch.setattr(web, "_ticker_market_group_for_live_trading", lambda *_args: "US")
+    monkeypatch.setattr(web, "_current_live_reasoning_trace", lambda: {"cycle_id": "cycle-1"})
+    monkeypatch.setattr(web, "_kis_overseas_realtime_state", {"symbols": ["SOFI"]})
+    diagnostic = {}
+    monkeypatch.setattr(web, "_realtime_candidate_filter_state", diagnostic)
+    monkeypatch.setattr(web, "_us_learning_watchlist_cache", {"symbols": []})
+
+    selected = web._realtime_engine_buy_candidates()
+
+    assert selected == ("SOFI",)
+    assert diagnostic["selected_count"] == 1
+    assert diagnostic["reason_counts"] == {
+        "ACCOUNT_OR_STORE_UNAVAILABLE_NOT_FILTERED": 1
+    }
+
+
+def test_extended_session_is_not_described_as_regular_market(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _closed_market_status()
+    status["last_summary"] = {
+        "reason": "NO_CANDIDATE_SYMBOLS",
+        "buy_candidate_count": 0,
+        "buy_candidate_sample": [],
+        "live_armed": True,
+    }
+    monkeypatch.setattr(
+        "app.data.market_session.new_entry_session_report",
+        lambda: {
+            "groups": {
+                "KRX": {
+                    "phase": "closed",
+                    "streaming_phase": "pre",
+                    "allows_new_entry": True,
+                    "fully_closed": False,
+                    "session": "NXT_PRE",
+                },
+                "US": {"allows_new_entry": False},
+            },
+            "extended_hours_entry_enabled": True,
+        },
+    )
+
+    chain = _chain_for(monkeypatch, status)
+
+    assert chain["market_session"]["ok"] is True
+    assert "신규 진입 허용" in chain["market_session"]["detail"]
+    assert "정규장" not in chain["market_session"]["detail"]

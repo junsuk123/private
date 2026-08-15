@@ -195,6 +195,7 @@ def build_strategy_gnn_visualization(
     )
     nodes.extend(parameter_nodes)
     links = [*topology_links, *parameter_links]
+    graph_dynamics = _attach_graph_dynamics(nodes, links)
     runtime_reasons: list[str] = []
     checkpoint_head_channels = int(strategy_heads.shape[-1])
     if strategy_count != len(STRATEGY_IDS):
@@ -254,6 +255,7 @@ def build_strategy_gnn_visualization(
             "parameter_nodes": len(parameter_nodes),
             "parameter_links": len(parameter_links),
         },
+        "dynamics": graph_dynamics,
     }
 
 
@@ -576,6 +578,81 @@ def _checkpoint_links(
         }
         for source, target, relation in raw
     ]
+
+
+def _attach_graph_dynamics(
+    nodes: list[dict[str, Any]],
+    links: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach renderer-neutral connectivity measurements to the graph.
+
+    ``learned_strength`` is already normalized inside its tensor family.  This
+    pass turns it into a per-edge message share and a per-node weighted degree,
+    then normalizes connectivity *within each node kind*.  Keeping the feature,
+    hidden, strategy and output scales separate prevents the dense parameter
+    layers from making every strategy appear disconnected.
+    """
+
+    by_id = {str(node.get("id")): node for node in nodes}
+    weighted_degree = {node_id: 0.0 for node_id in by_id}
+    edge_count = {node_id: 0 for node_id in by_id}
+    relations: dict[str, set[str]] = {node_id: set() for node_id in by_id}
+
+    for link in links:
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        strength = max(0.0, min(1.0, float(link.get("learned_strength") or 0.0)))
+        prior = _finite_or_none(link.get("prior_weight"))
+        kind = str(link.get("kind") or "topology")
+        # A topology edge splits its incoming message by prior_weight. Structural
+        # ownership is real connectivity but not a learned parameter, so it gets
+        # a smaller mechanical share than a unit learned weight.
+        share = strength
+        if prior is not None:
+            share *= 0.5 + 0.5 * max(0.0, min(1.0, prior))
+        if kind == "structural":
+            share *= 0.35
+        link["dynamic_weight"] = round(share, 6)
+        raw_weight = _finite_or_none(link.get("weight"))
+        link["polarity"] = -1 if (
+            (raw_weight is not None and raw_weight < 0)
+            or link.get("relation") == "contrasting_methodology"
+        ) else 1
+        relation = str(link.get("relation") or "topology")
+        for node_id in (source, target):
+            if node_id not in by_id:
+                continue
+            weighted_degree[node_id] += share
+            edge_count[node_id] += 1
+            relations[node_id].add(relation)
+
+    maxima: dict[str, float] = {}
+    for node_id, node in by_id.items():
+        kind = str(node.get("kind") or "unknown")
+        maxima[kind] = max(maxima.get(kind, 0.0), weighted_degree[node_id])
+    for node_id, node in by_id.items():
+        kind = str(node.get("kind") or "unknown")
+        maximum = maxima.get(kind, 0.0)
+        degree = weighted_degree[node_id]
+        node["edge_count"] = edge_count[node_id]
+        node["weighted_degree"] = round(degree, 6)
+        node["connectivity"] = round(degree / maximum, 6) if maximum > 0 else 0.0
+        node["relation_diversity"] = len(relations[node_id])
+
+    return {
+        "mapping": "checkpoint_weighted_orbital_physics_v2",
+        "weighted": True,
+        "node_connectivity_normalized_by_kind": True,
+        "edge_dynamic_weight": "learned_strength_x_message_share",
+        "trajectory_inputs": [
+            "connectivity",
+            "relation_diversity",
+            "training_filled_rows",
+            "training_positive_net_rate",
+            "live_activation",
+        ],
+        "relation_types": len({str(link.get("relation") or "topology") for link in links}),
+    }
 
 
 def _read_inference_overlay(

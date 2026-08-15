@@ -103,3 +103,65 @@ def test_strategy_terminal_includes_training_monitor() -> None:
     js_version = re.search(r"strategy_terminal\.js\?v=([\w.-]+)", response.text)
     assert css_version and js_version
     assert css_version.group(1) == js_version.group(1)
+
+
+def test_diagnostics_score_is_labeled_as_infrastructure_not_tradability() -> None:
+    response = TestClient(app).get("/account")
+    root = Path(__file__).parents[1]
+    script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert response.status_code == 200
+    assert 'aria-label="인프라 준비도"' in response.text
+    assert "인프라 신뢰도 기준" in script
+    assert "실거래 승격 기준" not in script
+
+
+def test_operations_overview_requires_checkpoint_and_trusted_strategy_for_execution() -> None:
+    script = (
+        Path(__file__).parents[1]
+        / "src"
+        / "app"
+        / "static"
+        / "operations_overview.js"
+    ).read_text(encoding="utf-8")
+
+    assert "gnn?.checkpoint_live_authorized === true" in script
+    assert "trusted.length > 0" in script
+
+
+def test_decision_ontology_graph_has_graph_only_fullscreen_control() -> None:
+    response = TestClient(app).get("/account")
+    root = Path(__file__).parents[1]
+    script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
+        encoding="utf-8"
+    )
+    styles = (root / "src" / "app" / "static" / "strategy_terminal.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert response.status_code == 200
+    assert 'id="decision-ontology-panel"' in response.text
+    assert 'id="decision-ontology-fullscreen"' in response.text
+    assert 'aria-controls="decision-ontology-panel"' in response.text
+    assert "panel.requestFullscreen()" in script
+    assert "document.exitFullscreen()" in script
+    assert "fullscreenchange" in script
+    assert "event.key !== 'Escape'" in script
+    assert ".decision-ontology-panel:fullscreen" in styles
+    assert ".decision-ontology-panel.is-viewport-fullscreen" in styles
+
+
+def test_decision_ontology_empty_active_path_uses_a_connected_gate() -> None:
+    root = Path(__file__).parents[1]
+    script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "id: 'decision_gate'" in script
+    assert "if (algorithm.gate)" in script
+    assert "from: `algorithm:${algorithm.id}`" in script
+    assert "to: decisionId" in script
+    assert "sources.filter((source) => source.available).slice" not in script
+    assert "indicators.filter((item) => item.available).slice" not in script

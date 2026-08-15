@@ -794,8 +794,11 @@ def _slow_technical_columns(
     )
     names = (
         "ema_fast", "ema_slow", "macd", "macd_signal", "macd_histogram",
-        "short_return", "momentum_persistence", "rsi", "bb_percent_b",
-        "bb_bandwidth", "vwap", "vwap_distance_bps", "vwap_slope",
+        "short_return", "momentum_persistence", "adx", "plus_di", "minus_di",
+        "dmi_spread", "supertrend", "supertrend_direction",
+        "supertrend_distance_bps", "rsi", "bb_percent_b", "bb_bandwidth",
+        "keltner_mid", "keltner_upper", "keltner_lower", "keltner_position",
+        "keltner_bandwidth", "choppiness", "vwap", "vwap_distance_bps", "vwap_slope",
         "relative_volume", "volume_spike_ratio", "donchian_high",
         "donchian_low", "breakout_strength", "donchian_low_distance",
         "false_breakout_risk", "atr_pct", "realized_volatility",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -20,6 +21,30 @@ from app.web import LIVE_FLAG_VALUES, app
 
 
 class WebLiveFlagsTest(unittest.TestCase):
+    def test_realtime_status_projects_the_live_trace_cycle_id(self) -> None:
+        engine = SimpleNamespace(
+            get_status=lambda: {
+                "live_trace": {"cycle_id": "2026-08-13T15:00:00+00:00"},
+                "last_summary": {"at": "2026-08-13T15:00:00+00:00"},
+            }
+        )
+        worker = SimpleNamespace(is_alive=lambda: True)
+        with (
+            patch("app.web._realtime_trading_engine", engine),
+            patch("app.web._realtime_trading_worker", worker),
+        ):
+            response = web_module.realtime_trading_status()
+
+        payload = json.loads(response.body)
+        self.assertEqual(
+            payload["status"]["engine_cycle_id"],
+            "2026-08-13T15:00:00+00:00",
+        )
+        self.assertEqual(
+            payload["status"]["last_summary"]["engine_cycle_id"],
+            "2026-08-13T15:00:00+00:00",
+        )
+
     def test_live_flags_enable_validated_model_inference(self) -> None:
         self.assertEqual(
             LIVE_FLAG_VALUES["LIVE_SIGNAL_MODEL_INFERENCE_ENABLED"],
@@ -43,7 +68,10 @@ class WebLiveFlagsTest(unittest.TestCase):
                 "app.web.build_strategy_market_view",
                 return_value={
                     "symbol": "NVDA",
-                    "selection": {},
+                    "selection": {
+                        "strategy_id": "intraday_momentum",
+                        "ontology_allowed": True,
+                    },
                     "algorithm": None,
                 },
             ) as build_view,
@@ -51,7 +79,15 @@ class WebLiveFlagsTest(unittest.TestCase):
         ):
             payload = web_module._strategy_market_view_with_live_session("005930", 30)
 
-        build_view.assert_called_once_with("NVDA", limit=30)
+        build_view.assert_called_once()
+        args, kwargs = build_view.call_args
+        self.assertEqual(args, ("NVDA",))
+        self.assertEqual(kwargs["limit"], 30)
+        self.assertEqual(kwargs["selection_override"]["action"], "OWNED")
+        self.assertEqual(
+            kwargs["selection_override"]["strategy_id"],
+            "intraday_momentum",
+        )
         self.assertEqual(payload["symbol"], "NVDA")
         self.assertEqual(payload["selection"]["strategy_id"], "intraday_momentum")
         self.assertTrue(payload["selection"]["ontology_allowed"])
@@ -82,7 +118,15 @@ class WebLiveFlagsTest(unittest.TestCase):
         ):
             payload = web_module._strategy_market_view_with_live_session("005930", 30)
 
-        build_view.assert_called_once_with("SOFI", limit=30)
+        build_view.assert_called_once()
+        args, kwargs = build_view.call_args
+        self.assertEqual(args, ("SOFI",))
+        self.assertEqual(kwargs["limit"], 30)
+        self.assertEqual(kwargs["selection_override"]["action"], "NO_TRADE")
+        self.assertIn(
+            "GNN_NOT_LIVE_AUTHORIZED",
+            kwargs["selection_override"]["reason_codes"],
+        )
         self.assertEqual(payload["symbol"], "SOFI")
         self.assertEqual(payload["live_trading"]["candidate_symbols"], ["SOFI", "PFE"])
 

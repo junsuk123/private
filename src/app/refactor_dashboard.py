@@ -5,6 +5,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 from collections import Counter
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -17,6 +19,9 @@ from app.strategy.experts import ALL_EXPERT_TYPES
 
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
+_MARKET_SERIES_CACHE_CONDITION = threading.Condition()
+_MARKET_SERIES_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_MARKET_SERIES_REFRESHING: set[tuple[str, str]] = set()
 
 
 def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
@@ -189,6 +194,7 @@ def build_strategy_market_view(
     *,
     limit: int = 180,
     root: str | Path = ".",
+    selection_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read-only chart, ontology, strategy, and execution view for one symbol."""
     base = Path(root)
@@ -212,6 +218,8 @@ def build_strategy_market_view(
         selected,
     )
     selection = _selection_for_symbol(shadow, selected)
+    if selection_override:
+        selection = {**selection, **dict(selection_override)}
     if not selection.get("sector_rank_table"):
         selection["sector_rank_table"] = _live_sector_rank_table()
     strategy_id = str(
@@ -712,6 +720,83 @@ def _candidate_symbols(
 
 
 def _market_series(database: Path, symbol: str, limit: int) -> dict[str, Any]:
+    """Cached UI read model over the live SQLite journal.
+
+    The terminal polls both the full view and the lightweight stream. They used
+    to launch identical 2,500-tick/600-book reads independently, so a slow read
+    made the next poll overlap and created an unbounded queue of duplicate
+    queries. Trading does not consume this function; a short stale-while-refresh
+    cache is therefore safe and keeps the GUI responsive without weakening any
+    execution freshness gate.
+    """
+    safe_limit = max(1, min(390, int(limit or 180)))
+    key = (str(database.resolve()), str(symbol or "").upper())
+    try:
+        cache_seconds = max(
+            0.25, float(os.getenv("MARKET_VIEW_CACHE_SECONDS", "1.0"))
+        )
+    except (TypeError, ValueError):
+        cache_seconds = 1.0
+    now = time.monotonic()
+    with _MARKET_SERIES_CACHE_CONDITION:
+        cached = _MARKET_SERIES_CACHE.get(key)
+        if cached is not None:
+            cached_at, payload = cached
+            if now - cached_at >= cache_seconds and key not in _MARKET_SERIES_REFRESHING:
+                _MARKET_SERIES_REFRESHING.add(key)
+                threading.Thread(
+                    target=_refresh_market_series_cache,
+                    args=(database, key),
+                    name=f"market-view-refresh-{key[1]}",
+                    daemon=True,
+                ).start()
+            return _project_market_series(payload, safe_limit)
+        if key in _MARKET_SERIES_REFRESHING:
+            _MARKET_SERIES_CACHE_CONDITION.wait(timeout=10.0)
+            cached = _MARKET_SERIES_CACHE.get(key)
+            if cached is not None:
+                return _project_market_series(cached[1], safe_limit)
+        _MARKET_SERIES_REFRESHING.add(key)
+    try:
+        payload = _market_series_uncached(database, key[1], 390)
+    finally:
+        # ``payload`` may not exist only on an unexpected non-SQLite exception.
+        with _MARKET_SERIES_CACHE_CONDITION:
+            if "payload" in locals():
+                _MARKET_SERIES_CACHE[key] = (time.monotonic(), payload)
+                if len(_MARKET_SERIES_CACHE) > 32:
+                    oldest = min(
+                        _MARKET_SERIES_CACHE,
+                        key=lambda item: _MARKET_SERIES_CACHE[item][0],
+                    )
+                    if oldest != key:
+                        _MARKET_SERIES_CACHE.pop(oldest, None)
+            _MARKET_SERIES_REFRESHING.discard(key)
+            _MARKET_SERIES_CACHE_CONDITION.notify_all()
+    return _project_market_series(payload, safe_limit)
+
+
+def _refresh_market_series_cache(
+    database: Path, key: tuple[str, str]
+) -> None:
+    try:
+        payload = _market_series_uncached(database, key[1], 390)
+    except Exception:  # noqa: BLE001 - retain the last good UI snapshot.
+        payload = None
+    with _MARKET_SERIES_CACHE_CONDITION:
+        if payload is not None:
+            _MARKET_SERIES_CACHE[key] = (time.monotonic(), payload)
+        _MARKET_SERIES_REFRESHING.discard(key)
+        _MARKET_SERIES_CACHE_CONDITION.notify_all()
+
+
+def _project_market_series(payload: dict[str, Any], limit: int) -> dict[str, Any]:
+    projected = dict(payload)
+    projected["bars"] = list(payload.get("bars") or ())[-limit:]
+    return projected
+
+
+def _market_series_uncached(database: Path, symbol: str, limit: int) -> dict[str, Any]:
     empty = {
         "symbol": symbol,
         "bars": [],
@@ -1300,7 +1385,7 @@ def _decision_ontology(
                 if rvgi_result and rvgi_result.signal is not None
                 else "completed bar history unavailable"
             ),
-            "completed_minute_bars",
+            "minute_bars",
         ),
         "rvgi_diff": _indicator(
             "RVGI - signal",
@@ -1319,7 +1404,7 @@ def _decision_ontology(
                 else None
             ),
             "pure causal RVGI",
-            "completed_minute_bars",
+            "minute_bars",
         ),
         "box_position": _indicator(
             "Frozen box position",
@@ -1330,7 +1415,7 @@ def _decision_ontology(
                 if box_result and box_result.ok
                 else "causal box history unavailable"
             ),
-            "completed_minute_bars",
+            "minute_bars",
         ),
         "return_1s": _indicator(
             "1초 수익률", _bounded(.5 + float(micro.get("return_1s") or 0.0) * 100),
@@ -1428,6 +1513,12 @@ def _decision_ontology(
             session_values.get("first_half_hour_volatility_percentile"),
             "동일 종목의 과거 첫 30분 변동성 대비 경험적 분위", "session_context",
         ),
+        "overnight_carry_window": _indicator(
+            "마감 30분 진입 창",
+            session_values.get("overnight_carry_window"),
+            session_values.get("minutes_to_continuous_close"),
+            "종목 거래소의 정규장 연속매매 종료까지 남은 시간", "session_context",
+        ),
         "opening_confirmation": _indicator(
             "시가 확인", _percentile(latest_return, returns), latest_return,
             "최근 수익률을 이용한 가격발견 확인", "minute_bars",
@@ -1504,7 +1595,7 @@ def _decision_ontology(
         for feature, operator, threshold in requirements.get(expert.strategy_id, ()):
             item = indicators.get(
                 feature,
-                _indicator(feature, None, None, "RVGI Box context unavailable", "completed_minute_bars"),
+                _indicator(feature, None, None, "RVGI Box context unavailable", "minute_bars"),
             )
             value = item["score"]
             passed = (
@@ -1559,15 +1650,19 @@ def _decision_ontology(
             price_available=bool(session_values.get("price_complete")),
         ),
     ]
-    reasons = [
-        str(reason)
-        for decision in selection.get("all_decisions") or []
-        for reason in decision.get("reason_codes") or []
-    ]
+    reasons = list(
+        dict.fromkeys(
+            str(reason)
+            for decision in selection.get("all_decisions") or []
+            for reason in decision.get("reason_codes") or []
+            if str(reason).strip()
+        )
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "provenance": {
-            "decision": "logs/refactor-shadow-comparison.jsonl",
+            "decision": selection.get("decision_source")
+            or "logs/refactor-shadow-comparison.jsonl",
             "indicators": "dashboard reconstruction from realtime_market_data.sqlite3",
             "warning": "지표값은 화면용 재구성값이며 저장된 모델 입력 텐서의 직접 기여도는 아닙니다.",
         },
@@ -1617,6 +1712,13 @@ def _dashboard_session_context(
     session = session_structure.regular_session(symbol)
     kst = session.zone
     now = parsed[-1][0] + timedelta(minutes=1)
+    minutes_to_close = session.minutes_to_continuous_close(now)
+    clock_result: dict[str, Any] = {
+        "overnight_carry_window": (
+            1.0 if session.in_last_continuous_half_hour(now) else 0.0
+        ),
+        "minutes_to_continuous_close": round(minutes_to_close, 3),
+    }
     latest_day = session.trading_day(now)
     current = [row for start, row in parsed if start.astimezone(kst).date() == latest_day]
     prior = [(start, row) for start, row in parsed if start.astimezone(kst).date() < latest_day]
@@ -1632,8 +1734,9 @@ def _dashboard_session_context(
         current, session_open=session_open, minutes=30, now=now
     )
     if observed is None:
-        return {"price_complete": False, "price_field_count": 0}
+        return {**clock_result, "price_complete": False, "price_field_count": 0}
     result: dict[str, Any] = {
+        **clock_result,
         "opening_range_high": observed.high,
         "opening_range_low": observed.low,
     }

@@ -85,6 +85,9 @@ BANDIT_NO_CANDIDATE_ARMS = "BANDIT_NO_CANDIDATE_ARMS"
 BANDIT_CHANGE_POINT_STAND_DOWN = "BANDIT_CHANGE_POINT_STAND_DOWN"
 BANDIT_CONTEXT_PENALTY_APPLIED = "BANDIT_CONTEXT_PENALTY_APPLIED"
 BANDIT_ARM_COLD_START_SHADOW_ONLY = "BANDIT_ARM_COLD_START_SHADOW_ONLY"
+BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES = (
+    "BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES"
+)
 BANDIT_ARM_LOSS_STREAK_SUSPENDED = "BANDIT_ARM_LOSS_STREAK_SUSPENDED"
 BANDIT_ARM_NOT_MACRO_PERMITTED = "BANDIT_ARM_NOT_MACRO_PERMITTED"
 BANDIT_ARM_COLD_START_EXPLORATION = "BANDIT_ARM_COLD_START_EXPLORATION"
@@ -390,6 +393,9 @@ class BanditConfig:
     unknown_context_penalty_bps: float = 10.0
     # Arms below this sample count may only run in shadow, never live.
     minimum_live_sample_count: int = 0
+    # A positive posterior can be prior-driven. Live execution additionally
+    # requires this many actually positive net observations.
+    minimum_live_positive_samples: int = 0
     require_positive_conservative_edge: bool = True
     # --- Cold-start exploration -------------------------------------------------
     # Pessimism alone is not a runnable policy: with no realized history EVERY arm
@@ -459,6 +465,13 @@ class BanditConfig:
             minimum_live_sample_count=max(
                 0, _env_int("BANDIT_MINIMUM_LIVE_SAMPLE_COUNT", cls.minimum_live_sample_count)
             ),
+            minimum_live_positive_samples=max(
+                0,
+                _env_int(
+                    "BANDIT_MINIMUM_LIVE_POSITIVE_SAMPLES",
+                    cls.minimum_live_positive_samples,
+                ),
+            ),
             require_positive_conservative_edge=_env_bool(
                 "BANDIT_REQUIRE_POSITIVE_CONSERVATIVE_EDGE",
                 cls.require_positive_conservative_edge,
@@ -491,6 +504,27 @@ class BanditConfig:
                     "BANDIT_SHORT_AGAINST_REGIME_PENALTY_BPS",
                     cls.short_against_regime_penalty_bps,
                 ),
+            ),
+        )
+
+    @classmethod
+    def for_live_execution(cls) -> "BanditConfig":
+        """Production authority posture; shadow collection remains automatic.
+
+        The generic constructor stays useful for counterfactual research and
+        deterministic unit tests. The live engine uses this constructor so no
+        cold-start arm can reach a broker merely because it predicted its own
+        edge. Environment variables may make the thresholds stricter, never
+        weaker than the production floor.
+        """
+        configured = cls.from_env()
+        return replace(
+            configured,
+            minimum_live_sample_count=max(
+                20, configured.minimum_live_sample_count
+            ),
+            minimum_live_positive_samples=max(
+                3, configured.minimum_live_positive_samples
             ),
         )
 
@@ -760,6 +794,14 @@ class ConservativeStrategyBandit:
             exploration = False
             shadow_only = True
             reasons.append(BANDIT_ARM_COLD_START_SHADOW_ONLY)
+        positive_samples = int(
+            math.floor(posterior.win_rate * posterior.sample_count + 1e-9)
+        )
+        if positive_samples < cfg.minimum_live_positive_samples:
+            admissible = False
+            exploration = False
+            shadow_only = True
+            reasons.append(BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES)
         if stand_down:
             # A structural break invalidates the forward-looking estimate too, so
             # exploration is suspended along with exploitation.

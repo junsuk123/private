@@ -13,6 +13,7 @@ from app.data.market_session import (
     is_market_fully_closed,
     market_has_live_session,
     market_phase,
+    new_entry_session_report,
 )
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.data.realtime_types import KIS_REALTIME_SOURCE, KIS_REST_SNAPSHOT_SOURCE
@@ -32,6 +33,21 @@ class _FakeSnapshot:
 
 
 class MarketPhaseTests(unittest.TestCase):
+    def test_report_distinguishes_closed_primary_venue_from_active_nxt(self) -> None:
+        # 08:24 KST: KRX itself has not opened, while NXT_PRE is active.
+        report = new_entry_session_report(
+            groups=("KRX",),
+            now_utc=_utc(2026, 8, 13, 23, 24),
+        )
+        krx = report["groups"]["KRX"]
+
+        self.assertEqual(krx["phase"], "closed")
+        self.assertEqual(krx["streaming_phase"], "pre")
+        self.assertEqual(krx["active_sessions"], ["NXT_PRE"])
+        self.assertTrue(krx["primary_venue_closed"])
+        self.assertTrue(krx["group_has_active_session"])
+        self.assertFalse(krx["fully_closed"])
+
     # 2026-07-09 is a Thursday (weekday). KST = UTC+9, ET = UTC-4 (EDT).
 
     def test_krx_regular_session(self) -> None:

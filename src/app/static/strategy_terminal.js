@@ -26,6 +26,10 @@ const terminalState = {
 // independent, while the expensive graph requests and render loop default off.
 const GNN_VISUALIZATION_STORAGE_KEY = 'strategy-terminal-gnn-3d-enabled-v1';
 let gnnVisualizationEnabled = readGnnVisualizationPreference();
+const GNN_AUTO_ROTATION_STORAGE_KEY = 'strategy-terminal-gnn-auto-rotation-v1';
+const GNN3D_AUTO_ROTATE_RAD_PER_SECOND = .075;
+const GNN3D_AUTO_ROTATE_RESUME_DELAY_MS = 2500;
+let gnnAutoRotationEnabled = readGnnAutoRotationPreference();
 
 let gnn3dState = null;
 let gnnThreePromise = null;
@@ -58,7 +62,13 @@ const GNN3D_EDGE_SEGMENTS = 6;
 // be re-solved, because a rope whose endpoint moved and whose vertices did not is
 // visibly detached from its own node. Above this count the orbits stop instead of
 // the ropes going stale: a still system is honest, a broken one is not.
-const GNN3D_MAX_DYNAMIC_EDGES = 5400;
+//
+// Sized against the DEPLOYED checkpoint, not an estimate: 23 strategies x 11 head
+// channels over a 47x16 encoder is 7,491 links under the "all connections" filter.
+// Measured solve cost is 0.61 ms/frame at 4,530 ropes, so 16,000 leaves the real
+// graph animating with headroom for another strategy family, and the binding cost
+// past that is the per-frame buffer upload rather than the solve.
+const GNN3D_MAX_DYNAMIC_EDGES = 16000;
 
 /**
  * Write one hanging rope into a LineSegments position buffer.
@@ -225,7 +235,13 @@ function gnn3dRopeSag(spring, span, across, market, swingClock) {
 /** Resolve one orbit's cartesian position from its current true anomaly. */
 function gnn3dOrbitPosition(orbit) {
   const e = orbit.e;
-  const r = orbit.a * (1 - e * e) / (1 + e * Math.cos(orbit.theta));
+  // Live activation does not invent a new lane: it makes the body's own measured
+  // lane breathe by at most 4%. Connectivity controls the phase offset, so two
+  // simultaneously active nodes do not pulse as a rigid sheet.
+  const radialPulse = 1 + Number(orbit.liveActivation || 0) * .04
+    * Math.sin(Number(orbit.activityPhase || 0) + Number(orbit.coupling || 0) * Math.PI);
+  const a = orbit.a * radialPulse;
+  const r = a * (1 - e * e) / (1 + e * Math.cos(orbit.theta));
   const inPlaneX = r * Math.cos(orbit.theta);
   const inPlaneY = r * Math.sin(orbit.theta);
   const cosNode = Math.cos(orbit.ascending), sinNode = Math.sin(orbit.ascending);
@@ -250,22 +266,42 @@ function gnn3dAdvanceOrbits(orbits, dt, clock) {
       // orbit runs fast at perihelion and drags at aphelion. That is what makes a
       // strategy whose training payoff was unreliable look unsteady in its lane.
       const sweep = orbit.r > 0 ? Math.min(3, (orbit.a / orbit.r) ** 2) : 1;
-      orbit.theta = (orbit.theta + orbit.omega * orbit.direction * dt * clock * sweep) % GNN3D_TWO_PI;
+      const activation = Number(orbit.liveActivation || 0);
+      const coupling = Number(orbit.coupling || 0);
+      const inertia = Number(orbit.inertialMass || 0);
+      // Strongly connected bodies exchange more message mass and circulate
+      // faster; heavily evidenced bodies resist acceleration. A live measured
+      // activation temporarily increases throughput without moving an idle node.
+      const relationshipSpeed = (.72 + coupling * .72) / (.82 + inertia * .34);
+      const liveBoost = 1 + activation * 1.45;
+      orbit.theta = (orbit.theta + orbit.omega * orbit.direction * dt * clock
+        * sweep * relationshipSpeed * liveBoost) % GNN3D_TWO_PI;
+      orbit.activityPhase = (Number(orbit.activityPhase || 0)
+        + dt * (.9 + coupling * 1.8 + activation * 3.2)) % GNN3D_TWO_PI;
+      // Relation diversity slowly precesses the orbital plane. This makes a node
+      // linked through several semantic relation types trace a different path
+      // from an equally heavy single-relation node.
+      orbit.ascending = (orbit.ascending + Number(orbit.precession || 0) * dt
+        * clock * (1 + activation)) % GNN3D_TWO_PI;
     }
     gnn3dOrbitPosition(orbit);
   }
 }
 
 const gnnClusterStyle = {
-  input_context: { label: '41-D INPUT FEATURES', color: '#8178ff', x: 120, y: 335, radius: 145 },
+  // Labels carry no dimension: the deployed checkpoint is 47 features / 16 hidden /
+  // 23 strategies x 11 head channels, and the hardcoded "41-D" / "104" went stale
+  // the moment it was retrained. Counts are appended live from the payload where
+  // these labels are drawn.
+  input_context: { label: 'INPUT FEATURES', color: '#8178ff', x: 120, y: 335, radius: 145 },
   input_identity: { label: 'STRATEGY IDENTITY', color: '#a990ff', x: 120, y: 335, radius: 82 },
-  hidden: { label: '16-D R-GCN MESSAGE', color: '#f6d778', x: 355, y: 335, radius: 105 },
+  hidden: { label: 'R-GCN MESSAGE', color: '#f6d778', x: 355, y: 335, radius: 105 },
   momentum: { label: 'MOMENTUM', color: '#ff537b', x: 590, y: 160, radius: 92 },
   breakout: { label: 'BREAKOUT', color: '#ffb861', x: 700, y: 245, radius: 92 },
   reversion: { label: 'REVERSION', color: '#20d9ff', x: 610, y: 455, radius: 102 },
   relative_strength: { label: 'RELATIVE', color: '#72e1bd', x: 745, y: 500, radius: 64 },
   specialist: { label: 'SPECIALIST', color: '#a78bfa', x: 670, y: 340, radius: 68 },
-  output: { label: '104 STRATEGY HEAD OUTPUTS', color: '#5eead4', x: 1010, y: 335, radius: 175 },
+  output: { label: 'STRATEGY HEAD OUTPUTS', color: '#5eead4', x: 1010, y: 335, radius: 175 },
 };
 
 const gnnRelationStyle = {
@@ -467,6 +503,7 @@ function refreshGnnMarketForces() {
     terminalState.data.market || {},
   );
   if (gnn3dState?.updateData) gnn3dState.updateData(terminalState.gnnGraph);
+  renderGnnSystemHealth();
 }
 
 function renderGnnLiveState(state) {
@@ -498,6 +535,7 @@ function renderGnnLiveState(state) {
   // accident exactly the pseudo-animation this panel was rid of. Stale is a
   // styling state, not an absence of knowledge.
   setGnnPhaseIndicator(activation?.layers || null, { stale: !active });
+  renderGnnSystemHealth();
 }
 
 /*
@@ -547,6 +585,99 @@ function renderGnnGraphSummary(data) {
   document.getElementById('gnn-inference-size').textContent = `${formatInteger(inference.successful_decisions)} 성공 · ${formatInteger(inference.blocked_decisions)} 차단`;
   document.getElementById('gnn-model-provenance').textContent =
     `SOURCE ${data.source?.checkpoint || '-'} · 실제 체크포인트 텐서 기반 · 기존 시장 사실 온톨로지 그래프와 분리 · 최근 추론 ${shortDateTime(inference.latest_at)}`;
+  renderGnnSystemHealth();
+}
+
+function renderGnnSystemHealth() {
+  const panel = document.getElementById('gnn-system-health');
+  if (!panel) return;
+  const graph = terminalState.gnnGraph || null;
+  const state = terminalState.gnnInference || {};
+  const model = graph?.model || {};
+  const forces = graph?.forces || GNN_NEUTRAL_FORCES;
+  const pipeline = graph?.pipeline || null;
+  const live = Boolean(state.active);
+  const age = state.age_seconds === null || state.age_seconds === undefined
+    ? NaN : Number(state.age_seconds);
+  const activation = state.activation || {};
+  const reasonCodes = Array.isArray(state.reason_codes) ? state.reason_codes : [];
+  const authorizationBlocked = reasonCodes.some((reason) =>
+    String(reason).startsWith('GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED')
+    || String(reason).startsWith('GNN_REALTIME_TRUST_NOT_READY')
+    || String(reason).startsWith('GNN_TRUST_'));
+  const strategies = activation.strategies || {};
+  const activeStrategies = new Set(Object.entries(strategies)
+    .filter(([, item]) => Number(item?.intensity || 0) > .02)
+    .map(([id]) => id));
+  const selected = activation.selected_strategy_id || null;
+  const measuredChannels = new Set(Object.keys(activation.channels || {}));
+  let activeNodes = live ? activeStrategies.size + measuredChannels.size : 0;
+  let activeEdges = 0;
+  if (live && graph) {
+    (graph.links || []).forEach((link) => {
+      const topology = (!link.kind || link.kind === 'topology')
+        && activeStrategies.has(link.source) && activeStrategies.has(link.target);
+      const decoded = link.relation === 'owns_output_head'
+        && link.source === selected
+        && measuredChannels.has((graph.nodes || []).find((node) => node.id === link.target)?.channel);
+      if (topology || decoded) activeEdges += 1;
+    });
+  }
+
+  const setCell = (id, level, value, detail) => {
+    const cell = document.getElementById(id);
+    if (!cell) return;
+    cell.dataset.state = level;
+    cell.querySelector('b').textContent = value;
+    cell.querySelector('small').textContent = detail;
+  };
+  const apiReady = Boolean(graph);
+  setCell(
+    'gnn-health-data',
+    !apiReady ? 'bad' : forces.observed ? 'good' : 'warn',
+    !apiReady ? 'DISCONNECTED' : forces.observed ? 'LIVE FEED' : 'API READY',
+    !apiReady ? '그래프 응답 없음' : forces.observed
+      ? `활동 ${(Number(forces.activity || 0) * 100).toFixed(0)}% · 에너지 ${(Number(forces.marketEnergy || 0) * 100).toFixed(0)}%`
+      : '시장 미관측 · 중립 물리값',
+  );
+  const compatible = Boolean(model.available && model.runtime_compatible);
+  setCell(
+    'gnn-health-model',
+    compatible && !authorizationBlocked ? 'good' : model.available ? 'warn' : 'bad',
+    !model.available ? 'NO CHECKPOINT' : !compatible ? 'INCOMPATIBLE'
+      : authorizationBlocked ? 'SHADOW ONLY' : 'LIVE AUTHORIZED',
+    compatible && !authorizationBlocked ? `${formatInteger(model.training_rows)}행 · ${formatInteger(model.relation_count)} 관계`
+      : authorizationBlocked ? '실시간 신뢰/승격 조건 미충족'
+      : (model.runtime_reasons || ['체크포인트 확인 필요']).join(' · '),
+  );
+  const flowLevel = live ? 'good' : state.state === 'BLOCKED' || state.state === 'OFFLINE' ? 'bad' : 'warn';
+  setCell(
+    'gnn-health-flow',
+    flowLevel,
+    live ? `${activeNodes} NODE · ${activeEdges} EDGE` : state.state || 'WAITING',
+    live ? `${state.symbol || '-'} · ${state.action || 'EVALUATING'}`
+      : Number.isFinite(age) ? `마지막 기록 ${age < 60 ? `${age.toFixed(1)}초` : `${(age / 60).toFixed(1)}분`} 전`
+        : '최근 추론 계측 없음',
+  );
+  const stageCounts = pipeline?.stage_counts || null;
+  let bottleneck = '파이프라인 미계측';
+  if (stageCounts) {
+    const highest = Object.entries(stageCounts).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
+    if (highest) bottleneck = `최대 탈락 ${highest[0]} ${formatInteger(highest[1])}건`;
+  }
+  setCell(
+    'gnn-health-physics',
+    forces.observed ? 'good' : 'warn',
+    `G ${Number(forces.gravity || 1).toFixed(2)} · T ${Number(forces.tension || 1).toFixed(2)}`,
+    `CLOCK ${gnnSystemClock(forces).toFixed(2)}× · ${bottleneck}`,
+  );
+
+  const overall = document.getElementById('gnn-health-overall');
+  const level = !apiReady || !model.available || state.state === 'OFFLINE' ? 'bad'
+    : !compatible || authorizationBlocked || state.state === 'BLOCKED' ? 'warn' : live ? 'good' : 'idle';
+  overall.dataset.state = level;
+  overall.textContent = level === 'good' ? 'RUNNING' : level === 'bad' ? 'DEGRADED'
+    : level === 'warn' ? 'CHECK' : 'READY · IDLE';
 }
 
 function prepareGnnGraph(data) {
@@ -763,7 +894,7 @@ async function startGnn3d(data, signature) {
     // operator who cannot tell which is which is looking at decoration.
     const mapping = createGnn3dLabel(
       THREE,
-      '궤도반경 = 학습 결합도 · 이심률 = 학습 수익 신뢰도 · 공전 = 케플러(a^1.5) · 늘어짐 = 중력 ÷ 연결장력(강도·증거·순엣지) · 대조/음수 가중치는 바깥으로 휨',
+      '궤도반경 = 학습 결합도 · 속도 = 연결도 ÷ 증거관성 · 궤도 세차 = 관계 다양성 · 활성 = 펄스/가속 · 늘어짐 = 시장중력 ÷ 엣지장력',
       0x8aa1b7,
       { height: 24 },
     );
@@ -802,6 +933,9 @@ async function startGnn3d(data, signature) {
       ...node, baseEmissive: emissive, baseRadius: radius,
       orbitRadius: layout.placements.get(node.id)?.a ?? null,
       orbitEccentricity: layout.placements.get(node.id)?.e ?? null,
+      orbitAngularSpeed: layout.placements.get(node.id)?.omega ?? null,
+      orbitPrecession: layout.placements.get(node.id)?.precession ?? null,
+      inertialMass: layout.placements.get(node.id)?.inertialMass ?? null,
       parameterNorm: metric.strength,
     };
     nodeIndex.set(node.id, meshes.length);
@@ -812,16 +946,16 @@ async function startGnn3d(data, signature) {
       label.userData = node;
       root.add(label);
       labels.push({ sprite: label, meshIndex: meshes.length - 1 });
-      // One additive halo per planet. Its size and opacity are that arm's measured
-      // activation, so "which strategy is the pass actually working on" is legible
-      // from across the panel instead of from a 6-pixel emissive change.
-      const halo = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTexture, color, transparent: true, opacity: 0,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      }));
-      root.add(halo);
-      halos.push({ sprite: halo, meshIndex: meshes.length - 1, unsupervised });
     }
+    // Every compute kind gets an additive halo. Only measured activation gives it
+    // material opacity, so output-channel activity is visible while uninstrumented
+    // input/hidden nodes remain honestly dark.
+    const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTexture, color, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    root.add(halo);
+    halos.push({ sprite: halo, meshIndex: meshes.length - 1, unsupervised });
   });
 
   // Real orbit paths, drawn from each planet's own elements. These replace the
@@ -1085,6 +1219,7 @@ async function startGnn3d(data, signature) {
   root.add(particles);
 
   let dragging = false, moved = false, lastX = 0, lastY = 0;
+  let autoRotateResumeAt = 0;
   // A tilted home view. The system is volumetric now, and a near-flat camera hid
   // the orbital planes that separate the methodology families.
   let rotationX = GNN3D_HOME_PITCH, rotationY = GNN3D_HOME_YAW, cameraTarget = GNN3D_HOME_DISTANCE;
@@ -1095,8 +1230,13 @@ async function startGnn3d(data, signature) {
     pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
   }
+  function resumeAutoRotationAfterManualControl() {
+    dragging = false;
+    autoRotateResumeAt = performance.now() + GNN3D_AUTO_ROTATE_RESUME_DELAY_MS;
+  }
   canvas.addEventListener('pointerdown', (event) => {
-    updatePointer(event); dragging = true; moved = false; lastX = event.clientX; lastY = event.clientY; canvas.setPointerCapture(event.pointerId);
+    updatePointer(event); dragging = true; moved = false; autoRotateResumeAt = Infinity;
+    lastX = event.clientX; lastY = event.clientY; canvas.setPointerCapture(event.pointerId);
   }, { signal: controller.signal });
   canvas.addEventListener('pointermove', (event) => {
     updatePointer(event);
@@ -1106,15 +1246,19 @@ async function startGnn3d(data, signature) {
     rotationY += dx * .006; rotationX += dy * .006; lastX = event.clientX; lastY = event.clientY;
   }, { signal: controller.signal });
   canvas.addEventListener('pointerup', (event) => {
-    updatePointer(event); dragging = false;
+    updatePointer(event); resumeAutoRotationAfterManualControl();
     if (!moved) {
       raycaster.setFromCamera(pointer, camera);
       const hit = raycaster.intersectObjects(meshes, false)[0];
       if (hit) renderGnnInspector(hit.object.userData);
     }
   }, { signal: controller.signal });
+  canvas.addEventListener('pointercancel', resumeAutoRotationAfterManualControl, {
+    signal: controller.signal,
+  });
   canvas.addEventListener('wheel', (event) => {
     event.preventDefault(); cameraTarget = Math.max(180, Math.min(2100, cameraTarget + event.deltaY * .7));
+    autoRotateResumeAt = performance.now() + GNN3D_AUTO_ROTATE_RESUME_DELAY_MS;
   }, { passive: false, signal: controller.signal });
 
   function resize() {
@@ -1357,16 +1501,22 @@ async function startGnn3d(data, signature) {
     const forceSignature = forceSignatureFor(forces);
     if (forceSignature !== lastForceSignature) { lastForceSignature = forceSignature; ropesDirty = true; }
 
-    // No automatic rotation. The camera belongs to the operator: the frame only
-    // turns when they drag it. Everything that moves in this picture is now a
-    // body on its own orbit or a rope under its own tension, and both carry data —
-    // a slowly spinning frame carried none and set every reading adrift with it.
+    // Auto-rotation changes only the observer's yaw. The data-driven body orbits,
+    // rope tension and inference pulses remain independent measurements. Direct
+    // manipulation wins immediately and gets a short reading pause before the
+    // overview resumes.
+    if (gnnAutoRotationEnabled && !dragging && now >= autoRotateResumeAt && dt > 0) {
+      rotationY = (rotationY + dt * GNN3D_AUTO_ROTATE_RAD_PER_SECOND) % GNN3D_TWO_PI;
+    }
     root.rotation.x += (rotationX - root.rotation.x) * .12;
     root.rotation.y += (rotationY - root.rotation.y) * .12;
     camera.position.z += (cameraTarget - camera.position.z) * .09;
 
     const clock = gnnSystemClock(forces);
     if (orbitsAnimated && dt > 0) {
+      for (let index = 0; index < meshOrbits.length; index += 1) {
+        if (meshOrbits[index]) meshOrbits[index].liveActivation = nodeIntensity[index] || 0;
+      }
       gnn3dAdvanceOrbits(orbits, dt, clock);
       for (let index = 0; index < meshes.length; index += 1) {
         const orbit = meshOrbits[index];
@@ -1390,8 +1540,8 @@ async function startGnn3d(data, signature) {
         mesh.scale.setScalar(mesh.userData.baseRadius * (1 + ambient * .025));
         continue;
       }
-      mesh.material.emissiveIntensity = mesh.userData.baseEmissive + intensity * (1.1 + pulse * 1.3);
-      mesh.scale.setScalar(mesh.userData.baseRadius * (1 + intensity * (.06 + pulse * .16)));
+      mesh.material.emissiveIntensity = mesh.userData.baseEmissive + intensity * (1.8 + pulse * 2.4);
+      mesh.scale.setScalar(mesh.userData.baseRadius * (1 + intensity * (.1 + pulse * .24)));
     }
     // Elastic time: the change-point probability sets how fast the ropes ring, and
     // integrating it here is what lets that rate change without shifting the phase
@@ -1399,7 +1549,7 @@ async function startGnn3d(data, signature) {
     swingClock += dt * 1000 * Number(forces.elasticity || 1);
     if (orbitsAnimated || ropesDirty) { solveRopes(swingClock, forces); ropesDirty = false; }
     if (glowLine) glowLine.material.opacity = activeEdgeIndexes.length
-      ? Math.min(.9, .12 + marketEnergy * .48 + pulse * (.12 + marketEnergy * .18))
+      ? Math.min(1, .38 + marketEnergy * .42 + pulse * (.24 + peak * .26))
       : 0;
     for (let index = 0; index < labels.length; index += 1) {
       const { sprite, meshIndex } = labels[index];
@@ -1413,9 +1563,9 @@ async function startGnn3d(data, signature) {
       const mesh = meshes[halo.meshIndex];
       const intensity = nodeIntensity[halo.meshIndex] || 0;
       halo.sprite.position.copy(mesh.position);
-      const size = mesh.userData.baseRadius * (5 + intensity * 7 + pulse * intensity * 4);
+      const size = mesh.userData.baseRadius * (5.5 + intensity * 10 + pulse * intensity * 7);
       halo.sprite.scale.set(size, size, 1);
-      halo.sprite.material.opacity = Math.min(.6, .04 + intensity * .5 + marketEnergy * .06)
+      halo.sprite.material.opacity = Math.min(.92, .025 + intensity * (.58 + pulse * .28) + marketEnergy * .045)
         * (halo.unsupervised ? .3 : 1);
     }
     // Orbit paths brighten with the arm that rides them, which makes the lane the
@@ -1431,7 +1581,7 @@ async function startGnn3d(data, signature) {
     coreLight.intensity = 14 + marketEnergy * 24 + peak * 22;
 
     particles.material.opacity = activeEdgeIndexes.length
-      ? Math.min(.78, marketEnergy * (.28 + pulse * .42) + peak * .3)
+      ? Math.min(.95, .22 + marketEnergy * (.3 + pulse * .42) + peak * .42)
       : 0;
     // Flow rate is measured tape speed: tick activity plus energy. A still book
     // leaves the packets nearly stationary rather than implying throughput. Also
@@ -1610,6 +1760,25 @@ function gnn3dLayout(nodes, links, model = null) {
     return Math.min(1, Math.log10(1 + rows) / Math.log10(1 + heaviestRows));
   };
 
+  // Connectivity is computed by the API from normalized checkpoint weights,
+  // separately within each node kind. It is the gravitational coupling used by
+  // the orbit solver. Relation diversity controls slow plane precession, while
+  // evidence mass provides inertia. These values are also exposed in the node
+  // inspector, so motion is auditable instead of decorative.
+  const dynamicsOf = (node, inertialMass = 0) => {
+    const coupling = Math.min(1, Math.max(0, Number(node.connectivity || 0)));
+    const diversity = Math.min(1, Math.max(0, Number(node.relation_diversity || 0) / 5));
+    const precessionSign = seededGraphUnit(`${node.id}:precession`) > .5 ? 1 : -1;
+    return {
+      coupling,
+      inertialMass: Math.min(1, Math.max(0, inertialMass)),
+      relationDiversity: diversity,
+      precession: precessionSign * (.002 + diversity * .012 + coupling * .004),
+      liveActivation: 0,
+      activityPhase: seededGraphUnit(`${node.id}:activity`) * GNN3D_TWO_PI,
+    };
+  };
+
   const makeOrbit = (spec) => {
     const orbit = { ...spec, direction: spec.direction || 1, x: 0, y: 0, z: 0, r: spec.a };
     gnn3dOrbitPosition(orbit);
@@ -1633,6 +1802,7 @@ function gnn3dLayout(nodes, links, model = null) {
       // Mixed directions: the nucleus churns instead of turning as one dial.
       direction: seededGraphUnit(`${node.id}:d`) > .5 ? 1 : -1,
       parent: null,
+      ...dynamicsOf(node, depth),
     });
     placements.set(node.id, orbit);
     metrics.set(node.id, {
@@ -1660,6 +1830,7 @@ function gnn3dLayout(nodes, links, model = null) {
       theta: seededGraphUnit(`${node.id}:t`) * GNN3D_TWO_PI,
       omega: keplerAbout(a),
       parent: null,
+      ...dynamicsOf(node, bound),
     });
     placements.set(node.id, orbit);
     metrics.set(node.id, {
@@ -1694,6 +1865,7 @@ function gnn3dLayout(nodes, links, model = null) {
       theta: seededGraphUnit(`${node.id}:t`) * GNN3D_TWO_PI,
       omega: keplerAbout(a),
       parent: null,
+      ...dynamicsOf(node, massOf(node)),
     });
     planetOrbits.set(node.id, orbit);
     placements.set(node.id, orbit);
@@ -1726,6 +1898,7 @@ function gnn3dLayout(nodes, links, model = null) {
       // retrograde: the sign of the parameter is visible in the motion.
       direction: (outputSigned.get(node.id) || 0) < 0 ? -1 : 1,
       parent,
+      ...dynamicsOf(node, bound),
     });
     placements.set(node.id, orbit);
     metrics.set(node.id, {
@@ -1999,6 +2172,20 @@ function drawGnnThreadWave(ctx, a, c, b, waves, color, timestamp, gain) {
   });
 }
 
+function gnnMeasuredNodeIntensity(node) {
+  const state = terminalState.gnnInference || {};
+  if (!state.active) return 0;
+  const activation = state.activation || {};
+  if (node.kind === 'strategy') {
+    return Math.min(1, Math.max(0, Number(activation.strategies?.[node.id]?.intensity || 0)));
+  }
+  if (node.kind === 'output' && node.strategy_id === activation.selected_strategy_id) {
+    const value = activation.channels?.[node.channel];
+    return value === undefined ? 0 : .35 + .65 * Math.min(1, Math.abs(Number(value)) / 2);
+  }
+  return 0;
+}
+
 function drawGnnGraph(timestamp) {
   if (!gnnVisualizationEnabled) { gnnGraphView.frame = null; return; }
   gnnGraphView.frame = requestAnimationFrame(drawGnnGraph);
@@ -2030,11 +2217,19 @@ function drawGnnGraph(timestamp) {
     glow.addColorStop(0, `${style.color}22`); glow.addColorStop(.58, `${style.color}0b`); glow.addColorStop(1, `${style.color}00`);
     ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(center.x, center.y, radius, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = `${style.color}aa`; ctx.font = `${Math.max(8, 9 * scale)}px Consolas, monospace`;
-    ctx.fillText(style.label, center.x - radius * .55, center.y - radius * .72);
+    // Count from the payload rather than the label, so a retrain that changes the
+    // model's shape is reflected here instead of contradicting it.
+    const members = gnnGraphView.nodes.filter((node) => node.cluster === clusterId).length;
+    ctx.fillText(`${style.label} · ${members}`, center.x - radius * .55, center.y - radius * .72);
   });
   ctx.fillStyle = '#5eead4aa';
   ctx.font = `${Math.max(8, 9 * scale)}px Consolas, monospace`;
-  ctx.fillText('104 STRATEGY HEAD OUTPUTS', ox + 855 * scale, oy + 30 * scale);
+  const outputCount = gnnGraphView.nodes.filter((node) => node.cluster === 'output').length;
+  ctx.fillText(
+    `${gnnClusterStyle.output.label} · ${outputCount}`,
+    ox + 855 * scale,
+    oy + 30 * scale,
+  );
 
   // Expire finished waves once per frame rather than per link, so every thread
   // in this frame is plucked by exactly the same set.
@@ -2069,13 +2264,23 @@ function drawGnnGraph(timestamp) {
     const cy = (a.y + b.y) / 2 + dx / distance * spread + sag + sway;
     const relationKey = String(link.relation || '').startsWith('relation_encoder:') ? 'self_encoder_weight' : link.relation;
     const relation = gnnRelationStyle[relationKey] || { color: '#8aa1b7' };
-    const active = source.active || target.active;
+    const sourceIntensity = gnnMeasuredNodeIntensity(source);
+    const targetIntensity = gnnMeasuredNodeIntensity(target);
+    const inferenceIntensity = Math.min(sourceIntensity, targetIntensity)
+      * (.35 + strength * .65);
+    const marketIntensity = (!link.kind || link.kind === 'topology')
+      ? Number(data.forces?.marketEnergy || 0) * (.16 + strength * .24) : 0;
+    const edgeIntensity = Math.max(inferenceIntensity, marketIntensity);
+    const active = edgeIntensity > .02;
     ctx.save();
     ctx.strokeStyle = relation.color;
     const parameter = link.kind === 'learned_parameter';
-    ctx.globalAlpha = (parameter ? .018 + strength * .075 : .055 + strength * .16) * (active ? 2.15 : 1);
-    ctx.lineWidth = parameter ? .25 + strength * .48 : .45 + strength * 1.05;
-    if (active) { ctx.shadowBlur = 7; ctx.shadowColor = relation.color; }
+    ctx.globalAlpha = active
+      ? Math.min(1, .34 + edgeIntensity * .66)
+      : (parameter ? .018 + strength * .075 : .055 + strength * .16);
+    ctx.lineWidth = active ? 1.4 + edgeIntensity * 2.2
+      : parameter ? .25 + strength * .48 : .45 + strength * 1.05;
+    if (active) { ctx.shadowBlur = 18 + edgeIntensity * 16; ctx.shadowColor = relation.color; }
     ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.quadraticCurveTo(cx, cy, b.x, b.y); ctx.stroke();
     ctx.restore();
     // Waves ride the topology and whatever is currently firing. Plucking every
@@ -2094,9 +2299,11 @@ function drawGnnGraph(timestamp) {
     const family = node.family || node.cluster;
     const style = gnnClusterStyle[family] || gnnClusterStyle.specialist;
     const baseRadius = node.kind === 'strategy' ? 7.5 : node.kind === 'hidden' ? 4.2 : node.kind === 'feature' ? 3.2 : 2.8;
-    const radius = (baseRadius + Number(node.learned_strength || 0) * (node.kind === 'strategy' ? 5.5 : 1.8) + (node.active ? pulse * 2.2 : 0)) * Math.max(.72, scale);
+    const intensity = gnnMeasuredNodeIntensity(node);
+    const radius = (baseRadius + Number(node.learned_strength || 0) * (node.kind === 'strategy' ? 5.5 : 1.8)
+      + intensity * (2.5 + pulse * 4.2)) * Math.max(.72, scale);
     ctx.save();
-    ctx.fillStyle = style.color; ctx.shadowColor = style.color; ctx.shadowBlur = node.active ? 20 : 9;
+    ctx.fillStyle = style.color; ctx.shadowColor = style.color; ctx.shadowBlur = intensity > 0 ? 28 + pulse * 22 : 7;
     ctx.globalAlpha = node === gnnGraphView.hovered ? 1 : .9;
     ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill();
     ctx.lineWidth = node === gnnGraphView.selected ? 2.4 : 1;
@@ -2175,8 +2382,8 @@ function updateGnnTooltip(event, node) {
   tooltip.style.left = `${Math.min(stage.width - 245, Math.max(8, event.clientX - stage.left + 12))}px`;
   tooltip.style.top = `${Math.min(stage.height - 70, Math.max(8, event.clientY - stage.top + 12))}px`;
   const detail = node.kind === 'strategy'
-    ? `학습 강도 ${Number(node.learned_strength || 0).toFixed(3)} · 추론 ${formatInteger(node.inference_count)}회`
-    : `${String(node.layer || node.kind || '').toUpperCase()} · 체크포인트 계산 노드`;
+    ? `학습 강도 ${Number(node.learned_strength || 0).toFixed(3)} · 연결도 ${(Number(node.connectivity || 0) * 100).toFixed(0)}% · 추론 ${formatInteger(node.inference_count)}회`
+    : `${String(node.layer || node.kind || '').toUpperCase()} · 연결도 ${(Number(node.connectivity || 0) * 100).toFixed(0)}% · ${formatInteger(node.edge_count)}개 엣지`;
   tooltip.innerHTML = `<b>${escapeHtml(node.label)}</b><br>${escapeHtml(detail)}`;
 }
 function renderGnnInspector(node) {
@@ -2186,6 +2393,11 @@ function renderGnnInspector(node) {
       : node.kind === 'hidden'
         ? [['계산 계층', 'R-GCN 메시지 은닉층'], ['은닉 인덱스', node.hidden_index], ['은닉 차원', terminalState.gnnGraph?.model?.hidden_dim]]
         : [['계산 계층', '전략별 출력 헤드'], ['전략', node.strategy_id], ['출력 채널', node.channel], ['채널 인덱스', node.channel_index]];
+    details.push(
+      ['가중 연결도', `${(Number(node.connectivity || 0) * 100).toFixed(1)}%`],
+      ['연결 / 관계 종류', `${formatInteger(node.edge_count)} / ${formatInteger(node.relation_diversity)}`],
+      ['기본 각속도', node.orbitAngularSpeed == null ? '-' : `${Number(node.orbitAngularSpeed).toFixed(4)} rad/s`],
+    );
     document.getElementById('gnn-model-inspector').innerHTML = `
       <span>CHECKPOINT COMPUTE NODE</span><h3>${escapeHtml(node.label)}</h3>
       <p>저장된 체크포인트 텐서에서 복원한 실제 계산 노드입니다.</p>
@@ -2197,6 +2409,9 @@ function renderGnnInspector(node) {
     <span>TRAINED STRATEGY NODE</span><h3>${escapeHtml(node.label)}</h3>
     <p>${cluster.label} 군집 · 체크포인트 전략 인덱스 ${Number(node.checkpoint_index) + 1}</p>
     <dl><div><dt>학습 헤드 강도</dt><dd>${Number(node.learned_strength || 0).toFixed(4)}</dd></div>
+    <div><dt>가중 연결도</dt><dd>${(Number(node.connectivity || 0) * 100).toFixed(1)}% · ${formatInteger(node.edge_count)} 엣지</dd></div>
+    <div><dt>관계 다양성 / 세차</dt><dd>${formatInteger(node.relation_diversity)}종 · ${node.orbitPrecession == null ? '-' : Number(node.orbitPrecession).toFixed(4)}</dd></div>
+    <div><dt>기본 각속도 / 관성</dt><dd>${node.orbitAngularSpeed == null ? '-' : Number(node.orbitAngularSpeed).toFixed(4)} · ${node.inertialMass == null ? '-' : Number(node.inertialMass).toFixed(3)}</dd></div>
     <div><dt>학습 라벨</dt><dd>${formatInteger(node.training_labels)} <small>(체결 ${formatInteger(node.training_filled_rows)})</small></dd></div>
     <div><dt>상승(MFE) 학습</dt><dd>${gnnUpsideSupervisionLabel(node)}</dd></div>
     <div><dt>학습 양수 순효율</dt><dd>${node.training_positive_net_rate == null ? '-' : `${(Number(node.training_positive_net_rate) * 100).toFixed(1)}%`}</dd></div>
@@ -2353,7 +2568,7 @@ function renderSystemDiagnostics(data) {
   document.getElementById('diagnostics-score').textContent =
     `${scorePercent.toFixed(0)}%`;
   document.getElementById('diagnostics-threshold').textContent =
-    `실거래 승격 기준 ${(threshold * 100).toFixed(0)}%`;
+    `인프라 신뢰도 기준 ${(threshold * 100).toFixed(0)}%`;
   document.getElementById('diagnostics-progress-bar').style.width = `${scorePercent}%`;
 
   const workers = data.workers || [];
@@ -2381,7 +2596,7 @@ function renderSystemDiagnostics(data) {
         <small>${escapeHtml(item.detail || item.code || '-')}</small>
       </div>
     `).join('')
-    : '<div class="blocker-clear">실거래 승격 차단 사유가 없습니다.</div>';
+    : '<div class="blocker-clear">인프라 신뢰도 차단 사유가 없습니다. 실제 진입 가능 여부는 별도 단계에서 확인합니다.</div>';
 
   const flows = data.flows || {};
   const researchCounts = (flows.research_collection || {}).counts || {};
@@ -3302,22 +3517,36 @@ function renderDecisionOntology(trace) {
   renderDecisionOntologyMeta(trace, ontology, finalDecision);
   if (terminalState.ontologySignature === graphSignature) return;
   terminalState.ontologySignature = graphSignature;
-  const activeAlgorithm = algorithms.find((item) => item.ontology_selected);
+  const activeAlgorithms = algorithms.filter((item) => item.ontology_selected || item.final_selected);
+  const activeAlgorithm = activeAlgorithms.find((item) => item.ontology_selected) || activeAlgorithms[0];
   const activeIndicatorIds = new Set(
     (activeAlgorithm?.requirements || []).map((item) => item.indicator_id),
   );
-  const visibleIndicators = terminalState.ontologyFilter === 'all'
+  const showAllRelationships = terminalState.ontologyFilter === 'all';
+  const visibleIndicators = showAllRelationships
     ? indicators
     : indicators.filter((item) => activeIndicatorIds.has(item.id));
-  const visibleSources = terminalState.ontologyFilter === 'all'
+  const visibleSources = showAllRelationships
     ? sources
     : sources.filter((source) => visibleIndicators.some((item) => item.source_id === source.id));
-  const graphSources = visibleSources.length ? visibleSources : sources.filter((source) => source.available).slice(0, 3);
-  const graphIndicators = visibleIndicators.length ? visibleIndicators : indicators.filter((item) => item.available).slice(0, 4);
-  const graphAlgorithms = terminalState.ontologyFilter === 'all'
+  // An empty active path is an authoritative state, not a cue to mix arbitrary
+  // available facts with every strategy. That old fallback produced orphaned
+  // cards and made a valid NO_TRADE decision look like a broken graph.
+  const graphSources = visibleSources;
+  const graphIndicators = visibleIndicators;
+  const reasonCodes = finalDecision.reason_codes || [];
+  const noCandidateSymbols = reasonCodes.includes('NO_CANDIDATE_SYMBOLS');
+  const emptyPathGate = {
+    id: 'decision_gate',
+    label: noCandidateSymbols ? '후보 종목 탐색 게이트' : '전략 선택 게이트',
+    thesis: noCandidateSymbols
+      ? '실시간 후보 탐색 결과가 0건이어서 전략 평가 단계로 진입하지 않았습니다.'
+      : '이번 판단 주기에는 선택되거나 라우팅된 전략이 없습니다.',
+    gate: true,
+  };
+  const displayedAlgorithms = showAllRelationships
     ? algorithms
-    : algorithms.filter((item) => item.ontology_selected || item.final_selected);
-  const displayedAlgorithms = graphAlgorithms.length ? graphAlgorithms : algorithms;
+    : activeAlgorithms.length ? activeAlgorithms : [emptyPathGate];
   const height = Math.max(
     510,
     78 + graphSources.length * 72,
@@ -3339,7 +3568,7 @@ function renderDecisionOntology(trace) {
   };
   addText(layerX.source, 27, '01  SOURCE DATA', 'graph-layer-label');
   addText(layerX.indicator, 27, '02  INDICATORS / FACTS', 'graph-layer-label');
-  addText(layerX.algorithm, 27, '03  STRATEGY EXPERTS', 'graph-layer-label');
+  addText(layerX.algorithm, 27, '03  STRATEGY / GATES', 'graph-layer-label');
   addText(layerX.decision, 27, '04  ROUTING', 'graph-layer-label');
 
   const layoutNodes = (items, layer, gap, formatter) => {
@@ -3399,17 +3628,23 @@ function renderDecisionOntology(trace) {
   layoutNodes(displayedAlgorithms, 'algorithm', 72, (item) => ({
     id: `algorithm:${item.id}`,
     title: strategyLabels[item.id] || item.label || item.id,
-    value: item.ontology_selected ? 'ONTOLOGY SELECTED' : item.final_selected ? 'FINAL SELECTED' : 'CANDIDATE',
-    className: item.ontology_selected || item.final_selected ? 'selected' : '',
+    value: item.gate
+      ? noCandidateSymbols ? '0 CANDIDATES' : 'NO STRATEGY SELECTED'
+      : item.ontology_selected ? 'ONTOLOGY SELECTED' : item.final_selected ? 'FINAL SELECTED' : 'CANDIDATE',
+    className: item.gate ? 'blocked' : item.ontology_selected || item.final_selected ? 'selected' : '',
     detail: {
-      kind: 'STRATEGY EXPERT',
+      kind: item.gate ? 'DECISION GATE' : 'STRATEGY EXPERT',
       title: strategyLabels[item.id] || item.label || item.id,
-      value: item.ontology_selected ? '온톨로지 선택' : item.final_selected ? '최종 선택' : '후보',
+      value: item.gate
+        ? noCandidateSymbols ? '후보 0건' : '선택 전략 없음'
+        : item.ontology_selected ? '온톨로지 선택' : item.final_selected ? '최종 선택' : '후보',
       description: item.thesis,
-      rows: (item.requirements || []).map((rule) => [
-        indicators.find((indicator) => indicator.id === rule.indicator_id)?.label || rule.indicator_id,
-        `${rule.operator} ${formatOntologyScore(rule.threshold)} · ${rule.passed === null ? 'UNKNOWN' : rule.passed ? 'PASS' : 'FAIL'}`,
-      ]),
+      rows: item.gate
+        ? [['판단 경로', finalDecision.path || '-'], ['차단 사유', reasonCodes.join(' · ') || 'NO_SELECTED_STRATEGY']]
+        : (item.requirements || []).map((rule) => [
+          indicators.find((indicator) => indicator.id === rule.indicator_id)?.label || rule.indicator_id,
+          `${rule.operator} ${formatOntologyScore(rule.threshold)} · ${rule.passed === null ? 'UNKNOWN' : rule.passed ? 'PASS' : 'FAIL'}`,
+        ]),
     },
   }));
 
@@ -3456,6 +3691,21 @@ function renderDecisionOntology(trace) {
     }
   });
   displayedAlgorithms.forEach((algorithm) => {
+    if (algorithm.gate) {
+      edges.push({
+        from: `algorithm:${algorithm.id}`,
+        to: decisionId,
+        className: 'block',
+        detail: {
+          kind: 'GATE → ROUTER',
+          title: `${algorithm.label} → ${finalDecision.action || 'NO_TRADE'}`,
+          value: noCandidateSymbols ? '후보 없음' : '전략 미선택',
+          description: algorithm.thesis,
+          rows: [['결과', finalDecision.action || 'NO_TRADE'], ['사유', reasonCodes.join(' · ') || 'NO_SELECTED_STRATEGY']],
+        },
+      });
+      return;
+    }
     (algorithm.requirements || []).forEach((rule) => {
       if (!positions.has(`indicator:${rule.indicator_id}`)) return;
       const indicator = indicators.find((item) => item.id === rule.indicator_id);
@@ -3474,7 +3724,7 @@ function renderDecisionOntology(trace) {
       });
     });
     const blockedByUtility = (finalDecision.reason_codes || []).some((reason) => String(reason).includes(algorithm.id));
-    if (algorithm.ontology_selected || terminalState.ontologyFilter === 'all') {
+    if (algorithm.ontology_selected || algorithm.final_selected || showAllRelationships) {
       edges.push({
         from: `algorithm:${algorithm.id}`,
         to: decisionId,
@@ -3515,8 +3765,9 @@ function renderDecisionOntology(trace) {
 
 function renderDecisionOntologyMeta(trace, ontology, finalDecision) {
   const allowedName = strategyLabels[ontology.strategy_id] || ontology.strategy_id || '선택 없음';
+  const primaryReason = (finalDecision.reason_codes || [])[0] || '판단 근거 기록 없음';
   document.getElementById('decision-ontology-summary').textContent =
-    `온톨로지: ${allowedName} ${ontology.allowed ? '허용' : '차단'} · 최종: ${finalDecision.action || 'NO_TRADE'} (${String(finalDecision.path || '-').toUpperCase()})`;
+    `온톨로지: ${allowedName} ${ontology.allowed ? '허용' : '차단'} · 최종: ${finalDecision.action || 'NO_TRADE'} (${String(finalDecision.path || '-').toUpperCase()}) · ${primaryReason}`;
   const liveBadge = document.getElementById('decision-ontology-live');
   liveBadge.textContent = `${trace.fresh ? 'LIVE' : 'STALE'} · ${shortClock(trace.generated_at)}`;
   liveBadge.className = trace.fresh ? 'status-chip' : 'status-chip blocked';
@@ -3814,12 +4065,179 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function syncDecisionOntologyFullscreen() {
+  const panel = document.getElementById('decision-ontology-panel');
+  const toggle = document.getElementById('decision-ontology-fullscreen');
+  if (!panel || !toggle) return;
+  const active = document.fullscreenElement === panel
+    || panel.classList.contains('is-viewport-fullscreen');
+  document.body.classList.toggle('decision-ontology-fullscreen', active);
+  toggle.classList.toggle('active', active);
+  toggle.setAttribute('aria-pressed', String(active));
+  toggle.textContent = active ? '⛶ 원래 크기' : '⛶ 전체화면';
+  toggle.title = active ? '네트워크 시각화 원래 크기로 복귀' : '네트워크 시각화 전체화면';
+  // The SVG uses a viewBox, but dispatching resize also lets every browser
+  // recalculate the fullscreen element before the next paint.
+  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+}
+
+async function toggleDecisionOntologyFullscreen() {
+  const panel = document.getElementById('decision-ontology-panel');
+  if (!panel) return;
+  const fallbackActive = panel.classList.contains('is-viewport-fullscreen');
+  const nativeActive = document.fullscreenElement === panel;
+  if (nativeActive && document.exitFullscreen) {
+    await document.exitFullscreen();
+    return;
+  }
+  if (fallbackActive) {
+    panel.classList.remove('is-viewport-fullscreen');
+    syncDecisionOntologyFullscreen();
+    return;
+  }
+  if (panel.requestFullscreen) {
+    try {
+      await panel.requestFullscreen();
+      return;
+    } catch (_error) {
+      // Embedded browsers can deny the native API. The viewport overlay keeps
+      // the same graph-only behavior without making the control a dead button.
+    }
+  }
+  panel.classList.add('is-viewport-fullscreen');
+  syncDecisionOntologyFullscreen();
+}
+
+function bindDecisionOntologyFullscreen() {
+  const panel = document.getElementById('decision-ontology-panel');
+  const toggle = document.getElementById('decision-ontology-fullscreen');
+  if (!panel || !toggle || toggle.dataset.bound === 'true') return;
+  toggle.dataset.bound = 'true';
+  toggle.addEventListener('click', () => {
+    toggleDecisionOntologyFullscreen().catch(() => {
+      panel.classList.add('is-viewport-fullscreen');
+      syncDecisionOntologyFullscreen();
+    });
+  });
+  document.addEventListener('fullscreenchange', syncDecisionOntologyFullscreen);
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !panel.classList.contains('is-viewport-fullscreen')) return;
+    panel.classList.remove('is-viewport-fullscreen');
+    syncDecisionOntologyFullscreen();
+  });
+  syncDecisionOntologyFullscreen();
+}
+
+function syncGnnModelFullscreen() {
+  const panel = document.getElementById('gnn-model-panel');
+  const toggle = document.getElementById('gnn-model-fullscreen');
+  if (!panel || !toggle) return;
+  const active = document.fullscreenElement === panel
+    || panel.classList.contains('is-viewport-fullscreen');
+  document.body.classList.toggle('gnn-model-fullscreen', active);
+  toggle.classList.toggle('active', active);
+  toggle.setAttribute('aria-pressed', String(active));
+  toggle.textContent = active ? '⛶ 원래 크기' : '⛶ 전체화면';
+  toggle.title = active
+    ? '학습·추론 GNN 네트워크 원래 크기로 복귀'
+    : '학습·추론 GNN 네트워크 전체화면';
+  // Fullscreen changes the WebGL canvas box without changing its backing
+  // buffer. Two frames let the browser finish layout before the renderer's
+  // existing resize listener reads the new dimensions.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    window.dispatchEvent(new Event('resize'));
+  }));
+}
+
+async function toggleGnnModelFullscreen() {
+  const panel = document.getElementById('gnn-model-panel');
+  if (!panel) return;
+  const fallbackActive = panel.classList.contains('is-viewport-fullscreen');
+  const nativeActive = document.fullscreenElement === panel;
+  if (nativeActive && document.exitFullscreen) {
+    await document.exitFullscreen();
+    return;
+  }
+  if (fallbackActive) {
+    panel.classList.remove('is-viewport-fullscreen');
+    syncGnnModelFullscreen();
+    return;
+  }
+  if (panel.requestFullscreen) {
+    try {
+      await panel.requestFullscreen();
+      return;
+    } catch (_error) {
+      // Some embedded browsers reject the native API. Use a viewport-fixed
+      // surface so the graph control still behaves as fullscreen.
+    }
+  }
+  panel.classList.add('is-viewport-fullscreen');
+  syncGnnModelFullscreen();
+}
+
+function bindGnnModelFullscreen() {
+  const panel = document.getElementById('gnn-model-panel');
+  const toggle = document.getElementById('gnn-model-fullscreen');
+  if (!panel || !toggle || toggle.dataset.bound === 'true') return;
+  toggle.dataset.bound = 'true';
+  toggle.addEventListener('click', () => {
+    toggleGnnModelFullscreen().catch(() => {
+      panel.classList.add('is-viewport-fullscreen');
+      syncGnnModelFullscreen();
+    });
+  });
+  document.addEventListener('fullscreenchange', syncGnnModelFullscreen);
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || !panel.classList.contains('is-viewport-fullscreen')) return;
+    panel.classList.remove('is-viewport-fullscreen');
+    syncGnnModelFullscreen();
+  });
+  syncGnnModelFullscreen();
+}
+
 function readGnnVisualizationPreference() {
   try {
     return localStorage.getItem(GNN_VISUALIZATION_STORAGE_KEY) === 'true';
   } catch (_error) {
     return false;
   }
+}
+
+function readGnnAutoRotationPreference() {
+  try {
+    const saved = localStorage.getItem(GNN_AUTO_ROTATION_STORAGE_KEY);
+    return saved === null ? true : saved === 'true';
+  } catch (_error) {
+    return true;
+  }
+}
+
+function applyGnnAutoRotationState() {
+  const toggle = document.getElementById('gnn-auto-rotation-toggle');
+  if (!toggle) return;
+  toggle.classList.toggle('active', gnnAutoRotationEnabled);
+  toggle.setAttribute('aria-pressed', String(gnnAutoRotationEnabled));
+  toggle.textContent = gnnAutoRotationEnabled ? '자동 회전 끄기' : '자동 회전 켜기';
+  toggle.title = gnnAutoRotationEnabled
+    ? '3D 네트워크 자동 회전 끄기'
+    : '3D 네트워크 자동 회전 켜기';
+}
+
+function bindGnnAutoRotationToggle() {
+  const toggle = document.getElementById('gnn-auto-rotation-toggle');
+  if (!toggle || toggle.dataset.bound === 'true') return;
+  toggle.dataset.bound = 'true';
+  toggle.addEventListener('click', () => {
+    gnnAutoRotationEnabled = !gnnAutoRotationEnabled;
+    try {
+      localStorage.setItem(GNN_AUTO_ROTATION_STORAGE_KEY, String(gnnAutoRotationEnabled));
+    } catch (_error) {
+      /* Private mode: the choice applies until the page is closed. */
+    }
+    applyGnnAutoRotationState();
+  });
+  applyGnnAutoRotationState();
 }
 
 function applyGnnVisualizationState() {
@@ -3912,6 +4330,9 @@ document.getElementById('terminal-refresh').addEventListener('click', () => {
 });
 bindGnnVisualizationToggle();
 applyGnnVisualizationState();
+bindGnnAutoRotationToggle();
+bindDecisionOntologyFullscreen();
+bindGnnModelFullscreen();
 // Every canvas sizes its backing store from its box, so a box that changed
 // without a repaint shows a stretched or clipped chart. Frames are now
 // resizable and movable, which makes that a routine event rather than a

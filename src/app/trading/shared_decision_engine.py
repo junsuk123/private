@@ -1150,17 +1150,11 @@ class SharedLiveDecisionEngine:
                 account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
             )
         )
-        # Under the GNN-direct posture the gate is demoted to advisory for an
-        # ELECTED strategy: it still runs and its verdict is still recorded, but it
-        # no longer vetoes. Scoped to ``strategy_locked`` on purpose -- the operator
-        # asked for the GNN's pick to reach execution, not for unrelated fallback
-        # buys to stop being judged.
-        profitability_bypassed = (
-            not profitability_decision.allowed
-            and strategy_locked
-            and _gnn_direct_election_enabled()
-        )
-        if not profitability_decision.allowed and not profitability_bypassed:
+        # Profitability is an execution authority, not an advisory score. No
+        # selector posture (including GNN-direct) may overrule a cost-adjusted
+        # negative-net verdict.
+        profitability_bypassed = False
+        if not profitability_decision.allowed:
             reasons = (
                 *profitability_decision.rejection_reasons,
                 "PROFITABILITY_GATE_REJECTED",

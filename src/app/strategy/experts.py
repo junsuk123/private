@@ -577,6 +577,51 @@ class BarTrendContinuationExpert(StrategyExpert):
         )
 
 
+class SupertrendDmiContinuationExpert(StrategyExpert):
+    strategy_id = "supertrend_dmi_continuation"
+    thesis = "ATR trend direction persists when directional strength and participation agree"
+    default_config = _geometry_config("supertrend_dmi_continuation")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        # The serving algorithm owns the point-value Supertrend/DMI tests.  The
+        # expert uses the already-stable graph vocabulary so adding this output
+        # head does not silently change the checkpoint input schema.
+        return (
+            c.q("return") >= self.config.entry_quantile
+            and c.q("momentum_persistence_long") >= self.config.entry_quantile
+            and c.q("volume") >= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class KeltnerVolatilityBreakoutExpert(StrategyExpert):
+    strategy_id = "keltner_volatility_breakout"
+    thesis = "compressed volatility expands above an ATR envelope with confirming volume"
+    default_config = _geometry_config("keltner_volatility_breakout")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            c.q("breakout") >= self.config.entry_quantile
+            and c.q("first_half_hour_volatility") >= self.config.confirmation_quantile
+            and c.q("volume") >= self.config.entry_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
+class ChoppinessRangeReversionExpert(StrategyExpert):
+    strategy_id = "choppiness_range_reversion"
+    thesis = "a nondirectional lower-band extreme reverts toward session value"
+    default_config = _geometry_config("choppiness_range_reversion")
+
+    def admissible(self, c: ExpertContext) -> bool:
+        return (
+            c.q("vwap_deviation") <= 1 - self.config.entry_quantile
+            and c.q("reversion") >= self.config.confirmation_quantile
+            and c.q("momentum_persistence_long") <= self.config.confirmation_quantile
+            and c.q("liquidity") >= self.config.confirmation_quantile
+        )
+
+
 ALL_EXPERT_TYPES = (
     IntradayMomentumExpert,
     BreakoutVolumeExpert,
@@ -598,6 +643,9 @@ ALL_EXPERT_TYPES = (
     OvernightGapCarryExpert,
     RangeSupportReversionExpert,
     BarTrendContinuationExpert,
+    SupertrendDmiContinuationExpert,
+    KeltnerVolatilityBreakoutExpert,
+    ChoppinessRangeReversionExpert,
 )
 
 assert tuple(kind.strategy_id for kind in ALL_EXPERT_TYPES) == STRATEGY_IDS

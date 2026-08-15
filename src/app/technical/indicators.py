@@ -68,6 +68,8 @@ __all__ = [
     "DonchianResult",
     "RvgiResult",
     "BoxGeometryResult",
+    "SupertrendResult",
+    "KeltnerResult",
     "closes",
     "highs",
     "lows",
@@ -87,6 +89,9 @@ __all__ = [
     "orderbook_imbalance",
     "rvgi",
     "causal_box_geometry",
+    "supertrend",
+    "keltner_channels",
+    "choppiness_index",
 ]
 
 
@@ -144,6 +149,27 @@ class BoxGeometryResult:
     width_pct: float | None
     position: float | None
     source_timestamp: object | None
+    ok: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class SupertrendResult:
+    line: float | None
+    direction: int | None
+    upper_band: float | None
+    lower_band: float | None
+    ok: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class KeltnerResult:
+    mid: float | None
+    upper: float | None
+    lower: float | None
+    position: float | None
+    bandwidth: float | None
     ok: bool
     reason: str = ""
 
@@ -398,6 +424,138 @@ def orderbook_imbalance(bid_size: object, ask_size: object) -> float | None:
     if total <= 0:
         return None
     return (bid - ask) / total
+
+
+def _true_ranges(bars: Sequence[OHLCVBar]) -> list[float]:
+    ordered = tuple(bars)
+    if not ordered:
+        return []
+    result: list[float] = []
+    previous_close: float | None = None
+    for bar in ordered:
+        high, low, close = float(bar.high), float(bar.low), float(bar.close)
+        if (
+            not all(math.isfinite(value) for value in (high, low, close))
+            or high < low
+        ):
+            return []
+        true_range = high - low
+        if previous_close is not None:
+            true_range = max(
+                true_range,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        result.append(true_range)
+        previous_close = close
+    return result
+
+
+def _wilder_rma_series(values: Sequence[float], period: int) -> list[float | None]:
+    if period <= 0 or len(values) < period:
+        return [None] * len(values)
+    out: list[float | None] = [None] * len(values)
+    current = fmean(values[:period])
+    out[period - 1] = current
+    for index in range(period, len(values)):
+        current = (current * (period - 1) + float(values[index])) / period
+        out[index] = current
+    return out
+
+
+def supertrend(
+    bars: Sequence[OHLCVBar], period: int = 10, multiplier: float = 3.0
+) -> SupertrendResult:
+    """TradingView-compatible ATR Supertrend over completed bars."""
+    ordered = tuple(bars)
+    if period <= 0 or multiplier <= 0 or len(ordered) < period + 1:
+        return SupertrendResult(None, None, None, None, False, "insufficient_data")
+    true_ranges = _true_ranges(ordered)
+    if not true_ranges:
+        return SupertrendResult(None, None, None, None, False, "invalid_data")
+    atr_values = _wilder_rma_series(true_ranges, period)
+    final_upper: float | None = None
+    final_lower: float | None = None
+    line: float | None = None
+    direction = -1
+    previous_close: float | None = None
+    for index, bar in enumerate(ordered):
+        atr_value = atr_values[index]
+        close = float(bar.close)
+        if atr_value is None:
+            previous_close = close
+            continue
+        midpoint = (float(bar.high) + float(bar.low)) / 2.0
+        basic_upper = midpoint + multiplier * atr_value
+        basic_lower = midpoint - multiplier * atr_value
+        prior_upper, prior_lower, prior_line = final_upper, final_lower, line
+        final_upper = (
+            basic_upper
+            if prior_upper is None
+            or basic_upper < prior_upper
+            or (previous_close is not None and previous_close > prior_upper)
+            else prior_upper
+        )
+        final_lower = (
+            basic_lower
+            if prior_lower is None
+            or basic_lower > prior_lower
+            or (previous_close is not None and previous_close < prior_lower)
+            else prior_lower
+        )
+        if prior_line is None or prior_upper is None:
+            direction = -1
+        elif abs(prior_line - prior_upper) <= 1e-12:
+            direction = 1 if close > final_upper else -1
+        else:
+            direction = -1 if close < final_lower else 1
+        line = final_lower if direction > 0 else final_upper
+        previous_close = close
+    if line is None or final_upper is None or final_lower is None:
+        return SupertrendResult(None, None, None, None, False, "insufficient_data")
+    return SupertrendResult(line, direction, final_upper, final_lower, True)
+
+
+def keltner_channels(
+    bars: Sequence[OHLCVBar],
+    period: int = 20,
+    atr_period: int = 14,
+    multiplier: float = 2.0,
+) -> KeltnerResult:
+    """EMA centre with Wilder-ATR envelopes, using completed bars only."""
+    ordered = tuple(bars)
+    if period <= 0 or atr_period <= 0 or multiplier <= 0:
+        return KeltnerResult(None, None, None, None, None, False, "invalid_params")
+    mid = ema(closes(ordered), period)
+    atr_value = atr(ordered, atr_period)
+    if mid is None or atr_value is None or not ordered:
+        return KeltnerResult(None, None, None, None, None, False, "insufficient_data")
+    upper = mid + multiplier * atr_value
+    lower = mid - multiplier * atr_value
+    width = upper - lower
+    if width <= 0 or mid <= 0:
+        return KeltnerResult(mid, upper, lower, None, None, False, "invalid_geometry")
+    position = (float(ordered[-1].close) - lower) / width
+    return KeltnerResult(mid, upper, lower, position, width / mid, True)
+
+
+def choppiness_index(bars: Sequence[OHLCVBar], period: int = 14) -> float | None:
+    """E.W. Dreiss CHOP in [0, 100]; direction-neutral regime descriptor."""
+    ordered = tuple(bars)
+    if period <= 1 or len(ordered) < period + 1:
+        return None
+    true_ranges = _true_ranges(ordered)
+    if not true_ranges:
+        return None
+    window = ordered[-period:]
+    price_range = max(float(bar.high) for bar in window) - min(
+        float(bar.low) for bar in window
+    )
+    total_range = sum(true_ranges[-period:])
+    if price_range <= 0 or total_range <= 0:
+        return None
+    value = 100.0 * math.log10(total_range / price_range) / math.log10(period)
+    return max(0.0, min(100.0, value))
 
 
 def rvgi(

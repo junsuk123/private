@@ -21,6 +21,31 @@ from app.strategy.catalog import STRATEGY_IDS
 from app.web_account_routes import create_account_router
 
 
+def test_market_series_cache_reuses_one_snapshot_across_poll_limits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from app import refactor_dashboard as dashboard_module
+
+    dashboard_module._MARKET_SERIES_CACHE.clear()
+    dashboard_module._MARKET_SERIES_REFRESHING.clear()
+    monkeypatch.setenv("MARKET_VIEW_CACHE_SECONDS", "60")
+    calls = []
+
+    def fake_read(database: Path, symbol: str, limit: int) -> dict:
+        calls.append((database, symbol, limit))
+        return {"symbol": symbol, "bars": list(range(390)), "second_bars": []}
+
+    monkeypatch.setattr(dashboard_module, "_market_series_uncached", fake_read)
+
+    short = dashboard_module._market_series(tmp_path / "market.sqlite3", "INTC", 30)
+    full = dashboard_module._market_series(tmp_path / "market.sqlite3", "INTC", 180)
+
+    assert len(short["bars"]) == 30
+    assert len(full["bars"]) == 180
+    assert len(calls) == 1
+    assert calls[0][2] == 390
+
+
 def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -422,6 +447,69 @@ def test_cross_section_source_reports_real_rank_table_availability() -> None:
     assert source["status"] == "AVAILABLE"
     assert indicator["available"] is True
     assert indicator["score"] == 1.0
+
+
+def test_live_selection_override_drives_decision_ontology_provenance() -> None:
+    trace = _decision_ontology(
+        {"symbol": "INTC", "bars": [], "microstructure": {}},
+        {
+            "action": "NO_TRADE",
+            "path": "live_engine",
+            "reason_codes": ["NO_CANDIDATE_SYMBOLS"],
+            "all_decisions": [
+                {
+                    "path": "live_engine",
+                    "action": "NO_TRADE",
+                    "strategy_id": None,
+                    "reason_codes": ["NO_CANDIDATE_SYMBOLS"],
+                }
+            ],
+            "decision_source": "realtime_trading_engine.live_trace",
+        },
+    )
+
+    assert trace["provenance"]["decision"] == "realtime_trading_engine.live_trace"
+    assert trace["final_decision"]["path"] == "live_engine"
+    assert trace["final_decision"]["reason_codes"] == ["NO_CANDIDATE_SYMBOLS"]
+
+
+def test_decision_ontology_indicators_reference_declared_source_nodes() -> None:
+    trace = _decision_ontology(
+        {"symbol": "INTC", "bars": [], "microstructure": {}},
+        {"all_decisions": []},
+    )
+
+    source_ids = {item["id"] for item in trace["sources"]}
+    indicator_source_ids = {item["source_id"] for item in trace["indicators"]}
+
+    assert indicator_source_ids <= source_ids
+
+
+def test_overnight_carry_window_is_backed_by_the_symbol_session_clock() -> None:
+    bar = {
+        "time": "2026-08-12T19:35:00+00:00",
+        "minute_start": "2026-08-12T19:35:00+00:00",
+        "open": 100.0,
+        "high": 101.0,
+        "low": 99.0,
+        "close": 100.5,
+        "volume": 1000,
+        "vwap": 100.0,
+    }
+    trace = _decision_ontology(
+        {"symbol": "INTC", "bars": [bar], "microstructure": {}},
+        {"all_decisions": []},
+    )
+
+    indicator = next(
+        item for item in trace["indicators"]
+        if item["id"] == "overnight_carry_window"
+    )
+
+    assert indicator["available"] is True
+    assert indicator["score"] == 1.0
+    assert indicator["raw_value"] == 24.0
+    assert indicator["source_id"] == "session_context"
 
 
 def test_market_view_keeps_ontology_admissible_when_gnn_says_no_trade(tmp_path: Path) -> None:

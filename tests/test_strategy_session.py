@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from app.schemas.domain import AccountSnapshot, Holding
 from app.trading.strategy_session import StrategySessionConfig, StrategySessionManager
+from app.technical.strategy_algorithms import round_trip_cost_bps
 
 
 NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
@@ -297,6 +298,63 @@ def test_owned_strategy_ignores_later_ontology_block_and_uses_its_stop(tmp_path)
     )
     assert state["phase"] == "EXITING"
     assert manager.exit_reason_for(stopped) == "STRATEGY_STOP_LOSS"
+
+
+def test_broker_confirmed_exit_fill_suppresses_duplicate_sell(tmp_path):
+    manager = StrategySessionManager(
+        config=_config(tmp_path, record_outcomes=False),
+        selection_evidence_provider=lambda symbols: {},
+    )
+    manager.evaluate(_account(), ("005930",), _bundle(), NOW)
+    manager.mark_entry_submitted("005930", NOW)
+    holding = Holding(
+        ticker="005930",
+        market="KR",
+        company_name="Samsung",
+        sector="Technology",
+        quantity=1,
+        average_price=70_000.0,
+        last_price=69_000.0,
+        opened_at=NOW,
+    )
+    manager.evaluate(_account(holding), (), _bundle(), NOW + timedelta(seconds=1))
+    assert manager.exit_reason_for(holding) == "STRATEGY_STOP_LOSS"
+
+    filled_at = NOW + timedelta(seconds=2)
+    manager.mark_exit_filled("005930", 69_050.0, filled_at)
+
+    state = manager.snapshot()
+    assert state["exit_price"] == 69_050.0
+    assert state["exit_filled_at"] == filled_at.isoformat()
+    assert state["last_reason"] == "EXIT_FILLED_AWAITING_ACCOUNT_FLAT"
+    assert manager.exit_reason_for(holding) is None
+
+
+def test_missing_us_cost_uses_overseas_fee_policy_not_kr_fallback(tmp_path):
+    manager = StrategySessionManager(
+        config=_config(tmp_path, fallback_round_trip_cost_bps=28.0),
+        selection_evidence_provider=lambda symbols: {
+            "AAPL": {
+                "decisions": [
+                    {
+                        "path": "cpu_gnn",
+                        "action": "ACTIVATE_STRATEGY",
+                        "strategy_id": "intraday_momentum",
+                        "reason_codes": ["GNN_REALTIME_TRUST_PASSED"],
+                    }
+                ]
+            }
+        },
+    )
+
+    us_regular = NOW.replace(hour=15)
+    state = manager.evaluate(
+        _account(), ("AAPL",), _bundle(symbol="AAPL"), us_regular
+    )
+
+    assert state["phase"] == "ARMED"
+    assert state["expected_cost_bps"] == round_trip_cost_bps("AAPL")
+    assert state["expected_cost_bps"] > 28.0
 
 
 def test_generic_ontology_admissibility_does_not_elect_first_strategy(tmp_path):

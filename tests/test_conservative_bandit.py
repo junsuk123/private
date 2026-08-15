@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.trading.conservative_bandit import (
     BANDIT_ARM_LOSS_STREAK_SUSPENDED,
+    BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES,
     BANDIT_ARM_MEASURED_NEGATIVE_EDGE,
     BANDIT_ARM_SELECTED,
     BANDIT_CHANGE_POINT_STAND_DOWN,
@@ -91,6 +92,54 @@ def test_cold_arm_with_positive_predicted_edge_is_explored_not_exploited(tmp_pat
     assert selection.selected_arm == "intraday_momentum"
     assert selection.is_exploration
     assert BANDIT_EXPLORATION_ARM_SELECTED in selection.reason_codes
+
+
+def test_live_execution_config_keeps_cold_arm_shadow_only(tmp_path):
+    config = BanditConfig.for_live_execution()
+    bandit = ConservativeStrategyBandit(store=_store(tmp_path), config=config)
+
+    selection = bandit.select(
+        (
+            ArmCandidate(
+                arm="intraday_momentum",
+                symbol="005930",
+                predicted_net_edge_bps=200.0,
+                expected_cost_bps=28.0,
+            ),
+        ),
+        _context(),
+        now=NOW,
+    )
+
+    assert selection.is_no_trade
+    reasons = selection.evaluations[0].reason_codes
+    assert "BANDIT_ARM_COLD_START_SHADOW_ONLY" in reasons
+    assert BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES in reasons
+
+
+def test_live_execution_config_auto_unlocks_after_positive_net_evidence(tmp_path):
+    store = _store(tmp_path)
+    _fill(store, "intraday_momentum", [80.0 + index % 3 for index in range(30)])
+    bandit = ConservativeStrategyBandit(
+        store=store, config=BanditConfig.for_live_execution()
+    )
+
+    selection = bandit.select(
+        (
+            ArmCandidate(
+                arm="intraday_momentum",
+                symbol="005930",
+                predicted_net_edge_bps=60.0,
+                expected_cost_bps=28.0,
+            ),
+        ),
+        _context(),
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert selection.selected_arm == "intraday_momentum"
+    assert not selection.is_no_trade
+    assert not selection.is_exploration
 
 
 def test_measured_negative_arm_is_never_explored(tmp_path):

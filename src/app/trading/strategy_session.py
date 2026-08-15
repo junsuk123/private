@@ -128,6 +128,27 @@ def _measured_spread_bps(micro_result: Any, evidence_row: Mapping[str, Any] | No
     return None
 
 
+def _market_round_trip_cost_bps(symbol: str, fallback_bps: float) -> float:
+    """Resolve a missing cost estimate from the symbol's actual market.
+
+    The legacy fallback is KRX-sized.  Reusing it for an overseas symbol makes a
+    US proposal look materially more profitable than the fee policy says it is.
+    Keep the configured fallback only for the genuinely unreadable-cost case.
+    """
+    # The configured fallback is deliberately the KRX reference and remains the
+    # compatibility authority for domestic proposals.  The defect was applying
+    # that same number to overseas orders.
+    if market_for_symbol(symbol) == "KR":
+        return max(0.0, float(fallback_bps))
+    try:
+        from app.technical.strategy_algorithms import round_trip_cost_bps
+
+        measured = _optional_float(round_trip_cost_bps(symbol))
+    except Exception:  # noqa: BLE001 - cost lookup must fail closed to config.
+        measured = None
+    return max(0.0, measured if measured is not None else float(fallback_bps))
+
+
 def _resolved_geometry(
     strategy_id: str,
     *,
@@ -704,6 +725,9 @@ class StrategySessionState:
         default_factory=lambda: _fallback_exit_geometry().max_holding_seconds
     )
     exit_requested_at: str | None = None
+    # Broker-confirmed terminal fill.  This is distinct from the requested time:
+    # account balance endpoints may continue to show the sold lot for minutes.
+    exit_filled_at: str | None = None
     exit_reason: str | None = None
     cooldown_until: str | None = None
     invalidation_cycles: int = 0
@@ -819,6 +843,14 @@ class StrategySessionManager:
             performance_store if performance_store is not None else _default_performance_store()
         )
         self.bandit = bandit or ConservativeStrategyBandit(store=self.performance_store)
+        # Algorithms are immutable policy objects for the lifetime of a live
+        # session. Building the registry per proposal reread and reparsed YAML
+        # hundreds of times in one election cycle, delaying the first cycle by
+        # minutes. Environment/config is already frozen when this manager is
+        # constructed, so resolve it once and reuse it consistently.
+        from app.technical.strategy_algorithms import build_algorithm_registry
+
+        self._algorithm_registry = build_algorithm_registry()
         self._lock = threading.RLock()
         self._state = self._load()
         # Shadow plans journaled this cycle, awaiting adoption by
@@ -930,10 +962,48 @@ class StrategySessionManager:
         with self._lock:
             if self._state.selected_symbol != str(symbol or "").upper():
                 return 0.0
-            return max(
+            bandit_config = getattr(self.bandit, "config", None)
+            requires_evidence = bool(
+                int(getattr(bandit_config, "minimum_live_sample_count", 0) or 0)
+                or int(
+                    getattr(
+                        bandit_config, "minimum_live_positive_samples", 0
+                    )
+                    or 0
+                )
+            )
+            if requires_evidence:
+                expected_arm = str(self._state.selected_strategy or "")
+                if str(self._state.selected_direction or "LONG").upper() == "SHORT":
+                    expected_arm = f"{expected_arm}:SHORT"
+                authority = next(
+                    (
+                        item
+                        for item in self._state.bandit_evaluations
+                        if str(item.get("arm") or "") == expected_arm
+                        and str(item.get("symbol") or "").upper()
+                        == str(symbol or "").upper()
+                    ),
+                    None,
+                )
+                if not authority or not bool(authority.get("admissible")):
+                    return 0.0
+            selector_cap = max(
                 0.0,
                 min(1.0, float(self._state.selector_v2_order_size_fraction or 0.0)),
             )
+            # Automatically promoted long theses enter through a size-limited
+            # probe.  The selector may impose an even smaller cap; neither layer
+            # can enlarge the other layer's grant.
+            try:
+                from app.trading.long_strategy_promotion import deployment_size_cap
+
+                deployment_cap = deployment_size_cap(
+                    parse_state(self._state.selected_deployment_state)
+                )
+            except Exception:  # noqa: BLE001 - order sizing fails closed.
+                return 0.0
+            return min(selector_cap, deployment_cap)
 
     def order_contract_for(self, symbol: str, *, closing: bool = False) -> dict[str, Any] | None:
         """The (direction, effect, product, loan_date) contract for an order.
@@ -977,6 +1047,10 @@ class StrategySessionManager:
         with self._lock:
             symbol = str(getattr(holding, "ticker", "") or "").upper()
             if self._state.phase != "EXITING" or symbol != self._state.selected_symbol:
+                return None
+            # The order-status endpoint is more authoritative about this order than
+            # a lagging balance row.  Once the exit filled, never emit another SELL.
+            if self._state.exit_filled_at:
                 return None
             return self._state.exit_reason or "STRATEGY_THESIS_INVALIDATED"
 
@@ -1054,6 +1128,31 @@ class StrategySessionManager:
                 self._state.exit_requested_at = self._state.exit_requested_at or _iso(now)
                 self._state.last_reason = "EXIT_ORDER_SUBMITTED_AWAITING_FLAT"
                 self._persist()
+
+    def mark_exit_filled(self, symbol: str, price: float, now: datetime) -> None:
+        """Adopt the broker's terminal exit fill before balance reconciliation.
+
+        This both freezes the actual execution price for learning and closes the
+        duplicate-order window created when the holdings endpoint lags the order
+        endpoint after a completed SELL.
+        """
+        normalized = str(symbol or "").upper()
+        moment = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+        with self._lock:
+            if (
+                self._state.selected_symbol != normalized
+                or self._state.phase not in {"OWNED", "EXITING"}
+            ):
+                return
+            if float(price or 0.0) > 0.0:
+                self._state.exit_price = float(price)
+            self._state.phase = "EXITING"
+            self._state.exit_filled_at = _iso(moment)
+            self._state.last_reason = "EXIT_FILLED_AWAITING_ACCOUNT_FLAT"
+            # Record now, while the true fill timestamp and price are available.
+            # A later flat balance reconciliation is idempotent via outcome_recorded.
+            self._record_outcome(moment)
+            self._persist()
 
     def drain_shadow_plans(self) -> tuple[Any, ...]:
         """Take the shadow plans journaled since the last drain.
@@ -1202,8 +1301,9 @@ class StrategySessionManager:
             else self.config.fallback_round_trip_cost_bps
         )
         opened = _parse_time(state.position_opened_at)
+        closed = _parse_time(state.exit_filled_at) or now
         holding_seconds = (
-            max(0.0, (now - opened).total_seconds()) if opened is not None else None
+            max(0.0, (closed - opened).total_seconds()) if opened is not None else None
         )
         # Borrow accrues over the holding period and is NOT in ``expected_cost_bps``
         # (which is the round trip). Deducted here so the recorded net is the number
@@ -1230,7 +1330,7 @@ class StrategySessionManager:
             expected_net_bps=state.expected_net_return_bps,
             holding_seconds=holding_seconds,
             exit_reason=state.exit_reason or "",
-            recorded_at=now,
+            recorded_at=closed,
             direction=str(direction),
             execution_product=state.selected_execution_product,
             deployment_state=str(state_enum),
@@ -1400,7 +1500,8 @@ class StrategySessionManager:
             self._state.last_reason = "WAITING_FOR_MACRO_MICRO_BUNDLE"
             return
         macro = getattr(bundle, "macro_result", None)
-        macro_regime = getattr(getattr(macro, "market_regime", None), "value", None)
+        raw_macro_regime = getattr(macro, "market_regime", None)
+        macro_regime = getattr(raw_macro_regime, "value", raw_macro_regime)
         self._state.macro_regime = str(macro_regime or "") or None
         self._state.ontology_reason_codes = list(
             getattr(macro, "reason_codes", ()) or ()
@@ -1487,18 +1588,36 @@ class StrategySessionManager:
         executable = [proposal for proposal in proposals if proposal.submits_orders]
         selected: "_ElectionProposal | None" = None
         decided = False
+        bandit_config = getattr(self.bandit, "config", None)
+        live_evidence_required = bool(
+            int(getattr(bandit_config, "minimum_live_sample_count", 0) or 0)
+            or int(
+                getattr(bandit_config, "minimum_live_positive_samples", 0) or 0
+            )
+        )
         if executable and self.config.gnn_direct_election:
-            # Operator posture: the GNN's ranking IS the election. See
-            # ``StrategySessionConfig.gnn_direct_election`` for what this gives up.
-            selected = self._gnn_direct_choice(executable)
+            # GNN-direct may own ranking, but production live authority still
+            # belongs to the evidence gate. This preserves the operator's model
+            # preference without allowing it to turn a cold estimate into an order.
+            gnn_selected = self._gnn_direct_choice(executable)
+            selected = (
+                self._bandit_choice([gnn_selected], macro, now)
+                if live_evidence_required and gnn_selected is not None
+                else gnn_selected
+            )
             decided = True
         elif proposals and self.config.bandit_enabled:
             selected = self._bandit_choice(proposals, macro, now)
             decided = True
         elif executable:
             # Bandit disabled: preserve the historical first-admissible behaviour,
-            # over the order-authorised subset only.
-            selected = executable[0]
+            # over the order-authorised subset only. Production evidence floors
+            # remain mandatory even if ranking was administratively disabled.
+            selected = (
+                self._bandit_choice([executable[0]], macro, now)
+                if live_evidence_required
+                else executable[0]
+            )
             decided = True
 
         # ...and journal the order-authorised arms that did NOT win. Without this the
@@ -1523,7 +1642,14 @@ class StrategySessionManager:
         )
         v2_context_id: str | None = None
         if self._selector_v2_live_authority():
-            selected, v2_context_id = self._selector_v2_live_choice(v2_results, proposals)
+            v2_selected, v2_context_id = self._selector_v2_live_choice(v2_results, proposals)
+            selected = (
+                self._bandit_choice([v2_selected], macro, now)
+                if live_evidence_required and v2_selected is not None
+                else v2_selected
+            )
+            if selected is None:
+                v2_context_id = None
             decided = True
 
         if selected is not None:
@@ -1664,6 +1790,7 @@ class StrategySessionManager:
                 is_actionable_strategy_route(gnn_action)
                 and is_known_strategy(gnn_strategy)
                 and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
+                and "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" not in gnn_reason_codes
             )
             # An untrusted GNN is a MISSING estimator, not a refusal. With the
             # bandit on, the candidate survives and pays an explicit uncertainty
@@ -1741,9 +1868,14 @@ class StrategySessionManager:
                 ),
                 None,
             )
+            expected_cost = _optional_float(gnn.get("expected_cost_bps"))
+            if expected_cost is None:
+                expected_cost = _market_round_trip_cost_bps(
+                    symbol, self.config.fallback_round_trip_cost_bps
+                )
             geometry = _resolved_geometry(
                 selected_strategy,
-                expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
+                expected_cost_bps=expected_cost,
                 micro_result=micro_result,
                 evidence_row=row if isinstance(row, Mapping) else None,
             )
@@ -1788,7 +1920,7 @@ class StrategySessionManager:
                     expected_net_return_bps=_optional_float(
                         getattr(intent, "expected_net_return_bps", None)
                     ),
-                    expected_cost_bps=_optional_float(gnn.get("expected_cost_bps")),
+                    expected_cost_bps=expected_cost,
                     gnn_actionable=gnn_actionable,
                     gnn_action=gnn_action,
                     gnn_reason_codes=gnn_reason_codes,
@@ -1867,6 +1999,7 @@ class StrategySessionManager:
                 is_actionable_strategy_route(gnn_action)
                 and is_known_strategy(gnn_strategy)
                 and "GNN_REALTIME_TRUST_PASSED" in gnn_reason_codes
+                and "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" not in gnn_reason_codes
             )
             strategy_rows = [
                 item
@@ -1907,10 +2040,13 @@ class StrategySessionManager:
                     continue
                 row_reasons = list(strategy_row.get("reason_codes") or ())
                 row_trusted = "GNN_REALTIME_TRUST_PASSED" in row_reasons
+                checkpoint_authorized = (
+                    "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" not in row_reasons
+                )
                 row_path = str(strategy_row.get("path") or "")
                 row_is_gnn = row_path.startswith("cpu_gnn")
                 row_is_validation = row_path == "cpu_gnn_validation"
-                row_actionable = row_is_gnn and row_trusted
+                row_actionable = row_is_gnn and row_trusted and checkpoint_authorized
                 # Full-vector rows are evidence, not permission.  Keep untrusted
                 # rows as SHADOW proposals so they are compared and journalled,
                 # but force their deployment state below to SHADOW.  The previous
@@ -1939,11 +2075,14 @@ class StrategySessionManager:
                         f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
                     )
                     continue
+                expected_cost = _optional_float(strategy_row.get("expected_cost_bps"))
+                if expected_cost is None:
+                    expected_cost = _market_round_trip_cost_bps(
+                        normalized, self.config.fallback_round_trip_cost_bps
+                    )
                 geometry = _resolved_geometry(
                     selected_strategy,
-                    expected_cost_bps=_optional_float(
-                        strategy_row.get("expected_cost_bps")
-                    ),
+                    expected_cost_bps=expected_cost,
                     micro_result=micro_result,
                     evidence_row=row if isinstance(row, Mapping) else None,
                 )
@@ -1997,7 +2136,6 @@ class StrategySessionManager:
                 # possible only when the owned algorithm actually fired above.
                 if row_is_gnn and not row_actionable and mechanical is None:
                     deployment_state = StrategyDeploymentState.SHADOW
-                expected_cost = _optional_float(strategy_row.get("expected_cost_bps"))
                 model_net = _optional_float(strategy_row.get("expected_net_return_bps"))
                 # An untrusted GNN vector proposes a pair but cannot define its
                 # forward edge.  For a real mechanical trigger, use the strategy's
@@ -2017,7 +2155,9 @@ class StrategySessionManager:
                         strategy_id=selected_strategy,
                         source=(
                             "GNN_JOINT_SYMBOL_STRATEGY_ELECTION"
-                            if row_is_gnn
+                            if row_actionable
+                            else "ALGORITHM_MECHANICAL_ELECTION"
+                            if row_is_gnn and mechanical is not None
                             else "ONTOLOGY_STRATEGY_ELECTION"
                         ),
                         entry_price=entry_price,
@@ -2101,7 +2241,9 @@ class StrategySessionManager:
             features = TechnicalFeatureSet(
                 **{key: value for key, value in raw_features.items() if key in feature_names}
             )
-            algorithm = get_algorithm(strategy_id)
+            algorithm = get_algorithm(
+                strategy_id, registry=self._algorithm_registry
+            )
             if algorithm is None:
                 decision = {
                     "strategy_id": strategy_id,
@@ -2182,8 +2324,7 @@ class StrategySessionManager:
                 selected[key] = proposal
         return list(selected.values())
 
-    @staticmethod
-    def _deployment_authorized(strategy_id: str) -> tuple[bool, str]:
+    def _deployment_authorized(self, strategy_id: str) -> tuple[bool, str]:
         """Is this strategy authorised for LIVE deployment (not just enabled)?
 
         Deployment-gated strategies (RVGI box breakout and the three added for the
@@ -2198,7 +2339,9 @@ class StrategySessionManager:
         try:
             from app.technical.strategy_algorithms import strategy_live_authorized
 
-            if strategy_live_authorized(strategy_id):
+            if strategy_live_authorized(
+                strategy_id, registry=self._algorithm_registry
+            ):
                 return True, ""
         except Exception:  # noqa: BLE001 - a lookup failure must fail closed.
             return False, f"STRATEGY_AUTHORIZATION_UNAVAILABLE:{strategy_id}"
@@ -2219,11 +2362,21 @@ class StrategySessionManager:
         """
         if direction is PositionDirection.LONG:
             authorized, _ = self._deployment_authorized(strategy_id)
-            return (
-                StrategyDeploymentState.LIVE_FULL
-                if authorized
-                else StrategyDeploymentState.SHADOW
-            )
+            if authorized:
+                return StrategyDeploymentState.LIVE_FULL
+            try:
+                from app.technical.strategy_algorithms import strategy_shadow_authorized
+                from app.trading.long_strategy_promotion import evaluate_long_promotion
+
+                if not strategy_shadow_authorized(
+                    strategy_id, registry=self._algorithm_registry
+                ):
+                    return StrategyDeploymentState.DISABLED
+                return evaluate_long_promotion(
+                    strategy_id, market, self.performance_store
+                ).state
+            except Exception:  # noqa: BLE001 - fail closed to SHADOW.
+                return StrategyDeploymentState.SHADOW
         try:
             from app.trading.short_strategy_promotion import default_promotion_controller
 
@@ -2914,7 +3067,9 @@ class StrategySessionManager:
             from app.technical.signals import TechnicalFeatureSet
             from app.technical.strategy_algorithms import ElectionContext, get_algorithm
 
-            algorithm = get_algorithm(state.selected_strategy)
+            algorithm = get_algorithm(
+                state.selected_strategy, registry=self._algorithm_registry
+            )
             if algorithm is None:
                 return
             allowed = ElectionContext.__dataclass_fields__.keys()

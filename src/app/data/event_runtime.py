@@ -160,7 +160,12 @@ async def run_event_driven_kis_websocket_collector(
 
 async def runtime_persistence_worker(runtime: EventDrivenMarketRuntime) -> None:
     while True:
-        await runtime.persist_one()
+        try:
+            await runtime.persist_one()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one transient store failure must not kill the worker.
+            logger.exception("realtime market persistence batch failed; worker will continue")
 
 
 async def slow_intelligence_worker(

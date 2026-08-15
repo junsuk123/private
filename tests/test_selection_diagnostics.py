@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.technical.selection_diagnostics import (
     SelectionDiagnosticsCollector,
     SelectionStage,
+    collector_from_algorithm_evaluations,
     merge_stage_counts,
 )
 
@@ -152,3 +153,47 @@ class TestMerge:
         assert merged["SELECTED"] == 4
         assert merged["SHADOW_ONLY"] == 2
         assert merged["MACRO_BLOCKED"] == 0
+
+
+class TestCycleSnapshotAdapter:
+    def test_reconstructs_real_feature_and_trigger_failures(self):
+        collector = collector_from_algorithm_evaluations(
+            [
+                {
+                    "symbol": "INTC",
+                    "strategy_id": "vwap_mean_reversion",
+                    "triggered": False,
+                    "expected_edge_bps": 0.0,
+                    "horizon_seconds": 240,
+                    "reason_codes": ["TICK_WINDOW_NOT_READY"],
+                },
+                {
+                    "symbol": "SOFI",
+                    "strategy_id": "bar_confirmed_vwap_recovery",
+                    "triggered": False,
+                    "expected_edge_bps": 0.0,
+                    "reason_codes": ["BAR_VWAP_DISPLACEMENT_TOO_SMALL"],
+                },
+            ],
+            session={"last_reason": "GNN_NOT_LIVE_AUTHORIZED"},
+        )
+
+        assert collector.records[0].stage is SelectionStage.FEATURE_UNAVAILABLE
+        assert collector.records[1].stage is SelectionStage.STRATEGY_TRIGGER_FALSE
+        assert collector.funnel()["raw"] == 2
+
+    def test_positive_trigger_without_gnn_authority_is_reported_as_authorization(self):
+        collector = collector_from_algorithm_evaluations(
+            [
+                {
+                    "symbol": "INTC",
+                    "strategy_id": "intraday_momentum",
+                    "triggered": True,
+                    "expected_edge_bps": 12.5,
+                    "reason_codes": [],
+                }
+            ],
+            session={"last_reason": "GNN_NOT_LIVE_AUTHORIZED"},
+        )
+
+        assert collector.records[0].stage is SelectionStage.LIVE_NOT_AUTHORIZED

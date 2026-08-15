@@ -409,7 +409,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260810-market-physics-3" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260813-live-ontology-v2" />
   <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
   <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
@@ -590,7 +590,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           <small id="diagnostics-threshold">승격 기준 -</small>
         </div>
       </div>
-      <div class="diagnostics-progress" aria-label="실거래 준비도">
+      <div class="diagnostics-progress" aria-label="인프라 준비도">
         <i id="diagnostics-progress-bar"></i>
       </div>
       <div class="diagnostics-grid">
@@ -689,6 +689,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <div class="gnn-model-actions">
           <span class="status-chip waiting" id="gnn-model-status">LOADING</span>
           <button type="button" class="gnn-visualization-toggle" id="gnn-visualization-toggle" aria-pressed="false">3D 시각화 켜기</button>
+          <button type="button" class="gnn-auto-rotation-toggle active" id="gnn-auto-rotation-toggle" aria-pressed="true" title="3D 네트워크 자동 회전 끄기">자동 회전 끄기</button>
           <button type="button" class="gnn-relation-filter active" data-gnn-relation="all">전체 연결</button>
           <button type="button" class="gnn-relation-filter" data-gnn-relation="learned_parameter">학습 파라미터</button>
           <button type="button" class="gnn-relation-filter" data-gnn-relation="strategy_topology">전략 토폴로지</button>
@@ -696,6 +697,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           <button type="button" class="gnn-relation-filter" data-gnn-relation="confirming_methodology">상호 확인</button>
           <button type="button" class="gnn-relation-filter" data-gnn-relation="contrasting_methodology">대조 관계</button>
           <button type="button" id="gnn-reset-view">전체 맞춤</button>
+          <button type="button" id="gnn-model-fullscreen" aria-pressed="false" title="학습·추론 GNN 네트워크 전체화면">⛶ 전체화면</button>
         </div>
       </div>
       <div class="gnn-model-metrics">
@@ -715,6 +717,15 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         <div class="gnn-phase-track" id="gnn-phase-track">
           <span data-gnn-phase="input">01 INPUT</span><span data-gnn-phase="message_passing">02 MESSAGE</span><span data-gnn-phase="strategy_election">03 ELECTION</span><span data-gnn-phase="output_decode">04 OUTPUT</span>
         </div>
+        <section class="gnn-system-health" id="gnn-system-health" aria-label="GNN 시스템 상태 텔레메트리" aria-live="polite">
+          <header><span>SYSTEM TELEMETRY</span><strong id="gnn-health-overall" data-state="idle">WAITING</strong></header>
+          <div class="gnn-health-grid">
+            <article id="gnn-health-data" data-state="warn"><span>DATA / API</span><b>WAITING</b><small>그래프 응답 대기</small></article>
+            <article id="gnn-health-model" data-state="warn"><span>MODEL</span><b>WAITING</b><small>체크포인트 확인 대기</small></article>
+            <article id="gnn-health-flow" data-state="warn"><span>INFERENCE FLOW</span><b>WAITING</b><small>실시간 계측 대기</small></article>
+            <article id="gnn-health-physics" data-state="warn"><span>DYNAMIC PHYSICS</span><b>G 1.00 · T 1.00</b><small>중립 물리값</small></article>
+          </div>
+        </section>
         <div class="gnn-model-tooltip" id="gnn-model-tooltip" hidden></div>
         <aside class="gnn-model-inspector" id="gnn-model-inspector">
           <span>MODEL INSPECTOR</span>
@@ -779,7 +790,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="terminal-panel decision-ontology-panel">
+    <section class="terminal-panel decision-ontology-panel" id="decision-ontology-panel">
       <div class="panel-head ontology-graph-head">
         <div>
           <p class="panel-kicker">LIVE DECISION ONTOLOGY</p>
@@ -790,6 +801,14 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           <span class="status-chip" id="decision-ontology-live">WAITING</span>
           <button type="button" class="graph-filter active" data-graph-filter="active">선택 경로</button>
           <button type="button" class="graph-filter" data-graph-filter="all">전체 관계</button>
+          <button
+            type="button"
+            class="graph-action-button ontology-fullscreen-toggle"
+            id="decision-ontology-fullscreen"
+            aria-controls="decision-ontology-panel"
+            aria-pressed="false"
+            title="네트워크 시각화 전체화면"
+          >⛶ 전체화면</button>
         </div>
       </div>
       <div class="ontology-legend">
@@ -883,8 +902,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260811-orbital-system-1"></script>
-  <script src="/static/operations_overview.js?v=20260810-macro-context-split-v1"></script>
+  <script src="/static/strategy_terminal.js?v=20260813-live-ontology-v2"></script>
+  <script src="/static/operations_overview.js?v=20260812-gnn-trust-state-v1"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->
   <script src="/static/terminal_layout.js?v=20260802-movable-frames-2"></script>

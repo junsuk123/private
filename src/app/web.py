@@ -68,7 +68,7 @@ from app.realtime.learning import (
 from app.graph.npu_classifier import get_ontology_npu_classifier
 from app.npu.runtime_manager import get_npu_runtime_manager
 from app.risk import PrincipalProtectionEngine, RiskManager
-from app.routing.gnn_realtime_trust import GnnRealtimeTrustEvaluator
+from app.routing.gnn_realtime_trust import default_gnn_realtime_trust_evaluator
 from app.schemas.domain import (
     AccountSnapshot,
     FinalOrder,
@@ -183,9 +183,7 @@ app = FastAPI(title="개인 투자 분석 시스템")
 # which is the same moment this app's 22 unauthenticated state-changing
 # endpoints stop being reachable only from this keyboard.
 app.add_middleware(AccessGuardMiddleware)
-_gnn_realtime_trust_evaluator = GnnRealtimeTrustEvaluator(
-    stale_while_refresh=True,
-)
+_gnn_realtime_trust_evaluator = default_gnn_realtime_trust_evaluator()
 _live_shadow_lock = threading.RLock()
 _live_shadow_service: Any | None = None
 _live_shadow_state: dict[str, Any] = {
@@ -483,33 +481,17 @@ def _strategy_market_view_with_live_session(
         selected = candidate_symbols[0]
     else:
         selected = requested_symbol or (candidate_symbols[0] if candidate_symbols else None)
-    view = build_strategy_market_view(selected, limit=limit)
+    selection_override = _live_session_selection_override(
+        session,
+        engine_status,
+        active_owner=active_owner,
+    )
+    view = build_strategy_market_view(
+        selected,
+        limit=limit,
+        selection_override=selection_override,
+    )
     view["strategy_session"] = session
-    if session and active_owner:
-        strategy_id = str(session.get("selected_strategy") or "")
-        view["selection"] = {
-            **dict(view.get("selection") or {}),
-            "action": (
-                "OWNED"
-                if session.get("phase") in {"OWNED", "EXITING"}
-                else session.get("phase")
-            ),
-            "strategy_id": strategy_id,
-            "ontology_strategy_id": strategy_id,
-            "ontology_allowed": bool(strategy_id and session.get("phase") != "SCANNING"),
-            "path": session.get("selection_source"),
-            "reason_codes": (
-                [session.get("last_reason")] if session.get("last_reason") else []
-            ),
-            "session_id": session.get("session_id"),
-        }
-        if strategy_id:
-            try:
-                from app.refactor_dashboard import _algorithm
-
-                view["algorithm"] = _algorithm(strategy_id) or view.get("algorithm")
-            except Exception:
-                pass
     journal = _live_order_journal_snapshot(limit=80)
     view["execution"] = _live_market_execution(
         str(view.get("symbol") or selected or ""),
@@ -566,6 +548,69 @@ def _strategy_market_view_with_live_session(
     # The terminal must represent the latter.
     view["live_order_capable"] = bool(engine_running and buy_enabled and live_armed)
     return view
+
+
+def _live_session_selection_override(
+    session: dict[str, Any],
+    engine_status: dict[str, Any],
+    *,
+    active_owner: bool,
+) -> dict[str, Any] | None:
+    """Project the authoritative engine cycle into LIVE DECISION ONTOLOGY.
+
+    The old terminal built its ontology from the latest shadow-comparison row
+    and overlaid the live session only afterwards.  The header could therefore
+    say ``SCANNING / NO_CANDIDATE_SYMBOLS`` while the graph still showed a prior
+    GNN shadow decision.  Supplying this override before graph construction
+    keeps the decision, reason codes, timestamp and provenance on one cycle.
+    """
+    if not session:
+        return None
+    phase = str(session.get("phase") or "SCANNING").upper()
+    strategy_id = str(session.get("selected_strategy") or "").strip() or None
+    action = (
+        "OWNED"
+        if active_owner and phase in {"OWNED", "EXITING"}
+        else phase if active_owner else "NO_TRADE"
+    )
+    reasons = list(
+        dict.fromkeys(
+            str(reason)
+            for reason in (
+                session.get("last_reason"),
+                *tuple(session.get("ontology_reason_codes") or ()),
+                *tuple(session.get("gnn_reason_codes") or ()),
+                *tuple(session.get("bandit_reason_codes") or ()),
+            )
+            if reason
+        )
+    )
+    as_of = session.get("last_evaluated_at") or engine_status.get("last_cycle_at")
+    path = str(session.get("selection_source") or "live_engine")
+    decision = {
+        "path": path,
+        "action": action,
+        "strategy_id": strategy_id,
+        "reason_codes": reasons,
+    }
+    return {
+        "as_of": as_of,
+        "action": action,
+        "strategy_id": strategy_id,
+        "utility": session.get("selection_score"),
+        "reason_codes": reasons,
+        "path": path,
+        "evidence_status": "CURRENT" if as_of else "MISSING",
+        "evidence_stale": False,
+        "evidence_age_seconds": 0.0 if as_of else None,
+        "ontology_allowed": bool(active_owner and strategy_id),
+        "ontology_action": "ADMISSIBLE" if active_owner and strategy_id else "GATE_ONLY",
+        "ontology_strategy_id": strategy_id,
+        "ontology_reason_codes": list(session.get("ontology_reason_codes") or ()),
+        "all_decisions": [decision],
+        "decision_source": "realtime_trading_engine.live_trace",
+        "session_id": session.get("session_id"),
+    }
 
 
 def _live_market_execution(
@@ -742,6 +787,15 @@ _kis_overseas_realtime_state: dict[str, Any] = {
     "symbols": (),
     "counts": {},
     "last_error": None,
+}
+_realtime_candidate_filter_state: dict[str, Any] = {
+    "observed_at": None,
+    "engine_cycle_id": None,
+    "input_count": 0,
+    "selected_count": 0,
+    "source_counts": {},
+    "reason_counts": {},
+    "reason_samples": {},
 }
 _pending_krx_buy_candidate_warmup: dict[str, float] = {}
 _dashboard_krx_watch: dict[str, float] = {}
@@ -1034,27 +1088,10 @@ def _account_basis_from_kis_connection(connection: dict[str, Any] | None) -> dic
   equity_reconciliation: dict[str, Any] = {
       "broker_reported_equity_krw": broker_reported_equity,
       "component_equity_krw": component_equity,
+      "difference_krw": broker_reported_equity - component_equity,
       "corrected": False,
+      "reason": "BROKER_INTEGRATED_TOTAL_AUTHORITATIVE",
   }
-  unexplained = equity - component_equity
-  duplicate_tolerance = max(100.0, foreign_cash_krw * 0.02)
-  duplicate_foreign_cash = (
-      foreign_cash_krw > 0
-      and abs(unexplained - foreign_cash_krw) <= duplicate_tolerance
-  )
-  # A flat account cannot have stock value outside cash components.  KIS's
-  # integrated overseas summary has been observed to add converted foreign cash
-  # once more to ``tot_asst_amt``. Correct only the diagnostic fingerprint of
-  # that exact duplication; do not erase genuine settlement receivables.
-  if not positions and invested <= 0.005 and duplicate_foreign_cash:
-    equity = component_equity
-    equity_reconciliation.update(
-        {
-            "corrected": True,
-            "reason": "FOREIGN_CASH_DUPLICATED_IN_BROKER_TOTAL",
-            "removed_duplicate_krw": unexplained,
-        }
-    )
   if equity > 0:
     # The broker integrated total is authoritative. Component fields may include
     # integrated-margin buying power, so explanatory cash buckets must not exceed
@@ -1354,6 +1391,11 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
         for item in tuple(stable.get("positions") or ())
         if isinstance(item, dict) and str(item.get("position_state") or "").lower() != "pending_balance"
     }
+    stable_has_pending_positions = any(
+        isinstance(item, dict)
+        and str(item.get("position_state") or "").lower() == "pending_balance"
+        for item in tuple(stable.get("positions") or ())
+    )
     new_quantities = {
         str(item.get("ticker") or "").upper(): _number_or_zero(item.get("quantity"))
         for item in tuple(basis.get("positions") or ())
@@ -1364,7 +1406,7 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
         for symbol, quantity in stable_quantities.items()
     )
     cash_increase = new_cash_equiv - stable_cash_equiv
-    if stable_equity > 0 and new_equity < stable_equity * drop_ratio and (
+    if not stable_has_pending_positions and stable_equity > 0 and new_equity < stable_equity * drop_ratio and (
         new_positions < stable_positions or new_cash_equiv + 1.0 < new_components
     ):
       degraded = True
@@ -1373,18 +1415,23 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
     # disappearing position with flat/falling cash is a partial response.
     if position_disappeared and cash_increase < 1_000.0:
       degraded = True
-    if stable_cash_equiv > 0 and new_cash_equiv < stable_cash_equiv * drop_ratio:
-      degraded = True
+    # A cash-equivalent component may legitimately fall while the broker's
+    # authoritative total equity and position set remain unchanged (settlement,
+    # FX-orderable cash, or a corrected component breakdown). Treating that
+    # component-only change as a degraded response pinned the GUI to its boot
+    # snapshot forever. Equity/position disappearance checks above still reject
+    # genuinely partial balance responses.
   if degraded:
     since = degraded_since or now
     with _live_lock:
       _operation_mode_state["account_degraded_since"] = since
     if now - since < max_stale:
-      audit.record(
-          "account_basis_degraded_carry_forward",
-          {"new_equity": new_equity, "stable_equity": _number_or_zero((stable or {}).get("equity")),
-           "new_positions": new_positions},
-      )
+      if degraded_since is None:
+        audit.record(
+            "account_basis_degraded_carry_forward",
+            {"new_equity": new_equity, "stable_equity": _number_or_zero((stable or {}).get("equity")),
+             "new_positions": new_positions},
+        )
       return stable
   # Accept: this is either complete or a sustained change. Refresh the stable snapshot.
   with _live_lock:
@@ -3219,6 +3266,32 @@ def _with_upside_supervision(payload: dict) -> dict:
   except (OSError, ValueError, json.JSONDecodeError):
     return payload
   supervised = set(_upside_supervised_strategy_ids(metadata))
+  checkpoint_live_authorized = bool(metadata.get("live_authorized"))
+  payload["checkpoint_live_authorized"] = checkpoint_live_authorized
+  payload["checkpoint_authorization_checks"] = dict(
+      metadata.get("authorization_checks") or {}
+  )
+  payload["score_available"] = int(payload.get("sample_count") or 0) > 0
+  payload["trust_state"] = (
+      "CHECKPOINT_NOT_PROMOTED"
+      if not checkpoint_live_authorized
+      else (
+          "ENTRY_READY"
+          if payload.get("trusted_strategy_ids")
+          else "CALIBRATED"
+          if payload.get("passed")
+          else "COLLECTING"
+      )
+  )
+  if not checkpoint_live_authorized:
+    payload["reason_codes"] = list(
+        dict.fromkeys(
+            [
+                *(payload.get("reason_codes") or []),
+                "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED",
+            ]
+        )
+    )
   supervision = metadata.get("strategy_supervision")
   outcomes = metadata.get("label_outcomes")
   minimum = int(
@@ -3270,11 +3343,56 @@ def _with_upside_supervision(payload: dict) -> dict:
   return payload
 
 
+def _with_gnn_runtime_observability(
+    payload: dict,
+    *,
+    now: datetime | None = None,
+) -> dict:
+  """Expose inference and matured-outcome progress as separate read-only facts."""
+  observed_at = now or datetime.now(timezone.utc)
+  with _live_shadow_lock:
+    shadow = {
+        **_live_shadow_state,
+        "errors": dict(_live_shadow_state.get("errors") or {}),
+    }
+  completed_at = _parse_iso_datetime(shadow.get("last_success_at"))
+  completion_age = (
+      max(0.0, (observed_at - completed_at).total_seconds())
+      if completed_at is not None
+      else None
+  )
+  active_max_age = max(
+      15.0,
+      _env_float_web("REALTIME_STRATEGY_SHADOW_HEALTH_MAX_AGE_SECONDS", 30.0),
+  )
+  payload["inference_input_last_received_at"] = shadow.get("last_attempt_at")
+  payload["inference_last_completed_at"] = shadow.get("last_success_at")
+  payload["inference_completion_age_seconds"] = completion_age
+  payload["inference_active"] = bool(
+      shadow.get("enabled")
+      and completed_at is not None
+      and completion_age is not None
+      and completion_age <= active_max_age
+  )
+  # ``generated`` advances only after ShadowComparisonRecorder.compare returns;
+  # it therefore counts inference results that reached the prediction journal.
+  payload["prediction_persisted_count"] = int(shadow.get("generated") or 0)
+  # The trust evaluator's sample count is the number of persisted predictions
+  # that have matured and successfully joined to realized outcomes.
+  payload["validation_count"] = int(payload.get("sample_count") or 0)
+  payload["validation_count_as_of"] = payload.get("evaluated_at")
+  return payload
+
+
 @app.get("/api/gnn/realtime-trust")
 def gnn_realtime_trust_status() -> JSONResponse:
   """Current forward-only confidence gate for ontology-weighted GNN routing."""
   return _json(
-      _with_upside_supervision(_gnn_realtime_trust_evaluator.evaluate().as_dict())
+      _with_gnn_runtime_observability(
+          _with_upside_supervision(
+              _gnn_realtime_trust_evaluator.evaluate().as_dict()
+          )
+      )
   )
 
 
@@ -4894,6 +5012,21 @@ def _system_diagnostics_payload() -> dict[str, Any]:
   us_fast_poll_running = bool(_us_fast_poll_thread is not None and _us_fast_poll_thread.is_alive())
   reasons = [str(code) for code in reliability.get("reasons") or ()]
   blockers = [_diagnostic_blocker(code, components) for code in reasons]
+  live_refresh_error = reliability.get("last_error") or snapshot.get("last_error")
+  # Infrastructure reliability and end-to-end health are not the same thing.
+  # A broker/feed score of 1.0 must not make the dashboard say READY while the
+  # background cache that supplies ontology/market views is throwing every cycle.
+  diagnostics_ready = bool(reliability.get("ready")) and not live_refresh_error
+  if live_refresh_error:
+    blockers.insert(
+        0,
+        {
+            "code": "LIVE_CACHE_REFRESH_ERROR",
+            "label": "실시간 캐시 갱신",
+            "message": "실시간 그래프·시장 화면 갱신이 실패하고 있습니다.",
+            "detail": str(live_refresh_error),
+        },
+    )
   # Reliability transitions are deliberately cadence-cached, but diagnostics must
   # show the artifact written moments ago rather than the previous 5-minute sample.
   model_health = _latest_model_reliability(now)
@@ -4971,7 +5104,7 @@ def _system_diagnostics_payload() -> dict[str, Any]:
   # carry their own temporary ``mode`` values; exposing either one at the top
   # made a live, buy-enabled engine appear to be in learning mode after restart.
   current_mode = _active_operation_mode()
-  if trading_running and current_mode == "live_trading" and bool(reliability.get("ready")):
+  if trading_running and current_mode == "live_trading" and diagnostics_ready:
     headline = "실시간 거래 엔진이 실행 중입니다."
     summary = "전략 판단과 주문 게이트가 실시간으로 평가되고 있습니다."
   elif trading_running:
@@ -4999,12 +5132,18 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       "collection_mode": learning.get("mode"),
       "score": float(reliability.get("score") or 0.0),
       "threshold": float(reliability.get("threshold") or 0.9),
-      "ready": bool(reliability.get("ready")),
+      "ready": diagnostics_ready,
+      "infrastructure_ready": bool(reliability.get("ready")),
       "active_markets": active_markets,
       "account_context": {
           "krw_orderable": _number_or_zero(orderable.get("KRW")),
           "usd_orderable": usd_orderable,
-          "us_collection_limited_by_cash": "US" in active_markets and usd_orderable <= 0,
+          # Market observation is now independent of settled USD.  Buying remains
+          # affordability-gated later in the order path.
+          "us_collection_limited_by_cash": False,
+          "us_buying_power_limited_by_cash": (
+              "US" in active_markets and usd_orderable <= 0
+          ),
       },
       "workers": [
           {
@@ -5038,7 +5177,7 @@ def _system_diagnostics_payload() -> dict[str, Any]:
               "label": "미국 실시간 보강",
               "running": us_fast_poll_running or bool(healthy.get("US")),
               "detail": (
-                  "USD 주문 가능 잔액 0원 · 미국 매수 후보 보강 제한"
+                  "USD 주문 가능 잔액 0원 · 시세·학습 수집 전용"
                   if "US" in active_markets and usd_orderable <= 0
                   else f"건강한 종목 {len(healthy.get('US') or ())}개"
               ),
@@ -5104,11 +5243,20 @@ def _system_diagnostics_payload() -> dict[str, Any]:
                   "complete_subscription_symbols": krx_feature_symbols,
                   "sampled_symbols": krx_feature_sampled_symbols,
                   "us_running": us_fast_poll_running,
+                  "us_stage": us_fast_poll_status.get("stage"),
+                  "us_stage_at": us_fast_poll_status.get("stage_at"),
                   "us_last_attempt_at": us_fast_poll_status.get("last_attempt_at"),
                   "us_last_success_at": us_fast_poll_status.get("last_success_at"),
                   "us_symbols": list(us_fast_poll_status.get("symbols") or ()),
+                  "us_rest_fallback_symbols": list(
+                      us_fast_poll_status.get("rest_fallback_symbols") or ()
+                  ),
                   "us_saved_ticks": int(us_fast_poll_status.get("saved_ticks") or 0),
                   "us_saved_orderbooks": int(us_fast_poll_status.get("saved_orderbooks") or 0),
+                  "us_feature_frames": int(us_fast_poll_status.get("feature_frames") or 0),
+                  "us_feature_errors": dict(
+                      us_fast_poll_status.get("feature_errors") or {}
+                  ),
                   "us_errors": dict(us_fast_poll_status.get("errors") or {}),
                   "us_last_error": us_fast_poll_status.get("last_error"),
               },
@@ -5136,19 +5284,99 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       "files": file_states,
       "recent_activity": rows[-10:],
       "next_collection_at": learning.get("next_collection_at"),
-      "last_error": reliability.get("last_error") or snapshot.get("last_error"),
+      "last_error": live_refresh_error,
   }
 
 
 @app.get("/api/system-diagnostics")
 def system_diagnostics() -> JSONResponse:
-  payload = _cached_system_diagnostics_payload()
-  # The expensive body is intentionally stale-while-revalidate, but the mode is
-  # control-plane state and must never lag a promotion/demotion by up to two cache
-  # windows. Override that one field on every cheap request from its authority.
-  payload["mode"] = _active_operation_mode()
+  payload = _overlay_system_diagnostics_live_state(
+      _cached_system_diagnostics_payload()
+  )
   payload["market_session_capabilities"] = _market_session_capability_payload()
   return _json(payload)
+
+
+def _overlay_system_diagnostics_live_state(payload: dict[str, Any]) -> dict[str, Any]:
+  """Replace fast-changing control fields in a stale-while-revalidate snapshot.
+
+  Model history and store summaries can take long enough to refresh that returning
+  them synchronously would stall the dashboard.  The reliability controller state,
+  however, is already held in memory and is the authority for READY/LEARNING and
+  market-feed health.  Keeping those fields cached made a recovered live engine look
+  demoted for minutes even though orders and per-symbol freshness gates were current.
+  """
+  result = dict(payload)
+  reliability = _auto_reliability_status()
+  snapshot = _live_snapshot()
+  learning = dict(snapshot.get("learning") or {})
+  components = dict(reliability.get("components") or {})
+  market_data = dict(components.get("market_data") or {})
+  current_mode = _active_operation_mode()
+  live_refresh_error = reliability.get("last_error") or snapshot.get("last_error")
+  infrastructure_ready = bool(reliability.get("ready"))
+  diagnostics_ready = infrastructure_ready and not live_refresh_error
+
+  result.update(
+      {
+          "live_state_at": reliability.get("evaluated_at"),
+          "mode": current_mode,
+          "controller_mode": reliability.get("mode"),
+          "collection_mode": learning.get("mode"),
+          "score": float(reliability.get("score") or 0.0),
+          "threshold": float(reliability.get("threshold") or 0.9),
+          "ready": diagnostics_ready,
+          "infrastructure_ready": infrastructure_ready,
+          "active_markets": list(reliability.get("active_markets") or ()),
+          "last_error": live_refresh_error,
+      }
+  )
+
+  reasons = [str(code) for code in reliability.get("reasons") or ()]
+  blockers = [_diagnostic_blocker(code, components) for code in reasons]
+  if live_refresh_error:
+    blockers.insert(
+        0,
+        {
+            "code": "LIVE_CACHE_REFRESH_ERROR",
+            "label": "실시간 캐시 갱신",
+            "message": "실시간 그래프·시장 화면 갱신이 실패하고 있습니다.",
+            "detail": str(live_refresh_error),
+        },
+    )
+  result["blockers"] = blockers
+
+  flows = dict(result.get("flows") or {})
+  market_flow = dict(flows.get("market_data") or {})
+  healthy = dict(market_data.get("healthy") or {})
+  market_flow.update(
+      {
+          "active": bool(any(healthy.values())),
+          "healthy": healthy,
+          "minimum_per_market": market_data.get("minimum_per_market"),
+          "minimum_by_market": market_data.get("minimum_by_market"),
+          "ready_markets": market_data.get("ready_markets"),
+          "required_markets": market_data.get("required_markets"),
+          "extended_order_markets": market_data.get("extended_order_markets"),
+          "missing_markets": market_data.get("missing_markets"),
+          "partial": bool(market_data.get("partial")),
+      }
+  )
+  flows["market_data"] = market_flow
+  result["flows"] = flows
+
+  with _realtime_trading_lock:
+    trading_running = bool(
+        _realtime_trading_worker is not None
+        and _realtime_trading_worker.is_alive()
+    )
+  if trading_running and current_mode == "live_trading" and diagnostics_ready:
+    result["headline"] = "실시간 거래 엔진이 실행 중입니다."
+    result["summary"] = "전략 판단과 주문 게이트가 실시간으로 평가되고 있습니다."
+  elif trading_running:
+    result["headline"] = "보유 종목 안전 감시는 실행 중이고, 신규 매수는 차단되어 있습니다."
+    result["summary"] = "학습 모드에서는 매도 위험 감시만 유지하고 신규 주문 승격을 대기합니다."
+  return result
 
 
 def _market_session_capability_payload() -> dict[str, Any]:
@@ -6277,7 +6505,11 @@ def realtime_trading_status() -> JSONResponse:
     engine = _realtime_trading_engine
     running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
   diagnostics = engine.decision_engine.get_diagnostics() if engine is not None and hasattr(engine, "decision_engine") else None
-  engine_status = engine.get_status() if engine is not None else None
+  engine_status = (
+      _status_with_engine_cycle_id(engine.get_status())
+      if engine is not None
+      else None
+  )
   return _json(
     {
       "ok": True,
@@ -6292,6 +6524,52 @@ def realtime_trading_status() -> JSONResponse:
       "decision_diagnostics": diagnostics,
     }
   )
+
+
+def _status_with_engine_cycle_id(status: dict[str, Any] | None) -> dict[str, Any] | None:
+  """Project the trace's immutable cycle id onto status read models only."""
+  if not isinstance(status, dict):
+    return status
+  result = dict(status)
+  trace = dict(result.get("live_trace") or {})
+  cycle_id = trace.get("cycle_id")
+  if cycle_id:
+    result["engine_cycle_id"] = cycle_id
+    summary = dict(result.get("last_summary") or {})
+    summary["engine_cycle_id"] = cycle_id
+    result["last_summary"] = summary
+  return result
+
+
+def _candidate_affordability_summary(
+    symbol_asks: tuple[tuple[str, str, float], ...],
+    orderable_cash_by_currency: dict[str, float],
+) -> dict[str, Any]:
+  """Compare each ask only with cash denominated in the same currency."""
+  cheapest: dict[str, dict[str, Any]] = {}
+  for symbol, raw_currency, raw_ask in symbol_asks:
+    currency = str(raw_currency or "").upper().strip()
+    ask = max(0.0, float(raw_ask or 0.0))
+    if not currency or ask <= 0:
+      continue
+    current = cheapest.get(currency)
+    if current is None or ask < float(current["ask"]):
+      cheapest[currency] = {"symbol": str(symbol), "ask": ask}
+  cash = {
+      str(currency).upper(): max(0.0, float(value or 0.0))
+      for currency, value in orderable_cash_by_currency.items()
+  }
+  unavailable = sorted(
+      currency
+      for currency, item in cheapest.items()
+      if cash.get(currency, 0.0) < float(item["ask"])
+  )
+  return {
+      "orderable_cash_by_currency": cash,
+      "cheapest_by_currency": cheapest,
+      "unaffordable_currencies": unavailable,
+      "unaffordable": bool(cheapest) and len(unavailable) == len(cheapest),
+  }
 
 
 def _buy_candidate_warmup_detail() -> dict:
@@ -6331,23 +6609,35 @@ def _buy_candidate_warmup_detail() -> dict:
     # and the two are indistinguishable from a bare "0 candidates". Measured case:
     # KRW orderable 0원 with 073240 at 7,220원, while the only funded currency
     # (USD 67.57) belonged to a closed market.
-    cheapest_symbol, cheapest_ask = "", 0.0
+    symbol_asks: list[tuple[str, str, float]] = []
     for symbol in active:
       try:
         book = store.latest_orderbook(symbol)
       except Exception:  # noqa: BLE001
         continue
       ask = float(getattr(book, "best_ask", 0.0) or 0.0) if book is not None else 0.0
-      if ask > 0 and (cheapest_ask <= 0 or ask < cheapest_ask):
-        cheapest_symbol, cheapest_ask = str(symbol), ask
+      if ask > 0:
+        currency = (
+            "KRW"
+            if _ticker_market_group_for_live_trading(str(symbol), "") == "KRX"
+            else "USD"
+        )
+        symbol_asks.append((str(symbol), currency, ask))
     # The engine's own account view, so the panel reports the same number the
     # affordability filter actually applied.
     try:
       account = _realtime_engine_account_snapshot()
-      krw_orderable = _account_available_cash(account, "KRW") if account else 0.0
+      orderable = {
+          "KRW": _account_available_cash(account, "KRW") if account else 0.0,
+          "USD": _account_available_cash(account, "USD") if account else 0.0,
+      }
     except Exception:  # noqa: BLE001 - cash lookup is diagnostic only.
-      krw_orderable = 0.0
-    unaffordable = bool(cheapest_ask > 0 and krw_orderable < cheapest_ask)
+      orderable = {"KRW": 0.0, "USD": 0.0}
+    affordability = _candidate_affordability_summary(
+        tuple(symbol_asks),
+        orderable,
+    )
+    krw_cheapest = dict(affordability["cheapest_by_currency"].get("KRW") or {})
     # No symbol traded in the last 120 seconds, so there is nothing to be warming up
     # AND nothing to report a shortfall against. Saying so is the difference between
     # "wait 20 minutes" and "the market is not printing right now".
@@ -6360,10 +6650,10 @@ def _buy_candidate_warmup_detail() -> dict:
         "best_bars": best_bars,
         "required_bars": required,
         "eta_minutes": 0 if no_recent_activity else max(0, required - best_bars),
-        "krw_orderable": krw_orderable,
-        "cheapest_candidate": cheapest_symbol,
-        "cheapest_ask": cheapest_ask,
-        "unaffordable": unaffordable,
+        "krw_orderable": orderable["KRW"],
+        "cheapest_candidate": krw_cheapest.get("symbol", ""),
+        "cheapest_ask": float(krw_cheapest.get("ask") or 0.0),
+        **affordability,
     }
   except Exception:  # noqa: BLE001 - diagnostics must never raise.
     return {}
@@ -6425,10 +6715,18 @@ def _entry_blockade_chain() -> list[dict]:
       if str(summary.get("reason") or "") == "MARKET_SESSION_CLOSED"
       else any(item.get("allows_new_entry") for item in scanned.values())
   )
+  entry_sessions = [
+      str(item.get("session") or group)
+      for group, item in scanned.items()
+      if item.get("allows_new_entry")
+  ]
   _link(
     "market_session",
     session_ok,
-    "정규장 진행 중"
+    (
+      "신규 진입 허용 세션 진행 중"
+      + (f" ({', '.join(entry_sessions)})" if entry_sessions else "")
+    )
     if session_ok
     else "스캔 중인 시장이 정규장이 아님 — 신규 진입 보류(청산은 계속 동작)",
     {"scanned_groups": scanned, "all_groups": sessions["groups"],
@@ -6462,14 +6760,47 @@ def _entry_blockade_chain() -> list[dict]:
       f"약 {warmup['eta_minutes']}분 후 충족 예상)"
     )
   elif count == 0 and warmup.get("unaffordable"):
+    blocked = []
+    for currency in warmup.get("unaffordable_currencies") or ():
+      item = (warmup.get("cheapest_by_currency") or {}).get(currency) or {}
+      cash = (warmup.get("orderable_cash_by_currency") or {}).get(currency, 0.0)
+      blocked.append(
+          f"{currency} {float(cash):,.2f} < {item.get('symbol') or '-'} {float(item.get('ask') or 0.0):,.2f}"
+      )
     detail = (
-      f"후보 0개 — 주문가능 현금 부족 "
-      f"(KRW {warmup['krw_orderable']:,.0f} < 최저가 {warmup['cheapest_candidate']} "
-      f"{warmup['cheapest_ask']:,.0f})"
+      "후보 0개 — 주문가능 현금 부족 (" + "; ".join(blocked) + ")"
     )
   elif count == 0:
     detail = "후보 0개 — 스트리밍 종목 없음 또는 전 종목이 후보 필터에서 제외됨"
-  _link("buy_candidates", count > 0, detail, {"sample": list(candidates), **warmup})
+  trace = dict((status or {}).get("live_trace") or {})
+  cycle_id = trace.get("cycle_id")
+  with _live_lock:
+    filter_state = dict(_realtime_candidate_filter_state)
+  filter_matches_cycle = bool(
+      cycle_id and filter_state.get("engine_cycle_id") == cycle_id
+  )
+  filter_diagnostics = {
+      "engine_cycle_id": cycle_id,
+      "candidate_filter_snapshot_matches_cycle": filter_matches_cycle,
+      "candidate_filter_input_count": (
+          int(filter_state.get("input_count") or 0) if filter_matches_cycle else None
+      ),
+      "candidate_filter_selected_count": (
+          int(filter_state.get("selected_count") or 0) if filter_matches_cycle else None
+      ),
+      "candidate_filter_reason_counts": (
+          dict(filter_state.get("reason_counts") or {}) if filter_matches_cycle else {}
+      ),
+      "candidate_filter_reason_samples": (
+          dict(filter_state.get("reason_samples") or {}) if filter_matches_cycle else {}
+      ),
+  }
+  _link(
+      "buy_candidates",
+      count > 0,
+      detail,
+      {"sample": list(candidates), **warmup, **filter_diagnostics},
+  )
 
   diagnostics = list(session.get("candidate_diagnostics") or ())
   actionable = [
@@ -6698,12 +7029,26 @@ def strategy_selection_diagnostics() -> JSONResponse:
   a reason rather than an error when the engine has not produced a cycle yet, so
   a dashboard can render the panel unconditionally.
   """
-  from app.technical.selection_diagnostics import STAGE_ORDER
+  from app.technical.selection_diagnostics import (
+      STAGE_ORDER,
+      collector_from_algorithm_evaluations,
+  )
 
   try:
     with _realtime_trading_lock:
       engine = _realtime_trading_engine
     collector = getattr(engine, "selection_diagnostics", None) if engine else None
+    source = "engine.selection_diagnostics"
+    if collector is None and engine is not None:
+      status = dict(engine.get_status() or {})
+      session = dict(status.get("strategy_session") or {})
+      evaluations = list(session.get("algorithm_evaluations") or ())
+      if evaluations:
+        collector = collector_from_algorithm_evaluations(
+            evaluations,
+            session=session,
+        )
+        source = "strategy_session.algorithm_evaluations"
     if collector is None:
       return _json(
           {
@@ -6718,6 +7063,7 @@ def strategy_selection_diagnostics() -> JSONResponse:
         {
             "ok": True,
             "available": True,
+            "source": source,
             "stages": [stage.value for stage in STAGE_ORDER],
             "blocking_summary": list(collector.blocking_summary()),
         }
@@ -7382,10 +7728,10 @@ def live_trading_progress() -> JSONResponse:
       basis["invested_value"] = sum(_number_or_zero(position.get("market_value_krw") or position.get("market_value")) for position in positions)
       connection = _connection_with_account_basis(connection, basis)
       connection["pending_positions"] = pending_positions
-      with _live_lock:
-        _operation_mode_state["stable_account_basis"] = basis
-        _operation_mode_state["last_kis_connection"] = connection
-        _operation_mode_state["last_kis_connection_checked_at"] = time.time()
+      # This is a short-lived overlay while the balance endpoint catches up,
+      # never a broker-authoritative account snapshot. Persisting it made the
+      # next real zero-position response look degraded and immortalised a
+      # position after its SELL had already filled.
     active_mode = None
     baseline_equity = None
     with _live_lock:
@@ -7561,6 +7907,54 @@ def _parse_event_datetime(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _recent_live_orders_for_reconciliation(
+    journal: dict[str, Any],
+    *,
+    max_age_seconds: float | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return one recent merged record per broker order, including SELLs.
+
+    Reconciliation bridges only the short delay between a terminal fill and the
+    balance endpoint. A multi-hour window can resurrect an old BUY after a later
+    SELL, so the default is intentionally bounded to fifteen minutes.
+    """
+    if max_age_seconds is None:
+      max_age_seconds = max(
+          30.0,
+          float(os.getenv("ORDER_RECONCILIATION_MAX_AGE_SEC", "900")),
+      )
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+    latest_by_order_id: dict[str, dict[str, Any]] = {}
+    first_seen: dict[str, int] = {}
+    for index, item in enumerate(list(journal.get("submitted_orders") or ())):
+      if not isinstance(item, dict):
+        continue
+      order_id = str(item.get("broker_order_id") or "")
+      ticker = str(item.get("ticker") or "").upper().strip()
+      side = str(item.get("side") or "").upper()
+      if not order_id or not ticker or side not in {"BUY", "SELL"}:
+        continue
+      recorded_at = _parse_event_datetime(item.get("recorded_at"))
+      if recorded_at is not None and recorded_at < cutoff:
+        continue
+      previous = latest_by_order_id.get(order_id, {})
+      merged = dict(previous)
+      merged.update(
+          {key: value for key, value in item.items() if value not in (None, "", ())}
+      )
+      latest_by_order_id[order_id] = merged
+      first_seen.setdefault(order_id, index)
+    ordered = sorted(
+        latest_by_order_id.values(),
+        key=lambda item: (
+            _parse_event_datetime(item.get("recorded_at")) or cutoff,
+            first_seen.get(str(item.get("broker_order_id") or ""), 0),
+        ),
+    )
+    return ordered[-max(1, limit):]
+
+
 def _recent_live_buy_orders_for_reconciliation(
     journal: dict[str, Any],
     positions: list[dict[str, Any]],
@@ -7568,26 +7962,22 @@ def _recent_live_buy_orders_for_reconciliation(
     max_age_hours: float = 36.0,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
-    existing = {str(position.get("ticker") or "").upper() for position in positions if isinstance(position, dict)}
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-    candidates: list[dict[str, Any]] = []
-    seen_order_ids: set[str] = set()
-    for item in reversed(list(journal.get("submitted_orders") or ())):
-      if not isinstance(item, dict):
-        continue
-      order_id = str(item.get("broker_order_id") or "")
-      ticker = str(item.get("ticker") or "").upper().strip()
-      side = str(item.get("side") or "").upper()
-      if not order_id or order_id in seen_order_ids or not ticker or ticker in existing or side != "BUY":
-        continue
-      recorded_at = _parse_event_datetime(item.get("recorded_at"))
-      if recorded_at is not None and recorded_at < cutoff:
-        continue
-      seen_order_ids.add(order_id)
-      candidates.append(item)
-      if len(candidates) >= limit:
-        break
-    return list(reversed(candidates))
+    """Compatibility projection for diagnostics and older callers."""
+    existing = {
+        str(position.get("ticker") or "").upper()
+        for position in positions
+        if isinstance(position, dict)
+    }
+    return [
+        item
+        for item in _recent_live_orders_for_reconciliation(
+            journal,
+            max_age_seconds=max_age_hours * 3600.0,
+            limit=max(limit * 4, limit),
+        )
+        if str(item.get("side") or "").upper() == "BUY"
+        and str(item.get("ticker") or "").upper() not in existing
+    ][-limit:]
 
 
 def _pending_position_from_order_status(order: dict[str, Any], execution: Any | None = None) -> dict[str, Any] | None:
@@ -7643,15 +8033,22 @@ def _reconciled_live_positions(
     existing = {str(position.get("ticker") or "").upper() for position in reconciled}
     pending: list[dict[str, Any]] = []
     owned_broker = broker
-    for order in _recent_live_buy_orders_for_reconciliation(journal, reconciled):
+    fills: list[tuple[dict[str, Any], str, int, float]] = []
+    for order in _recent_live_orders_for_reconciliation(journal):
       execution = None
       status_error = ""
-      if owned_broker is None:
+      journal_status = str(order.get("status") or "").upper()
+      journal_filled = int(_number_or_zero(order.get("filled_quantity") or 0))
+      journal_price = _number_or_zero(
+          order.get("average_fill_price") or order.get("limit_price") or 0
+      )
+      needs_status_lookup = journal_status not in {"FILLED", "PARTIALLY_FILLED"}
+      if needs_status_lookup and owned_broker is None:
         try:
           owned_broker = KisDevelopersApiClient(paper=False, enabled=True)
         except Exception as exc:  # pragma: no cover - credential/runtime defensive boundary
           status_error = str(exc)
-      if owned_broker is not None:
+      if needs_status_lookup and owned_broker is not None:
         try:
           order_id = str(order.get("broker_order_id") or "")
           if hasattr(owned_broker, "_orders") and order_id:
@@ -7670,14 +8067,64 @@ def _reconciled_live_positions(
           execution = owned_broker.get_order_status(str(order.get("broker_order_id") or ""))
         except Exception as exc:  # pragma: no cover - broker/network defensive boundary
           status_error = str(exc)
-      pending_position = _pending_position_from_order_status(order, execution)
+      status = str(getattr(execution, "status", None) or journal_status).upper()
+      if status not in {"FILLED", "PARTIALLY_FILLED"}:
+        continue
+      quantity = int(
+          _number_or_zero(
+              getattr(execution, "quantity", None)
+              or journal_filled
+              or order.get("quantity")
+              or 0
+          )
+      )
+      price = _number_or_zero(getattr(execution, "price", None) or journal_price)
+      if quantity <= 0 or price <= 0:
+        continue
+      resolved_order = dict(order)
+      if status_error:
+        resolved_order["order_status_error"] = status_error
+      fills.append((resolved_order, status, quantity, price))
+
+    # Net terminal fills chronologically. A later SELL consumes prior BUY
+    # quantity, so a flat account cannot be reconstructed as a synthetic long.
+    ledgers: dict[str, dict[str, Any]] = {}
+    for order, status, quantity, price in fills:
+      ticker = str(order.get("ticker") or "").upper()
+      side = str(order.get("side") or "").upper()
+      ledger = ledgers.setdefault(
+          ticker,
+          {"quantity": 0, "cost": 0.0, "order": order, "status": status},
+      )
+      if side == "BUY":
+        ledger["cost"] += quantity * price
+        ledger["quantity"] += quantity
+      else:
+        held = int(ledger["quantity"])
+        consumed = min(held, quantity)
+        if held > 0 and consumed > 0:
+          average = float(ledger["cost"]) / held
+          ledger["cost"] = max(
+              0.0, float(ledger["cost"]) - consumed * average
+          )
+        ledger["quantity"] = max(0, held - quantity)
+      ledger["order"] = order
+      ledger["status"] = status
+
+    for ticker, ledger in ledgers.items():
+      quantity = int(ledger["quantity"])
+      if quantity <= 0 or ticker in existing:
+        continue
+      order = dict(ledger["order"])
+      order["side"] = "BUY"
+      order["quantity"] = quantity
+      order["limit_price"] = float(ledger["cost"]) / quantity
+      order["status"] = ledger["status"]
+      pending_position = _pending_position_from_order_status(order)
       if pending_position is None:
         continue
-      ticker = str(pending_position.get("ticker") or "").upper()
-      if ticker in existing:
-        continue
-      if status_error:
-        pending_position["order_status_error"] = status_error
+      if order.get("order_status_error"):
+        pending_position["order_status_error"] = order["order_status_error"]
       existing.add(ticker)
       pending.append(pending_position)
       reconciled.append(pending_position)
@@ -8468,7 +8915,7 @@ def _live_training_loop() -> None:
   """
   startup_delay = max(
       0.0,
-      _env_float_web("LIVE_TRAINING_STARTUP_DELAY_SECONDS", 20.0),
+      _env_float_web("LIVE_TRAINING_STARTUP_DELAY_SECONDS", 90.0),
   )
   if _live_training_stop.wait(startup_delay):
     return
@@ -8611,6 +9058,10 @@ def _stop_live_training_worker() -> None:
 
 
 def _build_realtime_trading_engine() -> RealtimeTradingEngine:
+  from app.trading.conservative_bandit import (
+      BanditConfig,
+      ConservativeStrategyBandit,
+  )
   from app.trading.strategy_session import StrategySessionManager
 
   store = RealtimeMarketDataStore()
@@ -8634,6 +9085,9 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   strategy_session_manager = StrategySessionManager(
       selection_evidence_provider=_strategy_session_selection_evidence,
+      bandit=ConservativeStrategyBandit(
+          config=BanditConfig.for_live_execution(),
+      ),
   )
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
@@ -8842,6 +9296,7 @@ def _refresh_live_candidate_shadow(
           feature_dim=STRATEGY_GRAPH_CONTEXT_DIM,
           minimum_interval_seconds=interval,
           enable_npu_comparison=flags.npu_inference,
+          trust_evaluator=_gnn_realtime_trust_evaluator,
       )
 
     from app.routing.shadow_intelligence import slow_snapshot_from_live_feature_frame
@@ -8942,38 +9397,90 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
       account=account,
   )
   selected: list[str] = []
+  reason_counts: dict[str, int] = {}
+  reason_samples: dict[str, list[str]] = {}
+
+  def reject(reason: str, symbol: str) -> None:
+    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    sample = reason_samples.setdefault(reason, [])
+    normalized = str(symbol or "").upper().strip()
+    if normalized and normalized not in sample and len(sample) < 5:
+      sample.append(normalized)
+
   for symbol in ordered:
     normalized = str(symbol or "").upper()
     if normalized not in fresh_set:
+      reject("NOT_FRESH_IN_TICK_WINDOW", normalized)
       continue
-    if not _is_live_buy_candidate_symbol(symbol) or not _is_open_live_market_ticker(symbol):
+    if not _is_live_buy_candidate_symbol(symbol):
+      reject("INSTRUMENT_NOT_LIVE_BUY_ELIGIBLE", normalized)
+      continue
+    if not _is_open_live_market_ticker(symbol):
+      reject("MARKET_NOT_OPEN_FOR_NEW_ENTRY", normalized)
       continue
     group = _ticker_market_group_for_live_trading(symbol)
     if group == "US" and subscribed_us and normalized not in subscribed_us:
+      reject("NOT_IN_ACTIVE_US_SUBSCRIPTION_SET", normalized)
       continue
     if group == "KRX" and not _is_live_market_core_open("KRX"):
+      reject("KRX_CORE_SESSION_CLOSED", normalized)
       continue
     if (
         store is not None
         and group == "KRX"
         and not _candidate_has_strategy_feature_history(symbol, store)
     ):
+      reject("STRATEGY_FEATURE_HISTORY_INSUFFICIENT", normalized)
       continue
     if (
         store is not None
         and group == "KRX"
         and not _candidate_has_fresh_buy_orderbook(symbol, store)
     ):
+      reject("FRESH_BUY_ORDERBOOK_MISSING", normalized)
       continue
-    if account is not None and store is not None and not _cached_candidate_affordable(
-        symbol,
-        account,
-        store,
-    ):
+    if account is None or store is None:
+      # Preserve the existing candidate-selection behavior.  This counter is
+      # diagnostic only: affordability was historically skipped when either
+      # dependency was unavailable, so it must not become a new trade gate.
+      reason_counts["ACCOUNT_OR_STORE_UNAVAILABLE_NOT_FILTERED"] = (
+          reason_counts.get("ACCOUNT_OR_STORE_UNAVAILABLE_NOT_FILTERED", 0) + 1
+      )
+    elif not _cached_candidate_affordable(symbol, account, store):
+      currency = "KRW" if group == "KRX" else "USD"
+      reason = (
+          f"INSUFFICIENT_{currency}_ORDERABLE_CASH"
+          if _account_available_cash(account, currency) <= 0
+          else "PRICE_EXCEEDS_ORDERABLE_CASH"
+      )
+      reject(reason, normalized)
       continue
     selected.append(symbol)
     if len(selected) >= limit:
       break
+
+  trace = _current_live_reasoning_trace() or {}
+  snapshot = {
+      "observed_at": datetime.now(timezone.utc).isoformat(),
+      "engine_cycle_id": trace.get("cycle_id"),
+      "input_count": len(ordered),
+      "selected_count": len(selected),
+      "source_counts": {
+          "fresh_symbols": len(fresh_set),
+          "active_us_subscription_symbols": len(subscribed_us),
+          "cached_context_symbols": len(cached_context),
+          "domestic_ranked_symbols": len(domestic_ranked),
+          "sticky_us_symbols": len(sticky_us),
+      },
+      "reason_counts": dict(sorted(reason_counts.items())),
+      "reason_samples": {
+          reason: list(symbols)
+          for reason, symbols in sorted(reason_samples.items())
+      },
+  }
+  with _live_lock:
+    _realtime_candidate_filter_state.clear()
+    _realtime_candidate_filter_state.update(snapshot)
   return tuple(selected)
 
 
@@ -8999,11 +9506,16 @@ def _cached_candidate_affordable(
 
 _us_fast_poll_thread = None
 _us_fast_poll_state: dict[str, Any] = {
+    "stage": "not_started",
+    "stage_at": None,
     "last_attempt_at": None,
     "last_success_at": None,
     "symbols": (),
+    "rest_fallback_symbols": (),
     "saved_ticks": 0,
     "saved_orderbooks": 0,
+    "feature_frames": 0,
+    "feature_errors": {},
     "errors": {},
     "last_error": None,
 }
@@ -9386,6 +9898,30 @@ def _has_fresh_us_websocket_book(symbol: str, *, max_age_seconds: float = 30.0) 
   )
 
 
+def _us_fast_poll_symbol_sets(held: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+  """Return (feature targets, REST fallback targets) for an open US session.
+
+  A fresh WebSocket book suppresses only the redundant REST snapshot.  It must
+  not suppress feature materialisation: the periodic feature journal is the
+  source from which delayed labels and the next live-model challenger are built.
+  """
+  feature_symbols = _us_fast_poll_target_symbols(held)
+  rest_symbols = tuple(
+      symbol for symbol in feature_symbols if not _has_fresh_us_websocket_book(symbol)
+  )
+  return feature_symbols, rest_symbols
+
+
+def _mark_us_fast_poll_stage(stage: str) -> None:
+  with _live_lock:
+    _us_fast_poll_state.update(
+        {
+            "stage": str(stage),
+            "stage_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
 def _us_fast_poll_loop() -> None:
   import time as _t
   from types import SimpleNamespace
@@ -9403,58 +9939,76 @@ def _us_fast_poll_loop() -> None:
   while True:
     sleep_for = interval
     try:
+      _mark_us_fast_poll_stage("session_check")
       held = ()
       us_open = "US" in set(_active_live_market_groups())
       us_closed = is_market_fully_closed("US")
       if us_open or us_closed:
+        _mark_us_fast_poll_stage("account_snapshot")
         held = _held_us_realtime_symbols()
       if us_open:
         # Holdings must remain first-class poll targets in learning mode too.
         # Previously the learning candidate assignment discarded ``held``
         # entirely, so a held symbol could go stale while warm names stayed fresh.
-        symbols = _us_fast_poll_target_symbols(held)
+        _mark_us_fast_poll_stage("watchlist_selection")
+        feature_symbols, rest_symbols = _us_fast_poll_symbol_sets(tuple(held))
         # This thread is independent from the account/reliability controller, so a
         # slow portfolio request cannot stop sub-minute US market-data collection.
         from app.trading.us_realtime_bridge import refresh_us_realtime_for_context_buy_candidates
         # REST is now a watchdog/fallback. Do not overwrite a fresh WebSocket
         # event from HDFSASP0 with a polling snapshot.
-        symbols = tuple(
-            symbol for symbol in symbols if not _has_fresh_us_websocket_book(symbol)
-        )
-        if symbols:
+        result: dict[str, Any] = {"ok": True, "saved": {}, "errors": {}}
+        if rest_symbols:
+          _mark_us_fast_poll_stage("rest_fallback")
           result = refresh_us_realtime_for_context_buy_candidates(
               SimpleNamespace(markets=(), reasoning_paths=()),
-              symbols=symbols,
+              symbols=rest_symbols,
           )
-          collect_live_feature_frames_from_realtime_store(symbols=symbols)
-          saved = dict(result.get("saved") or {})
-          with _live_lock:
-            _us_fast_poll_state.update(
-                {
-                    "last_attempt_at": datetime.now(timezone.utc).isoformat(),
-                    "last_success_at": (
-                        datetime.now(timezone.utc).isoformat()
-                        if result.get("ok")
-                        else _us_fast_poll_state.get("last_success_at")
-                    ),
-                    "symbols": tuple(symbols),
-                    "saved_ticks": int(saved.get("realtime_ticks") or 0),
-                    "saved_orderbooks": int(saved.get("orderbooks") or 0),
-                    "errors": dict(result.get("errors") or {}),
-                    "last_error": None,
-                }
-            )
+        # Materialise every target, including symbols whose WebSocket data was
+        # already fresh.  Previously this call lived inside the REST-fallback
+        # branch, so a healthy WebSocket silently starved the training pipeline.
+        _mark_us_fast_poll_stage("feature_materialization")
+        feature_result = collect_live_feature_frames_from_realtime_store(
+            symbols=feature_symbols
+        )
+        saved = dict(result.get("saved") or {})
+        with _live_lock:
+          _us_fast_poll_state.update(
+              {
+                  "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+                  "last_success_at": (
+                      datetime.now(timezone.utc).isoformat()
+                      if result.get("ok")
+                      else _us_fast_poll_state.get("last_success_at")
+                  ),
+                  "symbols": tuple(feature_symbols),
+                  "rest_fallback_symbols": tuple(rest_symbols),
+                  "saved_ticks": int(saved.get("realtime_ticks") or 0),
+                  "saved_orderbooks": int(saved.get("orderbooks") or 0),
+                  "feature_frames": int(feature_result.get("built") or 0),
+                  "feature_errors": dict(feature_result.get("errors") or {}),
+                  "errors": dict(result.get("errors") or {}),
+                  "last_error": None,
+                  "stage": "waiting",
+                  "stage_at": datetime.now(timezone.utc).isoformat(),
+              }
+          )
       elif held and us_closed:
         # Fully closed: slower REST snapshot fallback (distinct source, not
         # live-buy eligible) so held US marks stay fresh for valuation/display.
         _rest_snapshot_fallback_refresh(held, "US")
         sleep_for = closed_interval
+        _mark_us_fast_poll_stage("closed_session_waiting")
+      else:
+        _mark_us_fast_poll_stage("inactive_session_waiting")
     except Exception as exc:  # noqa: BLE001 - best-effort; never crash the poll loop.
       with _live_lock:
         _us_fast_poll_state.update(
             {
                 "last_attempt_at": datetime.now(timezone.utc).isoformat(),
                 "last_error": f"{exc.__class__.__name__}: {exc}",
+                "stage": "error_waiting",
+                "stage_at": datetime.now(timezone.utc).isoformat(),
             }
         )
     _t.sleep(sleep_for)
@@ -9825,10 +10379,52 @@ def _record_realtime_trading_cycle(summary: dict[str, Any]) -> None:
       "live_armed": summary.get("live_armed"),
       "buy_disabled": summary.get("buy_disabled", False),
       "buy_disabled_reason": summary.get("buy_disabled_reason"),
-      "strategy_session": dict(summary.get("strategy_session") or {}),
+      "strategy_session": _compact_strategy_session(
+          summary.get("strategy_session") or {}
+      ),
       "rejections": list(summary.get("rejections") or ())[:5],
   }
   audit.record("realtime_trading_cycle", compact)
+
+
+def _compact_strategy_session(session: Any) -> dict[str, Any]:
+  """Keep decision evidence while excluding repeated full diagnostic vectors."""
+  if not isinstance(session, dict):
+    return {}
+  scalar_fields = (
+      "session_id", "phase", "last_reason", "selected_symbol",
+      "selected_strategy", "selected_direction", "selected_execution_product",
+      "selected_deployment_state", "selection_source", "selection_score",
+      "selection_confidence", "selected_at", "macro_regime", "micro_regime",
+      "gnn_action", "bandit_selected_arm", "bandit_conservative_edge_bps",
+      "bandit_is_exploration", "bandit_evaluated_at", "cost_coverage_ratio",
+      "cost_coverage_band", "change_point_probability", "halt_level",
+      "selection_authority", "selector_v2_context_id",
+      "selector_v2_authority_state", "position_seen", "entry_price",
+      "target_price", "stop_price", "exit_reason",
+  )
+  compact = {key: session.get(key) for key in scalar_fields if key in session}
+  for key in (
+      "gnn_reason_codes", "ontology_reason_codes", "bandit_reason_codes",
+      "halt_reason_codes", "bandit_shadow_arms",
+  ):
+    if key in session:
+      compact[key] = list(session.get(key) or ())[:24]
+  for key in (
+      "candidate_diagnostics", "algorithm_evaluations", "bandit_evaluations",
+      "explanation_paths",
+  ):
+    compact[f"{key}_count"] = len(session.get(key) or ())
+  if isinstance(session.get("session_phases"), dict):
+    compact["session_phases"] = dict(session["session_phases"])
+  selector = session.get("selector_v2")
+  if isinstance(selector, dict):
+    compact["selector_v2"] = {
+        key: selector.get(key)
+        for key in ("enabled", "state", "authority_state", "reason")
+        if key in selector
+    }
+  return compact
 
 
 def _apply_live_buy_candidate_backoff(summary: dict[str, Any]) -> None:
@@ -10247,6 +10843,7 @@ _us_nasdaq_universe_cache: dict[str, Any] = {"mtime": None, "symbols": ()}
 _us_learning_watchlist_cache: dict[str, Any] = {
     "at": 0.0,
     "cash_usd": None,
+    "price_cap_usd": None,
     "symbols": (),
     "pool": (),
     "rotation_index": 0,
@@ -10273,6 +10870,7 @@ def _recent_affordable_us_watchlist(
     *,
     limit: int,
     database: Path | None = None,
+    maximum_price_usd: float | None = None,
 ) -> tuple[str, ...]:
   """Rank affordable US symbols by sustained, execution-usable market activity.
 
@@ -10295,7 +10893,10 @@ def _recent_affordable_us_watchlist(
   so it gets a real subscription window to prove itself on.
   """
   cash_usd = _account_available_cash(account, "USD")
-  if cash_usd <= 0 or limit <= 0:
+  price_cap_usd = float(
+      maximum_price_usd if maximum_price_usd is not None else cash_usd
+  )
+  if price_cap_usd <= 0 or limit <= 0:
     return ()
   database = database or Path(
       os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3")
@@ -10418,7 +11019,7 @@ def _recent_affordable_us_watchlist(
               since,
               minimum_ticks,
               fresh_since,
-              cash_usd,
+              price_cap_usd,
               minimum_dense_ticks,
               max(limit * 8, limit),
           ),
@@ -10517,6 +11118,53 @@ def _liquid_affordable_us_seed_symbols(
   )
 
 
+def _liquid_us_collection_seed_symbols(
+    account: AccountSnapshot,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+  """Bootstrap a data-only US feed when the account holds no settled USD.
+
+  Subscription is observation, not an order authorization.  These symbols still
+  pass the common-stock/exchange filters, while every actual entry continues to
+  require broker-confirmed affordability in the trading candidate path.
+  """
+  if limit <= 0:
+    return ()
+  raw = os.getenv(
+      "REALTIME_US_LIQUIDITY_SEED_SYMBOLS",
+      "F,SOFI,INTC,PFE,T,BAC,WBD,SNAP,PLTR,NIO,RIVN,LCID,NU,CCL,KVUE,LYFT,HOOD",
+  )
+  excluded = _held_or_recent_buy_tickers(account)
+  configured = tuple(
+      dict.fromkeys(
+          ticker
+          for ticker in (item.strip().upper() for item in raw.replace(";", ",").split(","))
+          if ticker
+          and ticker not in excluded
+          and _is_live_buy_candidate_symbol(ticker, "US")
+      )
+  )
+  if not configured:
+    return ()
+  try:
+    exchange_map = _load_us_listed_exchange_map()
+  except Exception:
+    exchange_map = {}
+  if exchange_map:
+    configured = tuple(symbol for symbol in configured if symbol in exchange_map)
+  return configured[:limit]
+
+
+def _us_collection_price_cap_usd(account: AccountSnapshot) -> float:
+  """Observation universe price cap, deliberately independent of buying power."""
+  configured = max(
+      1.0,
+      _env_float_web("REALTIME_US_COLLECTION_MAX_PRICE_USD", 100.0),
+  )
+  return max(configured, _account_available_cash(account, "USD"))
+
+
 def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
   """Hold and rotate a broker-verified US watchlist to form causal labels."""
   safe_limit = max(1, int(limit))
@@ -10524,8 +11172,7 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
   if account is None:
     return ()
   cash_usd = round(_account_available_cash(account, "USD"), 2)
-  if cash_usd <= 0:
-    return ()
+  price_cap_usd = round(_us_collection_price_cap_usd(account), 2)
   now = time.monotonic()
   ttl = max(300.0, _env_float_web("REALTIME_US_WATCHLIST_TTL_SEC", 1800.0))
   quality_recheck = max(
@@ -10536,9 +11183,11 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
     cached_symbols = tuple(_us_learning_watchlist_cache.get("symbols") or ())
     cached_at = float(_us_learning_watchlist_cache.get("at") or 0.0)
     cached_cash = _us_learning_watchlist_cache.get("cash_usd")
+    cached_price_cap = _us_learning_watchlist_cache.get("price_cap_usd")
   if (
       cached_symbols
       and cached_cash == cash_usd
+      and cached_price_cap == price_cap_usd
       and now - cached_at < min(ttl, quality_recheck)
   ):
     return cached_symbols[:safe_limit]
@@ -10551,17 +11200,34 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
   except (TypeError, ValueError):
     pool_multiplier = 1
   pool_limit = safe_limit * pool_multiplier
-  pool = list(_recent_affordable_us_watchlist(account, limit=pool_limit))
+  # With no settled USD this watchlist is observation-only.  Do not make the
+  # latency-sensitive WebSocket and fast-poll workers scan/group the multi-GB
+  # tick store merely to rank names that cannot be bought.  A deterministic,
+  # liquid collection seed immediately restores subscriptions and still builds
+  # unbiased causal labels; actual entries remain cash-gated elsewhere.
+  pool = (
+      []
+      if cash_usd <= 0
+      else list(
+          _recent_affordable_us_watchlist(
+              account,
+              limit=pool_limit,
+              maximum_price_usd=price_cap_usd,
+          )
+      )
+  )
   if len(pool) < pool_limit:
+    seed_provider = (
+        _liquid_affordable_us_seed_symbols
+        if cash_usd > 0
+        else _liquid_us_collection_seed_symbols
+    )
     pool.extend(
         symbol
-        for symbol in _liquid_affordable_us_seed_symbols(
-            account,
-            limit=pool_limit - len(pool),
-        )
+        for symbol in seed_provider(account, limit=pool_limit - len(pool))
         if symbol not in pool
     )
-  if len(pool) < pool_limit:
+  if cash_usd > 0 and len(pool) < pool_limit:
     discovered = tuple(
         _live_affordable_buy_candidate_symbols(limit=pool_limit) or ()
     )
@@ -10626,6 +11292,7 @@ def _sticky_us_learning_symbols(limit: int) -> tuple[str, ...]:
         {
             "at": now,
             "cash_usd": cash_usd,
+            "price_cap_usd": price_cap_usd,
             "symbols": result,
             "pool": pool_result,
             "rotation_index": rotation_index,
@@ -11361,7 +12028,12 @@ def _env_float_web(name: str, default: float) -> float:
 
 
 _volume_surge_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
-_domestic_ranking_cache: dict[str, Any] = {"at": 0.0, "symbols": ()}
+_domestic_ranking_cache: dict[str, Any] = {
+    "at": 0.0,
+    "symbols": (),
+    "refreshing": False,
+    "last_error": None,
+}
 
 #: Last set of discovery candidates refused on instrument-eligibility grounds.
 #: Kept so "the universe is smaller than the ranking" has a visible answer instead of
@@ -11371,7 +12043,12 @@ _universe_exclusion_report: dict[str, Any] = {}
 
 #: Feasibility is a scan of stored minute bars for every ranking candidate, so it is
 #: cached on the same cadence as the ranking rather than recomputed per call.
-_feasibility_cache: dict[str, Any] = {"at": 0.0, "key": (), "value": {}}
+_feasibility_cache: dict[str, Any] = {
+    "at": 0.0,
+    "key": (),
+    "value": {},
+    "refreshing": False,
+}
 
 #: Last feasibility ranking, exposed on /api/realtime/runtime so a reordered universe
 #: is explainable rather than mysterious.
@@ -11391,16 +12068,23 @@ def _cached_symbol_feasibility(symbols: tuple[str, ...]) -> dict[str, Any]:
         and now - float(_feasibility_cache.get("at") or 0.0) < ttl
     ):
       return dict(_feasibility_cache.get("value") or {})
+    # Discovery, weekend analysis and the trading engine can request the same
+    # ranking at startup. Only one of them may run the per-symbol bar scan.
+    if _feasibility_cache.get("refreshing"):
+      return dict(_feasibility_cache.get("value") or {})
+    _feasibility_cache["refreshing"] = True
   try:
     from app.trading.strategy_feasibility import measure
 
     value = measure(symbols)
   except Exception:  # noqa: BLE001 - discovery must survive a measurement failure.
     value = {}
-  with _live_lock:
-    _feasibility_cache["at"] = now
-    _feasibility_cache["key"] = key
-    _feasibility_cache["value"] = value
+  finally:
+    with _live_lock:
+      _feasibility_cache["at"] = now
+      _feasibility_cache["key"] = key
+      _feasibility_cache["value"] = value
+      _feasibility_cache["refreshing"] = False
   return value
 
 
@@ -11530,8 +12214,27 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
   ttl = float(os.getenv("REALTIME_KRX_RANKING_TTL_SEC", "300"))
   now = time.monotonic()
   with _live_lock:
-    if now - float(_domestic_ranking_cache.get("at") or 0.0) < ttl and _domestic_ranking_cache.get("symbols"):
-      return tuple(_domestic_ranking_cache.get("symbols") or ())
+    cached = tuple(_domestic_ranking_cache.get("symbols") or ())
+    fresh = now - float(_domestic_ranking_cache.get("at") or 0.0) < ttl
+    if fresh and cached:
+      return cached
+    if _domestic_ranking_cache.get("refreshing"):
+      return cached
+    _domestic_ranking_cache["refreshing"] = True
+  # Broker ranking plus hundreds of per-symbol bar scans used to run inside the
+  # 1-second trading cycle (and again in the weekend worker). Start one refresh
+  # and let the engine proceed with its already-streaming symbols meanwhile.
+  threading.Thread(
+      target=_refresh_domestic_ranking_symbols,
+      name="domestic-ranking-refresh",
+      daemon=True,
+  ).start()
+  return cached
+
+
+def _refresh_domestic_ranking_symbols() -> None:
+  started = time.monotonic()
+  error: str | None = None
   try:
     from app.trading.domestic_realtime_bridge import fetch_domestic_ranking_symbols
     from app.trading.domestic_universe import (
@@ -11591,12 +12294,15 @@ def _cached_domestic_ranking_symbols() -> tuple[str, ...]:
     if decision.excluded:
       _record_universe_exclusions(decision, result)
     symbols = decision.symbols
-  except Exception:  # noqa: BLE001 - best-effort; never break candidate discovery.
+  except Exception as exc:  # noqa: BLE001 - best-effort; never break candidate discovery.
     symbols = ()
+    error = f"{type(exc).__name__}: {exc}"[:240]
   with _live_lock:
-    _domestic_ranking_cache["at"] = now
-    _domestic_ranking_cache["symbols"] = symbols
-  return symbols
+    _domestic_ranking_cache["at"] = started
+    if symbols:
+      _domestic_ranking_cache["symbols"] = symbols
+    _domestic_ranking_cache["last_error"] = error
+    _domestic_ranking_cache["refreshing"] = False
 
 
 def _realtime_engine_execution_summary() -> dict[str, Any] | None:
@@ -13952,7 +14658,14 @@ def _set_live_progress(
 
 
 def _iso_or_none(value: datetime | None) -> str | None:
-  return value.isoformat() if value is not None else None
+  if value is None:
+    return None
+  # Live dashboard state is recorded with ``datetime.now()`` in Asia/Seoul.
+  # Preserve that wall-clock value while making its timezone explicit so API
+  # consumers cannot mistake it for UTC when calculating freshness.
+  if value.tzinfo is None:
+    value = value.replace(tzinfo=timezone(timedelta(hours=9)))
+  return value.isoformat()
 
 
 def _candidate_chart_symbols(store: RealtimeMarketDataStore, *, limit: int = 12) -> tuple[str, ...]:

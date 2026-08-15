@@ -798,3 +798,24 @@ min(position_sizer, borrow_available, state_limit, risk_budget)
 
 숏 **청산**은 리스크 한도로 막지 않습니다. 한도 위반을 이유로 상환을 거부하면 무제한 손실
 포지션이 갇히며, 그것은 어떤 한도 위반보다 나쁩니다.
+
+## 12. TradingView 호환 레짐 지표와 신규 전략 (2026-08-12)
+
+공식 TradingView 계산 설명을 기준으로 완성된 OHLCV 봉에서 다음 지표를 추가했습니다.
+
+- Supertrend: Wilder ATR과 상·하단 band를 재귀적으로 갱신해 방향과 추세선을 계산합니다.
+  TradingView도 단독 사용 시 잘못된 신호가 날 수 있으므로 DMI/ADX·VWAP·상대거래량을 함께
+  요구합니다. 출처: https://www.tradingview.com/support/solutions/43000634738-supertrend/
+- DMI/ADX: +DI/-DI가 방향을, ADX가 추세 강도를 담당합니다. 신규 추세 전략은 ADX 25와 양의
+  DMI spread를 기본 확인값으로 둡니다. 출처:
+  https://www.tradingview.com/support/solutions/43000502250-directional-movement-dmi/
+- Keltner Channels: EMA 중심선과 ATR envelope를 사용합니다. 상단 돌파만으로 주문하지 않고
+  Bollinger/Keltner 압축, 변동성 확장, 상대거래량을 동시에 확인합니다. 출처:
+  https://tr.tradingview.com/support/solutions/43000502266/
+- Choppiness Index: `100 × log10(sum(TR)/range) / log10(n)`으로 방향성 없는 횡보도를 측정합니다.
+  CHOP ≥ 61.8, ADX ≤ 20인 경우에만 RSI·Bollinger·VWAP 과매도 회귀를 평가합니다. 출처:
+  https://de.tradingview.com/support/solutions/43000501980/
+
+TradingView는 지표 정의의 참고 출처일 뿐 외부 알림이나 Pine 신호가 주문 권한을 갖지 않습니다.
+모든 값은 로컬 live bar에서 재계산되고, 새 전략 3개는 SHADOW forward outcome으로 비용·안정성을
+입증한 뒤 자동 승격됩니다.

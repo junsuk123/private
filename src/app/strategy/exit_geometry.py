@@ -281,6 +281,13 @@ _GEOMETRY: dict[str, tuple[float, float, float, int]] = {
     # target into the KRX table would have mis-sized every KRX fill of this thesis in the
     # other direction, demanding 265bps where 185 is what compounds at 1.5 net R:R.
     "bar_trend_continuation": (75.0, 185.0, 40.0, 10800),
+    # TradingView-compatible, completed-bar regime strategies.  These remain
+    # deployment-gated; the geometry is nevertheless defined up front so their
+    # shadow outcomes are measured against the exact stop/target contract that a
+    # later LIVE_PROBE order will use.
+    "supertrend_dmi_continuation": (75.0, 185.0, 40.0, 10800),
+    "keltner_volatility_breakout": (75.0, 185.0, 40.0, 7200),
+    "choppiness_range_reversion": (65.0, 170.0, 35.0, 3600),
     # Unknown / adopted position. It gets the tightest admissible stop and the
     # shortest leash — but its target must still clear cost, which the previous
     # 40bps value did not: it was below the 28bps round trip plus any spread.

@@ -295,7 +295,62 @@ def test_checkpoint_with_incompatible_live_schema_is_not_scored(tmp_path, monkey
     cpu = result.comparison.decisions[-1]
     assert cpu.action == "NO_TRADE"
     assert "GNN_FEATURE_SCHEMA_MISMATCH" in cpu.reason_codes
-    assert "GNN_NOT_LIVE_AUTHORIZED" in cpu.reason_codes
+
+
+def test_unpromoted_matching_checkpoint_still_emits_validation_only_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    seed_service = ShadowIntelligenceService(
+        feature_dim=12,
+        minimum_interval_seconds=0,
+        comparison_path=tmp_path / "seed-shadow.jsonl",
+    )
+    checkpoint = seed_service.model.save_checkpoint(tmp_path / "model.npz")
+    checkpoint.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "input_feature_schema": "realtime_microstructure_v1",
+                "live_authorized": False,
+                "strategy_ids": list(STRATEGY_IDS),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REFACTOR_GNN_CHECKPOINT", str(checkpoint))
+    service = ShadowIntelligenceService(
+        feature_dim=12,
+        minimum_interval_seconds=0,
+        comparison_path=tmp_path / "shadow.jsonl",
+    )
+
+    result = service.evaluate(
+        SlowIntelligenceSnapshot(
+            snapshot_id="snapshot-unpromoted",
+            symbol="396500",
+            as_of=NOW,
+            valid_until=NOW + timedelta(seconds=5),
+            feature_snapshot_id="features-unpromoted",
+            features=(0.1,) * 12,
+            data_fresh=True,
+            tradable=True,
+            allowed_strategy_ids=("intraday_momentum",),
+            feature_schema_name="realtime_microstructure_v1",
+        )
+    )
+
+    assert result is not None
+    assert len(result.cpu_evidence) == len(STRATEGY_IDS)
+    cpu = next(item for item in result.comparison.decisions if item.path == "cpu_gnn")
+    assert cpu.action == "NO_TRADE"
+    assert "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" in cpu.reason_codes
+    assert result.comparison.validation_candidates
+    assert all(
+        "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" in item.reason_codes
+        and "ORDER_PERMISSION_NOT_GRANTED" in item.reason_codes
+        and "GNN_REALTIME_TRUST_PASSED" not in item.reason_codes
+        for item in result.comparison.validation_candidates
+    )
 
 
 def test_authorized_checkpoint_with_matching_schema_emits_live_shadow_evidence(

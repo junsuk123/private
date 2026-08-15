@@ -94,6 +94,13 @@ function opsPrimaryBlocker(diag, reliability, gnn, trading) {
       detail: `${missing} 시장에서 신선한 체결과 호가가 기준 종목 수만큼 필요합니다.`,
     };
   }
+  if (gnn?.checkpoint_live_authorized !== true) {
+    return {
+      tone: 'waiting',
+      title: 'GNN SHADOW ONLY',
+      detail: 'The checkpoint is not live-authorized. Inference may continue, but order authority remains blocked.',
+    };
+  }
   if (!gnn?.passed) {
     const sampleCount = Number(gnn?.sample_count || 0);
     const minimum = Number(gnn?.minimum_samples || 0);
@@ -147,6 +154,8 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
   const summary = trading?.status?.last_summary || {};
   const trusted = gnn?.trusted_strategy_ids || [];
   const calibrated = gnn?.calibrated_strategy_ids || [];
+  const gnnHasScore = gnn?.score_available === true
+    || Number(gnn?.sample_count || 0) > 0;
   const overall = opsPrimaryBlocker(diag, reliability, gnn, trading);
 
   const overallNode = document.getElementById('ops-overall-state');
@@ -184,12 +193,13 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
     'gnn',
     trusted.length ? 'pass' : (gnn?.passed ? 'warn' : 'block'),
     trusted.length ? '진입 신뢰 통과' : (gnn?.passed ? '모델 보정 통과' : '검증 대기'),
-    `점수 ${opsNumber(gnn?.score, 3)} · 보정 ${calibrated.length} · 진입 ${trusted.length}`,
+    `점수 ${gnnHasScore ? opsNumber(gnn?.score, 3) : 'N/A'} · 보정 ${calibrated.length} · 진입 ${trusted.length}`,
   );
   const executionReady = Boolean(
     trading?.running
     && trading?.buy_enabled
-    && gnn?.passed
+    && gnn?.checkpoint_live_authorized === true
+    && trusted.length > 0
     && session?.selected_strategy,
   );
   opsSetGate(
@@ -225,9 +235,13 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
   opsSetBadge(
     'ops-gnn-state',
     trusted.length ? 'pass' : 'warn',
-    trusted.length ? 'ENTRY READY' : (gnn?.passed ? 'CALIBRATED' : 'VALIDATING'),
+    trusted.length
+      ? 'ENTRY READY'
+      : (gnn?.checkpoint_live_authorized === false
+        ? 'SHADOW ONLY'
+        : (gnn?.passed ? 'CALIBRATED' : 'COLLECTING')),
   );
-  opsText('ops-gnn-score', opsNumber(gnn?.score, 3));
+  opsText('ops-gnn-score', gnnHasScore ? opsNumber(gnn?.score, 3) : 'N/A');
   opsText('ops-gnn-samples', `표본 ${opsNumber(gnn?.sample_count)}/${opsNumber(gnn?.minimum_samples)}`);
   const strategyRows = Object.values(gnn?.strategy_metrics || {});
   const upsideSupervised = (gnn?.upside_supervised_strategy_ids || []).length;

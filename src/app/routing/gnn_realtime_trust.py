@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from app.cost import TradingCostEngine
 from app.routing.actions import is_actionable_strategy_route
@@ -82,6 +82,7 @@ class GnnRealtimeTrustEvaluator:
         cache_seconds: float | None = None,
         allow_checkpoint_history: bool | None = None,
         stale_while_refresh: bool = False,
+        background_process: bool = False,
     ) -> None:
         self.comparison_path = Path(comparison_path)
         self.database_path = Path(database_path)
@@ -116,6 +117,7 @@ class GnnRealtimeTrustEvaluator:
             else bool(allow_checkpoint_history)
         )
         self.stale_while_refresh = bool(stale_while_refresh)
+        self.background_process = bool(background_process)
         self.minimum_strategy_samples = max(
             8,
             int(
@@ -131,6 +133,10 @@ class GnnRealtimeTrustEvaluator:
         self._evaluation_lock = threading.Lock()
         self._refresh_state_lock = threading.Lock()
         self._refreshing = False
+        # Sparse validation journals often need the full bounded scan. Remember
+        # that discovered depth so the next refresh does not reparse the same
+        # 4.8k, 9.6k, 19.2k... prefixes before reaching it again.
+        self._scan_lines_hint = max(2000, self.window_samples * 20)
 
     def evaluate(self, now: datetime | None = None) -> GnnRealtimeTrust:
         current = now or datetime.now(timezone.utc)
@@ -167,12 +173,49 @@ class GnnRealtimeTrustEvaluator:
             if self._refreshing:
                 return
             self._refreshing = True
+        if self.background_process:
+            try:
+                future = _trust_process_executor().submit(
+                    _evaluate_trust_in_worker,
+                    {
+                        "comparison_path": str(self.comparison_path),
+                        "database_path": str(self.database_path),
+                        "checkpoint_metadata_path": str(
+                            self.checkpoint_metadata_path
+                        ),
+                        "horizon_seconds": (
+                            None if self.use_strategy_horizons else self.horizon_seconds
+                        ),
+                        "minimum_samples": self.minimum_samples,
+                        "window_samples": self.window_samples,
+                        "allow_checkpoint_history": self.allow_checkpoint_history,
+                    },
+                    current.isoformat(),
+                )
+                future.add_done_callback(self._accept_process_refresh)
+                return
+            except Exception:  # noqa: BLE001 - fall back to the safe daemon path.
+                pass
         threading.Thread(
             target=self._refresh_in_background,
             args=(current,),
             name="gnn-realtime-trust-refresh",
             daemon=True,
         ).start()
+
+    def _accept_process_refresh(self, future: Future[GnnRealtimeTrust]) -> None:
+        try:
+            result = future.result()
+        except Exception:  # noqa: BLE001 - validation failure remains fail-closed.
+            result = self._empty(
+                datetime.now(timezone.utc),
+                ("GNN_TRUST_BACKGROUND_REFRESH_FAILED",),
+            )
+        with self._evaluation_lock:
+            self._cached = result
+            self._cached_at = time.monotonic()
+        with self._refresh_state_lock:
+            self._refreshing = False
 
     def _refresh_in_background(self, current: datetime) -> None:
         try:
@@ -378,7 +421,6 @@ class GnnRealtimeTrustEvaluator:
                 "price-only history"
             ),
         )
-
     def _query_outcomes(
         self,
         candidates: list[dict[str, Any]],
@@ -412,7 +454,10 @@ class GnnRealtimeTrustEvaluator:
         self, evaluation_time: datetime
     ) -> list[dict[str, Any]]:
         active_checkpoint_hash = self._active_checkpoint_hash()
-        scan_lines = max(2000, self.window_samples * 20)
+        scan_lines = max(
+            max(2000, self.window_samples * 20),
+            int(self._scan_lines_hint),
+        )
         max_scan_lines = max(
             scan_lines,
             int(
@@ -423,7 +468,7 @@ class GnnRealtimeTrustEvaluator:
             ),
         )
         while True:
-            rows = _tail_text_lines(
+            rows, has_earlier_rows = _tail_text_lines_across_rotations(
                 self.comparison_path,
                 max_lines=scan_lines,
             )
@@ -438,9 +483,10 @@ class GnnRealtimeTrustEvaluator:
             # Expand only until the bounded *valid* sample window is filled.
             if (
                 len(candidates) >= self.window_samples
-                or len(rows) < scan_lines
+                or not has_earlier_rows
                 or scan_lines >= max_scan_lines
             ):
+                self._scan_lines_hint = scan_lines
                 return self._bounded_per_strategy(candidates)
             scan_lines = min(max_scan_lines, scan_lines * 2)
 
@@ -488,13 +534,19 @@ class GnnRealtimeTrustEvaluator:
 
     def _prediction_candidates_from_rows(
         self,
-        rows: deque[str],
+        rows: Iterable[str],
         *,
         evaluation_time: datetime,
         active_checkpoint_hash: str | None,
     ) -> list[dict[str, Any]]:
         deduplicated: dict[tuple[str, str, str, int], dict[str, Any]] = {}
-        for raw in rows:
+        for row_index, raw in enumerate(rows):
+            # This runs in a daemon thread under stale-while-refresh. JSON
+            # decoding is CPU-bound and otherwise monopolises the GIL long
+            # enough to make tiny chart/API reads wait several seconds. Yield
+            # cooperatively without changing which rows or outcomes are used.
+            if row_index and row_index % 256 == 0:
+                time.sleep(0)
             try:
                 payload = json.loads(raw)
                 observed = datetime.fromisoformat(
@@ -787,27 +839,233 @@ class GnnRealtimeTrustEvaluator:
         )
 
 
-def _tail_text_lines(path: Path, *, max_lines: int) -> deque[str]:
-    """Read only the physical tail needed by the bounded trust window."""
+_default_evaluator: GnnRealtimeTrustEvaluator | None = None
+_default_evaluator_lock = threading.Lock()
+
+
+def default_gnn_realtime_trust_evaluator() -> GnnRealtimeTrustEvaluator:
+    """One process-wide evaluator for every live ingestion and UI consumer.
+
+    KRX ingestion, US ingestion, the strategy session, and the dashboard all
+    validate the same checkpoint against the same journals. Separate evaluator
+    instances each launched their own large-log refresh thread, tripling CPU and
+    starving small API reads. A single cache also guarantees that every consumer
+    sees the same evaluated timestamp and verdict.
+    """
+    global _default_evaluator
+    if _default_evaluator is not None:
+        return _default_evaluator
+    with _default_evaluator_lock:
+        if _default_evaluator is None:
+            _default_evaluator = GnnRealtimeTrustEvaluator(
+                stale_while_refresh=True,
+                background_process=True,
+            )
+        return _default_evaluator
+
+
+_trust_executor: ProcessPoolExecutor | None = None
+_trust_executor_lock = threading.Lock()
+_worker_evaluators: dict[tuple[Any, ...], GnnRealtimeTrustEvaluator] = {}
+
+
+def _trust_process_executor() -> ProcessPoolExecutor:
+    global _trust_executor
+    if _trust_executor is not None:
+        return _trust_executor
+    with _trust_executor_lock:
+        if _trust_executor is None:
+            _trust_executor = ProcessPoolExecutor(max_workers=1)
+        return _trust_executor
+
+
+def _evaluate_trust_in_worker(
+    config: dict[str, Any], evaluated_at: str
+) -> GnnRealtimeTrust:
+    """CPU-heavy journal parsing in one reusable worker process."""
+    key = (
+        config["comparison_path"],
+        config["database_path"],
+        config["checkpoint_metadata_path"],
+        config["horizon_seconds"],
+        config["minimum_samples"],
+        config["window_samples"],
+        config["allow_checkpoint_history"],
+    )
+    evaluator = _worker_evaluators.get(key)
+    if evaluator is None:
+        evaluator = GnnRealtimeTrustEvaluator(
+            comparison_path=config["comparison_path"],
+            database_path=config["database_path"],
+            checkpoint_metadata_path=config["checkpoint_metadata_path"],
+            horizon_seconds=config["horizon_seconds"],
+            minimum_samples=config["minimum_samples"],
+            window_samples=config["window_samples"],
+            allow_checkpoint_history=config["allow_checkpoint_history"],
+            stale_while_refresh=False,
+            background_process=False,
+        )
+        _worker_evaluators[key] = evaluator
+    moment = datetime.fromisoformat(evaluated_at.replace("Z", "+00:00"))
+    return evaluator._evaluate_uncached(moment)
+
+
+@dataclass(frozen=True)
+class _TailTextWindow:
+    path: Path
+    start: int
+    size: int
+    line_count: int
+    inode: int
+
+
+def _tail_text_window(path: Path, *, max_lines: int) -> tuple[_TailTextWindow | None, bool]:
+    """Locate a bounded tail while keeping the file closed between operations."""
     limit = max(1, int(max_lines))
     block_size = 256 * 1024
-    with path.open("rb") as handle:
+    try:
+        handle = path.open("rb")
+    except FileNotFoundError:
+        return None, False
+    with handle:
+        stat = os.fstat(handle.fileno())
         handle.seek(0, 2)
-        position = handle.tell()
-        chunks: list[bytes] = []
+        size = handle.tell()
+        position = size
+        ends_with_newline = False
+        if size:
+            handle.seek(size - 1)
+            ends_with_newline = handle.read(1) == b"\n"
+        target_newlines = limit + (1 if ends_with_newline else 0)
         newline_count = 0
-        while position > 0 and newline_count <= limit:
+        start = 0
+        has_earlier_rows = False
+        while position > 0:
             read_size = min(block_size, position)
             position -= read_size
             handle.seek(position)
             chunk = handle.read(read_size)
-            chunks.append(chunk)
-            newline_count += chunk.count(b"\n")
-    raw_lines = b"".join(reversed(chunks)).splitlines()[-limit:]
-    return deque(
-        (line.decode("utf-8", errors="ignore") for line in raw_lines),
-        maxlen=limit,
+            chunk_newlines = chunk.count(b"\n")
+            if newline_count + chunk_newlines >= target_newlines:
+                needed_in_chunk = target_newlines - newline_count
+                index = len(chunk)
+                for _ in range(needed_in_chunk):
+                    index = chunk.rfind(b"\n", 0, index)
+                start = position + index + 1
+                has_earlier_rows = True
+                break
+            newline_count += chunk_newlines
+
+    line_count = (
+        limit
+        if has_earlier_rows
+        else newline_count + (1 if size and not ends_with_newline else 0)
     )
+    if line_count <= 0:
+        return None, has_earlier_rows
+    return (
+        _TailTextWindow(
+            path=path,
+            start=start,
+            size=size,
+            line_count=line_count,
+            inode=int(getattr(stat, "st_ino", 0) or 0),
+        ),
+        has_earlier_rows,
+    )
+
+
+def _window_rows(window: _TailTextWindow) -> Iterator[str]:
+    try:
+        handle = window.path.open("rb")
+    except FileNotFoundError:
+        return
+    with handle:
+        current_inode = int(getattr(os.fstat(handle.fileno()), "st_ino", 0) or 0)
+        # Rotation may occur between locating the byte boundary and reopening the
+        # path.  Never apply an offset from the old segment to a new active file.
+        if window.inode and current_inode and current_inode != window.inode:
+            return
+        handle.seek(window.start)
+        for _ in range(window.line_count):
+            raw = handle.readline()
+            if not raw:
+                break
+            yield raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+
+
+def _tail_text_lines(
+    path: Path, *, max_lines: int
+) -> tuple[Iterator[str], bool]:
+    """Stream a bounded physical tail without retaining its large JSON rows.
+
+    Comparison rows can exceed 100 KiB.  The old deque implementation joined and
+    decoded thousands of them at once, briefly allocating hundreds of megabytes
+    on every trust refresh.  Find the byte boundary in reverse, then parse forward
+    one line at a time. ``has_earlier_rows`` preserves the evaluator's adaptive
+    expansion behaviour without materialising the window just to call ``len``.
+    """
+    window, has_earlier_rows = _tail_text_window(path, max_lines=max_lines)
+    return (_window_rows(window) if window is not None else iter(())), has_earlier_rows
+
+
+def _comparison_history_paths(path: Path) -> tuple[Path, ...]:
+    """Current journal followed by immutable/legacy rotations, newest first."""
+    prefix = f"{path.name}."
+    rotated: list[Path] = []
+    try:
+        candidates = tuple(path.parent.glob(f"{path.name}.*"))
+    except OSError:
+        candidates = ()
+    for candidate in candidates:
+        suffix = candidate.name[len(prefix) :]
+        if candidate.is_file() and (suffix.isdigit() or suffix.startswith("r")):
+            rotated.append(candidate)
+    rotated.sort(
+        key=lambda item: item.stat().st_mtime_ns if item.exists() else 0,
+        reverse=True,
+    )
+    maximum_rotations = max(
+        1,
+        int(os.getenv("GNN_TRUST_MAX_ROTATED_LOGS", "3")),
+    )
+    current = (path,) if path.exists() else ()
+    return (*current, *rotated[:maximum_rotations])
+
+
+def _tail_text_lines_across_rotations(
+    path: Path, *, max_lines: int
+) -> tuple[Iterator[str], bool]:
+    """Read one chronological physical tail across journal rotation boundaries."""
+    limit = max(1, int(max_lines))
+    paths = _comparison_history_paths(path)
+    if not paths:
+        return iter(()), False
+
+    remaining = limit
+    windows: list[_TailTextWindow] = []
+    has_earlier_rows = False
+    for index, history_path in enumerate(paths):
+        window, earlier_in_file = _tail_text_window(
+            history_path,
+            max_lines=remaining,
+        )
+        if window is not None:
+            windows.append(window)
+            remaining -= window.line_count
+        if remaining <= 0:
+            has_earlier_rows = earlier_in_file or index < len(paths) - 1
+            break
+    else:
+        has_earlier_rows = False
+
+    def rows() -> Iterator[str]:
+        # Windows were discovered newest -> oldest; emit oldest -> newest so the
+        # evaluator's first-positive-in-horizon rule remains chronological.
+        for window in reversed(windows):
+            yield from _window_rows(window)
+
+    return rows(), has_earlier_rows
 
 
 def _market_key(symbol: str) -> str:

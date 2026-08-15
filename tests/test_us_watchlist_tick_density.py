@@ -151,7 +151,7 @@ def _stub_pool(monkeypatch: pytest.MonkeyPatch, pool: tuple[str, ...]) -> None:
     monkeypatch.setattr(
         web,
         "_recent_affordable_us_watchlist",
-        lambda _account, *, limit, database=None: pool[:limit],
+        lambda _account, *, limit, database=None, maximum_price_usd=None: pool[:limit],
     )
     # A short pool otherwise pulls in the seed list and the discovery scan, which
     # would make the assertions here about those and not about the rotation.
@@ -162,7 +162,14 @@ def _stub_pool(monkeypatch: pytest.MonkeyPatch, pool: tuple[str, ...]) -> None:
     monkeypatch.setenv("REALTIME_US_ROTATION_POOL_MULTIPLIER", "3")
     monkeypatch.setenv("REALTIME_US_SESSION_ANCHOR_SLOTS", "3")
     web._us_learning_watchlist_cache.update(
-        {"at": 0.0, "cash_usd": None, "symbols": (), "pool": (), "rotation_index": 0}
+        {
+            "at": 0.0,
+            "cash_usd": None,
+            "price_cap_usd": None,
+            "symbols": (),
+            "pool": (),
+            "rotation_index": 0,
+        }
     )
 
 

@@ -510,6 +510,61 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "trailing_bps": 40.0,
         "horizon_seconds": 10800.0,
     },
+    "supertrend_dmi_continuation": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_adx": 25.0,
+        "min_dmi_spread": 5.0,
+        "min_supertrend_distance_bps": 0.0,
+        "min_vwap_premium_bps": 5.0,
+        "min_relative_volume": 1.0,
+        "min_momentum_persistence": 0.55,
+        "min_liquidity_score": 0.45,
+        "max_spread_bps": 35.0,
+        "max_change_point_probability": 0.50,
+        "target_capture_fraction": 0.60,
+        "stop_volatility_multiple": 2.5,
+        "trailing_bps": 35.0,
+        "horizon_seconds": 10800.0,
+    },
+    "keltner_volatility_breakout": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "max_squeeze_ratio": 1.25,
+        "min_volatility_expansion": 1.15,
+        "min_adx": 20.0,
+        "min_relative_volume": 1.50,
+        "min_vwap_premium_bps": 5.0,
+        "min_liquidity_score": 0.50,
+        "max_spread_bps": 35.0,
+        "max_change_point_probability": 0.45,
+        "target_capture_fraction": 0.65,
+        "stop_volatility_multiple": 2.5,
+        "trailing_bps": 40.0,
+        "horizon_seconds": 7200.0,
+    },
+    "choppiness_range_reversion": {
+        "enabled": 1.0,
+        "shadow_enabled": 1.0,
+        "paper_enabled": 1.0,
+        "live_authorized": 0.0,
+        "min_choppiness": 61.8,
+        "max_adx": 20.0,
+        "max_rsi": 35.0,
+        "max_percent_b": 0.10,
+        "min_vwap_discount_bps": 25.0,
+        "min_relative_volume": 0.70,
+        "min_liquidity_score": 0.45,
+        "max_spread_bps": 30.0,
+        "target_capture_fraction": 0.60,
+        "stop_volatility_multiple": 2.0,
+        "trailing_bps": 25.0,
+        "horizon_seconds": 3600.0,
+    },
     "liquidity_shock_reversal": {
         # The new ask-heavy absorption branch is validated on two US sessions
         # only.  Keep the whole arm shadow-only until forward outcomes provide
@@ -3369,6 +3424,185 @@ class BarTrendContinuationAlgorithm(TradingAlgorithm):
         return ()
 
 
+class SupertrendDmiContinuationAlgorithm(TradingAlgorithm):
+    """Strong directional tape: ATR trend line confirmed by DMI and volume."""
+
+    strategy_id = "supertrend_dmi_continuation"
+    thesis = "an ATR-defined uptrend with strong positive directional movement continues"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        required = (
+            f.price, f.supertrend, f.supertrend_direction,
+            f.supertrend_distance_bps, f.adx, f.dmi_spread,
+            f.vwap_distance_bps, f.relative_volume, f.momentum_persistence,
+            f.atr_pct, f.liquidity_score, f.spread_bps,
+        )
+        if not _present(*required):
+            return self._reject(("SUPER_DMI_INPUTS_MISSING",))
+        if float(f.supertrend_direction) <= 0 or float(f.price) <= float(f.supertrend):
+            return self._reject(("SUPER_DMI_UPTREND_NOT_ACTIVE",))
+        if float(f.adx) < self.p("min_adx") or float(f.dmi_spread) < self.p("min_dmi_spread"):
+            return self._reject(("SUPER_DMI_TREND_STRENGTH_LOW",), adx=f.adx, dmi_spread=f.dmi_spread)
+        if float(f.supertrend_distance_bps) < self.p("min_supertrend_distance_bps"):
+            return self._reject(("SUPER_DMI_PRICE_BELOW_TREND_LINE",))
+        if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
+            return self._reject(("SUPER_DMI_VWAP_NOT_CONFIRMED",))
+        if float(f.relative_volume) < self.p("min_relative_volume"):
+            return self._reject(("SUPER_DMI_VOLUME_NOT_CONFIRMED",))
+        if float(f.momentum_persistence) < self.p("min_momentum_persistence"):
+            return self._reject(("SUPER_DMI_PERSISTENCE_LOW",))
+        if float(f.liquidity_score) < self.p("min_liquidity_score") or float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(("SUPER_DMI_EXECUTION_QUALITY_LOW",))
+        if context.change_point_probability is not None and context.change_point_probability > self.p("max_change_point_probability"):
+            return self._reject(("SUPER_DMI_STRUCTURAL_BREAK",))
+        attainable = float(f.atr_pct) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
+        edge = attainable * self.p("target_capture_fraction")
+        score = _clamp(
+            0.35 * _clamp((float(f.adx) - self.p("min_adx")) / 25.0)
+            + 0.25 * _clamp(float(f.dmi_spread) / 30.0)
+            + 0.20 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
+            + 0.20 * _clamp((float(f.momentum_persistence) - 0.5) * 2.0)
+        )
+        return self._fire(
+            symbol=f.symbol, score=score, confidence=_clamp(0.35 + 0.5 * score),
+            edge_bps=edge, reasons=("SUPERTREND_UP", "DMI_ADX_TREND_CONFIRMED"),
+            adx=round(float(f.adx), 3), dmi_spread=round(float(f.dmi_spread), 3),
+            relative_volume=round(float(f.relative_volume), 3),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        target_edge = float(f.atr_pct or 0.0) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0 * self.p("target_capture_fraction")
+        structural_stop = float(f.supertrend) if f.supertrend and float(f.supertrend) < entry_price else None
+        return ExitRule(
+            self.strategy_id,
+            structural_stop or self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
+            entry_price * (1.0 + target_edge / 10_000.0),
+            self.p("trailing_bps"), self.horizon_seconds,
+            "supertrend_line", "atr_horizon_move",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        if f.supertrend_direction is not None and f.supertrend_direction <= 0:
+            return ("SUPERTREND_FLIPPED_DOWN",)
+        if f.dmi_spread is not None and f.dmi_spread <= 0:
+            return ("DMI_DIRECTION_REVERSED",)
+        return ()
+
+
+class KeltnerVolatilityBreakoutAlgorithm(TradingAlgorithm):
+    """Compression-to-expansion breakout with volume and trend-strength proof."""
+
+    strategy_id = "keltner_volatility_breakout"
+    thesis = "a compressed volatility envelope expands above Keltner resistance on volume"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        required = (
+            f.price, f.keltner_upper, f.keltner_bandwidth, f.bb_bandwidth,
+            f.volatility_expansion, f.adx, f.dmi_spread, f.relative_volume,
+            f.vwap_distance_bps, f.atr_pct, f.liquidity_score, f.spread_bps,
+        )
+        if not _present(*required):
+            return self._reject(("KELTNER_BREAKOUT_INPUTS_MISSING",))
+        squeeze_ratio = float(f.bb_bandwidth) / max(1e-12, float(f.keltner_bandwidth))
+        if squeeze_ratio > self.p("max_squeeze_ratio"):
+            return self._reject(("KELTNER_PRIOR_COMPRESSION_MISSING",), squeeze_ratio=squeeze_ratio)
+        if float(f.price) <= float(f.keltner_upper):
+            return self._reject(("KELTNER_UPPER_BAND_NOT_BROKEN",))
+        if float(f.volatility_expansion) < self.p("min_volatility_expansion"):
+            return self._reject(("KELTNER_VOLATILITY_NOT_EXPANDING",))
+        if float(f.adx) < self.p("min_adx") or float(f.dmi_spread) <= 0:
+            return self._reject(("KELTNER_DIRECTION_NOT_CONFIRMED",))
+        if float(f.relative_volume) < self.p("min_relative_volume"):
+            return self._reject(("KELTNER_RELATIVE_VOLUME_LOW",))
+        if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
+            return self._reject(("KELTNER_VWAP_NOT_CONFIRMED",))
+        if float(f.liquidity_score) < self.p("min_liquidity_score") or float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(("KELTNER_EXECUTION_QUALITY_LOW",))
+        if context.change_point_probability is not None and context.change_point_probability > self.p("max_change_point_probability"):
+            return self._reject(("KELTNER_STRUCTURAL_BREAK",))
+        attainable = float(f.atr_pct) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
+        edge = attainable * self.p("target_capture_fraction")
+        score = _clamp(
+            0.30 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
+            + 0.25 * _clamp((float(f.volatility_expansion) - 1.0) / 2.0)
+            + 0.25 * _clamp(float(f.adx) / 50.0)
+            + 0.20 * _clamp(float(f.dmi_spread) / 30.0)
+        )
+        return self._fire(
+            symbol=f.symbol, score=score, confidence=_clamp(0.30 + 0.55 * score),
+            edge_bps=edge, reasons=("KELTNER_UPPER_BREAKOUT", "VOLATILITY_EXPANSION_CONFIRMED"),
+            squeeze_ratio=round(squeeze_ratio, 4),
+            volatility_expansion=round(float(f.volatility_expansion), 4),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        edge = float(f.atr_pct or 0.0) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0 * self.p("target_capture_fraction")
+        return ExitRule(
+            self.strategy_id,
+            self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
+            entry_price * (1.0 + edge / 10_000.0), self.p("trailing_bps"),
+            self.horizon_seconds, "atr_volatility_stop", "volatility_expansion_move",
+        )
+
+
+class ChoppinessRangeReversionAlgorithm(TradingAlgorithm):
+    """Sideways tape: oversold lower-band displacement reverts toward VWAP."""
+
+    strategy_id = "choppiness_range_reversion"
+    thesis = "a high-CHOP, weak-ADX lower-band extreme reverts toward session value"
+
+    def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        required = (
+            f.price, f.choppiness, f.adx, f.rsi, f.bb_percent_b,
+            f.vwap, f.vwap_distance_bps, f.macd_histogram, f.relative_volume,
+            f.atr_pct, f.liquidity_score, f.spread_bps,
+        )
+        if not _present(*required):
+            return self._reject(("CHOP_REVERSION_INPUTS_MISSING",))
+        if float(f.choppiness) < self.p("min_choppiness") or float(f.adx) > self.p("max_adx"):
+            return self._reject(("CHOP_RANGE_REGIME_NOT_CONFIRMED",))
+        if float(f.rsi) > self.p("max_rsi") or float(f.bb_percent_b) > self.p("max_percent_b"):
+            return self._reject(("CHOP_OVERSOLD_EXTREME_MISSING",))
+        if float(f.vwap_distance_bps) > -self.p("min_vwap_discount_bps"):
+            return self._reject(("CHOP_VWAP_DISCOUNT_TOO_SMALL",))
+        # A completed-bar momentum turn avoids buying an accelerating band walk.
+        if float(f.macd_histogram) < 0:
+            return self._reject(("CHOP_RECOVERY_NOT_CONFIRMED",))
+        if float(f.relative_volume) < self.p("min_relative_volume"):
+            return self._reject(("CHOP_VOLUME_TOO_THIN",))
+        if float(f.liquidity_score) < self.p("min_liquidity_score") or float(f.spread_bps) > self.p("max_spread_bps"):
+            return self._reject(("CHOP_EXECUTION_QUALITY_LOW",))
+        structural_edge = max(0.0, (float(f.vwap) / float(f.price) - 1.0) * 10_000.0)
+        attainable = float(f.atr_pct) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
+        edge = min(structural_edge, attainable) * self.p("target_capture_fraction")
+        score = _clamp(
+            0.30 * _clamp((float(f.choppiness) - self.p("min_choppiness")) / 25.0)
+            + 0.30 * _clamp((self.p("max_rsi") - float(f.rsi)) / 35.0)
+            + 0.25 * _clamp((self.p("max_percent_b") - float(f.bb_percent_b)) / 0.5)
+            + 0.15 * float(f.liquidity_score)
+        )
+        return self._fire(
+            symbol=f.symbol, score=score, confidence=_clamp(0.30 + 0.5 * score),
+            edge_bps=edge, reasons=("CHOP_RANGE_CONFIRMED", "BOLLINGER_RSI_VWAP_EXTREME"),
+            choppiness=round(float(f.choppiness), 3), adx=round(float(f.adx), 3),
+            structural_edge_bps=round(structural_edge, 3),
+        )
+
+    def exit_rule(self, entry_price, f, context) -> ExitRule:
+        target = float(f.vwap) if f.vwap and float(f.vwap) > entry_price else None
+        return ExitRule(
+            self.strategy_id,
+            self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
+            target, self.p("trailing_bps"), self.horizon_seconds,
+            "atr_volatility_stop", "session_vwap",
+        )
+
+    def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
+        if f.adx is not None and f.adx > self.p("max_adx"):
+            return ("CHOP_RANGE_BECAME_DIRECTIONAL",)
+        return ()
+
+
 ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     IntradayMomentumAlgorithm,
     BreakoutVolumeAlgorithm,
@@ -3391,6 +3625,9 @@ ALL_ALGORITHM_TYPES: tuple[type[TradingAlgorithm], ...] = (
     OvernightGapCarryAlgorithm,
     RangeSupportReversionAlgorithm,
     BarTrendContinuationAlgorithm,
+    SupertrendDmiContinuationAlgorithm,
+    KeltnerVolatilityBreakoutAlgorithm,
+    ChoppinessRangeReversionAlgorithm,
 )
 
 ALGORITHM_IDS: tuple[str, ...] = tuple(kind.strategy_id for kind in ALL_ALGORITHM_TYPES)
@@ -3426,6 +3663,9 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     # it out entirely would make the macro layer read it as never permitted.
     "range_support_reversion": ("mean_reversion",),
     "bar_trend_continuation": ("momentum",),
+    "supertrend_dmi_continuation": ("momentum",),
+    "keltner_volatility_breakout": ("breakout", "momentum"),
+    "choppiness_range_reversion": ("mean_reversion", "vwap_reversion"),
     # --- SHORT theses -------------------------------------------------------- #
     # Mapped to SHORT-side families so the macro allow/block lists can permit a
     # falling-tape short without simultaneously permitting a long momentum entry.
@@ -3506,9 +3746,13 @@ def get_algorithm(
     return source.get(str(strategy_id or "").strip().lower())
 
 
-def strategy_live_authorized(strategy_id: str) -> bool:
+def strategy_live_authorized(
+    strategy_id: str,
+    *,
+    registry: Mapping[str, TradingAlgorithm] | None = None,
+) -> bool:
     """Deployment flag only; model/ontology authorization remains separate."""
-    algorithm = get_algorithm(strategy_id)
+    algorithm = get_algorithm(strategy_id, registry=registry)
     if algorithm is None:
         return False
     if strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:
@@ -3516,14 +3760,18 @@ def strategy_live_authorized(strategy_id: str) -> bool:
     return algorithm.p("enabled") >= 1.0 and algorithm.p("live_authorized") >= 1.0
 
 
-def strategy_shadow_authorized(strategy_id: str) -> bool:
+def strategy_shadow_authorized(
+    strategy_id: str,
+    *,
+    registry: Mapping[str, TradingAlgorithm] | None = None,
+) -> bool:
     """May this strategy be evaluated and journaled without a live order?
 
     A deployment-gated strategy that is not yet live-authorized is still expected
     to run in shadow — that is how it accumulates the per-regime samples the
     conservative bandit needs before it can ever be selected live.
     """
-    algorithm = get_algorithm(strategy_id)
+    algorithm = get_algorithm(strategy_id, registry=registry)
     if algorithm is None:
         return False
     if strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:

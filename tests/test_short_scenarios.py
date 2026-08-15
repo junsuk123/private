@@ -31,6 +31,7 @@ from app.trading.directional import (
 )
 from app.trading.directional_shadow import (
     OUTCOME_BORROW_RECALLED,
+    OUTCOME_EXPIRED,
     OUTCOME_STOP,
     OUTCOME_UNFILLED,
     QuoteObservation,
@@ -337,6 +338,40 @@ def test_entry_that_never_fills_is_recorded_as_unfilled_not_as_a_loss() -> None:
     assert not outcomes[0].scored
 
 
+def test_expiry_without_post_entry_quote_is_not_scored_as_a_loss() -> None:
+    simulator = _simulator()
+    simulator.submit(_plan(max_holding_seconds=60))
+    simulator.observe_symbol(
+        "005930", QuoteObservation(NOW + timedelta(seconds=1), 999.0, 1001.0)
+    )
+
+    outcome = simulator.expire(NOW + timedelta(seconds=120))[0]
+
+    assert outcome.outcome == OUTCOME_EXPIRED
+    assert outcome.net_return_bps is None
+    assert outcome.scored is False
+
+
+def test_expiry_uses_latest_executable_quote_not_worst_excursion() -> None:
+    simulator = _simulator()
+    simulator.submit(_plan(max_holding_seconds=60))
+    simulator.observe_symbol(
+        "005930", QuoteObservation(NOW + timedelta(seconds=1), 999.0, 1001.0)
+    )
+    simulator.observe_symbol(
+        "005930", QuoteObservation(NOW + timedelta(seconds=10), 1001.0, 1003.0)
+    )
+    simulator.observe_symbol(
+        "005930", QuoteObservation(NOW + timedelta(seconds=20), 997.0, 999.0)
+    )
+
+    outcome = simulator.expire(NOW + timedelta(seconds=90))[0]
+
+    assert outcome.outcome == OUTCOME_EXPIRED
+    assert outcome.exit_price == pytest.approx(999.0)
+    assert outcome.max_adverse_excursion_bps > 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Restart and reconciliation                                                   #
 # --------------------------------------------------------------------------- #
@@ -571,7 +606,7 @@ def test_signal_to_promotion_evidence_in_one_pass(tmp_path) -> None:
         shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
         performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
     )
-    service.evaluate_tick({}, now=NOW, new_plans=[_plan()])
+    service.evaluate_tick({}, now=NOW, new_plans=[_plan(regime="TREND_DOWN")])
     service.evaluate_tick(
         {
             "005930": {
@@ -597,6 +632,16 @@ def test_signal_to_promotion_evidence_in_one_pass(tmp_path) -> None:
     )
     assert metrics["filled_trade_count"] == 1
     assert metrics["mean_net_return_bps"] > 0
+    outcomes = service.performance_store.recent_outcomes(
+        KEY.strategy_id,
+        market=KEY.market,
+        regime="TREND_DOWN",
+        direction=str(KEY.direction),
+        execution_product=str(KEY.execution_product),
+        evaluation_sources=(EVALUATION_SOURCE_SHADOW,),
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].regime == "TREND_DOWN"
 
     controller = ShortStrategyPromotionController(
         config=ShortStrategyPromotionConfig(

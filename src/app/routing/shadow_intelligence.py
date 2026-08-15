@@ -41,7 +41,11 @@ from app.routing.shadow_comparison import (
     ShadowComparisonRecorder,
     ShadowDecision,
 )
-from app.routing.gnn_realtime_trust import GnnRealtimeTrust, GnnRealtimeTrustEvaluator
+from app.routing.gnn_realtime_trust import (
+    GnnRealtimeTrust,
+    GnnRealtimeTrustEvaluator,
+    default_gnn_realtime_trust_evaluator,
+)
 from app.routing.strategy_router import StrategyRouter
 from app.strategy.catalog import is_short_strategy
 from app.strategy.catalog import STRATEGY_IDS
@@ -156,6 +160,7 @@ class ShadowIntelligenceService:
         minimum_interval_seconds: float = 1.0,
         enable_npu_comparison: bool = False,
         comparison_path: str | Path = "logs/refactor-shadow-comparison.jsonl",
+        trust_evaluator: GnnRealtimeTrustEvaluator | None = None,
     ) -> None:
         self.context_feature_dim = feature_dim
         # Graph mode is keyed off the width the strategy-graph contract declares,
@@ -281,15 +286,27 @@ class ShadowIntelligenceService:
         self.minimum_interval = timedelta(seconds=max(0, minimum_interval_seconds))
         self.last_run: dict[str, datetime] = {}
         self.recorder = ShadowComparisonRecorder(comparison_path)
-        self.trust_evaluator = GnnRealtimeTrustEvaluator(
-            comparison_path=comparison_path,
-            database_path=os.getenv(
-                "REALTIME_MARKET_DATA_DB",
-                "data/store/realtime_market_data.sqlite3",
-            ),
-            checkpoint_metadata_path=checkpoint_path.with_suffix(".json"),
-            stale_while_refresh=True,
-        )
+        # The web dashboard and live shadow route consume the same trust
+        # evidence.  Accepting the process-wide evaluator prevents both paths
+        # from independently rescanning the large comparison journal whenever
+        # their caches expire.  Standalone/offline callers keep an isolated
+        # evaluator by default.
+        if trust_evaluator is not None:
+            self.trust_evaluator = trust_evaluator
+        elif Path(comparison_path) == Path("logs/refactor-shadow-comparison.jsonl"):
+            self.trust_evaluator = default_gnn_realtime_trust_evaluator()
+        else:
+            # Tests and offline experiments using a private comparison journal
+            # must remain isolated from live process state.
+            self.trust_evaluator = GnnRealtimeTrustEvaluator(
+                comparison_path=comparison_path,
+                database_path=os.getenv(
+                    "REALTIME_MARKET_DATA_DB",
+                    "data/store/realtime_market_data.sqlite3",
+                ),
+                checkpoint_metadata_path=checkpoint_path.with_suffix(".json"),
+                stale_while_refresh=True,
+            )
         self.cost_engine = TradingCostEngine()
         self.gate = ClosedWorldOntologyGate()
         self.router = StrategyRouter(
@@ -384,6 +401,7 @@ class ShadowIntelligenceService:
                 realtime_trust=realtime_trust,
                 evidence=cpu_evidence,
                 checkpoint_hash=self.checkpoint_hash,
+                checkpoint_live_authorized=self.live_authorized,
             ),
         ]
         if self.npu is not None:
@@ -402,6 +420,7 @@ class ShadowIntelligenceService:
                     realtime_trust=realtime_trust,
                     evidence=npu_evidence,
                     checkpoint_hash=self.checkpoint_hash,
+                    checkpoint_live_authorized=self.live_authorized,
                 )
             )
         comparison = self.recorder.compare(
@@ -413,6 +432,7 @@ class ShadowIntelligenceService:
                 cpu_evidence,
                 checkpoint_hash=self.checkpoint_hash,
                 realtime_trust=realtime_trust,
+                checkpoint_live_authorized=self.live_authorized,
             ),
         )
         return ShadowIntelligenceResult(
@@ -438,8 +458,12 @@ class ShadowIntelligenceService:
             reasons.append("GNN_STRATEGY_CATALOG_MISMATCH")
         if self.model_input_schema != snapshot.feature_schema_name:
             reasons.append("GNN_FEATURE_SCHEMA_MISMATCH")
-        if not self.live_authorized:
-            reasons.append("GNN_NOT_LIVE_AUTHORIZED")
+        # Offline promotion controls order authority, not shadow inference.
+        # Blocking inference here creates a permanent deadlock: an unpromoted
+        # checkpoint emits no validation forecasts, so it can never accumulate
+        # the forward outcomes used by the realtime trust gate.  Structural
+        # contract failures still block above; a quality-gate failure continues
+        # through the validation-only path and is kept non-executable below.
         return tuple(reasons)
 
     def _ontology(self, snapshot: SlowIntelligenceSnapshot):
@@ -648,6 +672,30 @@ COMPATIBILITY_UNAVAILABLE_REASONS: dict[str, str] = {
     # and nothing finer, so an OFI microprice cannot be formed on both sides.
     # Inventing one at serving time only would be a fabricated relation.
     "ofi_microprice_exhaustion_reversal": "CONTEXT_UNAVAILABLE:L2_MICROPRICE",
+    # The four below were added to the catalogue with no relation and no declared
+    # reason. They scored a permanent 0.0 and were ontology-blocked on every pass,
+    # and the guard meant to catch that was itself disabled -- see
+    # ``compatibility_coverage``. Declared rather than given an invented relation:
+    # each names an indicator the aligned context does not carry, and the contract
+    # only admits quantities BOTH producers compute over the same window.
+    #
+    # This is not cosmetic. On the current checkpoint the KRX label outcomes for
+    # supertrend_dmi_continuation (+4.20bps net over 33 fills) and
+    # bar_trend_continuation (+1.16bps over 36) are the closest of any high-fill KRX
+    # pair to the +5bps upside-authorisation bar, so two of the most promising arms
+    # in the system are blocked on a missing feature rather than on performance.
+    #
+    # The contract carries only the LAST bar's return, not a multi-bar persistence
+    # statistic, and no moving-average pair to separate.
+    "bar_trend_continuation": "CONTEXT_UNAVAILABLE:EMA_SEPARATION_AND_TREND_PERSISTENCE",
+    # ADX, the DMI spread and the Supertrend band are all absent; the contract's
+    # only indicator families are RVGI and the box.
+    "supertrend_dmi_continuation": "CONTEXT_UNAVAILABLE:ADX_DMI_SUPERTREND",
+    # Needs the Keltner band width to measure a squeeze, plus ADX.
+    "keltner_volatility_breakout": "CONTEXT_UNAVAILABLE:KELTNER_SQUEEZE_AND_ADX",
+    # Needs the choppiness index and ADX to establish a range, plus RSI and
+    # Bollinger %B to locate the entry inside it.
+    "choppiness_range_reversion": "CONTEXT_UNAVAILABLE:CHOPPINESS_RSI_BOLLINGER",
 }
 
 
@@ -657,8 +705,16 @@ def compatibility_coverage() -> dict[str, str]:
     Exists so the omission this map suffered cannot recur silently — a strategy
     added to the catalogue with neither a relation nor a documented reason shows
     up here as ``UNDECLARED`` and fails the contract test.
+
+    It asks :func:`_named_relation_scores` which ids have a relation, NOT
+    :func:`_strategy_compatibility`. The latter applies the closed-world fill
+    before returning, so every catalogue id was present in its result and the
+    ``UNDECLARED`` branch below was unreachable — the guard reported all 23 ids as
+    ``COMPUTED`` while five of them had no relation at all and were therefore
+    permanently blocked by the ontology gate. The guard built to catch exactly that
+    omission was defeated by the line that makes the omission invisible.
     """
-    computed = set(_strategy_compatibility(tuple([0.0] * STRATEGY_GRAPH_CONTEXT_DIM)))
+    computed = set(_named_relation_scores(tuple([0.0] * STRATEGY_GRAPH_CONTEXT_DIM)))
     coverage: dict[str, str] = {}
     for strategy_id in STRATEGY_IDS:
         if strategy_id in COMPATIBILITY_UNAVAILABLE_REASONS:
@@ -671,26 +727,42 @@ def compatibility_coverage() -> dict[str, str]:
 
 
 def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
-    """Domain priors encoded as soft ontology relations, never BUY signals.
+    """Domain priors as soft ontology relations, closed over the whole catalogue.
 
-    The GNN learns outcome utility; these values only describe how strongly the
-    current facts instantiate each strategy's domain relationship. Every id in
-    ``STRATEGY_IDS`` appears in the result: the ones whose facts this snapshot
-    contract cannot supply are an explicit 0.0 carrying a reason in
+    Every id in ``STRATEGY_IDS`` appears in the result: the ones whose facts this
+    snapshot contract cannot supply are an explicit 0.0 carrying a reason in
     ``COMPATIBILITY_UNAVAILABLE_REASONS``, so "unreachable" is a reported state
     rather than a missing dictionary key.
 
-    Reads by NAME on the aligned contract. The previous version indexed
-    ``features[4]`` and ``features[6]`` directly and went on scoring after those
-    slots came to hold different quantities in training and in serving.
-
-    A snapshot of any other width is a legacy schema (the 12-field quantile
-    vector, or v3/v4). Those keep their historical positional reading — changing
-    what a deployed checkpoint's priors mean is a separate decision from fixing
-    the contract — and are routed to :func:`_legacy_positional_compatibility`.
+    The fill lives HERE and not inside the relation functions, because
+    :func:`compatibility_coverage` has to be able to tell a computed relation from a
+    filled default. While the fill ran inside them, it made every id look computed
+    and the coverage guard could never fail.
     """
-    if len(features) != STRATEGY_GRAPH_CONTEXT_DIM:
-        return _legacy_positional_compatibility(features)
+    scores = (
+        _named_relation_scores(features)
+        if len(features) == STRATEGY_GRAPH_CONTEXT_DIM
+        else _legacy_relation_scores(features)
+    )
+    # Closed world, stated explicitly: every remaining catalogue id is present with
+    # a 0.0 whose reason is declared, so a strategy is never silently excluded by
+    # absence from the relation map.
+    for strategy_id in STRATEGY_IDS:
+        scores.setdefault(strategy_id, 0.0)
+    return scores
+
+
+def _named_relation_scores(features: tuple[float, ...]) -> dict[str, float]:
+    """Relations the ALIGNED contract can express, and only those.
+
+    Reads by NAME. The version before the contract indexed ``features[4]`` and
+    ``features[6]`` directly and went on scoring after those slots came to hold
+    different quantities in training and in serving.
+
+    Returns only the ids with a real relation -- no closed-world padding -- so the
+    caller can distinguish "this relation evaluated to zero" from "this contract
+    cannot express this relation at all".
+    """
     named = as_context_mapping(features)
 
     def value(name: str, default: float = 0.0) -> float:
@@ -753,12 +825,24 @@ def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
         "range_support_reversion": (
             box_available * unit(1.0 - box_position) * spread_quality
         ),
+        # Restored: this relation existed on the legacy path and was dropped when the
+        # aligned contract replaced it, which left the strategy scoring a permanent
+        # 0.0 -- ontology-blocked on every pass -- with nothing reporting it.
+        #
+        # Faithful port, not a new invention. ``vwap_premium`` in the legacy form is
+        # ``(price - vwap) / vwap``, which IS ``distance_from_vwap`` here, and the
+        # aggressor term takes the same substitution the contract already documents
+        # for intraday_momentum and breakout_volume: the historical path cannot
+        # produce ``aggressor_imbalance_5s``, and the scaled bar return is the
+        # directional-pressure measure both sides share. Minutes-to-close stays the
+        # owned algorithm's point-in-time responsibility, as it was before.
+        "overnight_gap_carry": (
+            unit(0.5 + 0.5 * momentum)
+            * unit(0.5 + 50.0 * value("distance_from_vwap"))
+            * volatility
+            * spread_quality
+        ),
     }
-    # Closed world, stated explicitly: every remaining catalogue id is present
-    # with a 0.0 whose reason is declared, so a strategy is never silently
-    # excluded by absence from this dictionary.
-    for strategy_id in STRATEGY_IDS:
-        computed.setdefault(strategy_id, 0.0)
     return computed
 
 
@@ -782,13 +866,16 @@ def _reference_price(snapshot) -> float:
     return float(features[0]) * 100_000.0 if features else 0.0
 
 
-def _legacy_positional_compatibility(features: tuple[float, ...]) -> dict[str, float]:
+def _legacy_relation_scores(features: tuple[float, ...]) -> dict[str, float]:
     """Priors for the pre-v5 schemas, read positionally as they always were.
 
     Kept verbatim so an operator still running a v3/v4 or 12-field checkpoint
     gets the behaviour that checkpoint was calibrated against. New work belongs
     in the named path above; this exists only so the contract fix does not
     quietly re-score deployed artifacts.
+
+    Like the named path, returns only the ids it can score; the closed-world fill
+    belongs to :func:`_strategy_compatibility`.
     """
 
     def value(index: int, default: float = 0.0) -> float:
@@ -830,8 +917,6 @@ def _legacy_positional_compatibility(features: tuple[float, ...]) -> dict[str, f
         # gap worth the round trip, in a book tight enough to get out of.
         "overnight_gap_carry": closing_drive * volatility * spread_quality,
     }
-    for strategy_id in STRATEGY_IDS:
-        computed.setdefault(strategy_id, 0.0)
     return computed
 
 
@@ -842,10 +927,12 @@ def _shadow_route(
     realtime_trust: GnnRealtimeTrust | None = None,
     evidence: tuple[StrategyUtilityEvidence, ...] = (),
     checkpoint_hash: str | None = None,
+    checkpoint_live_authorized: bool = True,
 ):
     selected = route.selected
     strategy_trusted = bool(
         realtime_trust is not None
+        and checkpoint_live_authorized
         and realtime_trust.passed
         and selected is not None
         and _strategy_market_trusted(
@@ -853,6 +940,8 @@ def _shadow_route(
         )
     )
     reason_codes = tuple(route.reason_codes)
+    if not checkpoint_live_authorized:
+        reason_codes = (*reason_codes, "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED")
     if realtime_trust is not None:
         reason_codes = (
             *reason_codes,
@@ -885,7 +974,11 @@ def _shadow_route(
         )
     return ShadowDecision(
         path=path,
-        action=route.action,
+        # A non-promoted checkpoint may be measured, never executed.  Keeping
+        # the selected strategy and metrics below preserves observability while
+        # the explicit NO_TRADE prevents a later consumer from treating the
+        # shadow winner as an order permission.
+        action=route.action if checkpoint_live_authorized else "NO_TRADE",
         strategy_id=selected.strategy_id if selected else None,
         utility=(
             route.weighted_utility
@@ -1031,6 +1124,7 @@ def _validation_candidates(
     *,
     checkpoint_hash: str | None,
     realtime_trust: GnnRealtimeTrust | None = None,
+    checkpoint_live_authorized: bool = True,
 ) -> tuple[ShadowDecision, ...]:
     """Persist every admissible strategy forecast for validation and joint ranking.
 
@@ -1048,10 +1142,16 @@ def _validation_candidates(
                 dict.fromkeys(
                     (
                         "ORDER_PERMISSION_NOT_GRANTED",
+                        *(
+                            ()
+                            if checkpoint_live_authorized
+                            else ("GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED",)
+                        ),
                         (
                             "GNN_REALTIME_TRUST_PASSED"
                             if (
-                                realtime_trust is not None
+                                checkpoint_live_authorized
+                                and realtime_trust is not None
                                 and realtime_trust.passed
                                 and _strategy_market_trusted(
                                     realtime_trust,

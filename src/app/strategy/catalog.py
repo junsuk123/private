@@ -104,6 +104,12 @@ STRATEGY_IDS: tuple[str, ...] = (
     # minute-bar trend, VWAP location, persistence and relative volume. It ships
     # SHADOW-only and must earn positive net counterfactual evidence before use.
     "bar_trend_continuation",
+    # TradingView-derived multi-indicator regime strategies. All three are
+    # appended and ship SHADOW-only: catalogue membership creates observation
+    # heads, never live authority.
+    "supertrend_dmi_continuation",
+    "keltner_volatility_breakout",
+    "choppiness_range_reversion",
 )
 
 # Compatibility alias for callers that explicitly ask for the complete catalog.

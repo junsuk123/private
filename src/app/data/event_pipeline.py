@@ -410,6 +410,10 @@ class RuntimeStats:
     persistence_enqueued: int
     persistence_dropped: int
     persistence_completed: int
+    persistence_errors: int
+    last_persistence_success_at: str | None
+    last_persistence_error_at: str | None
+    last_persistence_error_type: str | None
 
 
 class EventDrivenMarketRuntime:
@@ -435,6 +439,10 @@ class EventDrivenMarketRuntime:
         self._persistence_enqueued = 0
         self._persistence_dropped = 0
         self._persistence_completed = 0
+        self._persistence_errors = 0
+        self._last_persistence_success_at: datetime | None = None
+        self._last_persistence_error_at: datetime | None = None
+        self._last_persistence_error_type: str | None = None
         self.last_processed_event: MarketEvent | None = None
         #: (symbol, stream_id) -> 진행 중인 분 bar 를 마지막으로 내보낸 monotonic 시각.
         self._minute_bar_flushed: dict[tuple[str, str], float] = {}
@@ -512,6 +520,12 @@ class EventDrivenMarketRuntime:
         try:
             await asyncio.to_thread(self._persist_batch, batch)
             self._persistence_completed += len(batch)
+            self._last_persistence_success_at = datetime.now(timezone.utc)
+        except Exception as exc:
+            self._persistence_errors += 1
+            self._last_persistence_error_at = datetime.now(timezone.utc)
+            self._last_persistence_error_type = exc.__class__.__name__
+            raise
         finally:
             for _ in batch:
                 self._persistence.task_done()
@@ -526,6 +540,18 @@ class EventDrivenMarketRuntime:
             persistence_enqueued=self._persistence_enqueued,
             persistence_dropped=self._persistence_dropped,
             persistence_completed=self._persistence_completed,
+            persistence_errors=self._persistence_errors,
+            last_persistence_success_at=(
+                self._last_persistence_success_at.isoformat()
+                if self._last_persistence_success_at is not None
+                else None
+            ),
+            last_persistence_error_at=(
+                self._last_persistence_error_at.isoformat()
+                if self._last_persistence_error_at is not None
+                else None
+            ),
+            last_persistence_error_type=self._last_persistence_error_type,
         )
 
     def _current_bar_if_due(

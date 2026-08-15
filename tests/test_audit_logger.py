@@ -42,6 +42,21 @@ class AuditLoggerTest(unittest.TestCase):
         self.assertEqual(payload["nested"]["items"][0]["CANO"], REDACTED)
         self.assertEqual(payload["nested"]["items"][1]["safe"], "visible")
 
+    def test_audit_logger_rotates_before_exceeding_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "audit.jsonl"
+            logger = AuditLogger(path, max_bytes=180, backup_count=2)
+            logger.record("first", {"value": "x" * 90})
+            logger.record("second", {"value": "y" * 90})
+
+            current = json.loads(path.read_text(encoding="utf-8").strip())
+            previous = json.loads(
+                path.with_name("audit.jsonl.1").read_text(encoding="utf-8").strip()
+            )
+
+        self.assertEqual(current["event_type"], "second")
+        self.assertEqual(previous["event_type"], "first")
+
 
 if __name__ == "__main__":
     unittest.main()

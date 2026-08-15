@@ -84,6 +84,9 @@ _FAMILY: dict[str, StrategyFamily] = {
     "overnight_gap_carry": StrategyFamily.CROSS_SESSION,
     "range_support_reversion": StrategyFamily.MEAN_REVERSION,
     "bar_trend_continuation": StrategyFamily.TREND_FOLLOWING,
+    "supertrend_dmi_continuation": StrategyFamily.TREND_FOLLOWING,
+    "keltner_volatility_breakout": StrategyFamily.BREAKOUT,
+    "choppiness_range_reversion": StrategyFamily.MEAN_REVERSION,
 }
 
 
@@ -155,6 +158,22 @@ _REQUIRED_FEATURES: dict[str, tuple[str, ...]] = {
         "atr_pct", "ema_fast", "ema_slow", "liquidity_score", "macd_histogram",
         "momentum_persistence", "price", "relative_volume", "spread_bps",
         "vwap_distance_bps",
+    ),
+    "supertrend_dmi_continuation": (
+        "adx", "atr_pct", "dmi_spread", "liquidity_score",
+        "momentum_persistence", "price", "relative_volume", "spread_bps",
+        "supertrend", "supertrend_direction", "supertrend_distance_bps",
+        "vwap_distance_bps",
+    ),
+    "keltner_volatility_breakout": (
+        "adx", "atr_pct", "bb_bandwidth", "dmi_spread", "keltner_bandwidth",
+        "keltner_upper", "liquidity_score", "price", "relative_volume",
+        "spread_bps", "volatility_expansion", "vwap_distance_bps",
+    ),
+    "choppiness_range_reversion": (
+        "adx", "atr_pct", "bb_percent_b", "choppiness", "liquidity_score",
+        "macd_histogram", "price", "relative_volume", "rsi", "spread_bps",
+        "vwap", "vwap_distance_bps",
     ),
 }
 
@@ -245,6 +264,9 @@ _MINIMUM_HISTORY_BARS: dict[str, int] = {
     "rvgi_box_breakout": 20,
     "range_support_reversion": 20,
     "bar_trend_continuation": 30,
+    "supertrend_dmi_continuation": 30,
+    "keltner_volatility_breakout": 30,
+    "choppiness_range_reversion": 30,
     "vwap_mean_reversion": 30,
     "bar_confirmed_vwap_recovery": 30,
     "adaptive_anchored_vwap_reversion": 30,

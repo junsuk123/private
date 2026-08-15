@@ -61,10 +61,23 @@ class TechnicalFeatureSet:
     macd_histogram: float | None = None
     short_return: float | None = None
     momentum_persistence: float | None = None  # fraction of recent bars up, [0,1]
+    adx: float | None = None
+    plus_di: float | None = None
+    minus_di: float | None = None
+    dmi_spread: float | None = None
+    supertrend: float | None = None
+    supertrend_direction: float | None = None
+    supertrend_distance_bps: float | None = None
     # Oscillator / bands
     rsi: float | None = None
     bb_percent_b: float | None = None
     bb_bandwidth: float | None = None
+    keltner_mid: float | None = None
+    keltner_upper: float | None = None
+    keltner_lower: float | None = None
+    keltner_position: float | None = None
+    keltner_bandwidth: float | None = None
+    choppiness: float | None = None
     # VWAP / volume
     vwap: float | None = None
     vwap_distance_bps: float | None = None

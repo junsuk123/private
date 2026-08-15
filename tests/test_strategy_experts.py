@@ -152,6 +152,12 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
     # Inverting it globally would simply move the failure to the breakout expert.
     per_strategy_quantiles = {
         "range_support_reversion": {**quantiles, "box_position": 0.05},
+        # The CHOP thesis wants the opposite persistence regime from every trend
+        # expert. Keep the shared strong fixture and override only that fact.
+        "choppiness_range_reversion": {
+            **quantiles,
+            "momentum_persistence_long": 0.1,
+        },
     }
 
     def _context(values: dict[str, float]) -> ExpertContext:

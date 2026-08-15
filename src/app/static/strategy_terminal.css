@@ -65,6 +65,8 @@ button, a { font: inherit; }
 .gnn-model-actions button:hover, .gnn-model-actions button.active { border-color: var(--cyan); color: #d8faff; background: rgba(57, 215, 231, .09); }
 .gnn-model-actions .gnn-visualization-toggle { border-color: rgba(57, 215, 231, .55); color: #aeeef4; }
 .gnn-model-actions .gnn-visualization-toggle.active { border-color: #46e6a5; color: #baffdf; background: rgba(70, 230, 165, .12); box-shadow: 0 0 12px rgba(70, 230, 165, .12); }
+.gnn-model-actions .gnn-auto-rotation-toggle.active { border-color: #8f7cff; color: #d9d2ff; background: rgba(143, 124, 255, .12); box-shadow: 0 0 12px rgba(143, 124, 255, .12); }
+.gnn-model-actions #gnn-model-fullscreen.active { border-color: #2af7ff; color: #d8ffff; background: rgba(42, 247, 255, .13); box-shadow: 0 0 12px rgba(42, 247, 255, .14); }
 .gnn-model-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 12px; border: 1px solid #1c2a39; border-radius: 7px; overflow: hidden; }
 .gnn-model-metrics div { padding: 8px 11px; border-right: 1px solid #1c2a39; background: rgba(8, 14, 23, .8); }
 .gnn-model-metrics div:last-child { border-right: 0; }
@@ -102,6 +104,38 @@ button, a { font: inherit; }
    clearing on every gap made the chips flicker. */
 .gnn-phase-track span.stale { color: #5c7186; background: rgba(42, 247, 255, .05); }
 @keyframes gnn-live-pulse { from { transform: scale(.78); opacity: .65; } to { transform: scale(1.24); opacity: 1; } }
+.gnn-system-health {
+  position: absolute;
+  z-index: 4;
+  right: 12px;
+  bottom: 12px;
+  width: min(390px, calc(100% - 300px));
+  border: 1px solid rgba(91, 119, 150, .4);
+  border-radius: 7px;
+  padding: 8px;
+  background: rgba(5, 10, 18, .86);
+  box-shadow: 0 9px 28px rgba(0, 0, 0, .24);
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+.gnn-system-health header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.gnn-system-health header span { color: #70849a; font: 7px Consolas, monospace; letter-spacing: .12em; }
+.gnn-system-health header strong { color: #8496aa; font: 700 8px Consolas, monospace; letter-spacing: .08em; }
+.gnn-system-health header strong[data-state="good"] { color: #79ffd3; text-shadow: 0 0 8px rgba(66, 211, 146, .55); }
+.gnn-system-health header strong[data-state="warn"] { color: #ffd078; }
+.gnn-system-health header strong[data-state="bad"] { color: #ff7895; }
+.gnn-health-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-top: 6px; }
+.gnn-health-grid article { min-width: 0; border: 1px solid #1b2a3b; border-left-width: 2px; border-radius: 4px; padding: 6px 7px; background: rgba(12, 21, 32, .76); }
+.gnn-health-grid article[data-state="good"] { border-left-color: #42d392; }
+.gnn-health-grid article[data-state="warn"] { border-left-color: #e8b85e; }
+.gnn-health-grid article[data-state="bad"] { border-left-color: #ff6678; }
+.gnn-health-grid span, .gnn-health-grid b, .gnn-health-grid small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gnn-health-grid span { color: #5f7187; font: 6px Consolas, monospace; letter-spacing: .08em; }
+.gnn-health-grid b { margin-top: 3px; color: #c9d7e5; font: 700 8px Consolas, monospace; }
+.gnn-health-grid article[data-state="good"] b { color: #8be9c3; }
+.gnn-health-grid article[data-state="warn"] b { color: #edc77f; }
+.gnn-health-grid article[data-state="bad"] b { color: #ff91a8; }
+.gnn-health-grid small { margin-top: 2px; color: #63758a; font: 6px Consolas, monospace; }
 .gnn-model-inspector { position: absolute; z-index: 3; top: 12px; right: 12px; width: 230px; padding: 11px; border: 1px solid rgba(91, 119, 150, .42); border-radius: 7px; background: rgba(7, 12, 20, .88); backdrop-filter: blur(7px); }
 .gnn-model-inspector > span { color: var(--cyan); font: 7px Consolas, monospace; letter-spacing: .12em; }
 .gnn-model-inspector h3 { margin: 7px 0 5px; font-size: 11px; }
@@ -1074,7 +1108,8 @@ button, a { font: inherit; }
 .ontology-graph-head { align-items: center; }
 .ontology-graph-summary { margin: 5px 0 0; color: var(--muted); font-size: 9px; }
 .ontology-graph-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.graph-filter {
+.graph-filter,
+.graph-action-button {
   border: 1px solid #2a394b;
   border-radius: 5px;
   padding: 6px 9px;
@@ -1083,7 +1118,10 @@ button, a { font: inherit; }
   font: 9px/1 inherit;
   cursor: pointer;
 }
-.graph-filter:hover, .graph-filter.active {
+.graph-filter:hover,
+.graph-filter.active,
+.graph-action-button:hover,
+.graph-action-button.active {
   border-color: rgba(57, 215, 231, .55);
   color: var(--cyan);
   background: rgba(57, 215, 231, .08);
@@ -1207,7 +1245,9 @@ button, a { font: inherit; }
   .gnn-model-metrics div:nth-child(2) { border-right: 0; }
   .gnn-model-metrics div:nth-child(-n+2) { border-bottom: 1px solid #1c2a39; }
   .gnn-model-stage { height: 480px; }
-  .gnn-model-inspector { top: auto; bottom: 8px; right: 8px; width: min(230px, calc(100% - 16px)); }
+  .gnn-model-inspector { top: 8px; bottom: auto; right: 8px; width: min(230px, calc(100% - 16px)); }
+  .gnn-system-health { right: 8px; bottom: 52px; width: calc(100% - 16px); }
+  .gnn-health-grid small { display: none; }
   .instrument-hero { grid-template-columns: 1fr; }
   .algorithm-card { grid-column: auto; }
   .execution-track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1573,4 +1613,97 @@ button, a { font: inherit; }
   body:not(.classic-layout) .diagnostics-panel { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body:not(.classic-layout) .training-monitor { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body:not(.classic-layout) .training-kpis { grid-column: 1 / -1; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+
+/* Only the live decision network enters fullscreen. The surrounding account
+   terminal stays outside this element, while the header controls and node
+   inspector remain available for operating the graph. */
+body.decision-ontology-fullscreen { overflow: hidden; }
+body .decision-ontology-panel:fullscreen,
+body .decision-ontology-panel.is-viewport-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 14px;
+  overflow: hidden;
+  border-radius: 0;
+  background: #080e16;
+}
+body .decision-ontology-panel:fullscreen .decision-ontology-layout,
+body .decision-ontology-panel.is-viewport-fullscreen .decision-ontology-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 20vw);
+}
+body .decision-ontology-panel:fullscreen .decision-ontology-canvas,
+body .decision-ontology-panel.is-viewport-fullscreen .decision-ontology-canvas {
+  min-height: 0;
+  overflow: auto;
+}
+body .decision-ontology-panel:fullscreen #decision-ontology-graph,
+body .decision-ontology-panel.is-viewport-fullscreen #decision-ontology-graph {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+body .decision-ontology-panel:fullscreen .ontology-inspector,
+body .decision-ontology-panel.is-viewport-fullscreen .ontology-inspector {
+  min-height: 0;
+  overflow: auto;
+}
+body .decision-ontology-panel:fullscreen .algorithm-catalog,
+body .decision-ontology-panel.is-viewport-fullscreen .algorithm-catalog {
+  flex: 0 0 auto;
+  max-height: 18vh;
+  overflow: auto;
+}
+body .decision-ontology-panel:fullscreen .ontology-graph-summary,
+body .decision-ontology-panel:fullscreen .ontology-provenance,
+body .decision-ontology-panel.is-viewport-fullscreen .ontology-graph-summary,
+body .decision-ontology-panel.is-viewport-fullscreen .ontology-provenance {
+  display: block;
+}
+
+/* The trained GNN panel has its own fullscreen surface. Keeping the complete
+   panel in the surface preserves its model controls, metrics and inspector;
+   the WebGL stage takes only the remaining viewport height. */
+body.gnn-model-fullscreen { overflow: hidden; }
+body .gnn-model-panel:fullscreen,
+body .gnn-model-panel.is-viewport-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 14px;
+  overflow: hidden;
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(35, 91, 112, .15), transparent 34%),
+    #05080e;
+}
+body .gnn-model-panel:fullscreen .gnn-model-stage,
+body .gnn-model-panel.is-viewport-fullscreen .gnn-model-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+body .gnn-model-panel:fullscreen .gnn-model-provenance,
+body .gnn-model-panel.is-viewport-fullscreen .gnn-model-provenance {
+  flex: 0 0 auto;
 }

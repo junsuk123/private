@@ -314,6 +314,9 @@ class RealtimeTradingEngine:
         self._error_backoff_until: dict[str, float] = {}
         self._open_sell_orders: dict[str, dict[str, Any]] = {}
         self._sell_lock_until: dict[str, float] = {}
+        # A terminal SELL fill outranks a lagging holdings snapshot.  Keep a
+        # symbol tombstoned until a later account cycle actually reports it flat.
+        self._terminal_sell_fills: set[str] = set()
         # 최근 매도 시각(monotonic) — 재매수 쿨다운(churn 억제)에 사용.
         self._recent_sell_monotonic: dict[str, float] = {}
         self._recent_buy_orders: dict[str, Deque[tuple[float, float]]] = {}
@@ -696,6 +699,15 @@ class RealtimeTradingEngine:
                     )
                     summary["owned_buy_candidates"] = []
 
+        # A genuinely flat broker snapshot retires terminal-fill tombstones.  Until
+        # then a stale holding row must not be allowed to generate another SELL.
+        current_holding_symbols = {
+            str(getattr(item, "ticker", "") or "").upper()
+            for item in tuple(account.holdings or ())
+            if int(getattr(item, "quantity", 0) or 0) > 0
+        }
+        self._terminal_sell_fills.intersection_update(current_holding_symbols)
+
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
             holding_symbol = str(getattr(holding, "ticker", "") or "").upper()
@@ -704,6 +716,9 @@ class RealtimeTradingEngine:
                 continue
             if not liquidation_mode and sell_submitted >= self.config.max_orders_per_cycle:
                 break
+            if holding_symbol in self._terminal_sell_fills:
+                summary["skipped_cooldown"] += 1
+                continue
             if self.market_open_provider is not None and not self.market_open_provider(holding.ticker, holding.market or ""):
                 summary["skipped_market_closed"] += 1
                 continue  # 거래소 마감: 지금 주문하면 브로커가 거부하므로 보류.
@@ -1796,6 +1811,18 @@ class RealtimeTradingEngine:
             return
         raw = getattr(snapshot, "raw", None)
         observed_status = str(getattr(snapshot, "status", "UNKNOWN") or "UNKNOWN").upper()
+        raw_side = getattr(raw, "side", None)
+        raw_side = str(getattr(raw_side, "value", raw_side) or "").upper()
+        fill_price = float(getattr(raw, "price", 0.0) or 0.0)
+        fill_time = getattr(raw, "executed_at", None)
+        if not isinstance(fill_time, datetime):
+            fill_time = getattr(snapshot, "observed_at", datetime.now(timezone.utc))
+        if observed_status == "FILLED" and raw_side == "SELL":
+            self._terminal_sell_fills.add(symbol)
+            if self.strategy_session_manager is not None:
+                marker = getattr(self.strategy_session_manager, "mark_exit_filled", None)
+                if callable(marker):
+                    marker(symbol, fill_price, fill_time)
         if observed_status in {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
             self._open_sell_orders.pop(symbol, None)
             # Broker account snapshots can lag a terminal order status. Keep the

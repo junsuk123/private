@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Work Report Processing Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "input_sha256",
+    "started_at",
+    "completed_at",
+    "status",
+    "confirmed_root_causes",
+    "unconfirmed_inferences",
+    "changed_files",
+    "test_commands",
+    "test_results",
+    "safety_gate_results",
+    "remaining_issues",
+    "deployment_approval_required",
+    "next_check_metrics"
+  ],
+  "properties": {
+    "run_id": {"type": "string"},
+    "input_sha256": {"type": "string"},
+    "started_at": {"type": "string"},
+    "completed_at": {"type": "string"},
+    "status": {
+      "type": "string",
+      "enum": [
+        "NO_CHANGE_NEEDED",
+        "DIAGNOSTICS_ADDED",
+        "PATCHED_AND_TESTED",
+        "BLOCKED_NEEDS_INPUT",
+        "FAILED"
+      ]
+    },
+    "confirmed_root_causes": {"type": "array", "items": {"type": "string"}},
+    "unconfirmed_inferences": {"type": "array", "items": {"type": "string"}},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "test_commands": {"type": "array", "items": {"type": "string"}},
+    "test_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "exit_code", "summary"],
+        "properties": {
+          "command": {"type": "string"},
+          "exit_code": {"type": "integer"},
+          "summary": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "safety_gate_results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trading_gate_regressions_passed",
+        "server_restart_attempted",
+        "secret_changes_detected"
+      ],
+      "properties": {
+        "trading_gate_regressions_passed": {"type": "boolean"},
+        "server_restart_attempted": {"type": "boolean"},
+        "secret_changes_detected": {"type": "boolean"}
+      }
+    },
+    "remaining_issues": {"type": "array", "items": {"type": "string"}},
+    "deployment_approval_required": {"type": "boolean"},
+    "next_check_metrics": {"type": "array", "items": {"type": "string"}}
+  }
+}

@@ -7,8 +7,51 @@ import sqlite3
 import threading
 import time
 
-from app.routing.gnn_realtime_trust import GnnRealtimeTrustEvaluator
+from app.routing.gnn_realtime_trust import (
+    GnnRealtimeTrustEvaluator,
+    _tail_text_lines,
+    _tail_text_lines_across_rotations,
+)
 from app.strategy.exit_geometry import exit_geometry
+
+
+def test_tail_reader_streams_only_requested_physical_lines(tmp_path) -> None:
+    path = tmp_path / "large.jsonl"
+    rows = [f"row-{index}-" + ("x" * 300_000) for index in range(5)]
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    tail, has_earlier_rows = _tail_text_lines(path, max_lines=2)
+
+    assert not isinstance(tail, (list, tuple))
+    assert list(tail) == rows[-2:]
+    assert has_earlier_rows is True
+
+
+def test_tail_reader_reports_when_file_is_smaller_than_window(tmp_path) -> None:
+    path = tmp_path / "small.jsonl"
+    path.write_text("one\ntwo", encoding="utf-8")
+
+    tail, has_earlier_rows = _tail_text_lines(path, max_lines=5)
+
+    assert list(tail) == ["one", "two"]
+    assert has_earlier_rows is False
+
+
+def test_tail_reader_continues_across_rotated_journals(tmp_path) -> None:
+    path = tmp_path / "shadow.jsonl"
+    path.with_name("shadow.jsonl.1").write_text(
+        "old-1\nold-2\nold-3\n",
+        encoding="utf-8",
+    )
+    path.write_text("new-1\nnew-2\n", encoding="utf-8")
+
+    tail, has_earlier_rows = _tail_text_lines_across_rotations(
+        path,
+        max_lines=4,
+    )
+
+    assert list(tail) == ["old-2", "old-3", "new-1", "new-2"]
+    assert has_earlier_rows is True
 
 
 def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
@@ -811,6 +854,9 @@ def test_trust_payload_distinguishes_untaught_upside_from_awaiting_samples(
 
     payload = web._with_upside_supervision(
         {
+            "score": 0.0,
+            "sample_count": 0,
+            "reason_codes": ["GNN_TRUST_INSUFFICIENT_REALTIME_SAMPLES"],
             "strategy_metrics": {
                 "intraday_momentum": {"trade_sample_count": 0},
                 "breakout_volume": {"trade_sample_count": 0},
@@ -819,6 +865,10 @@ def test_trust_payload_distinguishes_untaught_upside_from_awaiting_samples(
     )
 
     assert payload["upside_supervised_strategy_ids"] == ["intraday_momentum"]
+    assert payload["score_available"] is False
+    assert payload["checkpoint_live_authorized"] is False
+    assert payload["trust_state"] == "CHECKPOINT_NOT_PROMOTED"
+    assert "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" in payload["reason_codes"]
     assert payload["minimum_upside_supervision_rows"] == 20
     assert payload["upside_authorized_strategy_markets"] == {
         "intraday_momentum": ["KRX"]
@@ -852,3 +902,34 @@ def test_unreadable_checkpoint_metadata_leaves_the_trust_payload_untouched(
     payload = web._with_upside_supervision(dict(original))
 
     assert payload == original
+
+
+def test_gnn_runtime_observability_separates_inference_from_validation(
+    monkeypatch,
+) -> None:
+    from app import web
+
+    monkeypatch.setattr(
+        web,
+        "_live_shadow_state",
+        {
+            "enabled": True,
+            "last_attempt_at": "2026-08-13T14:38:10+00:00",
+            "last_success_at": "2026-08-13T14:38:11+00:00",
+            "last_symbol": "INTC",
+            "generated": 321,
+            "errors": {},
+        },
+    )
+
+    payload = web._with_gnn_runtime_observability(
+        {"sample_count": 202, "evaluated_at": "2026-08-13T14:38:12+00:00"},
+        now=datetime(2026, 8, 13, 14, 38, 14, tzinfo=timezone.utc),
+    )
+
+    assert payload["inference_input_last_received_at"] == "2026-08-13T14:38:10+00:00"
+    assert payload["inference_last_completed_at"] == "2026-08-13T14:38:11+00:00"
+    assert payload["inference_active"] is True
+    assert payload["prediction_persisted_count"] == 321
+    assert payload["validation_count"] == 202
+    assert payload["validation_count_as_of"] == "2026-08-13T14:38:12+00:00"

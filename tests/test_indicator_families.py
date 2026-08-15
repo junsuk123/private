@@ -89,6 +89,23 @@ class TestKnownSeries:
         plus_di, minus_di, _ = ie.dmi_adx(ind.highs(up), ind.lows(up), ind.closes(up))
         assert plus_di > minus_di
 
+    def test_supertrend_and_keltner_follow_a_clean_uptrend(self):
+        bars = _bars(_ramp(count=160))
+        supertrend = ind.supertrend(bars)
+        keltner = ind.keltner_channels(bars)
+
+        assert supertrend.ok and supertrend.direction == 1
+        assert supertrend.line < bars[-1].close
+        assert keltner.ok and keltner.mid < bars[-1].close
+        assert keltner.upper > keltner.mid > keltner.lower
+
+    def test_choppiness_is_higher_for_sideways_zigzag_than_clean_trend(self):
+        trending = ind.choppiness_index(_bars(_ramp(count=160)))
+        sideways = ind.choppiness_index(_bars(_zigzag(count=160)))
+
+        assert trending is not None and sideways is not None
+        assert sideways > trending
+
     def test_williams_r_is_in_range_and_near_zero_at_highs(self):
         up = _bars(_ramp())
         value = ie.williams_r(ind.highs(up), ind.lows(up), ind.closes(up))
@@ -178,6 +195,9 @@ class TestDegenerateInput:
         assert ie.trendline(short)["slope_bps_per_bar"] is None
         assert ie.momentum(short, 10) is None
         assert ie.roc_bps(short, 10) is None
+        assert ind.supertrend(bars).ok is False
+        assert ind.keltner_channels(bars).ok is False
+        assert ind.choppiness_index(bars) is None
 
     def test_zero_range_window_returns_none_not_a_midpoint(self):
         flat = _bars(_flat(), spread=0.0)

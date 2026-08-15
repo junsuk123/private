@@ -299,7 +299,25 @@ class LiveExecutionCoordinator:
             "live_order_cancel_attempt",
             {"execution_id": execution_id, "broker_order_id": broker_order_id, "order": order},
         )
-        receipt = self.broker.cancel_order(broker_order_id, order)
+        # A failed cancel has to leave a trace, exactly as a failed amend does.
+        # Without this the journal recorded 4,549 cancel attempts against 3
+        # completions and ZERO errors, so 4,546 outcomes were simply absent: the
+        # single most important failure mode on the exit path -- "the order is still
+        # resting and we could not withdraw it" -- was unobservable, and reading the
+        # journal suggested cancels were being silently ignored rather than refused.
+        try:
+            receipt = self.broker.cancel_order(broker_order_id, order)
+        except Exception as exc:
+            self.journal.record(
+                "live_order_cancel_error",
+                {
+                    "execution_id": execution_id,
+                    "broker_order_id": broker_order_id,
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                },
+            )
+            raise
         canceled_order_id = str(getattr(receipt, "order_id", "") or broker_order_id)
         self.journal.record(
             "live_order_canceled",

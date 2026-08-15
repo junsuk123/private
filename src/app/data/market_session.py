@@ -225,14 +225,26 @@ def new_entry_session_report(
     for group in groups:
         normalized = _normalize_group(group)
         market = normalize_market_group(group)
+        primary_venue_closed = is_market_fully_closed(group, current)
+        active = (
+            service.active_capabilities(market, current)
+            if market is not None
+            else ()
+        )
+        group_has_active_session = bool(active)
         entry = {
             "phase": market_phase(group, current).value,
             "streaming_phase": streaming_phase(group, current).value,
             "allows_new_entry": allows_new_entry(group, current),
-            "fully_closed": is_market_fully_closed(group, current),
+            # ``phase`` deliberately describes the primary venue (KRX for the
+            # domestic group), while NXT can be active outside KRX hours. Keep
+            # that distinction explicit so 08:00-08:30 KST cannot render as
+            # both fully closed and NXT_PRE/trade-available.
+            "primary_venue_closed": primary_venue_closed,
+            "group_has_active_session": group_has_active_session,
+            "fully_closed": not group_has_active_session,
         }
         if market is not None:
-            active = service.active_capabilities(market, current)
             entry.update(
                 {
                     "session": service.primary_capability(market, current).session.value,

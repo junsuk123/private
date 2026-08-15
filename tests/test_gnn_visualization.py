@@ -87,6 +87,12 @@ def test_visualization_uses_checkpoint_topology_not_market_ontology(tmp_path: Pa
     momentum = next(node for node in payload["nodes"] if node["id"] == "intraday_momentum")
     assert momentum["active"] is True
     assert momentum["latest_utility"] == 1.25
+    assert momentum["edge_count"] > 0
+    assert 0.0 <= momentum["connectivity"] <= 1.0
+    assert momentum["relation_diversity"] >= 1
+    assert payload["dynamics"]["mapping"] == "checkpoint_weighted_orbital_physics_v2"
+    assert all("dynamic_weight" in link for link in payload["links"])
+    assert all(link["polarity"] in {-1, 1} for link in payload["links"])
     assert "GNN_HEAD_SCHEMA_MISMATCH" in payload["model"]["runtime_reasons"]
 
 
@@ -114,13 +120,49 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     assert 'id="gnn-model-canvas"' in page.text
     assert 'id="gnn-inference-live"' in page.text
     assert 'id="gnn-visualization-toggle"' in page.text
+    assert 'id="gnn-auto-rotation-toggle"' in page.text
+    assert 'id="gnn-model-fullscreen"' in page.text
+    assert 'id="gnn-system-health"' in page.text
+    assert 'id="gnn-health-physics"' in page.text
     assert 'aria-pressed="false"' in page.text
     # ONE cache-bust marker for the terminal bundle, bumped alongside the version
     # in web_account_routes.py. The point is that the page cannot ship a stale
     # strategy_terminal.js against a changed payload contract. There were two
     # markers here from successive features; the older one only recorded which
     # release last touched the file, and every bump broke it.
-    assert "20260810-market-physics-3" in page.text
+    assert "20260813-live-ontology-v2" in page.text
+
+
+def test_gnn_auto_rotation_is_default_on_persistent_and_pauses_for_manual_control() -> None:
+    script = (
+        Path(__file__).parents[1] / "src" / "app" / "static" / "strategy_terminal.js"
+    ).read_text(encoding="utf-8")
+
+    assert "strategy-terminal-gnn-auto-rotation-v1" in script
+    assert "return saved === null ? true : saved === 'true'" in script
+    assert "localStorage.setItem(GNN_AUTO_ROTATION_STORAGE_KEY" in script
+    assert "gnnAutoRotationEnabled && !dragging && now >= autoRotateResumeAt" in script
+    assert "rotationY = (rotationY + dt * GNN3D_AUTO_ROTATE_RAD_PER_SECOND)" in script
+    assert "autoRotateResumeAt = performance.now() + GNN3D_AUTO_ROTATE_RESUME_DELAY_MS" in script
+    assert "pointercancel', resumeAutoRotationAfterManualControl" in script
+
+
+def test_gnn_model_panel_has_dedicated_fullscreen_control_and_canvas_resize() -> None:
+    root = Path(__file__).parents[1]
+    script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
+        encoding="utf-8"
+    )
+    styles = (root / "src" / "app" / "static" / "strategy_terminal.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert "function bindGnnModelFullscreen()" in script
+    assert "document.fullscreenElement === panel" in script
+    assert "panel.requestFullscreen" in script
+    assert "panel.classList.add('is-viewport-fullscreen')" in script
+    assert "window.dispatchEvent(new Event('resize'))" in script
+    assert "body.gnn-model-fullscreen" in styles
+    assert ".gnn-model-panel:fullscreen .gnn-model-stage" in styles
 
 
 def test_graph_polling_updates_existing_scene_instead_of_recreating_it() -> None:
@@ -149,9 +191,36 @@ def test_graph_physics_uses_live_microstructure_without_faking_inference() -> No
     assert "micro.aggressor_imbalance_5s" in script
     assert "micro.spread_change_5s_bps" in script
     assert "refreshGnnMarketForces();" in script
-    assert "spring.baseSag * Number(forces.gravity || 1)" in script
+    # The current rope solver normalises raw live forces once and then applies
+    # gravity through the spring's learned mass/tension.  The former baseSag
+    # expression belonged to the retired straight-chord solver.
+    assert "const market = gnn3dMarketRopeTerms(forces)" in script
+    assert "market.gravity * (1 + spring.mass * .34)" in script
     assert "ambientEnergy * (.16 + Number(link.learned_strength || 0) * .24)" in script
     assert "(!link.kind || link.kind === 'topology')" in script
+
+
+def test_graph_motion_and_emphasis_are_driven_by_measured_graph_data() -> None:
+    root = Path(__file__).parents[1]
+    script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
+        encoding="utf-8"
+    )
+    styles = (root / "src" / "app" / "static" / "strategy_terminal.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const relationshipSpeed = (.72 + coupling * .72) / (.82 + inertia * .34)" in script
+    assert "const liveBoost = 1 + activation * 1.45" in script
+    assert "orbit.ascending = (orbit.ascending + Number(orbit.precession || 0)" in script
+    assert "meshOrbits[index].liveActivation = nodeIntensity[index] || 0" in script
+    assert "Every compute kind gets an additive halo" in script
+    assert "Math.min(.92" in script
+    assert "function renderGnnSystemHealth()" in script
+    assert "authorizationBlocked ? 'SHADOW ONLY' : 'LIVE AUTHORIZED'" in script
+    assert "checkpoint_weighted_orbital_physics_v2" in (
+        root / "src" / "app" / "gnn_visualization.py"
+    ).read_text(encoding="utf-8")
+    assert ".gnn-system-health" in styles
 
 
 def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:

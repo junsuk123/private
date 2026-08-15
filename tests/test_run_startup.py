@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -11,6 +11,24 @@ from app import run as run_module
 
 
 class RunStartupTest(unittest.TestCase):
+    def test_windows_uses_selector_event_loop_policy(self) -> None:
+        policy = object()
+        factory = Mock(return_value=policy)
+        with (
+            patch.object(run_module.sys, "platform", "win32"),
+            patch.object(
+                run_module.asyncio,
+                "WindowsSelectorEventLoopPolicy",
+                factory,
+                create=True,
+            ),
+            patch.object(run_module.asyncio, "set_event_loop_policy") as setter,
+        ):
+            run_module._configure_windows_event_loop_policy()
+
+        factory.assert_called_once_with()
+        setter.assert_called_once_with(policy)
+
     def test_main_starts_server_without_blocking_on_startup_checks(self) -> None:
         with (
             patch.object(sys, "argv", ["run.py", "--port", "8019", "--strict-port"]),

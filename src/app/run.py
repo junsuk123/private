@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import signal
@@ -34,6 +35,7 @@ from app.config.refactor_profile import load_refactor_profile
 
 def main() -> None:
     _configure_stdout()
+    _configure_windows_event_loop_policy()
     configure_default_event_llm_env()
     parser = argparse.ArgumentParser(description="Run the complete local investment system")
     parser.add_argument(
@@ -105,6 +107,21 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         print("Server stopped.")
+
+
+def _configure_windows_event_loop_policy() -> None:
+    """Avoid a Windows Proactor accept-loop failure that can silently drop HTTP.
+
+    The market-data worker threads can keep running after the listening socket is
+    lost, which makes the process look healthy while the GUI/API is unreachable.
+    Uvicorn's selector loop is sufficient for this application and does not use
+    the IOCP accept path that raised WinError 64 in production.
+    """
+    if sys.platform != "win32":
+        return
+    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_factory is not None:
+        asyncio.set_event_loop_policy(policy_factory())
 
 
 def _run_startup_checks_in_background(research_config: Path) -> None:

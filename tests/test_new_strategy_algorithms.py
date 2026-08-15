@@ -146,6 +146,67 @@ def test_bar_trend_continuation_is_tick_independent_and_shadow_only():
     assert strategy_live_authorized(strategy_id) is False
 
 
+def test_tradingview_regime_strategies_are_registered_shadow_only():
+    for strategy_id in (
+        "supertrend_dmi_continuation",
+        "keltner_volatility_breakout",
+        "choppiness_range_reversion",
+    ):
+        assert strategy_id in STRATEGY_IDS
+        assert strategy_id in ALGORITHM_IDS
+        assert strategy_id in all_geometries()
+        assert strategy_shadow_authorized(strategy_id) is True
+        assert strategy_live_authorized(strategy_id) is False
+
+
+def test_supertrend_dmi_continuation_requires_multi_indicator_confirmation():
+    strategy_id = "supertrend_dmi_continuation"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", price=101.0, supertrend=99.0,
+            supertrend_direction=1.0, supertrend_distance_bps=202.0,
+            adx=32.0, dmi_spread=18.0, vwap_distance_bps=45.0,
+            momentum_persistence=0.72, relative_volume=1.6, atr_pct=0.006,
+            liquidity_score=0.85, spread_bps=8.0,
+        ),
+        _context(strategy_id, change_point_probability=0.2),
+    )
+    assert decision.triggered is True, decision.reason_codes
+    assert "DMI_ADX_TREND_CONFIRMED" in decision.reason_codes
+
+
+def test_keltner_breakout_requires_compression_expansion_and_volume():
+    strategy_id = "keltner_volatility_breakout"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", price=103.0, keltner_upper=102.0,
+            keltner_bandwidth=0.04, bb_bandwidth=0.035,
+            volatility_expansion=1.6, adx=28.0, dmi_spread=12.0,
+            relative_volume=2.0, vwap_distance_bps=55.0, atr_pct=0.007,
+            liquidity_score=0.85, spread_bps=8.0,
+        ),
+        _context(strategy_id, change_point_probability=0.2),
+    )
+    assert decision.triggered is True, decision.reason_codes
+    assert "KELTNER_UPPER_BREAKOUT" in decision.reason_codes
+
+
+def test_choppiness_reversion_requires_a_nondirectional_oversold_extreme():
+    strategy_id = "choppiness_range_reversion"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", price=98.0, choppiness=68.0, adx=14.0,
+            rsi=28.0, bb_percent_b=0.02, vwap=100.0,
+            vwap_distance_bps=-200.0, macd_histogram=0.02,
+            relative_volume=1.1, atr_pct=0.006,
+            liquidity_score=0.80, spread_bps=8.0,
+        ),
+        _context(strategy_id),
+    )
+    assert decision.triggered is True, decision.reason_codes
+    assert "CHOP_RANGE_CONFIRMED" in decision.reason_codes
+
+
 def test_every_catalogued_strategy_is_at_least_shadow_authorized():
     """Nothing may be catalogued and then silently inert.
 

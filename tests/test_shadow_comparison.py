@@ -59,5 +59,54 @@ def test_shadow_comparison_rotates_oversized_log(tmp_path) -> None:
         ),
     )
 
-    assert path.with_name("shadow.jsonl.1").read_text(encoding="utf-8") == "old telemetry\n"
+    rotated = tuple(tmp_path.glob("shadow.jsonl.r*"))
+    assert len(rotated) == 1
+    assert rotated[0].read_text(encoding="utf-8") == "old telemetry\n"
     assert "rotation-check" in path.read_text(encoding="utf-8")
+
+
+def test_recorders_for_same_path_share_rotation_lock(tmp_path) -> None:
+    path = tmp_path / "shadow.jsonl"
+    first = ShadowComparisonRecorder(path, max_bytes=400, backup_count=100)
+    second = ShadowComparisonRecorder(path, max_bytes=400, backup_count=100)
+    errors: list[Exception] = []
+
+    def write(recorder: ShadowComparisonRecorder, prefix: str) -> None:
+        try:
+            for index in range(20):
+                recorder.compare(
+                    correlation_id=f"{prefix}-{index}",
+                    symbol="005930",
+                    as_of=datetime(2026, 8, 10, tzinfo=timezone.utc),
+                    decisions=(
+                        ShadowDecision(
+                            path="cpu_gnn",
+                            action="HOLD",
+                            strategy_id=None,
+                            utility=None,
+                            reason_codes=("NO_EDGE",),
+                        ),
+                    ),
+                )
+        except Exception as exc:  # pragma: no cover - assertion captures the race.
+            errors.append(exc)
+
+    import threading
+
+    threads = (
+        threading.Thread(target=write, args=(first, "a")),
+        threading.Thread(target=write, args=(second, "b")),
+    )
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    rows = []
+    for segment in (*tmp_path.glob("shadow.jsonl.r*"), path):
+        rows.extend(
+            json.loads(line)
+            for line in segment.read_text(encoding="utf-8").splitlines()
+        )
+    assert len(rows) == 40

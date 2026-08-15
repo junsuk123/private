@@ -3,9 +3,25 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+
+
+_path_locks_guard = threading.Lock()
+_path_locks: dict[str, threading.Lock] = {}
+
+
+def _shared_path_lock(path: Path) -> threading.Lock:
+    """Return one writer/rotation lock for every recorder targeting this path."""
+    key = str(path.resolve())
+    with _path_locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _path_locks[key] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -62,7 +78,23 @@ class ShadowComparisonRecorder:
             ),
         )
         self.backup_count = max(1, int(backup_count))
-        self._write_lock = threading.Lock()
+        # Several live inference services can share the default journal.  A lock
+        # owned by each recorder did not serialize them, so one recorder could
+        # append while another renamed the file on rotation.
+        self._write_lock = _shared_path_lock(self.path)
+
+    def _rotated_paths(self) -> list[Path]:
+        prefix = f"{self.path.name}."
+        paths: list[Path] = []
+        for candidate in self.path.parent.glob(f"{self.path.name}.*"):
+            suffix = candidate.name[len(prefix) :]
+            if candidate.is_file() and (suffix.isdigit() or suffix.startswith("r")):
+                paths.append(candidate)
+        return sorted(
+            paths,
+            key=lambda item: item.stat().st_mtime_ns if item.exists() else 0,
+            reverse=True,
+        )
 
     def _rotate_if_needed(self, incoming_bytes: int) -> None:
         try:
@@ -72,13 +104,28 @@ class ShadowComparisonRecorder:
         if current_bytes + incoming_bytes <= self.max_bytes:
             return
 
-        oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
-        oldest.unlink(missing_ok=True)
-        for index in range(self.backup_count - 1, 0, -1):
-            source = self.path.with_name(f"{self.path.name}.{index}")
-            if source.exists():
-                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
-        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
+        # Rotated files are immutable and uniquely named.  Renaming .1 -> .2 ->
+        # .3 collides with the GNN worker reading those files on Windows.  Moving
+        # only the active file either succeeds atomically or, when a reader has it
+        # open, is postponed without dropping the inference row.
+        rotation = self.path.with_name(
+            f"{self.path.name}.r{time.time_ns()}-{os.getpid()}-{threading.get_ident()}"
+        )
+        try:
+            self.path.replace(rotation)
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            return
+
+        # Retention is best effort: a reader may temporarily hold the oldest
+        # immutable segment.  It is safer to keep one extra segment until the next
+        # write than to fail the inference that was about to be recorded.
+        for stale in self._rotated_paths()[self.backup_count :]:
+            try:
+                stale.unlink(missing_ok=True)
+            except PermissionError:
+                continue
 
     def compare(
         self,

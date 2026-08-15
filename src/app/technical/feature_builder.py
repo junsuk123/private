@@ -78,6 +78,10 @@ def build_technical_feature_set(
     rsi_val = ti.rsi(close_vals, cfg.rsi_period)
     donch = ti.donchian(bars, cfg.donchian_period) if bars else None
     atr_val = ti.atr(bars, cfg.atr_period) if bars else None
+    dmi = ti.dmi_adx(bars, cfg.atr_period) if bars else None
+    supertrend = ti.supertrend(bars) if bars else None
+    keltner = ti.keltner_channels(bars) if bars else None
+    choppiness = ti.choppiness_index(bars, cfg.atr_period) if bars else None
 
     vwap_now = ti.vwap(bars) if bars else None
     vwap_distance_bps = None
@@ -156,9 +160,30 @@ def build_technical_feature_set(
         macd_histogram=macd_res.histogram if macd_res.ok else None,
         short_return=short_return,
         momentum_persistence=momentum_persistence,
+        adx=dmi.adx if dmi and dmi.ok else None,
+        plus_di=dmi.plus_di if dmi and dmi.ok else None,
+        minus_di=dmi.minus_di if dmi and dmi.ok else None,
+        dmi_spread=dmi.dmi_spread if dmi and dmi.ok else None,
+        supertrend=supertrend.line if supertrend and supertrend.ok else None,
+        supertrend_direction=(
+            float(supertrend.direction)
+            if supertrend and supertrend.ok and supertrend.direction is not None
+            else None
+        ),
+        supertrend_distance_bps=(
+            (last_price / supertrend.line - 1.0) * 10_000.0
+            if supertrend and supertrend.ok and supertrend.line and last_price
+            else None
+        ),
         rsi=rsi_val,
         bb_percent_b=boll.percent_b if boll.ok else None,
         bb_bandwidth=boll.bandwidth if boll.ok else None,
+        keltner_mid=keltner.mid if keltner and keltner.ok else None,
+        keltner_upper=keltner.upper if keltner and keltner.ok else None,
+        keltner_lower=keltner.lower if keltner and keltner.ok else None,
+        keltner_position=keltner.position if keltner and keltner.ok else None,
+        keltner_bandwidth=keltner.bandwidth if keltner and keltner.ok else None,
+        choppiness=choppiness,
         vwap=vwap_now,
         vwap_distance_bps=vwap_distance_bps,
         vwap_slope=vwap_slope,
@@ -242,9 +267,22 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         macd_histogram=slow("macd_histogram", g("macd_histogram")),
         short_return=slow("short_return", g("return_1m")),
         momentum_persistence=slow("momentum_persistence"),
+        adx=slow("adx", g("adx_14")),
+        plus_di=slow("plus_di"),
+        minus_di=slow("minus_di"),
+        dmi_spread=slow("dmi_spread", g("dmi_spread")),
+        supertrend=slow("supertrend"),
+        supertrend_direction=slow("supertrend_direction"),
+        supertrend_distance_bps=slow("supertrend_distance_bps"),
         rsi=slow("rsi", g("rsi_14")),
         bb_percent_b=slow("bb_percent_b", g("bollinger_percent_b")),
         bb_bandwidth=slow("bb_bandwidth"),
+        keltner_mid=slow("keltner_mid"),
+        keltner_upper=slow("keltner_upper"),
+        keltner_lower=slow("keltner_lower"),
+        keltner_position=slow("keltner_position"),
+        keltner_bandwidth=slow("keltner_bandwidth"),
+        choppiness=slow("choppiness"),
         vwap=slow("vwap", vwap),
         vwap_distance_bps=slow(
             "vwap_distance_bps",

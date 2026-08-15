@@ -180,6 +180,111 @@ class BarMicrostructure:
     trade_count: float | None
 
 
+def _preferred_minute_bar_streams(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    """One stream per (symbol, UTC date), so a series never mixes feeds within a day.
+
+    ``realtime_minute_bars`` stores a row per (symbol, minute, stream), so a symbol
+    carried by both the websocket feed and the REST snapshot holds two rows for the
+    same minute. Measured over the current store that is 9,104 of 109,247 rows
+    (8.3%), across 15 symbols with two to four streams each -- and they are the
+    symbols with the MOST training data: F, SOFI, PFE, T, 005930, INTC.
+
+    Reading them mixed is not a rounding error. ``build_labels`` walks each series
+    consecutively, so every duplicated minute:
+
+    - injects a return measured BETWEEN TWO FEEDS. ACDC at 2026-08-05T16:59 holds
+      close 4.425 (REST snapshot) and 4.421 (websocket); consecutive division
+      turns a stream switch into a fabricated -9bp minute that never happened.
+    - inflates ``realized_volatility_30m`` with those switches.
+    - double counts the symbol in :func:`_market_return_index`, which is the
+      cross-sectional benchmark the relative-strength experts measure against.
+    - makes the forward path the triple-barrier labels walk traverse the same
+      minute twice, so MFE/MAE and the simulated fill are read off a series that
+      is not a time series.
+
+    ``RealtimeMarketDataStore.preferred_minute_bar_stream`` already refuses to mix
+    them on the live side for exactly this reason, and this mirrors its ranking:
+    widest minute coverage, then tradeable, then trade count, then stream id.
+
+    The grouping is per DAY rather than per symbol because the streams are
+    time-disjoint eras, not steady duplicates -- the ``stream_id`` migration lands
+    around 2026-08-04, so a symbol's July bars carry an empty id and its August bars
+    a labelled one. Choosing one stream for a symbol's whole history therefore
+    discards an entire era: F keeps either 2,626 July minutes or 2,295 August ones.
+    Measured over the current store, the three candidate rules give:
+
+    ==========================  ==========  ====================
+    rule                        retained    intra-day feed switch
+    ==========================  ==========  ====================
+    one stream per symbol       78.6%       0
+    one row per symbol-minute   100.0%      1,346
+    one stream per symbol-day   **96.5%**   **0**
+    ==========================  ==========  ====================
+
+    Per-day wins on both axes. A switch at a date boundary is free because no
+    feature window survives an overnight gap -- :func:`_bars_are_contiguous` rejects
+    it -- whereas a switch inside a day injects a return measured between two feeds,
+    and those feeds disagree by a median 0.71bps but a p90 of 12.5bps, which is the
+    size of the edge this system is trying to measure.
+
+    Returns an empty mapping for a store with no ``stream_id`` column, which leaves
+    an older database on its previous behaviour rather than failing the run.
+    """
+    try:
+        rows = connection.execute(
+            """
+            SELECT symbol, substr(minute_start, 1, 10) AS day,
+                   COALESCE(stream_id, '') AS stream,
+                   COUNT(DISTINCT minute_start) AS minutes,
+                   MAX(COALESCE(is_tradeable, 0)) AS tradeable,
+                   SUM(COALESCE(trade_count, 0)) AS trades
+            FROM realtime_minute_bars
+            GROUP BY symbol, day, stream
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    best: dict[tuple[str, str], tuple[tuple[int, int, int, str], str]] = {}
+    for symbol, day, stream_id, minutes, tradeable, trades in rows:
+        stream = str(stream_id or "")
+        rank = (int(minutes or 0), int(tradeable or 0), int(trades or 0), stream)
+        key = (str(symbol), str(day))
+        current = best.get(key)
+        if current is None or rank > current[0]:
+            best[key] = (rank, stream)
+    return {key: chosen for key, (_rank, chosen) in best.items()}
+
+
+def _rows_on_preferred_stream(
+    connection: sqlite3.Connection,
+    columns: str,
+    preferred: dict[tuple[str, str], str],
+):
+    """Iterate ``columns`` for the bars on each (symbol, day)'s preferred stream.
+
+    ``columns`` must start with ``symbol, minute_start``; the day is taken from the
+    timestamp's date prefix, matching the grouping in
+    :func:`_preferred_minute_bar_streams`. The stream column is appended to the
+    projection and stripped here, so callers unpack exactly what they asked for
+    whether or not filtering is active.
+    """
+    if not preferred:
+        yield from connection.execute(
+            f"SELECT {columns} FROM realtime_minute_bars ORDER BY symbol, minute_start"
+        )
+        return
+    rows = connection.execute(
+        f"SELECT {columns}, COALESCE(stream_id, '') FROM realtime_minute_bars "
+        "ORDER BY symbol, minute_start"
+    )
+    for row in rows:
+        key = (str(row[0]), str(row[1])[:10])
+        if preferred.get(key, "") == str(row[-1] or ""):
+            yield row[:-1]
+
+
 def load_minute_microstructure(
     database: Path,
 ) -> dict[str, dict[datetime, BarMicrostructure]]:
@@ -188,17 +293,23 @@ def load_minute_microstructure(
     Keyed by timestamp rather than positional index on purpose: ``build_labels``
     filters bars for contiguity and activity, so a positional pairing would
     silently misalign a symbol's features with another bar's outcome.
+
+    Restricted to the same preferred stream as :func:`load_minute_bars`. Keying by
+    timestamp made the LAST row of a duplicated minute win, and the winner was
+    arbitrary among streams -- so a bar's OHLCV could come from the REST snapshot
+    while its spread and book imbalance came from the websocket. That also flipped
+    ``microstructure_available``, which keys off ``spread_bps > 0``, between the two
+    feeds for the same minute.
     """
     by_symbol: dict[str, dict[datetime, BarMicrostructure]] = defaultdict(dict)
     connection = sqlite3.connect(database)
     try:
-        rows = connection.execute(
-            """
-            SELECT symbol, minute_start, vwap, spread_bps, orderbook_imbalance,
-                   liquidity_score, volatility, trade_count
-            FROM realtime_minute_bars
-            ORDER BY symbol, minute_start
-            """
+        preferred = _preferred_minute_bar_streams(connection)
+        rows = _rows_on_preferred_stream(
+            connection,
+            "symbol, minute_start, vwap, spread_bps, orderbook_imbalance, "
+            "liquidity_score, volatility, trade_count",
+            preferred,
         )
         for (
             symbol,
@@ -333,15 +444,21 @@ def _optional_float(value: object) -> float | None:
 
 
 def load_minute_bars(database: Path) -> dict[str, tuple[Bar, ...]]:
+    """Every symbol's minute series, one feed per symbol.
+
+    See :func:`_preferred_minute_bar_streams` for why mixing streams here is not
+    survivable: a symbol carried by two feeds had two rows per minute, and this
+    loader's consecutive series turned each stream switch into a return that never
+    happened.
+    """
     by_symbol: dict[str, list[Bar]] = defaultdict(list)
     connection = sqlite3.connect(database)
     try:
-        rows = connection.execute(
-            """
-            SELECT symbol, minute_start, open, high, low, close, volume
-            FROM realtime_minute_bars
-            ORDER BY symbol, minute_start
-            """
+        preferred = _preferred_minute_bar_streams(connection)
+        rows = _rows_on_preferred_stream(
+            connection,
+            "symbol, minute_start, open, high, low, close, volume",
+            preferred,
         )
         for symbol, start, open_, high, low, close, volume in rows:
             start_time = datetime.fromisoformat(start)

@@ -167,6 +167,7 @@ def train_counterfactual_checkpoint(
     # never be satisfied. The per-strategy flags above are what the runtime
     # actually enforces; this only asks that the checkpoint taught at least one.
     strategy_coverage = bool(supervised_strategy_ids)
+    skill_verdict = _skill_verdict(validation_metrics)
     live_shadow_authorized = bool(
         authorize_live_shadow
         # Must match what the serving path emits TODAY, not a schema name frozen
@@ -176,6 +177,12 @@ def train_counterfactual_checkpoint(
         and len(rows) >= minimum_rows
         and len(grouped) >= minimum_snapshots
         and strategy_coverage
+        # The operator contract is explicit: a compatible checkpoint is not a
+        # profitable checkpoint.  Real-time GNN authority remains SHADOW until
+        # both ranking skill and a positive after-cost selected edge are
+        # established on the purged validation set.
+        and skill_verdict["selection_ranking_skill_established"]
+        and skill_verdict["selection_net_edge_established"]
     )
     report = {
         "checkpoint": str(checkpoint),
@@ -262,19 +269,20 @@ def train_counterfactual_checkpoint(
             "schema_matches_runtime": (
                 input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
             ),
-            # Reported, deliberately NOT blocking. Everything else in this block
-            # is a property of the training run; these two are claims about
-            # SKILL, and whether a model with unestablished skill may take a
-            # trade is an operator decision, not a training-time one. They are
-            # here so the decision is made against the numbers rather than
-            # against a bare ``live_authorized: true``.
-            **_skill_verdict(validation_metrics),
+            # These are now blocking authorization checks. The runtime may still
+            # use an unproven checkpoint as a shadow estimator, but never as an
+            # order authority.
+            **skill_verdict,
             **_context_field_coverage(rows, input_feature_schema),
         },
         "config": asdict(config),
     }
     report_path = checkpoint.with_suffix(".json")
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary_report = report_path.with_name(f".{report_path.stem}.writing.json")
+    temporary_report.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temporary_report.replace(report_path)
     return report
 
 

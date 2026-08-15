@@ -275,3 +275,92 @@ def merge_stage_counts(payloads: Iterable[Mapping[str, Any]]) -> dict[str, int]:
             except (TypeError, ValueError):
                 continue
     return {stage.value: total.get(stage.value, 0) for stage in STAGE_ORDER}
+
+
+def collector_from_algorithm_evaluations(
+    evaluations: Iterable[Mapping[str, Any]],
+    *,
+    session: Mapping[str, Any] | None = None,
+) -> SelectionDiagnosticsCollector:
+    """Reconstruct a measured funnel from the engine's cycle snapshot.
+
+    Older engine instances publish ``algorithm_evaluations`` but do not retain a
+    collector object.  Returning NO_SELECTION_CYCLE_YET in that case discards
+    evidence the engine already exposes.  This adapter is diagnostic-only: it
+    maps the recorded trigger/reason/edge fields and never influences selection.
+    """
+
+    owner = session or {}
+    collector = SelectionDiagnosticsCollector()
+    selected_symbol = str(owner.get("selected_symbol") or "")
+    selected_strategy = str(owner.get("selected_strategy") or "")
+    session_reasons = tuple(
+        str(code)
+        for code in (
+            owner.get("gnn_reason_codes")
+            or owner.get("ontology_reason_codes")
+            or ()
+        )
+    )
+    last_reason = str(owner.get("last_reason") or "")
+    if last_reason:
+        session_reasons = tuple(dict.fromkeys((*session_reasons, last_reason)))
+
+    for item in evaluations:
+        symbol = str(item.get("symbol") or "")
+        strategy_id = str(item.get("strategy_id") or "")
+        record = collector.candidate(symbol, strategy_id)
+        reasons = tuple(str(code) for code in item.get("reason_codes") or ())
+        horizon = item.get("horizon_seconds")
+        edge = _finite(item.get("expected_edge_bps"))
+        record.mark(
+            SelectionStage.RAW_CANDIDATE,
+            horizon_seconds=horizon,
+            rule_gross_bps=edge,
+            reason_codes=reasons,
+        )
+        if not bool(item.get("triggered")):
+            feature_missing = any(
+                marker in code
+                for code in reasons
+                for marker in ("NOT_READY", "MISSING", "UNAVAILABLE", "INSUFFICIENT")
+            )
+            record.mark(
+                SelectionStage.FEATURE_UNAVAILABLE
+                if feature_missing
+                else SelectionStage.STRATEGY_TRIGGER_FALSE,
+                reason_codes=reasons,
+                detail="recorded algorithm trigger did not fire",
+            )
+            continue
+        if edge is None:
+            record.mark(
+                SelectionStage.FEATURE_UNAVAILABLE,
+                reason_codes=reasons,
+                detail="triggered evaluation has no finite expected edge",
+            )
+        elif edge <= 0:
+            record.mark(
+                SelectionStage.GROSS_EDGE_NON_POSITIVE,
+                reason_codes=reasons,
+                detail="recorded expected edge is non-positive",
+            )
+        elif symbol == selected_symbol and strategy_id == selected_strategy:
+            record.mark(SelectionStage.SELECTED, reason_codes=session_reasons)
+        elif "GNN_NOT_LIVE_AUTHORIZED" in session_reasons:
+            record.mark(
+                SelectionStage.LIVE_NOT_AUTHORIZED,
+                reason_codes=session_reasons,
+                detail="cycle reached a positive trigger but live GNN authority was absent",
+            )
+        elif any(code.startswith("MACRO_") for code in session_reasons):
+            record.mark(SelectionStage.MACRO_BLOCKED, reason_codes=session_reasons)
+        elif any("ONTOLOGY" in code for code in session_reasons):
+            record.mark(SelectionStage.ONTOLOGY_BLOCKED, reason_codes=session_reasons)
+        else:
+            record.mark(
+                SelectionStage.STRATEGY_TRIGGER_FALSE,
+                reason_codes=(*reasons, *session_reasons),
+                detail="positive trigger was not selected in the recorded cycle",
+            )
+    return collector

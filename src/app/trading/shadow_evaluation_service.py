@@ -291,6 +291,7 @@ class ShadowEvaluationService:
             self.performance_store.record_directional(
                 outcome.key,
                 symbol=outcome.symbol,
+                regime=outcome.regime,
                 # Already direction-signed by ``gross_return_bps``; a short that
                 # covered lower records a POSITIVE net.
                 realized_net_bps=float(outcome.net_return_bps or 0.0),

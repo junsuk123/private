@@ -16,9 +16,24 @@ _MOMENTUM = {
     "intraday_momentum",
     "event_momentum",
     "cross_sectional_relative_strength",
+    "bar_trend_continuation",
+    "supertrend_dmi_continuation",
 }
-_BREAKOUT = {"breakout_volume", "gap_context", "rvgi_box_breakout"}
-_REVERSION = {"vwap_mean_reversion", "liquidity_shock_reversal"}
+_BREAKOUT = {
+    "breakout_volume",
+    "gap_context",
+    "rvgi_box_breakout",
+    "opening_range_breakout",
+    "keltner_volatility_breakout",
+}
+_REVERSION = {
+    "vwap_mean_reversion",
+    "liquidity_shock_reversal",
+    "bar_confirmed_vwap_recovery",
+    "adaptive_anchored_vwap_reversion",
+    "range_support_reversion",
+    "choppiness_range_reversion",
+}
 
 
 def strategy_relation_adjacency(
