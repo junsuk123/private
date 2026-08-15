@@ -70,11 +70,21 @@ function Get-ListeningEntries {
     Port + owning pid for every TCP socket in LISTEN state bound to loopback or to
     every interface. Ports outside the app's range are filtered by the callers.
   #>
+  # No filtering by local address on purpose. A socket can only be in LISTEN on an
+  # address this host owns, so "is it local" was never a question these rows could
+  # answer wrongly - but restricting to 127.0.0.1/0.0.0.0 DID hide real servers of
+  # ours: -External binds the tailnet address, and a server bound there became
+  # invisible to restart detection, so the next launch would try to bind an
+  # occupied port instead of replacing what was running. Port range plus the
+  # python/run.py command match in Get-LocalAppServerListeners are the real filter.
   if ($script:OnWindows) {
     return Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-      Where-Object { $_.LocalAddress -in @("127.0.0.1", "0.0.0.0") } |
       ForEach-Object {
-        [pscustomobject]@{ Port = [int]$_.LocalPort; ProcessId = [int]$_.OwningProcess }
+        [pscustomobject]@{
+          Port      = [int]$_.LocalPort
+          ProcessId = [int]$_.OwningProcess
+          Address   = [string]$_.LocalAddress
+        }
       }
   }
   $entries = @()
@@ -84,14 +94,42 @@ function Get-ListeningEntries {
     if ($line -notmatch '(?:^|\s)(\S+):(\d+)\s') { continue }
     $address = $Matches[1]
     $port = [int]$Matches[2]
-    # "*" is how ss renders the any-address; [::] is its IPv6 form, and a v6 any
-    # socket is reachable on 127.0.0.1 too, so it counts as a local listener.
-    if ($address -notin @("127.0.0.1", "0.0.0.0", "*", "[::]", "[::1]")) { continue }
     $processId = 0
     if ($line -match 'pid=(\d+)') { $processId = [int]$Matches[1] }
-    $entries += [pscustomobject]@{ Port = $port; ProcessId = $processId }
+    $entries += [pscustomobject]@{ Port = $port; ProcessId = $processId; Address = $address }
   }
   return $entries
+}
+
+function Get-ContactAddress {
+  <#
+    The address to send a request to for a server listening on $Address.
+
+    A wildcard bind is not something a client can connect to, so it becomes
+    loopback. Anything else is a specific address on this machine and is used as
+    given - which is what makes a -External server bound to the tailnet address
+    still reachable by this script's own control requests.
+  #>
+  param([string]$Address)
+  if (-not $Address) { return "127.0.0.1" }
+  if ($Address -in @("0.0.0.0", "*", "[::]", "::", "0000:0000:0000:0000:0000:0000:0000:0000")) { return "127.0.0.1" }
+  if ($Address -like "*:*" -and $Address -notlike "[[]*") { return "[$Address]" }
+  return $Address
+}
+
+function Get-ControlHeaders {
+  <#
+    Headers for this launcher's own requests to the server.
+
+    WebAccessGuard never challenges a loopback client, so this is empty for an
+    ordinary launch. It matters when APP_HOST names a specific address: the
+    launcher then reaches the server over that address, its own requests arrive
+    from a non-loopback source, and readiness/shutdown would come back 401 without
+    the token. The value is only present when THIS process configured it.
+  #>
+  $token = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
+  if ($token) { return @{ "X-App-Token" = $token } }
+  return @{}
 }
 
 function Test-ProcessAlive {
@@ -163,6 +201,7 @@ function Get-LocalAppServerListeners {
         Port      = [int]$entry.Port
         ProcessId = [int]$entry.ProcessId
         ParentId  = [int]$process.ParentId
+        Address   = Get-ContactAddress -Address $entry.Address
       }
     }
   }
@@ -259,7 +298,10 @@ function Stop-ExistingLocalAppServers {
   if (-not $listeners) { return $true }
 
   foreach ($listener in $listeners) {
-    $base = "http://127.0.0.1:$($listener.Port)"
+    # The address it is actually bound to, not an assumed loopback: a previous
+    # -External launch may have bound the tailnet address, and asking 127.0.0.1 to
+    # shut down would fail there and force-kill a healthy server instead.
+    $base = "http://$($listener.Address):$($listener.Port)"
     Write-Host "Found existing local app server on port $($listener.Port) (PID $($listener.ProcessId))"
 
     if ($HardKill) {
@@ -273,7 +315,7 @@ function Stop-ExistingLocalAppServers {
     $safe = $false
     $safetyKnown = $false
     try {
-      $safety = Invoke-RestMethod -Uri "$base/api/system/restart-safety" -TimeoutSec 20
+      $safety = Invoke-RestMethod -Uri "$base/api/system/restart-safety" -TimeoutSec 20 -Headers (Get-ControlHeaders)
       $safetyKnown = $true
       $safe = [bool]$safety.safe
       if (-not $safe) {
@@ -301,7 +343,7 @@ function Stop-ExistingLocalAppServers {
     $graceful = $false
     try {
       $query = if ($ForceRestart) { "?force=true" } else { "" }
-      $response = Invoke-RestMethod -Method Post -Uri "$base/api/system/graceful-shutdown$query" -TimeoutSec 30
+      $response = Invoke-RestMethod -Method Post -Uri "$base/api/system/graceful-shutdown$query" -TimeoutSec 30 -Headers (Get-ControlHeaders)
       if ($response.ok) {
         Write-Host "  Graceful shutdown accepted; waiting for the process to exit."
         $graceful = $true
@@ -408,6 +450,95 @@ function Find-BrowserExecutable {
   return $null
 }
 
+function Get-TailscaleEndpoint {
+  <#
+    This machine's tailnet address, or $null when Tailscale is not usable here.
+
+    "Installed" is not the same as "up": tailscaled can be stopped, logged out, or
+    still starting, and in every one of those states `tailscale ip` fails or prints
+    nothing. Binding to an address that does not exist yet would make the server
+    fail to start, so anything short of a real address falls back to the LAN path.
+
+    The MagicDNS name is preferred for DISPLAY only. It is stable across tailnet IP
+    changes and is what someone would actually type, but the bind has to be the
+    literal address.
+  #>
+  $tailscale = Get-Command tailscale -ErrorAction SilentlyContinue
+  if (-not $tailscale) { return $null }
+
+  $address = $null
+  try {
+    # -4 because APP_HOST/uvicorn wants a single literal address and the v6 form
+    # would need bracketing everywhere downstream.
+    $output = & $tailscale.Source ip -4 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      foreach ($line in @($output)) {
+        $candidate = ([string]$line).Trim()
+        # The CGNAT range Tailscale assigns from. Matching it rather than "first
+        # line that parses" keeps a future change in output format from handing us
+        # something that is not a tailnet address.
+        if ($candidate -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { $address = $candidate; break }
+      }
+    }
+  } catch {
+    return $null
+  }
+  if (-not $address) { return $null }
+
+  $displayHost = $address
+  try {
+    $status = & $tailscale.Source status --json 2>$null | ConvertFrom-Json
+    if ($status.BackendState -ne "Running") { return $null }
+    $dnsName = [string]$status.Self.DNSName
+    # DNSName is fully qualified with a trailing dot; a URL must not carry it.
+    if ($dnsName) { $displayHost = $dnsName.TrimEnd('.') }
+  } catch {
+    # Status is a nice-to-have. An address that answered is enough to bind to.
+  }
+
+  return [pscustomobject]@{
+    BindAddress = $address
+    DisplayHost = $displayHost
+    Kind        = "tailscale"
+  }
+}
+
+function Get-LanIPv4Address {
+  if ($script:OnWindows) {
+    return Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.IPAddress -notlike "127.*" -and
+        $_.IPAddress -notlike "169.254.*" -and
+        $_.PrefixOrigin -in @("Dhcp", "Manual")
+      } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+  }
+  # Same three exclusions as the Windows branch: loopback, link-local, and (via
+  # `scope global`) anything not routable off this host.
+  foreach ($line in (& ip -4 -o addr show scope global 2>$null)) {
+    if ($line -match 'inet\s+(\d+\.\d+\.\d+\.\d+)') {
+      $candidate = $Matches[1]
+      if ($candidate -like "127.*" -or $candidate -like "169.254.*") { continue }
+      # Skip the Tailscale interface here: this function answers "what is my LAN
+      # address", and the tailnet one is returned by Get-TailscaleEndpoint.
+      if ($candidate -like "100.*") { continue }
+      return $candidate
+    }
+  }
+  return $null
+}
+
+function Get-ExternalAccessEndpoint {
+  <# Where -External should publish: tailnet when there is one, LAN otherwise. #>
+  $tailscale = Get-TailscaleEndpoint
+  if ($tailscale) { return $tailscale }
+  return [pscustomobject]@{
+    BindAddress = "0.0.0.0"
+    DisplayHost = Get-LanIPv4Address
+    Kind        = "lan"
+  }
+}
+
 function Open-DefaultBrowser {
   param([string]$Url)
   if ($script:OnWindows) {
@@ -440,7 +571,7 @@ function Wait-LocalAppReady {
       throw "Local app server exited before it became ready. Check logs\run-server.err.log."
     }
     try {
-      $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2
+      $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 -Headers (Get-ControlHeaders)
       if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) { return }
     } catch {
       Start-Sleep -Milliseconds 500
@@ -517,7 +648,20 @@ Set-DefaultEnv "APP_PORT" "8010"
 # Without -External nothing here runs and the server stays loopback-only, which
 # is the posture every previous launch had.
 if ($External) {
-  Set-RunEnv "APP_HOST" "0.0.0.0"
+  # Tailscale changes the address that gets PUBLISHED, not the bind. Narrowing the
+  # bind to the tailnet address looks like a free security win and is not: uvicorn
+  # binds one address, so loopback stops being served, and then the readiness poll,
+  # the managed browser and the finally block's graceful-stop request all talk to
+  # an address the server does not answer on. Worse, WebAccessGuard challenges any
+  # non-loopback client - including this launcher on the same machine - and a
+  # replacement launch cannot know the previous run's one-session token, so every
+  # -External restart would force-kill a healthy server instead of asking it to
+  # stop. Reachability is narrowed with `tailscale serve` or a firewall rule, not
+  # by taking loopback away from the launcher.
+  #
+  # APP_HOST is still honoured if it was set deliberately before launching.
+  $script:ExternalEndpoint = Get-ExternalAccessEndpoint
+  Set-DefaultEnv "APP_HOST" "0.0.0.0"
   $accessToken = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
   if (-not $accessToken -or $accessToken.Length -lt 16) {
     # Generated per launch rather than persisted: a token written to disk in a
@@ -531,7 +675,9 @@ if ($External) {
   Write-Host ""
   Write-Host "EXTERNAL ACCESS IS ON." -ForegroundColor Yellow
   Write-Host "  This server submits REAL orders and accepts shutdown requests." -ForegroundColor Yellow
-  Write-Host "  Anything that can reach this port needs only the token below." -ForegroundColor Yellow
+  Write-Host "  Bound to every interface. Anything that can reach this port needs" -ForegroundColor Yellow
+  Write-Host "  only the token below - the tailnet address is the one published," -ForegroundColor Yellow
+  Write-Host "  not the only one that answers." -ForegroundColor Yellow
   Write-Host ""
 }
 Set-DefaultEnv "DATA_ENV" "realtime"
@@ -894,7 +1040,20 @@ New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 $serverOutLog = Join-Path $logsDir "run-server.out.log"
 $serverErrLog = Join-Path $logsDir "run-server.err.log"
 $port = [int]([Environment]::GetEnvironmentVariable("APP_PORT", "Process"))
-$url = "http://127.0.0.1:$port"
+# Every local control path below - the readiness poll, the managed browser window,
+# and the graceful-shutdown request in the finally block - talks to the server over
+# this URL, so it has to name an address the server is actually listening on.
+#
+# 127.0.0.1 is right for the default (loopback) and for a 0.0.0.0 bind, but NOT for
+# -External over Tailscale: uvicorn binds one address, and binding the tailnet
+# address means loopback is not served at all. The readiness poll then never
+# succeeds, the browser opens a dead URL, and the finally block cannot ask the
+# server to stop - so it force-kills a server that was perfectly healthy. The
+# tailnet address is an address on this machine, so using it here reaches the same
+# process over the same loopback path in practice.
+$appHost = [Environment]::GetEnvironmentVariable("APP_HOST", "Process")
+$localHost = if ($appHost -and $appHost -ne "0.0.0.0" -and $appHost -ne "::") { $appHost } else { "127.0.0.1" }
+$url = "http://${localHost}:$port"
 $launchUrl = "$url/account"
 $server = $null
 $browser = $null
@@ -925,38 +1084,37 @@ try {
   Write-Host "Server logs: $serverOutLog"
 
   if ($External) {
-    # The address a phone can actually open — "0.0.0.0" is not one. Printed with
-    # the token attached because the first request from a browser cannot set a
+    # The address another device can actually open — "0.0.0.0" is not one. Printed
+    # with the token attached because the first request from a browser cannot set a
     # header; the server turns that one query parameter into a cookie.
-    $lanAddress = if ($script:OnWindows) {
-      Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object {
-          $_.IPAddress -notlike "127.*" -and
-          $_.IPAddress -notlike "169.254.*" -and
-          $_.PrefixOrigin -in @("Dhcp", "Manual")
-        } |
-        Select-Object -First 1 -ExpandProperty IPAddress
-    } else {
-      # Same three exclusions as the Windows branch: loopback, link-local, and
-      # (via `scope global`) anything that is not routable off this host.
-      $found = $null
-      foreach ($line in (& ip -4 -o addr show scope global 2>$null)) {
-        if ($line -match 'inet\s+(\d+\.\d+\.\d+\.\d+)') {
-          $candidate = $Matches[1]
-          if ($candidate -like "127.*" -or $candidate -like "169.254.*") { continue }
-          $found = $candidate
-          break
-        }
-      }
-      $found
-    }
-    if ($lanAddress) {
+    $endpoint = $script:ExternalEndpoint
+    $externalHost = $endpoint.DisplayHost
+    if ($externalHost) {
       $token = [Environment]::GetEnvironmentVariable("APP_ACCESS_TOKEN", "Process")
       Write-Host ""
-      Write-Host "Open this on the other device (same dashboard as here):" -ForegroundColor Cyan
-      Write-Host "  http://${lanAddress}:${port}/account?token=$token" -ForegroundColor Cyan
+      if ($endpoint.Kind -eq "tailscale") {
+        Write-Host "Open this on any device in your tailnet (same dashboard as here):" -ForegroundColor Cyan
+      } else {
+        Write-Host "Open this on the other device (same dashboard as here):" -ForegroundColor Cyan
+      }
+      Write-Host "  http://${externalHost}:${port}/account?token=$token" -ForegroundColor Cyan
       Write-Host ""
-      if ($script:OnWindows) {
+      if ($endpoint.Kind -eq "tailscale") {
+        # No port-forwarding or router change is involved to reach this address:
+        # it lives on Tailscale's own interface. That is a statement about the
+        # LINK, not about who else can reach the port - the server is bound to
+        # every interface, so the local network can still reach it with the token.
+        # Saying otherwise here would read as a security guarantee that does not
+        # exist, so the way to actually get one is printed instead.
+        Write-Host "The other device must be signed into the same tailnet. No port" -ForegroundColor DarkGray
+        Write-Host "forwarding or router change is needed for this address." -ForegroundColor DarkGray
+        if (-not $script:OnWindows) {
+          Write-Host "The port is still open on the local network. To restrict it to the" -ForegroundColor DarkGray
+          Write-Host "tailnet (and to fix the link not loading at all):" -ForegroundColor DarkGray
+          Write-Host "  sudo ufw allow in on tailscale0 to any port $port proto tcp" -ForegroundColor DarkGray
+          Write-Host "  sudo ufw deny $port/tcp" -ForegroundColor DarkGray
+        }
+      } elseif ($script:OnWindows) {
         Write-Host "If it does not load, Windows Firewall is blocking the port. Allow it once:" -ForegroundColor DarkGray
         Write-Host "  New-NetFirewallRule -DisplayName 'OBAITS app $port' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -Profile Private" -ForegroundColor DarkGray
       } else {
@@ -964,7 +1122,8 @@ try {
         Write-Host "  sudo ufw allow $port/tcp" -ForegroundColor DarkGray
       }
     } else {
-      Write-Host "Could not determine a LAN address for this machine." -ForegroundColor Yellow
+      Write-Host "Could not determine a reachable address for this machine." -ForegroundColor Yellow
+      Write-Host "  Tailscale was not up and no routable LAN address was found." -ForegroundColor Yellow
     }
   }
 
@@ -1023,7 +1182,7 @@ try {
     # refusal at this point would leave the process running after "Local app
     # stopped." was printed, which is worse than an acknowledged unsafe stop.
     try {
-      Invoke-RestMethod -Method Post -Uri "$url/api/system/graceful-shutdown?force=true" -TimeoutSec 20 | Out-Null
+      Invoke-RestMethod -Method Post -Uri "$url/api/system/graceful-shutdown?force=true" -TimeoutSec 20 -Headers (Get-ControlHeaders) | Out-Null
       $deadline = (Get-Date).AddSeconds(25)
       while ((Get-Date) -lt $deadline -and -not $server.HasExited) {
         Start-Sleep -Milliseconds 400

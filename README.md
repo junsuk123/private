@@ -104,6 +104,28 @@ Python **3.11 이상**이 필요합니다(`app/schemas/domain.py`가 `enum.StrEn
 | 프로세스·포트 조회 | `Get-CimInstance`, `Get-NetTCPConnection` | `ps -eww`, `ss -ltnp` |
 | 관리 브라우저 | Chrome / Edge | google-chrome / chromium / edge |
 
+### 다른 기기에서 접속 (`-External`)
+
+기본은 loopback 전용입니다. `./run.ps1 -External`을 주면 1회용 토큰을 발급하고 다른 기기가 **같은 대시보드**를 열 수 있게 합니다.
+
+**Tailscale이 올라와 있으면 tailnet 주소를 링크로 출력합니다.** MagicDNS 이름을 쓰므로 tailnet IP가 바뀌어도 그대로이고, 어느 네트워크에 있든 같은 주소로 열립니다. 포트 포워딩이나 공유기 설정이 필요 없습니다.
+
+```
+Open this on any device in your tailnet (same dashboard as here):
+  http://<hostname>.<tailnet>.ts.net:8010/account?token=...
+```
+
+Tailscale이 없거나 `tailscaled`가 멈춰 있으면 LAN IPv4 주소로 떨어집니다.
+
+**출력되는 주소가 tailnet이라고 해서 도달 범위가 tailnet으로 좁혀지는 건 아닙니다.** 바인딩은 `0.0.0.0`이고, 접근 통제는 여전히 토큰 하나입니다 — `-External`이 원래부터 택한 자세입니다. bind를 tailnet 주소로 좁히는 건 공짜 개선처럼 보이지만 아닙니다: uvicorn은 주소 하나만 바인딩하므로 loopback이 죽고, 그러면 준비 상태 폴링·관리 브라우저·`finally`의 graceful 정지 요청이 전부 서버가 응답하지 않는 주소로 갑니다. 게다가 `WebAccessGuard`는 **같은 기기의 런처를 포함해** loopback이 아닌 클라이언트를 전부 challenge하는데, 교체 실행은 이전 실행의 1회용 토큰을 알 수 없으므로 `-External` 재시작마다 멀쩡한 서버를 강제 종료하게 됩니다.
+
+도달 범위를 실제로 좁히려면 loopback을 런처에서 뺏는 방식이 아니라 `tailscale serve` 또는 방화벽 규칙을 쓰세요:
+
+```bash
+sudo ufw allow in on tailscale0 to any port 8010 proto tcp
+sudo ufw deny 8010/tcp
+```
+
 ### 가속기 배치
 
 **가속 장치는 런처가 지정하지 않고 기기에서 탐지합니다.** `app/realtime/device_plan.py`가 워크로드별로 사다리를 내려가며 배치하고 항상 CPU에서 끝납니다. 이전 `run.ps1`은 `ONTOLOGY_ACCELERATOR`/`OPENVINO_DEVICE`/`LLM_EVENT_DEVICE`를 `NPU`로 무조건 고정했는데, 이 값들은 `os.environ.setdefault`로 읽히므로 **런처가 탐지 결과를 덮어써서** NPU가 없는 기기에서는 모든 소비자가 compile 실패 fallback 경로로 떨어졌습니다. 지금은 그 장치가 있다고 알려진 기기에서만 값을 고정합니다.
