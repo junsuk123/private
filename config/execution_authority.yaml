@@ -1,0 +1,46 @@
+# Who decides what, and which of those are switchable.
+#
+# Two kinds of entry live here and they behave differently.
+#
+# INVARIANTS are not toggles. They record architectural facts that the code enforces
+# structurally — there is no post-selection ProfitabilityGate call to switch back on, and
+# app/config/execution_authority.py REFUSES to load a file that sets one of them to a
+# value the code cannot honour. They are written down so an operator can see the contract,
+# and validated so the file cannot drift away from it.
+#
+# OPERATIONAL entries are real switches with real effects.
+
+schema_version: 1
+
+invariants:
+  # The elected strategy owns entry and exit from realtime ticks.
+  strategy_owned_execution: true
+  # After a TradePlan exists, nothing re-judges investment quality.
+  post_selection_profitability_veto: false
+  post_selection_position_resizing: false
+  post_selection_risk_veto: false
+  post_selection_ontology_reapproval: false
+  # The ExecutionGuard is always in the path; it checks order-ability only.
+  execution_guard: true
+  # No sample, synthetic or unknown-source data may inform a live decision.
+  synthetic_live_data: false
+  unknown_source_live: false
+  # Both survive: the idempotency store protects the broker call, the order state machine
+  # protects the record of it.
+  duplicate_protection: true
+  idempotency: true
+
+operational:
+  order_type: LIMIT
+  # One new entry per cycle. The session owns a single position at a time, so a second
+  # concurrent entry would contradict the ownership model rather than merely add risk.
+  max_buy_orders_per_cycle: 1
+  # An elected plan executes without a human in the loop. Manual arming is a separate,
+  # process-level control (REQUIRE_MANUAL_ARMING) and is unaffected by this.
+  manual_strategy_confirmation: false
+  # Seconds an elected plan stays executable before the strategy must be re-elected
+  # against a fresh market.
+  trade_plan_ttl_seconds: 300
+  # Blocks a BUY when orderable cash cannot be established. Live should leave this on:
+  # the broker's answer to an unanswerable affordability question is a rejection.
+  strict_affordability: true

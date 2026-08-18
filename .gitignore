@@ -74,3 +74,6 @@ config/local_llm.env
 # Per-machine tool permissions, not project configuration. .claude/settings.json
 # is the shared one and stays tracked.
 .claude/settings.local.json
+
+# Dry-run and replay reports are run artifacts, not source.
+data/reports/

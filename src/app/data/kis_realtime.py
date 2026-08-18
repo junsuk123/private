@@ -108,6 +108,16 @@ class KisRealtimeSubscriptionManager:
     store: RealtimeMarketDataStore
     message_source: Callable[[], Awaitable[str | None]]
     event_sink: Callable[[RealtimeTradeTick | RealtimeOrderbookSnapshot], Awaitable[bool]] | None = None
+    #: Synchronous fan-out to the strategy fast loop, invoked BEFORE persistence.
+    #:
+    #: The fast loop's whole claim is that a tick reaches the owning strategy without a
+    #: database round trip. Reading the tick back out of SQLite would add the write, the
+    #: read and the contention between them to every decision. This hook hands the parsed
+    #: objects straight over. It must not block: an exception is swallowed and counted so
+    #: a fault in a strategy cannot stop market-data collection.
+    tick_observer: Callable[
+        [tuple[RealtimeTradeTick, ...], tuple[RealtimeOrderbookSnapshot, ...]], None
+    ] | None = None
     symbols: set[str] = field(default_factory=set)
     running: bool = False
 
@@ -134,6 +144,16 @@ class KisRealtimeSubscriptionManager:
             orderbooks = tuple(
                 item for item in parsed.orderbooks if not self.symbols or item.symbol in self.symbols
             )
+            if self.tick_observer is not None and (ticks or orderbooks):
+                try:
+                    self.tick_observer(ticks, orderbooks)
+                except Exception as exc:  # noqa: BLE001 - a strategy fault must not stop the feed.
+                    counts["tick_observer_errors"] = (
+                        counts.get("tick_observer_errors", 0) + 1
+                    )
+                    counts["last_tick_observer_error"] = (
+                        str(exc) or exc.__class__.__name__
+                    )
             if self.event_sink is not None:
                 for event in (*ticks, *orderbooks):
                     await self.event_sink(event)

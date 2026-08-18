@@ -19,10 +19,20 @@ NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
 
 
 def _store(tmp_path, **overrides) -> StrategyPerformanceStore:
+    """A store whose clock is ``NOW``, so the 21-day window stays real but fixed.
+
+    The evidence cutoff is measured against the store's clock. While that clock was
+    the wall clock and ``NOW`` was a fixed past date, this file was a time bomb: it
+    passed for 21 days and then, on NOW + 21 days, every posterior assertion began
+    reading back an empty store while ``record`` still returned True. Pinning the
+    store's clock to the same instant the fixtures are dated from removes the coupling
+    without disabling the window — production's ``max_age_days`` stays in force here.
+    """
     return StrategyPerformanceStore(
         tmp_path / "perf.sqlite3",
         posterior_config=PosteriorConfig(**overrides) if overrides else PosteriorConfig(),
         cache_ttl_seconds=0.0,
+        clock=lambda: NOW,
     )
 
 
@@ -52,6 +62,42 @@ def test_recent_outcomes_are_newest_first(tmp_path):
     for index, value in enumerate([10.0, -5.0, 30.0]):
         assert _record(store, value, index=index)
     assert store.recent_net_bps("intraday_momentum") == (30.0, -5.0, 10.0)
+
+
+def test_evidence_older_than_the_window_is_dropped(tmp_path):
+    """The 21-day cutoff itself, asserted rather than assumed.
+
+    Deterministic because the store's clock is injected: the boundary is measured
+    from ``NOW``, not from whenever the suite happens to run.
+    """
+    store = _store(tmp_path, max_age_days=21.0)
+    for label, moment in (
+        (11.0, NOW - timedelta(days=30)),  # outside the window
+        (22.0, NOW - timedelta(days=1)),  # inside it
+    ):
+        assert store.record(
+            strategy_id="intraday_momentum",
+            symbol="005930",
+            market="KR",
+            regime="HIGH_VOL_TRENDING",
+            realized_net_bps=label,
+            expected_net_bps=25.0,
+            holding_seconds=300.0,
+            recorded_at=moment,
+        )
+    # Both rows are stored; only the recent one counts as evidence.
+    assert store.recent_net_bps("intraday_momentum") == (22.0,)
+
+
+def test_the_store_clock_defaults_to_the_wall_clock(tmp_path):
+    """The seam must not change production behaviour when nobody injects one."""
+    store = StrategyPerformanceStore(
+        tmp_path / "perf.sqlite3",
+        posterior_config=PosteriorConfig(),
+        cache_ttl_seconds=0.0,
+    )
+    drift = abs((store._now() - datetime.now(timezone.utc)).total_seconds())
+    assert drift < 5.0
 
 
 def test_loss_streak_counts_only_the_consecutive_tail(tmp_path):

@@ -25,22 +25,33 @@ def isolated_process_wide_stores(tmp_path_factory):
     root = tmp_path_factory.mktemp("process-stores")
     previous = {
         name: os.environ.get(name)
-        for name in ("STRATEGY_PERFORMANCE_STORE_PATH", "CHANGE_POINT_STATE_PATH")
+        for name in (
+            "STRATEGY_PERFORMANCE_STORE_PATH",
+            "CHANGE_POINT_STATE_PATH",
+            "TRADING_STATE_DB_PATH",
+        )
     }
     os.environ["STRATEGY_PERFORMANCE_STORE_PATH"] = str(root / "strategy-performance.sqlite3")
     os.environ["CHANGE_POINT_STATE_PATH"] = str(root / "change-point-state.json")
+    # The context/decision/order store. Without this a test run would write real order
+    # intents and gate verdicts into the operator's data/store, and the seasonality
+    # baselines would accumulate synthetic observations across runs.
+    os.environ["TRADING_STATE_DB_PATH"] = str(root / "trading-state.sqlite3")
 
     # The singletons may already exist if an earlier import touched them.
     from app.graph import change_point
+    from app.storage import trading_state_store
     from app.trading import strategy_performance_store
 
     strategy_performance_store.reset_default_store()
     change_point.reset_default_detector()
+    trading_state_store.reset_default_trading_state_store()
     try:
         yield root
     finally:
         strategy_performance_store.reset_default_store()
         change_point.reset_default_detector()
+        trading_state_store.reset_default_trading_state_store()
         for name, value in previous.items():
             if value is None:
                 os.environ.pop(name, None)

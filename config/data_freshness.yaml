@@ -1,0 +1,128 @@
+# Per-source, per-data-type freshness policy.
+#
+# Three timestamps are tracked for every observation:
+#   event_time      when the exchange says it happened
+#   received_time   when this process took delivery of it
+#   processed_time  when this process finished turning it into a feature
+#
+# Age is `now - event_time`. Received and processed times are kept because they separate
+# three different failures that all look identical from age alone: the venue is quiet
+# (event_time old, receive lag small), the feed has stalled (receive lag large), or our
+# own pipeline is behind (process lag large). The reason codes distinguish them.
+#
+# healthy_max_age_seconds   at or below this, HEALTHY
+# degraded_max_age_seconds  above healthy and at or below this, DEGRADED
+# beyond degraded           STALE
+#
+# critical
+#   true means a STALE reading BLOCKS new orders (hard gate STALE_DATA). Reserve it for
+#   inputs an order price or size actually depends on. A stale macro series should shrink
+#   size and be reported; it should not stop the system from closing a position.
+#
+# max_receive_lag_seconds / max_process_lag_seconds
+#   Independent of age. A tick whose event_time is current but which took 8 seconds to
+#   reach us is a feed problem even though its age looks fine.
+
+schema_version: 1
+
+defaults:
+  healthy_max_age_seconds: 60
+  degraded_max_age_seconds: 300
+  max_receive_lag_seconds: 10
+  max_process_lag_seconds: 10
+  critical: false
+
+policies:
+  # ---- KIS realtime websocket: the order path depends on these ----
+  - source: kis_realtime
+    data_type: trade
+    healthy_max_age_seconds: 3
+    degraded_max_age_seconds: 15
+    max_receive_lag_seconds: 2
+    max_process_lag_seconds: 2
+    critical: true
+  - source: kis_realtime
+    data_type: orderbook
+    healthy_max_age_seconds: 3
+    degraded_max_age_seconds: 15
+    max_receive_lag_seconds: 2
+    max_process_lag_seconds: 2
+    critical: true
+
+  # ---- KIS REST: snapshot backfill, deliberately slower and non-critical ----
+  - source: kis_rest
+    data_type: quote_snapshot
+    healthy_max_age_seconds: 30
+    degraded_max_age_seconds: 120
+    max_receive_lag_seconds: 5
+    max_process_lag_seconds: 5
+    critical: false
+  - source: kis_rest
+    data_type: account
+    healthy_max_age_seconds: 120
+    degraded_max_age_seconds: 600
+    critical: true
+  - source: kis_rest
+    data_type: positions
+    healthy_max_age_seconds: 120
+    degraded_max_age_seconds: 600
+    critical: true
+  - source: kis_rest
+    data_type: order_status
+    healthy_max_age_seconds: 30
+    degraded_max_age_seconds: 180
+    critical: true
+
+  # ---- derived state produced inside this process ----
+  - source: internal
+    data_type: minute_bar
+    healthy_max_age_seconds: 90
+    degraded_max_age_seconds: 300
+    critical: false
+  - source: internal
+    data_type: domestic_context
+    healthy_max_age_seconds: 60
+    degraded_max_age_seconds: 300
+    critical: true
+  - source: internal
+    data_type: sector_context
+    healthy_max_age_seconds: 120
+    degraded_max_age_seconds: 600
+    critical: false
+  - source: internal
+    data_type: regime
+    healthy_max_age_seconds: 120
+    degraded_max_age_seconds: 600
+    critical: false
+  - source: internal
+    data_type: model_prediction
+    healthy_max_age_seconds: 120
+    degraded_max_age_seconds: 600
+    critical: false
+
+  # ---- global / macro series: published slowly by nature ----
+  - source: global_indicator
+    data_type: index_level
+    healthy_max_age_seconds: 3600
+    degraded_max_age_seconds: 86400
+    critical: false
+  - source: global_indicator
+    data_type: index_futures
+    healthy_max_age_seconds: 300
+    degraded_max_age_seconds: 3600
+    critical: false
+  - source: fred
+    data_type: macro_series
+    healthy_max_age_seconds: 86400
+    degraded_max_age_seconds: 604800
+    critical: false
+  - source: ecos
+    data_type: macro_series
+    healthy_max_age_seconds: 86400
+    degraded_max_age_seconds: 604800
+    critical: false
+  - source: investor_flow
+    data_type: flow_daily
+    healthy_max_age_seconds: 86400
+    degraded_max_age_seconds: 259200
+    critical: false

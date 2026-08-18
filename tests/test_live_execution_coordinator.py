@@ -428,12 +428,19 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
             transport=transport,
             token_cache_path=Path(tmp) / "token.json",
         )
-        return LiveExecutionCoordinator(
+        coordinator = LiveExecutionCoordinator(
             client,
             idempotency_store=IdempotencyStore(Path(tmp) / "idempotency.jsonl"),
             journal=LiveOrderJournal(Path(tmp) / "live-orders.jsonl"),
             execution_config=load_order_execution_config("config/order_execution.json"),
         )
+        # These tests exercise ROUTING — TR ids, endpoints, order divisions — at arbitrary
+        # wall-clock times. The per-order ExecutionGuard would refuse every one of them
+        # for being outside a session, which is correct behaviour and a different subject;
+        # it has its own suites in tests/test_execution_guard.py and
+        # tests/test_pre_submit_guard.py.
+        coordinator.execution_guard = None
+        return coordinator
 
 
 def _order() -> FinalOrder:

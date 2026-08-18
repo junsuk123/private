@@ -22,10 +22,15 @@ NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
 
 
 def _store(tmp_path) -> StrategyPerformanceStore:
+    # The store's clock is pinned to ``NOW`` so the 21-day evidence window is measured
+    # from the same instant the fixtures are dated from. While that window ran off the
+    # real wall clock these tests expired silently on NOW + 21 days: the store read
+    # back empty and the election saw no history to elect on.
     return StrategyPerformanceStore(
         tmp_path / "perf.sqlite3",
         posterior_config=PosteriorConfig(),
         cache_ttl_seconds=0.0,
+        clock=lambda: NOW,
     )
 
 

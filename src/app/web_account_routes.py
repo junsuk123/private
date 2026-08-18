@@ -366,7 +366,7 @@ _ACCOUNT_PAGE = """<!doctype html>
         <h2>거시–미시 온톨로지 (자문 전용)</h2>
         <span class="badge" id="macro-micro-badge">-</span>
       </div>
-      <p class="tech-note">거시 온톨로지가 시장 레짐·후보·허용전략을 정하고, 미시 온톨로지가 종목별로 병렬 추론합니다. 최종 승인은 RiskManager·ProfitabilityGate가 가집니다.</p>
+      <p class="tech-note">거시 온톨로지가 시장 레짐·후보·허용전략을 정하고, 미시 온톨로지가 종목별로 병렬 추론합니다. 비용·사이즈·리스크는 <b>선출 이전</b>에 결정되어 TradePlan 에 고정되고, 선출 이후에는 선택된 전략이 실시간 틱으로 진입·청산을 직접 결정합니다. 주문 직전 ExecutionGuard 는 기술적 주문 가능성만 검사합니다.</p>
       <div class="mm-graph" id="mm-graph"></div>
       <div class="mm-macro" id="mm-macro"></div>
       <div class="mm-grid">
@@ -380,7 +380,7 @@ _ACCOUNT_PAGE = """<!doctype html>
         <h2>기술적 예측 (자문 전용)</h2>
         <span class="badge" id="technical-badge">-</span>
       </div>
-      <p class="tech-note">RiskManager·ProfitabilityGate가 최종 권한을 가지며, 아래는 근거·설명일 뿐입니다.</p>
+      <p class="tech-note">RiskManager·ProfitabilityGate 는 <b>선출 이전</b> 권한이며 그 결과는 TradePlan 에 고정됩니다. 선출 이후 투자 판단을 다시 하는 authority 는 없습니다 (<code>/api/execution/authority-path</code>).</p>
       <div class="tech-grid">
         <article><h3>매수 승인</h3><div class="tech-cards" id="tech-buy-approved"></div></article>
         <article><h3>매수 보류/거부</h3><div class="tech-cards" id="tech-buy-rejected"></div></article>

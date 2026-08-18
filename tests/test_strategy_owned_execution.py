@@ -83,6 +83,9 @@ def _coordinator(tmp_path: Path, broker: _Broker) -> LiveExecutionCoordinator:
         causal_journal=CausalOrderJournal(tmp_path / "causal.jsonl"),
     )
     coordinator._preflight_failures = lambda: []  # type: ignore[method-assign]
+    # Same reasoning as the process-level gates above: this test is about the
+    # causal chain, not about whether a session is open right now.
+    coordinator.execution_guard = None
     return coordinator
 
 

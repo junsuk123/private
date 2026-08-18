@@ -1,0 +1,203 @@
+# Market graph ontology: node types, relation types and EXPERT PRIORS.
+#
+# Everything in this file is a prior — a claim a person made about how markets relate. It
+# is stored separately from what the model learned, and both are exposed side by side in
+# every inference trace, so "the ontology said X and the model learned Y" is always a
+# question that can be answered rather than a blend nobody can decompose.
+#
+# prior_strength
+#   The expert's confidence in the relation, in [0, 1]. It enters the GNN as a SOFT BIAS
+#   on the relation's attention logit (bias = prior_bias_scale * prior_strength), never as
+#   a hard mask, so training can overrule it and the trace shows by how much.
+#
+# learnable
+#   false pins the relation to its prior. Reserve it for structural facts
+#   (BELONGS_TO, TRADED_ON) that are definitions rather than hypotheses — a model must not
+#   be able to learn that a stock partially belongs to a sector.
+#
+# lag_min / lag_max
+#   Minutes. The window in which the relation is expected to act. LEADS/LAGS carry a real
+#   window; instantaneous relations carry 0/0.
+
+schema_version: 1
+
+node_types:
+  - TemporalEntity
+  - Venue
+  - Market
+  - MacroFactor
+  - Sector
+  - Industry
+  - Stock
+  - MarketRegime
+  - Strategy
+  - RiskCondition
+  - TradeIntent
+
+relation_types:
+  INFLUENCES:      {symmetric: false, default_prior: 0.5, learnable: true,  lag_min: 0,  lag_max: 60}
+  LEADS:           {symmetric: false, default_prior: 0.4, learnable: true,  lag_min: 1,  lag_max: 120}
+  LAGS:            {symmetric: false, default_prior: 0.4, learnable: true,  lag_min: 1,  lag_max: 120}
+  CORRELATED_WITH: {symmetric: true,  default_prior: 0.5, learnable: true,  lag_min: 0,  lag_max: 0}
+  CONFIRMS:        {symmetric: false, default_prior: 0.6, learnable: true,  lag_min: 0,  lag_max: 30}
+  CONTRADICTS:     {symmetric: false, default_prior: 0.6, learnable: true,  lag_min: 0,  lag_max: 30}
+  INCREASES_RISK:  {symmetric: false, default_prior: 0.7, learnable: true,  lag_min: 0,  lag_max: 30}
+  DECREASES_RISK:  {symmetric: false, default_prior: 0.5, learnable: true,  lag_min: 0,  lag_max: 30}
+  SUITABLE_FOR:    {symmetric: false, default_prior: 0.6, learnable: true,  lag_min: 0,  lag_max: 0}
+  UNSUITABLE_FOR:  {symmetric: false, default_prior: 0.7, learnable: true,  lag_min: 0,  lag_max: 0}
+  REQUIRES:        {symmetric: false, default_prior: 0.9, learnable: false, lag_min: 0,  lag_max: 0}
+  INVALIDATES:     {symmetric: false, default_prior: 0.9, learnable: false, lag_min: 0,  lag_max: 0}
+  BELONGS_TO:      {symmetric: false, default_prior: 1.0, learnable: false, lag_min: 0,  lag_max: 0}
+  TRADED_ON:       {symmetric: false, default_prior: 1.0, learnable: false, lag_min: 0,  lag_max: 0}
+
+# How strongly a prior biases an attention logit before softmax. 1.0 means a
+# prior_strength of 1.0 shifts the logit by 1.0 — roughly a 2.7x weight preference
+# against an otherwise equal alternative. Large enough to matter, small enough that
+# evidence can overturn it.
+prior_bias_scale: 1.0
+
+nodes:
+  # -- venues and markets --
+  - {id: KRX,        type: Venue,       label: "한국거래소"}
+  - {id: NXT,        type: Venue,       label: "넥스트레이드"}
+  - {id: NASDAQ,     type: Venue,       label: "NASDAQ"}
+  - {id: NYSE,       type: Venue,       label: "NYSE"}
+  - {id: KR_MARKET,  type: Market,      label: "Korean equity market"}
+  - {id: US_MARKET,  type: Market,      label: "US equity market"}
+  - {id: ASIA_MARKET, type: Market,     label: "Asian equity markets"}
+
+  # -- macro factors (mirror the global indicator groups) --
+  - {id: US_EQUITY,     type: MacroFactor, label: "US equity complex",  attributes: {global_group: equity}}
+  - {id: US_SEMI,       type: MacroFactor, label: "US semiconductors",  attributes: {global_group: semiconductor}}
+  - {id: VOLATILITY,    type: MacroFactor, label: "Implied volatility", attributes: {global_group: risk}}
+  - {id: US_RATES,      type: MacroFactor, label: "US rates",           attributes: {global_group: rates}}
+  - {id: FX,            type: MacroFactor, label: "USDKRW / DXY",       attributes: {global_group: fx}}
+  - {id: COMMODITY,     type: MacroFactor, label: "Commodities",        attributes: {global_group: commodity}}
+  - {id: INDEX_FUTURES, type: MacroFactor, label: "US index futures",   attributes: {global_group: futures}}
+
+  # -- regimes --
+  - {id: TREND_UP,             type: MarketRegime}
+  - {id: TREND_DOWN,           type: MarketRegime}
+  - {id: RANGE_LOW_VOL,        type: MarketRegime}
+  - {id: RANGE_HIGH_VOL,       type: MarketRegime}
+  - {id: BREAKOUT_UP,          type: MarketRegime}
+  - {id: BREAKDOWN,            type: MarketRegime}
+  - {id: RISK_ON,              type: MarketRegime}
+  - {id: RISK_OFF,             type: MarketRegime}
+  - {id: LIQUIDITY_STRESS,     type: MarketRegime}
+  - {id: INDEX_UP_BREADTH_DOWN, type: MarketRegime}
+  - {id: INDEX_DOWN_BREADTH_UP, type: MarketRegime}
+  - {id: EVENT_SHOCK,          type: MarketRegime}
+  - {id: TRANSITION,           type: MarketRegime}
+
+  # -- strategy families --
+  - {id: TREND,             type: Strategy, attributes: {family: TREND}}
+  - {id: BREAKOUT,          type: Strategy, attributes: {family: BREAKOUT}}
+  - {id: MEAN_REVERSION,    type: Strategy, attributes: {family: MEAN_REVERSION}}
+  - {id: RELATIVE_STRENGTH, type: Strategy, attributes: {family: RELATIVE_STRENGTH}}
+  - {id: ORDER_FLOW,        type: Strategy, attributes: {family: ORDER_FLOW}}
+  - {id: GAP,               type: Strategy, attributes: {family: GAP}}
+  - {id: EVENT,             type: Strategy, attributes: {family: EVENT}}
+  - {id: DEFENSIVE,         type: Strategy, attributes: {family: DEFENSIVE}}
+
+  # -- risk conditions --
+  - {id: STALE_DATA,        type: RiskCondition}
+  - {id: WIDE_SPREAD,       type: RiskCondition}
+  - {id: LOW_LIQUIDITY,     type: RiskCondition}
+  - {id: HIGH_VOLATILITY,   type: RiskCondition}
+  - {id: GLOBAL_CONFLICT,   type: RiskCondition}
+  - {id: SECTOR_CONFLICT,   type: RiskCondition}
+  - {id: OPENING_EXTREME_VOL, type: RiskCondition}
+
+  # -- temporal --
+  - {id: OPENING_PHASE,  type: TemporalEntity, attributes: {session_phase: OPENING}}
+  - {id: MIDDAY_PHASE,   type: TemporalEntity, attributes: {session_phase: MIDDAY}}
+  - {id: CLOSING_PHASE,  type: TemporalEntity, attributes: {session_phase: CLOSING}}
+  - {id: EXPIRY_WINDOW,  type: TemporalEntity, attributes: {expiry: true}}
+
+edges:
+  # -- cross-market influence and lead/lag ------------------------------------
+  - {source: US_EQUITY,     target: KR_MARKET,  relation: INFLUENCES, prior_strength: 0.75, lag_min: 0, lag_max: 960}
+  - {source: US_SEMI,       target: KR_MARKET,  relation: INFLUENCES, prior_strength: 0.70, lag_min: 0, lag_max: 960}
+  - {source: INDEX_FUTURES, target: KR_MARKET,  relation: LEADS,      prior_strength: 0.65, lag_min: 1, lag_max: 120}
+  - {source: US_EQUITY,     target: INDEX_FUTURES, relation: CORRELATED_WITH, prior_strength: 0.90}
+  - {source: ASIA_MARKET,   target: KR_MARKET,  relation: CORRELATED_WITH, prior_strength: 0.60}
+  - {source: KR_MARKET,     target: ASIA_MARKET, relation: LAGS,      prior_strength: 0.35, lag_min: 1, lag_max: 60}
+  - {source: VOLATILITY,    target: KR_MARKET,  relation: INCREASES_RISK, prior_strength: 0.80, lag_min: 0, lag_max: 120}
+  - {source: US_RATES,      target: KR_MARKET,  relation: INFLUENCES, prior_strength: 0.45, lag_min: 0, lag_max: 960}
+  - {source: FX,            target: KR_MARKET,  relation: INCREASES_RISK, prior_strength: 0.55, lag_min: 0, lag_max: 480}
+  - {source: COMMODITY,     target: KR_MARKET,  relation: INFLUENCES, prior_strength: 0.30, lag_min: 0, lag_max: 960}
+  - {source: US_SEMI,       target: US_EQUITY,  relation: LEADS,      prior_strength: 0.50, lag_min: 1, lag_max: 60}
+
+  # -- venue structure (definitions: not learnable) ---------------------------
+  - {source: KRX,    target: KR_MARKET, relation: BELONGS_TO}
+  - {source: NXT,    target: KR_MARKET, relation: BELONGS_TO}
+  - {source: NASDAQ, target: US_MARKET, relation: BELONGS_TO}
+  - {source: NYSE,   target: US_MARKET, relation: BELONGS_TO}
+
+  # -- regime -> strategy suitability -----------------------------------------
+  - {source: TREND_UP,         target: TREND,             relation: SUITABLE_FOR,   prior_strength: 0.85}
+  - {source: TREND_UP,         target: RELATIVE_STRENGTH, relation: SUITABLE_FOR,   prior_strength: 0.70}
+  - {source: TREND_UP,         target: MEAN_REVERSION,    relation: UNSUITABLE_FOR, prior_strength: 0.60}
+  - {source: TREND_DOWN,       target: DEFENSIVE,         relation: SUITABLE_FOR,   prior_strength: 0.80}
+  - {source: TREND_DOWN,       target: TREND,             relation: SUITABLE_FOR,   prior_strength: 0.55}
+  - {source: TREND_DOWN,       target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.65}
+  - {source: RANGE_LOW_VOL,    target: MEAN_REVERSION,    relation: SUITABLE_FOR,   prior_strength: 0.85}
+  - {source: RANGE_LOW_VOL,    target: TREND,             relation: UNSUITABLE_FOR, prior_strength: 0.70}
+  - {source: RANGE_LOW_VOL,    target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.55}
+  - {source: RANGE_HIGH_VOL,   target: MEAN_REVERSION,    relation: SUITABLE_FOR,   prior_strength: 0.50}
+  - {source: RANGE_HIGH_VOL,   target: ORDER_FLOW,        relation: SUITABLE_FOR,   prior_strength: 0.55}
+  - {source: RANGE_HIGH_VOL,   target: TREND,             relation: UNSUITABLE_FOR, prior_strength: 0.60}
+  - {source: BREAKOUT_UP,      target: BREAKOUT,          relation: SUITABLE_FOR,   prior_strength: 0.90}
+  - {source: BREAKOUT_UP,      target: TREND,             relation: SUITABLE_FOR,   prior_strength: 0.60}
+  - {source: BREAKOUT_UP,      target: MEAN_REVERSION,    relation: UNSUITABLE_FOR, prior_strength: 0.80}
+  - {source: BREAKDOWN,        target: DEFENSIVE,         relation: SUITABLE_FOR,   prior_strength: 0.85}
+  - {source: BREAKDOWN,        target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.70}
+  - {source: BREAKDOWN,        target: MEAN_REVERSION,    relation: UNSUITABLE_FOR, prior_strength: 0.75}
+  - {source: RISK_ON,          target: RELATIVE_STRENGTH, relation: SUITABLE_FOR,   prior_strength: 0.70}
+  - {source: RISK_ON,          target: BREAKOUT,          relation: SUITABLE_FOR,   prior_strength: 0.60}
+  - {source: RISK_OFF,         target: DEFENSIVE,         relation: SUITABLE_FOR,   prior_strength: 0.85}
+  - {source: RISK_OFF,         target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.75}
+  - {source: RISK_OFF,         target: RELATIVE_STRENGTH, relation: UNSUITABLE_FOR, prior_strength: 0.40}
+  - {source: LIQUIDITY_STRESS, target: DEFENSIVE,         relation: SUITABLE_FOR,   prior_strength: 0.75}
+  - {source: LIQUIDITY_STRESS, target: ORDER_FLOW,        relation: UNSUITABLE_FOR, prior_strength: 0.85}
+  - {source: LIQUIDITY_STRESS, target: MEAN_REVERSION,    relation: UNSUITABLE_FOR, prior_strength: 0.70}
+  - {source: LIQUIDITY_STRESS, target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.80}
+  - {source: INDEX_UP_BREADTH_DOWN, target: RELATIVE_STRENGTH, relation: SUITABLE_FOR,   prior_strength: 0.70}
+  - {source: INDEX_UP_BREADTH_DOWN, target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.60}
+  - {source: INDEX_DOWN_BREADTH_UP, target: MEAN_REVERSION,    relation: SUITABLE_FOR,   prior_strength: 0.60}
+  - {source: EVENT_SHOCK,      target: EVENT,             relation: SUITABLE_FOR,   prior_strength: 0.70}
+  - {source: EVENT_SHOCK,      target: MEAN_REVERSION,    relation: UNSUITABLE_FOR, prior_strength: 0.80}
+  - {source: EVENT_SHOCK,      target: TREND,             relation: UNSUITABLE_FOR, prior_strength: 0.60}
+  - {source: TRANSITION,       target: DEFENSIVE,         relation: SUITABLE_FOR,   prior_strength: 0.55}
+  - {source: TRANSITION,       target: TREND,             relation: UNSUITABLE_FOR, prior_strength: 0.55}
+  - {source: TRANSITION,       target: BREAKOUT,          relation: UNSUITABLE_FOR, prior_strength: 0.50}
+
+  # -- temporal -> strategy ----------------------------------------------------
+  - {source: OPENING_PHASE, target: GAP,            relation: SUITABLE_FOR,   prior_strength: 0.75}
+  - {source: OPENING_PHASE, target: BREAKOUT,       relation: SUITABLE_FOR,   prior_strength: 0.60}
+  - {source: OPENING_PHASE, target: MEAN_REVERSION, relation: UNSUITABLE_FOR, prior_strength: 0.55}
+  - {source: MIDDAY_PHASE,  target: MEAN_REVERSION, relation: SUITABLE_FOR,   prior_strength: 0.55}
+  - {source: MIDDAY_PHASE,  target: BREAKOUT,       relation: UNSUITABLE_FOR, prior_strength: 0.50}
+  - {source: CLOSING_PHASE, target: TREND,          relation: SUITABLE_FOR,   prior_strength: 0.55}
+  - {source: CLOSING_PHASE, target: GAP,            relation: UNSUITABLE_FOR, prior_strength: 0.60}
+  - {source: EXPIRY_WINDOW, target: ORDER_FLOW,     relation: SUITABLE_FOR,   prior_strength: 0.45}
+  - {source: EXPIRY_WINDOW, target: TREND,          relation: UNSUITABLE_FOR, prior_strength: 0.45}
+
+  # -- risk conditions (hard structure: not learnable) -------------------------
+  - {source: STALE_DATA,          target: TREND,             relation: INVALIDATES}
+  - {source: STALE_DATA,          target: BREAKOUT,          relation: INVALIDATES}
+  - {source: STALE_DATA,          target: MEAN_REVERSION,    relation: INVALIDATES}
+  - {source: STALE_DATA,          target: RELATIVE_STRENGTH, relation: INVALIDATES}
+  - {source: STALE_DATA,          target: ORDER_FLOW,        relation: INVALIDATES}
+  - {source: STALE_DATA,          target: GAP,               relation: INVALIDATES}
+  - {source: STALE_DATA,          target: EVENT,             relation: INVALIDATES}
+  - {source: ORDER_FLOW,          target: LOW_LIQUIDITY,     relation: REQUIRES}
+  - {source: WIDE_SPREAD,         target: ORDER_FLOW,        relation: INCREASES_RISK, prior_strength: 0.85}
+  - {source: LOW_LIQUIDITY,       target: BREAKOUT,          relation: INCREASES_RISK, prior_strength: 0.80}
+  - {source: HIGH_VOLATILITY,     target: MEAN_REVERSION,    relation: INCREASES_RISK, prior_strength: 0.70}
+  - {source: HIGH_VOLATILITY,     target: DEFENSIVE,         relation: DECREASES_RISK, prior_strength: 0.50}
+  - {source: GLOBAL_CONFLICT,     target: TREND,             relation: CONTRADICTS,    prior_strength: 0.60}
+  - {source: GLOBAL_CONFLICT,     target: BREAKOUT,          relation: CONTRADICTS,    prior_strength: 0.65}
+  - {source: SECTOR_CONFLICT,     target: RELATIVE_STRENGTH, relation: CONTRADICTS,    prior_strength: 0.70}
+  - {source: OPENING_EXTREME_VOL, target: GAP,               relation: INCREASES_RISK, prior_strength: 0.60}

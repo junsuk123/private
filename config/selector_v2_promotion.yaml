@@ -11,6 +11,15 @@ minimum_chronological_windows: 4
 minimum_positive_windows: 3
 
 # 95% lower confidence bound of selected, after-cost returns.
+#
+# "Selected" is load-bearing and the code now honours it: the bound is measured over the
+# contexts the selector TRADED, not over every context it saw. A declined context scores
+# exactly 0.0, so an all-context denominator lets declines average the edge toward zero —
+# at ~3,500 declines even 200 trades at a clean +40bps after costs bounded out near
+# +1.8bps and could never clear 3.0. That made the rung unreachable by construction and
+# tightened it further every time the selector got more selective. Breadth
+# (minimum_distinct_days), regret and top-1 hit rate still run over every context, so
+# declining too often is still penalised — just not by pretending it was a losing trade.
 minimum_lower_bound_net_bps: 3.0
 # The same lower bound must remain positive after this extra round-trip cost shock.
 additional_cost_stress_bps: 5.0

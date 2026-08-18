@@ -220,13 +220,13 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | `src/app/web.py`, `web_account_routes.py`, `account_dashboard.py` | FastAPI 앱, `/account` 라우트와 payload |
 | `src/app/data/` | KIS 실시간 수집, 이벤트 파이프라인, realtime store, source policy, 세션 판정 |
 | `src/app/features/`, `technical/` | 지표, live feature frame, 근거 기반 기술적 예측 레이어 |
-| `src/app/context/` | 통합 `MarketContext` 단일 생성 권한 — (종목, 사이클)당 스냅샷 1개 + `context_id` |
+| `src/app/context/` | 통합 `MarketContext` 단일 생성 권한 — (종목, 사이클)당 스냅샷 1개 + `context_id`; 세션 phase(9단계)·temporal snapshot·Global/Domestic/Sector 컨텍스트·cross-market RS·멀티라벨 레짐 |
 | `src/app/graph/`, `ontology/` | KnowledgeGraph, FactTable, RDF/OWL/SHACL, 거시–미시 추론, closed-world 게이트, 전략 eligibility(hard mask + soft score) |
 | `src/app/models/`, `routing/`, `strategy/` | 학습·추론 backend, strategy-utility R-GCN, 실시간 신뢰도 평가, 라우터, `StrategySelectorV2`, 전략 spec/registry/proposal/coverage, 전략 expert(롱 20 + 숏 3, `STRATEGY_IDS` 기준) |
 | `src/app/evaluation/`, `monitoring/`, `strategy_validation/` | 반사실 shadow 포지션·selector regret·증거원 분리, drift 모니터, 단일 audit runner·purged CV·비용 스트레스·lifecycle 원장 |
 | `src/app/cost/`, `risk/`, `trading/` | ProfitabilityGate, 사이징, 원금보호, RiskManager, 동적 청산, 실시간 엔진 |
 | `src/app/trading/directional.py`, `borrow.py`, `directional_shadow.py`, `short_strategy_promotion.py` | 방향 계약, 대주 point-in-time 저널, forward shadow 평가, 배포 사다리 authority |
-| `src/app/execution/` | KIS adapter, 주문 가격 정책, 거래소 라우팅, live coordinator, 저널 |
+| `src/app/execution/` | KIS adapter, 주문 가격 정책, 거래소 라우팅, live coordinator, 저널, 주문 상태기계(`UNKNOWN` 포함), 체결·포지션·계좌 재조정, `ExecutionGuard`(기술적 주문 가능성 전용) |
 | `config/`, `packaging/raspberrypi/`, `scripts/` | 정책·프로파일 설정, Pi 패키지, 점검·학습·리플레이·벤치마크 스크립트 |
 
 ## 문서
@@ -234,6 +234,8 @@ bash packaging/raspberrypi/pi-dashboard-launch.sh   # LCD 키오스크
 | 문서 | 내용 |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | 런타임 구조, 모듈 지도, API, 운영 모드, 가속 경계, 알려진 한계 |
+| [docs/execution_authority.md](docs/execution_authority.md) | 선출 이전/이후 권한 분리, TradePlan, strategy-owned fast tick executor, ExecutionGuard, 제거된 post-selection veto, 지연 측정 |
+| [docs/context_hierarchy.md](docs/context_hierarchy.md) | 세션/캘린더 → 글로벌 → 국내 → 섹터 → 종목 컨텍스트, seasonality, Temporal Hetero GNN, 멀티라벨 레짐, FinalTradeGate, 주문 상태기계·재조정, 컨텍스트 API |
 | [docs/ontology_and_gnn.md](docs/ontology_and_gnn.md) | 온톨로지 계층, hard/soft eligibility 분리, 전략 효용 GNN, 가속기/CPU 분할 |
 | [docs/decision_and_risk.md](docs/decision_and_risk.md) | 데이터→판단 매핑, 순수익 게이트, 동적 청산, 리스크와 실행, 컴포넌트별 단일 질문(§7.1), 레짐 변화 대응(§9), 진입 차단 진단(§10) |
 | [docs/strategy_selection_v2.md](docs/strategy_selection_v2.md) | 전략 선택 V2: 효용 수식, 자동 `SHADOW → LIVE_PROBE → LIVE` 권한 사다리, 현재 상태, audit와 기술 부채 |
@@ -250,6 +252,22 @@ python -m pytest tests/test_web_live_flags.py tests/test_web_graph_payload.py te
 python -m pytest tests/test_directional_short_ladder.py   # 숏 사다리 안전 속성
 python -m pytest tests/test_strategy_selector_v2.py       # 전략 선택 V2 + 실행 계층 격리
 python -m pytest tests/test_selector_v2_auto_promotion.py # 자동 승격·강등·영속화·안전 기본값
+python -m pytest tests/test_temporal_context.py tests/test_seasonality.py \
+                tests/test_context_hierarchy.py tests/test_context_decision_pipeline.py
+python -m pytest tests/test_final_trade_gate.py tests/test_pre_submit_guard.py \
+                tests/test_order_state_machine.py                 # fail-closed 게이트와 주문 상태
+python -m pytest tests/test_context_api.py                        # 컨텍스트 API + WebSocket 채널
+python -m pytest tests/test_trade_plan.py tests/test_post_selection_authority.py \
+                tests/test_plan_driven_decision_path.py           # 선출 이전 결정 · 이후 authority 0개
+python -m pytest tests/test_fast_loop_latency.py                  # tick→전략→guard→브로커 지연
+python -m pytest tests/test_execution_authority_api.py \
+                tests/test_execution_authority_config.py          # 화면·설정이 실제 권한과 일치
+```
+
+실거래 경로 전체를 브로커 호출만 차단하고 검증한다 (주문 없음):
+
+```bash
+python scripts/context_pipeline_dry_run.py
 ```
 
 전략·계좌 audit 리포트(읽기 전용, 주문 없음):

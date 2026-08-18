@@ -47,7 +47,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 DEFAULT_STORE_PATH = "data/store/strategy-performance.sqlite3"
@@ -319,9 +319,19 @@ class StrategyPerformanceStore:
         *,
         posterior_config: PosteriorConfig | None = None,
         cache_ttl_seconds: float | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.path = Path(path or os.getenv("STRATEGY_PERFORMANCE_STORE_PATH", DEFAULT_STORE_PATH))
         self.posterior_config = posterior_config or PosteriorConfig.from_env()
+        # The one place this store reads the wall clock. ``max_age_days`` is measured
+        # against it, so without a seam any test that dates its fixtures absolutely is
+        # a time bomb: three test files pinned NOW to 2026-07-28, passed for 21 days,
+        # and on 2026-08-18 every posterior assertion began reading back an empty
+        # store while ``record`` still returned True. Injecting the clock is what makes
+        # ageing behaviour assertable instead of merely switched off.
+        self._clock: Callable[[], datetime] = clock or (
+            lambda: datetime.now(timezone.utc)
+        )
         self.cache_ttl_seconds = (
             float(cache_ttl_seconds)
             if cache_ttl_seconds is not None
@@ -331,6 +341,10 @@ class StrategyPerformanceStore:
         self._cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
         self._available = True
         self._migrate()
+
+    def _now(self) -> datetime:
+        """Current time as this store sees it. Always timezone-aware."""
+        return _aware(self._clock())
 
     # -- writes ------------------------------------------------------------- #
     def record(
@@ -373,7 +387,7 @@ class StrategyPerformanceStore:
         net_bps = _finite(realized_net_bps)
         if net_bps is None:
             return False
-        moment = _aware(recorded_at or datetime.now(timezone.utc))
+        moment = _aware(recorded_at) if recorded_at is not None else self._now()
         resolved_market = normalize_market(market or market_for_symbol(symbol))
         resolved_direction = normalize_direction(direction)
         resolved_product = (
@@ -492,7 +506,7 @@ class StrategyPerformanceStore:
         max_age_days = max(0.0, float(self.posterior_config.max_age_days))
         cutoff: str | None = None
         if max_age_days > 0.0:
-            moment = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            moment = self._now() - timedelta(days=max_age_days)
             cutoff = moment.replace(minute=0, second=0, microsecond=0).isoformat()
         key = (
             "outcomes",
@@ -551,7 +565,7 @@ class StrategyPerformanceStore:
             rows = ()
         outcomes = tuple(
             StrategyOutcome(
-                recorded_at=_parse_iso(row[0]) or datetime.now(timezone.utc),
+                recorded_at=_parse_iso(row[0]) or self._now(),
                 strategy_id=str(row[1]),
                 market=str(row[2]),
                 regime=str(row[3]),

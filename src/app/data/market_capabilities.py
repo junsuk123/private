@@ -477,17 +477,38 @@ class CalendarSnapshot:
     early_close: Mapping[str, Mapping[str, time]]
     completeness: Mapping[str, str]
     provider: str = "local_snapshot"
+    #: 설치되어 있으면 휴장일 권위. 없으면 스냅샷만 쓴다.
+    external: "_ExternalCalendar | None" = None
 
     def covers(self, day: date) -> bool:
         return self.coverage_start <= day <= self.coverage_end
 
     def is_holiday(self, group: MarketGroup, day: date) -> bool:
+        """외부 캘린더가 답할 수 있으면 그쪽이 권위, 아니면 스냅샷.
+
+        스냅샷을 버리지 않고 fallback 으로 남기는 이유는 외부 캘린더의 수록
+        범위가 유한하기 때문이다. 범위 밖에서는 고정일자 스냅샷이 불완전할지언정
+        아무 답도 없는 것보다 낫다.
+        """
+        if self.external is not None:
+            answer = self.external.is_holiday(group, day)
+            if answer is not None:
+                return answer
         return day.isoformat() in self.holidays.get(group.value, frozenset())
 
     def early_close_time(self, group: MarketGroup, day: date) -> time | None:
         return self.early_close.get(group.value, {}).get(day.isoformat())
 
-    def is_complete(self, group: MarketGroup) -> bool:
+    def is_complete(self, group: MarketGroup, day: date | None = None) -> bool:
+        """이 그룹의 휴장일 목록을 완전하다고 주장할 수 있는가.
+
+        ``day`` 를 주면 그 날짜에 대한 판단이다. 외부 캘린더가 그 날을 수록하고
+        있으면 음력·대체공휴일까지 포함하므로 완전하다. 수록 범위를 벗어나면
+        스냅샷으로 되돌아가므로 스냅샷 자신의 completeness 가 답이 된다 — KR 은
+        ``fixed_date_only`` 라 거기서는 여전히 SESSION_CALENDAR_SUSPECT 가 뜬다.
+        """
+        if day is not None and self.external is not None and self.external.covers(group, day):
+            return True
         return self.completeness.get(group.value, "unknown") == "full"
 
 
@@ -498,6 +519,91 @@ def _external_calendar_provider_available() -> bool:
     except Exception:  # noqa: BLE001
         return False
     return True
+
+
+#: 시장 그룹별 외부 캘린더 코드. KRX 는 XKRX, 미국 정규 거래소는 XNYS.
+_EXTERNAL_CALENDAR_CODES: Mapping[str, str] = {
+    MarketGroup.KR.value: "XKRX",
+    MarketGroup.US.value: "XNYS",
+}
+
+
+class _ExternalCalendar:
+    """``exchange_calendars`` 를 실제 휴장일 권위로 사용하는 어댑터.
+
+    이것이 없던 동안 ``prefer_external_provider`` 는 텔레메트리 라벨만 바꾸고
+    휴장일 조회는 전적으로 YAML 스냅샷이 했다. 스냅샷은 고정일자만 담을 수 있어서
+    음력 휴일(설날·추석·부처님오신날)과 대체공휴일이 통째로 빠져 있었고,
+    2026-08-17 (광복절 대체공휴일) 이 정규 거래일로 취급됐다.
+
+    XKRX 가 2026 년에 대해 답하는 평일 휴장일은 15 일이고, 그중 여섯 —
+    02-16/17/18 (설날), 05-25 (부처님오신날), 09-24/25 (추석) — 은 고정일자
+    스냅샷이 원리적으로 표현할 수 없는 것들이다.
+
+    답을 모르면 ``None`` 을 돌려준다
+    ---------------------------------
+    외부 캘린더의 수록 범위는 유한하다 (설치된 XKRX 는 2027-08-18 까지인데
+    스냅샷의 coverage_end 는 2027-12-31 이다). 범위 밖 날짜를 "휴장일 아님" 으로
+    답하면 조용히 거래일을 만들어내는 셈이라, 그런 날은 ``None`` 을 반환해
+    호출자가 스냅샷으로 되돌아가게 한다.
+
+    캘린더는 생성 시점에 전부 적재한다
+    ----------------------------------
+    첫 호출 때 지연 적재하고 실패를 기억하는 구조로 짰다가 되돌렸다. 이 서비스는
+    여러 워커 스레드가 동시에 두드리는데, 그 첫 호출들이 겹치면 한쪽이
+    ``import exchange_calendars`` 가 아직 초기화 중인 모듈을 만나 예외를 받는다.
+    실측: 16 스레드 동시 첫 호출에서 결과가 True/False 로 갈리고 실패 캐시가
+    오염됐다. 그 뒤로는 프로세스가 사는 내내 외부 캘린더가 꺼진 채로 돌아가면서도
+    provider 라벨은 ``exchange_calendars`` 라고 말한다 — 조용히 틀린 상태다.
+
+    그래서 import 와 캘린더 구축은 설정 로드 시점(단일 스레드)에 한 번 끝내고,
+    실패하면 생성자가 예외를 던져 호출자가 아예 외부 권위를 주장하지 않게 한다.
+    적재에 성공한 객체는 읽기 전용이라 이후 스레드 경합이 없다.
+    """
+
+    def __init__(self, groups: Sequence[MarketGroup] | None = None) -> None:
+        import exchange_calendars as xc  # 실패는 호출자가 처리한다.
+
+        wanted = tuple(groups or (MarketGroup.KR, MarketGroup.US))
+        calendars: dict[str, Any] = {}
+        bounds: dict[str, tuple[date, date]] = {}
+        for group in wanted:
+            code = _EXTERNAL_CALENDAR_CODES.get(group.value)
+            if code is None:
+                continue
+            calendar = xc.get_calendar(code)
+            calendars[group.value] = calendar
+            bounds[group.value] = (
+                calendar.first_session.date(),
+                calendar.last_session.date(),
+            )
+        if not calendars:
+            raise LookupError("외부 캘린더를 하나도 적재하지 못했다")
+        self._calendars = calendars
+        self._bounds = bounds
+
+    @property
+    def groups(self) -> tuple[str, ...]:
+        return tuple(sorted(self._calendars))
+
+    def covers(self, group: MarketGroup, day: date) -> bool:
+        window = self._bounds.get(group.value)
+        if window is None:
+            return False
+        first, last = window
+        return first <= day <= last
+
+    def is_holiday(self, group: MarketGroup, day: date) -> bool | None:
+        """``True``/``False`` 는 확정 답, ``None`` 은 "모른다"."""
+        if not self.covers(group, day):
+            return None
+        calendar = self._calendars.get(group.value)
+        if calendar is None:
+            return None
+        try:
+            return not bool(calendar.is_session(day.isoformat()))
+        except Exception:  # noqa: BLE001 - 개별 조회 실패는 스냅샷으로 되돌린다.
+            return None
 
 
 # --------------------------------------------------------------------------- #
@@ -765,8 +871,18 @@ def _calendar_from_mapping(raw: object) -> CalendarSnapshot:
         completeness[group.value] = str(section.get("completeness") or "unknown")
 
     provider = "local_snapshot"
-    if bool(data.get("prefer_external_provider", True)) and _external_calendar_provider_available():
-        provider = "exchange_calendars"
+    external: _ExternalCalendar | None = None
+    if bool(data.get("prefer_external_provider", True)):
+        # 라벨만 바꾸던 자리다. 이제 실제 조회 권위를 함께 세운다 — 라벨이
+        # exchange_calendars 라고 말하면서 스냅샷으로 답하고 있으면, 어느
+        # 캘린더로 학습·거래했는지 추적하겠다는 이 필드의 목적 자체가 무너진다.
+        # 그래서 적재에 성공했을 때만 라벨이 바뀐다. 설치 여부만 보고 라벨을
+        # 붙이면 적재 실패가 그대로 거짓 주장이 된다.
+        try:
+            external = _ExternalCalendar()
+            provider = "exchange_calendars"
+        except Exception:  # noqa: BLE001 - 미설치·적재 실패는 스냅샷으로 간다.
+            external = None
 
     return CalendarSnapshot(
         version=str(data.get("version") or "unversioned"),
@@ -777,6 +893,7 @@ def _calendar_from_mapping(raw: object) -> CalendarSnapshot:
         early_close=early,
         completeness=completeness,
         provider=provider,
+        external=external,
     )
 
 
@@ -837,7 +954,7 @@ class MarketSessionService:
         local_day = current.astimezone(zone).date()
         if not self.calendar.covers(local_day):
             reasons.append(ReasonCode.SESSION_CALENDAR_STALE.value)
-        if not self.calendar.is_complete(group):
+        if not self.calendar.is_complete(group, local_day):
             reasons.append(ReasonCode.SESSION_CALENDAR_SUSPECT.value)
         return tuple(reasons)
 

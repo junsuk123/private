@@ -8,6 +8,12 @@ SHADOW -> LIVE_PROBE is the first transition that can affect an order.  It there
 requires a positive lower confidence bound after an additional cost shock, breadth
 across days and chronological windows, and bounded selector regret.  LIVE_PROBE -> LIVE
 requires real selected outcomes; simulated outcomes cannot grant full authority.
+
+The edge bounds are measured over contexts the selector actually traded, not over every
+context it saw.  ``_metrics`` explains why at length: a declined context scores exactly
+0.0, so an all-context denominator makes the gate progressively harder the more
+selective the selector is, which had pinned this ladder in SHADOW permanently.  Breadth,
+regret and hit rate still run over every context.
 """
 
 from __future__ import annotations
@@ -154,12 +160,32 @@ class SelectorPromotionController:
             # Demotion requires much less evidence than promotion.  A live selector
             # with a clearly negative conservative edge or excessive wrong-regime
             # trading loses authority on the first evaluation.
-            if current.live_authority and int(metrics.get("context_count") or 0) >= 20:
-                lower_bound = metrics.get("lower_bound_net_bps")
-                if lower_bound is not None and float(lower_bound) <= self.config.demotion_lower_bound_bps:
+            #
+            # Either bound can trigger it, and they are not redundant. The traded bound
+            # is undiluted, so it reacts to a run of losing trades that declines would
+            # otherwise average back toward zero; the all-context bound stays because
+            # dropping it would only ever make demotion harder. Whichever crosses the
+            # floor first wins — this is the fail-closed direction, so the union of the
+            # two triggers is the safe combination rather than the intersection.
+            if current.live_authority:
+                bounds = []
+                if int(metrics.get("context_count") or 0) >= 20:
+                    bounds.append(metrics.get("lower_bound_net_bps"))
+                if int(metrics.get("traded_context_count") or 0) >= 20:
+                    bounds.append(metrics.get("traded_lower_bound_net_bps"))
+                negative_edge = any(
+                    bound is not None
+                    and float(bound) <= self.config.demotion_lower_bound_bps
+                    for bound in bounds
+                )
+                if negative_edge:
                     target = SelectorAuthorityState.SHADOW
                     reasons = ("SELECTOR_AUTO_DEMOTION_NEGATIVE_EDGE",)
-                elif float(metrics.get("wrong_regime_trade_rate") or 0.0) > self.config.demotion_wrong_regime_trade_rate:
+                elif (
+                    int(metrics.get("context_count") or 0) >= 20
+                    and float(metrics.get("wrong_regime_trade_rate") or 0.0)
+                    > self.config.demotion_wrong_regime_trade_rate
+                ):
                     target = SelectorAuthorityState.SHADOW
                     reasons = ("SELECTOR_AUTO_DEMOTION_WRONG_REGIME",)
 
@@ -274,10 +300,33 @@ class SelectorPromotionController:
             self._rows = {str(item["context_id"]): item for item in keep}
 
     def _metrics(self) -> dict[str, Any]:
+        """Edge over traded contexts; breadth, regret and hit rate over all of them.
+
+        The denominator is the whole point of this method. A NO_TRADE context carries a
+        realised outcome of exactly 0.0 (see ``app.evaluation.selector_regret``), so
+        averaging the edge over *every* context measures return per context looked at
+        rather than return per trade. For a selector whose job is to decline most
+        contexts those zeros dominate: against the ~3,500 declines this controller was
+        holding, even 200 trades averaging a clean +40bps after costs produce an
+        all-context 95% lower bound near +1.8bps — short of a 3.0bps gate that a further
+        5bps cost shock still has to survive. The rung was unreachable by construction,
+        and the more selective the selector became the further out of reach it moved.
+
+        So ``traded_*`` is the edge — "when it did choose, did the choice pay after
+        costs" — and that is what the promotion gates read. The all-context
+        ``mean_net_bps`` / ``lower_bound_net_bps`` stay because they are the honest
+        portfolio-level number and demotion still watches them, but they are
+        observability, not a bar to clear. Declining cannot lose money, so the
+        all-context figures can only dilute the edge toward zero; they never expose a
+        risk the traded figures hide. Trading too rarely is a real failure, but it is
+        priced by ``mean_regret_bps`` and ``top1_hit_rate``, which do run over every
+        context and stay unchanged.
+        """
         rows = sorted(self._rows.values(), key=lambda item: item.get("opened_at", ""))
         values = [float(item["selected_outcome_bps"]) for item in rows]
         regrets = [float(item["regret_bps"]) for item in rows]
         traded = [item for item in rows if item.get("selected_strategy")]
+        traded_values = [float(item["selected_outcome_bps"]) for item in traded]
         wrong = [
             item
             for item in traded
@@ -288,6 +337,10 @@ class SelectorPromotionController:
         days = {str(item.get("opened_at", ""))[:10] for item in rows if item.get("opened_at")}
         live_days = {str(item.get("opened_at", ""))[:10] for item in live if item.get("opened_at")}
         windows = _window_means(values, self.config.minimum_chronological_windows)
+        traded_windows = _window_means(
+            traded_values, self.config.minimum_chronological_windows
+        )
+        traded_lower_bound = _lower_bound(traded_values)
         return {
             "context_count": len(rows),
             "traded_context_count": len(traded),
@@ -297,11 +350,20 @@ class SelectorPromotionController:
             "cost_stressed_lower_bound_bps": _subtract_if_measured(
                 _lower_bound(values), self.config.additional_cost_stress_bps
             ),
+            "traded_mean_net_bps": _mean(traded_values),
+            "traded_lower_bound_net_bps": traded_lower_bound,
+            "traded_cost_stressed_lower_bound_bps": _subtract_if_measured(
+                traded_lower_bound, self.config.additional_cost_stress_bps
+            ),
             "mean_regret_bps": _mean(regrets),
             "top1_hit_rate": _mean([1.0 if item.get("top1_hit") else 0.0 for item in rows]),
             "wrong_regime_trade_rate": (len(wrong) / len(traded) if traded else None),
             "chronological_window_means_bps": windows,
             "positive_window_count": sum(1 for value in windows if value > 0.0),
+            "traded_chronological_window_means_bps": traded_windows,
+            "traded_positive_window_count": sum(
+                1 for value in traded_windows if value > 0.0
+            ),
             "live_context_count": len(live),
             "live_distinct_days": len(live_days),
             "live_lower_bound_net_bps": _lower_bound(
@@ -322,9 +384,15 @@ class SelectorPromotionController:
                 failures.append(f"SELECTOR_TRADED_SAMPLE_BELOW_{self.config.minimum_traded_contexts}")
             if int(metrics.get("distinct_days") or 0) < self.config.minimum_distinct_days:
                 failures.append(f"SELECTOR_DAY_BREADTH_BELOW_{self.config.minimum_distinct_days}")
-            if _lt(metrics.get("lower_bound_net_bps"), self.config.minimum_lower_bound_net_bps):
+            # Traded contexts only: see ``_metrics``. Both helpers treat a missing or
+            # non-finite value as a failure, so too few trades to compute a bound is
+            # still a blocked promotion rather than a silently passed one.
+            if _lt(
+                metrics.get("traded_lower_bound_net_bps"),
+                self.config.minimum_lower_bound_net_bps,
+            ):
                 failures.append("SELECTOR_NET_LOWER_BOUND_NOT_POSITIVE")
-            if _lt(metrics.get("cost_stressed_lower_bound_bps"), 0.0):
+            if _lt(metrics.get("traded_cost_stressed_lower_bound_bps"), 0.0):
                 failures.append("SELECTOR_COST_STRESS_NOT_SURVIVED")
             if _gt(metrics.get("mean_regret_bps"), self.config.maximum_mean_regret_bps):
                 failures.append("SELECTOR_REGRET_TOO_HIGH")
@@ -332,7 +400,10 @@ class SelectorPromotionController:
                 failures.append("SELECTOR_WRONG_REGIME_RATE_TOO_HIGH")
             if _lt(metrics.get("top1_hit_rate"), self.config.minimum_top1_hit_rate):
                 failures.append("SELECTOR_TOP1_HIT_RATE_TOO_LOW")
-            if int(metrics.get("positive_window_count") or 0) < self.config.minimum_positive_windows:
+            if (
+                int(metrics.get("traded_positive_window_count") or 0)
+                < self.config.minimum_positive_windows
+            ):
                 failures.append("SELECTOR_CHRONOLOGICAL_STABILITY_FAILED")
         else:
             if int(metrics.get("live_context_count") or 0) < self.config.minimum_live_probe_contexts:

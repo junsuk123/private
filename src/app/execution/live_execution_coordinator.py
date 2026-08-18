@@ -19,6 +19,11 @@ from app.execution.kis_errors import LiveExecutionBlocked
 from app.execution.kis_types import LiveOrderSubmission
 from app.execution.live_order_journal import LiveOrderJournal
 from app.execution.order_status_tracker import OrderStatusTracker
+from app.execution.execution_guard import (
+    ExecutionGuard,
+    GuardOrder,
+    default_execution_guard,
+)
 from app.schemas.domain import FinalOrder, OrderType
 from app.trading.contracts import (
     IntentAction,
@@ -40,6 +45,10 @@ class LiveExecutionCoordinator:
         journal: LiveOrderJournal | None = None,
         causal_journal: CausalOrderJournal | None = None,
         execution_config: OrderExecutionConfig | None = None,
+        execution_guard: ExecutionGuard | None = None,
+        plan_provider: Any | None = None,
+        orderable_cash_provider: Any | None = None,
+        sellable_quantity_provider: Any | None = None,
     ) -> None:
         self.broker = broker
         self.idempotency_store = idempotency_store or IdempotencyStore()
@@ -47,6 +56,18 @@ class LiveExecutionCoordinator:
         self.causal_journal = causal_journal
         self.execution_config = execution_config or load_order_execution_config(allow_example=True)
         self.status_tracker = OrderStatusTracker(broker)
+        # Built lazily-but-eagerly: constructing it here means a misconfigured guard
+        # fails at wiring time rather than on the first live order. This is the ONLY
+        # remaining gate on the execution path, and it judges order-ability, never
+        # investment quality — see app.execution.execution_guard.
+        self.execution_guard = (
+            execution_guard
+            if execution_guard is not None
+            else default_execution_guard(broker=broker, require_plan=False)
+        )
+        self.plan_provider = plan_provider
+        self.orderable_cash_provider = orderable_cash_provider
+        self.sellable_quantity_provider = sellable_quantity_provider
 
     def submit_final_order(self, order: FinalOrder, *, idempotency_key: str | None = None) -> LiveOrderSubmission:
         self._validate_final_order(order)
@@ -66,7 +87,7 @@ class LiveExecutionCoordinator:
                 message="idempotent replay",
             )
 
-        failures = self._preflight_failures()
+        failures = self._preflight_failures() + self._pre_submit_failures(order)
         if failures:
             self.journal.record("live_order_blocked", {"order": order, "reason_codes": failures})
             raise LiveExecutionBlocked(tuple(failures))
@@ -347,6 +368,75 @@ class LiveExecutionCoordinator:
         if not health.ok:
             failures.extend(f"KIS_HEALTH_{name.upper()}_FAILED" for name in health.failures)
         return failures
+
+    def _pre_submit_failures(self, order: FinalOrder) -> list[str]:
+        """Order-specific re-verification, one step before the broker call.
+
+        Separate from :meth:`_preflight_failures` because the two answer different
+        questions: that one asks "is this process allowed to trade at all", this one asks
+        "is THIS order still sendable right now". Kept apart so a test that disables the
+        process-level gates does not silently disable the per-order ones too.
+
+        Technical only. The guard has no access to the strategy's edge, confidence or
+        ranking, and cannot form an opinion about whether the trade is a good one.
+        """
+        guard = self.execution_guard
+        if guard is None:
+            return []
+        decision = guard.evaluate(
+            self._guard_order(order),
+            plan=self._plan_for(order),
+            orderable_cash=self._orderable_cash(order),
+            sellable_quantity=self._sellable_quantity(order),
+        )
+        self._last_guard_decision = decision
+        if decision.allowed:
+            return []
+        self.journal.record(
+            "live_order_execution_guard_blocked",
+            {"order": order, "guard": decision.as_dict()},
+        )
+        return list(decision.reason_codes)
+
+    @staticmethod
+    def _guard_order(order: FinalOrder) -> GuardOrder:
+        return GuardOrder(
+            symbol=str(order.ticker),
+            market=str(order.market),
+            side=str(getattr(order.side, "value", order.side)),
+            quantity=int(order.quantity),
+            limit_price=float(order.limit_price),
+            direction=str(getattr(order, "position_direction", "LONG") or "LONG"),
+            position_effect=str(getattr(order, "position_effect", "") or ""),
+            execution_product=str(getattr(order, "execution_product", "CASH") or "CASH"),
+        )
+
+    def _plan_for(self, order: FinalOrder) -> Any | None:
+        provider = self.plan_provider
+        if provider is None:
+            return None
+        try:
+            return provider(str(order.ticker))
+        except Exception:  # noqa: BLE001 - an unreadable plan is no plan.
+            return None
+
+    def _orderable_cash(self, order: FinalOrder) -> float | None:
+        provider = self.orderable_cash_provider
+        if provider is None:
+            return None
+        try:
+            return provider(order)
+        except Exception:  # noqa: BLE001 - unknown cash is handled by the guard.
+            return None
+
+    def _sellable_quantity(self, order: FinalOrder) -> int | None:
+        provider = self.sellable_quantity_provider
+        if provider is None:
+            return None
+        try:
+            return provider(order)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _validate_final_order(self, order: FinalOrder) -> None:
         if not isinstance(order, FinalOrder):

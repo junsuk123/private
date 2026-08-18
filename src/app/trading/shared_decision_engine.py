@@ -561,6 +561,7 @@ class SharedLiveDecisionEngine:
         decision_time: datetime | None = None,
         selected_strategy: str | None = None,
         election_context: Mapping[str, Any] | None = None,
+        trade_plan: Any | None = None,
     ) -> SharedDecisionResult:
         decision_time = decision_time or datetime.now(timezone.utc)
         frame = None
@@ -1131,6 +1132,28 @@ class SharedLiveDecisionEngine:
         gross_expected_return = max(0.0, expected_return_bps / 10_000.0)
         expected_exit_price = price * (1.0 + gross_expected_return)
 
+        # --- Plan-driven path: the election already decided -----------------------
+        # When a frozen TradePlan owns this symbol, cost, size and risk were computed
+        # before the strategy was elected (app.trading.trade_plan_builder) and are
+        # immutable. Re-running ProfitabilityGate / PositionSizer / RiskManager here is
+        # precisely the duplicate-veto stack this refactor removes: three authorities
+        # re-deciding, against a later and noisier market, what the election settled.
+        # The frozen snapshots travel into diagnostics as TELEMETRY, never as a gate.
+        if trade_plan is not None:
+            return self._plan_driven_buy(
+                symbol=symbol,
+                plan=trade_plan,
+                price=price,
+                market_name=market_name,
+                prediction=prediction,
+                technical_prediction=technical_prediction,
+                quote_refresh_status=quote_refresh_status,
+                quote_age_seconds=quote_age_seconds,
+                spread_bps=spread_bps,
+                orderbook=orderbook,
+                decision_time=decision_time,
+            )
+
         # --- Unified profitability gate (authoritative, mandatory) --------------
         profitability_decision = self.profitability_gate.evaluate(
             ProfitabilityInput(
@@ -1381,6 +1404,124 @@ class SharedLiveDecisionEngine:
             final_order=risk.final_order,
             prediction=prediction,
             reason_codes=reason_codes,
+            diagnostics=diagnostics,
+        )
+
+    def _plan_driven_buy(
+        self,
+        *,
+        symbol: str,
+        plan: Any,
+        price: float,
+        market_name: str,
+        prediction: Any,
+        technical_prediction: Any,
+        quote_refresh_status: str,
+        quote_age_seconds: float,
+        spread_bps: float,
+        orderbook: Any,
+        decision_time: datetime,
+    ) -> SharedDecisionResult:
+        """Turn a frozen plan into a FinalOrder. No investment judgement happens here.
+
+        The three things this deliberately does NOT do, each of which the pre-refactor
+        path did at this point:
+
+        * it does not evaluate profitability — the plan's ``cost_snapshot`` already holds
+          the verdict, computed before election on the price the election saw;
+        * it does not size — ``plan.quantity`` is the elected size, and the only later
+          reduction permitted is the broker clip in the ExecutionGuard;
+        * it does not run the RiskManager — the plan's ``risk_snapshot`` holds that
+          verdict too.
+
+        The only checks here are that the plan is still executable and that the price is
+        inside the band the election authorised. Both are properties of the plan, not new
+        opinions about the trade.
+        """
+        executable, why = plan.executable(decision_time)
+        if not executable:
+            diagnostics = {
+                "strategy_locked": True,
+                "execution_authority": "TRADE_PLAN",
+                "trade_plan": plan.as_dict(),
+                "plan_blocked_reason": why,
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                (str(why or "PLAN_NOT_EXECUTABLE"),),
+                diagnostics,
+            )
+        if not plan.entry_rule.price_permitted(price):
+            diagnostics = {
+                "strategy_locked": True,
+                "execution_authority": "TRADE_PLAN",
+                "trade_plan": plan.as_dict(),
+                "observed_price": price,
+            }
+            self._last_diagnostics = diagnostics
+            return SharedDecisionResult(
+                symbol,
+                False,
+                None,
+                prediction,
+                ("PLAN_ENTRY_PRICE_OUT_OF_BAND",),
+                diagnostics,
+            )
+
+        contract = dict(plan.order_contract or {})
+        final_order = FinalOrder(
+            ticker=str(plan.symbol),
+            market=market_name,
+            order_type=OrderType.LIMIT,
+            side=OrderSide.SELL if plan.is_short else OrderSide.BUY,
+            quantity=int(plan.quantity),
+            limit_price=float(price),
+            manual_approval_required=False,
+            position_direction=str(plan.direction),
+            position_effect=str(contract.get("position_effect") or "OPEN"),
+            execution_product=str(contract.get("execution_product") or "CASH"),
+        )
+        diagnostics = {
+            "strategy_locked": True,
+            "execution_authority": "TRADE_PLAN",
+            "selected_strategy": plan.strategy_id,
+            "trade_plan": plan.as_dict(),
+            # Frozen at election. Present so the dashboards and the cost telemetry keep
+            # working; read by nothing that can block an order.
+            "profitability_decision": dict(plan.cost_snapshot),
+            "risk_snapshot": dict(plan.risk_snapshot),
+            "weekday_time_context": dict(plan.weekday_time_context),
+            "post_selection_gates": [],
+            "quote_refresh_status": quote_refresh_status,
+            "quote_age_seconds": round(quote_age_seconds, 3),
+            "spread_bps": spread_bps,
+            "technical_prediction": (
+                technical_prediction.as_dict()
+                if technical_prediction is not None
+                else None
+            ),
+        }
+        if orderbook is not None:
+            diagnostics["orderbook_snapshot"] = {
+                "best_bid": orderbook.best_bid,
+                "best_ask": orderbook.best_ask,
+                "bid_depth": orderbook.total_bid_volume,
+                "ask_depth": orderbook.total_ask_volume,
+            }
+        self._last_diagnostics = diagnostics
+        return SharedDecisionResult(
+            symbol=symbol,
+            approved=True,
+            final_order=final_order,
+            prediction=prediction,
+            reason_codes=(
+                f"TRADE_PLAN:{plan.plan_id}",
+                f"STRATEGY_OWNED:{plan.strategy_id}",
+            ),
             diagnostics=diagnostics,
         )
 

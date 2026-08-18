@@ -793,7 +793,17 @@ class RealtimeTradingEngine:
                 # Resolve exchange, re-price from the live book (best_bid / marketable
                 # stop), and run the execution-quality gate for the SELL too.
                 priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
-                    holding.ticker, "SELL", final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
+                    holding.ticker,
+                    "SELL",
+                    final_order,
+                    getattr(result, "diagnostics", None),
+                    result.reason_codes,
+                    account,
+                    decision_time,
+                    # A strategy-owned exit carries its own thesis. Letting the BUY-shaped
+                    # spread/impact maths veto it is exactly how a stop-loss gets trapped
+                    # by the widening spread that triggered it.
+                    plan_owned=session_owned,
                 )
                 if not exec_ok or priced_order is None:
                     summary["sell_rejected"] += 1
@@ -888,6 +898,11 @@ class RealtimeTradingEngine:
                     "ontology_graph": None if selected_strategy else ontology_graph,
                     "decision_time": decision_time,
                 }
+                trade_plan = (
+                    self.strategy_session_manager.trade_plan_for(symbol)
+                    if self.strategy_session_manager is not None
+                    else None
+                )
                 if selected_strategy:
                     buy_kwargs["selected_strategy"] = selected_strategy
                     # Hand the algorithm the slow context frozen at election
@@ -895,6 +910,11 @@ class RealtimeTradingEngine:
                     election_context = self.strategy_session_manager.election_context_for(symbol)
                     if election_context:
                         buy_kwargs["election_context"] = election_context
+                    # The frozen plan carries the cost, size and risk verdicts. When it
+                    # is present the decision engine skips its three post-selection
+                    # authorities entirely — see SharedLiveDecisionEngine._plan_driven_buy.
+                    if trade_plan is not None:
+                        buy_kwargs["trade_plan"] = trade_plan
                 result = self.decision_engine.evaluate_buy(
                     symbol,
                     account,
@@ -907,7 +927,13 @@ class RealtimeTradingEngine:
             _record_technical_decision(symbol, "BUY", result)
             if result.approved and result.final_order is not None:
                 final_order = result.final_order
-                if self.strategy_session_manager is not None:
+                if trade_plan is not None:
+                    # The authority cap was applied ONCE, at election, inside the plan
+                    # builder. Re-applying it here would compound the same fraction twice
+                    # and make the elected size and the submitted size two different
+                    # numbers with no single place that knows both.
+                    summary["plan_sized_orders"] = int(summary.get("plan_sized_orders") or 0) + 1
+                elif self.strategy_session_manager is not None:
                     fraction = self.strategy_session_manager.entry_order_size_fraction(symbol)
                     if fraction <= 0.0:
                         summary["buy_rejected"] += 1
@@ -919,7 +945,14 @@ class RealtimeTradingEngine:
                     capped_quantity = max(1, min(original_quantity, math.floor(original_quantity * fraction)))
                     final_order = replace(final_order, quantity=capped_quantity)
                 priced_order, exec_ok, exec_reason, exec_diag = self._prepare_order_for_execution(
-                    symbol, "BUY", final_order, getattr(result, "diagnostics", None), result.reason_codes, account, decision_time
+                    symbol,
+                    "BUY",
+                    final_order,
+                    getattr(result, "diagnostics", None),
+                    result.reason_codes,
+                    account,
+                    decision_time,
+                    plan_owned=trade_plan is not None,
                 )
                 if not exec_ok or priced_order is None:
                     summary["buy_rejected"] += 1
@@ -1283,10 +1316,18 @@ class RealtimeTradingEngine:
         reason_codes: tuple[str, ...],
         account: AccountSnapshot | None,
         decision_time: datetime,
+        plan_owned: bool = False,
     ) -> tuple[FinalOrder | None, bool, str, dict[str, Any]]:
         """Resolve routing exchange, re-price from the live book, and run the
         execution-quality gate — for BOTH buys and sells. Returns
         ``(priced_order, ok, reason_code, diagnostics)``. Best-effort; never raises.
+
+        ``plan_owned`` marks an order whose thesis is a frozen TradePlan. For those the
+        execution-quality gate is reduced to what it is actually for downstream: deriving
+        an executable limit price from a book fresh enough to price against. Its
+        spread / depth / impact *profitability* judgement is skipped, because that
+        judgement was made before election on the same numbers and re-making it here
+        would let a widening spread veto a stop-loss.
 
         * BUY: uses best_ask (chase-capped); a missing/stale book blocks the order so it
           is never priced as if the spread were zero. Keeps the no-chase-after-failure guard.
@@ -1413,24 +1454,35 @@ class RealtimeTradingEngine:
                     diag["loss_minimizing_limit_preserved"] = True
 
             # 4) Execution-quality gate (side-aware; no-orderbook blocking).
-            assessment = self.execution_quality.assess(
-                ExecutionQualityInput(
-                    symbol=symbol,
-                    strategy_family="live_short_horizon",
-                    decision_reference_price=reference_price,
-                    gross_expected_return=float(pd.get("gross_expected_return", 0.0) or 0.0),
-                    net_expected_return=float(pd.get("net_expected_return", 0.0) or 0.0),
-                    required_min_net_return=float(pd.get("required_min_net_return", 0.0) or 0.0),
-                    best_bid=best_bid,
-                    best_ask=best_ask,
-                    bid_depth=bid_depth,
-                    ask_depth=ask_depth,
-                    order_quantity=int(getattr(final_order, "quantity", 1) or 1),
-                    side=side_u,
-                    action_reason=action_reason,
-                    orderbook_age_sec=orderbook_age_sec,
+            if plan_owned:
+                # Priceability only. A plan-owned order still needs a book fresh enough
+                # to construct a limit price against — that is a technical requirement,
+                # not an opinion about the trade — and step 5 below enforces it.
+                diag["exec_quality_skipped"] = "PLAN_OWNED_PRICEABILITY_ONLY"
+                assessment = SimpleNamespace(
+                    allowed=True,
+                    warnings=("EXEC_QUALITY_SKIPPED_PLAN_OWNED",),
+                    reject_reason=None,
                 )
-            )
+            else:
+                assessment = self.execution_quality.assess(
+                    ExecutionQualityInput(
+                        symbol=symbol,
+                        strategy_family="live_short_horizon",
+                        decision_reference_price=reference_price,
+                        gross_expected_return=float(pd.get("gross_expected_return", 0.0) or 0.0),
+                        net_expected_return=float(pd.get("net_expected_return", 0.0) or 0.0),
+                        required_min_net_return=float(pd.get("required_min_net_return", 0.0) or 0.0),
+                        best_bid=best_bid,
+                        best_ask=best_ask,
+                        bid_depth=bid_depth,
+                        ask_depth=ask_depth,
+                        order_quantity=int(getattr(final_order, "quantity", 1) or 1),
+                        side=side_u,
+                        action_reason=action_reason,
+                        orderbook_age_sec=orderbook_age_sec,
+                    )
+                )
             diag["exec_quality_warnings"] = list(assessment.warnings)
             if not assessment.allowed:
                 if side_u == "BUY":

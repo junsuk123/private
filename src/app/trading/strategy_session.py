@@ -796,6 +796,13 @@ class StrategySessionState:
     # is why it did not trade" rather than showing nothing at all.
     shadow_plan_ids: list[str] = field(default_factory=list)
     directional_comparison: dict[str, Any] = field(default_factory=dict)
+    # --- TradePlan link -------------------------------------------------------- #
+    # The plan itself lives in ``trade_plan`` (durable, immutable); the session keeps
+    # only the pointer, so a restart can reload the plan that owns the position rather
+    # than reconstructing it from these display fields.
+    trade_plan_id: str | None = None
+    trade_plan_quantity: int | None = None
+    trade_plan_expires_at: str | None = None
 
 
 def _selector_v2_snapshot(runner: Any, symbol: str | None) -> dict[str, Any]:
@@ -857,6 +864,11 @@ class StrategySessionManager:
         # ``ShadowEvaluationService``. Drained rather than accumulated so a cycle whose
         # plans nobody collects cannot grow without bound.
         self._pending_shadow_plans: list[Any] = []
+        # The frozen TradePlan for the current election. Built once in ``_arm`` and read
+        # by every downstream stage; ``None`` while SCANNING or when the plan could not
+        # be built (see ``_build_trade_plan``).
+        self._trade_plan: Any | None = None
+        self._plan_builder: Any | None = None
         # StrategySelectorV2, starting in SHADOW next to the live election. ``None`` unless
         # ``STRATEGY_SELECTOR_V2_ENABLED`` is set. Construct once rather than per cycle;
         # invalid configuration leaves the runner off and legacy authority intact.
@@ -912,7 +924,7 @@ class StrategySessionManager:
                 if holdings:
                     self._adopt_existing_position(holdings, macro_micro_bundle, now)
                 else:
-                    self._select(candidates, macro_micro_bundle, now)
+                    self._select(candidates, macro_micro_bundle, now, account=account)
 
             self._persist()
             return self.snapshot()
@@ -1070,6 +1082,249 @@ class StrategySessionManager:
                 return None
             return self._state.selected_strategy
 
+    def trade_plan_for(self, symbol: str) -> Any | None:
+        """The frozen plan that owns this symbol, or ``None``.
+
+        This is the object every downstream stage reads instead of re-deriving cost,
+        size or risk. ``None`` means no plan was built for this election, and the caller
+        falls back to the legacy path — which still runs its own gates, so the absence is
+        safe rather than permissive.
+        """
+        with self._lock:
+            plan = self._trade_plan
+            if plan is None:
+                return None
+            if str(getattr(plan, "symbol", "")).upper() != str(symbol or "").upper():
+                return None
+            return plan
+
+    def note_plan_entry_fill(self, symbol: str, price: float, quantity: int) -> None:
+        """Record the realised entry on the plan so its exit levels bind to the fill."""
+        with self._lock:
+            plan = self._trade_plan
+            if plan is None or str(plan.symbol).upper() != str(symbol or "").upper():
+                return
+            try:
+                self._trade_plan = plan.with_entry_fill(price, quantity)
+            except Exception:  # noqa: BLE001 - a bad fill report must not lose the plan.
+                return
+            self._save_trade_plan(self._trade_plan)
+
+    def _save_trade_plan(self, plan: Any) -> None:
+        try:
+            from app.trading.trade_plan import default_trade_plan_store
+
+            default_trade_plan_store().save(plan)
+        except Exception:  # noqa: BLE001 - persistence failure must not stop trading.
+            return
+
+    def _build_trade_plan(
+        self, proposal: "_ElectionProposal", now: datetime, *, account: Any
+    ) -> Any | None:
+        """Run cost, sizing and risk ONCE, here, and freeze the result into a plan.
+
+        Everything this computes used to be computed after election by
+        ``SharedLiveDecisionEngine.evaluate_buy``, where each stage could veto or resize
+        what had already been chosen. Same arithmetic, moved in front of the choice.
+
+        Returns ``None`` when the plan cannot be built — a thin edge, a risk rejection, a
+        missing account. The election still stands (the session owns the symbol) but no
+        plan-driven fast path is available, so the legacy gated path handles it.
+        """
+        if account is None or proposal.entry_price is None or proposal.entry_price <= 0:
+            return None
+        try:
+            from app.trading.trade_plan_builder import PlanRequest, TradePlanBuilder
+
+            market = _market_group_for(proposal.symbol)
+            snapshot = self._plan_market_snapshot(proposal, market, now)
+            if snapshot is None:
+                return None
+            context = self._election_context(
+                proposal.strategy_id,
+                now,
+                intent=proposal.intent,
+                candidate_count=proposal.candidate_count,
+                micro_result=proposal.micro_result,
+                evidence_row=proposal.evidence_row,
+                symbol=proposal.symbol,
+            )
+            builder = getattr(self, "_plan_builder", None)
+            if builder is None:
+                builder = TradePlanBuilder()
+                self._plan_builder = builder
+            outcome = builder.build(
+                PlanRequest(
+                    symbol=proposal.symbol,
+                    strategy_id=proposal.strategy_id,
+                    market=market,
+                    account=account,
+                    market_snapshot=snapshot,
+                    reference_price=float(proposal.entry_price),
+                    take_profit_rate=float(proposal.target_return_rate),
+                    stop_loss_rate=float(proposal.stop_loss_rate),
+                    trailing_rate=float(proposal.trailing_stop_rate) or None,
+                    max_holding_seconds=int(proposal.max_holding_seconds),
+                    gross_edge_bps=float(
+                        proposal.predicted_gross_edge_bps(
+                            self.config.fallback_round_trip_cost_bps
+                        )
+                        or 0.0
+                    ),
+                    direction=str(getattr(proposal.direction, "value", proposal.direction)),
+                    confidence=float(proposal.confidence or 0.0) or None,
+                    liquidity_score=self._plan_liquidity_score(proposal),
+                    spread_bps=_measured_spread_bps(
+                        proposal.micro_result, proposal.evidence_row
+                    ),
+                    authority_size_fraction=self._plan_authority_fraction(proposal),
+                    entry_trigger=str(proposal.strategy_id),
+                    strategy_exit_trigger=str(proposal.strategy_id),
+                    weekday_time_context=self._weekday_time_context(proposal.symbol, now),
+                    election_context=context,
+                    order_contract={
+                        "direction": str(
+                            getattr(proposal.direction, "value", proposal.direction)
+                        ),
+                        "position_effect": "OPEN",
+                        "execution_product": str(
+                            getattr(
+                                proposal.execution_product,
+                                "value",
+                                proposal.execution_product,
+                            )
+                        ),
+                    },
+                    source_ids=self._plan_source_ids(proposal, now),
+                    session_id=self._state.session_id,
+                    plan_ttl_seconds=self._plan_ttl_seconds(),
+                ),
+                now=now,
+            )
+        except Exception:  # noqa: BLE001 - a plan-build failure falls back, never crashes.
+            return None
+        if outcome.plan is None:
+            self._state.last_reason = (
+                f"PLAN_NOT_BUILT:{','.join((outcome.no_trade.reason_codes if outcome.no_trade else ()) or ('UNKNOWN',))}"
+            )
+            return None
+        self._save_trade_plan(outcome.plan)
+        return outcome.plan
+
+    def _plan_ttl_seconds(self) -> float:
+        """How long an elected plan stays executable.
+
+        The configured value, floored by the session's own ARMED window: a plan that
+        outlived the entry window it was elected for would authorise an order the session
+        has already given up on.
+        """
+        try:
+            from app.config.execution_authority import (
+                default_execution_authority_config,
+            )
+
+            configured = float(
+                default_execution_authority_config().trade_plan_ttl_seconds
+            )
+        except Exception:  # noqa: BLE001 - fall back to the session window.
+            configured = float(self.config.armed_timeout_seconds)
+        return max(30.0, min(configured, float(self.config.armed_timeout_seconds)))
+
+    def _weekday_time_context(self, symbol: str, now: datetime) -> dict[str, Any]:
+        """The weekday / session-phase context, taken from the temporal layer.
+
+        This is the join between the calendar refactor and the election: the plan carries
+        the same phase, day and seasonality bucket the context hierarchy resolved, so a
+        stored plan can be replayed against the kind of time it was made in.
+        """
+        context: dict[str, Any] = dict(_session_structure_context(now, symbol))
+        try:
+            from app.context.temporal_context import build_temporal_snapshot
+
+            snapshot = build_temporal_snapshot(_market_group_for(symbol), now)
+            context.update(
+                {
+                    "market_group": snapshot.market_group,
+                    "trading_day": str(snapshot.trading_day),
+                    "day_of_week": snapshot.day_of_week_name,
+                    "session_phase": snapshot.session_phase.value,
+                    "session_progress": snapshot.session_progress,
+                    "minutes_from_open": snapshot.minutes_from_open,
+                    "minutes_to_close": snapshot.minutes_to_close,
+                    "holiday_adjacent": snapshot.holiday_adjacent,
+                    "month_end": snapshot.month_end,
+                    "quarter_end": snapshot.quarter_end,
+                    "expiry_context": snapshot.expiry_context.value,
+                }
+            )
+        except Exception:  # noqa: BLE001 - the clock context is additive, never required.
+            context.setdefault("temporal_context_unavailable", True)
+        return context
+
+    def _plan_market_snapshot(
+        self, proposal: "_ElectionProposal", market: str, now: datetime
+    ) -> Any | None:
+        """A MarketSnapshot for the risk manager, from what the election measured."""
+        try:
+            from app.schemas.domain import MarketSnapshot, SourceMetadata
+        except Exception:  # noqa: BLE001
+            return None
+        row = proposal.evidence_row if isinstance(proposal.evidence_row, Mapping) else {}
+        return MarketSnapshot(
+            ticker=str(proposal.symbol).upper(),
+            market=market,
+            company_name=str(row.get("company_name") or ""),
+            sector=str(row.get("sector") or ""),
+            last_price=float(proposal.entry_price or 0.0),
+            average_daily_trading_value=float(
+                row.get("average_daily_trading_value") or 0.0
+            ),
+            volatility_20d=float(row.get("volatility_20d") or 0.0),
+            source=SourceMetadata(
+                source_name="kis_realtime",
+                retrieved_at=now,
+                source_type="broker_api",
+                trust_level=5,
+                is_realtime=True,
+                observed_at=now,
+            ),
+        )
+
+    @staticmethod
+    def _plan_liquidity_score(proposal: "_ElectionProposal") -> float:
+        row = proposal.evidence_row if isinstance(proposal.evidence_row, Mapping) else {}
+        value = row.get("liquidity_score")
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        return max(0.0, min(1.0, score))
+
+    def _plan_authority_fraction(self, proposal: "_ElectionProposal") -> float:
+        """The deployment/selector size cap, applied at election rather than downstream."""
+        try:
+            from app.trading.long_strategy_promotion import deployment_size_cap
+
+            cap = deployment_size_cap(parse_state(str(proposal.deployment_state)))
+        except Exception:  # noqa: BLE001 - an unreadable cap sizes to zero, not to full.
+            return 0.0
+        selector_cap = max(
+            0.0, min(1.0, float(self._state.selector_v2_order_size_fraction or 1.0))
+        )
+        return max(0.0, min(1.0, min(cap, selector_cap)))
+
+    @staticmethod
+    def _plan_source_ids(proposal: "_ElectionProposal", now: datetime) -> tuple[str, ...]:
+        row = proposal.evidence_row if isinstance(proposal.evidence_row, Mapping) else {}
+        ids = tuple(
+            str(item)
+            for item in (row.get("source_record_ids") or ())
+            if str(item or "").strip()
+        )
+        return ids or (
+            f"election:{proposal.symbol}:{proposal.strategy_id}:{now.strftime('%Y%m%d%H%M%S')}",
+        )
+
     def election_context_for(self, symbol: str) -> dict[str, Any] | None:
         """Slow context the ontology resolved when it elected this strategy."""
         with self._lock:
@@ -1180,6 +1435,14 @@ class StrategySessionManager:
             # true and conclude a pessimistic bound and a NO_TRADE option were in
             # play when neither is.
             payload["gnn_direct_election"] = self.config.gnn_direct_election
+            # The plan is the real authority downstream, so it belongs in the snapshot
+            # every dashboard reads. Without it the UI would still be describing the
+            # pre-refactor path in which the gates decided after election.
+            plan = self._trade_plan
+            payload["trade_plan"] = plan.as_dict() if plan is not None else None
+            payload["execution_authority"] = (
+                "TRADE_PLAN" if plan is not None else "LEGACY_GATED_PATH"
+            )
             payload["selection_authority"] = (
                 "GNN_DIRECT" if self.config.gnn_direct_election
                 else "CONSERVATIVE_BANDIT" if self.config.bandit_enabled
@@ -1470,7 +1733,14 @@ class StrategySessionManager:
             if last_price > 0:
                 state.exit_price = last_price
 
-    def _select(self, candidates: tuple[str, ...], bundle: Any, now: datetime) -> None:
+    def _select(
+        self,
+        candidates: tuple[str, ...],
+        bundle: Any,
+        now: datetime,
+        *,
+        account: Any = None,
+    ) -> None:
         """Elect one (symbol, strategy) — or deliberately elect nothing.
 
         Two-phase by design:
@@ -1653,7 +1923,7 @@ class StrategySessionManager:
             decided = True
 
         if selected is not None:
-            self._arm(selected, now, macro)
+            self._arm(selected, now, macro, account=account)
             if v2_context_id:
                 runner = self._selector_v2
                 self._state.selector_v2_context_id = v2_context_id
@@ -2745,7 +3015,14 @@ class StrategySessionManager:
         winner.conservative_edge_bps = selection.conservative_edge_bps
         return winner
 
-    def _arm(self, proposal: "_ElectionProposal", now: datetime, macro: Any = None) -> None:
+    def _arm(
+        self,
+        proposal: "_ElectionProposal",
+        now: datetime,
+        macro: Any = None,
+        *,
+        account: Any = None,
+    ) -> None:
         """Commit one proposal to ARMED, preserving the audit trail."""
         coverage = evaluate_cost_coverage(
             proposal.predicted_gross_edge_bps(self.config.fallback_round_trip_cost_bps),
@@ -2834,6 +3111,16 @@ class StrategySessionManager:
                 borrow_snapshot=proposal.borrow_snapshot,
             ),
         )
+        # The plan is the durable, immutable output of this election. Building it here —
+        # inside _arm, with the account in hand — is what moves cost, sizing and risk in
+        # front of the selection instead of behind it. A failure to build one is not
+        # fatal to the election: the session still owns the symbol, and the legacy
+        # evaluate_buy path (which still runs its own gates) handles it.
+        self._trade_plan = self._build_trade_plan(proposal, now, account=account)
+        if self._trade_plan is not None:
+            self._state.trade_plan_id = self._trade_plan.plan_id
+            self._state.trade_plan_quantity = self._trade_plan.quantity
+            self._state.trade_plan_expires_at = _iso(self._trade_plan.expires_at)
 
     def _no_election_reason(
         self, evidence: Mapping[str, Any], intents: list[Any]

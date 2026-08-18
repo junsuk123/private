@@ -79,6 +79,9 @@ def test_full_strategy_owned_chain_reaches_mock_broker_once(tmp_path) -> None:
         causal_journal=CausalOrderJournal(tmp_path / "causal.jsonl"),
     )
     coordinator._preflight_failures = lambda: []  # type: ignore[method-assign]
+    # Same reasoning as the process-level gates above: this test is about the
+    # causal chain, not about whether a session is open right now.
+    coordinator.execution_guard = None
     workflow = StrategyOwnedExecutionWorkflow(
         CausalRiskGate(CausalRiskLimits(1000, 10)), coordinator
     )

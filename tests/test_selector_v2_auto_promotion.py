@@ -134,6 +134,90 @@ def test_single_resolved_context_is_insufficient_not_an_evaluator_fault(tmp_path
     assert controller.snapshot()["evidence_rows"] == 1
 
 
+def _declined_groups(count: int, *, start: datetime):
+    """Contexts the selector passed on, where trading would have lost money anyway.
+
+    ``selected_strategy=None`` is the NO_TRADE decision, and its realised outcome is
+    0.0 by definition. Every alternative loses, so declining was correct: these carry no
+    regret and must not be able to argue against the selector's measured edge.
+    """
+    groups = []
+    for index in range(count):
+        loser = SimpleNamespace(
+            strategy_id="alternative",
+            net_return_bps=-8.0,
+            gross_return_bps=-3.0,
+            quotes_observed=3,
+            evidence_source="shadow",
+            regime="RANGE",
+        )
+        groups.append(
+            SimpleNamespace(
+                context_id=f"declined-{index}",
+                symbol="TEST",
+                market="KR",
+                opened_at=start + timedelta(minutes=index),
+                selected_strategy=None,
+                decision="NO_TRADE",
+                outcomes={"alternative": loser},
+                live_outcome_net_bps=None,
+                live_outcome_source=None,
+                predicted_utility_bps={"alternative": -4.0},
+            )
+        )
+    return groups
+
+
+def test_declines_do_not_dilute_the_measured_edge(tmp_path):
+    """A selective selector must still be able to earn LIVE_PROBE.
+
+    Regression for a deadlock: the edge bound was averaged over every context, and a
+    declined context scores exactly 0.0. Those zeros pulled the 95% lower bound toward
+    zero, so the more contexts the selector correctly passed on, the further it fell
+    below ``minimum_lower_bound_net_bps`` — the rung got harder precisely because the
+    selector was doing its job. Live evidence showed 3,531 declines against 0 trades.
+    """
+    config = _config(tmp_path)
+    controller = SelectorPromotionController(config)
+    evidence = [*_groups(), *_declined_groups(400, start=AT)]
+
+    metrics = controller.evaluate(evidence, now=AT + timedelta(days=2)).metrics
+    assert metrics["traded_context_count"] == 4
+    assert metrics["context_count"] == 404
+    # The all-context bound is swamped by the 400 zeros; the traded bound is not.
+    assert metrics["lower_bound_net_bps"] < 1.0
+    assert metrics["traded_lower_bound_net_bps"] > 15.0
+
+    decision = controller.evaluate(evidence, now=AT + timedelta(days=2, minutes=5))
+    assert decision.to_state is SelectorAuthorityState.LIVE_PROBE
+    assert controller.order_size_fraction == 0.10
+
+
+def test_losing_trades_still_demote_when_declines_would_have_masked_them(tmp_path):
+    """Demotion reads the undiluted bound too, so declines cannot hide a losing run."""
+    config = _config(tmp_path)
+    controller = SelectorPromotionController(config)
+    controller.evaluate([*_groups(), *_declined_groups(400, start=AT)], now=AT)
+    controller.evaluate(
+        [*_groups(), *_declined_groups(400, start=AT)], now=AT + timedelta(minutes=5)
+    )
+    assert controller.state is SelectorAuthorityState.LIVE_PROBE
+
+    losing = []
+    for batch in range(5):
+        for group in _groups(negative=True):
+            group.context_id = f"bad-{batch}-{group.context_id}"
+            losing.append(group)
+    # 20 losing trades against 400 declines: the all-context bound stays above the
+    # demotion floor, so only the traded bound can catch this.
+    decision = controller.evaluate(
+        [*losing, *_declined_groups(400, start=AT)], now=AT + timedelta(days=5)
+    )
+    assert decision.metrics["lower_bound_net_bps"] > config.demotion_lower_bound_bps
+    assert decision.to_state is SelectorAuthorityState.SHADOW
+    assert "SELECTOR_AUTO_DEMOTION_NEGATIVE_EDGE" in decision.reason_codes
+
+
 def test_runner_reports_effective_automatic_authority(tmp_path):
     controller = SelectorPromotionController(_config(tmp_path))
     controller.evaluate(_groups(), now=AT)

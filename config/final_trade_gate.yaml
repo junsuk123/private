@@ -1,0 +1,94 @@
+# FinalTradeGate policy: hard gates, soft gates, sizing and exposure limits.
+#
+# These are the authority. No model output, learned weight or strategy preference can
+# raise a limit in this file — app/risk/final_trade_gate.py takes the minimum of what the
+# model asks for and what this policy permits, in that direction only.
+#
+# Hard gates are not listed here because they are not tunable. They are conditions under
+# which the system does not know enough to send an order, and a threshold that could
+# switch one off would defeat the point. They live in the code as a fixed set.
+#
+# Soft gates degrade size. Each contributes a multiplier; the applied factor is the
+# PRODUCT of the triggered ones, so two mild problems compound rather than the worse one
+# simply winning. `block_below` stops the trade entirely once the compounded multiplier
+# gets small enough that the position would not be worth its own execution cost.
+
+schema_version: 1
+
+sizing:
+  # Fraction of equity a full-conviction position is allowed to reach before any
+  # multiplier is applied.
+  base_position_fraction: 0.05
+  # Compounded multiplier below which the order is refused outright. At 0.05 equity and a
+  # 0.15 floor the smallest permitted position is 0.75% of equity — below that the round
+  # trip cost dominates any edge this system can measure.
+  block_below: 0.15
+  # Model confidence is clamped into this band before it multiplies. The floor stops a
+  # near-zero confidence from producing an unfillable one-share order (block_below
+  # handles the refusal); the ceiling stops an overconfident model from sizing up.
+  model_confidence_floor: 0.20
+  model_confidence_ceiling: 1.00
+
+# Multiplier contributed by the dominant regime. A regime not listed here uses 1.0, so
+# UNKNOWN is listed explicitly and low: "the estimator could not name a regime" must size
+# down, and falling through to the 1.0 default would make it size up instead.
+regime_factors:
+  UNKNOWN: 0.30
+  TREND_UP: 1.00
+  TREND_DOWN: 0.60
+  RANGE_LOW_VOL: 0.85
+  RANGE_HIGH_VOL: 0.55
+  BREAKOUT_UP: 0.95
+  BREAKDOWN: 0.40
+  RISK_ON: 1.00
+  RISK_OFF: 0.50
+  LIQUIDITY_STRESS: 0.30
+  INDEX_UP_BREADTH_DOWN: 0.65
+  INDEX_DOWN_BREADTH_UP: 0.75
+  EVENT_SHOCK: 0.35
+  TRANSITION: 0.70
+
+soft_gates:
+  HIGH_VOLATILITY:
+    # Realized volatility, per-observation fraction. 0.005 on a one-minute bar is extreme.
+    threshold: 0.005
+    multiplier: 0.60
+  LOW_LIQUIDITY:
+    # Liquidity score in [0, 1]; below the threshold triggers.
+    threshold: 0.35
+    multiplier: 0.50
+  GLOBAL_CONFLICT:
+    # Domestic/global agreement below this (i.e. actively opposed) triggers.
+    threshold: -0.25
+    multiplier: 0.70
+  SECTOR_CONFLICT:
+    # Sector relative strength opposing the intended side.
+    threshold: 0.0
+    multiplier: 0.75
+  LOW_MODEL_CONFIDENCE:
+    threshold: 0.45
+    multiplier: 0.60
+  OPENING_EXTREME_VOL:
+    # Only evaluated during OPEN_TRANSITION / OPENING. Volatility multiple of the
+    # session baseline at which the opening tape is judged untradeable at full size.
+    threshold: 2.5
+    multiplier: 0.50
+  ABNORMAL_SPREAD:
+    # Spread in bps. 25bps is several times a normal KRX top-of-book spread.
+    threshold: 25.0
+    multiplier: 0.55
+
+limits:
+  # All fractions of total account equity unless stated.
+  max_position_per_stock: 0.10
+  max_sector_exposure: 0.30
+  max_market_exposure: 0.80
+  # Session loss, as a positive fraction of starting equity, at which new entries stop.
+  max_daily_loss: 0.02
+  # Peak-to-trough drawdown at which new entries stop.
+  max_drawdown: 0.10
+
+model_health:
+  # Size factor contributed by GNN health. OFFLINE is not listed: it is a hard gate.
+  HEALTHY: 1.0
+  DEGRADED: 0.5

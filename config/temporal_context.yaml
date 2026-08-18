@@ -1,0 +1,73 @@
+# Temporal context: session-phase boundaries, expiry rules and seasonality policy.
+#
+# Nothing here is a trading rule. Day-of-week and clock position are CONTEXT, and the
+# only way they reach a BUY/SELL decision is as a seasonality z-score against a rolling
+# baseline conditioned on (day, session phase, regime) — see app/features/seasonality.py.
+# A fixed "sell on Friday afternoon" rule is exactly what this file exists to prevent.
+#
+# Times are never hardcoded in code: session windows come from config/market_sessions.yaml
+# through app.data.market_capabilities, and the phase boundaries below are expressed as
+# minutes relative to the calendar-resolved open/close of the continuous session, so an
+# early close or a DST shift moves them automatically.
+
+schema_version: 1
+
+session_phase:
+  # Minutes after the continuous open during which the tape is still resolving the
+  # auction imbalance. Separate from OPENING because the spread and the trade rate in
+  # this window are not comparable with anything later in the session.
+  open_transition_minutes: 2.0
+  # End of OPENING, in minutes from the continuous open. 30 matches the two theses whose
+  # definition is a half hour (opening_range_breakout, market_intraday_momentum), so the
+  # phase label cannot disagree with the strategies that read it.
+  opening_minutes: 30.0
+  # End of MORNING_TREND, as a fraction of the continuous session length. KRX 09:00-15:20
+  # puts this at 11:07 KST; US 09:30-16:00 at 11:47 ET.
+  morning_end_fraction: 0.33
+  # End of MIDDAY, same units.
+  midday_end_fraction: 0.66
+  # Minutes before the continuous close that count as CLOSING. The closing auction is
+  # always CLOSING regardless of this value.
+  closing_minutes: 30.0
+
+expiry:
+  # Derivatives expiry, used only as CONTEXT (expiry weeks have a different flow profile).
+  # KRX: KOSPI200 futures/options expire on the second Thursday of each month; March,
+  # June, September and December are the quarterly ("네 마녀") expiries.
+  # US: monthly equity options expire on the third Friday; the same four months are
+  # quadruple witching.
+  KR:
+    weekday: 3            # Thursday (Mon=0)
+    ordinal: 2            # second occurrence in the month
+    quarterly_months: [3, 6, 9, 12]
+  US:
+    weekday: 4            # Friday
+    ordinal: 3
+    quarterly_months: [3, 6, 9, 12]
+  # A session within this many trading days of an expiry is flagged as expiry-adjacent.
+  adjacent_trading_days: 1
+
+calendar:
+  # Number of CLOSED WEEKDAYS beside a session that makes it holiday-adjacent. Weekends
+  # are excluded on purpose: counting raw calendar days would flag every Friday and every
+  # Monday, which turns the feature into a restatement of day_of_week. At 1 this fires on
+  # a genuine market closure — a national holiday, a 대체공휴일, the 추석 block.
+  holiday_gap_days: 1
+  # Bound on the backward scan for the previous trading day, so a calendar hole cannot
+  # spin. Exceeding it yields no value rather than a wrong one.
+  max_lookback_days: 21
+
+seasonality:
+  # z = (x - mu[d, s, r]) / (sigma[d, s, r] + eps)
+  epsilon: 1.0e-9
+  # Shrinkage toward the global baseline: (n/(n+k))*bucket + (k/(n+k))*global.
+  shrinkage_k: 30.0
+  # Rolling baseline window, in observations per bucket. Older observations are dropped
+  # from the sufficient statistics by exponential decay rather than by re-reading history.
+  baseline_window: 500
+  # A bucket below this many observations reports confidence < 1 and is shrunk hard toward
+  # the global baseline. It is never suppressed: a shrunk estimate with its sample count
+  # attached is more useful than a missing one.
+  minimum_samples: 5
+  # Buckets untouched for this long are considered stale and reported as such.
+  staleness_days: 45

@@ -1,0 +1,101 @@
+# Global market indicators: group membership, orientation and normalisation scales.
+#
+# The GlobalContext builder is pure — it is handed observations and reads this file for
+# how to combine them. Nothing here says what to trade. A falling S&P is a global input;
+# turning it into a domestic SELL requires domestic relative strength, breadth and flow
+# to confirm, which is enforced in app/context/domestic_context.py and the strategy
+# selector, not here.
+#
+# risk_on_sign
+#   +1 when a RISE in this indicator means risk appetite increasing (equity indices),
+#   -1 when a rise means the opposite (VIX).
+#   Used for direction / risk_sentiment / global_alignment.
+#
+# scale
+#   The fractional move treated as "one unit" for this indicator, i.e. the denominator of
+#   tanh(change / scale). Set to a typical one-session move so an ordinary day scores well
+#   inside the linear part of tanh and a shock saturates it. Values are session-return
+#   fractions (0.01 = 1%).
+#
+# max_age_seconds
+#   Beyond this the observation contributes nothing and lowers the group's confidence.
+#   Index closes from a market that is shut are inherently old; the allowance is per group
+#   and reflects the publication cadence, not a freshness preference.
+
+schema_version: 1
+
+groups:
+  equity:
+    weight: 1.0
+    scale: 0.010
+    risk_on_sign: 1
+    max_age_seconds: 86400
+    members: [SP500, NASDAQ, DOW, RUSSELL2000]
+  semiconductor:
+    weight: 1.0
+    scale: 0.018
+    risk_on_sign: 1
+    max_age_seconds: 86400
+    members: [SOX, NVDA, AMD, AVGO, MU, TSM, INTC]
+  risk:
+    weight: 1.0
+    scale: 0.080
+    risk_on_sign: -1
+    max_age_seconds: 86400
+    # Level at which the group's volatility output reads 1.0. VIX 20 is the long-run
+    # median; the output saturates above it rather than growing without bound.
+    reference_level: 20.0
+    members: [VIX]
+  rates:
+    weight: 0.8
+    scale: 0.030
+    risk_on_sign: -1
+    max_age_seconds: 172800
+    members: [US2Y, US10Y]
+  fx:
+    weight: 0.8
+    scale: 0.006
+    risk_on_sign: -1
+    max_age_seconds: 86400
+    members: [USDKRW, DXY]
+  commodity:
+    weight: 0.5
+    scale: 0.020
+    risk_on_sign: 1
+    max_age_seconds: 86400
+    members: [WTI, GOLD, COPPER]
+  asia:
+    weight: 0.8
+    scale: 0.010
+    risk_on_sign: 1
+    max_age_seconds: 86400
+    members: [NIKKEI, HANGSENG, CSI300]
+  futures:
+    weight: 1.0
+    scale: 0.008
+    risk_on_sign: 1
+    # Index futures trade nearly around the clock, so a stale print here is a real
+    # feed problem rather than a closed market.
+    max_age_seconds: 3600
+    members: [ES, NQ, YM, US_INDEX_FUTURES]
+
+# Groups whose risk_on-adjusted score forms the headline `direction`. Rates, FX and
+# commodities move direction only through `global_alignment`: a yield move is a reason to
+# doubt an equity signal, not an equity signal of its own.
+direction_groups: [equity, semiconductor, asia, futures]
+
+# Minimum share of configured group WEIGHT that must be observed before the context
+# reports a direction at all. Below it the outputs stay None and confidence reports why.
+minimum_group_coverage: 0.35
+
+cross_market:
+  # Rolling window, in observations, for the beta used by RS = R_local - beta * R_reference.
+  beta_window: 60
+  # Fewer paired observations than this and beta is not estimated; RS then falls back to
+  # the raw spread with beta = 1.0 and says so.
+  beta_minimum_samples: 20
+  # Beta is clamped to this band. An unclamped rolling beta on a thin overlap can reach
+  # values that turn RS into noise amplification.
+  beta_bounds: [0.0, 3.0]
+  # Maximum lead/lag, in minutes, searched when estimating which series leads.
+  max_lag_minutes: 120

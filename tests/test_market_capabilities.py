@@ -196,11 +196,112 @@ def test_us_holiday_has_no_sessions(service):
 
 
 def test_kr_fixed_date_holiday_has_no_sessions(service):
-    assert service.is_trading_day(MarketGroup.KR, kst(2026, 8, 17, 11, 0)) is True
-    assert service.is_trading_day(MarketGroup.KR, kst(2026, 3, 2, 11, 0)) is True
+    # 대조군은 대체공휴일이 아닌 실제 영업일이어야 한다. 이 두 자리에는 원래
+    # 2026-08-17 과 2026-03-02 가 있었는데, 둘 다 대체공휴일이다 — 앞의 주석이
+    # 8/15 가 토요일임을 알아챘으면서 그 다음 평일까지는 따라가지 않았다.
+    # 2026-08-18 은 실측으로도 영업일이다 (KRX 틱 307,592건 / 35종목).
+    assert service.is_trading_day(MarketGroup.KR, kst(2026, 8, 18, 11, 0)) is True
+    assert service.is_trading_day(MarketGroup.KR, kst(2026, 3, 3, 11, 0)) is True
     # 2026-08-15 는 토요일이므로 광복절 판정 대신 2026-10-09 (금, 한글날) 로 확인.
     assert service.is_trading_day(MarketGroup.KR, kst(2026, 10, 9, 11, 0)) is False
     assert sessions(service, "KR", kst(2026, 10, 9, 11, 0)) == set()
+
+
+def test_lunar_holidays_need_the_external_calendar(service):
+    """고정일자 스냅샷이 원리적으로 표현할 수 없는 휴장일까지 잡히는가.
+
+    설날·부처님오신날·추석은 음력이라 YAML 에 적을 수 없다. 이 테스트가 통과하려면
+    ``prefer_external_provider`` 가 라벨이 아니라 실제 조회 권위여야 한다 — 그 배선이
+    없던 동안 이 여섯 날은 전부 정규 거래일로 판정됐다.
+    """
+    if service.calendar.external is None:
+        pytest.skip("exchange_calendars 미설치: 스냅샷 fallback 경로")
+    for lunar in (
+        kst(2026, 2, 16, 11, 0),  # 설날 연휴
+        kst(2026, 2, 17, 11, 0),
+        kst(2026, 2, 18, 11, 0),
+        kst(2026, 5, 25, 11, 0),  # 부처님오신날
+        kst(2026, 9, 24, 11, 0),  # 추석 연휴
+        kst(2026, 9, 25, 11, 0),
+    ):
+        assert service.is_trading_day(MarketGroup.KR, lunar) is False
+        assert service.calendar.is_holiday(MarketGroup.KR, lunar.astimezone(SEOUL).date())
+
+
+def test_external_calendar_clears_suspect_only_where_it_reaches(service):
+    """수록 범위 안에서만 완전하다고 주장한다.
+
+    외부 캘린더는 유한한 범위를 갖는다. 그 밖에서는 불완전한 스냅샷으로 되돌아가므로
+    SESSION_CALENDAR_SUSPECT 가 계속 떠야 한다 — 범위를 벗어났는데도 완전하다고
+    말하면 그 사유코드는 아무 것도 지키지 못한다.
+    """
+    if service.calendar.external is None:
+        pytest.skip("exchange_calendars 미설치")
+    inside = kst(2026, 8, 18, 11, 0)
+    assert ReasonCode.SESSION_CALENDAR_SUSPECT.value not in service.calendar_state(
+        MarketGroup.KR, inside
+    )
+    beyond = kst(2027, 12, 1, 11, 0)
+    if not service.calendar.external.covers(MarketGroup.KR, beyond.astimezone(SEOUL).date()):
+        assert ReasonCode.SESSION_CALENDAR_SUSPECT.value in service.calendar_state(
+            MarketGroup.KR, beyond
+        )
+
+
+def test_external_calendar_is_consistent_under_concurrent_first_use(service):
+    """워커 스레드들이 동시에 두드려도 답이 갈리면 안 된다.
+
+    첫 호출 때 지연 적재하고 실패를 기억하던 판에서 실제로 깨졌다: 16 스레드 동시
+    첫 호출이 True/False 로 갈리고 실패 캐시가 오염돼, 그 뒤로 프로세스가 사는 내내
+    외부 캘린더가 꺼진 채 provider 라벨만 exchange_calendars 로 남았다. 서버에서
+    SESSION_CALENDAR_SUSPECT 가 사라지지 않은 원인이 이것이었다.
+    """
+    if service.calendar.external is None:
+        pytest.skip("exchange_calendars 미설치")
+    import threading
+
+    moment = kst(2026, 8, 18, 11, 0)
+    seen: list[tuple[str, ...]] = []
+
+    def probe() -> None:
+        seen.append(service.calendar_state(MarketGroup.KR, moment))
+
+    threads = [threading.Thread(target=probe) for _ in range(32)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(seen) == 32
+    assert len(set(seen)) == 1, f"동시 호출에서 답이 갈렸다: {set(seen)}"
+
+
+def test_external_calendar_answers_none_outside_its_range(service):
+    """모르는 날은 "휴장일 아님" 이 아니라 "모름" 이어야 한다.
+
+    범위 밖을 False 로 답하면 조용히 거래일을 만들어낸다.
+    """
+    if service.calendar.external is None:
+        pytest.skip("exchange_calendars 미설치")
+    from datetime import date
+
+    assert service.calendar.external.is_holiday(MarketGroup.KR, date(1990, 1, 2)) is None
+    assert service.calendar.external.is_holiday(MarketGroup.KR, date(2099, 1, 2)) is None
+
+
+def test_kr_substitute_holiday_has_no_sessions(service):
+    """주말과 겹친 공휴일의 대체공휴일도 휴장일이다.
+
+    2026-08-17 이 빠져 있던 동안 엔진은 그날 KRX 정규장이 열려 있다고 보고 하루
+    종일 게이트를 평가했다 — 실측 KR 틱 0건, 직전 거래일 08-14 는 448,763건.
+    """
+    for holiday in (
+        kst(2026, 3, 2, 11, 0),   # 삼일절 (일) 대체
+        kst(2026, 8, 17, 11, 0),  # 광복절 (토) 대체
+        kst(2026, 10, 5, 11, 0),  # 개천절 (토) 대체
+    ):
+        assert service.is_trading_day(MarketGroup.KR, holiday) is False
+        assert sessions(service, "KR", holiday) == set()
 
 
 def test_us_early_close_shortens_regular_session(service):
@@ -232,14 +333,24 @@ def test_date_outside_calendar_coverage_fails_closed_for_entry(service):
 
 
 def test_incomplete_calendar_does_not_block_all_entry(service):
-    """KR 스냅샷은 음력 휴장일을 포함하지 않지만, 그것이 국내 거래를 영구 차단해서는 안 된다.
+    """불완전한 캘린더는 경고이지 거부권이 아니다 — 국내 거래를 영구 차단하면 안 된다.
 
     누락 휴장일은 freshness 게이트(피드 증거 없음)가 잡는다.
+
+    SUSPECT 가 실제로 뜨는 날짜에서 확인해야 계약이 검증된다. 외부 캘린더가
+    설치되어 있으면 그 수록 범위 안에서는 음력·대체공휴일까지 알고 있어 SUSPECT 가
+    뜨지 않으므로, 범위 밖이면서 스냅샷 coverage 안인 평일 (2027-12-01, 수) 로
+    옮긴다. 미설치 환경에서는 여름 평일 그대로 SUSPECT 가 뜬다.
     """
-    reasons = service.calendar_state(MarketGroup.KR, kst(*WEDNESDAY_SUMMER, 11, 0))
+    moment = kst(*WEDNESDAY_SUMMER, 11, 0)
+    if service.calendar.external is not None:
+        moment = kst(2027, 12, 1, 11, 0)
+
+    reasons = service.calendar_state(MarketGroup.KR, moment)
     assert ReasonCode.SESSION_CALENDAR_SUSPECT.value in reasons
-    assert service.blocking_calendar_reasons(MarketGroup.KR, kst(*WEDNESDAY_SUMMER, 11, 0)) == ()
-    assert service.new_entry_allowed("KR", kst(*WEDNESDAY_SUMMER, 11, 0)) is True
+    # 경고일 뿐이라는 것이 이 테스트의 계약이다.
+    assert service.blocking_calendar_reasons(MarketGroup.KR, moment) == ()
+    assert service.new_entry_allowed("KR", moment) is True
 
 
 # --------------------------------------------------------------------------- #

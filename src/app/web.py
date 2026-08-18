@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette import routing as starlette_routing
 
 from app.web_account_routes import create_account_router
+from app.web_context_routes import create_context_router
 from app.web_short_strategy_routes import create_short_strategy_router
 from app.account_dashboard import AccountDashboardService
 from app.refactor_dashboard import (
@@ -741,6 +742,52 @@ app.include_router(
         session_snapshot_provider=lambda: _short_strategy_session_snapshot(),
     )
 )
+
+# Context -> decision -> gate surface. Its own router and its own runtime object so the
+# hierarchy can be inspected whether or not the trading engine is running: "why did
+# nothing trade" has to be answerable when nothing is trading.
+_context_runtime_lock = threading.Lock()
+_context_runtime: Any | None = None
+_context_runtime_error: str | None = None
+_context_refresh_stop = threading.Event()
+
+#: Seconds between background context refreshes. Matched to the realtime loop's own
+#: cadence: refreshing faster would recompute a graph from the same ticks, slower would
+#: let the dashboard show a state the engine has already left.
+CONTEXT_REFRESH_INTERVAL_SECONDS = 5.0
+
+
+def get_context_runtime() -> Any | None:
+    """The process-wide :class:`ContextRuntime`, built on first use.
+
+    Returns ``None`` — never raises — when construction fails, so a broken context layer
+    degrades the dashboard to "unavailable, here is why" instead of taking down the app
+    that also has to be able to close positions.
+    """
+    global _context_runtime, _context_runtime_error
+    with _context_runtime_lock:
+        if _context_runtime is not None:
+            return _context_runtime
+        try:
+            from app.trading.context_runtime import ContextRuntime
+
+            _context_runtime = ContextRuntime(
+                require_checkpoint=True,
+                session_snapshot_provider=_short_strategy_session_snapshot,
+            )
+            _context_runtime_error = None
+        except Exception as exc:  # noqa: BLE001 - reported through the routes.
+            _context_runtime_error = f"{type(exc).__name__}: {exc}"
+            _context_runtime = None
+        return _context_runtime
+
+
+def context_runtime_error() -> str | None:
+    with _context_runtime_lock:
+        return _context_runtime_error
+
+
+app.include_router(create_context_router(runtime_provider=get_context_runtime))
 
 
 def _short_strategy_session_snapshot() -> dict[str, Any]:
@@ -2581,6 +2628,7 @@ def _startup_live_worker() -> None:
     _ensure_us_fast_poll_started()
     _ensure_krx_feature_frame_started()
     _start_auto_reliability_controller()
+    _start_context_refresher()
 
 
 def _graceful_teardown() -> list[str]:
@@ -2600,6 +2648,7 @@ def _graceful_teardown() -> list[str]:
     for name, stop in (
         # Trading first — nothing else matters if orders can still be submitted.
         ("realtime_trading_engine", _stop_realtime_trading_engine),
+        ("context_refresher", _stop_context_refresher),
         ("auto_reliability_controller", _stop_auto_reliability_controller),
         ("live_training_worker", _stop_live_training_worker),
         ("krx_feature_frame_worker", _stop_krx_feature_frame_worker),
@@ -2620,8 +2669,39 @@ def _graceful_teardown() -> list[str]:
     return stopped
 
 
+def _context_refresh_loop() -> None:
+    """Keep the context hierarchy current while the server is up.
+
+    Runs whether or not live trading is armed. The dashboard's job is to explain the
+    market and the system's own health, and both questions are most useful precisely
+    when trading is switched off.
+    """
+    while not _context_refresh_stop.is_set():
+        service = get_context_runtime()
+        if service is not None:
+            try:
+                service.refresh()
+            except Exception:  # noqa: BLE001 - recorded inside refresh(); never fatal.
+                pass
+        _context_refresh_stop.wait(CONTEXT_REFRESH_INTERVAL_SECONDS)
+
+
+def _start_context_refresher() -> None:
+    if live_env_bool("CONTEXT_RUNTIME_DISABLED", False):
+        return
+    _context_refresh_stop.clear()
+    threading.Thread(
+        target=_context_refresh_loop, name="context-runtime-refresh", daemon=True
+    ).start()
+
+
+def _stop_context_refresher() -> None:
+    _context_refresh_stop.set()
+
+
 @app.on_event("shutdown")
 def _shutdown_live_worker() -> None:
+    _stop_context_refresher()
     _graceful_teardown()
 
 
@@ -9080,7 +9160,6 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       risk_manager=RiskManager(rules),
       market_refresher=_refresh_market_snapshot,
   )
-  coordinator = LiveExecutionCoordinator(broker_client)
   _ensure_us_fast_poll_started()
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   strategy_session_manager = StrategySessionManager(
@@ -9088,6 +9167,16 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       bandit=ConservativeStrategyBandit(
           config=BanditConfig.for_live_execution(),
       ),
+  )
+  # The ExecutionGuard needs the plan that owns the order and the broker's own view of
+  # cash and sellable quantity. Wired here rather than looked up inside the guard so the
+  # guard stays a pure function of what it is handed, and so the session manager remains
+  # the single source of the plan.
+  coordinator = LiveExecutionCoordinator(
+      broker_client,
+      plan_provider=strategy_session_manager.trade_plan_for,
+      orderable_cash_provider=_live_orderable_cash_for_order,
+      sellable_quantity_provider=_live_sellable_quantity_for_order,
   )
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
@@ -9101,6 +9190,42 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       macro_micro_observer=macro_micro_observer,
       strategy_session_manager=strategy_session_manager,
   )
+
+
+def _live_orderable_cash_for_order(order: Any) -> float | None:
+  """Broker-reported orderable cash in the order's currency, or ``None``.
+
+  ``None`` means "could not be established", which the ExecutionGuard treats as missing
+  evidence rather than as sufficient funds. It is deliberately not defaulted to 0.0:
+  that would read as a hard refusal and block trading whenever the account endpoint is
+  briefly slow.
+  """
+  try:
+    account = _realtime_engine_account_snapshot()
+    if account is None:
+      return None
+    from app.market_affordability import cash_available_for_market
+
+    return float(
+        cash_available_for_market(account, str(getattr(order, "market", "") or ""))
+    )
+  except Exception:  # noqa: BLE001 - unknown cash is reported as unknown.
+    return None
+
+
+def _live_sellable_quantity_for_order(order: Any) -> int | None:
+  """Broker-reported sellable quantity for the order's symbol, or ``None``."""
+  try:
+    account = _realtime_engine_account_snapshot()
+    if account is None:
+      return None
+    ticker = str(getattr(order, "ticker", "") or "").upper()
+    for holding in tuple(getattr(account, "holdings", ()) or ()):
+      if str(getattr(holding, "ticker", "") or "").upper() == ticker:
+        return max(0, int(getattr(holding, "quantity", 0) or 0))
+    return 0
+  except Exception:  # noqa: BLE001
+    return None
 
 
 def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, Any]:
@@ -12279,6 +12404,16 @@ def _refresh_domestic_ranking_symbols() -> None:
     ranked_symbols = (
       rank_by_feasibility(permitted, feasibility) if feasibility else permitted
     )
+    # Turnover says shares changed hands and feasibility says the barrier is
+    # reachable; neither says the symbol PRINTS often enough for a sub-second
+    # trigger to be evaluated at all. Measured 2026-08-18, 97 minutes into the
+    # session: 18 of the 38 symbols then holding a collector subscription were
+    # below 10 prints/market-minute, nine of them with zero ticks all session.
+    # Every evaluation on those names can only return TICK_WINDOW_NOT_READY --
+    # 12 of 42 recorded evaluations did. This is the same pathology
+    # ``_recent_affordable_us_watchlist`` already fixed on the US side, and this
+    # is the KRX half of it. Reorders rather than filters, and fails open.
+    ranked_symbols, _ = _apply_domestic_print_density(ranked_symbols, size=size)
     decision = resolve_universe(
       ranked_symbols,
       state=load_state(),
@@ -12303,6 +12438,46 @@ def _refresh_domestic_ranking_symbols() -> None:
       _domestic_ranking_cache["symbols"] = symbols
     _domestic_ranking_cache["last_error"] = error
     _domestic_ranking_cache["refreshing"] = False
+
+
+def _apply_domestic_print_density(
+    ranked: tuple[str, ...], *, size: int
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+  """Move symbols that actually print to the front of the KRX discovery ranking.
+
+  Returns the reordered ranking and the telemetry for it. The ranking is only
+  reordered, never shortened: ``resolve_universe`` still owns truncation and its
+  own exclusion rules, and handing it a shorter list would take decisions away
+  from it on the strength of a measurement that fails open.
+
+  The reserved exploration slots have to land inside the first ``size`` entries or
+  truncation would discard them and an unmeasured symbol could never earn a
+  subscription window. So the blend is asked for exactly ``size`` names, and the
+  remainder is appended behind them in its existing order.
+  """
+  if not ranked:
+    return ranked, {"applied": False, "reason": "NO_CANDIDATES"}
+  try:
+    from app.trading.print_density import rank_by_print_density
+
+    database = os.getenv(
+        "REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"
+    )
+    with _live_lock:
+      cursor = int(_domestic_ranking_cache.get("density_cursor") or 0)
+    selected, next_cursor, stats = rank_by_print_density(
+        ranked, database=database, limit=max(1, int(size)), cursor=cursor
+    )
+    with _live_lock:
+      _domestic_ranking_cache["density_cursor"] = next_cursor
+      _domestic_ranking_cache["density"] = stats
+    if not stats.get("applied"):
+      return ranked, stats
+    chosen = set(selected)
+    reordered = (*selected, *(item for item in ranked if item not in chosen))
+    return reordered, stats
+  except Exception as exc:  # noqa: BLE001 - discovery must survive a telemetry fault.
+    return ranked, {"applied": False, "reason": f"{type(exc).__name__}: {exc}"[:160]}
 
 
 def _realtime_engine_execution_summary() -> dict[str, Any] | None:

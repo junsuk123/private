@@ -143,20 +143,38 @@ def test_endpoint_proceeds_when_safe(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 # Teardown ordering                                                            #
 # --------------------------------------------------------------------------- #
+#: Every stopper ``_graceful_teardown`` invokes, in its order. Kept as one list so adding
+#: a worker updates both tests together — and so a worker added to the teardown but not
+#: to this list fails the completeness check below rather than passing unnoticed.
+_TEARDOWN_STOPPERS: tuple[str, ...] = (
+    "_stop_realtime_trading_engine",
+    "_stop_context_refresher",
+    "_stop_auto_reliability_controller",
+    "_stop_live_training_worker",
+    "_stop_krx_feature_frame_worker",
+    "_stop_kis_overseas_realtime_collector",
+    "_stop_kis_realtime_collector",
+    "_stop_asset_history_sampler",
+    "_stop_live_worker",
+)
+
+
+def test_teardown_list_matches_the_stoppers_under_test(monkeypatch) -> None:
+    """A worker added to the teardown must be added to ``_TEARDOWN_STOPPERS`` too."""
+    called: list[str] = []
+    for name in _TEARDOWN_STOPPERS:
+        monkeypatch.setattr(web, name, (lambda n: lambda: called.append(n))(name))
+    stopped = web._graceful_teardown()
+    assert len(stopped) == len(called), (
+        "a stopper ran that this test does not patch; add it to _TEARDOWN_STOPPERS"
+    )
+
+
 def test_teardown_stops_trading_before_market_data(monkeypatch) -> None:
     """An engine still evaluating while its price feed disappears is the exact
     stale-data condition every gate in this codebase exists to prevent."""
     order: list[str] = []
-    for name in (
-        "_stop_realtime_trading_engine",
-        "_stop_auto_reliability_controller",
-        "_stop_live_training_worker",
-        "_stop_krx_feature_frame_worker",
-        "_stop_kis_overseas_realtime_collector",
-        "_stop_kis_realtime_collector",
-        "_stop_asset_history_sampler",
-        "_stop_live_worker",
-    ):
+    for name in _TEARDOWN_STOPPERS:
         monkeypatch.setattr(web, name, (lambda n: lambda: order.append(n))(name))
 
     stopped = web._graceful_teardown()
@@ -165,20 +183,14 @@ def test_teardown_stops_trading_before_market_data(monkeypatch) -> None:
         "_stop_kis_realtime_collector"
     )
     assert "realtime_trading_engine" in stopped
-    assert len(stopped) == 8
+    assert len(stopped) == len(_TEARDOWN_STOPPERS)
 
 
 def test_one_stuck_worker_does_not_block_the_rest(monkeypatch) -> None:
     order: list[str] = []
-    for name in (
-        "_stop_auto_reliability_controller",
-        "_stop_live_training_worker",
-        "_stop_krx_feature_frame_worker",
-        "_stop_kis_overseas_realtime_collector",
-        "_stop_kis_realtime_collector",
-        "_stop_asset_history_sampler",
-        "_stop_live_worker",
-    ):
+    for name in _TEARDOWN_STOPPERS:
+        if name == "_stop_realtime_trading_engine":
+            continue
         monkeypatch.setattr(web, name, (lambda n: lambda: order.append(n))(name))
 
     def _stuck():
@@ -188,4 +200,6 @@ def test_one_stuck_worker_does_not_block_the_rest(monkeypatch) -> None:
 
     stopped = web._graceful_teardown()
     assert "realtime_trading_engine" not in stopped
-    assert len(stopped) == 7, "every other worker must still be stopped"
+    assert len(stopped) == len(_TEARDOWN_STOPPERS) - 1, (
+        "every other worker must still be stopped"
+    )
