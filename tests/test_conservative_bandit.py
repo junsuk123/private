@@ -9,6 +9,8 @@ from app.trading.conservative_bandit import (
     BANDIT_ARM_SELECTED,
     BANDIT_CHANGE_POINT_STAND_DOWN,
     BANDIT_EXPLORATION_ARM_SELECTED,
+    BANDIT_EVIDENCE_WARMUP,
+    BANDIT_MEASURED_EDGE_REJECTED,
     BANDIT_NO_CANDIDATE_ARMS,
     BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE,
     ArmCandidate,
@@ -120,6 +122,7 @@ def test_live_execution_config_keeps_cold_arm_shadow_only(tmp_path):
     reasons = selection.evaluations[0].reason_codes
     assert "BANDIT_ARM_COLD_START_SHADOW_ONLY" in reasons
     assert BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES in reasons
+    assert BANDIT_EVIDENCE_WARMUP in selection.reason_codes
 
 
 def test_live_execution_config_auto_unlocks_after_positive_net_evidence(tmp_path):
@@ -166,6 +169,7 @@ def test_measured_negative_arm_is_never_explored(tmp_path):
     )
     assert selection.is_no_trade
     assert BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE in selection.reason_codes
+    assert BANDIT_MEASURED_EDGE_REJECTED in selection.reason_codes
     reasons = selection.evaluations[0].reason_codes
     assert BANDIT_ARM_LOSS_STREAK_SUSPENDED in reasons or (
         BANDIT_ARM_MEASURED_NEGATIVE_EDGE in reasons

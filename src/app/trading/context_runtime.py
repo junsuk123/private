@@ -729,6 +729,8 @@ class ContextRuntime:
         latest = self.latest()
         return {
             **health.as_dict(),
+            "model_id": "temporal_hetero_gnn",
+            "model_role": "context_regime_auxiliary",
             "cycle_stale": self.is_stale(now=moment),
             "last_cycle_at": iso_column(latest.captured_at) if latest else None,
             "runtime": self.status().as_dict(),

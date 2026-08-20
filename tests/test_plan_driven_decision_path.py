@@ -165,6 +165,40 @@ def test_a_plan_reaches_a_final_order_without_touching_any_gate(engine, account)
     assert all(spy.calls == 0 for spy in spies.values())
 
 
+def test_a_frozen_plan_does_not_require_the_entry_trigger_to_fire_twice(engine, account) -> None:
+    spies = _disarm(engine)
+
+    class LaterFrameNoLongerFires:
+        tradable = False
+        confidence = 0.0
+        regime = "NO_TRADE"
+        methodology = "intraday_momentum"
+        expected_net_return_bps = 0.0
+        expected_gross_return = 0.0
+        reason_codes = ("TECHNICAL_CONFIDENCE_TOO_LOW",)
+
+        def as_dict(self) -> dict:
+            return {"tradable": False, "reason_codes": list(self.reason_codes)}
+
+    engine._owned_strategy_prediction = (  # type: ignore[method-assign]
+        lambda frame, symbol, strategy_id, election_context=None: LaterFrameNoLongerFires()
+    )
+    plan = _plan()
+
+    result = engine.evaluate_buy(
+        SYMBOL,
+        account,
+        decision_time=NOW,
+        selected_strategy=plan.strategy_id,
+        trade_plan=plan,
+    )
+
+    assert result.approved, result.reason_codes
+    assert result.final_order is not None
+    assert "SELECTED_STRATEGY_ENTRY_NOT_READY" not in result.reason_codes
+    assert all(spy.calls == 0 for spy in spies.values())
+
+
 def test_the_submitted_quantity_is_the_elected_quantity(engine, account) -> None:
     _disarm(engine)
     plan = _plan(quantity=7)

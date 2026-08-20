@@ -4,6 +4,7 @@ import json
 import hashlib
 import math
 import os
+from functools import lru_cache
 import sqlite3
 import threading
 from collections import defaultdict
@@ -93,13 +94,94 @@ def _label_strategy_id() -> str:
     return str(os.getenv("LIVE_LABEL_STRATEGY", DEFAULT_LABEL_STRATEGY) or "").strip().lower()
 
 
-def _label_barriers() -> tuple[float, float, float, str]:
+#: Percentile of the measured tape used as the labelling cost. The p75 rather
+#: than the median because the two barriers are asymmetric in consequence: a
+#: label priced under the true cost teaches wins the executor cannot realize,
+#: while one priced slightly over merely withholds a marginal setup.
+_LABEL_COST_PERCENTILE = 0.75
+
+
+def _measured_round_trip_cost_bps(market: str) -> float | None:
+    """Round-trip cost the venue ACTUALLY charged, from the shadow tape.
+
+    The fee configuration prices commission, tax and a nominal slippage, and on
+    both venues it is materially light because it cannot see the spread the book
+    charges at the moment of the fill: 45bps configured against a 74bps p75 on
+    US, 28bps against 53bps on KR. Labelling at the configured number is what
+    left 208 false positives per 136 true ones -- setups labelled a win that the
+    executor, paying the real number, stops out of.
+
+    Returns ``None`` when the tape has too few resolved round trips to speak.
+    """
+    path = Path("data/store/directional-shadow.sqlite3")
+    if not path.exists():
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)) as conn:
+            values = [
+                float(row[0])
+                for row in conn.execute(
+                    "select trading_cost_bps from shadow_outcomes "
+                    "where market = ? and trading_cost_bps is not null "
+                    "order by trading_cost_bps",
+                    (str(market or "").strip().upper(),),
+                )
+                if row[0] is not None
+            ]
+    except Exception:  # noqa: BLE001 - labelling must not fail on a tape read.
+        return None
+    if len(values) < 30:
+        return None
+    return values[min(len(values) - 1, int(len(values) * _LABEL_COST_PERCENTILE))]
+
+
+@lru_cache(maxsize=8)
+def market_round_trip_cost_bps(market: str) -> float | None:
+    """All-in round-trip cost, in bps, to size this market's label barriers.
+
+    The measured tape wins where it exists, floored at the configured estimate so
+    a thin or unrepresentative tape can never price the round trip below its
+    known fees. ``None`` only when neither source can answer, which makes the
+    caller fall back to the geometry table rather than to a fabricated number.
+    """
+    venue = "KRX" if str(market or "").strip().upper() == "KR" else "NASD"
+    instrument = "domestic_stock" if venue == "KRX" else "overseas_stock"
+    configured: float | None = None
+    try:
+        from app.cost.trading_cost_engine import TradingCostEngine
+
+        breakdown = TradingCostEngine().estimate(
+            symbol="", market=market, venue=venue, instrument_type=instrument,
+            entry_price=100.0, expected_exit_price=100.0, quantity=100,
+        )
+        configured = float(breakdown.total_cost_rate) * 10_000.0
+    except Exception:  # noqa: BLE001 - labelling must not fail on a cost lookup.
+        configured = None
+    measured = _measured_round_trip_cost_bps(market)
+    if measured is None:
+        return configured
+    if configured is None:
+        return measured
+    return max(configured, measured)
+
+
+def _label_barriers(market: str | None = None) -> tuple[float, float, float, str]:
     """``(take_profit_bps, stop_loss_bps, horizon_seconds, basis)`` for the label.
 
     Aligned by default with a real strategy's exit geometry, so a training success
     is a trade the executor would actually have held to target. Explicit
     ``LIVE_LABEL_*`` environment overrides still win, and
     ``LIVE_LABEL_STRATEGY=legacy`` restores the pre-alignment constants.
+
+    ``market`` is what keeps that alignment true off KRX. The executor sizes its
+    barriers through ``resolve_exit_geometry`` at the cost measured for the trade,
+    so on a 67bps US round trip it works a 265/65 target while this function,
+    reading the 28bps-KRX table verbatim, labelled the same setup 170/65. A pattern
+    that reliably runs 170bps and stalls was therefore a TRAINING SUCCESS and an
+    EXECUTION TIMEOUT -- the exact defect ``app.strategy.exit_geometry`` was written
+    to remove, reintroduced through the runtime cost lift the table cannot see.
+    Passing the market re-derives the label barriers from the same cost the
+    executor will pay. Omitting it keeps the table verbatim.
     """
     strategy_id = _label_strategy_id()
     if strategy_id in {"", "legacy", "none"}:
@@ -109,9 +191,15 @@ def _label_barriers() -> tuple[float, float, float, str]:
             _label_horizon_seconds(),
             "legacy_constants",
         )
-    from app.strategy.exit_geometry import exit_geometry
+    from app.strategy.exit_geometry import exit_geometry, resolve_exit_geometry
 
-    geometry = exit_geometry(strategy_id)
+    cost_bps = market_round_trip_cost_bps(market) if market else None
+    if cost_bps is None:
+        geometry = exit_geometry(strategy_id)
+        basis_suffix = ""
+    else:
+        geometry = resolve_exit_geometry(strategy_id, round_trip_cost_bps=cost_bps)
+        basis_suffix = f"@{market}:{cost_bps:.0f}bps"
     take_profit = (
         abs(float(os.environ["LIVE_LABEL_TAKE_PROFIT_BPS"]))
         if os.getenv("LIVE_LABEL_TAKE_PROFIT_BPS") not in (None, "")
@@ -127,7 +215,29 @@ def _label_barriers() -> tuple[float, float, float, str]:
         if os.getenv("LIVE_LABEL_HORIZON_SECONDS") not in (None, "")
         else float(geometry.max_holding_seconds)
     )
-    return take_profit, stop_loss, horizon, f"strategy_exit_geometry:{geometry.strategy_id}"
+    return (
+        take_profit,
+        stop_loss,
+        horizon,
+        f"strategy_exit_geometry:{geometry.strategy_id}{basis_suffix}",
+    )
+
+
+def _label_rule_description() -> str:
+    """Human-readable statement of the barriers rows were labelled with.
+
+    Per market, because ``_label_barriers`` resolves the target against the cost
+    of the venue the symbol trades on; one line cannot describe both.
+    """
+    parts = []
+    for market in ("KR", "US"):
+        tp, sl, horizon, basis = _label_barriers(market)
+        parts.append(f"{market}: tp={tp:g}bps sl={sl:g}bps horizon={horizon:g}s [{basis}]")
+    return (
+        "triple_barrier net_of_costs; "
+        + "; ".join(parts)
+        + f" (fallback: forward_return_after_30s > {_label_min_net_return_bps()}bps)"
+    )
 
 
 def _per_strategy_labels_enabled() -> bool:
@@ -342,6 +452,12 @@ def train_live_short_horizon_from_collected_features(
     # function at the same time. Serialize the expensive fit so they cannot train
     # duplicate challengers concurrently; the follower will then hit the dataset
     # fingerprint fast path.
+    try:
+        from app.monitoring import worker_heartbeat
+
+        worker_heartbeat.record(worker_heartbeat.MODEL_TRAINING)
+    except Exception:  # noqa: BLE001 - never break training on a heartbeat.
+        pass
     with _LIVE_TRAINING_LOCK:
         artifact, training_rows = _train_live_short_horizon_from_collected_features_unlocked(
             journal_path=journal_path,
@@ -535,6 +651,7 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             "pruned_materialized_row_count": row_merge["pruned_rows"],
             "materialized_row_limit": row_merge["maximum_rows"],
             "duplicate_rows_removed": row_merge["duplicate_rows_removed"],
+            "stale_label_basis_rows_evicted": row_merge.get("stale_label_basis_rows", 0),
             "invalid_rows_removed": row_merge["invalid_rows_removed"],
             "minimum_row_spacing_seconds": _training_min_row_spacing_seconds(),
             "training_mode": training_mode,
@@ -548,11 +665,13 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             "materialized_row_store": str(row_store_path),
             "dataset_fingerprint": dataset_fingerprint,
             "trade_feedback": _trade_event_stats(DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH),
-            "label_rule": (
-                f"triple_barrier tp={_label_take_profit_bps()}bps sl={_label_stop_loss_bps()}bps "
-                f"horizon={_label_horizon_seconds()}s net_of_costs "
-                f"(fallback: forward_return_after_30s > {_label_min_net_return_bps()}bps)"
-            ),
+            # Report the barriers the rows were ACTUALLY labelled with. This read
+            # the legacy constants while _label_barriers() did the labelling, so a
+            # fresh artifact advertised "tp=25 sl=100 horizon=600" no matter what
+            # it had been trained on -- the audit record contradicting the run that
+            # produced it, which is worse than no record. Barriers are per market,
+            # so each is named.
+            "label_rule": _label_rule_description(),
             "schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
             "training_recipe_version": TRAINING_RECIPE_VERSION,
             "row_quality": _row_quality_summary(rows),
@@ -635,6 +754,16 @@ def build_live_training_rows_from_feature_journal(
             continue
         by_symbol[str(frame.get("symbol") or "")].append(frame)
 
+    # Resolved per market, not once for the batch: a KR and a US row priced with
+    # one set of barriers is the label/execution mismatch in miniature, and the
+    # journal mixes both. Cached by market, so this costs one lookup per market.
+    _barrier_cache: dict[str, tuple[float, float, float, str]] = {}
+
+    def _barriers_for(market: str) -> tuple[float, float, float, str]:
+        if market not in _barrier_cache:
+            _barrier_cache[market] = _label_barriers(market)
+        return _barrier_cache[market]
+
     take_profit_bps, stop_loss_bps, horizon_seconds, label_basis = _label_barriers()
     per_strategy = _per_strategy_labels_enabled()
     strategy_geometries: dict[str, Any] = {}
@@ -645,6 +774,9 @@ def build_live_training_rows_from_feature_journal(
 
     rows: list[dict[str, Any]] = []
     for symbol, symbol_frames in by_symbol.items():
+        take_profit_bps, stop_loss_bps, horizon_seconds, label_basis = _barriers_for(
+            _row_market(symbol)
+        )
         ordered = _dedupe_sorted_frames(symbol_frames)
         times = [_parse_frame_time(frame) for frame in ordered]
         # Future path points are label inputs too. Applying quality checks only
@@ -1336,6 +1468,64 @@ def _training_row_store_path(
     return journal.with_suffix(".training_rows.sqlite3")
 
 
+def _evict_stale_label_basis_rows(conn: sqlite3.Connection) -> int:
+    """Drop materialized rows labelled under a rule that is no longer in force.
+
+    Rows persist with their label baked into the payload, and roughly 59 fresh
+    rows land per cycle against a 100,000-row store. Changing the labelling rule
+    therefore changed almost nothing: the trainer kept fitting labels from the
+    superseded rule for thousands of cycles, and no field anywhere said so. The
+    artifact would report the new rule while the data underneath was the old one.
+
+    ``label_basis`` is already written into every payload and already names the
+    rule, so it is the invalidation key. Rows whose basis no longer matches the
+    one in force for their market are evicted and will re-materialize with a
+    current label. Rows predating the field are left alone rather than dropped
+    wholesale -- an unlabelled basis is not evidence of a stale basis, and
+    discarding the entire store on an upgrade would be worse than the staleness.
+    """
+    try:
+        current = {market: _label_barriers(market)[3] for market in ("KR", "US")}
+    except Exception:  # noqa: BLE001 - never let invalidation break training.
+        return 0
+    total = int(conn.execute("select count(*) from live_training_rows").fetchone()[0])
+    # Bounded on purpose, in two directions. A rule change makes EVERY row stale
+    # at once, and rows only re-materialize at roughly 59 per cycle against a
+    # 100,000-row store, so evicting the lot would leave the trainer with almost
+    # no data and the live model refitting on a handful of rows. Retiring a slice
+    # per cycle lets current labels displace superseded ones while the dataset
+    # stays large enough to fit, and the floor guarantees a trainable set exists
+    # at every point in between.
+    floor = max(0, int(_env_float("LIVE_TRAINING_STALE_LABEL_FLOOR_ROWS", 20_000)))
+    per_cycle = max(1, int(_env_float("LIVE_TRAINING_STALE_LABEL_EVICT_PER_CYCLE", 2_000)))
+    budget = min(per_cycle, max(0, total - floor))
+    if budget <= 0:
+        return 0
+    stale: list[str] = []
+    # Oldest first: those are the labels furthest from the rule now in force and
+    # the least likely to still be reachable in the feature journal.
+    for row_key, market, payload in conn.execute(
+        "select row_key, market, payload from live_training_rows order by as_of asc"
+    ):
+        if len(stale) >= budget:
+            break
+        try:
+            basis = json.loads(payload).get("label_basis")
+        except (TypeError, ValueError):
+            continue
+        if not basis:
+            continue
+        expected = current.get(str(market or "").strip().upper())
+        if expected and basis != expected:
+            stale.append(row_key)
+    if stale:
+        conn.executemany(
+            "delete from live_training_rows where row_key = ?",
+            ((key,) for key in stale),
+        )
+    return len(stale)
+
+
 def _merge_materialized_training_rows(
     path: Path,
     fresh_rows: list[dict[str, Any]],
@@ -1351,6 +1541,7 @@ def _merge_materialized_training_rows(
         conn.execute("pragma busy_timeout = 30000")
         _ensure_training_row_schema(conn)
         compacted = _compact_materialized_training_rows_once(conn)
+        stale_basis_rows = _evict_stale_label_basis_rows(conn)
         before_count = int(
             conn.execute("select count(*) from live_training_rows").fetchone()[0]
         )
@@ -1408,6 +1599,7 @@ def _merge_materialized_training_rows(
         "maximum_rows": maximum,
         "duplicate_rows_removed": int(compacted["duplicate_rows_removed"]),
         "invalid_rows_removed": int(compacted["invalid_rows_removed"]) + rejected_fresh_rows,
+        "stale_label_basis_rows": stale_basis_rows,
         "changed_keys": tuple(sorted(changed_keys)),
     }
 
@@ -1964,16 +2156,52 @@ def _feature_journal_max_bytes() -> int:
 
 
 def _discard_oversized_feature_journal(path: Path) -> None:
-    rotated = path.with_suffix(path.suffix + ".oversized")
+    """Retire an oversized feature journal, keeping the retired copy.
+
+    This used to rename the journal aside and then delete it, which destroyed
+    every frame it held. Measured on the live tape that is not a rare cleanup:
+    the journal grows about 22MB an hour against a 256MB cap, so the whole
+    feature history was being erased roughly every nine hours, silently and with
+    no record that it had happened. Anything not yet materialised into the
+    training row store was simply gone, and a re-labelling that needed to rebuild
+    from history had at most nine hours to rebuild from.
+
+    Keeping one retired segment costs one journal on disk and makes the loss
+    recoverable instead of final. The active file is still replaced, so the
+    property the original code cared about -- never parsing a giant file in the
+    live server -- is unchanged. ``scripts/prune_logs.py`` expires the segment by
+    the same rules it applies to every other rotated journal.
+
+    The event is also recorded, because a silent nine-hourly deletion of the
+    training input is exactly the kind of thing that should not have to be
+    discovered by noticing a model got worse.
+    """
+    retired = path.with_suffix(path.suffix + ".1")
     try:
-        if rotated.exists():
-            rotated.unlink()
-        os.replace(path, rotated)
-        rotated.unlink(missing_ok=True)
+        size = path.stat().st_size
+    except OSError:
+        size = -1
+    try:
+        retired.unlink(missing_ok=True)
+        os.replace(path, retired)
     except OSError:
         # Failing closed here means skipping this cycle, never loading the giant
         # file into the live server. A later frame writer/iteration retries rotation.
         return
+    try:
+        from app.audit import AuditLogger, log_path
+
+        AuditLogger(log_path("audit.jsonl")).record(
+            "feature_journal_retired",
+            {
+                "path": str(path),
+                "retired_to": str(retired),
+                "bytes": size,
+                "reason": "LIVE_FEATURE_JOURNAL_MAX_BYTES exceeded",
+            },
+        )
+    except Exception:  # noqa: BLE001 - never fail training on an audit write.
+        pass
     with _FEATURE_FRAME_CACHE_LOCK:
         _FEATURE_FRAME_CACHE.update(
             {"path": None, "offset": 0, "mtime_ns": None, "head_digest": None, "frames": []}

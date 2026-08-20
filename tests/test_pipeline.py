@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from app.audit import log_path
 from app.pipeline import _augment_live_cash_fit_signals, build_analysis_context
 from app.cli import run_demo
 from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderAction, RiskRules, SourceMetadata, StrategySignal
@@ -23,7 +24,11 @@ class PipelineTest(unittest.TestCase):
         self.assertGreater(len(result["strategy_signals"]), 0)
         self.assertGreater(len(result["order_intents"]), 0)
         self.assertGreater(len(result["risk_results"]), 0)
-        self.assertEqual(result["audit_log"], "logs/audit.jsonl")
+        # Compared against the resolver rather than the literal "logs/audit.jsonl":
+        # the journal directory is redirectable via OBAITS_LOG_DIR (conftest points
+        # the whole suite at a temp dir so a test run cannot write to the operator's
+        # audit trail), so pinning the string would assert the redirect had failed.
+        self.assertEqual(result["audit_log"], str(log_path("audit.jsonl")))
 
     def test_live_context_filters_domestic_and_overseas_by_one_share_cash(self) -> None:
         now = datetime.now(timezone.utc)

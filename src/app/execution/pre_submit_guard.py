@@ -196,15 +196,42 @@ class PreSubmitGuard:
         return ()
 
     def _check_freshness(
-        self, *, now: datetime, detail: dict[str, Any], **_: Any
+        self,
+        *,
+        ticker: str,
+        market: str,
+        now: datetime,
+        detail: dict[str, Any],
+        **_: Any,
     ) -> tuple[str, ...]:
         registry = self._freshness
         if registry is None:
             return ("PRESUBMIT_NO_EVIDENCE:DATA_FRESHNESS",)
-        blocking = tuple(registry.blocking_reasons(now=now))
+        all_blocking = tuple(registry.blocking_reasons(now=now))
+        # Freshness rows are retained for rotating subscription symbols.  A stale
+        # Samsung row must not veto a fresh INTC order (and vice versa). Keep
+        # unscoped infrastructure failures plus rows scoped to this order's symbol
+        # or market; every other symbol is irrelevant to this broker call.
+        symbol = str(ticker or "").strip().upper()
+        raw_market = str(market or "").strip().upper()
+        market_scopes = {
+            raw_market,
+            "KRX" if raw_market in {"KR", "KRX", "KOREA"} else "US",
+        }
+        blocking: tuple[str, ...] = tuple(
+            reason
+            for reason in all_blocking
+            if _freshness_reason_applies(
+                reason,
+                symbol=symbol,
+                market_scopes=market_scopes,
+            )
+        )
         if blocking:
             detail["stale_streams"] = list(blocking)
             return ("STALE_DATA",)
+        if all_blocking:
+            detail["ignored_stale_stream_count"] = len(all_blocking)
         return ()
 
     def _check_account(
@@ -243,6 +270,20 @@ def _parse(value: Any) -> datetime | None:
     return (moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)).astimezone(
         timezone.utc
     )
+
+
+def _freshness_reason_applies(
+    reason: str,
+    *,
+    symbol: str,
+    market_scopes: set[str],
+) -> bool:
+    """Whether ``STALE_DATA:source/type[:scope]`` applies to this order."""
+    parts = str(reason or "").split(":", 2)
+    if len(parts) < 3:
+        return True
+    scope = parts[2].strip().upper()
+    return not scope or scope == symbol or scope in market_scopes
 
 
 def default_pre_submit_guard(*, strict: bool | None = None) -> PreSubmitGuard:

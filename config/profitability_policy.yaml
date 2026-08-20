@@ -55,15 +55,16 @@ max_cost_to_alpha_ratio: 1.05
 # own cost. Both terms are estimates, so equality is a loss in expectation.
 #
 #   < 1.0    cost not covered                  -> never
-#   1.0-1.3  covered but inside the error bars  -> do not trade
+#   1.0-1.3  covered but inside the error bars  -> minimum size / warning
 #   1.3-1.7  real but thin                      -> shadow or minimum size
 #   >= 1.7   worth taking                       -> live candidate
 #
-# min_cost_coverage_ratio is the hard reject boundary (reason code
-# COST_COVERAGE_INSUFFICIENT); the 1.3-1.7 band only raises a COST_COVERAGE_THIN
-# warning so position sizing can keep it small. Override with
-# REALTIME_MIN_COST_COVERAGE_RATIO.
-min_cost_coverage_ratio: 1.3
+# The deterministic strategy already charges the full round-trip cost before it
+# can trigger. Requiring 1.3x again here duplicated that entry decision and made
+# a positive-net algorithm election impossible to execute. The final gate still
+# recomputes actual all-in cost and rejects coverage below 1.0; 1.0-1.7 remains a
+# warning/sizing band. Override with REALTIME_MIN_COST_COVERAGE_RATIO.
+min_cost_coverage_ratio: 1.0
 cost_coverage:
   covered: 1.0
   live: 1.3

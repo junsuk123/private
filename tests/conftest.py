@@ -16,8 +16,31 @@ Both are session-scoped and autouse: no test should have to remember this.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
+
+# --------------------------------------------------------------------------- #
+# The operator's journals, redirected before ANY product module is imported.
+# --------------------------------------------------------------------------- #
+# This runs at conftest import, not inside a fixture, and that is the whole point.
+# pytest imports the test modules -- and therefore ``app.web`` and friends -- before
+# any fixture body executes, and ``app.web`` resolves its audit path at module level.
+# A fixture would be too late for exactly the sink that writes most.
+#
+# What it prevents, measured on 2026-08-19 before the redirect existed: the journals
+# a funded account is reconciled against had accumulated 6,162 ``LAB`` order records
+# in ``logs/live-orders.jsonl`` and 665 demo-issuer (900001/900002) entries in
+# ``logs/audit.jsonl``, written by tests that constructed a ``LiveOrderJournal``,
+# ``DecisionLogger`` or ``RiskManager`` without naming a path. Those paths were
+# default ARGUMENTS pointing at ``logs/``, so "did not pass a path" meant "wrote to
+# production". A synthetic order sitting in the real order journal is not untidiness;
+# it is an audit trail that can no longer be trusted to mean what it says.
+#
+# ``setdefault``, so a deliberate OBAITS_LOG_DIR (a CI artifact directory, say) wins.
+os.environ.setdefault(
+    "OBAITS_LOG_DIR", tempfile.mkdtemp(prefix="obaits-test-logs-")
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -29,6 +52,7 @@ def isolated_process_wide_stores(tmp_path_factory):
             "STRATEGY_PERFORMANCE_STORE_PATH",
             "CHANGE_POINT_STATE_PATH",
             "TRADING_STATE_DB_PATH",
+            "ADAPTIVE_THRESHOLDS_STORE_PATH",
         )
     }
     os.environ["STRATEGY_PERFORMANCE_STORE_PATH"] = str(root / "strategy-performance.sqlite3")
@@ -37,21 +61,31 @@ def isolated_process_wide_stores(tmp_path_factory):
     # intents and gate verdicts into the operator's data/store, and the seasonality
     # baselines would accumulate synthetic observations across runs.
     os.environ["TRADING_STATE_DB_PATH"] = str(root / "trading-state.sqlite3")
+    # Learned entry policy: adapted thresholds and the edge calibrator. Reached
+    # from every algorithm trigger, and it WRITES -- so without redirection a test
+    # run edits the strictness a funded account trades on. It also reads, which is
+    # not merely untidy: the calibrator had learned enough from the live tape to
+    # refuse a trade a signal-engine test asserted, so the suite's result depended
+    # on how the real system happened to be doing that morning.
+    os.environ["ADAPTIVE_THRESHOLDS_STORE_PATH"] = str(root / "adaptive-thresholds.sqlite3")
 
     # The singletons may already exist if an earlier import touched them.
     from app.graph import change_point
     from app.storage import trading_state_store
+    from app.technical import adaptive_thresholds
     from app.trading import strategy_performance_store
 
     strategy_performance_store.reset_default_store()
     change_point.reset_default_detector()
     trading_state_store.reset_default_trading_state_store()
+    adaptive_thresholds.reset_default_adaptive_thresholds()
     try:
         yield root
     finally:
         strategy_performance_store.reset_default_store()
         change_point.reset_default_detector()
         trading_state_store.reset_default_trading_state_store()
+        adaptive_thresholds.reset_default_adaptive_thresholds()
         for name, value in previous.items():
             if value is None:
                 os.environ.pop(name, None)

@@ -8,7 +8,7 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
-from app.audit import AuditLogger
+from app.audit import AuditLogger, log_path
 from app.backtesting import run_accelerated_demo
 from app.execution import PaperOrderExecutor
 from app.pipeline import build_analysis_context
@@ -35,7 +35,7 @@ def run_demo(research_result: ResearchRunResult | None = None) -> dict[str, Any]
         if result.approved and result.final_order is not None
     )
 
-    audit = AuditLogger(Path("logs/audit.jsonl"))
+    audit = AuditLogger(log_path("audit.jsonl"))
     audit.record("portfolio_report", context.report)
     audit.record("strategy_signals", context.signals)
     audit.record("order_intents", context.intents)
@@ -51,7 +51,7 @@ def run_demo(research_result: ResearchRunResult | None = None) -> dict[str, Any]
         "order_intents": context.intents,
         "risk_results": context.risk_results,
         "paper_receipts": paper_receipts,
-        "audit_log": "logs/audit.jsonl",
+        "audit_log": str(log_path("audit.jsonl")),
         "store_summary": store.summary(),
     }
 

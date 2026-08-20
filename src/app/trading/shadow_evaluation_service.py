@@ -275,10 +275,42 @@ class ShadowEvaluationService:
         The shadow journal always gets it (including unexecutable signals, which the
         holdout windows and borrow-availability rate both need). The performance store
         gets it too, tagged ``evaluation_source=shadow`` and with
-        ``signal_executable`` reflecting whether a locate existed — that flag is what
-        keeps unexecutable signals out of every promotion statistic while still
-        counting them in the borrow denominator.
+        ``signal_executable`` reflecting whether the trade was placeable at all —
+        a borrow locate existed AND the entry gate admitted the signal. That flag
+        is what keeps unexecutable signals out of every promotion statistic while
+        still counting them in the borrow denominator.
         """
+        # Close the learning loop. This is the only label this system gets: it
+        # acted, it observed a signed net return, and that is the supervision.
+        # Fed BEFORE the journal write so a failure in the journal cannot silently
+        # stop the thresholds from learning.
+        try:
+            from app.technical.adaptive_thresholds import (
+                default_adaptive_thresholds,
+                resolve_market as _adaptive_market,
+            )
+
+            # The calibration label: what this arm CLAIMED against what it PAID,
+            # gross so the two are the same quantity (the claim is a gross edge).
+            from app.technical.adaptive_thresholds import default_edge_calibrator
+
+            predicted_gross = getattr(outcome, "predicted_gross_edge_bps", None)
+            if predicted_gross is not None and outcome.gross_return_bps is not None:
+                default_edge_calibrator().record(
+                    outcome.key.strategy_id,
+                    _adaptive_market(outcome.symbol),
+                    predicted_edge_bps=float(predicted_gross),
+                    realized_gross_bps=float(outcome.gross_return_bps),
+                )
+            if outcome.net_return_bps is not None:
+                default_adaptive_thresholds().record_outcome(
+                    outcome.key.strategy_id,
+                    _adaptive_market(outcome.symbol),
+                    realized_net_bps=float(outcome.net_return_bps),
+                    admissible=bool(outcome.executable and outcome.signal_admissible),
+                )
+        except Exception:  # noqa: BLE001 - learning must not break the engine loop.
+            logger.exception("failed to feed adaptive thresholds for %s", outcome.plan_id)
         try:
             self.shadow_store.record_outcome(outcome)
         except Exception:  # noqa: BLE001 - journaling must not break the engine loop.
@@ -309,7 +341,16 @@ class ShadowEvaluationService:
                     else None
                 ),
                 borrow_fee_bps=None,
-                signal_executable=outcome.executable,
+                # Two independent ways a signal was never placeable, and BOTH
+                # must keep it out of the posterior: no borrow locate, or an
+                # entry gate that already refused it. The second one is why the
+                # bandit stalled -- 1,315 shadow rows averaging -107bps were
+                # written here with signal_executable=1, of which the large
+                # majority carried EDGE_BELOW_COST_FLOOR. The posterior then
+                # measured the rejected region, concluded every arm was deeply
+                # negative, and blocked the live trades that region says nothing
+                # about. The journal above still records them either way.
+                signal_executable=bool(outcome.executable) and bool(outcome.signal_admissible),
             )
         except Exception:  # noqa: BLE001
             logger.exception("failed to record shadow outcome %s", outcome.plan_id)

@@ -2090,6 +2090,24 @@ class RealtimeTradingEngine:
         with self._lock:
             self._status["cycles"] += 1
             self._status["last_cycle_at"] = summary["at"]
+            # Leave a mark any process can read. The engine lives in one
+            # process's memory, so without this an observer that does not own it
+            # -- the read-only instance published behind Funnel -- reports the
+            # engine stopped while it is running here.
+            try:
+                from app.monitoring import worker_heartbeat
+
+                worker_heartbeat.record(
+                    worker_heartbeat.TRADING_ENGINE,
+                    detail={
+                        "cycles": self._status.get("cycles"),
+                        "last_cycle_at": summary["at"],
+                        "submitted": self._status.get("submitted"),
+                        "errors": self._status.get("errors"),
+                    },
+                )
+            except Exception:  # noqa: BLE001 - never break the trading loop.
+                pass
             self._status["submitted"] += summary["submitted"]
             self._status["amended"] += summary.get("amended", 0)
             self._status["buy_submitted"] += summary.get("buy_submitted", 0)

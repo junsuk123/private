@@ -429,6 +429,28 @@ class MicroSymbolReasoner:
                     "liquidity_score": features.liquidity_score,
                 }
             )
+        positive_events = [
+            item
+            for item in data.event_evidence
+            if str(item.get("sentiment") or "").upper() == "POSITIVE"
+        ]
+        if positive_events:
+            freshest = min(
+                positive_events,
+                key=lambda item: float(item.get("age_seconds", float("inf")) or 0.0),
+            )
+            age = freshest.get("age_seconds")
+            ttl = freshest.get("ttl_seconds")
+            if age is not None and ttl is not None:
+                measured_diagnostics.update(
+                    {
+                        "event_age_seconds": float(age),
+                        "event_ttl_seconds": float(ttl),
+                        "positive_event_score": float(
+                            freshest.get("confidence", 0.0) or 0.0
+                        ),
+                    }
+                )
         return MicroReasoningResult(
             timestamp=data.timestamp,
             symbol=data.symbol,

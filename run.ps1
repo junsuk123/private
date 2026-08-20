@@ -14,7 +14,16 @@ param(
   # machine sees. Off by default: this server has no authentication of its own and
   # accepts live-trading and shutdown requests, so reachability and a token are one
   # decision. A token is generated and printed if APP_ACCESS_TOKEN is not already set.
-  [switch]$External
+  [switch]$External,
+  # The public read-only site on 8110 comes up with an ordinary launch, because
+  # Tailscale Funnel is a persisted tailscaled setting: it stays pointed at
+  # 100.x:8110 across reboots, so whenever that port is empty the published URL
+  # serves 502 to anyone who opens it. Tying the site's lifetime to this launcher
+  # is what keeps the two in step. Pass this to leave it down.
+  [switch]$NoExternalSite,
+  # Port for that site. Outside 8000-8050 on purpose: this launcher stops every
+  # app-server listener in that range when it starts.
+  [int]$ExternalSitePort = 8110
 )
 
 $ErrorActionPreference = "Stop"
@@ -711,6 +720,10 @@ Set-RunEnv "REQUIRE_MANUAL_ARMING" "false"
 # 전역 (종목, 전략, 방향) 공동 순위와 NO_TRADE를 사용한다. 종목별 GNN
 # 1등을 먼저 확정하면 최종 밴딧과 다른 목적함수로 전역 우승 조합을 버릴 수 있다.
 Set-RunEnv "STRATEGY_SESSION_GNN_DIRECT_ELECTION" "false"
+# Deterministic ontology/strategy policy is the baseline; learned estimates and
+# realised posteriors refine its ranking. Cold live probes are capped at 10%.
+Set-RunEnv "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION" "true"
+Set-DefaultEnv "BANDIT_EXPLORATION_SIZE_FRACTION" "0.10"
 # --- Event-driven market-data ingestion (2026-08-04) ---------------------------------
 # 국내·미국 실시간 수집을 event bus + 영속화 워커 경로로 돌린다. 켜면:
 #   * 분 bar 를 in-memory 집계기(IncrementalMinuteBarBuilder)로 만든다 — 메시지마다
@@ -785,6 +798,21 @@ Set-DefaultEnv "REALTIME_US_ROTATION_POOL_MULTIPLIER" "3"
 # Keep each window for one full model-label horizon before rotating it.
 Set-DefaultEnv "REALTIME_US_WATCHLIST_RECHECK_SEC" "600"
 Set-DefaultEnv "GNN_TRUST_HORIZON_SECONDS" "1800"
+# Upside-head authorisation needs 20 FILLED label rows per (strategy, market). Left at the
+# code default deliberately, with the measurement that justifies it recorded here.
+#
+# On 2026-08-19 this was briefly lowered to 16 to admit bar_confirmed_vwap_recovery on KRX,
+# which showed +15.5bps mean net over 16 filled rows -- three times the +5.0bps bar -- and
+# was the only ontology-passable pair anywhere near authorisation. Retraining the
+# strategy-utility checkpoint the same day (100,260 -> 173,091 rows) resolved that pair to
+# 42 filled rows at -23.3bps. The +15.5 was small-sample noise, and a threshold of 16 would
+# have opened an upside head on a strategy that loses 23bps a round trip.
+#
+# The same retrain collapsed every other thin positive in the KRX table the same way:
+# cross_sectional_relative_strength 83/+12.2 -> 160/-4.1, ofi_microprice 2/+115.2 -> 17/+1.7,
+# rvgi_box_breakout 1/+42.2 -> 5/+1.5, liquidity_shock_reversal 1/+22.6 -> 11/-28.1.
+# Twenty rows is what separates those from a measurement. Do not lower it again without a
+# checkpoint that carries the rows on its own.
 # Run the new context/utility selector beside the legacy authority. This records
 # Starts in SHADOW and gathers coverage/counterfactual outcomes. The persisted controller
 # may later grant V2 LIVE_PROBE/LIVE selection authority; order construction and every
@@ -1057,8 +1085,140 @@ $url = "http://${localHost}:$port"
 $launchUrl = "$url/account"
 $server = $null
 $browser = $null
+function Test-TcpPortOpen {
+  param([string]$TargetHost, [int]$Port)
+  try {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $async = $client.BeginConnect($TargetHost, $Port, $null, $null)
+    $ok = $async.AsyncWaitHandle.WaitOne(700)
+    if ($ok) { $client.EndConnect($async) }
+    $client.Close()
+    return [bool]$ok
+  } catch { return $false }
+}
+
+function Start-PublicReadOnlySite {
+  <#
+    .SYNOPSIS
+      Bring up the read-only proxy that Tailscale Funnel publishes.
+
+    .DESCRIPTION
+      A proxy in front of the server this launcher just started -- NOT a second
+      application instance. That distinction is the whole point.
+
+      The published port used to run its own copy of the application in
+      read-only mode. It shared the SQLite stores, so account and market figures
+      matched, but the trading engine, the worker threads and the operation mode
+      live in the LIVE process's memory, and a second process can only report on
+      itself. The published dashboard therefore showed a stopped engine, three of
+      five workers, mode "learning" and readiness 0.75 while the engine was
+      mid-session at full readiness one port away. It also doubled the memory and
+      re-derived everything the live process had already computed.
+
+      Relaying instead removes the question. One process owns the workers and the
+      stores; the published page is the page the local server serves, because it
+      is that page. scripts/run_public_proxy.sh owns the tailnet bind, the token
+      and the read-only enforcement.
+
+      Idempotent: if something is already serving the port it is left alone,
+      which is what makes an ordinary relaunch safe while the site is up.
+  #>
+  param([int]$Port)
+
+  $bind = $null
+  try {
+    foreach ($line in (& tailscale ip -4 2>$null)) {
+      $candidate = ([string]$line).Trim()
+      if ($candidate -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') { $bind = $candidate; break }
+    }
+  } catch { $bind = $null }
+  if (-not $bind) {
+    Write-Host "External site: skipped (Tailscale is not up, so there is no address to publish)." -ForegroundColor DarkGray
+    return $null
+  }
+  if (Test-TcpPortOpen -TargetHost $bind -Port $Port) {
+    Write-Host "External site: already serving ${bind}:${Port}; left running." -ForegroundColor DarkGray
+    return $null
+  }
+
+  $script = Join-ProjectPath "scripts" "run_public_proxy.sh"
+  if (-not (Test-Path $script)) {
+    Write-Host "External site: skipped ($script not found)." -ForegroundColor Yellow
+    return $null
+  }
+
+  $outLog = Join-ProjectPath "logs" "public-proxy.out.log"
+  $errLog = Join-ProjectPath "logs" "public-proxy.err.log"
+  $arguments = @{
+    FilePath               = "/usr/bin/env"
+    ArgumentList           = @("bash", $script, "--port", "$Port")
+    WorkingDirectory       = $PSScriptRoot
+    RedirectStandardOutput = $outLog
+    RedirectStandardError  = $errLog
+    PassThru               = $true
+  }
+
+  try {
+    $proc = Start-Process @arguments
+  } catch {
+    Write-Host "External site: failed to start ($($_.Exception.Message))." -ForegroundColor Yellow
+    return $null
+  }
+
+  # Seconds, not minutes: the proxy loads no models and holds no state. The wait
+  # is short but not skipped, because reporting a URL before it answers is how a
+  # working link becomes a support question.
+  $deadline = (Get-Date).AddSeconds(45)
+  while ((Get-Date) -lt $deadline) {
+    if ($proc.HasExited) {
+      Write-Host "External site: process exited during startup; see $errLog." -ForegroundColor Yellow
+      return $null
+    }
+    if (Test-TcpPortOpen -TargetHost $bind -Port $Port) { break }
+    Start-Sleep -Milliseconds 750
+  }
+  if (-not (Test-TcpPortOpen -TargetHost $bind -Port $Port)) {
+    Write-Host "External site: not reachable on ${bind}:${Port} yet; see $outLog." -ForegroundColor Yellow
+    return $proc
+  }
+
+  Write-Host ""
+  Write-Host "External read-only view: http://${bind}:${Port}  (relays this server; GET only)" -ForegroundColor Cyan
+  Write-Host "  account balances and holdings are visible to anyone holding the token" -ForegroundColor Yellow
+  # Read the token from its file rather than scraping the log. run.py prints its
+  # own "Reachable on this network: ...token=..." line with the value redacted,
+  # and a last-match-wins scrape picks that one up and publishes a URL whose
+  # token is the literal string "...".
+  $tokenFile = Join-ProjectPath "config" "secrets" "public_readonly_token"
+  $token = $null
+  if (Test-Path $tokenFile) {
+    $token = (Get-Content -Path $tokenFile -Raw).Trim()
+    if ($token.Length -lt 16) { $token = $null }
+  }
+  $publicHost = $null
+  try {
+    $funnel = (& tailscale funnel status 2>$null) -join "`n"
+    if ($funnel -match 'https://([A-Za-z0-9\.\-]+\.ts\.net)') { $publicHost = $Matches[1] }
+  } catch { }
+  if ($publicHost -and $funnel -match [regex]::Escape("${bind}:${Port}")) {
+    if ($token) {
+      Write-Host "Published on the internet via Funnel:" -ForegroundColor Cyan
+      Write-Host "  https://$publicHost/account?token=$token" -ForegroundColor Cyan
+    } else {
+      Write-Host "Published on the internet via Funnel: https://$publicHost" -ForegroundColor Cyan
+      Write-Host "  token unavailable; run scripts/run_public_proxy.sh --show-token" -ForegroundColor DarkGray
+    }
+  } else {
+    Write-Host "Funnel is not pointed at this port. As root, once:" -ForegroundColor DarkGray
+    Write-Host "  sudo tailscale funnel --bg --https=443 http://${bind}:${Port}" -ForegroundColor DarkGray
+  }
+  Write-Host ""
+  return $proc
+}
+
 $browserProfile = $null
 $browserStartedAt = $null
+$publicSite = $null
 
 try {
   $serverArguments = @{
@@ -1082,6 +1242,10 @@ try {
   Write-Host "Web UI: $url"
   Write-Host "Account dashboard: $launchUrl"
   Write-Host "Server logs: $serverOutLog"
+
+  if (-not $NoExternalSite) {
+    $publicSite = Start-PublicReadOnlySite -Port $ExternalSitePort
+  }
 
   if ($External) {
     # The address another device can actually open — "0.0.0.0" is not one. Printed
@@ -1134,14 +1298,26 @@ try {
     $browserProfile = Join-ProjectPath "data" "runtime" "managed-browser-profile"
     New-Item -ItemType Directory -Force -Path $browserProfile | Out-Null
     $browserStartedAt = Get-Date
+    # Chrome writes its own diagnostics to stderr -- a snap GLIBCXX mismatch in
+    # libgiolibproxy, an accessibility bus it cannot reach, a GCM registration
+    # quota -- none of which say anything about this application. Inherited, they
+    # bury the two lines that matter (the URL and the token) in noise that reads
+    # like a failed start. Sent to a log they stay available and stop lying.
+    $browserLog = Join-ProjectPath "logs" "managed-browser.err.log"
     $browser = Start-Process `
       -FilePath $browserExe `
       -ArgumentList @(
         "--app=$launchUrl",
         "--user-data-dir=$browserProfile",
         "--no-first-run",
-        "--disable-extensions"
+        "--disable-extensions",
+        # Silences the GCM registration attempt (and its QUOTA_EXCEEDED error);
+        # a local dashboard window has no use for push messaging.
+        "--disable-features=OptimizationGuideModelDownloading,PushMessaging",
+        "--disable-background-networking",
+        "--log-level=3"
       ) `
+      -RedirectStandardError $browserLog `
       -PassThru
     Write-Host "Opened managed browser window (PID $($browser.Id))."
     Write-Host "Close that browser window to stop the server, or press Ctrl+C here to close both."
@@ -1193,6 +1369,13 @@ try {
     if (-not $server.HasExited) {
       Stop-ProcessTree -RootProcessId ([int]$server.Id)
     }
+  }
+  if ($publicSite -and -not $publicSite.HasExited) {
+    # Stopped with the rest: leaving it up would keep a real portfolio published
+    # after "Local app stopped." was printed. Funnel itself stays configured --
+    # it is a tailscaled setting, not ours -- so the URL serves 502 until the
+    # next launch brings the site back.
+    Stop-ProcessTree -RootProcessId ([int]$publicSite.Id)
   }
   # Whatever is still bound after that is not ours to negotiate with.
   if (-not (Test-PortRangeFree)) {

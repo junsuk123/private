@@ -1510,6 +1510,7 @@ class RealtimeModesTest(unittest.TestCase):
             ),
             patch("app.web._is_live_buy_candidate_symbol", return_value=True),
             patch("app.web._is_open_live_market_ticker", return_value=True),
+            patch("app.web._candidate_has_ready_strategy_tick_window", return_value=True),
             patch("app.web._live_affordable_buy_candidate_symbols") as broker_discovery,
         ):
             store_cls.return_value.active_symbols.return_value = ("HST", "HUYA")
@@ -1535,6 +1536,7 @@ class RealtimeModesTest(unittest.TestCase):
             patch("app.web._is_live_buy_candidate_symbol", return_value=True),
             patch("app.web._is_open_live_market_ticker", return_value=True),
             patch("app.web._ticker_market_group_for_live_trading", return_value="US"),
+            patch("app.web._candidate_has_ready_strategy_tick_window", return_value=True),
         ):
             store_cls.return_value.active_symbols.return_value = ("AXTI", "INTC")
             with web_module._live_lock:
@@ -1548,6 +1550,47 @@ class RealtimeModesTest(unittest.TestCase):
                     web_module._kis_overseas_realtime_state.update(previous)
 
         assert candidates == ("INTC",)
+
+    def test_strategy_tick_window_rejects_a_currently_silent_symbol(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        class Store:
+            def recent_ticks(self, symbol, since, *, until=None):
+                return (
+                    SimpleNamespace(
+                        source="kis_realtime_websocket",
+                        exchange_timestamp=now - timedelta(seconds=1),
+                        meta=SimpleNamespace(is_tradeable=True),
+                    ),
+                )
+
+            def latest_orderbook(self, symbol):
+                return SimpleNamespace(received_at=now)
+
+        assert not web_module._candidate_has_ready_strategy_tick_window(
+            "SOFI", Store(), now=now
+        )
+
+    def test_strategy_tick_window_accepts_two_seconds_and_a_fresh_book(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        class Store:
+            def recent_ticks(self, symbol, since, *, until=None):
+                return tuple(
+                    SimpleNamespace(
+                        source="kis_realtime_websocket",
+                        exchange_timestamp=now - timedelta(seconds=seconds),
+                        meta=SimpleNamespace(is_tradeable=True),
+                    )
+                    for seconds in (1, 2)
+                )
+
+            def latest_orderbook(self, symbol):
+                return SimpleNamespace(received_at=now - timedelta(seconds=1))
+
+        assert web_module._candidate_has_ready_strategy_tick_window(
+            "INTC", Store(), now=now
+        )
 
     def test_web_macro_observer_uses_live_us_market_context(self) -> None:
         now = datetime.now(timezone.utc)
@@ -1636,6 +1679,42 @@ class RealtimeModesTest(unittest.TestCase):
         diagnostics = bundle.macro_result.diagnostics
         self.assertEqual(diagnostics["market_context_symbol_count"], 2)
         self.assertEqual(diagnostics["trading_candidate_input_count"], 0)
+
+    def test_election_evidence_keeps_market_capacity_for_risk_gate(self) -> None:
+        rows = {"AXTI": {"symbol": "AXTI", "technical_features": {}}}
+        web_module._enrich_election_market_metadata(
+            rows,
+            (
+                SimpleNamespace(
+                    ticker="AXTI",
+                    company_name="AXT Inc",
+                    sector="Technology",
+                    average_daily_trading_value=12_500_000.0,
+                    volatility_20d=0.031,
+                ),
+            ),
+        )
+
+        self.assertEqual(rows["AXTI"]["average_daily_trading_value"], 12_500_000.0)
+        self.assertEqual(rows["AXTI"]["volatility_20d"], 0.031)
+        self.assertEqual(rows["AXTI"]["sector"], "Technology")
+
+    def test_live_orderable_cash_provider_maps_us_market_to_usd(self) -> None:
+        account = AccountSnapshot(
+            cash=95_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 95_000.0, "USD": 211.82},
+            orderable_cash_by_currency={"KRW": 390_000.0, "USD": 211.82},
+        )
+        order = SimpleNamespace(ticker="CAMT", market="NASD")
+
+        with patch(
+            "app.web._realtime_engine_account_snapshot",
+            return_value=account,
+        ):
+            available = web_module._live_orderable_cash_for_order(order)
+
+        self.assertEqual(available, 211.82)
 
     def test_us_learning_watchlist_stays_fixed_during_cache_ttl(self) -> None:
         account = AccountSnapshot(
@@ -1865,6 +1944,7 @@ class RealtimeModesTest(unittest.TestCase):
     def test_us_learning_fast_poll_keeps_holdings_ahead_of_warm_symbols(self) -> None:
         with (
             patch("app.web._active_operation_mode", return_value="learning"),
+            patch("app.web._armed_us_strategy_symbol", return_value=""),
             patch("app.web._sticky_us_learning_symbols", return_value=("EDTK", "MSFT")),
         ):
             symbols = web_module._us_fast_poll_target_symbols(("F", "EDTK"))
@@ -1880,6 +1960,7 @@ class RealtimeModesTest(unittest.TestCase):
         try:
             with (
                 patch("app.web._active_operation_mode", return_value="live_trading"),
+                patch("app.web._armed_us_strategy_symbol", return_value=""),
                 patch("app.web._sticky_us_learning_symbols", return_value=("AAPL", "MSFT")) as warm,
                 patch.dict("os.environ", {"AUTO_RELIABILITY_US_WARM_SYMBOLS": "2"}),
             ):
@@ -1891,6 +1972,16 @@ class RealtimeModesTest(unittest.TestCase):
             with web_module._live_lock:
                 web_module._us_learning_watchlist_cache.clear()
                 web_module._us_learning_watchlist_cache.update(previous)
+
+    def test_us_fast_poll_pins_the_armed_strategy_symbol(self) -> None:
+        with (
+            patch("app.web._active_operation_mode", return_value="live_trading"),
+            patch("app.web._armed_us_strategy_symbol", return_value="CAMT"),
+            patch("app.web._sticky_us_learning_symbols", return_value=("AAPL", "MSFT")),
+        ):
+            symbols = web_module._us_fast_poll_target_symbols(("F",))
+
+        self.assertEqual(symbols, ("F", "CAMT", "AAPL", "MSFT"))
 
     def test_us_fast_poll_keeps_websocket_symbols_for_feature_collection(self) -> None:
         with (

@@ -122,7 +122,7 @@ def test_ranking_puts_exploration_inside_the_truncation_budget(tmp_path):
     database = _store(tmp_path, prints)
 
     selected, _cursor, stats = rank_by_print_density(
-        [*loud, *quiet], database=database, limit=12, cursor=0
+        [*loud, *quiet], database=database, limit=12, cursor=0, now=AT
     )
     assert stats["applied"] is True
     assert stats["dense"] == 20
@@ -141,7 +141,7 @@ def test_ranking_fails_open(tmp_path, database, candidates):
     """Losing the ranking is worse than keeping a few quiet names."""
     path = database if database is not None else _store(tmp_path, {})
     selected, cursor, stats = rank_by_print_density(
-        candidates, database=path, limit=10, cursor=7
+        candidates, database=path, limit=10, cursor=7, now=AT
     )
     assert stats["applied"] is False
     assert list(selected) == candidates
@@ -157,7 +157,7 @@ def test_all_quiet_leaves_the_ranking_alone(tmp_path):
     """
     database = _store(tmp_path, {"000110": 3, "000220": 2, "000330": 1})
     selected, cursor, stats = rank_by_print_density(
-        ["000110", "000220", "000330"], database=database, limit=3, cursor=4
+        ["000110", "000220", "000330"], database=database, limit=3, cursor=4, now=AT
     )
     assert stats["applied"] is False
     assert stats["reason"] == "NO_DENSE_CANDIDATE"
@@ -174,7 +174,7 @@ def test_a_window_with_no_krx_market_minutes_is_not_an_opinion(tmp_path):
     """
     database = _store(tmp_path, {"AAPL": 5000, "INTC": 4000})
     selected, cursor, stats = rank_by_print_density(
-        ["005930", "000660"], database=database, limit=2, cursor=9
+        ["005930", "000660"], database=database, limit=2, cursor=9, now=AT
     )
     assert stats["applied"] is False
     assert stats["reason"] == "NO_MEASUREMENT"
@@ -186,7 +186,7 @@ def test_filter_can_be_switched_off(tmp_path, monkeypatch):
     database = _store(tmp_path, {"005930": 2000, "088350": 0})
     monkeypatch.setenv("REALTIME_KRX_DENSITY_FILTER_ENABLED", "0")
     selected, _cursor, stats = rank_by_print_density(
-        ["088350", "005930"], database=database, limit=2, cursor=0
+        ["088350", "005930"], database=database, limit=2, cursor=0, now=AT
     )
     assert stats["applied"] is False
     assert stats["reason"] == "DISABLED"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -144,6 +145,51 @@ def test_live_and_stored_paths_share_the_same_session_values() -> None:
     assert stored_values["intraday_momentum_signal"] == pytest.approx(
         .5 + live["first_half_hour_return_bps"] / 200.0
     )
+
+
+def test_us_gap_context_is_available_after_first_bar_not_after_thirty_minutes() -> None:
+    ny = ZoneInfo("America/New_York")
+    previous = datetime(2026, 8, 18, 15, 59, tzinfo=ny)
+    current = datetime(2026, 8, 19, 9, 30, tzinfo=ny)
+    rows = (
+        SimpleNamespace(
+            minute_start=previous, open=100.0, high=100.0, low=100.0,
+            close=100.0, volume=100,
+        ),
+        SimpleNamespace(
+            minute_start=current, open=102.0, high=102.5, low=101.8,
+            close=102.2, volume=100,
+        ),
+    )
+    result = _session_structure_diagnostics(
+        SimpleNamespace(recent_minute_bars=lambda *_args, **_kwargs: rows),
+        "INTC",
+        datetime(2026, 8, 19, 13, 32, tzinfo=timezone.utc),
+    )
+
+    assert result["previous_close_price"] == 100.0
+    assert result["session_open_price"] == 102.0
+    assert result["gap_rate"] == pytest.approx(0.02)
+    assert result["gap_submode"] == "continuation"
+    assert "opening_range_high" not in result
+
+
+def test_us_session_context_does_not_reuse_yesterday_before_regular_open() -> None:
+    ny = ZoneInfo("America/New_York")
+    old = datetime(2026, 8, 18, 15, 59, tzinfo=ny)
+    rows = (
+        SimpleNamespace(
+            minute_start=old, open=100.0, high=100.0, low=100.0,
+            close=100.0, volume=100,
+        ),
+    )
+    result = _session_structure_diagnostics(
+        SimpleNamespace(recent_minute_bars=lambda *_args, **_kwargs: rows),
+        "INTC",
+        datetime(2026, 8, 19, 13, 0, tzinfo=timezone.utc),
+    )
+
+    assert result == {}
 
 
 def test_micro_diagnostics_preserve_measured_session_fields() -> None:

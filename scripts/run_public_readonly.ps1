@@ -30,7 +30,15 @@
      is enforced on exactly the traffic that needs it. Do not "simplify" this to
      127.0.0.1.
 
-  3. PORT OUTSIDE 8000-8050. run.ps1 stops every python run.py listener in that
+  3. --keep-existing-servers IS REQUIRED, NOT OPTIONAL. run.py's
+     _stop_existing_app_servers matches other instances by command line and
+     workspace path, NOT by port: any python process in this workspace whose
+     command mentions run.py or app.web:app is killed on startup. Without this
+     flag, launching the published instance terminates the live trading engine.
+     Choosing a port outside run.ps1's sweep range is not sufficient, because
+     that sweep and this one are different mechanisms.
+
+  4. PORT OUTSIDE 8000-8050. run.ps1 stops every python run.py listener in that
      range when it starts, so a second instance inside it would be killed by the
      next ordinary launch of the live server.
 
@@ -141,4 +149,4 @@ Write-Host "  # point it at ${bindAddress}, NEVER 127.0.0.1 - see this script's 
 Write-Host "  # off again: sudo tailscale funnel --https=443 off" -ForegroundColor DarkGray
 Write-Host ""
 
-& $python run.py --skip-startup-checks --host $bindAddress --port $Port --strict-port
+& $python run.py --skip-startup-checks --keep-existing-servers --host $bindAddress --port $Port --strict-port

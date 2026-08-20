@@ -188,6 +188,11 @@ class FastLoopRunner:
         )
 
         request = executor.on_tick(tick, now=moment)
+        # Stamped from the wall clock, NOT from ``moment``: a latency is elapsed real
+        # time, and marking it with an injected clock would report 0.0 for every span
+        # whenever a caller supplies ``now``. ``moment`` governs decision logic only.
+        # The corollary for callers: a span is only meaningful if the tick's
+        # ``received_time`` came from the same real clock.
         self._latency.mark(span, "strategy_decision")
         if request is None:
             self._latency.finish(span, outcome="NO_ACTION")

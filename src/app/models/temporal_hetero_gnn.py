@@ -62,6 +62,7 @@ from app.ontology.market_graph import NODE_TYPES, RELATION_TYPES
 
 __all__ = [
     "GNN_HEADS",
+    "SUPERVISED_HEADS",
     "InferenceTrace",
     "REGIME_LABELS",
     "STRATEGY_FAMILIES",
@@ -69,6 +70,12 @@ __all__ = [
     "TemporalHeteroGnnConfig",
     "TemporalHeteroGnnOutput",
 ]
+
+#: Heads that carry a training signal, named as the loss decomposition names them. A
+#: checkpoint records which of these were actually supervised, because an unsupervised
+#: head still emits confident-looking numbers from its initialisation and nothing in the
+#: tensor itself distinguishes the two.
+SUPERVISED_HEADS: tuple[str, ...] = ("regime", "trade_quality", "expected_return")
 
 #: Multi-label regime catalogue. Order is part of the checkpoint contract: appending is
 #: safe, reordering invalidates every stored model.
@@ -289,6 +296,10 @@ class TemporalHeteroGnn:
 
     def __init__(self, config: TemporalHeteroGnnConfig) -> None:
         self.config = config
+        #: Heads this instance's weights were fitted against. A freshly constructed model
+        #: has been fitted against none; ``load_checkpoint`` and ``save_checkpoint`` set
+        #: it from the artifact.
+        self.trained_heads: tuple[str, ...] = ()
         rng = np.random.default_rng(config.seed)
         hidden = config.hidden_dim
 
@@ -566,18 +577,32 @@ class TemporalHeteroGnn:
         "head_scalar_bias",
     )
 
-    def save_checkpoint(self, path: str | Path) -> Path:
+    def save_checkpoint(
+        self, path: str | Path, *, trained_heads: Sequence[str] | None = None
+    ) -> Path:
+        """Write the checkpoint, recording which heads were actually supervised.
+
+        ``trained_heads`` is the provenance the loader needs to decide whether the model
+        may be believed. A fit run against examples that carried no ``trade_quality``
+        label leaves that head at its initialisation, and the resulting tensors are
+        indistinguishable from a trained head's by shape or finiteness — the only way the
+        runtime can tell is if the trainer says so here. ``None`` means "every head",
+        which is what a fit with a full label set should pass.
+        """
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.stem}.writing.npz")
+        heads = tuple(SUPERVISED_HEADS if trained_heads is None else trained_heads)
         np.savez_compressed(
             temporary,
             artifact_version=np.asarray([self.ARTIFACT_VERSION], dtype=np.int64),
             config=self.config.as_array(),
+            trained_heads=np.asarray(heads, dtype="<U32"),
             **{name: getattr(self, name) for name in self._TENSOR_NAMES},
         )
         # Never expose a half-written checkpoint to a live loader.
         os.replace(temporary, target)
+        self.trained_heads = heads
         return target
 
     @classmethod
@@ -609,6 +634,14 @@ class TemporalHeteroGnn:
                 if not np.isfinite(value).all():
                     raise ValueError(f"checkpoint tensor {name} contains non-finite values")
                 setattr(model, name, value.copy())
+            # A checkpoint written before heads were recorded carries no marker. It is
+            # read as fully supervised: the loader must not invent a provenance defect
+            # for an artifact it cannot assess.
+            model.trained_heads = (
+                tuple(str(head) for head in np.asarray(data["trained_heads"]).ravel().tolist())
+                if "trained_heads" in data
+                else SUPERVISED_HEADS
+            )
         return model
 
     def parameter_count(self) -> int:

@@ -48,6 +48,7 @@ import numpy as np
 from app.models.graph_snapshot import GraphSnapshot
 from app.models.temporal_hetero_gnn import (
     REGIME_LABELS,
+    SUPERVISED_HEADS,
     TemporalHeteroGnn,
     TemporalHeteroGnnConfig,
 )
@@ -61,7 +62,9 @@ from app.storage.trading_state_store import (
 __all__ = [
     "TrainingExample",
     "TrainingReport",
+    "evaluate_promotion",
     "fit_relation_weights",
+    "label_counts",
     "persist_relation_weights",
     "train_temporal_hetero_gnn",
 ]
@@ -100,6 +103,8 @@ class TrainingReport:
     example_count: int
     checkpoint_path: str | None = None
     per_head_loss: Mapping[str, float] = field(default_factory=dict)
+    #: Heads that had at least one label, and so are the only ones this fit moved.
+    trained_heads: tuple[str, ...] = ()
 
     @property
     def improved(self) -> bool:
@@ -115,6 +120,7 @@ class TrainingReport:
             "example_count": self.example_count,
             "checkpoint_path": self.checkpoint_path,
             "per_head_loss": dict(self.per_head_loss),
+            "trained_heads": list(self.trained_heads),
         }
 
 
@@ -151,6 +157,28 @@ def _unflatten(model: TemporalHeteroGnn, vector: np.ndarray) -> None:
             vector[offset : offset + size].reshape(current.shape).astype(np.float32),
         )
         offset += size
+
+
+def label_counts(examples: Sequence[TrainingExample]) -> dict[str, int]:
+    """How many labels each supervised head actually has.
+
+    Counted without running inference, because the caller needs this *before* deciding
+    whether a fit is worth starting. A head that scores zero here contributes nothing to
+    the loss, so its weights come out of training exactly as they went in — which is the
+    fact a checkpoint has to carry.
+    """
+    counts = {head: 0 for head in SUPERVISED_HEADS}
+    for example in examples:
+        if example.node_index() is None:
+            continue
+        counts["regime"] += sum(
+            1 for label in REGIME_LABELS if example.regime_labels.get(label) is not None
+        )
+        if example.trade_quality is not None:
+            counts["trade_quality"] += 1
+        if example.realised_return_bps is not None:
+            counts["expected_return"] += 1
+    return counts
 
 
 def evaluate_loss(
@@ -210,6 +238,56 @@ def evaluate_loss(
     return loss, per_head
 
 
+def evaluate_promotion(
+    candidate: TemporalHeteroGnn,
+    examples: Sequence[TrainingExample],
+    *,
+    incumbent_path: str | Path,
+    minimum_improvement: float = 0.0,
+) -> dict[str, Any]:
+    """Decide whether ``candidate`` should replace the checkpoint already deployed.
+
+    Both models are scored on the *same* examples, because the loss is only comparable
+    within one example set — a challenger fitted on a later, easier window would otherwise
+    win on the strength of its data rather than its weights. With no incumbent on disk the
+    candidate is promoted unopposed: something is strictly better than the OFFLINE state
+    that a missing checkpoint produces.
+    """
+    source = Path(incumbent_path)
+    candidate_loss, _ = evaluate_loss(candidate, examples)
+    if not source.exists():
+        return {
+            "promote": True,
+            "reason": "NO_INCUMBENT",
+            "candidate_loss": round(candidate_loss, 8),
+            "incumbent_loss": None,
+        }
+    try:
+        incumbent = TemporalHeteroGnn.load_checkpoint(source)
+    except Exception as exc:  # noqa: BLE001 - an unreadable champion cannot defend itself.
+        return {
+            "promote": True,
+            "reason": f"INCUMBENT_UNREADABLE:{type(exc).__name__}",
+            "candidate_loss": round(candidate_loss, 8),
+            "incumbent_loss": None,
+        }
+    if incumbent.config != candidate.config:
+        return {
+            "promote": True,
+            "reason": "INCUMBENT_SHAPE_MISMATCH",
+            "candidate_loss": round(candidate_loss, 8),
+            "incumbent_loss": None,
+        }
+    incumbent_loss, _ = evaluate_loss(incumbent, examples)
+    promote = candidate_loss < incumbent_loss - float(minimum_improvement)
+    return {
+        "promote": promote,
+        "reason": "CHALLENGER_BETTER" if promote else "INCUMBENT_RETAINED",
+        "candidate_loss": round(candidate_loss, 8),
+        "incumbent_loss": round(incumbent_loss, 8),
+    }
+
+
 def train_temporal_hetero_gnn(
     examples: Sequence[TrainingExample],
     *,
@@ -225,6 +303,7 @@ def train_temporal_hetero_gnn(
     checkpoint_path: str | Path | None = None,
     initial: TemporalHeteroGnn | None = None,
     progress: Callable[[int, float], None] | None = None,
+    trained_heads: Sequence[str] | None = None,
 ) -> tuple[TemporalHeteroGnn, TrainingReport]:
     """Fit the model with an evolutionary strategy and optionally save a checkpoint.
 
@@ -279,9 +358,20 @@ def train_temporal_hetero_gnn(
 
     _unflatten(model, best_theta)
     final_loss, per_head = evaluate_loss(model, examples)
+    # Only heads that actually saw a label were fitted; the rest are still at their
+    # initialisation and the checkpoint has to say so, or the runtime will serve them as
+    # if they meant something. A caller with a stricter bar than "one label" passes its
+    # own set, so the artifact and the caller's report cannot disagree.
+    published_heads = (
+        tuple(trained_heads)
+        if trained_heads is not None
+        else tuple(head for head, count in label_counts(examples).items() if count > 0)
+    )
     saved: str | None = None
     if checkpoint_path is not None:
-        saved = str(model.save_checkpoint(checkpoint_path))
+        saved = str(
+            model.save_checkpoint(checkpoint_path, trained_heads=published_heads)
+        )
     return model, TrainingReport(
         epochs=int(epochs),
         population=int(population),
@@ -290,6 +380,7 @@ def train_temporal_hetero_gnn(
         example_count=len(examples),
         checkpoint_path=saved,
         per_head_loss={name: round(value, 8) for name, value in per_head.items()},
+        trained_heads=published_heads,
     )
 
 

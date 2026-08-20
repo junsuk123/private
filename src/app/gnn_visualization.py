@@ -271,7 +271,11 @@ def build_strategy_gnn_state(
     empty = {
         "state": "OFFLINE",
         "active": False,
+        "inference_usable": False,
+        "order_authorized": False,
         "phase": "idle",
+        "model_id": "strategy_utility_rgcn",
+        "model_role": "strategy_ranking_auxiliary",
         "updated_at": None,
         "age_seconds": None,
         "symbol": None,
@@ -299,11 +303,36 @@ def build_strategy_gnn_state(
     ]
     decision = decisions[-1] if decisions else {}
     active = age_seconds <= max(1.0, float(active_window_seconds))
-    blocked = bool(decision) and not decision.get("strategy_id")
+    reason_codes = tuple(str(code) for code in decision.get("reason_codes") or ())
+    hard_blocked = bool(decision) and any(
+        code in {
+            "GNN_FEATURE_SCHEMA_MISMATCH",
+            "GNN_CHECKPOINT_MISSING",
+            "GNN_INFERENCE_FAILED",
+        }
+        for code in reason_codes
+    )
+    inference_usable = active and bool(decision) and not hard_blocked
+    order_authorized = (
+        inference_usable
+        and "GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED" not in reason_codes
+    )
     return {
-        "state": "INFERENCE_RUNNING" if active else "BLOCKED" if blocked else "IDLE",
+        "state": "BLOCKED" if hard_blocked else "INFERENCE_RUNNING" if active else "IDLE",
         "active": active,
-        "phase": "message_passing" if active else "blocked" if blocked else "idle",
+        "inference_usable": inference_usable,
+        "order_authorized": order_authorized,
+        "phase": (
+            "blocked"
+            if hard_blocked
+            else "validation_only"
+            if inference_usable and not order_authorized
+            else "message_passing"
+            if active
+            else "idle"
+        ),
+        "model_id": "strategy_utility_rgcn",
+        "model_role": "strategy_ranking_auxiliary",
         "updated_at": modified_at.isoformat(),
         "age_seconds": round(age_seconds, 3),
         "observed_at": latest.get("as_of"),
@@ -312,7 +341,7 @@ def build_strategy_gnn_state(
         "strategy_id": decision.get("strategy_id"),
         "path": decision.get("path"),
         "utility": _finite_or_none(decision.get("utility")),
-        "reason_codes": list(decision.get("reason_codes") or ()),
+        "reason_codes": list(reason_codes),
         "activation": _activation_map(decision, active=active),
     }
 

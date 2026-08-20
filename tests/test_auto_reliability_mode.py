@@ -324,6 +324,57 @@ def test_model_only_demotion_falls_back_instead_of_blocking_entries() -> None:
     enforce.assert_not_called()
 
 
+def test_model_only_degradation_does_not_leave_live_mode() -> None:
+    with web_module._live_lock:
+        web_module._auto_reliability_state["unready_streak"] = 0
+    with (
+        patch.object(
+            web_module,
+            "_evaluate_auto_reliability",
+            return_value=_model_snapshot(["MODEL_NOT_READY"]),
+        ),
+        patch.object(web_module, "_active_operation_mode", return_value="live_trading"),
+        patch.object(web_module, "_auto_reliability_enter_model_degraded") as degraded,
+        patch.object(web_module, "_auto_reliability_transition_to_learning") as demote,
+        patch.object(web_module, "_live_market_data_startup_grace_active", return_value=False),
+    ):
+        result = web_module._auto_reliability_step()
+
+    assert result["mode"] == "live_trading"
+    assert result["last_transition_reason"] == "MODEL_DEGRADED_FALLBACK"
+    degraded.assert_called_once_with("MODEL_NOT_READY")
+    demote.assert_not_called()
+
+
+def test_brief_market_data_gap_requires_longer_live_mode_hysteresis() -> None:
+    failed = {
+        **_ready_snapshot(),
+        "score": 0.8,
+        "ready": False,
+        "reasons": ["MARKET_DATA_NOT_READY"],
+    }
+    with web_module._live_lock:
+        web_module._auto_reliability_state["unready_streak"] = 0
+    with (
+        patch.dict(
+            "os.environ",
+            {"AUTO_RELIABILITY_MARKET_DATA_DEMOTE_CONSECUTIVE": "3"},
+        ),
+        patch.object(web_module, "_evaluate_auto_reliability", return_value=failed),
+        patch.object(web_module, "_active_operation_mode", return_value="live_trading"),
+        patch.object(web_module, "_auto_reliability_transition_to_learning") as demote,
+        patch.object(web_module, "_auto_reliability_learning_maintenance"),
+        patch.object(web_module, "_live_market_data_startup_grace_active", return_value=False),
+    ):
+        first = web_module._auto_reliability_step()
+        second = web_module._auto_reliability_step()
+        third = web_module._auto_reliability_step()
+
+    assert first["mode"] == second["mode"] == "live_trading"
+    assert third["mode"] == "learning"
+    demote.assert_called_once()
+
+
 def test_unusable_model_still_fails_closed() -> None:
     # UNUSABLE means there is no artifact to reason about at all.
     result, enforce, degraded = _run_step(

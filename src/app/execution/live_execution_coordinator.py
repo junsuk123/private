@@ -63,7 +63,11 @@ class LiveExecutionCoordinator:
         self.execution_guard = (
             execution_guard
             if execution_guard is not None
-            else default_execution_guard(broker=broker, require_plan=False)
+            # Process health is checked once in ``_preflight_failures``. Giving
+            # the same broker to the guard repeated the full account/WebSocket
+            # network probe after the quote was priced, adding ~13 seconds and
+            # making the order's own fresh tick stale before submission.
+            else default_execution_guard(broker=None, require_plan=False)
         )
         self.plan_provider = plan_provider
         self.orderable_cash_provider = orderable_cash_provider
@@ -364,7 +368,15 @@ class LiveExecutionCoordinator:
         failures = list(
             evaluate_live_runtime_gates(require_manual_arming=require_manual_arming).failures
         )
-        health = run_kis_health_check(self.broker, include_account=True, include_websocket=True)
+        # Account reconciliation, orderable cash and feed freshness are checked
+        # per order by ExecutionGuard. The preflight only needs credentials,
+        # mode and a valid/cached token; repeating slow portfolio and WebSocket
+        # approval calls here made fresh orders stale before the guard saw them.
+        health = run_kis_health_check(
+            self.broker,
+            include_account=False,
+            include_websocket=False,
+        )
         if not health.ok:
             failures.extend(f"KIS_HEALTH_{name.upper()}_FAILED" for name in health.failures)
         return failures

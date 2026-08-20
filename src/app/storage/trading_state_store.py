@@ -290,6 +290,8 @@ create table if not exists strategy_decision (
 );
 create index if not exists idx_strategy_decision_ticker
     on strategy_decision(ticker, decided_at);
+create index if not exists idx_strategy_decision_action_time
+    on strategy_decision(action, decided_at);
 
 create table if not exists gate_decision (
     gate_id text primary key,
@@ -583,6 +585,58 @@ class TradingStateStore:
                 if cursor.rowcount > 0:
                     removed[table] = int(cursor.rowcount)
         return removed
+
+    def prune_unexecuted_decisions(
+        self,
+        *,
+        retention_hours: int = 24,
+        batch_size: int = 25_000,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        """Bound high-volume non-order traces without touching execution audit.
+
+        Only terminal non-entry decisions with no linked order intent are eligible.
+        Any decision or gate referenced by an order is retained indefinitely.
+        """
+        cutoff = _iso(
+            (now or _utcnow()) - timedelta(hours=max(1, int(retention_hours)))
+        )
+        limit = max(1, min(int(batch_size), 250_000))
+        with self.transaction() as conn:
+            conn.execute(
+                "create temporary table prune_decision_ids"
+                " (decision_id text primary key)"
+            )
+            conn.execute(
+                "insert into prune_decision_ids(decision_id)"
+                " select d.decision_id from strategy_decision d"
+                " where d.decided_at < ?"
+                " and upper(d.action) in ('WAIT', 'NO_TRADE', 'HOLD')"
+                " and not exists ("
+                "   select 1 from order_intent oi where oi.decision_id = d.decision_id"
+                " ) order by d.decided_at limit ?",
+                (cutoff, limit),
+            )
+            gates = conn.execute(
+                "delete from gate_decision"
+                " where decision_id in (select decision_id from prune_decision_ids)"
+                " and not exists ("
+                "   select 1 from order_intent oi where oi.gate_id = gate_decision.gate_id"
+                " )"
+            ).rowcount
+            decisions = conn.execute(
+                "delete from strategy_decision"
+                " where decision_id in (select decision_id from prune_decision_ids)"
+                " and not exists ("
+                "   select 1 from order_intent oi"
+                "   where oi.decision_id = strategy_decision.decision_id"
+                " )"
+            ).rowcount
+            conn.execute("drop table prune_decision_ids")
+        return {
+            "strategy_decision": max(0, int(decisions)),
+            "gate_decision": max(0, int(gates)),
+        }
 
 
 def upsert_row(

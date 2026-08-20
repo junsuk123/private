@@ -67,11 +67,9 @@ def _env_float(name: str, default: float) -> float:
 class NoTradePolicyConfig:
     """Per-market minimum edge, plus the horizon attainability rule.
 
-    ``base_minimum_edge_bps`` is the net edge, over and above cost, that makes a trade
-    worth taking rather than break-even. The defaults mirror
-    ``strategy_algorithms.shared.min_net_buffer_bps`` (10bps) for KR and are raised for US
-    because the round trip is roughly twice as expensive there, so the same 10bps buffer
-    is a much smaller fraction of what has to be earned.
+    ``base_minimum_edge_bps`` is a V2-only utility preference. It is not the live
+    deterministic algorithm's entry floor: that path charges the complete round-trip
+    cost once and requires strictly positive net edge without this additional buffer.
     """
 
     base_minimum_edge_bps: Mapping[str, float] = field(

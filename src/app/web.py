@@ -34,7 +34,7 @@ from app.refactor_dashboard import (
     build_strategy_market_stream,
     build_strategy_market_view,
 )
-from app.audit import AuditLogger
+from app.audit import AuditLogger, log_path
 from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
 from app.data.llm_classifier import build_event_llm_classifier_from_env, configure_default_event_llm_env, event_llm_runtime_status
@@ -48,6 +48,9 @@ from app.config import LiveConfigError, load_live_trading_safety_config, load_or
 from app.config.refactor_flags import RefactorFeatureFlags
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.features.strategy_graph_context import STRATEGY_GRAPH_CONTEXT_DIM
+from app.models.gnn_runtime import (
+    DEFAULT_CHECKPOINT_PATH as DEFAULT_GNN_CHECKPOINT_PATH,
+)
 from app.models.model_artifact_registry import ModelArtifactRegistry
 from app.models.model_staleness import ModelTrustLevel
 from app.models.live_training_pipeline import (
@@ -205,7 +208,7 @@ def favicon() -> FileResponse:
     # Browsers (and the Pi Chromium kiosk) auto-request /favicon.ico; serve the
     # app icon so the tab/home-screen icon matches the in-page <link rel=icon>.
     return FileResponse(_APP_ICON_PATH, media_type="image/png")
-audit = AuditLogger(Path("logs/web-audit.jsonl"))
+audit = AuditLogger(log_path("web-audit.jsonl"))
 sessions: dict[str, dict[str, Any]] = {}
 DEFAULT_RESEARCH_CONFIG = Path(os.getenv("RESEARCH_CONFIG", "config/research_sources.live.json"))
 LIVE_REFRESH_SECONDS = max(5, int(os.getenv("LIVE_REFRESH_SECONDS", "15")))
@@ -230,6 +233,17 @@ AUTO_START_REALTIME_TRADING = os.getenv("AUTO_START_REALTIME_TRADING", "false").
 # 데이터 수집은 실시간(KIS 수집기 + 트레이딩 평가 프레임 저널링), 학습은 이 워커가 주기적으로 수행.
 AUTO_START_LIVE_TRAINING = os.getenv("AUTO_START_LIVE_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
 LIVE_TRAINING_INTERVAL_SECONDS = max(60, int(os.getenv("LIVE_TRAINING_INTERVAL_SECONDS", "300")))
+# 온톨로지 컨텍스트 GNN 자동 학습·승격: 체크포인트가 없으면 런타임이 OFFLINE이 되어 신규
+# 진입이 전부 막히므로, 서버가 뜨면 곧바로 한 번 학습하고 이후 주기적으로 재학습한다.
+# 학습은 별도 프로세스에서 저우선순위로 돌린다 — 이 적합은 CPU를 오래 점유하고,
+# 트레이딩 루프는 지연에 민감하다.
+AUTO_START_TEMPORAL_GNN_TRAINING = os.getenv("AUTO_START_TEMPORAL_GNN_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
+TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS = max(600, int(os.getenv("TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS", "21600")))
+TEMPORAL_GNN_TRAINING_LIMIT = max(50, int(os.getenv("TEMPORAL_GNN_TRAINING_LIMIT", "400")))
+TEMPORAL_GNN_TRAINING_EPOCHS = max(1, int(os.getenv("TEMPORAL_GNN_TRAINING_EPOCHS", "12")))
+TEMPORAL_GNN_TRAINING_POPULATION = max(2, int(os.getenv("TEMPORAL_GNN_TRAINING_POPULATION", "8")))
+TEMPORAL_GNN_TRAINING_THREADS = max(1, int(os.getenv("TEMPORAL_GNN_TRAINING_THREADS", "4")))
+TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS = max(300, int(os.getenv("TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS", "10800")))
 _live_training_history_cache: dict[str, Any] = {
     "loaded_at": 0.0,
     "root": "",
@@ -750,6 +764,8 @@ _context_runtime_lock = threading.Lock()
 _context_runtime: Any | None = None
 _context_runtime_error: str | None = None
 _context_refresh_stop = threading.Event()
+_trading_state_maintenance_lock = threading.Lock()
+_trading_state_maintenance_at = 0.0
 
 #: Seconds between background context refreshes. Matched to the realtime loop's own
 #: cadence: refreshing faster would recompute a graph from the same ticks, slower would
@@ -818,6 +834,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
 _live_lock = threading.Lock()
 _refresh_guard = threading.Lock()
 _kis_realtime_collector_stop = threading.Event()
+#: Transport state of the domestic realtime socket, kept separately from data freshness.
+#: The trade gate asks two different questions — "is the socket up" (WS_DISCONNECTED) and
+#: "is what came over it recent" (STALE_DATA) — and answering the first with tick recency
+#: would collapse them into one, so this is set at the connect/return boundary instead.
+#: ``None`` means the collector has never run: unknown, which the gate refuses.
+_kis_realtime_ws_state: dict[str, Any] = {"connected": None, "changed_at": None}
 _kis_realtime_collector_resubscribe = threading.Event()
 _kis_overseas_realtime_stop = threading.Event()
 # Set to make the persistent overseas session re-diff its subscriptions in
@@ -1492,11 +1514,61 @@ def _refresh_live_account_basis_for_auto() -> dict[str, Any] | None:
   if cached.get("account_checked"):
     basis = _account_basis_from_kis_connection(cached)
     if basis is not None:
-      return _stabilize_account_basis(basis)
+      stable = _stabilize_account_basis(basis)
+      if stable is not None:
+        _persist_execution_account_reconciliation(stable)
+      return stable
   # _cached_kis_connection_probe already performs one live probe when its cache is
   # stale. Retrying immediately doubled the broker traffic, hit KIS per-second
   # limits, and kept the single web worker blocked for another full timeout.
   return None
+
+
+_execution_account_reconciliation_lock = threading.Lock()
+_execution_account_reconciliation_at = 0.0
+
+
+def _persist_execution_account_reconciliation(basis: Mapping[str, Any]) -> None:
+  """Bridge the authoritative KIS cash cross-check into the final order store.
+
+  The dashboard account cache and the pre-submit guard deliberately use different
+  stores.  Until this bridge existed, the dashboard could prove a reconciled live
+  account while ``trading_state.account_snapshot`` stayed empty forever, making
+  every broker call fail closed.  Persist at most once per 30 seconds; the guard
+  still enforces its independent ten-minute maximum age.
+  """
+  global _execution_account_reconciliation_at
+  now_monotonic = time.monotonic()
+  with _execution_account_reconciliation_lock:
+    if now_monotonic - _execution_account_reconciliation_at < 30.0:
+      return
+    check = dict(basis.get("orderable_cash_reconciliation") or {})
+    if not check or check.get("error") not in (None, ""):
+      return
+    try:
+      portfolio_cash = float(check.get("portfolio_krw"))
+      authoritative_cash = float(check.get("authoritative_krw"))
+      equity = float(
+          basis.get("equity")
+          or basis.get("total_equity_krw")
+          or basis.get("cash_equivalent_krw")
+      )
+    except (TypeError, ValueError):
+      return
+    from app.execution.reconciliation import AccountReconciler, AccountView
+
+    AccountReconciler().reconcile(
+        AccountView(
+            equity=equity,
+            cash=authoritative_cash,
+            currency="KRW",
+            observed_at=datetime.now(timezone.utc),
+        ),
+        local_equity=equity,
+        local_cash=portfolio_cash,
+        source="kis_live_orderable_cash_crosscheck",
+    )
+    _execution_account_reconciliation_at = now_monotonic
 
 
 def _cached_kis_connection_probe(
@@ -1712,7 +1784,12 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
     )
     canonical_staleness = ModelArtifactRegistry(root).staleness(now=now)
   except (OSError, ValueError, json.JSONDecodeError):
-    return {"ok": False, "reason": "MODEL_ARTIFACT_MISSING_OR_INVALID"}
+    return {
+        "ok": False,
+        "model_id": "live_short_horizon",
+        "model_role": "auto_reliability_entry_model",
+        "reason": "MODEL_ARTIFACT_MISSING_OR_INVALID",
+    }
   active_age_seconds = (
       canonical_staleness.age_seconds
       if canonical_staleness.age_seconds is not None
@@ -1793,6 +1870,8 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
     reason_codes.append("MODEL_TRAINING_STALE")
   return {
       "ok": not reason_codes,
+      "model_id": "live_short_horizon",
+      "model_role": "auto_reliability_entry_model",
       "live_eligible": live_eligible,
       "schema_matches": schema_matches,
       "age_seconds": active_age_seconds,
@@ -2224,6 +2303,9 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
     unready_streak += 1
   promote_after = _auto_reliability_int("AUTO_RELIABILITY_PROMOTE_CONSECUTIVE", 4)
   demote_after = _auto_reliability_int("AUTO_RELIABILITY_DEMOTE_CONSECUTIVE", 2)
+  market_data_demote_after = _auto_reliability_int(
+      "AUTO_RELIABILITY_MARKET_DATA_DEMOTE_CONSECUTIVE", 8, 2
+  )
   transition_reason = None
   if snapshot["ready"] and ready_streak >= promote_after and current_mode != "live_trading":
     result = _auto_reliability_transition_to_live()
@@ -2235,6 +2317,7 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
       snapshot["reasons"] = [*snapshot["reasons"], "LIVE_TRANSITION_NOT_ARMED"]
       unready_streak = 1
   elif not snapshot["ready"] and current_mode == "live_trading":
+    model_degraded_only = _auto_reliability_model_degraded_only(snapshot)
     critical = any(
         reason in snapshot["reasons"]
         for reason in (
@@ -2242,19 +2325,34 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
             "RUNTIME_NOT_READY",
             "CONFIG_NOT_READY",
             "RISK_POLICY_NOT_READY",
-            "MODEL_NOT_READY",
             "NO_OPEN_MARKET",
         )
     )
+    # A scoreable-but-stale learned artifact is auxiliary to the deterministic
+    # strategy path. Keep live mode armed and visibly fall back instead of
+    # oscillating the whole process through learning mode. UNUSABLE models and
+    # mixed failures still fail closed below.
+    if "MODEL_NOT_READY" in snapshot["reasons"] and not model_degraded_only:
+      critical = True
     startup_grace = _live_market_data_startup_grace_active(now)
     market_data_only = set(snapshot["reasons"]) == {"MARKET_DATA_NOT_READY"}
-    if critical or (unready_streak >= demote_after and not (market_data_only and startup_grace)):
+    if model_degraded_only:
+      reason = ",".join(snapshot["reasons"]) or "MODEL_NOT_READY"
+      _auto_reliability_enter_model_degraded(reason)
+      transition_reason = "MODEL_DEGRADED_FALLBACK"
+    elif critical or (
+        market_data_only
+        and unready_streak >= market_data_demote_after
+        and not startup_grace
+    ) or (
+        not market_data_only and unready_streak >= demote_after
+    ):
       reason = ",".join(snapshot["reasons"]) or "RELIABILITY_BELOW_THRESHOLD"
       # Leaving live_trading is the first graded step and still applies. Killing
       # entries is the second, and a stale-but-scoreable model does not warrant it.
       _auto_reliability_transition_to_learning(
           reason,
-          disable_buys=not _auto_reliability_model_degraded_only(snapshot),
+          disable_buys=True,
       )
       current_mode = "learning"
       transition_reason = reason
@@ -2493,6 +2591,22 @@ _realtime_trading_worker: threading.Thread | None = None
 _realtime_trading_stop = threading.Event()
 _realtime_trading_engine: Any | None = None
 _realtime_trading_lock = threading.Lock()
+# 컨텍스트 GNN 자동 학습 워커: 학습 자체는 자식 프로세스에서 수행한다.
+_temporal_gnn_worker: threading.Thread | None = None
+_temporal_gnn_stop = threading.Event()
+#: The running trainer child, so shutdown can end it. Without this the fit outlives the
+#: server that started it — and since the next server trains again on boot, a few restarts
+#: would leave several of them competing for the machine.
+_temporal_gnn_child: Any | None = None
+_temporal_gnn_heartbeat: dict[str, Any] = {
+    "started_at": None,
+    "finished_at": None,
+    "ok": False,
+    "promoted": False,
+    "checkpoint": None,
+    "health_state": None,
+    "error": None,
+}
 # 주기적 백그라운드 학습 워커: 수집·트레이딩과 독립된 스레드.
 _live_training_worker: threading.Thread | None = None
 _live_training_stop = threading.Event()
@@ -2625,6 +2739,8 @@ def _startup_live_worker() -> None:
       _start_realtime_trading_engine()
     if AUTO_START_LIVE_TRAINING:
       _start_live_training_worker()
+    if AUTO_START_TEMPORAL_GNN_TRAINING:
+      _start_temporal_gnn_training_worker()
     _ensure_us_fast_poll_started()
     _ensure_krx_feature_frame_started()
     _start_auto_reliability_controller()
@@ -2651,6 +2767,7 @@ def _graceful_teardown() -> list[str]:
         ("context_refresher", _stop_context_refresher),
         ("auto_reliability_controller", _stop_auto_reliability_controller),
         ("live_training_worker", _stop_live_training_worker),
+        ("temporal_gnn_training_worker", _stop_temporal_gnn_training_worker),
         ("krx_feature_frame_worker", _stop_krx_feature_frame_worker),
         # Feeds last, so exits could still price correctly on the way down.
         ("kis_overseas_realtime_collector", _stop_kis_overseas_realtime_collector),
@@ -2669,21 +2786,140 @@ def _graceful_teardown() -> list[str]:
     return stopped
 
 
+def _context_account_state() -> Any:
+    """The account as the trade gate needs it, or ``None`` when it cannot be established.
+
+    ``reconciled`` comes from the broker cash cross-check, not from "we have a snapshot":
+    holding numbers we never compared against the broker is exactly the state the gate's
+    ACCOUNT_RECONCILIATION_FAIL exists to refuse.
+    """
+    from app.trading.context_decision_pipeline import AccountState
+
+    def _amount(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return number if number == number and number not in (float("inf"), float("-inf")) else 0.0
+
+    try:
+        basis = _refresh_live_account_basis_for_auto() or _last_live_account_basis()
+    except Exception:  # noqa: BLE001 - no basis, no claim.
+        return None
+    if not basis:
+        return None
+    check = dict(basis.get("orderable_cash_reconciliation") or {})
+    reconciled: bool | None = None
+    if check and check.get("error") in (None, "") and "mismatch" in check:
+        reconciled = not bool(check.get("mismatch"))
+
+    positions = basis.get("positions") or []
+    by_ticker: dict[str, float] = {}
+    by_sector: dict[str, float] = {}
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        ticker = str(position.get("ticker") or position.get("symbol") or "").upper()
+        value = _amount(position.get("evaluated_amount") or position.get("value"))
+        if ticker and value:
+            by_ticker[ticker] = by_ticker.get(ticker, 0.0) + value
+            sector = str(position.get("sector") or "")
+            by_sector[sector] = by_sector.get(sector, 0.0) + value
+    equity = _amount(basis.get("total_equity_krw") or basis.get("cash_equivalent_krw"))
+    return AccountState(
+        equity=equity or None,
+        cash=_amount(basis.get("krw_cash")) or None,
+        reconciled=reconciled,
+        position_value_by_ticker=by_ticker,
+        exposure_by_sector=by_sector,
+        total_market_exposure=sum(by_ticker.values()),
+    )
+
+
+def _context_venue_halted() -> bool | None:
+    """Venue-level halt for the primary domestic market, or ``None`` if not established.
+
+    Per-symbol suspensions come from the broker quote and override this on the candidate
+    itself; this only answers whether the venue as a whole is transacting.
+    """
+    try:
+        transacting = _is_live_market_extended_open("KR")
+    except Exception:  # noqa: BLE001 - unknown stays unknown.
+        return None
+    # Only the affirmative is safe to assert. A venue with no order route may be halted
+    # or may simply be closed, and this cannot tell them apart — reporting a halt for a
+    # closed market would put the wrong reason on the dashboard. Closed sessions are
+    # already refused by the gate's own UNKNOWN_SESSION check.
+    return False if transacting else None
+
+
 def _context_refresh_loop() -> None:
     """Keep the context hierarchy current while the server is up.
 
     Runs whether or not live trading is armed. The dashboard's job is to explain the
     market and the system's own health, and both questions are most useful precisely
     when trading is switched off.
+
+    The gate inputs are supplied here rather than left to default. They default to
+    ``None``, and every hard gate reads ``None`` as "not established" and refuses — so a
+    refresh that passed nothing made the dashboard report WS_DISCONNECTED and
+    ACCOUNT_RECONCILIATION_FAIL on every candidate forever, as statements of fact about a
+    connected socket and a reconciled account.
     """
     while not _context_refresh_stop.is_set():
         service = get_context_runtime()
         if service is not None:
             try:
-                service.refresh()
+                service.refresh(
+                    account=_context_account_state(),
+                    websocket_connected=_kis_realtime_websocket_connected(),
+                    trading_halted=_context_venue_halted(),
+                )
             except Exception:  # noqa: BLE001 - recorded inside refresh(); never fatal.
                 pass
+        _maintain_trading_state_storage()
         _context_refresh_stop.wait(CONTEXT_REFRESH_INTERVAL_SECONDS)
+
+
+def _maintain_trading_state_storage() -> None:
+    """Keep explanatory traces bounded while preserving every order audit row."""
+    global _trading_state_maintenance_at
+    now_monotonic = time.monotonic()
+    interval = max(
+        300,
+        _auto_reliability_int("TRADING_STATE_MAINTENANCE_SECONDS", 3600, 300),
+    )
+    with _trading_state_maintenance_lock:
+        if now_monotonic - _trading_state_maintenance_at < interval:
+            return
+        _trading_state_maintenance_at = now_monotonic
+    try:
+        from app.storage.trading_state_store import default_trading_state_store
+
+        store = default_trading_state_store()
+        decisions = store.prune_unexecuted_decisions(
+            retention_hours=_auto_reliability_int(
+                "TRADING_STATE_DECISION_RETENTION_HOURS", 24, 1
+            ),
+            batch_size=_auto_reliability_int(
+                "TRADING_STATE_DECISION_PRUNE_BATCH", 25_000, 1
+            ),
+        )
+        history = store.prune_history(
+            retention_days=_auto_reliability_int(
+                "TRADING_STATE_CONTEXT_RETENTION_DAYS", 30, 1
+            )
+        )
+        if any(decisions.values()) or history:
+            audit.record(
+                "trading_state_retention_pruned",
+                {"decisions": decisions, "history": history},
+            )
+    except Exception as exc:  # noqa: BLE001 - maintenance must not affect trading.
+        audit.record(
+            "trading_state_retention_error",
+            {"error": f"{type(exc).__name__}: {exc}"},
+        )
 
 
 def _start_context_refresher() -> None:
@@ -3965,7 +4201,18 @@ def _ai_validation_recommendation(
 
 @app.get("/api/live-training/status")
 def live_training_status_api() -> JSONResponse:
-    return _json(_safe_live_training_status())
+    payload = _safe_live_training_status()
+    with _live_lock:
+        heartbeat = dict(_temporal_gnn_heartbeat)
+    payload["temporal_gnn_training"] = {
+        **heartbeat,
+        "enabled": AUTO_START_TEMPORAL_GNN_TRAINING,
+        "interval_seconds": TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS,
+        "running": bool(_temporal_gnn_worker is not None and _temporal_gnn_worker.is_alive()),
+        "checkpoint_path": str(DEFAULT_GNN_CHECKPOINT_PATH),
+        "checkpoint_exists": DEFAULT_GNN_CHECKPOINT_PATH.exists(),
+    }
+    return _json(payload)
 
 
 @app.get("/api/npu/runtime")
@@ -4893,6 +5140,30 @@ def _live_training_history(
   return payload
 
 
+def _worker_running_anywhere(worker: str, local_thread_alive: bool) -> bool:
+    """Local thread first, then a recent mark left by whichever process owns it."""
+    try:
+        from app.monitoring import worker_heartbeat
+
+        return worker_heartbeat.running(worker, local_thread_alive)
+    except Exception:  # noqa: BLE001 - diagnostics must not fail on telemetry.
+        return bool(local_thread_alive)
+
+
+def _worker_heartbeat_detail(worker: str) -> dict[str, Any]:
+    """What the owning process last reported, for an observer that has no engine."""
+    try:
+        from app.monitoring import worker_heartbeat
+
+        mark = worker_heartbeat.read(worker)
+        if not mark or not worker_heartbeat.is_alive(worker):
+            return {}
+        detail = mark.get("detail")
+        return dict(detail) if isinstance(detail, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _diagnostic_blocker(code: str, components: dict[str, Any]) -> dict[str, Any]:
   details = {
       "RISK_POLICY_NOT_READY": (
@@ -5081,14 +5352,22 @@ def _system_diagnostics_payload() -> dict[str, Any]:
     us_fast_poll_status = dict(_us_fast_poll_state)
     us_websocket_status = dict(_kis_overseas_realtime_state)
   with _realtime_trading_lock:
-    trading_running = bool(
+    trading_worker_local = bool(
         _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
     )
     trading_engine = _realtime_trading_engine
+  # "Is the engine running" is a question about the SYSTEM, not about this
+  # process. The read-only instance runs no workers by design -- the live
+  # instance owns the SQLite stores -- so asking only the local thread made the
+  # published dashboard report a stopped engine and a degraded readiness score
+  # while the engine was running normally in the other process.
+  trading_running = _worker_running_anywhere("trading_engine", trading_worker_local)
   try:
     trading_engine_status = trading_engine.get_status() if trading_engine is not None else {}
   except Exception:
     trading_engine_status = {}
+  if not trading_engine_status and not trading_worker_local:
+    trading_engine_status = _worker_heartbeat_detail("trading_engine")
   us_fast_poll_running = bool(_us_fast_poll_thread is not None and _us_fast_poll_thread.is_alive())
   reasons = [str(code) for code in reliability.get("reasons") or ()]
   blockers = [_diagnostic_blocker(code, components) for code in reasons]
@@ -5173,7 +5452,9 @@ def _system_diagnostics_payload() -> dict[str, Any]:
   training_history = _live_training_history()
 
   research_active = bool(learning.get("active") and learning_worker_running)
-  training_active = bool(training_worker_running)
+  # Same reasoning as trading_engine: the training thread runs in one process,
+  # and an observer without it must report the system rather than itself.
+  training_active = _worker_running_anywhere("model_training", bool(training_worker_running))
   trade_data_active = bool(
       any(healthy.get(market) for market in active_markets)
       or int(market_counts.get("realtime_ticks") or 0) > 0
@@ -5446,9 +5727,9 @@ def _overlay_system_diagnostics_live_state(payload: dict[str, Any]) -> dict[str,
   result["flows"] = flows
 
   with _realtime_trading_lock:
-    trading_running = bool(
-        _realtime_trading_worker is not None
-        and _realtime_trading_worker.is_alive()
+    trading_running = _worker_running_anywhere(
+        "trading_engine",
+        bool(_realtime_trading_worker is not None and _realtime_trading_worker.is_alive()),
     )
   if trading_running and current_mode == "live_trading" and diagnostics_ready:
     result["headline"] = "실시간 거래 엔진이 실행 중입니다."
@@ -6583,12 +6864,17 @@ def trade_explanations() -> JSONResponse:
 def realtime_trading_status() -> JSONResponse:
   with _realtime_trading_lock:
     engine = _realtime_trading_engine
-    running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+    local_running = _realtime_trading_worker is not None and _realtime_trading_worker.is_alive()
+  # An observer without the engine still reports the system. Without this the
+  # published read-only dashboard showed "running: false, status: null" for an
+  # engine that was mid-session in the other process, which is the single most
+  # misleading thing this endpoint can say.
+  running = _worker_running_anywhere("trading_engine", bool(local_running))
   diagnostics = engine.decision_engine.get_diagnostics() if engine is not None and hasattr(engine, "decision_engine") else None
   engine_status = (
       _status_with_engine_cycle_id(engine.get_status())
       if engine is not None
-      else None
+      else (_worker_heartbeat_detail("trading_engine") or None)
   )
   return _json(
     {
@@ -6882,7 +7168,15 @@ def _entry_blockade_chain() -> list[dict]:
       {"sample": list(candidates), **warmup, **filter_diagnostics},
   )
 
+  # Do not append stale context-pipeline micro results or a previous election
+  # after the live engine had zero candidates in THIS cycle.  Besides being
+  # visually contradictory ("0 candidates" followed by "2 micro strategies"),
+  # it made the operator chase a strategy-selection block that was never reached.
+  if count <= 0 and "buy_candidate_count" in summary:
+    return chain
+
   diagnostics = list(session.get("candidate_diagnostics") or ())
+  live_algorithm_evaluations = list(session.get("algorithm_evaluations") or ())
   actionable = [
     item for item in diagnostics
     if str(item.get("selected_strategy") or "").lower() not in {"", "hold", "sell", "reduce_risk"}
@@ -6919,9 +7213,14 @@ def _entry_blockade_chain() -> list[dict]:
       f"종목×전략 동시평가 가능 {len(pair_eligible)}/{len(diagnostics)}"
       f" · 즉시 기술 매수신호 {len(actionable)}"
     )
+  elif live_algorithm_evaluations:
+    micro_detail = (
+      "레거시 마이크로 직접신호 없음 · "
+      f"독립 전략 알고리즘 {len(live_algorithm_evaluations)}개 평가로 계속 진행"
+    )
   _link(
     "micro_buy_intents",
-    bool(pair_eligible),
+    bool(pair_eligible or live_algorithm_evaluations),
     micro_detail,
     {
       "pair_eligible_count": len(pair_eligible),
@@ -6930,6 +7229,7 @@ def _entry_blockade_chain() -> list[dict]:
       "blocking_reason_codes": sorted(reason_counts)[:12],
       "reason_code_counts": dict(sorted(reason_counts.items())),
       "candidate_diagnostics": diagnostics[:8],
+      "independent_algorithm_evaluation_count": len(live_algorithm_evaluations),
     },
   )
 
@@ -7858,8 +8158,8 @@ def live_trading_progress() -> JSONResponse:
     )
 
 
-def _live_order_journal_snapshot(path: str | Path = "logs/live-orders.jsonl", limit: int = 20) -> dict[str, Any]:
-    journal_path = Path(path)
+def _live_order_journal_snapshot(path: str | Path | None = None, limit: int = 20) -> dict[str, Any]:
+    journal_path = Path(path) if path is not None else log_path("live-orders.jsonl")
     if not journal_path.exists():
       return {
           "path": str(journal_path),
@@ -9110,6 +9410,221 @@ def _live_training_loop() -> None:
     _live_training_stop.wait(next_wait_seconds)
 
 
+def _temporal_gnn_training_command() -> list[str]:
+  """The trainer, as a child process at low priority.
+
+  Out-of-process for three reasons: the fit saturates every core it is given and the
+  trading loop is latency-sensitive; ``nice`` and the BLAS thread caps can only be set
+  for a whole process; and a fresh interpreter cannot inherit a lock this multi-threaded
+  server was holding, which is the failure that took the trust refresher down.
+  """
+  import shutil as _shutil
+  import sys as _sys
+
+  root = Path(__file__).resolve().parents[2]
+  command = [
+      _sys.executable,
+      str(root / "scripts" / "train_temporal_hetero_gnn.py"),
+      "--limit", str(TEMPORAL_GNN_TRAINING_LIMIT),
+      "--epochs", str(TEMPORAL_GNN_TRAINING_EPOCHS),
+      "--population", str(TEMPORAL_GNN_TRAINING_POPULATION),
+  ]
+  nice = _shutil.which("nice")
+  return [nice, "-n", "10", *command] if nice else command
+
+
+def _run_temporal_gnn_training_once() -> dict[str, Any]:
+  """One train-and-promote cycle. Returns the child's report, never raises."""
+  import subprocess as _subprocess
+
+  root = Path(__file__).resolve().parents[2]
+  environment = dict(os.environ)
+  # Cap the maths libraries explicitly. Left alone they each spawn one thread per core
+  # and the trading loop loses the machine to a background fit.
+  for variable in (
+      "OMP_NUM_THREADS",
+      "OPENBLAS_NUM_THREADS",
+      "MKL_NUM_THREADS",
+      "NUMEXPR_NUM_THREADS",
+  ):
+    environment[variable] = str(TEMPORAL_GNN_TRAINING_THREADS)
+  global _temporal_gnn_child
+  try:
+    child = _subprocess.Popen(
+        _temporal_gnn_training_command(),
+        cwd=str(root),
+        env=environment,
+        stdout=_subprocess.PIPE,
+        stderr=_subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+  except Exception as exc:  # noqa: BLE001 - 학습 실패가 서버를 죽여서는 안 된다.
+    return {"error": f"{exc.__class__.__name__}: {exc}"}
+
+  with _live_lock:
+    _temporal_gnn_child = child
+  try:
+    stdout, stderr = child.communicate(
+        timeout=TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS
+    )
+  except _subprocess.TimeoutExpired:
+    _terminate_temporal_gnn_child()
+    return {"error": f"training exceeded {TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS}s"}
+  except Exception as exc:  # noqa: BLE001
+    _terminate_temporal_gnn_child()
+    return {"error": f"{exc.__class__.__name__}: {exc}"}
+  finally:
+    with _live_lock:
+      _temporal_gnn_child = None
+
+  payload: dict[str, Any] = {}
+  try:
+    payload = json.loads(stdout or "{}")
+  except ValueError:
+    payload = {}
+  if not isinstance(payload, dict):
+    payload = {}
+  if not payload:
+    tail = (stderr or stdout or "").strip().splitlines()
+    payload = {"error": tail[-1] if tail else f"exit {child.returncode} with no report"}
+  return payload
+
+
+def _terminate_temporal_gnn_child() -> None:
+  """End the trainer child and everything it started.
+
+  ``start_new_session`` puts the child in its own process group so the server's signals
+  do not reach it; that same isolation means it has to be killed by group here, or it
+  keeps running after the server it belongs to is gone.
+  """
+  import signal as _signal
+
+  with _live_lock:
+    child = _temporal_gnn_child
+  if child is None or child.poll() is not None:
+    return
+  try:
+    os.killpg(os.getpgid(child.pid), _signal.SIGTERM)
+  except (ProcessLookupError, PermissionError, AttributeError, OSError):
+    try:
+      child.terminate()
+    except Exception:  # noqa: BLE001 - best effort; the process may already be gone.
+      pass
+  try:
+    child.wait(timeout=5.0)
+  except Exception:  # noqa: BLE001
+    try:
+      os.killpg(os.getpgid(child.pid), _signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+      pass
+
+
+def _reload_temporal_gnn_runtime() -> str | None:
+  """Pick up a freshly published checkpoint without a server restart.
+
+  ``GnnRuntime.reload`` is the documented way out of a latched OFFLINE, and it is only
+  called from the constructor — so without this a promoted checkpoint would sit on disk
+  being ignored until someone restarted a live trading server to collect it.
+  """
+  try:
+    runtime = get_context_runtime()
+    if runtime is None:
+      return None
+    return runtime.gnn.reload().state.value
+  except Exception as exc:  # noqa: BLE001 - 리로드 실패는 상태로 보고한다.
+    return f"RELOAD_FAILED:{exc.__class__.__name__}"
+
+
+def _temporal_gnn_training_loop() -> None:
+  # Train immediately, then on the interval: a restart is exactly when the checkpoint is
+  # most likely to be missing, and waiting six hours to discover that leaves the runtime
+  # OFFLINE — which blocks every new entry — for the whole of that window.
+  while not _temporal_gnn_stop.is_set():
+    with _live_lock:
+      _temporal_gnn_heartbeat.update(
+          {"started_at": datetime.now(timezone.utc).isoformat(), "error": None}
+      )
+    report = _run_temporal_gnn_training_once()
+    error = report.get("error")
+    promoted = bool(report.get("promoted"))
+    health_state: str | None = None
+    if promoted:
+      health_state = _reload_temporal_gnn_runtime()
+
+    if error:
+      status, message = "error", f"컨텍스트 GNN 학습 실패: {error}"
+    elif promoted:
+      status = "complete"
+      message = (
+          "컨텍스트 GNN 체크포인트 재학습·승격 완료"
+          f" (모델 상태 {health_state or 'UNKNOWN'})"
+      )
+    elif report.get("refused"):
+      status, message = "waiting", f"컨텍스트 GNN 학습 보류: {report['refused']}"
+    else:
+      status = "complete"
+      message = "컨텍스트 GNN 챌린저가 기존 체크포인트를 넘지 못해 유지"
+
+    with _live_lock:
+      _temporal_gnn_heartbeat.update(
+          {
+              "finished_at": datetime.now(timezone.utc).isoformat(),
+              "ok": not error,
+              "promoted": promoted,
+              "checkpoint": report.get("checkpoint"),
+              "health_state": health_state,
+              "error": error,
+          }
+      )
+      _append_collection_log_unlocked(
+          status,
+          message,
+          counts={
+              "training_examples": report.get("training_examples"),
+              "supervised_heads": report.get("supervised_heads"),
+              "head_label_counts": report.get("head_label_counts"),
+              "expected_health": report.get("expected_health"),
+              "promotion": report.get("promotion"),
+              "promoted": promoted,
+              "checkpoint": report.get("checkpoint"),
+              "model_health_state": health_state,
+          },
+      )
+    _temporal_gnn_stop.wait(TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS)
+
+
+def _start_temporal_gnn_training_worker() -> None:
+  global _temporal_gnn_worker
+  with _live_lock:
+    if _temporal_gnn_worker is not None and _temporal_gnn_worker.is_alive():
+      return
+    _temporal_gnn_stop.clear()
+    _append_collection_log_unlocked(
+        "scheduled",
+        "컨텍스트 GNN 자동 학습 시작 (기동 직후 1회, 이후"
+        f" {TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS}s 주기)",
+    )
+    _temporal_gnn_worker = threading.Thread(
+        target=_temporal_gnn_training_loop,
+        name="temporal-gnn-training",
+        daemon=True,
+    )
+    _temporal_gnn_worker.start()
+
+
+def _stop_temporal_gnn_training_worker() -> None:
+  worker: threading.Thread | None
+  _temporal_gnn_stop.set()
+  # Kill the fit before joining: the worker thread is parked inside ``communicate`` and
+  # would not notice the stop flag for as long as the training runs.
+  _terminate_temporal_gnn_child()
+  with _live_lock:
+    worker = _temporal_gnn_worker
+  if worker is not None:
+    worker.join(timeout=2.0)
+
+
 def _start_live_training_worker() -> None:
   global _live_training_worker
   with _live_lock:
@@ -9138,11 +9653,8 @@ def _stop_live_training_worker() -> None:
 
 
 def _build_realtime_trading_engine() -> RealtimeTradingEngine:
-  from app.trading.conservative_bandit import (
-      BanditConfig,
-      ConservativeStrategyBandit,
-  )
   from app.trading.strategy_session import StrategySessionManager
+  from app.trading.trade_plan_builder import TradePlanBuilder
 
   store = RealtimeMarketDataStore()
   account = _live_account_snapshot_for_analysis()
@@ -9164,9 +9676,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   strategy_session_manager = StrategySessionManager(
       selection_evidence_provider=_strategy_session_selection_evidence,
-      bandit=ConservativeStrategyBandit(
-          config=BanditConfig.for_live_execution(),
-      ),
+      plan_builder=TradePlanBuilder(risk_manager=RiskManager(rules)),
   )
   # The ExecutionGuard needs the plan that owns the order and the broker's own view of
   # cash and sellable quantity. Wired here rather than looked up inside the guard so the
@@ -9206,9 +9716,16 @@ def _live_orderable_cash_for_order(order: Any) -> float | None:
       return None
     from app.market_affordability import cash_available_for_market
 
-    return float(
-        cash_available_for_market(account, str(getattr(order, "market", "") or ""))
+    # ``cash_available_for_market`` expects a market-like object so it can map
+    # NASD/NYSE to USD. Passing the raw market string raised AttributeError and
+    # the broad safety boundary converted every valid balance into UNKNOWN.
+    from types import SimpleNamespace
+
+    market = SimpleNamespace(
+        market=str(getattr(order, "market", "") or ""),
+        ticker=str(getattr(order, "ticker", "") or ""),
     )
+    return float(cash_available_for_market(account, market))
   except Exception:  # noqa: BLE001 - unknown cash is reported as unknown.
     return None
 
@@ -9297,6 +9814,10 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
       # to become trusted later.
       row["mark_price"] = float(getattr(frame, "mark_price", 0.0) or 0.0) or None
       row["mark_price_as_of"] = observed_at.isoformat()
+      # Freshness belongs to this point-in-time feature frame, not to whether a
+      # model emitted a usable vector. Previously only the RVGI branch refreshed
+      # ``as_of``, so other valid frames vanished before algorithm evaluation.
+      row["as_of"] = observed_at.isoformat()
       # The GNN vector proposes symbol×strategy pairs; the strategy's own
       # mechanical algorithm remains the entry authority.  Carry the exact
       # point-in-time features so StrategySessionManager can run that trigger
@@ -9315,6 +9836,18 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
             row["history_bar_count"] = max(0, int(float(bar_count)))
           except (TypeError, ValueError):
             pass
+        observed_value = frame_extras.get("slow_technical:observed_trading_value")
+        try:
+          observed_value = float(observed_value)
+        except (TypeError, ValueError):
+          observed_value = 0.0
+        if observed_value > 0.0:
+          # The risk field is named ADV, but this lower bound is safer than an
+          # extrapolated daily estimate: only value already traded is credited.
+          row["average_daily_trading_value"] = max(
+              float(row.get("average_daily_trading_value") or 0.0),
+              observed_value,
+          )
       box_width_ok = (
           features.box_width_pct is not None
           and 0.002 <= features.box_width_pct <= 0.04
@@ -9385,7 +9918,40 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
         row["decisions"] = decisions
   except Exception:
     pass
+  # The strategy trigger uses point-in-time micro liquidity, while the risk
+  # manager independently checks whether a position can be exited in the name's
+  # normal daily market. Preserve the researched ADV/volatility metadata in the
+  # election row; dropping it converted "unknown" to 0 inside MarketSnapshot and
+  # made every otherwise valid BUY fail ``liquidity_check``.
+  with _live_lock:
+    live_context = _live_state.get("context")
+  _enrich_election_market_metadata(
+      rows,
+      tuple(getattr(live_context, "markets", ()) or ()),
+  )
   return rows
+
+
+def _enrich_election_market_metadata(
+    rows: dict[str, Any],
+    markets: tuple[Any, ...],
+) -> None:
+  """Join researched market capacity onto live feature evidence in place."""
+
+  for market in markets:
+    symbol = str(getattr(market, "ticker", "") or "").upper().strip()
+    row = rows.get(symbol)
+    if not symbol or not isinstance(row, dict):
+      continue
+    for key in (
+        "company_name",
+        "sector",
+        "average_daily_trading_value",
+        "volatility_20d",
+    ):
+      value = getattr(market, key, None)
+      if value is not None and value != "":
+        row.setdefault(key, value)
 
 
 def _refresh_live_candidate_shadow(
@@ -9550,6 +10116,11 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
     if group == "KRX" and not _is_live_market_core_open("KRX"):
       reject("KRX_CORE_SESSION_CLOSED", normalized)
       continue
+    if store is not None and not _candidate_has_ready_strategy_tick_window(
+        symbol, store
+    ):
+      reject("STRATEGY_TICK_WINDOW_NOT_READY", normalized)
+      continue
     if (
         store is not None
         and group == "KRX"
@@ -9627,6 +10198,67 @@ def _cached_candidate_affordable(
   cash = _account_available_cash(account, currency)
   buffer_rate = max(1.0, _env_float_web("REALTIME_AFFORDABILITY_BUFFER_RATE", 1.01))
   return cash + 1e-9 >= price * buffer_rate
+
+
+def _candidate_has_ready_strategy_tick_window(
+    ticker: str,
+    store: RealtimeMarketDataStore,
+    *,
+    now: datetime | None = None,
+) -> bool:
+  """Admit only symbols whose live 10-second window can run an entry rule.
+
+  Long-lookback density chooses subscription slots; this last-mile check answers
+  the stricter question the algorithms ask right now.  It prevents repeatedly
+  evaluating a subscribed but temporarily silent name only to return
+  ``TICK_WINDOW_NOT_READY`` on every arm.
+
+  A test/offline store without the realtime query API is left unchanged. In
+  production, a query error fails closed at candidate admission and is visible in
+  the filter diagnostics.
+  """
+  moment = now or datetime.now(timezone.utc)
+  try:
+    ticks = store.recent_ticks(
+        str(ticker or "").upper(),
+        moment - timedelta(seconds=10),
+        until=moment,
+    )
+  except AttributeError:
+    return True
+  except Exception:
+    return False
+  live_ticks = [
+      tick
+      for tick in ticks
+      if str(getattr(tick, "source", "") or "") == "kis_realtime_websocket"
+      and getattr(getattr(tick, "meta", None), "is_tradeable", True) is not False
+  ]
+  seconds = {
+      getattr(tick, "exchange_timestamp", None).replace(microsecond=0)
+      for tick in live_ticks
+      if getattr(tick, "exchange_timestamp", None) is not None
+  }
+  if len(live_ticks) < 2 or len(seconds) < 2:
+    return False
+  try:
+    book = store.latest_orderbook(str(ticker or "").upper())
+  except AttributeError:
+    return True
+  except Exception:
+    return False
+  received_at = getattr(book, "received_at", None) if book is not None else None
+  if received_at is None:
+    return False
+  try:
+    age = max(0.0, (moment - received_at).total_seconds())
+  except (TypeError, ValueError):
+    return False
+  maximum_book_age = max(
+      1.0,
+      _env_float_web("REALTIME_STRATEGY_TICK_WINDOW_BOOK_MAX_AGE_SEC", 5.0),
+  )
+  return age <= maximum_book_age
 
 
 _us_fast_poll_thread = None
@@ -9732,16 +10364,34 @@ def _krx_feature_frame_loop() -> None:
 
 def _us_fast_poll_target_symbols(held: tuple[str, ...]) -> tuple[str, ...]:
   """Return stable US poll targets without ever dropping held positions."""
+  armed = _armed_us_strategy_symbol()
   if _active_operation_mode() == "live_trading":
     limit = max(1, _auto_reliability_int("AUTO_RELIABILITY_US_WARM_SYMBOLS", 4))
     # Always use the TTL-aware selector. Reading the cache directly forever
     # pinned the first few symbols and starved the wider scanner of live data.
     watched = _sticky_us_learning_symbols(limit)
-    return tuple(dict.fromkeys((*held, *watched)))
+    return tuple(dict.fromkeys((*held, *((armed,) if armed else ()), *watched)))
   warm = _sticky_us_learning_symbols(
       _auto_reliability_int("AUTO_RELIABILITY_US_WARM_SYMBOLS", 4)
   )
-  return tuple(dict.fromkeys((*held, *warm)))
+  return tuple(dict.fromkeys((*held, *((armed,) if armed else ()), *warm)))
+
+
+def _armed_us_strategy_symbol() -> str:
+  """Keep the elected US name subscribed until its session releases ownership."""
+
+  engine = _realtime_trading_engine
+  manager = getattr(engine, "strategy_session_manager", None)
+  if manager is None:
+    return ""
+  try:
+    state = manager.snapshot()
+  except Exception:
+    return ""
+  if str(state.get("phase") or "").upper() not in {"ARMED", "IN_POSITION", "EXITING"}:
+    return ""
+  symbol = str(state.get("selected_symbol") or "").upper().strip()
+  return symbol if symbol and _ticker_market_group_for_live_trading(symbol, "") == "US" else ""
 
 
 def _held_us_realtime_symbols() -> tuple[str, ...]:
@@ -10249,6 +10899,7 @@ def _live_event_evidence(
         "labels": list(getattr(event, "event_labels", ()) or ()),
         "classification_model": classification_model,
         "age_seconds": age_seconds,
+        "ttl_seconds": float(ttl_hours * 3600),
     }
     tickers = {
         str(ticker or "").upper().strip()
@@ -10354,6 +11005,24 @@ def _build_macro_micro_observer(decision_engine):
     context_universe = tuple(
         dict.fromkeys(str(symbol) for symbol in context_symbols if str(symbol))
     )[:context_limit]
+    # A flat account used to mean an empty sector map because holdings were the
+    # only metadata source. That made every cross-sectional/residual strategy
+    # permanently return RANK_ABSENT. Prefer real context metadata, then use an
+    # explicit same-market peer group (not a fabricated industry classification).
+    with _live_lock:
+        live_context = _live_state.get("context")
+    for market in tuple(getattr(live_context, "markets", ()) or ()):
+        ticker = str(getattr(market, "ticker", "") or "").upper().strip()
+        sector = str(getattr(market, "sector", "") or "").strip()
+        if ticker and sector and sector.lower() != "unknown":
+            sector_of.setdefault(ticker, sector)
+    for symbol in context_universe:
+        sector_of.setdefault(
+            symbol,
+            "KR_MARKET_PEERS"
+            if symbol.isdigit() and len(symbol) == 6
+            else "US_MARKET_PEERS",
+        )
     macro_event_evidence, symbol_event_evidence = _live_event_evidence(
         context_universe,
         decision_time,
@@ -13064,6 +13733,7 @@ def _kis_realtime_collector_loop() -> None:
       # with tr_type 1/2 instead of reconnecting. Reconnecting minted a new
       # approval key each time and KIS bills registrations per session, which
       # is what drained the account down to a single subscribable symbol.
+      _mark_kis_realtime_ws(True)
       counts = asyncio.run(
           collector_fn(
               symbols=symbols,
@@ -13081,6 +13751,9 @@ def _kis_realtime_collector_loop() -> None:
               orderbook_symbol_filter=_kis_realtime_symbol_wants_orderbook,
           )
       )
+      # ``collector_fn`` blocks for as long as the socket is open, so returning at all
+      # means it closed.
+      _mark_kis_realtime_ws(False)
       _record_kis_realtime_collector_result(counts)
       if not _kis_realtime_collector_stop.is_set():
         if counts.get("appkey_already_in_use"):
@@ -13090,6 +13763,7 @@ def _kis_realtime_collector_loop() -> None:
         else:
           time.sleep(2.0)
     except Exception as exc:  # noqa: BLE001 - keep app startup alive and surface collector failures.
+      _mark_kis_realtime_ws(False)
       with _live_lock:
         _append_collection_log_unlocked(
             "error",
@@ -13123,6 +13797,23 @@ def _kis_realtime_effective_subscription_capacity() -> int | None:
   if age >= retry_seconds:
     return None  # re-probe the configured maximum on the next subscribe
   return _kis_realtime_observed_subscription_capacity
+
+
+def _mark_kis_realtime_ws(connected: bool) -> None:
+  with _live_lock:
+    if _kis_realtime_ws_state.get("connected") is not connected:
+      _kis_realtime_ws_state["changed_at"] = datetime.now(timezone.utc).isoformat()
+    _kis_realtime_ws_state["connected"] = bool(connected)
+
+
+def _kis_realtime_websocket_connected() -> bool | None:
+  """``True``/``False`` once the collector has run, ``None`` before that.
+
+  Never guesses. A caller that gets ``None`` is being told the state is not established,
+  which the hard gate treats the same as disconnected.
+  """
+  with _live_lock:
+    return _kis_realtime_ws_state.get("connected")
 
 
 def _record_kis_realtime_collector_result(counts: dict[str, Any]) -> None:
@@ -14095,7 +14786,7 @@ def _held_or_recent_buy_tickers(account: AccountSnapshot | None) -> set[str]:
   return excluded
 
 
-def _recent_live_buy_tickers(path: str | Path = "logs/live-orders.jsonl") -> set[str]:
+def _recent_live_buy_tickers(path: str | Path | None = None) -> set[str]:
   try:
     cooldown_seconds = max(0, int(os.getenv("LIVE_BUY_TICKER_COOLDOWN_SECONDS", "21600")))
   except ValueError:
@@ -14104,8 +14795,9 @@ def _recent_live_buy_tickers(path: str | Path = "logs/live-orders.jsonl") -> set
     return set()
   cutoff = datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)
   tickers: set[str] = set()
+  journal_path = Path(path) if path is not None else log_path("live-orders.jsonl")
   try:
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    lines = journal_path.read_text(encoding="utf-8").splitlines()
   except OSError:
     return tickers
   for line in lines[-200:]:
@@ -19674,4 +20366,3 @@ HTML = """
 </body>
 </html>
 """
-

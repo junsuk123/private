@@ -121,6 +121,29 @@ class TestFreshnessAndExit:
         assert MICRO_NEGATIVE_EVENT_RISK in r.reason_codes
         assert r.diagnostics["event_evidence_count"] == 1
 
+    def test_positive_event_age_and_ttl_reach_strategy_diagnostics(self):
+        data = _inp()
+        data = MicroReasoningInput(
+            **{
+                **data.__dict__,
+                "event_evidence": (
+                    {
+                        "sentiment": "POSITIVE",
+                        "confidence": 0.82,
+                        "age_seconds": 90.0,
+                        "ttl_seconds": 3600.0,
+                        "event_id": "event-positive-1",
+                    },
+                ),
+            }
+        )
+
+        result = _reasoner().reason(data)
+
+        assert result.diagnostics["event_age_seconds"] == 90.0
+        assert result.diagnostics["event_ttl_seconds"] == 3600.0
+        assert result.diagnostics["positive_event_score"] == 0.82
+
     def test_stale_quote_blocks(self):
         r = _reasoner().reason(_inp(quote_age=200.0))
         assert r.entry_signal == EntrySignal.BLOCKED

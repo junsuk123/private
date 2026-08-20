@@ -197,3 +197,50 @@ class TestCycleSnapshotAdapter:
         )
 
         assert collector.records[0].stage is SelectionStage.LIVE_NOT_AUTHORIZED
+
+    def test_negative_bandit_edge_is_profitability_not_macro_block(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "019010",
+                "strategy_id": "bar_confirmed_vwap_recovery",
+                "triggered": True,
+                "expected_edge_bps": 138.0,
+                "reason_codes": ["BAR_CONFIRMED_VWAP_RECOVERY"],
+            }],
+            session={
+                "macro_regime": "RANGE_BOUND",
+                "ontology_reason_codes": ["MACRO_RANGE_BOUND"],
+                "last_reason": "BANDIT_NO_TRADE_NO_POSITIVE_CONSERVATIVE_EDGE",
+                "bandit_evaluations": [{
+                    "symbol": "019010",
+                    "arm": "bar_confirmed_vwap_recovery",
+                    "admissible": False,
+                    "shadow_only": False,
+                    "conservative_edge_bps": -121.193,
+                    "posterior_mean_net_bps": -60.758,
+                    "uncertainty_penalty_bps": 60.434,
+                    "reason_codes": ["BANDIT_ARM_MEASURED_NEGATIVE_EDGE"],
+                }],
+            },
+        )
+
+        record = collector.records[0]
+        assert record.stage is SelectionStage.PROFITABILITY_REJECTED
+        assert record.market == "KR"
+        assert record.regime == "RANGE_BOUND"
+        assert record.fused_net_bps == -121.193
+        assert "MACRO_RANGE_BOUND" in record.reason_codes
+
+    def test_only_explicit_macro_block_is_classified_as_macro(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "INTC",
+                "strategy_id": "intraday_momentum",
+                "triggered": True,
+                "expected_edge_bps": 12.5,
+                "reason_codes": [],
+            }],
+            session={"ontology_reason_codes": ["MACRO_STRATEGY_BLOCKED"]},
+        )
+
+        assert collector.records[0].stage is SelectionStage.MACRO_BLOCKED

@@ -134,6 +134,36 @@ def test_soft_micro_holds_do_not_block_joint_symbol_strategy_election(
     assert chain["micro_buy_intents"]["data"]["hard_blocked_symbols"] == ["T"]
 
 
+def test_missing_legacy_micro_result_does_not_block_independent_algorithms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _closed_market_status()
+    status["last_summary"] = {
+        "reason": "NO_MECHANICAL_STRATEGY_TRIGGER",
+        "buy_candidate_count": 1,
+        "buy_candidate_sample": ["INTC"],
+        "live_armed": True,
+        "strategy_session": {
+            "phase": "SCANNING",
+            "bandit_selected_arm": None,
+            "candidate_diagnostics": [],
+            "algorithm_evaluations": [
+                {
+                    "symbol": "INTC",
+                    "strategy_id": "intraday_momentum",
+                    "triggered": False,
+                    "reason_codes": ["MOMENTUM_TICK_RETURN_TOO_WEAK"],
+                }
+            ],
+        },
+    }
+
+    chain = _chain_for(monkeypatch, status)
+
+    assert chain["micro_buy_intents"]["ok"] is True
+    assert "독립 전략 알고리즘 1개 평가" in chain["micro_buy_intents"]["detail"]
+
+
 def test_missing_bandit_fields_still_report_stale_code(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _closed_market_status()
     status["strategy_session"] = {"phase": "SCANNING"}
@@ -195,6 +225,8 @@ def test_candidate_blockade_exposes_same_cycle_filter_reasons(
     assert data["candidate_filter_reason_samples"] == {
         "INSUFFICIENT_USD_ORDERABLE_CASH": ["F", "SOFI"]
     }
+    assert "micro_buy_intents" not in chain
+    assert "strategy_election" not in chain
 
 
 def test_candidate_filter_diagnostics_do_not_add_a_dependency_gate(

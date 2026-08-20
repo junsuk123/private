@@ -96,6 +96,8 @@ BANDIT_ARM_MEASURED_NEGATIVE_EDGE = "BANDIT_ARM_MEASURED_NEGATIVE_EDGE"
 BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS = (
     "BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS"
 )
+BANDIT_EVIDENCE_WARMUP = "BANDIT_EVIDENCE_WARMUP"
+BANDIT_MEASURED_EDGE_REJECTED = "BANDIT_MEASURED_EDGE_REJECTED"
 BANDIT_SHORT_DIRECTION_PENALTY_APPLIED = "BANDIT_SHORT_DIRECTION_PENALTY_APPLIED"
 BANDIT_SHORT_AGAINST_REGIME_PENALTY = "BANDIT_SHORT_AGAINST_REGIME_PENALTY"
 BANDIT_BOTH_DIRECTIONS_NEGATIVE = ShortReasonCodes.BOTH_DIRECTIONS_NEGATIVE
@@ -597,6 +599,22 @@ class ConservativeStrategyBandit:
         best = next((item for item in evaluations if item.admissible), None)
         shadow = tuple(item.arm for item in evaluations if item.shadow_only)
         if best is None:
+            evaluation_reasons = {
+                code
+                for item in evaluations
+                for code in item.reason_codes
+            }
+            if evaluation_reasons & {
+                BANDIT_ARM_COLD_START_SHADOW_ONLY,
+                BANDIT_ARM_INSUFFICIENT_POSITIVE_SAMPLES,
+            }:
+                reasons.append(BANDIT_EVIDENCE_WARMUP)
+            if evaluation_reasons & {
+                BANDIT_ARM_LOSS_STREAK_SUSPENDED,
+                BANDIT_ARM_MEASURED_NEGATIVE_EDGE,
+                BANDIT_ARM_PREDICTION_CAPPED_BY_REALIZED_LOSS,
+            }:
+                reasons.append(BANDIT_MEASURED_EDGE_REJECTED)
             reasons.append(BANDIT_NO_POSITIVE_CONSERVATIVE_EDGE)
             no_trade = BanditSelection(
                 selected_arm=NO_TRADE_ARM,

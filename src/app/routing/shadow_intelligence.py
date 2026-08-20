@@ -471,9 +471,10 @@ class ShadowIntelligenceService:
             "data_fresh": _fact(snapshot, "data_fresh", snapshot.data_fresh),
             "tradable": _fact(snapshot, "tradable", snapshot.tradable),
         }
-        compatibility = _strategy_compatibility(snapshot.features)
+        compatibility, expressible = _compatibility_with_provenance(snapshot.features)
         for strategy_id in STRATEGY_IDS:
             compatibility_score = compatibility.get(strategy_id, 0.0)
+            unavailable = strategy_id not in expressible
             facts[f"allow:{strategy_id}"] = _fact(
                 snapshot,
                 f"allow:{strategy_id}",
@@ -483,6 +484,11 @@ class ShadowIntelligenceService:
                 snapshot,
                 f"compat:{strategy_id}",
                 compatibility_score,
+            )
+            facts[f"compat_unavailable:{strategy_id}"] = _fact(
+                snapshot,
+                f"compat_unavailable:{strategy_id}",
+                unavailable,
             )
             facts[f"compatible:{strategy_id}"] = _fact(
                 snapshot,
@@ -654,48 +660,8 @@ COMPATIBILITY_UNAVAILABLE_REASONS: dict[str, str] = {
     "residual_relative_strength": "CONTEXT_UNAVAILABLE:PEER_RESIDUALS",
     "residual_relative_weakness": "CONTEXT_UNAVAILABLE:PEER_RESIDUALS",
     "cross_sectional_relative_strength": "CONTEXT_UNAVAILABLE:PEER_RANKING",
-    # Session structure: opening range and the first-half-hour return are
-    # measured from session boundaries, not from the sub-second window.
-    "opening_range_breakout": "CONTEXT_UNAVAILABLE:OPENING_RANGE",
-    "opening_range_breakdown": "CONTEXT_UNAVAILABLE:OPENING_RANGE",
-    "market_intraday_momentum": "CONTEXT_UNAVAILABLE:FIRST_HALF_HOUR",
-    "market_intraday_momentum_short": "CONTEXT_UNAVAILABLE:FIRST_HALF_HOUR",
-    "gap_context": "CONTEXT_UNAVAILABLE:SESSION_OPEN_GAP",
     # Point-in-time news: an event relation needs the event and its age.
     "event_momentum": "CONTEXT_UNAVAILABLE:EVENT_FACTS",
-    # A meaningful anchor (session open, volatility spike, news time) is what
-    # separates this from plain VWAP reversion; the snapshot carries only the
-    # rolling VWAP proxy.
-    "adaptive_anchored_vwap_reversion": "CONTEXT_UNAVAILABLE:VWAP_ANCHOR",
-    # The contract carries a bar-level ``orderbook_imbalance`` but no bid/ask
-    # depth or microprice: the historical path has the persisted per-bar columns
-    # and nothing finer, so an OFI microprice cannot be formed on both sides.
-    # Inventing one at serving time only would be a fabricated relation.
-    "ofi_microprice_exhaustion_reversal": "CONTEXT_UNAVAILABLE:L2_MICROPRICE",
-    # The four below were added to the catalogue with no relation and no declared
-    # reason. They scored a permanent 0.0 and were ontology-blocked on every pass,
-    # and the guard meant to catch that was itself disabled -- see
-    # ``compatibility_coverage``. Declared rather than given an invented relation:
-    # each names an indicator the aligned context does not carry, and the contract
-    # only admits quantities BOTH producers compute over the same window.
-    #
-    # This is not cosmetic. On the current checkpoint the KRX label outcomes for
-    # supertrend_dmi_continuation (+4.20bps net over 33 fills) and
-    # bar_trend_continuation (+1.16bps over 36) are the closest of any high-fill KRX
-    # pair to the +5bps upside-authorisation bar, so two of the most promising arms
-    # in the system are blocked on a missing feature rather than on performance.
-    #
-    # The contract carries only the LAST bar's return, not a multi-bar persistence
-    # statistic, and no moving-average pair to separate.
-    "bar_trend_continuation": "CONTEXT_UNAVAILABLE:EMA_SEPARATION_AND_TREND_PERSISTENCE",
-    # ADX, the DMI spread and the Supertrend band are all absent; the contract's
-    # only indicator families are RVGI and the box.
-    "supertrend_dmi_continuation": "CONTEXT_UNAVAILABLE:ADX_DMI_SUPERTREND",
-    # Needs the Keltner band width to measure a squeeze, plus ADX.
-    "keltner_volatility_breakout": "CONTEXT_UNAVAILABLE:KELTNER_SQUEEZE_AND_ADX",
-    # Needs the choppiness index and ADX to establish a range, plus RSI and
-    # Bollinger %B to locate the entry inside it.
-    "choppiness_range_reversion": "CONTEXT_UNAVAILABLE:CHOPPINESS_RSI_BOLLINGER",
 }
 
 
@@ -724,6 +690,26 @@ def compatibility_coverage() -> dict[str, str]:
         else:
             coverage[strategy_id] = "UNDECLARED"
     return coverage
+
+
+def _compatibility_with_provenance(
+    features: tuple[float, ...],
+) -> tuple[dict[str, float], frozenset[str]]:
+    """Scores, plus which ids the contract could actually express.
+
+    The pair is the point. ``_strategy_compatibility`` alone cannot answer "was this a
+    measured zero or an absent relation", and the gate needs that distinction: a relation
+    this snapshot cannot compute is not evidence against the strategy.
+    """
+    scores = (
+        _named_relation_scores(features)
+        if len(features) == STRATEGY_GRAPH_CONTEXT_DIM
+        else _legacy_relation_scores(features)
+    )
+    expressible = frozenset(scores)
+    for strategy_id in STRATEGY_IDS:
+        scores.setdefault(strategy_id, 0.0)
+    return scores, expressible
 
 
 def _strategy_compatibility(features: tuple[float, ...]) -> dict[str, float]:
@@ -805,6 +791,47 @@ def _named_relation_scores(features: tuple[float, ...]) -> dict[str, float]:
         * box_available
         * unit(0.45 * rvgi_cross + 0.35 * box_position + 0.20 * breakout_pressure)
     )
+    # --- Trend structure, v6 ------------------------------------------------ #
+    # These relations exist because the v5 contract could not express them at all,
+    # and the closed-world gate turns "cannot express" into a permanent veto: every
+    # trend, volatility-regime and range-regime arm in the catalogue was unreachable
+    # on every pass, which left the elector choosing among mean-reversion arms only.
+    # Like the relations above, each states the COARSE thesis and leaves exact
+    # thresholds to the owned algorithm.
+    trend_known = unit(value("trend_available"))
+    #: ADX 25 is the conventional "trending, not ranging" line; adx_scaled is ADX/100.
+    trend_conviction = trend_known * unit(value("adx_scaled") / 0.25)
+    directional_bias = unit(0.5 + 0.5 * value("supertrend_direction"))
+    dmi_bias = unit(0.5 + 0.5 * value("dmi_spread_scaled") / 0.25)
+    ema_bias = unit(0.5 + 0.5 * value("ema_separation_pct"))
+    keltner_known = unit(value("keltner_available"))
+    oscillator_known = unit(value("oscillator_available"))
+    #: CHOP above ~61 is the conventional "range, not trend" reading.
+    range_regime = oscillator_known * unit(value("choppiness_scaled") / 0.61)
+
+    # --- Session structure, v6 ---------------------------------------------- #
+    session_known = unit(value("session_structure_available"))
+    opening_position = value("opening_range_position")
+    #: 0 below 0.9 of the range, 1.0 at or past 1.1 — crisp about the boundary the
+    #: thesis is actually about, rather than scoring mid-range drift as half a break.
+    above_opening_range = unit((opening_position - 0.9) * 5.0)
+    below_opening_range = unit((0.1 - opening_position) * 5.0)
+    #: The intraday-momentum effect is a statement about the CLOSE, so how late in
+    #: the session it is belongs in the relation.
+    session_maturity = unit(value("minutes_since_session_open") / 330.0)
+    first_half_hour = value("first_half_hour_return_pct")
+
+    # ``spread_quality`` is zero whenever the minute carried no book sample, which is
+    # ~89.5% of KRX bars. Multiplying a relation by it therefore does not express "the
+    # book is poor" — it expresses "we did not look", and on nine bars in ten it zeroes
+    # the relation outright. That is the right factor for a thesis the book is PART of,
+    # and the wrong one for a thesis measured from bars over hours: a three-hour trend
+    # continuation does not stop being a trend because one minute went unsampled, and
+    # spread is an execution concern the guard already re-checks at submit time with a
+    # live book rather than a stale bar column.
+    #
+    # So the factor is applied by whether the THESIS reads the book, not uniformly.
+    book_thesis = spread_quality
     computed = {
         "intraday_momentum": trend_strength * spread_quality,
         "breakout_volume": breakout_pressure * spread_quality,
@@ -836,6 +863,81 @@ def _named_relation_scores(features: tuple[float, ...]) -> dict[str, float]:
         # produce ``aggressor_imbalance_5s``, and the scaled bar return is the
         # directional-pressure measure both sides share. Minutes-to-close stays the
         # owned algorithm's point-in-time responsibility, as it was before.
+        # A continuation thesis needs the trend to be real (ADX), pointed (supertrend)
+        # and confirmed by directional movement (DMI) — three readings of the same
+        # structure, so they multiply rather than average.
+        "supertrend_dmi_continuation": (
+            trend_conviction * directional_bias * dmi_bias
+        ),
+        # The bar-trend arm reads separation rather than ADX: fast EMA above slow,
+        # and price holding above the fast one.
+        "bar_trend_continuation": (
+            trend_known
+            * ema_bias
+            * unit(0.5 + 0.5 * value("ema_fast_distance_pct"))
+        ),
+        # A channel breakout is only interesting where the channel is being pushed
+        # AND the move has directional conviction; without ADX this scores every
+        # drift through the band as a breakout.
+        "keltner_volatility_breakout": (
+            keltner_known
+            * unit(value("keltner_position"))
+            * trend_conviction
+        ),
+        # The opposite regime to the three above, and deliberately expressed from the
+        # same numbers the other way up: a high choppiness index with price at the
+        # lower Bollinger extreme is the range-reversion thesis.
+        "choppiness_range_reversion": (
+            range_regime * unit(1.0 - value("bb_percent_b"))
+        ),
+        # Exhaustion, not continuation: the book leans one way while the last
+        # completed bar moved the other. Their product is negative exactly when they
+        # disagree, which is the whole relation.
+        # This one IS a book thesis — microprice against flow — so an unsampled book
+        # really does mean it cannot be evaluated.
+        "ofi_microprice_exhaustion_reversal": (
+            microstructure_known
+            * unit(abs(order_imbalance))
+            * unit(0.5 - 2.0 * momentum * order_imbalance)
+        ),
+        # Anchored VWAP reversion is displacement measured against the symbol's own
+        # volatility rather than an absolute band — a 30bp gap is a long way for a
+        # quiet name and noise for a violent one, which is what makes it adaptive.
+        "adaptive_anchored_vwap_reversion": (
+            unit(vwap_deviation * 100.0 / max(value("atr_pct"), 0.05))
+            * book_thesis
+        ),
+        # A range break is the range being cleared, with the completed-minute
+        # pressure to suggest it holds. The width term keeps a one-tick "range" from
+        # scoring as a decisive break.
+        "opening_range_breakout": (
+            session_known
+            * above_opening_range
+            * breakout_pressure
+            * unit(value("opening_range_width_pct") / 0.2)
+        ),
+        "opening_range_breakdown": (
+            session_known
+            * below_opening_range
+            * unit(1.0 - breakout_pressure)
+            * unit(value("opening_range_width_pct") / 0.2)
+        ),
+        # Gap context is about a gap existing and being large enough to organise the
+        # session around; which side to take is the owned algorithm's submode.
+        "gap_context": (
+            unit(value("session_gap_available"))
+            * unit(abs(value("session_gap_pct")) / 1.0)
+            * spread_quality
+        ),
+        # The intraday-momentum effect: the first half hour's sign carries into the
+        # close. Both arms read the SAME field with opposite sign, which is what makes
+        # them a matched long/short pair rather than two unrelated theses.
+        "market_intraday_momentum": (
+            session_known * session_maturity * unit(first_half_hour)
+        ),
+        "market_intraday_momentum_short": (
+            session_known * session_maturity * unit(-first_half_hour)
+        ),
         "overnight_gap_carry": (
             unit(0.5 + 0.5 * momentum)
             * unit(0.5 + 50.0 * value("distance_from_vwap"))

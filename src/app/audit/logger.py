@@ -24,6 +24,30 @@ SENSITIVE_KEYS = {
 }
 REDACTED = "***REDACTED***"
 
+#: Default directory for the operator's journals.
+DEFAULT_LOG_DIR = "logs"
+
+
+def log_path(name: str) -> Path:
+    """Resolve a journal filename under the active log directory.
+
+    Every default journal path goes through here so that ``OBAITS_LOG_DIR`` can move
+    the whole set at once. That exists because the paths used to be hardcoded as
+    default ARGUMENTS -- ``LiveOrderJournal(path="logs/live-orders.jsonl")``,
+    ``RiskManager``'s fallback ``AuditLogger(Path("logs/principal-protection.jsonl"))``
+    -- so any caller that constructed one without naming a path wrote to the
+    operator's real audit trail. A test suite is exactly such a caller, and the
+    result was measurable: 6,162 ``LAB`` order records in ``logs/live-orders.jsonl``
+    and 665 demo-issuer (900001/900002) entries in ``logs/audit.jsonl``, sitting
+    indistinguishable from real ones in the journal a funded account is reconciled
+    against.
+
+    Resolved on CALL, never at import, so redirecting it does not depend on which
+    modules an interpreter happened to import first.
+    """
+    root = (os.getenv("OBAITS_LOG_DIR") or "").strip() or DEFAULT_LOG_DIR
+    return Path(root) / name
+
 
 class AuditLogger:
     def __init__(

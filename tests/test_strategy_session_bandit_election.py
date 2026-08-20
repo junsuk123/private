@@ -41,6 +41,10 @@ def _manager(tmp_path, *, store=None, evidence=None, **config_overrides):
         "cooldown_seconds": 5,
         "entry_timeout_seconds": 30,
         "require_live_gnn": False,
+        # This module exercises the legacy bandit deliberately. Production now
+        # uses deterministic algorithm authority with the bandit disabled.
+        "algorithm_primary_election": False,
+        "bandit_enabled": True,
     }
     values.update(config_overrides)
     return StrategySessionManager(
@@ -303,7 +307,12 @@ def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_pa
             ],
         }
     }
-    manager = _manager(tmp_path, evidence=evidence)
+    manager = _manager(
+        tmp_path,
+        evidence=evidence,
+        algorithm_primary_election=True,
+        bandit_enabled=False,
+    )
     manager._journal_shadow_proposals = lambda proposals, now, **_kwargs: None
     bundle = SimpleNamespace(
         ranked_trade_intents=(), buy_candidates=(), sell_reduce_candidates=(),
@@ -314,9 +323,12 @@ def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_pa
 
     assert state["phase"] == "ARMED"
     assert state["selected_strategy"] == "intraday_momentum"
-    assert state["selection_source"] == "ALGORITHM_MECHANICAL_ELECTION"
-    assert state["bandit_is_exploration"] is True
-    assert "BANDIT_EXPLORATION_ARM_SELECTED" in state["bandit_reason_codes"]
+    # The validation vector may confirm that the owned algorithm fired, but it
+    # cannot replace that deterministic proposal or charge a model-absence
+    # penalty to its edge.
+    assert state["selection_source"] == "ONTOLOGY_ALGORITHM_ELECTION"
+    assert state["bandit_is_exploration"] is False
+    assert state["bandit_evaluations"] == []
 
 
 def test_string_macro_regime_is_preserved_for_posterior_context(tmp_path):

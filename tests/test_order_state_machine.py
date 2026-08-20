@@ -397,3 +397,40 @@ def test_absent_account_view_is_not_reconciled(tmp_path) -> None:
     )
     assert not result.reconciled
     assert "ACCOUNT_QUERY_FAILED" in result.reason_codes
+
+
+def test_prune_unexecuted_decisions_preserves_recent_buy_and_order_audit(tmp_path) -> None:
+    store = TradingStateStore(tmp_path / "s.sqlite3")
+    old = (NOW - timedelta(hours=48)).isoformat()
+    recent = NOW.isoformat()
+    with store.transaction() as conn:
+        conn.executemany(
+            "insert into strategy_decision"
+            " (decision_id, decided_at, ticker, action) values (?, ?, ?, ?)",
+            (
+                ("discard", old, "A", "WAIT"),
+                ("ordered", old, "B", "WAIT"),
+                ("buy", old, "C", "BUY"),
+                ("recent", recent, "D", "WAIT"),
+            ),
+        )
+        conn.execute(
+            "insert into order_intent"
+            " (intent_id, created_at, decision_id, ticker, side, quantity,"
+            " idempotency_key, state, state_updated_at)"
+            " values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("intent", old, "ordered", "B", "BUY", 1, "key", "CREATED", old),
+        )
+
+    removed = store.prune_unexecuted_decisions(
+        retention_hours=24, now=NOW
+    )
+
+    assert removed["strategy_decision"] == 1
+    assert store.fetch_one(
+        "select decision_id from strategy_decision where decision_id = 'discard'"
+    ) is None
+    assert {
+        row["decision_id"]
+        for row in store.fetch_all("select decision_id from strategy_decision")
+    } == {"ordered", "buy", "recent"}

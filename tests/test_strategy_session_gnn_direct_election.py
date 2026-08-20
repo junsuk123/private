@@ -39,6 +39,10 @@ def _manager(tmp_path, *, store=None, **config_overrides):
         "cooldown_seconds": 5,
         "entry_timeout_seconds": 30,
         "require_live_gnn": False,
+        # Control cases in this module explicitly compare GNN-direct with the
+        # legacy bandit, not with the production deterministic selector.
+        "algorithm_primary_election": False,
+        "bandit_enabled": True,
     }
     values.update(config_overrides)
     return StrategySessionManager(

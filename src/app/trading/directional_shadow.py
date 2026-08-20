@@ -304,6 +304,17 @@ class ShadowOutcome:
     max_favorable_excursion_bps: float | None = None
     fill_ratio: float = 1.0
     reason_codes: tuple[str, ...] = ()
+    #: The gross edge the algorithm claimed at signal time. Carried onto the
+    #: outcome so the calibrator can pair a claim with what it paid; without it
+    #: the pairing would need a second lookup against the plan journal.
+    predicted_gross_edge_bps: float | None = None
+    #: Did the signal that produced this plan clear its own entry gate?
+    #: False for a plan the algorithm layer already refused (below the
+    #: cost floor, non-positive edge). Such a plan is still walked and
+    #: journalled -- it is how the rejected region stays measurable -- but it
+    #: is NOT evidence about trades the executor would place, and the bandit
+    #: posterior must not read it as such.
+    signal_admissible: bool = True
 
     @property
     def scored(self) -> bool:
@@ -657,6 +668,8 @@ class ShadowFillSimulator:
             else None
         )
         return ShadowOutcome(
+            signal_admissible=plan_signal_admissible(plan),
+            predicted_gross_edge_bps=plan.predicted_gross_edge_bps,
             plan_id=plan.plan_id,
             key=plan.key,
             symbol=plan.symbol,
@@ -694,6 +707,33 @@ def _fill_ratio(
     if available is None:
         return 1.0
     return max(0.0, min(1.0, float(available) / wanted))
+
+
+#: Reason codes the algorithm layer emits when it REFUSES a signal. A plan
+#: carrying one of these was never a tradeable candidate: ``_fire`` returned a
+#: rejection and the executor would not have placed it.
+SIGNAL_REJECTION_CODES: frozenset[str] = frozenset(
+    {
+        "EDGE_BELOW_COST_FLOOR",
+        "EDGE_BELOW_ALGORITHM_FLOOR",
+        "TECHNICAL_EDGE_NON_POSITIVE",
+    }
+)
+
+
+def plan_signal_admissible(plan: "ShadowTradePlan") -> bool:
+    """Would the entry gate have let this plan through?
+
+    Two independent ways to fail, because the two layers can disagree: an
+    explicit rejection code from ``_fire``, or a predicted net edge that cannot
+    pay for the round trip. Either one means the live executor would not have
+    taken the trade, so its realized outcome says nothing about the strategy's
+    live performance -- it measures the rejected region.
+    """
+    if set(plan.signal_reason_codes) & SIGNAL_REJECTION_CODES:
+        return False
+    predicted = plan.predicted_net_edge_bps
+    return predicted is None or predicted > 0.0
 
 
 def _apply_slippage(

@@ -320,7 +320,7 @@ def test_the_guard_never_emits_an_investment_reason() -> None:
         {"orderable_cash": 0.0},
         {"sellable_quantity": 0},
     ):
-        decision = _guard().evaluate(_order(), plan=plan, **kwargs)
+        decision = _guard().evaluate(_order(), plan=plan, now=NOW, **kwargs)
         for reason in decision.reason_codes:
             for forbidden in FORBIDDEN_INVESTMENT_CHECKS:
                 assert forbidden not in reason.upper(), reason
@@ -352,19 +352,21 @@ def test_the_guard_source_contains_no_investment_vocabulary() -> None:
     ],
 )
 def test_technical_defects_block(kwargs: dict, expected: str) -> None:
-    decision = _guard().evaluate(_order(**kwargs), plan=_plan())
+    decision = _guard().evaluate(_order(**kwargs), plan=_plan(), now=NOW)
     assert not decision.allowed
     assert expected in decision.reason_codes
 
 
 def test_insufficient_cash_blocks_a_buy() -> None:
-    decision = _guard().evaluate(_order(), plan=_plan(), orderable_cash=100.0)
+    decision = _guard().evaluate(_order(), plan=_plan(), orderable_cash=100.0, now=NOW)
     assert not decision.allowed
     assert "GUARD_INSUFFICIENT_CASH" in decision.reason_codes
 
 
 def test_partial_cash_clips_rather_than_blocks() -> None:
-    decision = _guard().evaluate(_order(quantity=10), plan=_plan(), orderable_cash=300_000.0)
+    decision = _guard().evaluate(
+        _order(quantity=10), plan=_plan(), orderable_cash=300_000.0, now=NOW
+    )
     assert decision.allowed
     assert decision.clipped
     assert 0 < decision.permitted_quantity < 10

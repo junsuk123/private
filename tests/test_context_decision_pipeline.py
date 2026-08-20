@@ -579,3 +579,55 @@ def test_gnn_cannot_reach_the_execution_layer() -> None:
     ):
         assert f"import {forbidden}" not in text
         assert f"from {forbidden}" not in text
+
+
+def test_a_suspended_symbol_is_halted_even_while_the_venue_transacts(
+    store, fresh_registry, tmp_path
+) -> None:
+    """Per-symbol suspension is the case that actually occurs.
+
+    The cycle-wide flag can only answer "is the venue trading". A symbol suspended inside
+    an open session would otherwise pass the halt gate on the venue's answer.
+    """
+    pipeline = _pipeline(store, fresh_registry, tmp_path)
+    result = _run(
+        pipeline, candidates=[_candidate(halted=True)], trading_halted=False
+    )
+
+    decision = result.decisions[0]
+    assert "HARD:TRADING_HALT" in decision.gate_reasons
+    assert decision.gate_result is False
+    # And it is the ONLY complaint: everything else the gate needs was supplied.
+    assert [r for r in decision.gate_reasons if r.startswith("HARD:")] == [
+        "HARD:TRADING_HALT"
+    ]
+
+
+def test_a_tradable_symbol_does_not_inherit_a_halt_it_does_not_have(
+    store, fresh_registry, tmp_path
+) -> None:
+    pipeline = _pipeline(store, fresh_registry, tmp_path)
+    result = _run(
+        pipeline, candidates=[_candidate(halted=False)], trading_halted=True
+    )
+
+    decision = result.decisions[0]
+    assert "HARD:TRADING_HALT" not in decision.gate_reasons
+
+
+def test_scoped_staleness_does_not_contaminate_another_symbol() -> None:
+    from app.trading.context_decision_pipeline import (
+        _global_stale_reasons,
+        _stale_reasons_for_ticker,
+    )
+
+    reasons = (
+        "STALE_DATA:kis_websocket/tick:005930",
+        "STALE_DATA:kis_websocket/orderbook:AAPL",
+        "STALE_DATA:collector/heartbeat",
+    )
+    assert _stale_reasons_for_ticker(reasons, "AAPL") == (
+        "STALE_DATA:kis_websocket/orderbook:AAPL",
+        "STALE_DATA:collector/heartbeat",
+    )
+    assert _global_stale_reasons(reasons) == ("STALE_DATA:collector/heartbeat",)

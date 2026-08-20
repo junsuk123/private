@@ -18,7 +18,7 @@ from typing import Any
 
 import uvicorn
 
-from app.audit import AuditLogger
+from app.audit import AuditLogger, log_path
 from app.cli import run_demo
 from app.data.llm_classifier import configure_default_event_llm_env
 from app.research import ResearchService
@@ -63,6 +63,15 @@ def main() -> None:
         action="store_true",
         help="Start the web server without running research and demo checks first",
     )
+    parser.add_argument(
+        "--keep-existing-servers",
+        action="store_true",
+        help=(
+            "Do not stop other app servers in this workspace before binding. "
+            "Required to run a second instance alongside the live one, because "
+            "the default sweep matches on command line and workspace, not port."
+        ),
+    )
     args = parser.parse_args()
 
     # Checked BEFORE anything else starts: the failure mode this prevents is a
@@ -74,7 +83,14 @@ def main() -> None:
         print(f"REFUSING TO START: {exc}", file=sys.stderr)
         raise SystemExit(2)
 
-    _stop_existing_app_servers(args.host, args.port)
+    # Port is NOT part of the match: _stop_existing_app_servers kills every
+    # python/uvicorn process in this workspace whose command mentions run.py or
+    # app.web:app. That is what the live launcher wants (it sweeps a port range
+    # and expects to own the machine), and it is exactly wrong for a second,
+    # read-only instance published on another port -- starting one would
+    # terminate the live trading engine. Hence the explicit opt-out.
+    if not args.keep_existing_servers:
+        _stop_existing_app_servers(args.host, args.port)
 
     if not args.skip_startup_checks:
         _run_startup_checks_in_background(Path(args.research_config))
@@ -126,7 +142,7 @@ def _configure_windows_event_loop_policy() -> None:
 
 def _run_startup_checks_in_background(research_config: Path) -> None:
     def worker() -> None:
-        audit = AuditLogger(Path("logs/startup.jsonl"))
+        audit = AuditLogger(log_path("startup.jsonl"))
         try:
             startup = run_startup_checks(research_config)
             print(json.dumps(_to_jsonable(startup), indent=2, ensure_ascii=False, sort_keys=True))
@@ -141,7 +157,7 @@ def _run_startup_checks_in_background(research_config: Path) -> None:
 
 
 def run_startup_checks(research_config: Path) -> dict[str, Any]:
-    audit = AuditLogger(Path("logs/startup.jsonl"))
+    audit = AuditLogger(log_path("startup.jsonl"))
     store = LocalResearchStore()
     research_result = ResearchService(archive=None).run_from_config(research_config)
     stored_counts = store.save_research_result(research_result)
@@ -250,6 +266,15 @@ def _stop_existing_app_servers(host: str, preferred_port: int) -> None:
         if pid <= 0 or pid in protected_pids:
             continue
         command = str(process.get("command", "") or "")
+        if "--keep-existing-servers" in command:
+            # That instance declared it coexists with others, and the declaration
+            # has to bind in both directions to mean anything. The published
+            # read-only instance runs with this flag on a port of its own; if an
+            # ordinary live restart still swept it away, the public Funnel URL
+            # would 502 every time the live server was restarted, silently and
+            # with the Funnel still switched on. Matching is by command line and
+            # workspace rather than port, so a different port does not save it.
+            continue
         if _is_existing_app_server_command(command, workspace) or (
             pid in listening_pids and _looks_like_app_server_command(command)
         ):

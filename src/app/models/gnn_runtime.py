@@ -39,6 +39,7 @@ from typing import Any, Mapping
 
 from app.models.graph_snapshot import GraphSnapshot
 from app.models.temporal_hetero_gnn import (
+    SUPERVISED_HEADS,
     TemporalHeteroGnn,
     TemporalHeteroGnnConfig,
     TemporalHeteroGnnOutput,
@@ -46,6 +47,7 @@ from app.models.temporal_hetero_gnn import (
 
 __all__ = [
     "DEFAULT_CHECKPOINT_PATH",
+    "GNN_PARTIAL_TRAINING",
     "GnnHealth",
     "GnnHealthState",
     "GnnRuntime",
@@ -61,6 +63,7 @@ GNN_PREDICTION_STALE = "GNN_PREDICTION_STALE"
 GNN_HIGH_UNCERTAINTY = "GNN_HIGH_UNCERTAINTY"
 GNN_SHAPE_MISMATCH = "GNN_SHAPE_MISMATCH"
 GNN_UNTRAINED_WEIGHTS = "GNN_UNTRAINED_WEIGHTS"
+GNN_PARTIAL_TRAINING = "GNN_PARTIAL_TRAINING"
 
 
 class GnnHealthState(str, Enum):
@@ -198,6 +201,8 @@ class GnnRuntime:
         self._last_inference_at: datetime | None = None
         self._last_error: str | None = None
         self._load_reasons: tuple[str, ...] = (GNN_NO_CHECKPOINT,)
+        #: Supervised heads the loaded checkpoint says it never fitted.
+        self._untrained_heads: tuple[str, ...] = ()
         self._offline_latched = False
         self.reload()
 
@@ -208,6 +213,7 @@ class GnnRuntime:
         """(Re)load the checkpoint. The only way out of a latched OFFLINE."""
         with self._lock:
             reasons: list[str] = []
+            self._untrained_heads = ()
             model: TemporalHeteroGnn | None = None
             version = "none"
             loaded_at: datetime | None = None
@@ -230,6 +236,18 @@ class GnnRuntime:
                 version = "untrained"
                 loaded_at = _utcnow()
                 reasons.append(GNN_UNTRAINED_WEIGHTS)
+
+            if model is not None and version != "untrained":
+                missing = tuple(
+                    head
+                    for head in SUPERVISED_HEADS
+                    if head not in tuple(getattr(model, "trained_heads", SUPERVISED_HEADS) or ())
+                )
+                if missing:
+                    # The weights load and infer perfectly well; they were simply never
+                    # shown a label. Believing them is the failure mode, not loading them.
+                    reasons.append(GNN_PARTIAL_TRAINING)
+                    self._untrained_heads = missing
 
             if model is not None and self._config is not None:
                 if model.config != self._config:
@@ -330,7 +348,7 @@ class GnnRuntime:
             if self._consecutive_failures > 0:
                 reasons.append(GNN_INFERENCE_FAILED)
                 state = GnnHealthState.DEGRADED
-            if GNN_UNTRAINED_WEIGHTS in reasons:
+            if GNN_UNTRAINED_WEIGHTS in reasons or GNN_PARTIAL_TRAINING in reasons:
                 state = GnnHealthState.DEGRADED
             if self._last_inference_at is not None and self._max_prediction_age > 0:
                 age = (moment - self._last_inference_at).total_seconds()
@@ -355,6 +373,7 @@ class GnnRuntime:
                 "mean_uncertainty": uncertainty,
                 "failure_threshold": self._failure_threshold,
                 "max_prediction_age_seconds": self._max_prediction_age,
+                "untrained_heads": list(self._untrained_heads),
             },
         )
 

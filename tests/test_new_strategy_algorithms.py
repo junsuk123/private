@@ -631,13 +631,76 @@ def test_ofi_exhaustion_has_the_shortest_thesis_driven_holding_window():
     assert holding["ofi_microprice_exhaustion_reversal"] == min(holding.values())
 
 
-def test_every_algorithm_rejects_a_cold_tick_window():
-    """No thesis in this module may fire before the tick window is populated."""
+def test_incomplete_theses_reject_even_when_tick_window_is_cold():
+    """A cold tick window must not manufacture missing strategy evidence."""
     cold = _features(second_data_ready=0.0, tick_count_5s=0.0)
     for strategy_id in STRATEGY_IDS:
         algorithm = get_algorithm(strategy_id)
         decision = algorithm.entry(cold, _context(strategy_id))
         assert not decision.triggered, strategy_id
+
+
+def test_slow_cross_sectional_strategy_does_not_require_tick_window():
+    decision = get_algorithm("cross_sectional_relative_strength").entry(
+        _features(
+            symbol="INTC", second_data_ready=0.0, tick_count_5s=0.0,
+            aggressor_imbalance_5s=None, short_return=0.004,
+            realized_volatility=0.01,
+        ),
+        _context(
+            "cross_sectional_relative_strength",
+            sector_rank=1,
+            sector_candidate_count=4,
+        ),
+    )
+
+    assert decision.triggered, decision.reason_codes
+    assert "TICK_WINDOW_NOT_READY" not in decision.reason_codes
+
+
+def test_us_residual_strength_does_not_require_krx_investor_flow_or_ticks():
+    decision = get_algorithm("residual_relative_strength").entry(
+        _features(
+            symbol="INTC", second_data_ready=0.0, tick_count_5s=0.0,
+            aggressor_imbalance_5s=None, short_return=0.004,
+            realized_volatility=0.01,
+        ),
+        _context(
+            "residual_relative_strength",
+            residual_return_short_bps=20.0,
+            residual_return_long_bps=15.0,
+            sector_rank=1,
+            sector_candidate_count=4,
+            foreign_flow_zscore=None,
+            institution_flow_zscore=None,
+            market_beta=0.9,
+            change_point_probability=0.1,
+        ),
+    )
+
+    assert decision.triggered, decision.reason_codes
+    assert "RESIDUAL_INVESTOR_FLOW_ABSENT" not in decision.reason_codes
+    assert "TICK_WINDOW_NOT_READY" not in decision.reason_codes
+
+
+def test_overnight_gap_carry_uses_completed_bar_confirmation_without_ticks():
+    decision = get_algorithm("overnight_gap_carry").entry(
+        _features(
+            symbol="INTC", second_data_ready=0.0, tick_count_5s=0.0,
+            aggressor_imbalance_5s=None, realized_volatility=0.01,
+            vwap_distance_bps=80.0, momentum_persistence=0.8,
+            liquidity_score=0.9,
+        ),
+        _context(
+            "overnight_gap_carry",
+            in_last_continuous_half_hour=True,
+            minutes_to_continuous_close=10.0,
+            change_point_probability=0.1,
+        ),
+    )
+
+    assert decision.triggered, decision.reason_codes
+    assert "TICK_WINDOW_NOT_READY" not in decision.reason_codes
 
 
 # --------------------------------------------------------------------------- #

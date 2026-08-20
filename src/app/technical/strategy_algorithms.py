@@ -302,6 +302,37 @@ def tick_expected_move_bps(
     return max(0.0, capture_fraction * scaled * 10_000.0)
 
 
+def _market_scale_bps(f: "TechnicalFeatureSet") -> float | None:
+    """The name's current move scale, in bps, for threshold normalization.
+
+    Realized 10-second volatility first because the triggers this normalizes are
+    tick-window triggers measured over comparable spans; the minute figure is the
+    fallback when the tick window has not filled. Spread is the last resort: a
+    book's width is a weak proxy for how far price travels, but it is never
+    missing and it is the right order of magnitude.
+    """
+    for value, scale in (
+        (getattr(f, "realized_volatility_10s", None), 10_000.0),
+        (getattr(f, "realized_volatility", None), 10_000.0),
+    ):
+        if value is not None:
+            try:
+                bps = float(value) * scale
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(bps) and bps > 0:
+                return bps
+    spread = getattr(f, "spread_bps", None)
+    if spread is not None:
+        try:
+            bps = float(spread)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(bps) and bps > 0:
+            return bps
+    return None
+
+
 def _present(*values: float | None) -> bool:
     return all(value is not None for value in values)
 
@@ -401,9 +432,11 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # the edge exceed cost by that multiple, which is the honest posture when
         # both terms are estimates: equality is a loss once either is off.
         "cost_floor_multiple": 1.0,
-        # Net bps that must remain after cost. This is what makes a trigger worth
-        # taking rather than merely break-even.
-        "min_net_buffer_bps": 10.0,
+        # No second safety margin here. The full round-trip cost is already
+        # charged below and the deterministic selector separately requires a
+        # strictly positive net edge. An additional buffer duplicated the same
+        # decision and suppressed otherwise profitable triggers.
+        "min_net_buffer_bps": 0.0,
         # Escape hatch for replaying historical configs: 0 restores the old
         # constant floor. Not for making a strategy trade again — a strategy that
         # only fires below its cost floor has no edge to recover.
@@ -928,6 +961,46 @@ class TradingAlgorithm:
     def p(self, key: str) -> float:
         return self.config.get(self.strategy_id, key)
 
+    def adaptive_p(
+        self,
+        key: str,
+        f: "TechnicalFeatureSet",
+        *,
+        stricter_is_larger: bool = True,
+    ) -> float:
+        """``p(key)`` restated in units of the CURRENT market scale.
+
+        A constant in bps is the wrong unit for a threshold on a price move: -40bps
+        in ten seconds is a dislocation in a name whose 10s volatility is 5bps and
+        noise in one where it is 50bps. This rescales the configured value by how
+        the name's current volatility compares to its own running reference, and
+        clamps the result so it can only ever be stricter than the configuration.
+
+        Falls back to the raw constant whenever the scale cannot be measured, so a
+        missing feature degrades to today's behaviour rather than to an accident.
+        """
+        static_value = self.p(key)
+        try:
+            from app.technical.adaptive_thresholds import (
+                default_adaptive_thresholds,
+                resolve_market as _adaptive_market,
+            )
+
+            adaptive = default_adaptive_thresholds()
+            market = _adaptive_market(getattr(f, "symbol", "") or "")
+            scale_bps = _market_scale_bps(f)
+            adaptive.observe_scale(self.strategy_id, market, scale_bps)
+            adapted, _diagnostics = adaptive.adapt_threshold(
+                self.strategy_id,
+                market,
+                static_value=static_value,
+                scale_bps=scale_bps,
+                stricter_is_larger=stricter_is_larger,
+            )
+            return adapted
+        except Exception:  # noqa: BLE001 - a trigger must not fail on telemetry.
+            return static_value
+
     @property
     def horizon_seconds(self) -> int:
         return int(self.p("horizon_seconds"))
@@ -956,6 +1029,29 @@ class TradingAlgorithm:
         return ()
 
     # -- shared building blocks -------------------------------------------- #
+    @staticmethod
+    def _below_minimum(
+        value: float | None, threshold: float, *, inclusive: bool = False
+    ) -> bool:
+        """Reject when the reading is missing, or genuinely under the bar.
+
+        ``None`` and ``0.0`` are different findings and must not collapse into one.
+        ``None`` means the window produced no reading, and a strategy must not fire on an
+        assumption. ``0.0`` means the tape *was* measured and came out balanced — which
+        the mean-reversion and exhaustion theses explicitly allow, which is why their
+        thresholds are zero or negative.
+
+        This existed as ``(value or -1.0) < threshold``. ``0.0`` is falsy, so a balanced
+        tape was rewritten to maximally sell-side and rejected; on the live KRX feed
+        ``aggressor_imbalance_5s`` is exactly ``0.0`` in 46.7%% of frames, because that is
+        what the builder emits when no trade in the window could be direction-classified.
+        The strategies whose thresholds are <= 0 are precisely the ones meant to fire on a
+        neutral tape, so the idiom disabled exactly the arms it most needed to admit.
+        """
+        if value is None:
+            return True
+        return value <= threshold if inclusive else value < threshold
+
     def _tick_ready(self, f: TechnicalFeatureSet) -> tuple[bool, tuple[str, ...]]:
         if not f.tick_data_ready:
             return False, ("TICK_WINDOW_NOT_READY",)
@@ -1049,7 +1145,11 @@ class TradingAlgorithm:
             return absolute, {"floor_basis": "cost_config_unreadable"}
         multiple = max(0.0, self.config.shared("cost_floor_multiple"))
         buffer_bps = max(0.0, self.config.shared("min_net_buffer_bps"))
-        required = cost_bps * multiple + buffer_bps
+        # Realized-history adaptation is telemetry, not another permission layer.
+        # The former learned multiplier could only raise this floor, recreating
+        # the removed bandit veto inside the deterministic algorithm.
+        effective_multiple = multiple
+        required = cost_bps * effective_multiple + buffer_bps
         venue, instrument_type = _resolve_market(symbol)
         return max(absolute, required), {
             "floor_basis": "round_trip_cost",
@@ -1057,6 +1157,7 @@ class TradingAlgorithm:
             "instrument_type": instrument_type,
             "round_trip_cost_bps": round(cost_bps, 3),
             "cost_floor_multiple": multiple,
+            "effective_cost_floor_multiple": round(effective_multiple, 4),
             "min_net_buffer_bps": buffer_bps,
         }
 
@@ -1072,6 +1173,9 @@ class TradingAlgorithm:
         **diagnostics: Any,
     ) -> AlgorithmDecision:
         minimum, floor_diagnostics = self.entry_floor_bps(symbol)
+        # Historical edge calibration remains recorded for analysis, but does
+        # not rewrite a deterministic strategy's point-in-time edge or veto its
+        # trigger. Learned estimates are auxiliary throughout the live path.
         if edge_bps < minimum:
             # Distinct reason code from the old constant-floor rejection: an edge
             # that cannot cover its market's costs is a different diagnosis from
@@ -1101,7 +1205,7 @@ class TradingAlgorithm:
                 else self.horizon_seconds
             ),
             reason_codes=tuple(dict.fromkeys(reasons)),
-            diagnostics=diagnostics,
+            diagnostics={**floor_diagnostics, **diagnostics},
         )
 
     def _volatility_stop(self, entry_price: float, f: TechnicalFeatureSet, multiple: float) -> float | None:
@@ -1561,14 +1665,26 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
         if not _present(f.return_10s, f.spread_change_5s, f.orderbook_imbalance):
             return self._reject(("SHOCK_TICK_INPUTS_MISSING",))
         shock_bps = (f.return_10s or 0.0) * 10_000.0
-        if shock_bps > self.p("shock_return_10s_bps"):
-            return self._reject(("NO_LIQUIDITY_SHOCK_DETECTED",), return_10s_bps=round(shock_bps, 3))
+        # Scale-relative, not absolute. ``stricter_is_larger=False`` because this
+        # bound is negative: a stricter shock threshold is a MORE negative one, so
+        # clamping "toward strict" here means taking the minimum. Getting that
+        # backwards would loosen the trigger in exactly the quiet tape where the
+        # measured reversion is smallest (+2bps at -10..-30bps of shock).
+        shock_threshold_bps = self.adaptive_p(
+            "shock_return_10s_bps", f, stricter_is_larger=False
+        )
+        if shock_bps > shock_threshold_bps:
+            return self._reject(
+                ("NO_LIQUIDITY_SHOCK_DETECTED",),
+                return_10s_bps=round(shock_bps, 3),
+                shock_threshold_bps=round(shock_threshold_bps, 3),
+            )
         # Spread must be contracting from its shock peak, not still widening.
         if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
             return self._reject(("SPREAD_STILL_WIDENING",), spread_change_5s=f.spread_change_5s)
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if self._below_minimum(f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")):
             return self._reject(("SELL_IMBALANCE_NOT_DECREASING",))
-        if (f.orderbook_imbalance or -1.0) <= self.p("min_orderbook_imbalance"):
+        if self._below_minimum(f.orderbook_imbalance, self.p("min_orderbook_imbalance"), inclusive=True):
             return self._reject(("BID_DEPTH_NOT_RESTORED",))
 
         # Structural edge: a fraction of the shock retraces.
@@ -1642,9 +1758,6 @@ class EventMomentumAlgorithm(TradingAlgorithm):
     thesis = "fresh material information keeps repricing until its TTL expires"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         # Event evidence comes from the electing ontology; absence fails closed.
         if not context.event_fresh:
             return self._reject(("EVENT_EVIDENCE_ABSENT",))
@@ -1654,18 +1767,47 @@ class EventMomentumAlgorithm(TradingAlgorithm):
         volume_ratio = f.volume_spike_ratio
         if volume_ratio is None or volume_ratio < self.p("min_volume_spike_ratio"):
             return self._reject(("EVENT_VOLUME_NOT_ABNORMAL",), volume_spike_ratio=volume_ratio)
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
-            return self._reject(("EVENT_FLOW_NOT_CONFIRMING",))
-        # Underreaction only: if the move already happened, there is nothing left.
-        move_bps = (f.return_10s or 0.0) * 10_000.0
-        if move_bps >= self.p("exhaustion_return_10s_bps"):
-            return self._reject(("EVENT_MOVE_ALREADY_EXHAUSTED",), return_10s_bps=round(move_bps, 3))
+        tick_ready, _ = self._tick_ready(f)
+        if tick_ready:
+            if self._below_minimum(
+                f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+            ):
+                return self._reject(("EVENT_FLOW_NOT_CONFIRMING",))
+            # Underreaction only: if the move already happened, there is nothing left.
+            move_bps = (f.return_10s or 0.0) * 10_000.0
+            if move_bps >= self.p("exhaustion_return_10s_bps"):
+                return self._reject(
+                    ("EVENT_MOVE_ALREADY_EXHAUSTED",),
+                    return_10s_bps=round(move_bps, 3),
+                )
+            volatility = f.realized_volatility_10s
+            window_seconds = 10
+            confirmation = "EVENT_TICK_REPRICING_CONFIRMED"
+        else:
+            # US data is REST/book + completed bars. A fresh positive event can
+            # still be confirmed causally by a completed-bar uptrend; requiring a
+            # streamed 5-second window made this strategy unreachable there.
+            bar_up = (
+                (f.macd_histogram is not None and f.macd_histogram >= 0.0)
+                and (
+                    f.ema_fast is None
+                    or f.ema_slow is None
+                    or f.ema_fast >= f.ema_slow
+                )
+                and (f.short_return is None or f.short_return >= 0.0)
+            )
+            if not bar_up:
+                return self._reject(("EVENT_BAR_TREND_NOT_CONFIRMING",))
+            volatility = f.realized_volatility
+            window_seconds = 60
+            confirmation = "EVENT_BAR_REPRICING_CONFIRMED"
 
         remaining = max(0.0, ttl - age)
         horizon = int(min(self.horizon_seconds, remaining)) or self.horizon_seconds
         edge = tick_expected_move_bps(
-            f.realized_volatility_10s,
+            volatility,
             horizon,
+            window_seconds=window_seconds,
             capture_fraction=self.config.shared("capture_fraction"),
         )
         freshness = _clamp(1.0 - age / ttl) if ttl > 0 else 0.0
@@ -1675,7 +1817,7 @@ class EventMomentumAlgorithm(TradingAlgorithm):
             score=score,
             confidence=_clamp(0.3 + 0.5 * freshness),
             edge_bps=edge,
-            reasons=("EVENT_REPRICING_CONFIRMED", "EVENT_WITHIN_TTL"),
+            reasons=("EVENT_REPRICING_CONFIRMED", confirmation, "EVENT_WITHIN_TTL"),
             event_age_seconds=age,
             event_ttl_seconds=ttl,
             event_freshness=round(freshness, 4),
@@ -1722,19 +1864,20 @@ class CrossSectionalRelativeStrengthAlgorithm(TradingAlgorithm):
     thesis = "the strongest name in a supportive sector keeps outperforming"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         rank = context.sector_rank
         universe = context.sector_candidate_count
         if rank is None or universe is None or universe <= 1:
             return self._reject(("CROSS_SECTIONAL_RANK_ABSENT",))
         if rank > int(self.p("max_sector_rank")):
             return self._reject(("SECTOR_RANK_TOO_LOW",), sector_rank=rank, universe=universe)
-        short_return_bps = (f.short_return or 0.0) * 10_000.0
+        if f.short_return is None:
+            return self._reject(("RELATIVE_STRENGTH_RETURN_ABSENT",))
+        short_return_bps = float(f.short_return) * 10_000.0
         if short_return_bps < self.p("min_short_return_bps"):
             return self._reject(("RELATIVE_STRENGTH_NOT_CONFIRMED",), short_return_bps=short_return_bps)
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if f.tick_data_ready and self._below_minimum(
+            f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+        ):
             return self._reject(("RELATIVE_STRENGTH_FLOW_NOT_CONFIRMED",))
 
         edge = self._volatility_edge(f)
@@ -1779,9 +1922,6 @@ class GapContextAlgorithm(TradingAlgorithm):
     thesis = "an opening gap either continues on confirmation or fills after exhaustion"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         gap = context.gap_rate
         submode = (context.gap_submode or "").strip().lower()
         if gap is None or not submode:
@@ -1802,8 +1942,16 @@ class GapContextAlgorithm(TradingAlgorithm):
         volume_ratio = f.volume_spike_ratio
         if volume_ratio is None or volume_ratio < self.p("min_volume_spike_ratio"):
             return self._reject(("GAP_VOLUME_NOT_CONFIRMED",), volume_spike_ratio=volume_ratio)
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
-            return self._reject(("GAP_FLOW_NOT_CONFIRMED",))
+        if f.tick_data_ready:
+            if self._below_minimum(
+                f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+            ):
+                return self._reject(("GAP_FLOW_NOT_CONFIRMED",))
+        elif not (
+            (f.short_return is not None and f.short_return >= 0.0)
+            or (f.macd_histogram is not None and f.macd_histogram >= 0.0)
+        ):
+            return self._reject(("GAP_BAR_CONTINUATION_NOT_CONFIRMED",))
         open_price = context.session_open_price
         if open_price and f.price and f.price < open_price:
             return self._reject(("GAP_CONTINUATION_LOST_OPEN",), price=f.price, open_price=open_price)
@@ -1822,10 +1970,16 @@ class GapContextAlgorithm(TradingAlgorithm):
         # Long-only: only a down-gap can be bought for the fill.
         if gap >= 0:
             return self._reject(("GAP_FADE_REQUIRES_DOWN_GAP",), gap_rate=gap)
-        if (f.return_1s or 0.0) < 0:
-            return self._reject(("GAP_FADE_STILL_FALLING",))
-        if (f.orderbook_imbalance_change_5s or 0.0) < 0:
-            return self._reject(("GAP_FADE_PRESSURE_WORSENING",))
+        if f.tick_data_ready:
+            if (f.return_1s or 0.0) < 0:
+                return self._reject(("GAP_FADE_STILL_FALLING",))
+            if (f.orderbook_imbalance_change_5s or 0.0) < 0:
+                return self._reject(("GAP_FADE_PRESSURE_WORSENING",))
+        elif not (
+            (f.short_return is not None and f.short_return >= 0.0)
+            or (f.macd_histogram is not None and f.macd_histogram >= 0.0)
+        ):
+            return self._reject(("GAP_FADE_BAR_RECOVERY_NOT_CONFIRMED",))
         previous_close = context.previous_close_price
         if not previous_close or not f.price or f.price >= previous_close:
             return self._reject(("GAP_ALREADY_FILLED",))
@@ -2030,9 +2184,6 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
     thesis = "idiosyncratic strength net of market and sector beta persists while flow confirms it"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         short_residual = context.residual_return_short_bps
         long_residual = context.residual_return_long_bps
         if not _present(short_residual, long_residual):
@@ -2065,7 +2216,9 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
                 (rc.VOLUME_CONFIRMATION_MISSING, "RESIDUAL_VOLUME_NOT_CONFIRMED"),
                 relative_volume=relative_volume,
             )
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if f.tick_data_ready and self._below_minimum(
+            f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+        ):
             return self._reject(("RESIDUAL_FLOW_NOT_CONFIRMED",))
         microprice_edge = f.microprice_edge_bps
         if microprice_edge is None:
@@ -2081,7 +2234,8 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
             for value in (context.foreign_flow_zscore, context.institution_flow_zscore)
             if value is not None
         ]
-        if self.p("require_flow_confirmation") >= 1.0:
+        is_kr = str(f.symbol or "").isdigit() and len(str(f.symbol or "")) == 6
+        if self.p("require_flow_confirmation") >= 1.0 and is_kr:
             if not flow_scores:
                 return self._reject(("RESIDUAL_INVESTOR_FLOW_ABSENT",))
             if max(flow_scores) < self.p("min_flow_zscore"):
@@ -2326,7 +2480,7 @@ class OfiMicropriceExhaustionReversalAlgorithm(TradingAlgorithm):
         ofi_slope = f.orderbook_imbalance_change_5s
         if ofi_slope is None or ofi_slope <= self.p("min_ofi_slope"):
             return self._reject(("OFI_SLOPE_NOT_POSITIVE",), ofi_slope=ofi_slope)
-        if (f.orderbook_imbalance or -1.0) < self.p("min_orderbook_imbalance"):
+        if self._below_minimum(f.orderbook_imbalance, self.p("min_orderbook_imbalance")):
             return self._reject(
                 ("OFI_BID_SIDE_NOT_RESTORED",), orderbook_imbalance=f.orderbook_imbalance
             )
@@ -2337,7 +2491,7 @@ class OfiMicropriceExhaustionReversalAlgorithm(TradingAlgorithm):
             return self._reject(("OFI_ASK_NOT_DEPLETED",), depth_ratio=depth_ratio)
         if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
             return self._reject(("OFI_SPREAD_STILL_WIDENING",), spread_change_5s=f.spread_change_5s)
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if self._below_minimum(f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")):
             return self._reject(("OFI_SELL_AGGRESSION_NOT_EASING",))
         microprice_edge = f.microprice_edge_bps
         if microprice_edge is None:
@@ -2414,10 +2568,6 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
     thesis = "price clears the session opening range on unusually high relative volume"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
-
         high = context.opening_range_high
         low = context.opening_range_low
         if high is None or low is None or high <= low or high <= 0:
@@ -2449,7 +2599,9 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
                 excess_bps=round(excess_bps, 3),
                 opening_range_high=high,
             )
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if f.tick_data_ready and self._below_minimum(
+            f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+        ):
             return self._reject(("ORB_FLOW_NOT_CONFIRMED",))
         if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
             return self._reject(("ORB_SPREAD_WIDENING_INTO_BREAK",))
@@ -2533,10 +2685,6 @@ class MarketIntradayMomentumAlgorithm(TradingAlgorithm):
     thesis = "a positive first half-hour continues into the last continuous half-hour"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
-
         in_window = context.in_last_continuous_half_hour
         if in_window is None:
             return self._reject(("MIM_SESSION_CONTEXT_ABSENT",))
@@ -2567,7 +2715,9 @@ class MarketIntradayMomentumAlgorithm(TradingAlgorithm):
                 first_half_hour_volatility_percentile=volatility_percentile,
             )
 
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if f.tick_data_ready and self._below_minimum(
+            f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+        ):
             return self._reject(("MIM_FLOW_NOT_CONFIRMED",))
         change_point = context.change_point_probability
         if change_point is not None and change_point > self.p("max_change_point_probability"):
@@ -2738,9 +2888,6 @@ class MarketIntradayMomentumShortAlgorithm(ShortTradingAlgorithm):
     thesis = "a negative first half-hour continues into the last continuous half-hour"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         blocked = self._short_preconditions(f, context)
         if blocked:
             return self._reject(blocked)
@@ -2776,9 +2923,11 @@ class MarketIntradayMomentumShortAlgorithm(ShortTradingAlgorithm):
             )
         # Sell-side aggression: +1.0 default so an ABSENT imbalance fails the test
         # (mirrors the long side's -1.0 default doing the same).
-        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
-            "max_aggressor_imbalance"
-        ):
+        if f.tick_data_ready and (
+            f.aggressor_imbalance_5s
+            if f.aggressor_imbalance_5s is not None
+            else 1.0
+        ) > self.p("max_aggressor_imbalance"):
             return self._reject(("MIMS_FLOW_NOT_SELL_SIDE",))
         breadth = context.market_breadth
         if breadth is not None and breadth > self.p("max_market_breadth"):
@@ -2842,9 +2991,6 @@ class OpeningRangeBreakdownAlgorithm(ShortTradingAlgorithm):
     thesis = "price loses the session opening range on high relative volume and sell-side aggression"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         blocked = self._short_preconditions(f, context)
         if blocked:
             return self._reject(blocked)
@@ -2879,9 +3025,11 @@ class OpeningRangeBreakdownAlgorithm(ShortTradingAlgorithm):
                 excess_bps=round(excess_bps, 3),
                 opening_range_low=low,
             )
-        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
-            "max_aggressor_imbalance"
-        ):
+        if f.tick_data_ready and (
+            f.aggressor_imbalance_5s
+            if f.aggressor_imbalance_5s is not None
+            else 1.0
+        ) > self.p("max_aggressor_imbalance"):
             return self._reject(("ORBD_FLOW_NOT_SELL_SIDE",))
         if (f.spread_change_5s or 0.0) > self.p("max_spread_change_5s"):
             return self._reject(("ORBD_SPREAD_WIDENING_INTO_BREAK",))
@@ -2967,9 +3115,6 @@ class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
     thesis = "idiosyncratic weakness net of market and sector beta persists while distribution confirms it"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
         blocked = self._short_preconditions(f, context)
         if blocked:
             return self._reject(blocked)
@@ -3010,9 +3155,11 @@ class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
                 (rc.VOLUME_CONFIRMATION_MISSING, "RESIDUAL_WEAKNESS_VOLUME_NOT_CONFIRMED"),
                 relative_volume=relative_volume,
             )
-        if (f.aggressor_imbalance_5s if f.aggressor_imbalance_5s is not None else 1.0) > self.p(
-            "max_aggressor_imbalance"
-        ):
+        if f.tick_data_ready and (
+            f.aggressor_imbalance_5s
+            if f.aggressor_imbalance_5s is not None
+            else 1.0
+        ) > self.p("max_aggressor_imbalance"):
             return self._reject(("RESIDUAL_WEAKNESS_FLOW_NOT_CONFIRMED",))
         microprice_edge = f.microprice_edge_bps
         if microprice_edge is None:
@@ -3030,7 +3177,8 @@ class ResidualRelativeWeaknessAlgorithm(ShortTradingAlgorithm):
             for value in (context.foreign_flow_zscore, context.institution_flow_zscore)
             if value is not None
         ]
-        if self.p("require_flow_confirmation") >= 1.0:
+        is_kr = str(f.symbol or "").isdigit() and len(str(f.symbol or "")) == 6
+        if self.p("require_flow_confirmation") >= 1.0 and is_kr:
             if not flow_scores:
                 return self._reject(("RESIDUAL_WEAKNESS_INVESTOR_FLOW_ABSENT",))
             if min(flow_scores) > self.p("max_flow_zscore"):
@@ -3149,10 +3297,6 @@ class OvernightGapCarryAlgorithm(TradingAlgorithm):
         )
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
-        ready, reasons = self._tick_ready(f)
-        if not ready:
-            return self._reject(reasons)
-
         in_window = context.in_last_continuous_half_hour
         if in_window is None:
             return self._reject(("OGC_SESSION_CONTEXT_ABSENT",))
@@ -3181,7 +3325,9 @@ class OvernightGapCarryAlgorithm(TradingAlgorithm):
         persistence = f.momentum_persistence
         if persistence is None or persistence < self.p("min_momentum_persistence"):
             return self._reject(("OGC_CLOSING_DRIVE_NOT_CONFIRMED",))
-        if (f.aggressor_imbalance_5s or -1.0) < self.p("min_aggressor_imbalance"):
+        if f.tick_data_ready and self._below_minimum(
+            f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
+        ):
             return self._reject(("OGC_FLOW_NOT_BUY_SIDE",))
 
         change_point = context.change_point_probability

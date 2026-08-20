@@ -151,6 +151,7 @@ _TEARDOWN_STOPPERS: tuple[str, ...] = (
     "_stop_context_refresher",
     "_stop_auto_reliability_controller",
     "_stop_live_training_worker",
+    "_stop_temporal_gnn_training_worker",
     "_stop_krx_feature_frame_worker",
     "_stop_kis_overseas_realtime_collector",
     "_stop_kis_realtime_collector",

@@ -116,6 +116,10 @@ class CandidateInput:
     data_age_seconds: float | None = None
     price_feed_divergence_bps: float | None = None
     reference_price: float | None = None
+    #: Venue-reported halt for THIS symbol. Takes precedence over the cycle-wide flag,
+    #: which can only answer "is the venue trading" — a suspended symbol inside an open
+    #: session is the case that actually occurs.
+    halted: bool | None = None
     peers: Sequence[str] = ()
     requested_position_fraction: float | None = None
 
@@ -333,7 +337,9 @@ class ContextDecisionPipeline:
         risk_conditions = dict(active_risk_conditions or {})
         risk_conditions.update(
             self._derive_risk_conditions(
-                stale_reasons=stale_reasons,
+                # Symbol-scoped freshness is evaluated against that symbol's
+                # gate below. It is not a market-wide ontology risk condition.
+                stale_reasons=_global_stale_reasons(stale_reasons),
                 domestic_context=domestic_context,
                 global_context=global_context,
             )
@@ -383,6 +389,9 @@ class ContextDecisionPipeline:
         # -- per-candidate decisions --------------------------------------------- #
         decisions: list[DecisionTrace] = []
         for candidate in candidates:
+            candidate_stale_reasons = _stale_reasons_for_ticker(
+                stale_reasons, candidate.ticker
+            )
             decisions.append(
                 self._decide(
                     candidate,
@@ -395,7 +404,7 @@ class ContextDecisionPipeline:
                     prediction=prediction,
                     health=health,
                     risk_conditions=risk_conditions,
-                    stale_reasons=stale_reasons,
+                    stale_reasons=candidate_stale_reasons,
                     account=account_state,
                     websocket_connected=websocket_connected,
                     trading_halted=trading_halted,
@@ -547,7 +556,9 @@ class ContextDecisionPipeline:
             model_health=health.as_dict() if health else {},
             data_health={
                 "worst_state": data_health.get("worst_state"),
-                "blocking_reasons": list(data_health.get("blocking_reasons", [])),
+                # A stale quote for A must never make B look unsafe. Unscoped
+                # sources (account/global context) still apply to every ticker.
+                "blocking_reasons": list(stale_reasons),
             },
             gate_id=gate.gate_id,
             strategy_candidates=tuple(item.as_dict() for item in selection.ranked),
@@ -650,7 +661,9 @@ class ContextDecisionPipeline:
             price_feed_divergence_bps=candidate.price_feed_divergence_bps,
             session_id=temporal.phase_state.primary_session,
             session_allows_new_entry=_session_allows_entry(temporal),
-            trading_halted=trading_halted,
+            trading_halted=(
+                candidate.halted if candidate.halted is not None else trading_halted
+            ),
             account_reconciled=account.reconciled,
             unknown_order_ids=unknown_orders,
             duplicate_order_risk=duplicate_risk,
@@ -1050,3 +1063,26 @@ def _session_allows_entry(temporal: TemporalSnapshot) -> bool:
         return default_service().new_entry_allowed(market, temporal.as_of)
     except Exception:  # noqa: BLE001 - an unreadable capability is a closed session.
         return False
+
+def _stale_reasons_for_ticker(
+    reasons: Sequence[str], ticker: str
+) -> tuple[str, ...]:
+    """Return global reasons plus reasons scoped to ``ticker``.
+
+    Freshness codes are ``STALE_DATA:source/type[:scope]``.  The registry keeps
+    observations for rotating symbols, so passing its complete blocking list to
+    every candidate made one inactive symbol veto the whole market.
+    """
+    wanted = str(ticker or "").strip().upper()
+    selected: list[str] = []
+    for raw in reasons:
+        reason = str(raw)
+        parts = reason.split(":", 2)
+        if len(parts) < 3 or str(parts[2]).strip().upper() == wanted:
+            selected.append(reason)
+    return tuple(dict.fromkeys(selected))
+
+
+def _global_stale_reasons(reasons: Sequence[str]) -> tuple[str, ...]:
+    """Freshness failures without a symbol scope affect market-wide context."""
+    return tuple(dict.fromkeys(str(reason) for reason in reasons if str(reason).count(":") < 2))

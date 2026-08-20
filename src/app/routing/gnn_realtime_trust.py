@@ -5,6 +5,7 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
@@ -133,6 +134,13 @@ class GnnRealtimeTrustEvaluator:
         self._evaluation_lock = threading.Lock()
         self._refresh_state_lock = threading.Lock()
         self._refreshing = False
+        #: When the in-flight refresh started, so a refresh that never finishes cannot
+        #: latch ``_refreshing`` for the process lifetime. See
+        #: ``_trust_process_executor`` for the hang this guards.
+        self._refresh_started_at: float | None = None
+        self.refresh_timeout_seconds = max(
+            60.0, float(os.getenv("GNN_TRUST_REFRESH_TIMEOUT_SEC", "600"))
+        )
         # Sparse validation journals often need the full bounded scan. Remember
         # that discovered depth so the next refresh does not reparse the same
         # 4.8k, 9.6k, 19.2k... prefixes before reaching it again.
@@ -171,8 +179,18 @@ class GnnRealtimeTrustEvaluator:
     def _start_background_refresh(self, current: datetime) -> None:
         with self._refresh_state_lock:
             if self._refreshing:
-                return
+                elapsed = time.monotonic() - (self._refresh_started_at or 0.0)
+                if elapsed < self.refresh_timeout_seconds:
+                    return
+                # The in-flight refresh has outlived any legitimate scan, so treat it
+                # as lost rather than waiting on it forever. A queued task cannot be
+                # rescued: the pool holds one worker, so a new submit would simply
+                # queue behind the stuck one. Discarding the executor is what lets the
+                # next attempt make progress -- either on a fresh pool, or on the
+                # in-process daemon fallback if the pool itself is broken.
+                _discard_trust_process_executor()
             self._refreshing = True
+            self._refresh_started_at = time.monotonic()
         if self.background_process:
             try:
                 future = _trust_process_executor().submit(
@@ -192,7 +210,14 @@ class GnnRealtimeTrustEvaluator:
                     },
                     current.isoformat(),
                 )
-                future.add_done_callback(self._accept_process_refresh)
+                # Bind the token this refresh started with. A refresh abandoned by the
+                # timeout above can still complete afterwards, and without the token it
+                # would overwrite the cache a newer refresh had already filled and clear
+                # ``_refreshing`` out from under it.
+                token = self._refresh_started_at
+                future.add_done_callback(
+                    lambda done: self._accept_process_refresh(done, token)
+                )
                 return
             except Exception:  # noqa: BLE001 - fall back to the safe daemon path.
                 pass
@@ -203,7 +228,9 @@ class GnnRealtimeTrustEvaluator:
             daemon=True,
         ).start()
 
-    def _accept_process_refresh(self, future: Future[GnnRealtimeTrust]) -> None:
+    def _accept_process_refresh(
+        self, future: Future[GnnRealtimeTrust], token: float | None = None
+    ) -> None:
         try:
             result = future.result()
         except Exception:  # noqa: BLE001 - validation failure remains fail-closed.
@@ -211,11 +238,16 @@ class GnnRealtimeTrustEvaluator:
                 datetime.now(timezone.utc),
                 ("GNN_TRUST_BACKGROUND_REFRESH_FAILED",),
             )
+        with self._refresh_state_lock:
+            # A superseded refresh must not publish. Its result is stale by definition
+            # and its completion says nothing about the refresh now in flight.
+            if token is not None and self._refresh_started_at != token:
+                return
+            self._refreshing = False
+            self._refresh_started_at = None
         with self._evaluation_lock:
             self._cached = result
             self._cached_at = time.monotonic()
-        with self._refresh_state_lock:
-            self._refreshing = False
 
     def _refresh_in_background(self, current: datetime) -> None:
         try:
@@ -232,6 +264,7 @@ class GnnRealtimeTrustEvaluator:
         finally:
             with self._refresh_state_lock:
                 self._refreshing = False
+                self._refresh_started_at = None
 
     def _evaluate_uncached(self, now: datetime) -> GnnRealtimeTrust:
         reasons: list[str] = []
@@ -394,8 +427,8 @@ class GnnRealtimeTrustEvaluator:
             score=round(score, 6),
             sample_count=sample_count,
             minimum_samples=self.minimum_samples,
-            positive_net_rate=round(positive_rate, 6),
-            mean_realized_net_bps=round(mean_net, 6),
+            positive_net_rate=round(positive_rate, 6) if realized else None,
+            mean_realized_net_bps=round(mean_net, 6) if realized else None,
             brier_score=round(brier, 6),
             mean_uncertainty=round(mean_uncertainty, 6),
             net_sign_accuracy=round(sign_accuracy, 6),
@@ -870,13 +903,57 @@ _worker_evaluators: dict[tuple[Any, ...], GnnRealtimeTrustEvaluator] = {}
 
 
 def _trust_process_executor() -> ProcessPoolExecutor:
+    """One background worker for trust refreshes, started with ``spawn``.
+
+    The start method is the whole point of this function. ``ProcessPoolExecutor``
+    defaults to ``fork`` on Linux, and this pool is created from the app server --
+    a process running the trading engine thread, the collectors and uvicorn's own
+    workers. Forking a multi-threaded process copies the mutex STATE but only the
+    calling thread, so any lock another thread happened to hold at that instant is
+    inherited already-locked with no owner left to release it. The child then
+    blocks on it forever.
+
+    That is not hypothetical here: it was measured on 2026-08-19. The forked worker
+    sat in ``futex_wait_queue`` for 4h51m having used 5 seconds of CPU, and because
+    ``max_workers=1`` every later refresh queued behind it. ``_refreshing`` stayed
+    latched True, ``_cached`` stayed None, and the endpoint returned
+    ``GNN_TRUST_REFRESH_PENDING`` indefinitely while the engine reported
+    ``GNN_NOT_LIVE_AUTHORIZED`` -- so the trust gate, which live entry
+    authorisation requires, was silently dead with no traceback and no error count.
+    It is restart-dependent (it survived the previous boot), which is what makes it
+    a latent fault rather than an obvious one.
+
+    ``spawn`` starts a fresh interpreter that inherits no locks. It costs a re-import
+    per refresh, which is irrelevant for a periodic background job and is the correct
+    trade against an unrecoverable hang.
+    """
     global _trust_executor
     if _trust_executor is not None:
         return _trust_executor
     with _trust_executor_lock:
         if _trust_executor is None:
-            _trust_executor = ProcessPoolExecutor(max_workers=1)
+            _trust_executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
         return _trust_executor
+
+
+def _discard_trust_process_executor() -> None:
+    """Drop the shared pool so the next refresh builds a new one.
+
+    Called when a refresh has outlived its timeout. ``cancel_futures`` clears the
+    queue and ``wait=False`` matters: the stuck worker may never return, and blocking
+    on it here would move the hang from the pool into the caller.
+    """
+    global _trust_executor
+    with _trust_executor_lock:
+        executor, _trust_executor = _trust_executor, None
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 - a failed teardown must not block the retry.
+            pass
 
 
 def _evaluate_trust_in_worker(
@@ -1154,7 +1231,15 @@ def _strategy_metrics(
         "minimum_samples": minimum_samples,
         "minimum_positive_prediction_samples": minimum_trade_samples,
         "horizon_seconds": horizon_seconds,
-        "positive_net_rate": round(positive_rate, 6),
+        # ``0.0`` here used to mean two different things -- "every profitable
+        # forecast lost" and "no profitable forecast was ever made" -- and on this
+        # account it was always the second. Reporting None for the empty case
+        # matches ``mean_realized_net_bps`` and stops the dashboard reading an
+        # untested strategy as a failed one. The gate below still uses the
+        # numeric ``positive_rate``; only the reported field changes.
+        "positive_net_rate": (
+            round(positive_rate, 6) if trade_sample_count else None
+        ),
         "mean_realized_net_bps": (
             round(mean_net, 6) if trade_sample_count else None
         ),

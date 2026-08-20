@@ -60,6 +60,41 @@ def test_floor_is_per_market_not_constant() -> None:
     assert krx_floor > 4 * algorithm.config.shared("min_expected_edge_bps")
 
 
+def test_floor_charges_round_trip_once_without_a_second_net_buffer() -> None:
+    algorithm = IntradayMomentumAlgorithm()
+    floor, diagnostics = algorithm.entry_floor_bps("005930")
+
+    assert algorithm.config.shared("min_net_buffer_bps") == 0.0
+    assert floor == pytest.approx(round_trip_cost_bps("005930"))
+    assert diagnostics["effective_cost_floor_multiple"] == 1.0
+
+
+def test_realized_edge_calibrator_cannot_veto_a_deterministic_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.technical.adaptive_thresholds as adaptive
+
+    monkeypatch.setattr(
+        adaptive,
+        "default_edge_calibrator",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("learned calibration must not re-judge live entry")
+        ),
+    )
+    algorithm = IntradayMomentumAlgorithm()
+    floor, _ = algorithm.entry_floor_bps("005930")
+
+    decision = algorithm._fire(
+        score=0.9,
+        confidence=0.8,
+        edge_bps=floor + 1.0,
+        reasons=("TEST",),
+        symbol="005930",
+    )
+
+    assert decision.triggered is True
+
+
 def test_edge_that_cannot_cover_its_cost_is_rejected_with_a_naming_reason() -> None:
     algorithm = IntradayMomentumAlgorithm()
 

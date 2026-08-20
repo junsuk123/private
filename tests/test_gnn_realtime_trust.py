@@ -933,3 +933,129 @@ def test_gnn_runtime_observability_separates_inference_from_validation(
     assert payload["prediction_persisted_count"] == 321
     assert payload["validation_count"] == 202
     assert payload["validation_count_as_of"] == "2026-08-13T14:38:12+00:00"
+
+
+def test_trust_pool_does_not_fork_the_multithreaded_server() -> None:
+    """The refresh pool must use ``spawn``, not the Linux default ``fork``.
+
+    Measured 2026-08-19: the forked worker inherited a locked mutex from the app
+    server's other threads and sat in ``futex_wait_queue`` for 4h51m on 5 seconds of
+    CPU. With ``max_workers=1`` every later refresh queued behind it, so the trust
+    gate stayed ``GNN_TRUST_REFRESH_PENDING`` for the process lifetime with no
+    traceback and no error count -- and live entry authorisation requires that gate.
+    """
+    from app.routing import gnn_realtime_trust as module
+
+    module._discard_trust_process_executor()
+    try:
+        executor = module._trust_process_executor()
+        # Reaching the private context attribute is deliberate: the start method is
+        # the entire behaviour under test and there is no public accessor for it.
+        assert executor._mp_context.get_start_method() == "spawn"
+    finally:
+        module._discard_trust_process_executor()
+
+
+def test_trust_result_survives_the_spawn_boundary() -> None:
+    """``spawn`` pickles what ``fork`` used to share, so the contract must round-trip.
+
+    Guards the fix above: an unpicklable argument or result would turn the hang into
+    a permanent ``GNN_TRUST_BACKGROUND_REFRESH_FAILED`` instead of fixing it.
+    """
+    import pickle
+
+    from app.routing.gnn_realtime_trust import (
+        GnnRealtimeTrust,
+        _evaluate_trust_in_worker,
+    )
+
+    assert pickle.loads(pickle.dumps(_evaluate_trust_in_worker)) is _evaluate_trust_in_worker
+
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path="does-not-exist.jsonl",
+        database_path="does-not-exist.sqlite3",
+    )
+    empty = evaluator._empty(datetime.now(timezone.utc), ("GNN_TRUST_LOG_MISSING",))
+    restored = pickle.loads(pickle.dumps(empty))
+
+    assert isinstance(restored, GnnRealtimeTrust)
+    assert restored.reason_codes == ("GNN_TRUST_LOG_MISSING",)
+    # The empty case is exactly what a cold worker returns first, and it is the shape
+    # that must survive the boundary for the pool to be usable at all.
+    assert restored.positive_net_rate is None
+
+
+def test_a_hung_refresh_does_not_latch_out_every_later_one(monkeypatch) -> None:
+    """``_refreshing`` must expire, or one stuck worker disables trust permanently.
+
+    Asserted by counting refreshes actually STARTED rather than by reading
+    ``_refreshing`` afterwards: the real refresh runs on a daemon thread and clears
+    that flag in a ``finally``, so an earlier version of this test was racing it and
+    read False for a takeover that had already succeeded.
+    """
+    evaluator = GnnRealtimeTrustEvaluator(
+        comparison_path="does-not-exist.jsonl",
+        database_path="does-not-exist.sqlite3",
+        stale_while_refresh=True,
+        background_process=False,
+    )
+    evaluator.refresh_timeout_seconds = 60.0
+    now = datetime.now(timezone.utc)
+    started: list[object] = []
+    monkeypatch.setattr(
+        evaluator, "_refresh_in_background", lambda current: started.append(current)
+    )
+
+    # A refresh that started and has not finished still owns the slot.
+    evaluator._refreshing = True
+    evaluator._refresh_started_at = time.monotonic()
+    evaluator._start_background_refresh(now)
+    assert started == [], "a fresh in-flight refresh must not be superseded"
+
+    # Aged past the timeout, the next attempt takes over instead of returning early.
+    evaluator._refresh_started_at = time.monotonic() - 61.0
+    evaluator._start_background_refresh(now)
+    assert len(started) == 1, "a timed-out refresh must not block the next one forever"
+
+
+def test_spawned_worker_can_actually_import_and_return(tmp_path) -> None:
+    """End-to-end submit through the real pool: spawn must re-import and return.
+
+    The narrow risk this covers is that ``spawn`` starts a bare interpreter which has
+    to re-import ``app.routing.gnn_realtime_trust``. If the child cannot resolve the
+    package the future raises and the hang becomes a permanent
+    ``GNN_TRUST_BACKGROUND_REFRESH_FAILED`` -- a different failure, not a fix. Paths
+    that do not exist are used on purpose so the worker returns its empty result
+    immediately instead of scanning the production database.
+    """
+    from app.routing import gnn_realtime_trust as module
+
+    import os
+
+    module._discard_trust_process_executor()
+    try:
+        # Prove the work leaves this process at all. A pool that silently ran inline
+        # would satisfy every other assertion here while keeping the fork hazard.
+        assert (
+            module._trust_process_executor().submit(os.getpid).result(timeout=180)
+            != os.getpid()
+        )
+        future = module._trust_process_executor().submit(
+            module._evaluate_trust_in_worker,
+            {
+                "comparison_path": str(tmp_path / "missing.jsonl"),
+                "database_path": str(tmp_path / "missing.sqlite3"),
+                "checkpoint_metadata_path": str(tmp_path / "missing.json"),
+                "horizon_seconds": 1800,
+                "minimum_samples": 40,
+                "window_samples": 100,
+                "allow_checkpoint_history": False,
+            },
+            datetime.now(timezone.utc).isoformat(),
+        )
+        result = future.result(timeout=180)
+    finally:
+        module._discard_trust_process_executor()
+
+    assert result.passed is False
+    assert "GNN_TRUST_LOG_MISSING" in result.reason_codes

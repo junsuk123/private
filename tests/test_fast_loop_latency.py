@@ -95,8 +95,32 @@ def _runner(**overrides) -> tuple[FastLoopRunner, _Recorder, ExecutionLatencyRec
     return FastLoopRunner(**base), sink, latency
 
 
-def _tick(price: float, *, at: datetime = NOW) -> TickEvent:
-    return TickEvent(symbol="000660", price=price, event_time=at, received_time=at)
+def _tick(
+    price: float, *, at: datetime = NOW, received_at: datetime | None = None
+) -> TickEvent:
+    """A tick. ``received_at`` separates feed-receipt time from the frozen event time.
+
+    Needed because ``decision_latency_ms`` is ``strategy_decision - tick_received``,
+    and the ``strategy_decision`` stage is stamped from the wall clock inside the
+    runner (correctly -- a latency cannot be measured on an injected clock). With
+    ``received_time`` also frozen to ``NOW``, that delta measured the gap between the
+    hardcoded date and the real clock, so it grew by a second every second: the
+    assertion held only when run near 2026-08-19 01:30 UTC and failed by ~36,500,000ms
+    ten hours later. Tests that care about the decision COST pass a live
+    ``received_at``; the rest keep the frozen clock, which is what makes them
+    deterministic.
+    """
+    return TickEvent(
+        symbol="000660",
+        price=price,
+        event_time=at,
+        received_time=received_at if received_at is not None else at,
+    )
+
+
+def _live_tick(price: float) -> TickEvent:
+    """A tick whose receipt is stamped now, so latency spans measure real elapsed work."""
+    return _tick(price, received_at=datetime.now(timezone.utc))
 
 
 # --------------------------------------------------------------------------- #
@@ -209,10 +233,12 @@ def test_the_decision_stage_stays_light() -> None:
     """The constraint made executable: deciding must not do real work."""
     runner, _, latency = _runner()
     runner.adopt(_plan())
-    runner.on_tick(_tick(70_000.0), now=NOW)
+    # Every tick here carries a live receipt time, so each span measures the work the
+    # decision actually did rather than the distance to a frozen date.
+    runner.on_tick(_live_tick(70_000.0), now=NOW)
     runner.on_entry_fill("000660", 70_000.0, 10, now=NOW)
     for index in range(200):
-        runner.on_tick(_tick(70_000.0 + (index % 5)), now=NOW)
+        runner.on_tick(_live_tick(70_000.0 + (index % 5)), now=NOW)
     summary = latency.summary()
     assert summary["sample_count"] >= 200
     assert summary["decision_latency_ms"]["p99"] < MAX_DECISION_LATENCY_MS

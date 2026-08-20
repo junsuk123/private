@@ -591,7 +591,11 @@ class SharedLiveDecisionEngine:
             if strategy_locked
             else self._technical_prediction(frame, symbol, model_prediction=prediction)
         )
-        if strategy_locked and (
+        # A frozen TradePlan means the strategy trigger, cost, size and risk were
+        # already resolved at election time. Requiring the later feature frame to
+        # fire the same trigger again turns a momentary entry condition into an
+        # impossible two-stage coincidence and restores a post-selection veto.
+        if strategy_locked and trade_plan is None and (
             technical_prediction is None or not technical_prediction.tradable
         ):
             reason_codes = tuple(

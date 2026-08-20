@@ -295,21 +295,46 @@ def collector_from_algorithm_evaluations(
     selected_symbol = str(owner.get("selected_symbol") or "")
     selected_strategy = str(owner.get("selected_strategy") or "")
     session_reasons = tuple(
-        str(code)
-        for code in (
-            owner.get("gnn_reason_codes")
-            or owner.get("ontology_reason_codes")
-            or ()
+        dict.fromkeys(
+            str(code)
+            for group in (
+                owner.get("gnn_reason_codes") or (),
+                owner.get("ontology_reason_codes") or (),
+                owner.get("bandit_reason_codes") or (),
+            )
+            for code in group
         )
     )
     last_reason = str(owner.get("last_reason") or "")
     if last_reason:
         session_reasons = tuple(dict.fromkeys((*session_reasons, last_reason)))
 
+    bandit_by_pair: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for bandit in owner.get("bandit_evaluations") or ():
+        if not isinstance(bandit, Mapping):
+            continue
+        arm = str(bandit.get("arm") or "").split(":", 1)[0]
+        pair = (str(bandit.get("symbol") or ""), arm)
+        if all(pair):
+            bandit_by_pair[pair] = bandit
+
+    regime = str(owner.get("macro_regime") or "")
+    explicit_macro_blocks = {
+        "MACRO_BLOCKED",
+        "MACRO_STRATEGY_BLOCKED",
+        "BANDIT_ARM_NOT_MACRO_PERMITTED",
+        "MICRO_STRATEGY_BLOCKED_BY_MACRO",
+    }
     for item in evaluations:
         symbol = str(item.get("symbol") or "")
         strategy_id = str(item.get("strategy_id") or "")
-        record = collector.candidate(symbol, strategy_id)
+        market = "KR" if len(symbol) == 6 and symbol.isdigit() else "US"
+        record = collector.candidate(
+            symbol,
+            strategy_id,
+            market=market,
+            regime=regime,
+        )
         reasons = tuple(str(code) for code in item.get("reason_codes") or ())
         horizon = item.get("horizon_seconds")
         edge = _finite(item.get("expected_edge_bps"))
@@ -347,13 +372,39 @@ def collector_from_algorithm_evaluations(
             )
         elif symbol == selected_symbol and strategy_id == selected_strategy:
             record.mark(SelectionStage.SELECTED, reason_codes=session_reasons)
+        elif (bandit := bandit_by_pair.get((symbol, strategy_id))) is not None and not bool(
+            bandit.get("admissible")
+        ):
+            bandit_reasons = tuple(str(code) for code in bandit.get("reason_codes") or ())
+            if bool(bandit.get("shadow_only")):
+                record.mark(
+                    SelectionStage.SHADOW_ONLY,
+                    reason_codes=(*reasons, *bandit_reasons, *session_reasons),
+                    fused_net_bps=bandit.get("conservative_edge_bps"),
+                    uncertainty_penalty_bps=bandit.get("uncertainty_penalty_bps"),
+                    required_net_bps=0.0,
+                    detail="bandit arm was measured but remains shadow-only",
+                )
+            else:
+                record.mark(
+                    SelectionStage.PROFITABILITY_REJECTED,
+                    reason_codes=(*reasons, *bandit_reasons, *session_reasons),
+                    fused_net_bps=bandit.get("conservative_edge_bps"),
+                    model_net_bps=bandit.get("posterior_mean_net_bps"),
+                    uncertainty_penalty_bps=bandit.get("uncertainty_penalty_bps"),
+                    required_net_bps=0.0,
+                    detail="realized-history conservative edge did not beat NO_TRADE",
+                )
         elif "GNN_NOT_LIVE_AUTHORIZED" in session_reasons:
             record.mark(
                 SelectionStage.LIVE_NOT_AUTHORIZED,
                 reason_codes=session_reasons,
                 detail="cycle reached a positive trigger but live GNN authority was absent",
             )
-        elif any(code.startswith("MACRO_") for code in session_reasons):
+        elif any(
+            code in explicit_macro_blocks or code.endswith("_BLOCKED_BY_MACRO")
+            for code in session_reasons
+        ):
             record.mark(SelectionStage.MACRO_BLOCKED, reason_codes=session_reasons)
         elif any("ONTOLOGY" in code for code in session_reasons):
             record.mark(SelectionStage.ONTOLOGY_BLOCKED, reason_codes=session_reasons)

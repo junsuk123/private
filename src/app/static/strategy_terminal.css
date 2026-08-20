@@ -37,9 +37,9 @@ button, a { font: inherit; }
 .gnn-model-panel { order: 2; }
 .selection-strip { order: 3; }
 .instrument-hero { order: 4; }
-.workspace-grid { order: 5; }
-.execution-panel { order: 6; }
-.decision-ontology-panel { order: 7; }
+.decision-ontology-panel { order: 5; }
+.workspace-grid { order: 6; }
+.execution-panel { order: 7; }
 .second-analysis-panel { order: 8; }
 .asset-overview { order: 9; }
 .diagnostics-panel { order: 10; }
@@ -788,7 +788,8 @@ button, a { font: inherit; }
   background: var(--panel);
 }
 .chart-panel, .ontology-panel, .execution-panel { padding: 14px; }
-.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; min-width: 0; }
+.panel-head > div { min-width: 0; }
 .panel-head h2 { margin: 0; font-size: 14px; }
 .chart-head-tools { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
 .chart-stream-state {
@@ -864,22 +865,37 @@ button, a { font: inherit; }
   font-size: 8px;
 }
 
-.ontology-flow { display: grid; gap: 7px; margin-top: 13px; }
+.ontology-panel {
+  display: flex;
+  flex-direction: column;
+  border-color: rgba(57, 215, 231, .26);
+  background:
+    linear-gradient(150deg, rgba(57, 215, 231, .07), transparent 36%),
+    var(--panel);
+}
+.ontology-panel .panel-head {
+  padding-bottom: 10px;
+  border-bottom: 1px solid #1a2635;
+}
+.ontology-panel .status-chip {
+  flex: 0 0 auto;
+  max-width: 44%;
+  justify-content: center;
+  text-align: center;
+}
+.ontology-flow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 12px;
+}
 .ontology-node {
   position: relative;
   border: 1px solid #263444;
   border-radius: 7px;
+  min-width: 0;
   padding: 9px 10px 9px 31px;
   background: var(--panel-2);
-}
-.ontology-node:not(:last-child)::after {
-  content: "";
-  position: absolute;
-  left: 14px;
-  bottom: -8px;
-  width: 1px;
-  height: 8px;
-  background: #314257;
 }
 .ontology-node i {
   position: absolute;
@@ -894,8 +910,8 @@ button, a { font: inherit; }
 .ontology-node.block i { border-color: var(--red); background: var(--red); }
 .ontology-node b, .ontology-node small { display: block; }
 .ontology-node b { font-size: 10px; }
-.ontology-node small { margin-top: 2px; color: var(--muted); font-size: 8px; }
-.reason-box { margin-top: 13px; border-top: 1px solid var(--line); padding-top: 11px; }
+.ontology-node small { margin-top: 2px; color: var(--muted); font-size: 8px; line-height: 1.35; overflow-wrap: anywhere; }
+.reason-box { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 11px; }
 .reason-box h3 { margin: 0 0 7px; color: #a8b6c8; font-size: 9px; }
 #ontology-reasons { display: flex; flex-wrap: wrap; gap: 5px; }
 .reason-chip {
@@ -904,11 +920,12 @@ button, a { font: inherit; }
   background: rgba(255, 102, 120, .09);
   color: #ff9aaa;
   font: 8px/1.3 Consolas, monospace;
+  overflow-wrap: anywhere;
 }
-.decision-compare { display: grid; gap: 5px; margin-top: 11px; }
+.decision-compare { display: grid; gap: 5px; margin-top: auto; padding-top: 11px; }
 .decision-row {
   display: grid;
-  grid-template-columns: 58px 68px minmax(0, 1fr);
+  grid-template-columns: minmax(48px, .7fr) minmax(58px, .8fr) minmax(0, 1.4fr);
   gap: 7px;
   border-top: 1px solid #19222e;
   padding-top: 6px;
@@ -1104,10 +1121,25 @@ button, a { font: inherit; }
   font-size: 8px;
 }
 
-.decision-ontology-panel { margin-top: 12px; padding: 14px; overflow: hidden; }
-.ontology-graph-head { align-items: center; }
-.ontology-graph-summary { margin: 5px 0 0; color: var(--muted); font-size: 9px; }
-.ontology-graph-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.decision-ontology-panel {
+  margin-top: 12px;
+  padding: 14px;
+  overflow: hidden;
+  border-color: rgba(57, 215, 231, .32);
+  background:
+    linear-gradient(140deg, rgba(57, 215, 231, .08), transparent 40%),
+    #081018;
+}
+.ontology-graph-head { align-items: flex-start; gap: 18px; }
+.ontology-graph-summary { max-width: 920px; margin: 5px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
+.ontology-graph-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  flex: 0 0 min(430px, 45%);
+  gap: 6px;
+}
 .graph-filter,
 .graph-action-button {
   border: 1px solid #2a394b;
@@ -1118,6 +1150,8 @@ button, a { font: inherit; }
   font: 9px/1 inherit;
   cursor: pointer;
 }
+.graph-filter { min-width: 74px; }
+.graph-action-button { min-width: 98px; }
 .graph-filter:hover,
 .graph-filter.active,
 .graph-action-button:hover,
@@ -1126,7 +1160,20 @@ button, a { font: inherit; }
   color: var(--cyan);
   background: rgba(57, 215, 231, .08);
 }
-.ontology-legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 13px 0 8px; color: #8191a5; font-size: 8px; }
+.ontology-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 13px 0 8px;
+  color: #8191a5;
+  font-size: 8px;
+}
+.ontology-legend span {
+  border: 1px solid #1f2d3d;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(11, 18, 28, .72);
+}
 .ontology-legend span::before {
   content: "";
   display: inline-block;
@@ -1143,14 +1190,14 @@ button, a { font: inherit; }
 .ontology-legend .unknown-path::before { background: #536176; }
 .decision-ontology-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 245px;
-  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 260px);
+  gap: 12px;
   min-height: 510px;
 }
 .decision-ontology-canvas {
   min-width: 0;
   overflow: auto;
-  border: 1px solid #1d2a38;
+  border: 1px solid #22354a;
   border-radius: 8px;
   background:
     linear-gradient(rgba(36, 51, 68, .13) 1px, transparent 1px),
@@ -1183,10 +1230,12 @@ button, a { font: inherit; }
 .graph-node .node-value { fill: #7f91a6; font: 8px Consolas, monospace; }
 .graph-node.selected .node-title { fill: #72e8f3; }
 .ontology-inspector {
-  border: 1px solid #223043;
+  border: 1px solid #22354a;
   border-radius: 8px;
   padding: 13px;
-  background: #0c131d;
+  background:
+    linear-gradient(180deg, rgba(57, 215, 231, .055), transparent 72px),
+    #0c131d;
 }
 .ontology-inspector > span { color: var(--cyan); font: 8px Consolas, monospace; letter-spacing: .12em; }
 .ontology-inspector h3 { margin: 10px 0 6px; font-size: 13px; line-height: 1.35; }
@@ -1255,7 +1304,9 @@ button, a { font: inherit; }
   .execution-bottom { grid-template-columns: 1fr; }
   .terminal-footer { grid-template-columns: 1fr; }
   .ontology-graph-head { align-items: flex-start; flex-direction: column; }
-  .ontology-graph-actions { width: 100%; }
+  .ontology-graph-actions { width: 100%; flex-basis: auto; justify-content: flex-start; }
+  .ontology-flow { grid-template-columns: 1fr; }
+  .ontology-panel .status-chip { max-width: 100%; }
   .second-analysis-footer { flex-direction: column; }
 }
 @media (max-width: 480px) {
@@ -1457,9 +1508,20 @@ button, a { font: inherit; }
   body:not(.classic-layout) #price-chart { position: absolute; inset: 0; }
   body:not(.classic-layout) .volume-wrap { height: 44px; }
   body:not(.classic-layout) .chart-footer { margin-top: 5px; padding-top: 5px; }
-  body:not(.classic-layout) .ontology-flow { margin-top: 7px; gap: 5px; }
+  body:not(.classic-layout) .ontology-panel { overflow: hidden; }
+  body:not(.classic-layout) .ontology-panel .panel-head { padding-bottom: 6px; }
+  body:not(.classic-layout) .ontology-panel .status-chip { max-width: 48%; }
+  body:not(.classic-layout) .ontology-flow {
+    grid-template-columns: 1fr;
+    align-content: start;
+    margin-top: 7px;
+    gap: 5px;
+    overflow: auto;
+  }
   body:not(.classic-layout) .ontology-node { padding: 6px 8px 6px 28px; }
   body:not(.classic-layout) .reason-box { margin-top: 8px; padding-top: 7px; }
+  body:not(.classic-layout) #ontology-reasons { max-height: 62px; overflow: auto; }
+  body:not(.classic-layout) .decision-compare { margin-top: 7px; padding-top: 7px; overflow: auto; }
 
   /* --- 08 order lifecycle ------------------------------------------------ */
   body:not(.classic-layout) .execution-panel { display: flex; flex-direction: column; overflow: hidden; }
@@ -1495,7 +1557,10 @@ button, a { font: inherit; }
 
   /* --- 10 decision ontology graph ---------------------------------------- */
   body:not(.classic-layout) .decision-ontology-panel { display: flex; flex-direction: column; overflow: hidden; }
+  body:not(.classic-layout) .ontology-graph-head { gap: 10px; }
+  body:not(.classic-layout) .ontology-graph-actions { flex: 0 0 auto; }
   body:not(.classic-layout) .ontology-legend { margin: 7px 0 6px; }
+  body:not(.classic-layout) .ontology-legend span { padding: 3px 7px; }
   body:not(.classic-layout) .decision-ontology-layout {
     flex: 1 1 auto;
     min-height: 0;

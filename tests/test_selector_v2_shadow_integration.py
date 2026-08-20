@@ -371,6 +371,7 @@ def test_session_manager_publishes_v2_telemetry_without_authority() -> None:
         "GNN_DIRECT",
         "CONSERVATIVE_BANDIT",
         "FIRST_ADMISSIBLE",
+        "DETERMINISTIC_ALGORITHM",
     }
 
 

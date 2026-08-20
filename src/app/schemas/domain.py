@@ -194,6 +194,11 @@ class MarketSnapshot:
     volatility_20d: float
     source: SourceMetadata
     investor_flow: InvestorFlowSnapshot | None = None
+    #: Venue-reported trading halt. ``None`` means the feed did not say — which the trade
+    #: gate treats as "not established" and refuses, the same as a halt. Only a broker
+    #: field may set this; it is never inferred from an absence of ticks, because a quiet
+    #: symbol and a suspended one look identical on the tape.
+    halted: bool | None = None
 
 
 @dataclass(frozen=True)

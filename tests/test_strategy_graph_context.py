@@ -128,6 +128,10 @@ def _training_context(rows: tuple[_Row, ...], anchor: int) -> tuple[float, ...]:
         ),
         rvgi_result=ti.rvgi(completed, 10),
         box=ti.causal_box_geometry(completed, 20),
+        # Exactly what the labelling loop passes: ``bars[history_start : index + 1]``,
+        # the history window plus the anchor bar.
+        bar_window=bars[history_start : anchor + 1],
+        session_history=bars[max(0, anchor - ctx.SESSION_CONTEXT_BARS) : anchor + 1],
     )
 
 

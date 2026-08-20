@@ -17,16 +17,17 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Deque
+from app.audit import log_path
 
 
 class ExecutionQualityStore:
     def __init__(
         self,
-        path: str | Path = "logs/execution-quality.jsonl",
+        path: str | Path | None = None,
         *,
         window: int = 50,
     ) -> None:
-        self.path = Path(path)
+        self.path = Path(path) if path is not None else log_path("execution-quality.jsonl")
         self.window = max(1, int(window))
         self._recent: dict[tuple[str, str], Deque[float]] = defaultdict(lambda: deque(maxlen=self.window))
         self._by_time_bucket: dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=self.window))

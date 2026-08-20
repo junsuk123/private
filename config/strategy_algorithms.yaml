@@ -64,8 +64,8 @@ shared:
   # Absolute lower bound, used only when the cost config cannot be read. It is
   # NOT the operative floor: with cost_aware_floor_enabled the floor becomes
   # round_trip_cost * cost_floor_multiple + min_net_buffer_bps, resolved per
-  # market from config/trading_costs.json — about 44 bps on KRX and 61 bps on US
-  # at the current fee schedule.
+  # market from config/trading_costs.json — the full configured round trip for
+  # that venue, with no additional strategy-selection buffer layered on top.
   #
   # Why this changed: a flat 8 bps let every algorithm fire on edges that could
   # not survive their own round trip, which is exactly the measured pathology
@@ -78,8 +78,9 @@ shared:
   # the edge exceed cost by a margin; both terms are estimates, so equality is
   # a loss whenever either is off.
   cost_floor_multiple: 1.0
-  # Net bps that must survive the round trip for the trade to be worth taking.
-  min_net_buffer_bps: 10.0
+  # The selector already requires net edge > 0 after this full round trip.
+  # A second fixed buffer duplicated that decision and is intentionally zero.
+  min_net_buffer_bps: 0.0
 
 # Tick order-flow continuation, confirmed by bar trend agreement.
 intraday_momentum:

@@ -14,12 +14,17 @@ from app.models.graph_snapshot import (
     GraphSnapshotBuilder,
     StockNodeObservation,
 )
-from app.models.temporal_hetero_gnn import TemporalHeteroGnn, TemporalHeteroGnnConfig
+from app.models.temporal_hetero_gnn import (
+    SUPERVISED_HEADS,
+    TemporalHeteroGnn,
+    TemporalHeteroGnnConfig,
+)
 from app.models.temporal_hetero_gnn_training import (
     RelationOutcome,
     TrainingExample,
     evaluate_loss,
     fit_relation_weights,
+    label_counts,
     load_relation_weights,
     persist_relation_weights,
     train_temporal_hetero_gnn,
@@ -216,3 +221,95 @@ def test_reloading_ignores_a_weight_for_an_edge_that_became_structural(tmp_path)
     fresh = load_market_graph()
     # Applying it would raise; the loader must skip it instead.
     assert load_relation_weights(fresh, store=store) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Head provenance
+# --------------------------------------------------------------------------- #
+def _unfilled(examples: list[TrainingExample]) -> list[TrainingExample]:
+    """The same decisions, none of which ever became a fill."""
+    return [
+        TrainingExample(
+            snapshot=example.snapshot,
+            node_id=example.node_id,
+            regime_labels=example.regime_labels,
+            trade_quality=None,
+            realised_return_bps=None,
+        )
+        for example in examples
+    ]
+
+
+def test_label_counts_reports_each_head_separately() -> None:
+    counts = label_counts(_examples(8))
+    assert counts["trade_quality"] == 8
+    assert counts["expected_return"] == 8
+    assert counts["regime"] == 16  # two regime labels per example
+
+    unfilled = label_counts(_unfilled(_examples(8)))
+    assert unfilled["regime"] == 16
+    assert unfilled["trade_quality"] == 0
+    assert unfilled["expected_return"] == 0
+
+
+def test_a_checkpoint_records_which_heads_were_supervised(tmp_path) -> None:
+    """Unfilled decisions supervise regime only, and the artifact has to say so."""
+    target = tmp_path / "partial.npz"
+    _, report = train_temporal_hetero_gnn(
+        _unfilled(_examples(12)),
+        config=CONFIG,
+        epochs=2,
+        population=4,
+        checkpoint_path=target,
+    )
+    assert report.trained_heads == ("regime",)
+    assert TemporalHeteroGnn.load_checkpoint(target).trained_heads == ("regime",)
+
+
+def test_a_partially_supervised_checkpoint_degrades_rather_than_going_healthy(
+    tmp_path,
+) -> None:
+    """The whole point: unlabelled heads must never become model evidence.
+
+    An unsupervised head still emits finite, confident-looking numbers, so nothing about
+    the tensors themselves would stop the runtime reporting HEALTHY and sizing at 1.0
+    against its initialisation.
+    """
+    target = tmp_path / "partial.npz"
+    TemporalHeteroGnn(CONFIG).save_checkpoint(target, trained_heads=("regime",))
+    health = GnnRuntime(
+        config=CONFIG, checkpoint_path=target, require_checkpoint=True
+    ).health()
+
+    assert health.state is GnnHealthState.DEGRADED
+    assert "GNN_PARTIAL_TRAINING" in health.reason_codes
+    assert health.detail["untrained_heads"] == ["trade_quality", "expected_return"]
+    # Entries stay open at half size; the model's own outputs are not admitted.
+    assert health.allows_new_entry is True
+    assert health.allows_model_evidence is False
+    assert health.size_multiplier == 0.5
+
+
+def test_a_fully_supervised_checkpoint_is_healthy(tmp_path) -> None:
+    target = tmp_path / "full.npz"
+    TemporalHeteroGnn(CONFIG).save_checkpoint(target, trained_heads=SUPERVISED_HEADS)
+    health = GnnRuntime(
+        config=CONFIG, checkpoint_path=target, require_checkpoint=True
+    ).health()
+
+    assert health.state is GnnHealthState.HEALTHY
+    assert "GNN_PARTIAL_TRAINING" not in health.reason_codes
+
+
+def test_a_checkpoint_without_the_marker_is_read_as_fully_supervised(tmp_path) -> None:
+    """Provenance predates the marker; the loader must not invent a defect."""
+    written = tmp_path / "legacy.npz"
+    TemporalHeteroGnn(CONFIG).save_checkpoint(written)
+    with np.load(written) as data:
+        kept = {name: data[name] for name in data.files if name != "trained_heads"}
+    np.savez_compressed(written, **kept)
+
+    health = GnnRuntime(
+        config=CONFIG, checkpoint_path=written, require_checkpoint=True
+    ).health()
+    assert health.state is GnnHealthState.HEALTHY

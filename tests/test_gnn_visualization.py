@@ -130,7 +130,7 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     # strategy_terminal.js against a changed payload contract. There were two
     # markers here from successive features; the older one only recorded which
     # release last touched the file, and every bump broke it.
-    assert "20260813-live-ontology-v2" in page.text
+    assert "20260820-live-ontology-gate-ui" in page.text
 
 
 def test_gnn_auto_rotation_is_default_on_persistent_and_pauses_for_manual_control() -> None:
@@ -258,6 +258,56 @@ def test_gnn_state_marks_recent_log_as_active(tmp_path: Path) -> None:
     assert activation["strategies"]["intraday_momentum"]["state"] == "ELECTED_NO_TRADE"
     assert activation["layers"]["strategy_election"]["observed"] is True
     assert activation["layers"]["input"]["observed"] is False
+
+
+def test_recent_schema_mismatch_is_active_transport_but_blocked_inference(
+    tmp_path: Path,
+) -> None:
+    inference = tmp_path / "inference.jsonl"
+    inference.write_text(
+        json.dumps({
+            "symbol": "005930",
+            "decisions": [{
+                "path": "cpu_gnn",
+                "action": "NO_TRADE",
+                "strategy_id": None,
+                "reason_codes": ["GNN_FEATURE_SCHEMA_MISMATCH"],
+            }],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    state = build_strategy_gnn_state(inference_path=inference, active_window_seconds=10)
+
+    assert state["active"] is True
+    assert state["inference_usable"] is False
+    assert state["state"] == "BLOCKED"
+    assert state["model_id"] == "strategy_utility_rgcn"
+
+
+def test_unpromoted_checkpoint_is_usable_for_validation_not_orders(
+    tmp_path: Path,
+) -> None:
+    inference = tmp_path / "inference.jsonl"
+    inference.write_text(
+        json.dumps({
+            "symbol": "INTC",
+            "decisions": [{
+                "path": "cpu_gnn",
+                "action": "NO_TRADE",
+                "strategy_id": None,
+                "reason_codes": ["GNN_CHECKPOINT_NOT_LIVE_AUTHORIZED"],
+            }],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    state = build_strategy_gnn_state(inference_path=inference, active_window_seconds=10)
+
+    assert state["state"] == "INFERENCE_RUNNING"
+    assert state["inference_usable"] is True
+    assert state["order_authorized"] is False
+    assert state["phase"] == "validation_only"
 
 
 def test_strategy_nodes_publish_upside_supervision_next_to_label_count() -> None:

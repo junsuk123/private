@@ -1228,6 +1228,10 @@ def build_labels(
                     rvgi_result=rvgi_result,
                     box=box,
                     quantiles=quantiles,
+                    bar_window=history_window,
+                    session_history=bars[
+                        max(0, index - strategy_graph_context.SESSION_CONTEXT_BARS) : index + 1
+                    ],
                 )
             except StrategyGraphContextError:
                 continue
@@ -1538,6 +1542,8 @@ def _label_features(
     rvgi_result,
     box,
     quantiles: dict[str, float],
+    bar_window: Sequence[Any] = (),
+    session_history: Sequence[Any] = (),
 ) -> tuple[float, ...]:
     if schema_name == STRATEGY_GRAPH_CONTEXT_SCHEMA:
         return _strategy_graph_context_features(
@@ -1548,6 +1554,8 @@ def _label_features(
             microstructure=microstructure,
             rvgi_result=rvgi_result,
             box=box,
+            bar_window=bar_window,
+            session_history=session_history,
         )
     micro = _realtime_microstructure_proxy_features(
         current=current,
@@ -1597,6 +1605,8 @@ def _strategy_graph_context_features(
     microstructure: BarMicrostructure | None,
     rvgi_result,
     box,
+    bar_window: Sequence[Any] = (),
+    session_history: Sequence[Any] = (),
 ) -> tuple[float, ...]:
     """The aligned GNN context, built from the SAME source columns as serving.
 
@@ -1645,6 +1655,14 @@ def _strategy_graph_context_features(
                 microstructure.spread_bps,
                 microstructure.orderbook_imbalance,
                 microstructure.liquidity_score,
+            ),
+            # Same span the serving path uses: history plus the anchor bar, handed
+            # to the one shared estimator rather than recomputed here.
+            **strategy_graph_context.trend_structure_columns(bar_window),
+            # Session block: the same shared boundary rule the serving path uses, so
+            # neither side can disagree about where the session began.
+            **strategy_graph_context.session_structure_columns(
+                *strategy_graph_context.session_slice(session_history)
             ),
             "return_1m_scaled": strategy_graph_context.scaled_return(current_return),
             "realized_volatility_30m": strategy_graph_context.realized_volatility(

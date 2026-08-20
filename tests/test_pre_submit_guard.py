@@ -129,6 +129,28 @@ def test_stale_critical_data_blocks_a_buy(store, machine) -> None:
     assert decision.detail["stale_streams"]
 
 
+def test_stale_other_symbol_does_not_block_fresh_order_symbol(
+    store, machine, registry
+) -> None:
+    _reconciled(store)
+    registry.expect("kis_realtime", "trade", scope_key="000660")
+    decision = _guard(store, machine, registry).evaluate(
+        ticker="005930", side="BUY", market="KR", now=NOW
+    )
+    assert decision.allowed
+    assert decision.detail["ignored_stale_stream_count"] == 1
+
+
+def test_stale_same_symbol_still_blocks(store, machine, registry) -> None:
+    _reconciled(store)
+    registry.expect("kis_realtime", "trade", scope_key="005930")
+    decision = _guard(store, machine, registry).evaluate(
+        ticker="005930", side="BUY", market="KR", now=NOW
+    )
+    assert not decision.allowed
+    assert "STALE_DATA" in decision.reason_codes
+
+
 def test_an_unreconciled_account_blocks_a_buy(store, machine, registry) -> None:
     _reconciled(store, ok=False)
     decision = _guard(store, machine, registry).evaluate(

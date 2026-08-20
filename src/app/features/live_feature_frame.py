@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from app.audit import log_path
 from app.data.market_data_health import evaluate_market_data_health
 from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.data.realtime_store import RealtimeMarketDataStore
@@ -90,7 +91,7 @@ class LiveFeatureFrameBuilder:
         # any spread/cost/liquidity/instrument risk gate.
         max_quote_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_QUOTE_AGE_MS_US", "90000")),
         max_orderbook_age_ms_us: int = int(os.getenv("LIVE_FEATURE_MAX_ORDERBOOK_AGE_MS_US", "90000")),
-        journal_path: str | Path = "logs/live-feature-frames.jsonl",
+        journal_path: str | Path | None = None,
         sentiment_store: NewsSentimentStore | None = None,
     ) -> None:
         self.store = store
@@ -103,7 +104,10 @@ class LiveFeatureFrameBuilder:
         self.max_orderbook_age_ms = max_orderbook_age_ms
         self.max_quote_age_ms_us = max_quote_age_ms_us
         self.max_orderbook_age_ms_us = max_orderbook_age_ms_us
-        self.journal_path = Path(journal_path)
+        self.journal_path = (
+            Path(journal_path) if journal_path is not None
+            else log_path("live-feature-frames.jsonl")
+        )
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -207,10 +211,12 @@ class LiveFeatureFrameBuilder:
             decision_time,
             float(prices[-1]),
         )
-        session_diagnostics = (
-            _session_structure_diagnostics(self.store, symbol, decision_time)
-            if not is_us
-            else {}
+        # Session structure is exchange-aware and works for both KRX and US
+        # minute bars. Dropping it for US made every opening/gap strategy
+        # permanently context-less in the market where those low-turnover
+        # strategies are most useful.
+        session_diagnostics = _session_structure_diagnostics(
+            self.store, symbol, decision_time
         )
         second_features = _second_level_features(
             ticks,
@@ -599,10 +605,14 @@ def _slow_context_bars(store, symbol: str, decision_time: datetime):
     from app.technical.causal_bars import completed_bars
 
     try:
+        # 240 minutes covered the trend window but stopped short of the session
+        # open after roughly 13:00 KST, which would make the session block
+        # unavailable for the back half of every session — precisely the hours the
+        # opening-range and first-half-hour theses are evaluated against.
         rows = store.recent_minute_bars(
             symbol,
-            decision_time - timedelta(minutes=240),
-            limit=240,
+            decision_time - timedelta(minutes=_ctx_session_bars()),
+            limit=_ctx_session_bars(),
         )
     except Exception:  # noqa: BLE001 - slow context fails closed, never raises.
         rows = ()
@@ -614,6 +624,12 @@ def _slow_context_bars(store, symbol: str, decision_time: datetime):
         warmup_required=64,
     )
     return bar_set, tuple(rows or ())
+
+
+def _ctx_session_bars() -> int:
+    from app.features import strategy_graph_context as ctx
+
+    return int(ctx.SESSION_CONTEXT_BARS)
 
 
 def _strategy_graph_context_columns(
@@ -678,12 +694,18 @@ def _strategy_graph_context_columns(
 
     box_available = float(rvgi_box.get("box_available", 0.0) or 0.0)
     box_high = float(rvgi_box.get("box_high", 0.0) or 0.0)
+    # The trend block reads the same window as the statistics above: the history
+    # plus the anchor bar. The labelling path passes ``bars[history_start:index+1]``,
+    # which is that same span, and both hand it to the one shared estimator.
+    trend_window = bars[max(0, len(bars) - 1 - ctx.CONTEXT_HISTORY_BARS) :]
     return {
         **ctx.microstructure_columns(
             _optional_column(micro, "spread_bps"),
             _optional_column(micro, "orderbook_imbalance"),
             _optional_column(micro, "liquidity_score"),
         ),
+        **ctx.trend_structure_columns(trend_window),
+        **ctx.session_structure_columns(*ctx.session_slice(bars)),
         "return_1m_scaled": ctx.scaled_return(bar_return),
         "realized_volatility_30m": ctx.realized_volatility(returns),
         "distance_from_vwap": ctx.safe_ratio(price, vwap) - 1.0 if vwap else 0.0,
@@ -810,6 +832,14 @@ def _slow_technical_columns(
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             result[name] = float(value)
     result["bar_count"] = float(len(bars))
+    # Conservative, directly observed exit-capacity evidence. This is only the
+    # completed bars in the current context window, so it is a lower bound on a
+    # full day's traded value rather than a forecast or a fabricated ADV.
+    result["observed_trading_value"] = sum(
+        max(0.0, float(bar.close)) * max(0.0, float(bar.volume))
+        for bar in bars
+        if math.isfinite(float(bar.close)) and math.isfinite(float(bar.volume))
+    )
     return result
 
 
@@ -909,11 +939,40 @@ def _session_structure_diagnostics(
     )
     session = session_structure.regular_session(symbol)
     zone = session.zone
+    local_now = decision_time.astimezone(zone)
+    # Before today's regular open there is no current-session opening range.
+    # Returning yesterday's completed range would leak a stale gap thesis into
+    # premarket trading because ``trading_day`` correctly points to the previous
+    # completed session at that time.
+    if local_now.weekday() >= 5 or local_now.time() < session.open_time:
+        return {}
     session_open = session.session_open(decision_time)
     current_day = session.trading_day(decision_time)
     current_bars = tuple(
         bar for bar in bars if bar.minute_start.astimezone(zone).date() == current_day
     )
+    previous = tuple(
+        bar for bar in bars if bar.minute_start.astimezone(zone).date() < current_day
+    )
+    previous_close = float(previous[-1].close) if previous else 0.0
+    session_open_price = (
+        float(getattr(current_bars[0], "open", 0.0) or 0.0)
+        if current_bars
+        else 0.0
+    )
+    # Gap context exists as soon as the first regular-session bar completes. It
+    # must not wait for the full 30-minute opening range: doing so moved a 5-minute
+    # gap thesis outside its useful entry horizon.
+    result: dict[str, Any] = {}
+    if session_open_price > 0.0:
+        result["session_open_price"] = session_open_price
+    if previous_close > 0.0:
+        result["previous_close_price"] = previous_close
+    if session_open_price > 0.0 and previous_close > 0.0:
+        gap_rate = session_open_price / previous_close - 1.0
+        result["gap_rate"] = gap_rate
+        result["gap_submode"] = "continuation" if gap_rate > 0.0 else "fade"
+
     observed = session_structure.opening_range(
         current_bars,
         session_open=session_open,
@@ -921,12 +980,7 @@ def _session_structure_diagnostics(
         now=decision_time,
     )
     if observed is None:
-        return {}
-
-    previous = tuple(
-        bar for bar in bars if bar.minute_start.astimezone(zone).date() < current_day
-    )
-    previous_close = float(previous[-1].close) if previous else 0.0
+        return result
     opening_return = session_structure.first_half_hour_return_bps(
         current_bars,
         previous_close=previous_close,
@@ -962,11 +1016,11 @@ def _session_structure_diagnostics(
         observed.volatility,
         minimum_samples=minimum_samples,
     )
-    result: dict[str, Any] = {
-        "opening_range_high": observed.high,
-        "opening_range_low": observed.low,
-        "opening_range_minutes": observed.minutes,
-    }
+    result.update(
+        opening_range_high=observed.high,
+        opening_range_low=observed.low,
+        opening_range_minutes=observed.minutes,
+    )
     if opening_return is not None:
         result["first_half_hour_return_bps"] = opening_return
     if volatility_percentile is not None:

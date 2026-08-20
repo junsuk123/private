@@ -23,6 +23,19 @@ KIS_PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 KIS_SECRETS_FILE = Path("config/secrets/kis_api_keys.env")
 KIS_TOKEN_CACHE_SKEW_SECONDS = 60
 _KIS_ENV_FILE_LOADED = False
+
+#: Keys in the secrets file that gate real money rather than authenticate.
+#: load_kis_env_file() never overrides these when the process already set one.
+TRADING_POLICY_KEYS = frozenset(
+    {
+        "LIVE_TRADING_ENABLED",
+        "LIVE_ORDER_SUBMIT_ENABLED",
+        "REQUIRE_MANUAL_ARMING",
+        "KILL_SWITCH_ENABLED",
+        "KIS_PAPER_TRADING",
+        "KIS_LIVE_ENABLED",
+    }
+)
 _KIS_GET_RATE_LOCK = threading.Lock()
 _KIS_GET_NEXT_ALLOWED_AT = 0.0
 _KIS_TOKEN_REFRESH_LOCK = threading.Lock()
@@ -1206,6 +1219,7 @@ class KisDevelopersApiClient:
             last_price=price,
             average_daily_trading_value=trading_value,
             volatility_20d=max(0.005, min(0.20, volatility or 0.03)),
+            halted=_kis_trading_halted(output),
             source=_broker_quote_source(ticker, "domestic", now),
         )
 
@@ -2343,6 +2357,32 @@ def _kis_yyyymmdd(value: Any) -> str:
     return str(value).replace("-", "").strip()
 
 
+#: ``iscd_stat_cls_code`` (종목 상태 구분 코드) values that mean the symbol cannot be
+#: traded right now. 58 is 거래정지; the surrounding codes are 관리/투자경고 designations
+#: which restrict but do not suspend, so they are deliberately NOT listed here.
+_KIS_HALTED_STATUS_CODES = frozenset({"58"})
+
+#: Y/N flags KIS sets on a suspended or temporarily-stopped symbol.
+_KIS_HALT_FLAG_FIELDS = ("trht_yn", "temp_stop_yn")
+
+
+def _kis_trading_halted(output: dict[str, Any]) -> bool | None:
+    """Venue-reported halt, or ``None`` when the response did not carry the field.
+
+    The distinction matters: the final trade gate fails closed on ``None``, so returning
+    ``False`` for "the field was absent" would silently convert an unknown into an
+    all-clear on a hard, non-maskable gate.
+    """
+    for field in _KIS_HALT_FLAG_FIELDS:
+        raw = str(output.get(field) or "").strip().upper()
+        if raw in {"Y", "N"}:
+            return raw == "Y"
+    status = str(output.get("iscd_stat_cls_code") or "").strip()
+    if status:
+        return status in _KIS_HALTED_STATUS_CODES
+    return None
+
+
 def _first_float(data: dict[str, Any], *keys: str) -> float:
     for key in keys:
         value = _to_float(data.get(key))
@@ -2904,6 +2944,18 @@ def load_kis_env_file(path: str | Path | None = None, override: bool = False) ->
         name, value = line.split("=", 1)
         key = name.strip()
         if not key:
+            continue
+        if key in TRADING_POLICY_KEYS and key in os.environ:
+            # override=True exists so an edited secrets file is picked up without
+            # a restart, and for CREDENTIALS that is right. These keys are not
+            # credentials: they decide whether this process may send an order.
+            # Overriding them silently reverses a posture the process was
+            # started with -- the read-only instance published behind Tailscale
+            # Funnel sets LIVE_ORDER_SUBMIT_ENABLED=false, and a readiness check
+            # calling validate_live_secret_file() would flip it back to the
+            # file's "true" while the operator believed orders were impossible.
+            # An explicitly set value wins; the file still supplies the default
+            # when the process did not set one.
             continue
         if override or key not in os.environ:
             os.environ[key] = value.strip().strip('"').strip("'")

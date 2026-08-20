@@ -56,7 +56,7 @@ class StrategyGraphContextError(ValueError):
 #: the checkpoint's ``input_feature_schema`` and refuses to score on a mismatch
 #: (``MODEL_INPUT_SCHEMA_MISMATCH``), which is what keeps a stale checkpoint from
 #: being fed a vector whose slots have moved.
-STRATEGY_GRAPH_CONTEXT_SCHEMA = "realtime_strategy_graph_v5_aligned"
+STRATEGY_GRAPH_CONTEXT_SCHEMA = "realtime_strategy_graph_v6_trend"
 
 #: Ordered context fields. Every name documents an estimator and a window; both
 #: producers must implement THAT estimator over THAT window, not something
@@ -107,6 +107,46 @@ STRATEGY_GRAPH_CONTEXT_FIELDS: tuple[str, ...] = (
     "breakout_distance_pct",      # (close / box_high - 1) * 100
     "box_previous_close_ratio",
     "box_context_available",
+    # --- Trend structure over completed bars -------------------------------- #
+    # v5 spent fifteen of its twenty-four slots on RVGI and box geometry, and
+    # carried nothing a trend thesis could read. The ontology therefore had no
+    # relation to express for supertrend_dmi_continuation, bar_trend_continuation,
+    # keltner_volatility_breakout or choppiness_range_reversion, and the closed-
+    # world gate turned "cannot express" into a permanent veto — every trend and
+    # volatility-regime arm in the catalogue was unreachable on every pass.
+    #
+    # Each field below is produced by the SAME estimator on both sides, because
+    # both call ``trend_structure_columns`` rather than reimplementing it.
+    "trend_available",            # 1.0 when the window satisfies the longest warmup
+    "adx_scaled",                 # ADX(14) / 100, [0, 1]
+    "dmi_spread_scaled",          # (plus_di - minus_di) / 100, [-1, 1]
+    "supertrend_direction",       # -1.0 / 0.0 / 1.0
+    "supertrend_distance_pct",    # (close / supertrend_line - 1) * 100
+    "ema_separation_pct",         # (EMA9 / EMA21 - 1) * 100
+    "ema_fast_distance_pct",      # (close / EMA9 - 1) * 100
+    "atr_pct",                    # ATR(14) / close * 100
+    "keltner_available",
+    "keltner_position",           # (close - mid) / (upper - mid), [-5, 5]
+    "keltner_bandwidth_pct",      # (upper - lower) / mid * 100
+    "oscillator_available",
+    "rsi_scaled",                 # RSI(14) / 100, [0, 1]
+    "choppiness_scaled",          # CHOP(14) / 100, [0, 1]
+    "bb_percent_b",               # Bollinger %B, [-5, 5]
+    "bb_bandwidth_pct",           # (upper - lower) / mid * 100
+    # --- Session structure -------------------------------------------------- #
+    # Anchored to the session open, not to the rolling window: at 14:00 an opening
+    # range is five hours behind the anchor bar. Producing these is what lets the
+    # ontology express opening_range_breakout / _breakdown, gap_context and the two
+    # market_intraday_momentum arms, all of which were CONTEXT_UNAVAILABLE.
+    "session_structure_available",
+    "opening_range_high_ratio",   # opening-range high / close
+    "opening_range_low_ratio",    # opening-range low / close
+    "opening_range_position",     # 0 at the range low, 1 at the high, unclamped
+    "opening_range_width_pct",    # (high - low) / close * 100
+    "minutes_since_session_open",
+    "first_half_hour_return_pct",
+    "session_gap_available",
+    "session_gap_pct",            # (session open / previous close - 1) * 100
 )
 
 STRATEGY_GRAPH_CONTEXT_DIM = len(STRATEGY_GRAPH_CONTEXT_FIELDS)
@@ -126,6 +166,24 @@ _BOUNDS: dict[str, tuple[float, float]] = {
     "volume_spike_ratio": (0.0, 10.0),
     "box_position": (-5.0, 5.0),
     "breakout_distance_pct": (-100.0, 100.0),
+    "adx_scaled": (0.0, 1.0),
+    "dmi_spread_scaled": (-1.0, 1.0),
+    "supertrend_direction": (-1.0, 1.0),
+    "supertrend_distance_pct": (-100.0, 100.0),
+    "ema_separation_pct": (-100.0, 100.0),
+    "ema_fast_distance_pct": (-100.0, 100.0),
+    "atr_pct": (0.0, 100.0),
+    "keltner_position": (-5.0, 5.0),
+    "keltner_bandwidth_pct": (0.0, 100.0),
+    "rsi_scaled": (0.0, 1.0),
+    "choppiness_scaled": (0.0, 1.0),
+    "bb_percent_b": (-5.0, 5.0),
+    "bb_bandwidth_pct": (0.0, 100.0),
+    "opening_range_position": (-20.0, 20.0),
+    "opening_range_width_pct": (0.0, 100.0),
+    "minutes_since_session_open": (0.0, 1440.0),
+    "first_half_hour_return_pct": (-100.0, 100.0),
+    "session_gap_pct": (-100.0, 100.0),
 }
 
 
@@ -317,3 +375,234 @@ def is_krx_symbol(symbol: str | None) -> float:
     """1.0 for a six-digit KRX code, 0.0 otherwise."""
     text = str(symbol or "").strip()
     return 1.0 if text.isdigit() and len(text) == 6 else 0.0
+
+
+#: Longest warmup among the trend estimators below. Keltner needs 20 bars for its
+#: EMA basis plus an ATR, Bollinger needs 20, ADX needs 2x14. The window is
+#: CONTEXT_HISTORY_BARS + the anchor bar, so a full window clears all of them; a
+#: short one reports ``trend_available = 0.0`` rather than a partially-warmed number.
+TREND_WARMUP_BARS = 28
+
+
+def trend_structure_columns(bars: Sequence[object]) -> dict[str, float]:
+    """Trend, volatility-regime and oscillator structure of a completed-bar window.
+
+    The one implementation. Both producers call THIS, for the same reason
+    :func:`microstructure_columns` exists: a near-copy on each side is how v4 came to
+    serve one quantity into a slot fitted on another.
+
+    Everything is scale-free — ratios, percentages and bounded oscillators, never a
+    price level — so the model cannot learn which instrument it is looking at from a
+    trend field, the identity leak the v4 notes describe.
+
+    A window too short for the longest estimator returns ``trend_available = 0.0`` with
+    zeros beside it. That is the same availability convention as ``rvgi_available`` and
+    ``box_available``: the model can separate "no reading" from "a reading of zero",
+    which for a signed field like ``dmi_spread_scaled`` are opposite claims.
+    """
+    from app.technical.indicators import (
+        atr_percent,
+        bollinger,
+        choppiness_index,
+        dmi_adx,
+        ema,
+        keltner_channels,
+        rsi,
+        supertrend,
+    )
+
+    blank = {
+        "trend_available": 0.0,
+        "adx_scaled": 0.0,
+        "dmi_spread_scaled": 0.0,
+        "supertrend_direction": 0.0,
+        "supertrend_distance_pct": 0.0,
+        "ema_separation_pct": 0.0,
+        "ema_fast_distance_pct": 0.0,
+        "atr_pct": 0.0,
+        "keltner_available": 0.0,
+        "keltner_position": 0.0,
+        "keltner_bandwidth_pct": 0.0,
+        "oscillator_available": 0.0,
+        "rsi_scaled": 0.0,
+        "choppiness_scaled": 0.0,
+        "bb_percent_b": 0.0,
+        "bb_bandwidth_pct": 0.0,
+    }
+    window = tuple(bars or ())
+    if len(window) < TREND_WARMUP_BARS:
+        return blank
+    closes = [float(bar.close) for bar in window]
+    price = closes[-1]
+    if not math.isfinite(price) or price <= 0:
+        return blank
+
+    def pct(numerator: float | None, denominator: float) -> float:
+        if numerator is None or denominator == 0.0:
+            return 0.0
+        ratio = float(numerator) / denominator - 1.0
+        return ratio * 100.0 if math.isfinite(ratio) else 0.0
+
+    columns = dict(blank)
+
+    # ``trend_available`` follows the estimators' own warmup, not the bar count. A
+    # 28-bar window is long enough to call ``dmi_adx`` and long enough for it to
+    # return not-ok, and reporting available beside an unwarmed ADX of 0.0 would
+    # publish exactly the partially-warmed number this convention exists to avoid.
+    dmi = dmi_adx(window)
+    trend = supertrend(window)
+    fast = ema(closes, 9)
+    slow = ema(closes, 21)
+    if not (dmi.ok and trend.ok and fast is not None and slow is not None and slow > 0):
+        return blank
+
+    columns["trend_available"] = 1.0
+    columns["adx_scaled"] = float(dmi.adx or 0.0) / 100.0
+    columns["dmi_spread_scaled"] = float(dmi.dmi_spread or 0.0) / 100.0
+    columns["supertrend_direction"] = float(trend.direction or 0.0)
+    columns["supertrend_distance_pct"] = pct(price, float(trend.line or 0.0))
+    columns["ema_separation_pct"] = pct(fast, slow)
+    columns["ema_fast_distance_pct"] = pct(price, float(fast))
+    columns["atr_pct"] = float(atr_percent(window) or 0.0)
+
+    channel = keltner_channels(window)
+    if channel.ok and channel.mid:
+        columns["keltner_available"] = 1.0
+        columns["keltner_position"] = float(channel.position or 0.0)
+        columns["keltner_bandwidth_pct"] = float(channel.bandwidth or 0.0)
+
+    strength = rsi(closes)
+    chop = choppiness_index(window)
+    bands = bollinger(closes)
+    if strength is not None and chop is not None and bands.ok:
+        columns["oscillator_available"] = 1.0
+        columns["rsi_scaled"] = float(strength) / 100.0
+        columns["choppiness_scaled"] = float(chop) / 100.0
+        columns["bb_percent_b"] = float(bands.percent_b or 0.0)
+        columns["bb_bandwidth_pct"] = float(bands.bandwidth or 0.0)
+    return columns
+
+
+#: Bars from the session's first print that the opening range spans. KRX and the US
+#: both run a 30-minute opening auction-to-continuous settling period, and every
+#: opening-range strategy in the catalogue is parameterised on it.
+OPENING_RANGE_BARS = 30
+
+#: How far back a producer must load for the session block to be computable at any
+#: point in the day. KRX runs 390 continuous minutes and the US 390; the margin
+#: carries the previous session's last close for the gap. Both producers bound their
+#: lookback by this, so neither can silently see a different amount of history.
+SESSION_CONTEXT_BARS = 450
+
+
+def session_structure_columns(
+    session_bars: Sequence[object],
+    previous_session_close: float | None = None,
+) -> dict[str, float]:
+    """Where the current bar sits relative to the session's own opening structure.
+
+    ``session_bars`` is every completed bar of the CURRENT session, oldest first, the
+    anchor bar last. Not the rolling 30-bar window the trend block uses: an opening
+    range is anchored to the session open, so at 14:00 the facts it needs are five
+    hours behind the anchor and a rolling window cannot see them. That is why this
+    takes its own span.
+
+    ``previous_session_close`` is the last close of the prior session, for the gap.
+    ``None`` means the producer could not reach back that far, and the gap reports
+    unavailable rather than defaulting to "no gap" — which is a claim, not an absence.
+
+    Scale-free like the rest of the contract: ratios and percentages, never a level.
+    """
+    blank = {
+        "session_structure_available": 0.0,
+        "opening_range_high_ratio": 0.0,
+        "opening_range_low_ratio": 0.0,
+        "opening_range_position": 0.0,
+        "opening_range_width_pct": 0.0,
+        "minutes_since_session_open": 0.0,
+        "first_half_hour_return_pct": 0.0,
+        "session_gap_available": 0.0,
+        "session_gap_pct": 0.0,
+    }
+    bars = tuple(session_bars or ())
+    if len(bars) < OPENING_RANGE_BARS:
+        return blank
+    price = float(bars[-1].close)
+    if not math.isfinite(price) or price <= 0:
+        return blank
+
+    opening = bars[:OPENING_RANGE_BARS]
+    highs = [float(bar.high) for bar in opening]
+    lows = [float(bar.low) for bar in opening]
+    range_high = max(highs)
+    range_low = min(lows)
+    if not math.isfinite(range_high) or range_high <= 0 or range_low <= 0:
+        return blank
+
+    columns = dict(blank)
+    columns["session_structure_available"] = 1.0
+    columns["opening_range_high_ratio"] = safe_ratio(range_high, price)
+    columns["opening_range_low_ratio"] = safe_ratio(range_low, price)
+    width = range_high - range_low
+    columns["opening_range_width_pct"] = (width / price) * 100.0 if price else 0.0
+    # 0.0 at the range low, 1.0 at the high, and deliberately unclamped beyond that:
+    # "how far outside the range" IS the breakout thesis, so clipping it to the band
+    # would erase the only part an opening-range strategy cares about.
+    columns["opening_range_position"] = (
+        (price - range_low) / width if width > 0 else 0.0
+    )
+    session_open = float(opening[0].open)
+    columns["first_half_hour_return_pct"] = (
+        (float(opening[-1].close) / session_open - 1.0) * 100.0
+        if session_open > 0
+        else 0.0
+    )
+    # Minutes rather than bar count: a halted or untraded minute writes no bar, and
+    # "how far into the session" must not shrink because the tape went quiet.
+    span = getattr(bars[-1], "as_of", None) or getattr(bars[-1], "start_time", None)
+    start = getattr(opening[0], "as_of", None) or getattr(opening[0], "start_time", None)
+    if span is not None and start is not None:
+        columns["minutes_since_session_open"] = max(
+            0.0, (span - start).total_seconds() / 60.0
+        )
+
+    if previous_session_close is not None and float(previous_session_close) > 0:
+        columns["session_gap_available"] = 1.0
+        columns["session_gap_pct"] = (
+            session_open / float(previous_session_close) - 1.0
+        ) * 100.0
+    return columns
+
+
+def _bar_time(bar: object):
+    return getattr(bar, "as_of", None) or getattr(bar, "start_time", None)
+
+
+def session_slice(bars: Sequence[object]) -> tuple[tuple, float | None]:
+    """The current session's bars, and the previous session's last close.
+
+    One boundary rule for both producers. The labelling path already derived sessions
+    from a UTC date change (``_session_date_changed``) because the store holds no
+    session metadata and neither KRX nor US regular hours straddle UTC midnight; this
+    is that rule, shared, so the live path cannot disagree about where a session began.
+
+    ``bars`` is oldest-first with the anchor last. The previous close is ``None`` when
+    the window does not reach back into the prior session — an absence the caller
+    reports rather than fills.
+    """
+    window = tuple(bars or ())
+    if not window:
+        return (), None
+    start = 0
+    for position in range(1, len(window)):
+        previous_time = _bar_time(window[position - 1])
+        current_time = _bar_time(window[position])
+        if previous_time is None or current_time is None:
+            continue
+        if previous_time.date() != current_time.date():
+            start = position
+    previous_close: float | None = None
+    if start > 0:
+        candidate = float(getattr(window[start - 1], "close", 0.0) or 0.0)
+        previous_close = candidate if candidate > 0 else None
+    return window[start:], previous_close

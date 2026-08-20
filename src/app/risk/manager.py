@@ -7,7 +7,7 @@ from pathlib import Path
 
 import math
 
-from app.audit import AuditLogger
+from app.audit import AuditLogger, log_path
 from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.data.instrument_eligibility import CATEGORY_DERIVATIVE as INSTRUMENT_DERIVATIVE
 from app.data.instrument_eligibility import CATEGORY_ETN as INSTRUMENT_ETN
@@ -41,7 +41,10 @@ class RiskManager:
         self.cost_engine = TradingCostEngine()
         self._profitability_gate = ProfitabilityGate(cost_engine=self.cost_engine)
         self.principal_protection = PrincipalProtectionEngine()
-        self.audit_logger = audit_logger or AuditLogger(Path("logs/principal-protection.jsonl"))
+        # A RiskManager built without an explicit logger used to write straight into
+        # the operator's principal-protection journal, which every test that
+        # constructs one then did too. See app.audit.logger.log_path.
+        self.audit_logger = audit_logger or AuditLogger(log_path("principal-protection.jsonl"))
 
     def validate(
         self,

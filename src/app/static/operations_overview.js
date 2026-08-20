@@ -6,6 +6,8 @@ const operationsOverviewState = {
 const opsReasonLabels = {
   MARKET_DATA_NOT_READY: '실시간 체결·호가 신선도 부족',
   GNN_NOT_LIVE_AUTHORIZED: 'GNN 실시간 신뢰도 미승격',
+  NO_MECHANICAL_STRATEGY_TRIGGER: '전략별 실제 진입 조건 대기',
+  NO_ADMISSIBLE_TRIGGERED_STRATEGY: '발동 전략의 실행 권한·차입 조건 미충족',
   NO_POSITIVE_NET_GNN_EDGE: 'GNN 검증 완료 · 현재 양의 순효율 후보 없음',
   GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION: '양의 순효율 후보 실시간 결과 검증 중',
   GNN_REALTIME_MODEL_TRUST_PASSED: 'GNN 실시간 모델 검증 통과',
