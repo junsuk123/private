@@ -912,6 +912,57 @@ def _rvgi_box_columns(
 _KST = timezone(timedelta(hours=9))
 
 
+#: ``(symbol, trading_day) -> completed bars from earlier trading days``. Bounded
+#: because a live universe rotates and a stale entry is only wasted memory.
+_PREVIOUS_SESSION_BARS_CACHE: dict[tuple[str, Any], tuple[Any, ...]] = {}
+_PREVIOUS_SESSION_BARS_CACHE_MAX = 256
+
+
+def _cached_previous_session_bars(
+    store: RealtimeMarketDataStore,
+    symbol: str,
+    decision_time: datetime,
+    current_day: Any,
+    zone: Any,
+) -> tuple[Any, ...] | None:
+    """Completed bars from trading days BEFORE ``current_day``.
+
+    Immutable for the whole trading day, so it is fetched once per
+    ``(symbol, current_day)``. Returns ``None`` only when the query itself failed,
+    which the caller treats as "context unavailable" and fails closed on; an empty
+    tuple means the query succeeded and there is genuinely no prior history.
+    """
+    key = (symbol, current_day)
+    cached = _PREVIOUS_SESSION_BARS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        raw = store.recent_minute_bars(
+            symbol,
+            decision_time - timedelta(days=14),
+            limit=1600,
+        )
+    except Exception:  # noqa: BLE001 - unavailable context must fail closed.
+        return None
+    previous = tuple(
+        bar
+        for bar in raw
+        if bar.minute_start + timedelta(minutes=1) <= decision_time
+        and bar.minute_start.astimezone(zone).date() < current_day
+    )
+    if len(_PREVIOUS_SESSION_BARS_CACHE) >= _PREVIOUS_SESSION_BARS_CACHE_MAX:
+        # Drop entries for earlier trading days first; they can never be read
+        # again. Only fall back to arbitrary eviction if today filled the cache.
+        for stale in [
+            existing
+            for existing in _PREVIOUS_SESSION_BARS_CACHE
+            if existing[1] != current_day
+        ] or list(_PREVIOUS_SESSION_BARS_CACHE)[:1]:
+            _PREVIOUS_SESSION_BARS_CACHE.pop(stale, None)
+    _PREVIOUS_SESSION_BARS_CACHE[key] = previous
+    return previous
+
+
 def _session_structure_diagnostics(
     store: RealtimeMarketDataStore,
     symbol: str,
@@ -924,19 +975,6 @@ def _session_structure_diagnostics(
     The session clock comes from ``session_structure.regular_session`` so a US
     symbol is anchored to 09:30 America/New_York rather than to 09:00 Asia/Seoul.
     """
-    try:
-        raw = store.recent_minute_bars(
-            symbol,
-            decision_time - timedelta(days=14),
-            limit=1600,
-        )
-    except Exception:  # noqa: BLE001 - unavailable context must fail closed.
-        return {}
-    bars = tuple(
-        bar
-        for bar in raw
-        if bar.minute_start + timedelta(minutes=1) <= decision_time
-    )
     session = session_structure.regular_session(symbol)
     zone = session.zone
     local_now = decision_time.astimezone(zone)
@@ -944,15 +982,41 @@ def _session_structure_diagnostics(
     # Returning yesterday's completed range would leak a stale gap thesis into
     # premarket trading because ``trading_day`` correctly points to the previous
     # completed session at that time.
+    #
+    # Checked BEFORE any query: this used to fetch fourteen days of minute bars
+    # first and only then discover it had nothing to say, so every pre-open and
+    # weekend cycle paid the full cost for an empty answer.
     if local_now.weekday() >= 5 or local_now.time() < session.open_time:
         return {}
     session_open = session.session_open(decision_time)
     current_day = session.trading_day(decision_time)
-    current_bars = tuple(
-        bar for bar in bars if bar.minute_start.astimezone(zone).date() == current_day
+    # Split in two, because the two halves have completely different lifetimes.
+    #
+    # The prior-day bars feed ``historical_volatility`` and ``previous_close``, and
+    # they cannot change until tomorrow -- yet this ran a 14-day / 1600-row query
+    # on EVERY feature-frame build, per symbol, per engine cycle. Measured
+    # 2026-08-21 at 50-95ms per call against an idle reader, and far worse under a
+    # growing WAL: it is the query the trading engine and the KIS websocket loop
+    # were both found parked in. Cached per trading day it runs once per symbol
+    # per day; only today's bars are re-read.
+    previous = _cached_previous_session_bars(
+        store, symbol, decision_time, current_day, zone
     )
-    previous = tuple(
-        bar for bar in bars if bar.minute_start.astimezone(zone).date() < current_day
+    if previous is None:
+        return {}
+    try:
+        current_raw = store.recent_minute_bars(
+            symbol,
+            session_open - timedelta(hours=1),
+            limit=1600,
+        )
+    except Exception:  # noqa: BLE001 - unavailable context must fail closed.
+        return {}
+    current_bars = tuple(
+        bar
+        for bar in current_raw
+        if bar.minute_start + timedelta(minutes=1) <= decision_time
+        and bar.minute_start.astimezone(zone).date() == current_day
     )
     previous_close = float(previous[-1].close) if previous else 0.0
     session_open_price = (

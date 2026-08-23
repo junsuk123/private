@@ -100,6 +100,27 @@ class BoundedMarketEventBus:
             self._consumed += 1
             return self._items.popleft()
 
+    async def wait_for_depth(self, timeout: float) -> bool:
+        """Sleep until an event is queued, or ``timeout`` elapses.
+
+        Exists so an idle consumer can WAIT instead of polling ``stats().depth``
+        in a ``sleep(0)`` loop. That loop shared its event loop with the KIS
+        websocket reader, and burned a full core spinning while the reader was
+        starved of it — the socket stayed ESTABLISHED, the kernel receive queue
+        grew past 3MB, and US market data stopped arriving with no error anywhere.
+
+        A missed ``notify`` cannot lose data: producers append before notifying
+        and the caller re-checks depth, so the worst case is one extra timeout.
+        """
+        async with self._condition:
+            if self._items:
+                return True
+            try:
+                await asyncio.wait_for(self._condition.wait(), timeout)
+            except (TimeoutError, asyncio.TimeoutError):
+                return False
+            return bool(self._items)
+
     def stats(self) -> EventBusStats:
         return EventBusStats(
             published=self._published,

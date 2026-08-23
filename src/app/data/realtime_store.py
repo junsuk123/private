@@ -685,6 +685,36 @@ class RealtimeMarketDataStore:
             ),
         )
 
+    def checkpoint_wal(self) -> int | None:
+        """Fully checkpoint and truncate the write-ahead log.
+
+        Returns the bytes reclaimed, or ``None`` when the WAL could not be reset
+        (a reader still holds an older snapshot). Never raises for that case: it
+        is a normal outcome and the caller retries later.
+
+        ``TRUNCATE`` is deliberate. ``wal_autocheckpoint`` copies frames back into
+        the database but cannot shrink the WAL file while any reader is attached,
+        and this store always has readers, so the file grew for a whole session
+        (~16MB/min, observed at 282MB) until every reader was searching a huge WAL
+        index and ``recent_minute_bars`` effectively hung.
+        """
+        wal_path = Path(f"{self.db_path}-wal")
+        try:
+            before = wal_path.stat().st_size
+        except OSError:
+            before = 0
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("pragma wal_checkpoint(truncate)")
+            except sqlite3.OperationalError:
+                # Busy: another connection holds the write lock right now.
+                return None
+        try:
+            after = wal_path.stat().st_size
+        except OSError:
+            after = 0
+        return max(0, before - after)
+
     def prune_operational_history(self, *, retention_hours: int | None = None) -> int:
         hours = (
             max(1, int(retention_hours))

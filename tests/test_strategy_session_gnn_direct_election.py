@@ -102,9 +102,18 @@ def _account():
 
 
 def _losing_store(tmp_path) -> StrategyPerformanceStore:
-    """History that makes the pessimistic bound refuse to trade."""
+    """History that makes the pessimistic bound refuse to trade.
+
+    Deliberately BELOW ``LongPromotionConfig.minimum_shadow_samples`` (20). Past
+    that count the store is allowed to speak about the arm, and a non-positive
+    conservative edge demotes it out of live authority entirely — at which point no
+    election posture can arm it and this test would be measuring the deployment
+    ladder instead of the posture. Under the count, the bandit still refuses on
+    pessimism while the arm keeps whatever the operator's flag grants it, which is
+    exactly the cold-arm case this posture exists to override.
+    """
     store = _store(tmp_path)
-    for index in range(25):
+    for index in range(15):
         store.record(
             strategy_id="intraday_momentum",
             symbol="005930",

@@ -8,10 +8,11 @@ the only component allowed to stop a running algorithm.
 Two violation tiers, deliberately separated:
 
 ``HARD``
-    The premise of trading at all is gone — stale data, an untradable session,
-    an unreadable broker, the daily loss budget breached, or the ontology
-    withdrawing the elected strategy. New entries stop AND the open position is
-    handed to the exit path immediately.
+    The premise of trading at all is gone — an unreadable broker or the daily
+    loss budget breached. New entries stop AND the open position is handed to
+    the exit path immediately. Stale data is HARD only before an order is
+    committed; once exposure exists, selling without a trustworthy quote can
+    manufacture a loss and is therefore entry-blocking only.
 
 ``SOFT``
     Conditions have deteriorated but the position is still governed by a valid
@@ -186,8 +187,15 @@ class StrategySupervisor:
             soft.append("SESSION_NOT_TRADABLE")
         elif age is not None and age > config.max_data_age_seconds:
             # Staleness only means something while the venue is actually
-            # trading; when it is closed, stale data is expected.
-            hard.append(f"DATA_STALE:{age:.1f}s>{config.max_data_age_seconds:.0f}s")
+            # trading; when it is closed, stale data is expected.  Once an
+            # entry is submitted or a position exists, a short feed gap must
+            # not create an opposite market order at an unverified price.  The
+            # strategy resumes target/stop management when fresh data returns.
+            reason = f"DATA_STALE:{age:.1f}s>{config.max_data_age_seconds:.0f}s"
+            if observation.position_open:
+                soft.append(reason)
+            else:
+                hard.append(reason)
         if observation.broker_healthy is False:
             hard.append("BROKER_UNHEALTHY")
 

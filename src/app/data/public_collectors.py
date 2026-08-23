@@ -92,7 +92,7 @@ class RssCollectionResult:
     raw_records: tuple[RawSourceRecord, ...]
 
 
-def extract_focus_sections(text: str) -> dict[str, Any]:
+def extract_focus_sections(text: str, preferred_title: str | None = None) -> dict[str, Any]:
     compact = " ".join(text.split())
     if not compact:
         return {
@@ -101,7 +101,16 @@ def extract_focus_sections(text: str) -> dict[str, Any]:
             "numeric_highlights": (),
         }
 
-    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", compact) if item.strip()]
+    # Government and regulator pages commonly prepend thousands of characters of
+    # navigation.  Their article heading appears again immediately before the
+    # actual body, so the last exact heading is a reliable, source-agnostic anchor.
+    title = " ".join(str(preferred_title or "").split())
+    if title:
+        positions = [match.start() for match in re.finditer(re.escape(title), compact, re.IGNORECASE)]
+        if positions:
+            compact = compact[positions[-1] :]
+    compact = compact[:5000]
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?。])\s+", compact) if item.strip()]
     headline = sentences[0] if sentences else compact[:160]
     summary = " ".join(sentences[:3]) if sentences else compact[:300]
     numeric = [sentence for sentence in sentences if re.search(r"\d|%|\$|USD|KRW|bps", sentence, re.IGNORECASE)]
@@ -140,6 +149,7 @@ class RssNewsCollector:
         max_llm_items: int | None = None,
         fetch_articles: bool = False,
         article_limit: int | None = None,
+        item_limit: int | None = None,
         event_type: EventType = EventType.NEWS,
     ) -> RssCollectionResult:
         response = self.client.get_text(feed_url)
@@ -147,9 +157,12 @@ class RssNewsCollector:
         events: list[ClassifiedEvent] = []
         raw_records: list[RawSourceRecord] = []
 
-        for index, item in enumerate(root.findall(".//item")):
-            title = _xml_text(item, "title")
-            description = _xml_text(item, "description")
+        items = root.findall(".//item")
+        if item_limit is not None:
+            items = items[: max(0, int(item_limit))]
+        for index, item in enumerate(items):
+            title = _plain_text(_xml_text(item, "title"))
+            description = _plain_text(_xml_text(item, "description"))
             link = _xml_text(item, "link") or response.url
             source = source_now("rss", link, f"rss:{_stable_id(link + title)}")
             body = description
@@ -158,7 +171,7 @@ class RssNewsCollector:
                 try:
                     article_record = HtmlResearchCollector(self.client).collect(link)
                     raw_records.append(article_record)
-                    sections = extract_focus_sections(article_record.payload)
+                    sections = extract_focus_sections(article_record.payload, preferred_title=title)
                     article_body = sections["summary"] or article_record.payload[:1200]
                     if sections["numeric_highlights"]:
                         article_body = f"{article_body} {' '.join(sections['numeric_highlights'])}".strip()
@@ -173,7 +186,7 @@ class RssNewsCollector:
                     source=source,
                     event_type=event_type,
                     known_tickers=known_tickers,
-                    event_date=_parse_rss_date(_xml_text(item, "pubDate")),
+                    event_date=_parse_rss_date(_rss_date_text(item)),
                     llm_classifier=llm_classifier if max_llm_items is None or index < max_llm_items else None,
                 )
             )
@@ -554,6 +567,26 @@ def _xml_text(item: ET.Element, tag: str) -> str:
     return (node.text or "").strip() if node is not None else ""
 
 
+def _rss_date_text(item: ET.Element) -> str:
+    value = _xml_text(item, "pubDate")
+    if value:
+        return value
+    for node in item:
+        if str(node.tag).split("}")[-1].lower() in {"date", "published", "updated"}:
+            text = (node.text or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _plain_text(value: str) -> str:
+    if "<" not in value and "&" not in value:
+        return " ".join(value.split())
+    parser = TextExtractor()
+    parser.feed(value)
+    return " ".join(parser.text().split())
+
+
 def _parse_rss_date(value: str) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
@@ -562,7 +595,11 @@ def _parse_rss_date(value: str) -> datetime:
 
         return parsedate_to_datetime(value)
     except (TypeError, ValueError):
-        return datetime.now(timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return datetime.now(timezone.utc)
 
 
 def _parse_yyyymmdd(value: str) -> datetime:

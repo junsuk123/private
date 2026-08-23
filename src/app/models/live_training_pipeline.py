@@ -113,26 +113,12 @@ def _measured_round_trip_cost_bps(market: str) -> float | None:
 
     Returns ``None`` when the tape has too few resolved round trips to speak.
     """
-    path = Path("data/store/directional-shadow.sqlite3")
-    if not path.exists():
-        return None
-    try:
-        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)) as conn:
-            values = [
-                float(row[0])
-                for row in conn.execute(
-                    "select trading_cost_bps from shadow_outcomes "
-                    "where market = ? and trading_cost_bps is not null "
-                    "order by trading_cost_bps",
-                    (str(market or "").strip().upper(),),
-                )
-                if row[0] is not None
-            ]
-    except Exception:  # noqa: BLE001 - labelling must not fail on a tape read.
-        return None
-    if len(values) < 30:
-        return None
-    return values[min(len(values) - 1, int(len(values) * _LABEL_COST_PERCENTILE))]
+    # One authority, shared with the trigger floor and the session election. This
+    # used to be a private copy of the same query, which is how the three layers
+    # drifted apart in the first place.
+    from app.cost.round_trip import measured_round_trip_bps
+
+    return measured_round_trip_bps(market)
 
 
 @lru_cache(maxsize=8)

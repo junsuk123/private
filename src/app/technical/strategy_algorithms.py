@@ -376,45 +376,30 @@ _round_trip_cache: dict[tuple[str, str], float] = {}
 
 
 def round_trip_cost_bps(symbol: str) -> float | None:
-    """Round-trip cost in bps for this symbol's market, or None if unresolvable.
+    """All-in round-trip cost in bps for this symbol, or None if unresolvable.
 
-    Cached per market: the fee policy is a config read, and this runs inside the
-    per-tick entry path of every algorithm.
+    Delegates to :mod:`app.cost.round_trip`, which is the single authority the
+    trigger floor, the session election and the training labels all read. Reading
+    the fee policy directly here is what held a KRX trigger to 33.8bps while the
+    labels scored the same setup against the 51.9bps the tape actually charged, so
+    the algorithm fired on 40bps edges that were labelled -- and executed -- as
+    losses.
     """
-    global _cost_engine
-    venue, instrument_type = _resolve_market(symbol)
-    cached = _round_trip_cache.get((venue, instrument_type))
-    if cached is not None:
-        return cached
-    try:
-        if _cost_engine is None:
-            from app.cost.trading_cost_engine import TradingCostEngine
+    from app.cost.round_trip import all_in_round_trip_bps, policy_round_trip_bps
 
-            _cost_engine = TradingCostEngine()
-        policy = _cost_engine.policy_for(venue=venue, instrument_type=instrument_type)
-    except Exception:  # noqa: BLE001 - an unreadable cost config must not crash entry.
+    if policy_round_trip_bps(symbol) is None:
         return None
-    total_rate = (
-        policy.buy_fee_rate
-        + policy.sell_fee_rate
-        + policy.sell_tax_rate
-        # Slippage is paid on both legs; spread and impact are charged once each
-        # by the gate, so the floor charges them the same way.
-        + 2.0 * policy.slippage_rate
-        + policy.spread_rate
-        + policy.market_impact_rate
-        + policy.safety_margin_rate
-    )
-    cost_bps = max(0.0, total_rate * 10_000.0)
-    _round_trip_cache[(venue, instrument_type)] = cost_bps
-    return cost_bps
+    return all_in_round_trip_bps(symbol)
 
 
 def reset_cost_floor_cache() -> None:
     """Drop the cached fee policies (tests, and config edits without a restart)."""
     global _cost_engine
+    from app.cost.round_trip import reset_caches
+
     _cost_engine = None
     _round_trip_cache.clear()
+    reset_caches()
 
 
 # --------------------------------------------------------------------------- #

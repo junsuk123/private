@@ -1,20 +1,20 @@
 {
   "consecutive_negative_challengers": 0,
-  "last_challenger_artifact_id": "live_short_horizon.20260820T142542753234Z",
-  "last_challenger_at": "2026-08-20T14:25:42.754240+00:00",
+  "last_challenger_artifact_id": "live_short_horizon.20260823T234320873188Z",
+  "last_challenger_at": "2026-08-23T23:43:20.882072+00:00",
   "last_challenger_live_eligible": true,
   "last_challenger_promoted": false,
-  "last_challenger_top_k_net_bps": 35.2010168175778,
+  "last_challenger_top_k_net_bps": 33.08747637498565,
   "recent_challenger_top_k_net_bps": [
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778,
-    35.2010168175778
+    33.08747637498565,
+    32.53198573219251,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157,
+    32.84454498112157
   ]
 }

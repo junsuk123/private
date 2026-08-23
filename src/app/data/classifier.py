@@ -121,7 +121,12 @@ def classify_text_event(
             sentiment = llm.sentiment
             summary = llm.summary or summary
             key_facts = llm.key_facts
-            event_labels = _merge_strings(event_labels, llm.event_labels)
+            # A successful semantic classification is authoritative for labels.
+            # Keep deterministic labels only when the model deliberately returns
+            # none; merging both made a single keyword false-positive survive an
+            # otherwise correct LLM verdict and contaminate the ontology.
+            if llm.event_labels:
+                event_labels = llm.event_labels
             tickers = _merge_strings(
                 tickers,
                 _filter_known_tickers(llm.tickers, known_tickers, text=text),

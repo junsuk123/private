@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -113,6 +114,23 @@ class ResearchAndReasoningTest(unittest.TestCase):
         )
 
         self.assertEqual(result.events[0].event_type, EventType.MACRO)
+
+    def test_rss_collector_limits_items_and_reads_namespaced_iso_date(self) -> None:
+        rss = """<?xml version="1.0"?>
+        <rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel>
+          <item><title>First</title><description>One</description>
+            <link>https://example.test/1</link><dc:date>2026-08-20T03:04:05Z</dc:date></item>
+          <item><title>Second</title><description>Two</description>
+            <link>https://example.test/2</link></item>
+        </channel></rss>"""
+
+        result = RssNewsCollector(FakeClient(rss)).collect_with_articles(
+            "https://example.test/rss", {}, item_limit=1
+        )
+
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.events[0].title, "First")
+        self.assertEqual(result.events[0].event_date, datetime(2026, 8, 20, 3, 4, 5, tzinfo=timezone.utc))
 
     def test_tickerless_macro_event_gets_global_market_lineage(self) -> None:
         event = classify_text_event(

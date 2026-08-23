@@ -34,6 +34,7 @@
     ['ins', '.instrument-hero', '종목·알고리즘'],
     ['sec', '.second-analysis-panel', '1초 체결·호가'],
     ['wrk', '.workspace-grid', '가격 차트·결정 근거'],
+    ['trd', '.trade-layers', '전략별 거래 레이어'],
     ['exe', '.execution-panel', '주문·체결 과정'],
     ['gnn', '.gnn-model-panel', '학습·추론 GNN'],
     ['don', '.decision-ontology-panel', '결정 온톨로지'],
@@ -43,6 +44,7 @@
     { height: 1.1, columns: [col(6, 'ops'), col(3, 'own'), col(3, 'ast')] },
     { height: 0.8, columns: [col(3, 'sel'), col(4, 'ins'), col(5, 'sec')] },
     { height: 1.25, columns: [col(7, 'wrk'), col(5, 'exe')] },
+    { height: 1.0, columns: [col(12, 'trd')] },
     { height: 1.15, columns: [col(5, 'gnn'), col(7, 'don')] },
     { height: 1.35, columns: [col(12, 'dia')] },
   ];

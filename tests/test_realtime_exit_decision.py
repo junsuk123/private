@@ -1005,6 +1005,35 @@ class RealtimeSellAmendTest(unittest.TestCase):
         self.assertEqual(decision_engine.calls, 1)
         self.assertEqual(coordinator.submitted[0].ticker, "000660")
 
+    def test_learning_mode_authority_blocks_buys_before_evaluation(self) -> None:
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 1_000_000.0},
+        )
+        decision_engine = _FixedBuyDecisionEngine()
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=decision_engine,
+            coordinator=coordinator,
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660",),
+            session_open_provider=lambda: True,
+            new_entries_authorized_provider=lambda: False,
+            market_open_provider=lambda ticker, market: True,
+        )
+
+        summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertFalse(summary["operation_mode_allows_entries"])
+        self.assertTrue(summary["buy_disabled"])
+        self.assertEqual(
+            summary["buy_disabled_reason"], "OPERATION_MODE_BLOCKS_NEW_ENTRIES"
+        )
+        self.assertEqual(summary["buy_evaluated"], 0)
+        self.assertEqual(decision_engine.calls, 0)
+        self.assertEqual(coordinator.submitted, [])
+
     def test_domestic_buy_is_skipped_outside_core_session(self) -> None:
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
         coordinator = _AmendAwareCoordinator()

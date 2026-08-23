@@ -235,6 +235,7 @@ def test_reliability_step_promotes_only_after_sustained_passes() -> None:
     with web_module._live_lock:
         web_module._auto_reliability_state["ready_streak"] = 0
         web_module._auto_reliability_state["unready_streak"] = 0
+        web_module._auto_reliability_state["manual_hold"] = False
     with (
         patch.dict(
             "os.environ",
@@ -259,6 +260,46 @@ def test_reliability_step_promotes_only_after_sustained_passes() -> None:
     assert first["mode"] == "learning"
     assert second["mode"] == "live_trading"
     promote.assert_called_once()
+
+
+def test_manual_learning_hold_is_never_auto_promoted() -> None:
+    now = datetime.now(timezone.utc)
+    with web_module._live_lock:
+        previous_hold = web_module._auto_reliability_state.get("manual_hold", False)
+        web_module._auto_reliability_state["ready_streak"] = 20
+        web_module._auto_reliability_state["unready_streak"] = 0
+        web_module._auto_reliability_state["manual_hold"] = True
+    try:
+        with (
+            patch.object(web_module, "_evaluate_auto_reliability", return_value=_ready_snapshot()),
+            patch.object(web_module, "_active_operation_mode", return_value="learning"),
+            patch.object(web_module, "_auto_reliability_learning_maintenance"),
+            patch.object(web_module, "_auto_reliability_transition_to_live") as promote,
+        ):
+            result = web_module._auto_reliability_step(now)
+    finally:
+        with web_module._live_lock:
+            web_module._auto_reliability_state["manual_hold"] = previous_hold
+
+    assert result["mode"] == "learning"
+    assert result["promotion_suppressed_reason"] == "MANUAL_LEARNING_HOLD"
+    promote.assert_not_called()
+
+
+def test_failed_auto_promotion_rolls_back_to_learning() -> None:
+    blocked = {
+        "ok": True,
+        "status": "started",
+        "live_trading_status": "blocked",
+    }
+    with (
+        patch.object(web_module, "_operation_mode_start_response", return_value=blocked),
+        patch.object(web_module, "_auto_reliability_enter_learning") as rollback,
+    ):
+        result = web_module._auto_reliability_transition_to_live()
+
+    assert result == blocked
+    rollback.assert_called_once_with()
 
 
 def test_live_mode_is_demoted_immediately_on_broker_failure() -> None:

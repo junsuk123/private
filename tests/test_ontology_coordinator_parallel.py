@@ -111,7 +111,6 @@ class TestDispatch:
         bundle = coord.run(MacroReasoningInput(timestamp=_now()), micro_input_builder=_builder, held_symbols=("HELD",))
         assert {"A", "HELD"} <= {r.symbol for r in bundle.micro_results}
 
-
 class TestFailureIsolation:
     def test_worker_exception_does_not_crash_loop(self):
         micro = _FakeMicro(raise_for=("BAD",))

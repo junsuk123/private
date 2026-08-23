@@ -103,6 +103,7 @@ const SHORT_REASON_LABELS = {
   SHORT_LOSS_STREAK_EXCEEDED: '연속 손실 초과',
   SHORT_DEPLOYMENT_SUSPENDED: '중단됨',
   SHORT_STRATEGY_SHADOW_ONLY: '섀도우 전용',
+  STRATEGY_DEPLOYMENT_SHADOW_ONLY: '실적 미달 · 섀도우 강등',
 };
 
 function shortReasonLabel(code) {

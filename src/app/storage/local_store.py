@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import sqlite3
 import time
 from contextlib import closing
@@ -551,8 +552,9 @@ class LocalResearchStore:
         }
 
     def prune_stale(self) -> int:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
-        macro_cutoff = datetime.now(timezone.utc) - timedelta(days=_macro_retention_days())
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=self.retention_days)
+        macro_cutoff = now - timedelta(days=_macro_retention_days())
         cutoff_text = cutoff.isoformat()
         macro_cutoff_text = macro_cutoff.isoformat()
         try:
@@ -579,6 +581,16 @@ class LocalResearchStore:
                 days=_retention_days("RESEARCH_TYPED_SCORE_RETENTION_DAYS", 30)
             ),
         }
+        kind_cutoffs = {
+            "raw_records": now - timedelta(days=_retention_days("RESEARCH_RAW_RETENTION_DAYS", 7)),
+            "graph_triples": now - timedelta(days=_retention_days("RESEARCH_GRAPH_RETENTION_DAYS", 3)),
+            "reasoning_paths": now - timedelta(days=_retention_days("RESEARCH_REASONING_RETENTION_DAYS", 7)),
+        }
+        kind_caps = {
+            "raw_records": _retention_days("RESEARCH_RAW_MAX_ROWS", 50_000),
+            "graph_triples": _retention_days("RESEARCH_GRAPH_MAX_ROWS", 250_000),
+            "reasoning_paths": _retention_days("RESEARCH_REASONING_MAX_ROWS", 100_000),
+        }
 
         def write(conn: sqlite3.Connection) -> int:
             before = conn.total_changes
@@ -587,12 +599,26 @@ class LocalResearchStore:
                 delete from records where rowid in (
                     select rowid from records
                     where (kind = 'macro_metrics' and observed_at < ?)
-                       or (kind <> 'macro_metrics' and observed_at < ?)
+                       or (kind not in ('macro_metrics', 'raw_records', 'graph_triples', 'reasoning_paths')
+                           and observed_at < ?)
                     limit ?
                 )
                 """,
                 (macro_cutoff_text, cutoff_text, batch_size),
             )
+            for kind, kind_cutoff in kind_cutoffs.items():
+                conn.execute(
+                    "delete from records where rowid in ("
+                    "select rowid from records where kind = ? and observed_at < ? limit ?)",
+                    (kind, kind_cutoff.isoformat(), batch_size),
+                )
+            for kind, max_rows in kind_caps.items():
+                conn.execute(
+                    "delete from records where rowid in ("
+                    "select rowid from records where kind = ? "
+                    "order by observed_at desc limit ? offset ?)",
+                    (kind, batch_size, max_rows),
+                )
             for table, typed_cutoff in typed_cutoffs.items():
                 conn.execute(
                     f"delete from {table} where rowid in ("
@@ -967,7 +993,8 @@ def _event_key(row: dict[str, Any]) -> str:
 def _raw_key(row: dict[str, Any]) -> str:
     source = row["source"]
     source_id = source.get("source_id") or source.get("raw_url") or row["payload"][:80]
-    return f"{source_id}:{source.get('retrieved_at')}"
+    content_hash = hashlib.sha256(str(row["payload"]).encode("utf-8")).hexdigest()[:20]
+    return f"{source_id}:{content_hash}"
 
 
 def _market_key(row: dict[str, Any]) -> str:

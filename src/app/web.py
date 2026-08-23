@@ -275,7 +275,7 @@ _auto_live_readiness_started = False
 # kiosk shows the trade display, not /account). Read-only w.r.t. trading.
 AUTO_START_ASSET_HISTORY_SAMPLER = os.getenv("AUTO_START_ASSET_HISTORY_SAMPLER", "true").lower() not in {"0", "false", "no", "off"}
 ASSET_HISTORY_SAMPLE_SECONDS = max(15, int(os.getenv("ASSET_HISTORY_SAMPLE_SECONDS", "60")))
-AUTO_RELIABILITY_MODE_ENABLED = live_env_bool("AUTO_RELIABILITY_MODE_ENABLED", False)
+AUTO_RELIABILITY_MODE_ENABLED = live_env_bool("AUTO_RELIABILITY_MODE_ENABLED", True)
 
 
 def _account_dashboard_status_provider() -> dict[str, Any]:
@@ -556,6 +556,11 @@ def _strategy_market_view_with_live_session(
         )
     )
     view["live_shadow"] = live_shadow
+    view["trading_layers"] = _live_trading_visualization_layers(
+        engine_status,
+        session=session,
+        journal=journal,
+    )
     if engine_running:
         view["mode"] = "live_trading"
     # The refactor dashboard's promotion flags describe shadow-model promotion,
@@ -563,6 +568,170 @@ def _strategy_market_view_with_live_session(
     # The terminal must represent the latter.
     view["live_order_capable"] = bool(engine_running and buy_enabled and live_armed)
     return view
+
+
+def _live_trading_visualization_layers(
+    engine_status: dict[str, Any],
+    *,
+    session: dict[str, Any],
+    journal: dict[str, Any],
+    market_limit: int = 90,
+) -> list[dict[str, Any]]:
+    """Project every broker position into an independent live chart layer.
+
+    StrategySessionManager intentionally owns one new-risk session, but a broker
+    account may contain several positions. The terminal therefore cannot use the
+    one session snapshot as the list of trades. Broker positions are the strict
+    membership authority: quantity > 0 creates a layer, absence removes it. The
+    session and durable order journal only enrich current members.
+    """
+    basis = _last_live_account_basis() or {}
+    positions = [
+        dict(item)
+        for item in tuple(basis.get("positions") or ())
+        if isinstance(item, dict)
+        and str(item.get("ticker") or "").strip()
+        and int(_number_or_zero(item.get("quantity"))) > 0
+    ]
+    records = [
+        dict(item)
+        for item in (
+            *tuple(journal.get("submitted_orders") or ()),
+            *tuple(journal.get("recent_orders") or ()),
+        )
+        if isinstance(item, dict) and str(item.get("ticker") or "").strip()
+    ]
+    recent_engine_events = [
+        dict(item)
+        for item in tuple(engine_status.get("recent_events") or ())
+        if isinstance(item, dict)
+    ]
+    selected_symbol = str(session.get("selected_symbol") or "").upper()
+    engine_config = dict(engine_status.get("config") or {})
+    default_target_rate = max(0.0, _number_or_zero(engine_config.get("take_profit")))
+    default_stop_rate = max(0.0, _number_or_zero(engine_config.get("stop_loss")))
+    layers: list[dict[str, Any]] = []
+    for position in positions:
+      symbol = str(position.get("ticker") or "").upper()
+      matching_session = symbol == selected_symbol
+      symbol_records = [
+          item for item in records if str(item.get("ticker") or "").upper() == symbol
+      ][-24:]
+      strategy_id = (
+          str(session.get("selected_strategy") or "")
+          if matching_session
+          else _strategy_id_from_live_events(symbol, recent_engine_events, symbol_records)
+      )
+      entry_price = _number_or_zero(position.get("average_price"))
+      current_price = _number_or_zero(position.get("last_price"))
+      target_price = (
+          _number_or_zero(session.get("target_price"))
+          if matching_session
+          else entry_price * (1.0 + default_target_rate)
+      )
+      stop_price = _number_or_zero(session.get("stop_price")) if matching_session else 0.0
+      if stop_price <= 0 and entry_price > 0 and default_stop_rate > 0:
+        stop_price = entry_price * (1.0 - default_stop_rate)
+      try:
+        market = build_strategy_market_stream(symbol, limit=market_limit).get("market") or {}
+      except Exception:  # noqa: BLE001 - one chart layer must not hide the others.
+        market = {}
+      current_price = _number_or_zero(market.get("last_price")) or current_price
+      quantity = int(_number_or_zero(position.get("quantity")))
+      currency = str(position.get("currency") or ("KRW" if symbol.isdigit() else "USD"))
+      unrealized = _number_or_zero(position.get("unrealized_pnl"))
+      if unrealized == 0 and entry_price > 0 and current_price > 0:
+        unrealized = (current_price - entry_price) * quantity
+      return_rate = (
+          current_price / entry_price - 1.0
+          if entry_price > 0 and current_price > 0
+          else _number_or_zero(position.get("return_rate"))
+      )
+      layers.append(
+          {
+              "layer_id": str(session.get("session_id") or f"position-{symbol}") if matching_session else f"position-{symbol}",
+              "symbol": symbol,
+              "market": position.get("market"),
+              "currency": currency,
+              "strategy_id": strategy_id or "position_recovery",
+              "strategy_label_source": "live_session" if matching_session else "order_journal",
+              "phase": str(session.get("phase") or "OWNED") if matching_session else "OWNED",
+              "quantity": quantity,
+              "entry_price": entry_price,
+              "current_price": current_price,
+              "target_price": target_price or None,
+              "stop_price": stop_price or None,
+              "high_watermark_price": (
+                  _number_or_zero(session.get("high_watermark_price")) or None
+                  if matching_session
+                  else None
+              ),
+              "unrealized_pnl": unrealized,
+              "return_rate": return_rate,
+              "opened_at": session.get("position_opened_at") if matching_session else _first_filled_at(symbol_records, "BUY"),
+              "max_holding_seconds": session.get("max_holding_seconds") if matching_session else None,
+              "exit_reason": session.get("exit_reason") if matching_session else None,
+              "market_data": {
+                  "stale": market.get("stale"),
+                  "last_event_at": market.get("last_event_at"),
+                  "feed_state": market.get("feed_state"),
+                  "bars": list(market.get("bars") or ())[-90:],
+                  "second_bars": list(market.get("second_bars") or ())[-90:],
+              },
+              "timeline": _trading_layer_timeline(symbol_records, matching_session, session),
+          }
+      )
+    return layers
+
+
+def _strategy_id_from_live_events(
+    symbol: str,
+    engine_events: list[dict[str, Any]],
+    journal_records: list[dict[str, Any]],
+) -> str:
+    for item in (*engine_events, *reversed(journal_records)):
+      if str(item.get("symbol") or item.get("ticker") or "").upper() != symbol:
+        continue
+      explicit = str(item.get("strategy_id") or "").strip()
+      if explicit:
+        return explicit
+      reason = str(item.get("reason") or item.get("error") or "")
+      marker = "STRATEGY_OWNED:"
+      if marker in reason:
+        return reason.split(marker, 1)[1].split(";", 1)[0].strip()
+    return ""
+
+
+def _first_filled_at(records: list[dict[str, Any]], side: str) -> str | None:
+    for item in records:
+      if str(item.get("side") or "").upper() != side:
+        continue
+      if str(item.get("status") or "").upper() in {"FILLED", "PARTIALLY_FILLED"}:
+        return str(item.get("recorded_at") or "") or None
+    return None
+
+
+def _trading_layer_timeline(
+    records: list[dict[str, Any]],
+    matching_session: bool,
+    session: dict[str, Any],
+) -> list[dict[str, Any]]:
+    timeline: list[dict[str, Any]] = []
+    if matching_session and session.get("selected_at"):
+      timeline.append({"kind": "SELECTED", "at": session.get("selected_at"), "detail": session.get("selected_strategy")})
+    for item in records[-12:]:
+      event_type = str(item.get("event_type") or "")
+      status = str(item.get("status") or "").upper()
+      if event_type not in {"live_strategy_order_link", "live_order_submitted", "live_order_status", "live_order_canceled"}:
+        continue
+      timeline.append(
+          {
+              "kind": status or event_type.removeprefix("live_order_").upper(),
+              "at": item.get("recorded_at"),
+              "detail": f"{item.get('side') or '-'} {item.get('quantity') or item.get('filled_quantity') or '-'}주 @ {item.get('average_fill_price') or item.get('limit_price') or '-'}",
+          }
+      )
+    return timeline[-8:]
 
 
 def _live_session_selection_override(
@@ -905,6 +1074,10 @@ _streaming_demo_step_locks: dict[str, threading.Lock] = {}
 _operation_mode_lock = threading.Lock()
 _operation_mode_state: dict[str, Any] = {
     "active": None,
+    # A live-trading request is not entry authority until every broker/config/
+    # runtime preflight has completed. This closes the old several-second window
+    # where the mode was already live while readiness was still being checked.
+    "live_preflight_pending": False,
     "last_kis_connection": None,
     "last_kis_connection_checked_at": None,
     "request": {
@@ -922,6 +1095,7 @@ _auto_reliability_stop = threading.Event()
 _auto_reliability_state: dict[str, Any] = {
     "enabled": AUTO_RELIABILITY_MODE_ENABLED,
     "mode": "learning",
+    "manual_hold": False,
     "score": 0.0,
     "ready": False,
     "ready_streak": 0,
@@ -1460,6 +1634,13 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
         for item in tuple(stable.get("positions") or ())
         if isinstance(item, dict) and str(item.get("position_state") or "").lower() != "pending_balance"
     }
+    stable_values_krw = {
+        str(item.get("ticker") or "").upper(): _number_or_zero(
+            item.get("market_value_krw") or item.get("market_value")
+        )
+        for item in tuple(stable.get("positions") or ())
+        if isinstance(item, dict) and str(item.get("position_state") or "").lower() != "pending_balance"
+    }
     stable_has_pending_positions = any(
         isinstance(item, dict)
         and str(item.get("position_state") or "").lower() == "pending_balance"
@@ -1474,6 +1655,11 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
         quantity > new_quantities.get(symbol, 0.0)
         for symbol, quantity in stable_quantities.items()
     )
+    vanished_value_krw = sum(
+        max(0.0, stable_values_krw.get(symbol, 0.0))
+        for symbol, quantity in stable_quantities.items()
+        if quantity > new_quantities.get(symbol, 0.0)
+    )
     cash_increase = new_cash_equiv - stable_cash_equiv
     if not stable_has_pending_positions and stable_equity > 0 and new_equity < stable_equity * drop_ratio and (
         new_positions < stable_positions or new_cash_equiv + 1.0 < new_components
@@ -1482,7 +1668,16 @@ def _stabilize_account_basis(basis: dict[str, Any] | None) -> dict[str, Any] | N
     # KIS can retain the total-equity summary while intermittently omitting an
     # overseas position or one cash component. A real sale increases cash; a
     # disappearing position with flat/falling cash is a partial response.
-    if position_disappeared and cash_increase < 1_000.0:
+    #
+    # The bar is the VANISHED LOT'S OWN VALUE, not a flat 1,000 KRW. A single-share
+    # position is a fraction of a percent of equity, so the ratio test above cannot
+    # see it disappear, and 1,000 KRW of ordinary cash-component wobble was enough to
+    # wave the partial response through — which is how a held lot became invisible to
+    # the trading engine for tens of seconds at a time. Half the lot's value leaves
+    # room for fees, tax and FX rounding while still requiring the proceeds of a real
+    # sale to be present.
+    proceeds_floor = max(1_000.0, 0.5 * vanished_value_krw)
+    if position_disappeared and cash_increase < proceeds_floor:
       degraded = True
     # A cash-equivalent component may legitimately fall while the broker's
     # authoritative total equity and position set remain unchanged (settlement,
@@ -1757,6 +1952,14 @@ def _active_operation_mode() -> str:
     return "learning"
   mode_value = getattr(mode, "mode", mode)
   return str(getattr(mode_value, "value", mode_value))
+
+
+def _live_entries_authorized() -> bool:
+  with _live_lock:
+    return bool(
+        _active_operation_mode() == "live_trading"
+        and not _operation_mode_state.get("live_preflight_pending", False)
+    )
 
 
 def _auto_reliability_int(name: str, default: int, minimum: int = 1) -> int:
@@ -2228,6 +2431,8 @@ def _auto_reliability_transition_to_learning(
   state = OperationModeManager().start("learning")
   with _live_lock:
     _operation_mode_state["active"] = state
+    _operation_mode_state["live_preflight_pending"] = False
+    _auto_reliability_state["manual_hold"] = False
   _start_live_worker("learning")
   audit.record("auto_reliability_demoted_to_learning", {"reason": reason})
 
@@ -2254,12 +2459,18 @@ def _auto_reliability_enforce_sell_only(reason: str) -> None:
 
 
 def _auto_reliability_transition_to_live() -> dict[str, Any]:
-  result = _operation_mode_start_response({"mode": "live_trading"})
+  result = _operation_mode_start_response(
+      {"mode": "live_trading", "transition_source": "auto_reliability"}
+  )
   if result.get("ok") and result.get("live_trading_status") == "armed":
     with _realtime_trading_lock:
       engine = _realtime_trading_engine
     if engine is not None and hasattr(engine, "enable_buys"):
       engine.enable_buys("AUTO_RELIABILITY_PROMOTION")
+  else:
+    # A failed automatic preflight must return to a real learning state instead
+    # of leaving the public mode live with a permanently-held entry latch.
+    _auto_reliability_enter_learning()
   audit.record(
       "auto_reliability_live_transition",
       {"ok": result.get("ok"), "status": result.get("status"), "live_status": result.get("live_trading_status")},
@@ -2271,6 +2482,8 @@ def _auto_reliability_enter_learning() -> None:
   state = OperationModeManager().start("learning")
   with _live_lock:
     _operation_mode_state["active"] = state
+    _operation_mode_state["live_preflight_pending"] = False
+    _auto_reliability_state["manual_hold"] = False
   _start_live_worker("learning")
 
 
@@ -2293,6 +2506,7 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
   current_mode = _active_operation_mode()
   with _live_lock:
     active_state = _operation_mode_state.get("active")
+    manual_hold = bool(_auto_reliability_state.get("manual_hold", False))
     ready_streak = int(_auto_reliability_state.get("ready_streak") or 0)
     unready_streak = int(_auto_reliability_state.get("unready_streak") or 0)
   if snapshot["ready"]:
@@ -2307,7 +2521,12 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
       "AUTO_RELIABILITY_MARKET_DATA_DEMOTE_CONSECUTIVE", 8, 2
   )
   transition_reason = None
-  if snapshot["ready"] and ready_streak >= promote_after and current_mode != "live_trading":
+  if (
+      snapshot["ready"]
+      and ready_streak >= promote_after
+      and current_mode != "live_trading"
+      and not manual_hold
+  ):
     result = _auto_reliability_transition_to_live()
     if result.get("ok") and result.get("live_trading_status") == "armed":
       current_mode = "live_trading"
@@ -2377,6 +2596,12 @@ def _auto_reliability_step(now: datetime | None = None) -> dict[str, Any]:
             "ready_streak": ready_streak,
             "unready_streak": unready_streak,
             "last_error": None,
+            "manual_hold": manual_hold,
+            "promotion_suppressed_reason": (
+                "MANUAL_LEARNING_HOLD"
+                if manual_hold and current_mode != "live_trading"
+                else None
+            ),
         }
     )
     if transition_reason:
@@ -2878,7 +3103,64 @@ def _context_refresh_loop() -> None:
             except Exception:  # noqa: BLE001 - recorded inside refresh(); never fatal.
                 pass
         _maintain_trading_state_storage()
+        _checkpoint_realtime_store_wal()
         _context_refresh_stop.wait(CONTEXT_REFRESH_INTERVAL_SECONDS)
+
+
+_realtime_wal_checkpoint_at = 0.0
+_realtime_wal_checkpoint_lock = threading.Lock()
+
+
+def _checkpoint_realtime_store_wal() -> None:
+    """Truncate the realtime store's write-ahead log on a schedule.
+
+    Nothing was doing this. ``wal_autocheckpoint`` only checkpoints on a writer's
+    commit and can never RESET the file while any reader holds an older snapshot,
+    and this store always has readers (the trading engine, feature frames, the
+    dashboards). So the WAL grew for the whole session -- measured 2026-08-21 at
+    ~16MB/min, reaching 282MB -- and every reader then had to search an
+    ever-larger WAL index. ``recent_minute_bars``, which costs ~95ms against a
+    small WAL, degraded until it effectively hung: the KIS websocket loop stopped
+    draining its socket and the trading engine completed ONE cycle in thirteen
+    minutes. Truncating by hand took 2.6s and reclaimed all 282MB, after which the
+    engine advanced immediately -- nothing was permanently pinning it, the
+    checkpoint simply never ran.
+
+    ``TRUNCATE`` rather than ``PASSIVE``: passive checkpointed 67,994 of 68,449
+    frames and still left the 282MB file in place, which is the part that hurts.
+    Best-effort by design -- a checkpoint that cannot get the lock right now is
+    retried on the next pass.
+    """
+    global _realtime_wal_checkpoint_at
+    # 60s, not the more relaxed interval it started at. Measured write pressure on
+    # this store is ~37MB of WAL per minute -- small rows, but each commit dirties
+    # several 4KB index pages -- so a two-minute cadence still let the file reach
+    # 278MB between successful truncations, and a busy truncate is skipped and
+    # retried, which stretches the real gap further. At this cadence the WAL stays
+    # in the range where ``recent_minute_bars`` measures ~95ms instead of hanging.
+    interval = max(
+        15.0,
+        _env_float_web("REALTIME_STORE_WAL_CHECKPOINT_SEC", 60.0),
+    )
+    now_monotonic = time.monotonic()
+    with _realtime_wal_checkpoint_lock:
+        if now_monotonic - _realtime_wal_checkpoint_at < interval:
+            return
+        _realtime_wal_checkpoint_at = now_monotonic
+    try:
+        reclaimed = RealtimeMarketDataStore().checkpoint_wal()
+    except Exception as exc:  # noqa: BLE001 - maintenance must never affect trading.
+        audit.record(
+            "realtime_store_wal_checkpoint_error",
+            {"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return
+    if reclaimed is not None and reclaimed >= 64 * 1024 * 1024:
+        # Only worth an audit row when it actually reclaimed something large;
+        # a routine few-MB checkpoint every two minutes is noise.
+        audit.record(
+            "realtime_store_wal_truncated", {"reclaimed_bytes": int(reclaimed)}
+        )
 
 
 def _maintain_trading_state_storage() -> None:
@@ -4483,6 +4765,7 @@ async def operation_mode_start(request: Request) -> JSONResponse:
 
 def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
     requested_mode = str(payload.get("mode", "live_trading"))
+    transition_source = str(payload.get("transition_source") or "manual")
     deprecated_paper_modes = {"testing", "paper", "paper_trading", "paper_trading_test"}
     mode = "live_trading" if requested_mode in deprecated_paper_modes else requested_mode
     if not _operation_mode_lock.acquire(blocking=False):
@@ -4498,7 +4781,10 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       _set_operation_request(True, "starting", f"Starting {mode}", None)
       state = OperationModeManager().start(mode)
       with _live_lock:
+        _operation_mode_state["live_preflight_pending"] = mode == "live_trading"
         _operation_mode_state["active"] = state
+        if transition_source != "auto_reliability":
+          _auto_reliability_state["manual_hold"] = mode == "learning"
         if mode != "live_trading":
           _clear_live_analysis_cache_unlocked()
       audit.record("operation_mode_started", {"mode_state": state})
@@ -4551,10 +4837,6 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         # (주문의 실제 전송은 LiveExecutionCoordinator의 안전 게이트가 최종 결정한다.)
         _start_kis_realtime_collector()
         _start_realtime_trading_engine()
-        with _realtime_trading_lock:
-          active_engine = _realtime_trading_engine
-        if active_engine is not None and hasattr(active_engine, "enable_buys"):
-          active_engine.enable_buys("OPERATION_MODE_LIVE_TRADING")
         config = load_short_horizon_strategy_config()
         execution_config = config.get("execution", {})
         config_live_enabled = bool(execution_config.get("live_trading_enabled", False))
@@ -4576,6 +4858,18 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
         result["runtime_gate"] = {"ok": runtime_gate.ok, "failures": tuple(runtime_gate.failures)}
         result["live_order_journal"] = _live_order_journal_snapshot()
         result["live_trading_status"] = "armed" if config_live_enabled and env_live_enabled and kis_connection.get("ok") and runtime_gate.ok else "blocked"
+        with _realtime_trading_lock:
+          active_engine = _realtime_trading_engine
+        if result["live_trading_status"] == "armed":
+          # Enable the instance control while the external preflight latch still
+          # blocks entries, then release the latch last. There is no interval in
+          # which either a pre-existing or newly-started engine can submit early.
+          if active_engine is not None and hasattr(active_engine, "enable_buys"):
+            active_engine.enable_buys("OPERATION_MODE_LIVE_TRADING_PREFLIGHT_PASSED")
+          with _live_lock:
+            _operation_mode_state["live_preflight_pending"] = False
+        elif active_engine is not None and hasattr(active_engine, "disable_buys"):
+          active_engine.disable_buys("LIVE_TRADING_PREFLIGHT_BLOCKED")
         result["live_trading_enabled_by_config"] = config_live_enabled
         result["live_trading_enabled_by_env"] = env_live_enabled
         result["live_trading_message"] = (
@@ -4599,6 +4893,15 @@ def _operation_mode_start_response(payload: dict[str, Any]) -> dict[str, Any]:
       result["learning"] = _learning_state_snapshot()
       return result
     except Exception as exc:
+      if mode == "live_trading":
+        fallback = OperationModeManager().start("learning")
+        with _live_lock:
+          _operation_mode_state["active"] = fallback
+          _operation_mode_state["live_preflight_pending"] = False
+        with _realtime_trading_lock:
+          failed_engine = _realtime_trading_engine
+        if failed_engine is not None and hasattr(failed_engine, "disable_buys"):
+          failed_engine.disable_buys("LIVE_TRADING_PREFLIGHT_ERROR")
       _set_operation_request(False, "error", f"{mode} failed", str(exc))
       audit.record("operation_mode_failed", {"mode": mode, "error": str(exc)})
       return {
@@ -5214,7 +5517,24 @@ def _intelligence_lineage_payload(
     now: datetime,
 ) -> dict[str, Any]:
   context = snapshot.get("context")
-  events = tuple(getattr(context, "events", ()) or ()) if context is not None else ()
+  context_events = tuple(getattr(context, "events", ()) or ()) if context is not None else ()
+  research_result = snapshot.get("research_result")
+  collected_events = tuple(getattr(research_result, "events", ()) or ())
+  event_by_id = {
+      str(getattr(event, "event_id", index)): event
+      for index, event in enumerate((*context_events, *collected_events))
+  }
+  persisted_events_sampled = 0
+  if not event_by_id:
+    try:
+      persisted = LocalResearchStore(root=_get_store_root()).load_recent_events(limit=1000)
+      persisted_events_sampled = len(persisted)
+      event_by_id.update(
+          {str(getattr(event, "event_id", index)): event for index, event in enumerate(persisted)}
+      )
+    except Exception:  # noqa: BLE001
+      pass
+  events = tuple(event_by_id.values())
   triples = tuple(getattr(getattr(context, "graph", None), "triples", lambda: ())())
   fresh_cutoff = now - timedelta(hours=24)
   fresh_events = 0
@@ -5252,7 +5572,6 @@ def _intelligence_lineage_payload(
       for row in micro_rows
       if isinstance(row, dict)
   )
-  research_result = snapshot.get("research_result")
   research_reason = str(
       ((getattr(research_result, "diagnostics", None) or {}).get("reason") or "")
   )
@@ -5274,7 +5593,9 @@ def _intelligence_lineage_payload(
           snapshot.get("research_last_collected_at")
       ),
       "research_interval_seconds": LIVE_RESEARCH_COLLECTION_INTERVAL_SECONDS,
-      "context_events": len(events),
+      "context_events": len(context_events),
+      "collected_events": len(collected_events),
+      "persisted_events_sampled": persisted_events_sampled,
       "fresh_events_24h": fresh_events,
       "llm_classified_events": llm_events,
       "labeled_events": labeled_events,
@@ -8266,6 +8587,7 @@ def _live_order_event_payload(event: dict[str, Any]) -> dict[str, Any] | None:
         "currency": currency,
         "broker_order_id": payload.get("broker_order_id") or payload.get("order_id") or raw.get("order_id") or "",
         "status": status,
+        "strategy_id": payload.get("strategy_id") or "",
         "filled_quantity": filled_quantity,
         "average_fill_price": average_fill_price,
         "raw": raw,
@@ -8728,7 +9050,11 @@ def _mock_performance(context: Any) -> dict[str, Any]:
 
 
 def _load_default_research() -> ResearchRunResult:
-    return ResearchService(progress_callback=_research_progress).run_from_config(DEFAULT_RESEARCH_CONFIG)
+    existing_events = LocalResearchStore(root=_get_store_root()).load_recent_events(limit=20_000)
+    return ResearchService(
+        progress_callback=_research_progress,
+        existing_events=existing_events,
+    ).run_from_config(DEFAULT_RESEARCH_CONFIG)
 
 
 def _live_research_collection_due(now: datetime | None = None) -> bool:
@@ -9694,6 +10020,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       account_provider=_realtime_engine_account_snapshot,
       candidate_symbols_provider=_realtime_engine_buy_candidates,
       session_open_provider=lambda: bool(_active_live_market_groups()),
+      new_entries_authorized_provider=_live_entries_authorized,
       ontology_graph_provider=_latest_ontology_graph,
       market_open_provider=_is_open_live_market_ticker,
       cycle_observer=_record_realtime_trading_cycle,
@@ -10090,13 +10417,28 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   selected: list[str] = []
   reason_counts: dict[str, int] = {}
   reason_samples: dict[str, list[str]] = {}
+  admission_counts: dict[str, int] = {}
+  admission_samples: dict[str, list[str]] = {}
 
-  def reject(reason: str, symbol: str) -> None:
-    reason_counts[reason] = reason_counts.get(reason, 0) + 1
-    sample = reason_samples.setdefault(reason, [])
+  def _tally(
+      counts: dict[str, int], samples: dict[str, list[str]], reason: str, symbol: str
+  ) -> None:
+    counts[reason] = counts.get(reason, 0) + 1
+    sample = samples.setdefault(reason, [])
     normalized = str(symbol or "").upper().strip()
     if normalized and normalized not in sample and len(sample) < 5:
       sample.append(normalized)
+
+  def reject(reason: str, symbol: str) -> None:
+    _tally(reason_counts, reason_samples, reason, symbol)
+
+  def note(reason: str, symbol: str) -> None:
+    """Why an admitted symbol was admitted, when it was not the usual path.
+
+    Kept out of ``reason_counts`` because every entry there is read as a rejection;
+    a note counted alongside them would make the funnel look narrower than it is.
+    """
+    _tally(admission_counts, admission_samples, reason, symbol)
 
   for symbol in ordered:
     normalized = str(symbol or "").upper()
@@ -10116,16 +10458,34 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
     if group == "KRX" and not _is_live_market_core_open("KRX"):
       reject("KRX_CORE_SESSION_CLOSED", normalized)
       continue
-    if store is not None and not _candidate_has_ready_strategy_tick_window(
-        symbol, store
-    ):
+    # Only 8 of the 23 registered algorithms consult the sub-second tick window
+    # (``TradingAlgorithm._tick_ready``). The other 15 are bar-based, and that set is
+    # exactly where every long-horizon arm lives -- 1500s through 64800s, which is
+    # also the only group whose measured net return clears the KRX round-trip cost.
+    # Applying the strictest arm's admission criterion to all of them dropped a
+    # perfectly tradeable slow-printing name from the candidate list entirely, so the
+    # arms that can pay for a round trip were the ones systematically starved. Admit
+    # on either evidence and let each algorithm assert its own data requirement.
+    tick_window_ready = (
+        _candidate_has_ready_strategy_tick_window(symbol, store)
+        if store is not None
+        else True
+    )
+    bar_history_ready: bool | None = None
+    if store is not None and (not tick_window_ready or group == "KRX"):
+      bar_history_ready = _candidate_has_strategy_feature_history(symbol, store)
+    if store is not None and not tick_window_ready and not bar_history_ready:
       reject("STRATEGY_TICK_WINDOW_NOT_READY", normalized)
       continue
-    if (
-        store is not None
-        and group == "KRX"
-        and not _candidate_has_strategy_feature_history(symbol, store)
-    ):
+    if store is not None and not tick_window_ready:
+      # Bar-based arms only. A slow tape is still tradeable on an hours-long thesis,
+      # but the ORDER still has to be priced, so the book must be current -- the same
+      # requirement the execution layer's pre-submit STALE_DATA guard enforces later.
+      if not _candidate_has_fresh_live_orderbook(symbol, store):
+        reject("BAR_ONLY_CANDIDATE_ORDERBOOK_STALE", normalized)
+        continue
+      note("ADMITTED_ON_BAR_HISTORY_WITHOUT_TICK_WINDOW", normalized)
+    if store is not None and group == "KRX" and bar_history_ready is False:
       reject("STRATEGY_FEATURE_HISTORY_INSUFFICIENT", normalized)
       continue
     if (
@@ -10172,6 +10532,11 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
       "reason_samples": {
           reason: list(symbols)
           for reason, symbols in sorted(reason_samples.items())
+      },
+      "admission_note_counts": dict(sorted(admission_counts.items())),
+      "admission_note_samples": {
+          reason: list(symbols)
+          for reason, symbols in sorted(admission_samples.items())
       },
   }
   with _live_lock:
@@ -10489,19 +10854,28 @@ def _kis_overseas_realtime_collector_loop() -> None:
             run_event_driven_kis_overseas_websocket_collector,
         )
         overseas_collector_fn = run_event_driven_kis_overseas_websocket_collector
+      # Hard wall-clock cap on one collector cycle. The in-loop stall watchdog
+      # only fires while the recv loop is still turning; this catches the case
+      # where the loop is wedged on some other await and would otherwise hold
+      # the socket forever with nobody draining it. Cancelling the coroutine
+      # unwinds ``async with websockets.connect(...)``, which closes the socket
+      # and lets this loop reconnect on the next pass.
       counts = asyncio.run(
-          overseas_collector_fn(
-              symbols=symbols,
-              symbols_provider=_kis_overseas_realtime_symbols,
-              store=RealtimeMarketDataStore(),
-              client=_kis_realtime_collector_client(),
-              stop_event=_kis_overseas_realtime_stop,
-              resubscribe_event=_kis_overseas_realtime_resubscribe,
-              max_runtime_seconds=runtime_seconds,
-              progress_callback=_record_kis_overseas_realtime_progress,
-              session_active_provider=lambda: (
-                  _kis_realtime_session_owner() in {"US", "BOTH"}
+          _run_collector_cycle_with_cap(
+              overseas_collector_fn(
+                  symbols=symbols,
+                  symbols_provider=_kis_overseas_realtime_symbols,
+                  store=RealtimeMarketDataStore(),
+                  client=_kis_realtime_collector_client(),
+                  stop_event=_kis_overseas_realtime_stop,
+                  resubscribe_event=_kis_overseas_realtime_resubscribe,
+                  max_runtime_seconds=runtime_seconds,
+                  progress_callback=_record_kis_overseas_realtime_progress,
+                  session_active_provider=lambda: (
+                      _kis_realtime_session_owner() in {"US", "BOTH"}
+                  ),
               ),
+              cap_seconds=_collector_cycle_cap_seconds(),
           )
       )
       status, cycle_message = _classify_kis_overseas_collector_cycle(counts)
@@ -10563,14 +10937,41 @@ def _kis_overseas_realtime_collector_loop() -> None:
         return
 
 
+#: Last time the overseas progress callback recomputed its published symbol list.
+_kis_overseas_progress_symbols_at = 0.0
+#: How stale that published list may get. It is dashboard telemetry, and
+#: recomputing it reads the account snapshot, so it must not run per message.
+_KIS_OVERSEAS_PROGRESS_SYMBOL_REFRESH_SEC = 5.0
+
+
 def _record_kis_overseas_realtime_progress(counts: dict[str, Any]) -> None:
-  """Expose persistent-session control replies without waiting for disconnect."""
+  """Expose persistent-session control replies without waiting for disconnect.
+
+  Runs on the collector's asyncio event loop, once per websocket message. So it
+  must never block: anything that waits here stops the loop from calling
+  ``recv()``, the websockets library then pauses the transport, and the kernel
+  receive queue grows while KIS keeps sending. That is exactly what happened on
+  2026-08-21 -- the socket stayed ESTABLISHED with Recv-Q climbing past 3MB and
+  US market data stopped 40 seconds after every reconnect, with no error raised
+  anywhere. See [[obaits-collector-busywait-starves-websocket]].
+
+  Two things made it block. ``_live_lock`` is shared with the account refresh and
+  the trading engine, so a message could wait behind an unrelated broker call;
+  it is now acquired non-blocking, and a contended sample is DROPPED rather than
+  waited for -- this is telemetry, and a missing sample costs nothing while a
+  stalled feed costs everything. And the published symbol list was recomputed on
+  every message via ``_kis_overseas_realtime_symbols()``, which reads the live
+  account basis; it is now refreshed at most every few seconds.
+  """
   global _kis_overseas_observed_subscription_capacity, _kis_overseas_observed_capacity_at
+  global _kis_overseas_progress_symbols_at
   accepted = int(counts.get("subscriptions_accepted") or 0)
   has_events = int(counts.get("ticks") or 0) + int(counts.get("orderbooks") or 0) > 0
   limit_reached = bool(counts.get("subscription_limit_reached"))
   notice: tuple[str, str] | None = None
-  with _live_lock:
+  if not _live_lock.acquire(blocking=False):
+    return
+  try:
     _kis_overseas_realtime_state["counts"] = dict(counts)
     if accepted > 0:
       _kis_overseas_realtime_state["last_success_at"] = (
@@ -10601,23 +11002,67 @@ def _record_kis_overseas_realtime_progress(counts: dict[str, Any]) -> None:
       _kis_overseas_realtime_state["observed_capacity"] = (
           _kis_overseas_observed_subscription_capacity
       )
+  finally:
+    _live_lock.release()
+  symbols_due = (
+      time.monotonic() - _kis_overseas_progress_symbols_at
+      >= _KIS_OVERSEAS_PROGRESS_SYMBOL_REFRESH_SEC
+  )
   current_symbols = (
       _kis_overseas_realtime_symbols()
-      if _kis_overseas_observed_subscription_capacity
+      if _kis_overseas_observed_subscription_capacity and (symbols_due or notice)
       else ()
   )
-  if current_symbols:
-    with _live_lock:
+  if current_symbols and _live_lock.acquire(blocking=False):
+    try:
+      _kis_overseas_progress_symbols_at = time.monotonic()
       _kis_overseas_realtime_state["symbols"] = current_symbols
       live_counts = dict(_kis_overseas_realtime_state.get("counts") or {})
       live_counts["active_complete_subscriptions"] = len(current_symbols) * 2
       live_counts["active_complete_symbols"] = list(current_symbols)
       _kis_overseas_realtime_state["counts"] = live_counts
+    finally:
+      _live_lock.release()
   if notice is not None:
     _kis_overseas_realtime_resubscribe.set()
-  if notice is not None:
+    # The collection log is operator-visible history, so unlike the telemetry
+    # above it must not be silently dropped. A capacity change is rare (rate
+    # limited to once per 600s by ``capacity_is_stale``), so blocking here
+    # cannot stall the feed the way a per-message wait did.
     with _live_lock:
       _append_collection_log_unlocked(notice[0], notice[1], counts=dict(counts))
+
+
+def _collector_cycle_cap_seconds() -> float:
+  """Wall-clock ceiling for one realtime collector cycle.
+
+  Must exceed ``KIS_REALTIME_WS_MAX_SESSION_SEC`` so a healthy session ends on
+  its own recycle path (releasing its registrations) rather than being cancelled
+  mid-flight. This is the backstop for a wedged cycle, not the normal exit.
+  """
+  try:
+    session_cap = float(os.getenv("KIS_REALTIME_WS_MAX_SESSION_SEC", "3600") or 0.0)
+  except (TypeError, ValueError):
+    session_cap = 3600.0
+  try:
+    configured = float(os.getenv("KIS_REALTIME_COLLECTOR_CYCLE_CAP_SEC", "0") or 0.0)
+  except (TypeError, ValueError):
+    configured = 0.0
+  if configured > 0.0:
+    return configured
+  return max(300.0, session_cap + 300.0)
+
+
+async def _run_collector_cycle_with_cap(
+    coroutine: Any, *, cap_seconds: float
+) -> dict[str, Any]:
+  """Await a collector cycle, cancelling it if it outlives ``cap_seconds``."""
+  if cap_seconds <= 0.0:
+    return await coroutine
+  try:
+    return await asyncio.wait_for(coroutine, timeout=cap_seconds)
+  except (TimeoutError, asyncio.TimeoutError):
+    return {"collector_cycle_timeout": 1, "collector_cycle_cap_seconds": cap_seconds}
 
 
 def _classify_kis_overseas_collector_cycle(
@@ -10640,11 +11085,32 @@ def _classify_kis_overseas_collector_cycle(
             else "KIS overseas websocket subscription rejected: account limit reached"
         ),
     )
+  if counts.get("stream_stalled"):
+    # Subscribed and connected, but the socket went silent. Reported as an error
+    # because it is indistinguishable from healthy on every other signal: the
+    # thread is alive, no exception is raised, and the last cycle looked fine.
+    return (
+        "error",
+        (
+            "KIS overseas websocket stalled: no frame for "
+            f"{counts.get('stream_stalled_seconds')}s; reconnecting"
+        ),
+    )
+  if counts.get("collector_cycle_timeout"):
+    return (
+        "error",
+        "KIS overseas websocket cycle exceeded its wall-clock cap; connection torn down",
+    )
   if accepted > 0:
     if counts.get("connection_closed"):
       return (
           "waiting",
           "KIS overseas websocket disconnected after a valid subscription; reconnecting",
+      )
+    if counts.get("session_recycled"):
+      return (
+          "running",
+          f"KIS overseas websocket session recycled ({ticks} ticks, {orderbooks} books)",
       )
     return (
         "running",
@@ -11195,12 +11661,13 @@ def _compact_strategy_session(session: Any) -> dict[str, Any]:
       "cost_coverage_band", "change_point_probability", "halt_level",
       "selection_authority", "selector_v2_context_id",
       "selector_v2_authority_state", "position_seen", "entry_price",
-      "target_price", "stop_price", "exit_reason",
+      "target_price", "stop_price", "exit_reason", "invalidation_cycles",
+      "last_invalidation_evidence_at",
   )
   compact = {key: session.get(key) for key in scalar_fields if key in session}
   for key in (
       "gnn_reason_codes", "ontology_reason_codes", "bandit_reason_codes",
-      "halt_reason_codes", "bandit_shadow_arms",
+      "halt_reason_codes", "bandit_shadow_arms", "invalidation_reason_codes",
   ):
     if key in session:
       compact[key] = list(session.get(key) or ())[:24]
@@ -12494,6 +12961,50 @@ def _is_krx_ticker(ticker: str) -> bool:
   return text.isdigit() and len(text) == 6
 
 
+def _candidate_has_fresh_live_orderbook(
+    ticker: str, store: RealtimeMarketDataStore
+) -> bool:
+  """Two-sided, currently-priced book, in EITHER market.
+
+  ``_candidate_has_fresh_buy_orderbook`` short-circuits to ``True`` for anything
+  that is not a KRX ticker and additionally demands a ``kis_realtime_websocket``
+  source, which no REST-polled US book can ever report. This is the market-agnostic
+  question a bar-based candidate has to answer: can the order be priced right now?
+  """
+  try:
+    orderbook = store.latest_orderbook(str(ticker or "").upper())
+  except AttributeError:
+    return True
+  except Exception:  # noqa: BLE001 - fail closed for a live entry.
+    return False
+  if orderbook is None:
+    return False
+  bid = _number_or_zero(getattr(orderbook, "best_bid", 0.0))
+  ask = _number_or_zero(getattr(orderbook, "best_ask", 0.0))
+  if bid <= 0 or ask <= 0 or ask < bid:
+    return False
+  received_at = getattr(orderbook, "received_at", None)
+  if received_at is None:
+    return False
+  try:
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - received_at).total_seconds())
+  except (TypeError, ValueError):
+    return False
+  # A bar-based thesis holds for 25 minutes to 18 hours, so the book does not need to
+  # be sub-second fresh -- it needs to satisfy the budget the ORDER will actually be
+  # held to. That budget is 180s, both at execution
+  # (``REALTIME_EXEC_US_ORDERBOOK_MAX_AGE_SEC``) and at the other candidate-admission
+  # site (``REALTIME_US_CANDIDATE_ORDERBOOK_MAX_AGE_SEC``), so this default is the
+  # same number rather than an independently chosen one. Measured cadence on this
+  # account's overseas feed is ~55s between prints per symbol during the US regular
+  # session, so a tighter budget here admits nothing at all.
+  maximum_age = max(
+      1.0,
+      _env_float_web("REALTIME_BAR_CANDIDATE_ORDERBOOK_MAX_AGE_SEC", 180.0),
+  )
+  return age_seconds <= maximum_age
+
+
 def _candidate_has_fresh_buy_orderbook(ticker: str, store: RealtimeMarketDataStore) -> bool:
   if not _is_krx_ticker(ticker):
     return True
@@ -13734,21 +14245,27 @@ def _kis_realtime_collector_loop() -> None:
       # approval key each time and KIS bills registrations per session, which
       # is what drained the account down to a single subscribable symbol.
       _mark_kis_realtime_ws(True)
+      # Same wall-clock backstop as the overseas loop: this is the identical
+      # persistent-session code path, so it carries the identical exposure to a
+      # cycle that never returns.
       counts = asyncio.run(
-          collector_fn(
-              symbols=symbols,
-              symbols_provider=_kis_realtime_collector_symbols,
-              store=RealtimeMarketDataStore(),
-              client=_kis_realtime_collector_client(),
-              stop_event=_kis_realtime_collector_stop,
-              resubscribe_event=_kis_realtime_collector_resubscribe,
-              skip_subscriptions=_kis_realtime_collector_skip_pairs(),
-              max_runtime_seconds=resubscribe_seconds,
-              session_active_provider=lambda: (
-                  _kis_realtime_session_owner() in {"KRX", "BOTH"}
+          _run_collector_cycle_with_cap(
+              collector_fn(
+                  symbols=symbols,
+                  symbols_provider=_kis_realtime_collector_symbols,
+                  store=RealtimeMarketDataStore(),
+                  client=_kis_realtime_collector_client(),
+                  stop_event=_kis_realtime_collector_stop,
+                  resubscribe_event=_kis_realtime_collector_resubscribe,
+                  skip_subscriptions=_kis_realtime_collector_skip_pairs(),
+                  max_runtime_seconds=resubscribe_seconds,
+                  session_active_provider=lambda: (
+                      _kis_realtime_session_owner() in {"KRX", "BOTH"}
+                  ),
+                  subscription_tr_ids=subscription_tr_ids,
+                  orderbook_symbol_filter=_kis_realtime_symbol_wants_orderbook,
               ),
-              subscription_tr_ids=subscription_tr_ids,
-              orderbook_symbol_filter=_kis_realtime_symbol_wants_orderbook,
+              cap_seconds=_collector_cycle_cap_seconds(),
           )
       )
       # ``collector_fn`` blocks for as long as the socket is open, so returning at all

@@ -3,12 +3,12 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Any
-from urllib import robotparser
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, url2pathname, urlopen
@@ -39,15 +39,13 @@ class HttpClient:
         if not parsed.scheme or not parsed.netloc:
             return False
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-        parser = robotparser.RobotFileParser()
         try:
             request = Request(robots_url, headers={"User-Agent": self.user_agent})
             with urlopen(request, timeout=self.robots_timeout_seconds) as response:
                 text = response.read().decode("utf-8", errors="replace")
-            parser.parse(text.splitlines())
         except (OSError, URLError, HTTPError, TimeoutError):
             return True
-        return parser.can_fetch(self.user_agent, url)
+        return _robots_can_fetch(text, self.user_agent, url)
 
     def get_text(self, url: str, params: dict[str, Any] | None = None) -> HttpResponse:
         full_url = _with_query(url, params)
@@ -97,6 +95,62 @@ def _with_query(url: str, params: dict[str, Any] | None) -> str:
         return url
     separator = "&" if "?" in url else "?"
     return f"{url}{separator}{urlencode(params)}"
+
+
+def _robots_can_fetch(text: str, user_agent: str, url: str) -> bool:
+    """Evaluate robots rules using RFC 9309's most-specific-match precedence.
+
+    ``urllib.robotparser`` uses the first matching rule.  That incorrectly blocks
+    sites such as the Bank of Korea whose file declares ``Disallow: /`` followed
+    by the more specific ``Allow: /portal/``.
+    """
+    groups: list[tuple[tuple[str, ...], tuple[tuple[bool, str], ...]]] = []
+    agents: list[str] = []
+    rules: list[tuple[bool, str]] = []
+
+    def flush() -> None:
+        nonlocal agents, rules
+        if agents:
+            groups.append((tuple(agents), tuple(rules)))
+        agents, rules = [], []
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        field, value = (part.strip() for part in line.split(":", 1))
+        field = field.lower()
+        if field == "user-agent":
+            if rules:
+                flush()
+            agents.append(value.lower())
+        elif field in {"allow", "disallow"} and agents:
+            if value or field == "allow":
+                rules.append((field == "allow", value))
+    flush()
+
+    product = user_agent.split("/", 1)[0].strip().lower()
+    exact = [rules for names, rules in groups if any(name != "*" and name in product for name in names)]
+    applicable = exact or [rules for names, rules in groups if "*" in names]
+    target = urlparse(url).path or "/"
+    if urlparse(url).query:
+        target = f"{target}?{urlparse(url).query}"
+    matches: list[tuple[int, bool]] = []
+    for group_rules in applicable:
+        for allowed, pattern in group_rules:
+            if not pattern and not allowed:
+                continue
+            anchored = pattern.endswith("$")
+            raw_pattern = pattern[:-1] if anchored else pattern
+            expression = re.escape(raw_pattern).replace(r"\*", ".*")
+            expression = f"^{expression}{'$' if anchored else ''}"
+            if re.search(expression, target):
+                specificity = len(raw_pattern.replace("*", ""))
+                matches.append((specificity, allowed))
+    if not matches:
+        return True
+    best_specificity = max(item[0] for item in matches)
+    return any(allowed for specificity, allowed in matches if specificity == best_specificity)
 
 
 def _positive_float(value: str | None, default: float) -> float:

@@ -373,7 +373,23 @@ def test_event_runtime_can_dispatch_slow_shadow_off_fast_path(monkeypatch, tmp_p
     assert result["slow_intelligence_enabled"] is True
 
 
-def test_slow_shadow_worker_continues_after_one_inference_failure() -> None:
+def _slow_request(symbol: str):
+    from app.data.event_runtime import _SlowSnapshotRequest
+
+    now = datetime.now(timezone.utc)
+    return _SlowSnapshotRequest(
+        symbol=symbol,
+        record_id=f"{symbol}-1",
+        now=now,
+        as_of=now,
+        last_price=100.0,
+        data_fresh=True,
+        sequence_uncertain=False,
+    )
+
+
+def test_slow_shadow_worker_continues_after_one_inference_failure(monkeypatch) -> None:
+    from app.data import event_runtime
     from app.data.event_runtime import slow_intelligence_worker
 
     class FlakyService:
@@ -385,12 +401,20 @@ def test_slow_shadow_worker_continues_after_one_inference_failure() -> None:
             if self.calls == 1:
                 raise RuntimeError("transient inference failure")
 
+    monkeypatch.setattr(
+        event_runtime,
+        "_build_slow_snapshot",
+        lambda runtime, request: SimpleNamespace(symbol=request.symbol),
+    )
+
     async def scenario() -> int:
         service = FlakyService()
         queue: asyncio.Queue = asyncio.Queue()
-        worker = asyncio.create_task(slow_intelligence_worker(service, queue))
-        await queue.put(type("Snapshot", (), {"symbol": "SOFI"})())
-        await queue.put(type("Snapshot", (), {"symbol": "PFE"})())
+        worker = asyncio.create_task(
+            slow_intelligence_worker(service, queue, SimpleNamespace(store=object()))
+        )
+        await queue.put(_slow_request("SOFI"))
+        await queue.put(_slow_request("PFE"))
         await asyncio.wait_for(queue.join(), timeout=2.0)
         worker.cancel()
         try:
@@ -400,6 +424,53 @@ def test_slow_shadow_worker_continues_after_one_inference_failure() -> None:
         return service.calls
 
     assert asyncio.run(scenario()) == 2
+
+
+def test_slow_snapshot_build_never_runs_on_the_event_loop_thread(monkeypatch) -> None:
+    """The store-backed half must be executed in a worker thread.
+
+    Building the snapshot issues several SQLite queries against an 8GB store
+    (``_slow_context_bars`` -> ``recent_minute_bars``). Running that on the
+    collector's event loop, once per second per symbol, starved the websocket
+    reader sharing it: the socket stayed ESTABLISHED with the kernel receive
+    queue climbing and US market data stopped ~70s after every reconnect. A
+    SIGUSR1 thread dump caught the loop parked in ``recent_minute_bars``.
+    """
+    import threading
+
+    from app.data import event_runtime
+    from app.data.event_runtime import slow_intelligence_worker
+
+    build_threads: list[str] = []
+
+    def _fake_build(runtime, request):
+        build_threads.append(threading.current_thread().name)
+        return SimpleNamespace(symbol=request.symbol)
+
+    monkeypatch.setattr(event_runtime, "_build_slow_snapshot", _fake_build)
+
+    async def scenario() -> str:
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = asyncio.create_task(
+            slow_intelligence_worker(
+                SimpleNamespace(evaluate=lambda _s: None),
+                queue,
+                SimpleNamespace(store=object()),
+            )
+        )
+        await queue.put(_slow_request("INTC"))
+        await asyncio.wait_for(queue.join(), timeout=2.0)
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        return threading.current_thread().name
+
+    loop_thread = asyncio.run(scenario())
+
+    assert build_threads, "the snapshot was never built"
+    assert loop_thread not in build_threads
 
 
 def test_event_runtime_builds_current_strategy_graph_context(monkeypatch) -> None:
@@ -428,3 +499,51 @@ def test_event_runtime_builds_current_strategy_graph_context(monkeypatch) -> Non
 
     assert context is not None
     assert len(context) == STRATEGY_GRAPH_CONTEXT_DIM
+
+
+def test_bus_idle_wait_sleeps_until_published_instead_of_spinning() -> None:
+    """An idle consumer must WAIT, not poll ``stats().depth`` in a bare yield.
+
+    The consumer loop used ``await asyncio.sleep(0)`` when the bus was empty.
+    That is a yield, not a sleep, so the loop ran as fast as the interpreter
+    could execute it and starved the KIS websocket reader sharing its event
+    loop: on 2026-08-21 the socket stayed ESTABLISHED with a growing kernel
+    receive queue while the process burned 1.6 cores and read nothing.
+    """
+
+    async def scenario() -> tuple[bool, bool, int]:
+        bus = BoundedMarketEventBus(4)
+        loop = asyncio.get_running_loop()
+
+        # Empty bus: the wait must actually block for the whole timeout.
+        started = loop.time()
+        timed_out = await bus.wait_for_depth(0.05)
+        idle_elapsed = loop.time() - started
+
+        polls = 0
+
+        async def _count_polls() -> None:
+            nonlocal polls
+            while True:
+                polls += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.create_task(_count_polls())
+        waiter = asyncio.create_task(bus.wait_for_depth(1.0))
+        await asyncio.sleep(0.01)
+        await bus.publish(_tick(1, 100.0, 1))
+        woke = await waiter
+        counter.cancel()
+        try:
+            await counter
+        except asyncio.CancelledError:
+            pass
+        return timed_out, woke, int(idle_elapsed >= 0.04)
+
+    timed_out, woke, blocked_for_the_timeout = asyncio.run(scenario())
+
+    # Empty bus -> reports nothing available, and did not return immediately.
+    assert timed_out is False
+    assert blocked_for_the_timeout == 1
+    # A publish wakes the waiter rather than it discovering the item by polling.
+    assert woke is True

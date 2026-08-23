@@ -37,6 +37,16 @@ class FakeLLMClient:
 
 
 class LLMEventClassifierTest(unittest.TestCase):
+    def test_generic_regulatory_contract_text_is_not_a_supply_contract(self) -> None:
+        event = classify_text_event(
+            title="Regulator announces enforcement action",
+            body="The agency amended a general contract under its enforcement program.",
+            source=source_now("unit", "local://regulator", "regulator:1"),
+        )
+
+        self.assertIn("regulation", event.event_labels)
+        self.assertNotIn("supply_contract", event.event_labels)
+
     def test_keyword_semantic_labels_remain_when_llm_omits_labels(self) -> None:
         event = classify_text_event(
             title="NVDA wins supply contract",
@@ -193,9 +203,7 @@ class LLMEventClassifierTest(unittest.TestCase):
             store.save_research_result(Result())
             loaded = store.load().events[0]
 
-        self.assertIn("analyst_report", loaded.event_labels)
-        self.assertIn("AnalystUpgrade", loaded.event_labels)
-        self.assertIn("TargetPriceRaised", loaded.event_labels)
+        self.assertEqual(loaded.event_labels, ("AnalystUpgrade", "TargetPriceRaised"))
         self.assertEqual(loaded.key_facts, ("Target price raised",))
         self.assertEqual(loaded.classification_model, "fake-mini-llm")
 

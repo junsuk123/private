@@ -92,6 +92,12 @@ def _finite(values: Sequence[float]) -> list[float]:
     return out
 
 
+#: Bars in the long-horizon trend/residual window. Named because two things must
+#: agree on it: the statistic itself, and how much history the store is asked for.
+#: They silently disagreed, and the long residual was absent on every call.
+_LONG_TREND_WINDOW = 30
+
+
 def _rolling_return(closes: list[float], window: int) -> float | None:
     if len(closes) < window + 1 or closes[-window - 1] == 0:
         return None
@@ -153,7 +159,7 @@ def build_macro_feature_frame(
     sector_of: Mapping[str, str] | None = None,
     trend_window: int = 5,
     vol_window: int = 20,
-    long_trend_window: int = 30,
+    long_trend_window: int = _LONG_TREND_WINDOW,
 ) -> MacroFeatureFrame:
     timestamp = timestamp or datetime.now(timezone.utc)
     sector_of = {str(k): str(v) for k, v in (sector_of or {}).items() if v and str(v).lower() != "unknown"}
@@ -421,7 +427,19 @@ def macro_feature_frame_from_store(
     all-``None`` (conservative macro fallback). Best-effort and error-isolated.
     """
     now = now or datetime.now(timezone.utc)
-    since = now - timedelta(minutes=max(1, lookback_minutes))
+    # ``build_macro_feature_frame`` measures the long-horizon return over
+    # ``long_trend_window`` COMPLETED bars, which needs ``window + 1`` closes. Asking
+    # the store for exactly ``lookback_minutes`` of minute bars for a window of the
+    # same length is off by one: 30 minutes yields at most 30 bars, one short, so
+    # ``per_symbol_long_return`` came back empty on every call. That emptied
+    # ``long_residual_returns``, and both consumers of it
+    # (``residual_relative_strength``, ``residual_relative_weakness``) fail closed on
+    # an absent long residual -- so two registered strategies rejected every tick with
+    # ``RESIDUAL_STRENGTH_CONTEXT_ABSENT`` and could never once have fired. Fetch with
+    # enough headroom that the window is actually measurable; symbols whose history is
+    # genuinely too short still resolve to absent, which is the honest answer.
+    fetch_minutes = max(1, lookback_minutes, _LONG_TREND_WINDOW + 2)
+    since = now - timedelta(minutes=fetch_minutes)
     closes: dict[str, list[float]] = {}
     volumes: dict[str, list[float]] = {}
     for symbol in dict.fromkeys(str(s) for s in symbols if str(s)):

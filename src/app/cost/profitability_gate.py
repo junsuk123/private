@@ -81,11 +81,9 @@ DEFAULT_PROFITABILITY_POLICY: dict[str, Any] = {
     "max_spread_alpha_ratio": 0.35,    # spread may not eat > this fraction of gross alpha
     "max_cost_to_alpha_ratio": 0.5,
     # Predicted gross edge must be at least this multiple of the all-in cost.
-    # The built-in default (1.0 == "edge merely covers cost") is deliberately the
-    # permissive end so that omitting the key changes no behaviour; the live
-    # policy in config/profitability_policy.yaml raises it into the band where
-    # the margin actually survives estimation error.
-    "min_cost_coverage_ratio": 1.0,
+    # Equality is net break-even only under perfect estimates.  The live band
+    # starts at 1.3 so a missing config cannot silently re-enable fee bleed.
+    "min_cost_coverage_ratio": 1.3,
     "cost_coverage": {"covered": 1.0, "live": 1.3, "comfortable": 1.7},
     "min_liquidity_score": 0.3,
     # Dynamic required-net-return buffers.
@@ -113,7 +111,7 @@ class ProfitabilityPolicy:
     liquidity_buffer_max: float
     small_account_equity_krw: float
     small_account_extra_net: float
-    min_cost_coverage_ratio: float = 1.0
+    min_cost_coverage_ratio: float = 1.3
     cost_coverage_thresholds: CostCoverageThresholds = field(
         default_factory=CostCoverageThresholds
     )
@@ -775,7 +773,7 @@ def load_policy(config_path: Path | str = "config/profitability_policy.yaml") ->
     coverage_thresholds = CostCoverageThresholds.from_env(merged.get("cost_coverage") or {})
     min_coverage = _env_float(
         "REALTIME_MIN_COST_COVERAGE_RATIO",
-        float(merged.get("min_cost_coverage_ratio", 1.0)),
+        float(merged.get("min_cost_coverage_ratio", 1.3)),
     )
     policy = ProfitabilityPolicy(
         min_required_net_return={k: float(v) for k, v in min_net.items()},

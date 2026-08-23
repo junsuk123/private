@@ -218,6 +218,54 @@ def _websocket_post_subscribe_drain_seconds() -> float:
         return 0.6
 
 
+def _websocket_progress_interval_seconds() -> float:
+    """Minimum gap between per-message telemetry publishes. 0 publishes every message."""
+    raw = os.getenv("KIS_REALTIME_PROGRESS_INTERVAL_SEC", "1.0")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _websocket_stall_seconds() -> float:
+    """Silence that means the stream is dead rather than the tape being quiet.
+
+    A live KIS session is never silent: it sends application-level PINGPONG
+    keepalive frames even when no symbol trades, so "no frame at all" is a
+    connection fact, not a market condition. Measured against frames of ANY kind
+    for exactly that reason — gating on ticks would tear down a healthy socket
+    during a quiet auction.
+
+    Observed 2026-08-21 with no watchdog at all: the overseas socket stayed
+    ESTABLISHED with the kernel receive queue growing past 3MB while all six
+    subscribed symbols stopped at the identical instant. Nothing noticed for
+    15+ minutes, the collector logged no error, and US market data simply
+    stopped. 0 disables.
+    """
+    raw = os.getenv("KIS_REALTIME_WS_STALL_SEC", "120")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _websocket_max_session_seconds() -> float:
+    """Absolute cap on one persistent websocket session.
+
+    With ``symbols_provider`` the session is deliberately long-lived and
+    ``max_runtime_seconds`` becomes a re-diff cadence rather than a deadline, so
+    before this cap existed the connection had NO upper bound. That made every
+    failure mode that leaves the reader wedged permanent, and let the account's
+    subscription registrations accumulate against a socket nobody was draining.
+    Recycling bounds both. 0 disables.
+    """
+    raw = os.getenv("KIS_REALTIME_WS_MAX_SESSION_SEC", "3600")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 3600.0
+
+
 async def run_kis_realtime_websocket_collector(
     *,
     symbols: Iterable[str],
@@ -294,6 +342,9 @@ async def run_kis_realtime_websocket_collector(
     ping_timeout = _websocket_ping_setting("KIS_REALTIME_WS_PING_TIMEOUT_SECONDS", None)
     subscribe_delay = _websocket_subscription_delay_seconds()
     post_subscribe_drain = _websocket_post_subscribe_drain_seconds()
+    stall_seconds = _websocket_stall_seconds()
+    max_session_seconds = _websocket_max_session_seconds()
+    progress_interval = _websocket_progress_interval_seconds()
     subscription_limit_reached = False
     # Registrations this session currently holds. KIS bills them against the
     # account, so they must be released with tr_type=2 before the socket goes
@@ -301,9 +352,24 @@ async def run_kis_realtime_websocket_collector(
     # one symbol fits.
     held_registrations: set[tuple[str, str]] = set()
 
-    def _notify_progress() -> None:
+    #: Last telemetry publish, so a busy symbol cannot turn every message into a
+    #: callback into shared server state. Progress is a dashboard read model: at
+    #: one publish per second it is indistinguishable to an operator, while
+    #: per-message publishing put a lock acquisition and an account read on the
+    #: websocket event loop for every tick.
+    progress_published_at = 0.0
+
+    def _notify_progress(*, force: bool = True) -> None:
+        nonlocal progress_published_at
         if progress_callback is None:
             return
+        if not force:
+            now = time.monotonic()
+            if now - progress_published_at < progress_interval:
+                return
+            progress_published_at = now
+        else:
+            progress_published_at = time.monotonic()
         try:
             progress_callback(dict(counts))
         except Exception:
@@ -432,6 +498,12 @@ async def run_kis_realtime_websocket_collector(
             max_runtime_seconds if max_runtime_seconds and symbols_provider is not None else None
         )
         next_resync = time.monotonic() + resync_interval if resync_interval else None
+        # Frame-liveness clock and the absolute session cap. Both are wall-clock
+        # facts about the CONNECTION, tracked independently of the market tape.
+        last_frame_at = time.monotonic()
+        session_deadline = (
+            time.monotonic() + max_session_seconds if max_session_seconds else None
+        )
 
         async def _resync() -> bool:
             """Recompute desired registrations and apply the difference."""
@@ -480,9 +552,23 @@ async def run_kis_realtime_websocket_collector(
                     break
             if deadline is not None and time.monotonic() >= deadline:
                 break
+            if session_deadline is not None and time.monotonic() >= session_deadline:
+                counts["session_recycled"] = 1
+                break
             try:
                 raw = await asyncio.wait_for(websocket.recv(), timeout=1.0)
             except TimeoutError:
+                # One second of silence is ordinary. Sustained silence is not:
+                # PINGPONG keeps a live session emitting frames, so crossing the
+                # stall budget means this socket will never deliver again. Break
+                # so the caller reconnects instead of looping on a dead stream
+                # for the rest of the session.
+                if stall_seconds and time.monotonic() - last_frame_at >= stall_seconds:
+                    counts["stream_stalled"] = 1
+                    counts["stream_stalled_seconds"] = round(
+                        time.monotonic() - last_frame_at, 1
+                    )
+                    break
                 continue
             except Exception as exc:
                 if _is_websocket_connection_closed(exc):
@@ -490,6 +576,7 @@ async def run_kis_realtime_websocket_collector(
                     counts["last_close_error"] = str(exc) or exc.__class__.__name__
                     break
                 raise
+            last_frame_at = time.monotonic()
             closed = await _process_kis_realtime_raw(
                 raw=raw,
                 websocket=websocket,
@@ -501,7 +588,7 @@ async def run_kis_realtime_websocket_collector(
             )
             if closed:
                 break
-            _notify_progress()
+            _notify_progress(force=False)
             if max_messages is not None and counts["messages"] >= max_messages:
                 break
         # Normal end of run (resubscribe, deadline, stop). Release the account's
@@ -761,15 +848,28 @@ async def _process_kis_realtime_raw(
         # new_buy 를 전면 차단한다. 즉 "전략 채택 불가"의 최상위 원인이었다.
         #
         # 분당 심볼당 한 번으로 제한한다 (메시지마다 DB 왕복을 하지 않는다).
-        _build_minute_bars_throttled(
+        # The minute-bar rebuild re-reads the current minute from the store and
+        # upserts a bar. Running it inline put a synchronous SQLite round trip on
+        # the WEBSOCKET EVENT LOOP for every message, against an 8GB store with a
+        # 30s ``busy_timeout``: one contended statement stopped the loop calling
+        # ``recv()``, the websockets library paused the transport, and the kernel
+        # receive queue grew while KIS kept sending. Merely moving it to a thread
+        # was not enough either -- the socket still AWAITED it once per message,
+        # so ingestion ran at the store's latency and stayed ~30-45s behind the
+        # tape. Dispatch it instead: the throttle decision is made here (cheap),
+        # and the store work runs where the socket never waits on it.
+        # See [[obaits-collector-busywait-starves-websocket]].
+        _dispatch_minute_bar_rebuild(
             store,
             {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks},
             counts,
         )
         counts["messages"] += 1
         return False
-    counts["ticks"] += store.save_ticks(ticks)
-    counts["orderbooks"] += store.save_orderbooks(orderbooks)
+    # Same reasoning for the legacy (no event_sink) path: these are blocking
+    # writes, and this coroutine is the only thing draining the socket.
+    counts["ticks"] += await asyncio.to_thread(store.save_ticks, ticks)
+    counts["orderbooks"] += await asyncio.to_thread(store.save_orderbooks, orderbooks)
     observed = {tick.symbol for tick in ticks} | {book.symbol for book in orderbooks}
     # 분 bar 를 **메시지마다** 재집계하지 않는다.
     #
@@ -782,11 +882,13 @@ async def _process_kis_realtime_raw(
     # 연속 분 bar 를 얻지 못해 NO_TRADE_MARKET → 신규 매수 전면 차단이 됐다.
     #
     # 분 bar 는 분 단위 산출물이므로 심볼당 몇 초 간격이면 충분히 수렴한다.
-    _build_minute_bars_throttled(store, observed, counts)
+    await asyncio.to_thread(_build_minute_bars_throttled, store, observed, counts)
     for symbol in observed:
         try:
             if feature_builder is not None:
-                feature_builder.build(symbol)
+                # Reads the store and writes a feature frame, so it belongs off
+                # the loop for the same reason as the bar rebuild above.
+                await asyncio.to_thread(feature_builder.build, symbol)
             counts["feature_frames"] = counts.get("feature_frames", 0) + 1
         except (FeatureFrameError, RuntimeError, ValueError) as exc:
             counts["feature_frame_errors"] = counts.get("feature_frame_errors", 0) + 1
@@ -1085,6 +1187,76 @@ def _minute_bar_rebuild_interval_seconds() -> float:
         return 2.0
 
 
+#: In-flight background minute-bar rebuild, at most one at a time. A second
+#: concurrent rebuild would only queue behind the first on the same SQLite writer
+#: while letting the task set grow without bound; skipping is free because the
+#: next message retries and the bar is an aggregate that converges.
+_minute_bar_task: "asyncio.Task[None] | None" = None
+
+
+def _dispatch_minute_bar_rebuild(
+    store: RealtimeMarketDataStore,
+    symbols: set[str],
+    counts: dict[str, Any],
+) -> None:
+    """Schedule a minute-bar rebuild WITHOUT the caller awaiting it.
+
+    The caller is the coroutine draining the websocket, so it must never be
+    gated on store latency. Returns immediately; the rebuild lands in a worker
+    thread. Dropped silently when one is already running or no symbol is due.
+    """
+    global _minute_bar_task
+    if _minute_bar_task is not None and not _minute_bar_task.done():
+        counts["minute_bar_rebuilds_skipped"] = (
+            counts.get("minute_bar_rebuilds_skipped", 0) + 1
+        )
+        return
+    due = minute_bars_due(symbols)
+    if not due:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _build_minute_bars_throttled(store, set(due), counts)
+        return
+    _minute_bar_task = loop.create_task(
+        asyncio.to_thread(_build_minute_bars_throttled, store, set(due), counts)
+    )
+    # Nobody awaits this task, so an exception would surface only as a warning at
+    # garbage-collection time. Consume it into the counters the operator reads.
+    def _absorb(task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        counts["minute_bar_errors"] = counts.get("minute_bar_errors", 0) + 1
+        counts["last_minute_bar_error"] = str(error) or error.__class__.__name__
+
+    _minute_bar_task.add_done_callback(_absorb)
+
+
+def minute_bars_due(symbols: set[str], *, stamp: float | None = None) -> tuple[str, ...]:
+    """Which observed symbols are due for a minute-bar rebuild right now.
+
+    Split out of ``_build_minute_bars_throttled`` so the throttle decision — two
+    dict lookups and a float compare — can be made on the websocket event loop
+    while the actual store round trip is dispatched somewhere that the socket
+    does not wait on. Awaiting the rebuild per message capped ingestion at the
+    store's latency: the feed came back but ran ~30-45s behind the tape, with the
+    kernel receive queue still climbing.
+    """
+    moment = time.monotonic() if stamp is None else stamp
+    interval = _minute_bar_rebuild_interval_seconds()
+    due: list[str] = []
+    for symbol in symbols:
+        previous = _LAST_MINUTE_BAR_BUILT.get(symbol)
+        if previous is not None and (moment - previous) < interval:
+            continue
+        due.append(symbol)
+    return tuple(due)
+
+
 def _build_minute_bars_throttled(
     store: RealtimeMarketDataStore,
     symbols: set[str],
@@ -1104,12 +1276,8 @@ def _build_minute_bars_throttled(
     제한하면서 같은 수렴 성질을 유지한다.
     """
     current = now or datetime.now(timezone.utc)
-    interval = _minute_bar_rebuild_interval_seconds()
     stamp = time.monotonic()
-    for symbol in symbols:
-        previous = _LAST_MINUTE_BAR_BUILT.get(symbol)
-        if previous is not None and (stamp - previous) < interval:
-            continue
+    for symbol in minute_bars_due(symbols, stamp=stamp):
         try:
             bar = store.build_latest_minute_bar(symbol, now=current)
         except Exception as exc:  # noqa: BLE001 - bar 집계 실패가 수집을 멈추면 안 된다.

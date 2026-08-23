@@ -5,8 +5,8 @@ import os
 import hashlib
 import time
 from collections import deque
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -57,10 +57,12 @@ class ResearchService:
         archive: RawArchive | None = None,
         progress_callback: ProgressCallback | None = None,
         llm_classifier: JsonEventLLMClassifier | None = None,
+        existing_events: tuple[ClassifiedEvent, ...] = (),
     ) -> None:
         self.archive = archive
         self.progress_callback = progress_callback
         self.llm_classifier = llm_classifier
+        self.existing_events = existing_events
 
     def run_from_config(self, path: Path) -> ResearchRunResult:
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -73,7 +75,8 @@ class ResearchService:
             known_tickers.update(universe_context["known_tickers"])
         llm_classifier = self.llm_classifier or build_event_llm_classifier_from_env()
         llm_items_per_source = _positive_int(os.getenv("LLM_EVENT_MAX_ITEMS_PER_SOURCE"), default=2)
-        llm_items_remaining = _nonnegative_int(os.getenv("LLM_EVENT_MAX_ITEMS_PER_RUN"), default=3)
+        llm_items_per_run = _nonnegative_int(os.getenv("LLM_EVENT_MAX_ITEMS_PER_RUN"), default=3)
+        llm_max_age_days = _positive_int(os.getenv("LLM_EVENT_MAX_AGE_DAYS"), default=7)
         retry_enabled = bool(config.get("retry_failed_sources", True))
         retry_attempts = max(1, int(config.get("retry_attempts", 3)))
         retry_backoff_ms = max(200, int(config.get("retry_backoff_ms", 700)))
@@ -85,6 +88,7 @@ class ResearchService:
         market_snapshots: list[MarketSnapshot] = []
         macro_metrics: list[MacroMetricRecord] = []
         skipped: list[str] = []
+        optional_unavailable: list[str] = []
         archived_paths: list[str] = []
         retry_queue: deque[_RetryJob] = deque()
         total_sources = _configured_source_count(config)
@@ -104,27 +108,25 @@ class ResearchService:
 
         rss_collector = RssNewsCollector()
         for rss_source in config.get("rss_feeds", []):
-            feed_url, rss_event_type = _parse_rss_source(rss_source, base_dir)
+            feed_url, rss_event_type, rss_options = _parse_rss_source(rss_source, base_dir)
             source_key = f"rss:{feed_url}"
 
             def _action(
                 url: str = str(feed_url),
                 source_event_type: EventType = rss_event_type,
+                source_options: dict[str, Any] = rss_options,
             ) -> None:
-                nonlocal llm_items_remaining
-                max_llm_items = min(llm_items_per_source, llm_items_remaining)
                 rss_result = rss_collector.collect_with_articles(
-                        str(feed_url),
+                        url,
                         known_tickers,
-                        llm_classifier=llm_classifier if max_llm_items > 0 else None,
-                        max_llm_items=max_llm_items,
-                        fetch_articles=rss_fetch_articles,
-                        article_limit=rss_article_limit_value,
+                        llm_classifier=None,
+                        fetch_articles=bool(source_options.get("fetch_articles", rss_fetch_articles)),
+                        article_limit=source_options.get("article_limit", rss_article_limit_value),
+                        item_limit=source_options.get("max_items"),
                         event_type=source_event_type,
                     )
                 events.extend(rss_result.events)
                 raw_records.extend(rss_result.raw_records)
-                llm_items_remaining = max(0, llm_items_remaining - max_llm_items)
 
             if not _run_or_queue(source_key, _action, retry_enabled, retry_queue, skipped):
                 _mark(source_key)
@@ -151,7 +153,7 @@ class ResearchService:
                         source=record.source,
                         event_type=source_event_type,
                         known_tickers=known_tickers,
-                        llm_classifier=llm_classifier,
+                        llm_classifier=None,
                     )
                 )
                 if self.archive is not None:
@@ -183,7 +185,7 @@ class ResearchService:
                     timeout_ms=timeout,
                 )
                 raw_records.append(record)
-                sections = extract_focus_sections(record.payload)
+                sections = extract_focus_sections(record.payload, preferred_title=page_title)
                 event_title = page_title or sections["headline"] or _title_from_payload(record.payload)
                 event_body = sections["summary"]
                 if sections["numeric_highlights"]:
@@ -195,7 +197,7 @@ class ResearchService:
                         source=record.source,
                         event_type=source_event_type,
                         known_tickers=known_tickers,
-                        llm_classifier=llm_classifier,
+                        llm_classifier=None,
                     )
                 )
                 if self.archive is not None:
@@ -285,6 +287,10 @@ class ResearchService:
         ecos = EcosMacroCollector()
         for item in config.get("ecos_series", []):
             source_key = f"ecos:{item.get('statistic_code')}"
+            if bool(item.get("optional_without_api_key", False)) and not ecos.api_key:
+                optional_unavailable.append(source_key)
+                _mark(source_key)
+                continue
 
             def _action(target: dict[str, Any] = item) -> None:
                 metric = ecos.collect_latest(
@@ -319,7 +325,7 @@ class ResearchService:
                     begin_date=str(target["begin_date"]),
                     end_date=str(target["end_date"]),
                     known_tickers=known_tickers,
-                    llm_classifier=llm_classifier,
+                    llm_classifier=None,
                 )
                 if not rows:
                     raise RuntimeError("missing_api_key_or_data")
@@ -340,6 +346,15 @@ class ResearchService:
         )
 
         deduped_events = _dedupe_events(tuple(events))
+        deduped_events, llm_diagnostics = _enrich_new_events_with_llm(
+            deduped_events,
+            existing_events=self.existing_events,
+            known_tickers=known_tickers,
+            llm_classifier=llm_classifier,
+            max_items_per_source=llm_items_per_source,
+            max_items_per_run=llm_items_per_run,
+            max_age_days=llm_max_age_days,
+        )
         deduped_raw_records = _dedupe_raw_records(tuple(raw_records))
         diagnostics = _build_diagnostics(
             deduped_events,
@@ -350,6 +365,8 @@ class ResearchService:
         )
         diagnostics.update(universe_context["diagnostics"])
         diagnostics.update(_build_config_diagnostics(config))
+        diagnostics.update(llm_diagnostics)
+        diagnostics["optional_sources_unavailable"] = optional_unavailable
 
         return ResearchRunResult(
             events=deduped_events,
@@ -371,7 +388,7 @@ def _resolve_source(value: Any, base_dir: Path | None) -> str:
     return (base_dir / text).resolve().as_uri()
 
 
-def _parse_rss_source(value: Any, base_dir: Path | None) -> tuple[str, EventType]:
+def _parse_rss_source(value: Any, base_dir: Path | None) -> tuple[str, EventType, dict[str, Any]]:
     """Parse a feed URL plus its semantic scope.
 
     Plain strings retain the historical NEWS default.  Mapping sources let
@@ -385,8 +402,17 @@ def _parse_rss_source(value: Any, base_dir: Path | None) -> tuple[str, EventType
             event_type = EventType(raw_type)
         except ValueError:
             event_type = EventType.NEWS
-        return url, event_type
-    return _resolve_source(value, base_dir), EventType.NEWS
+        options: dict[str, Any] = {}
+        max_items = _optional_positive_int(value.get("max_items"))
+        article_limit = _optional_nonnegative_int(value.get("article_limit"))
+        if max_items is not None:
+            options["max_items"] = max_items
+        if article_limit is not None:
+            options["article_limit"] = article_limit
+        if "fetch_articles" in value:
+            options["fetch_articles"] = bool(value.get("fetch_articles"))
+        return url, event_type, options
+    return _resolve_source(value, base_dir), EventType.NEWS, {}
 
 
 def _configured_source_count(config: dict[str, Any]) -> int:
@@ -648,6 +674,92 @@ def _nonnegative_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _enrich_new_events_with_llm(
+    events: tuple[ClassifiedEvent, ...],
+    *,
+    existing_events: tuple[ClassifiedEvent, ...],
+    known_tickers: dict[str, str],
+    llm_classifier: JsonEventLLMClassifier | None,
+    max_items_per_source: int,
+    max_items_per_run: int,
+    max_age_days: int,
+) -> tuple[tuple[ClassifiedEvent, ...], dict[str, int]]:
+    """Reuse persisted classifications and spend inference only on unseen events."""
+    existing_by_id = {event.event_id: event for event in existing_events}
+    resolved = {
+        event.event_id: existing_by_id.get(event.event_id, event)
+        for event in events
+    }
+    unseen = [event for event in events if event.event_id not in existing_by_id]
+    fresh_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    eligible_unseen = [
+        event for event in unseen
+        if _as_aware_event_date(event.event_date) >= fresh_cutoff
+    ]
+    candidates = sorted(
+        eligible_unseen,
+        key=lambda event: _as_aware_event_date(event.event_date),
+        reverse=True,
+    )
+    used_by_source: dict[str, int] = {}
+    attempted = 0
+    classified = 0
+    if llm_classifier is not None and max_items_per_run > 0:
+        for event in candidates:
+            if attempted >= max_items_per_run:
+                break
+            source_key = str(
+                urlparse(event.source.raw_url or "").netloc
+                or event.source.source_name
+                or event.source.source_id
+                or "unknown"
+            )
+            if used_by_source.get(source_key, 0) >= max_items_per_source:
+                continue
+            attempted += 1
+            used_by_source[source_key] = used_by_source.get(source_key, 0) + 1
+            enriched = classify_text_event(
+                title=event.title,
+                body=event.summary,
+                source=event.source,
+                event_type=event.event_type,
+                known_tickers=known_tickers,
+                event_date=event.event_date,
+                llm_classifier=llm_classifier,
+            )
+            resolved[event.event_id] = replace(enriched, event_id=event.event_id)
+            if enriched.classification_model not in {"keyword_v1", "keyword_v1_after_llm_error"}:
+                classified += 1
+    return tuple(resolved[event.event_id] for event in events), {
+        "llm_new_candidates": len(unseen),
+        "llm_reused_events": len(events) - len(unseen),
+        "llm_attempted_new_events": attempted,
+        "llm_classified_new_events": classified,
+        "llm_stale_candidates_skipped": len(unseen) - len(eligible_unseen),
+        "llm_budget_exhausted_events": max(0, len(eligible_unseen) - attempted),
+    }
+
+
+def _as_aware_event_date(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _dedupe_events(events: tuple[ClassifiedEvent, ...]) -> tuple[ClassifiedEvent, ...]:

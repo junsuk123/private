@@ -74,7 +74,9 @@ def _macro(**overrides):
     return SimpleNamespace(**base)
 
 
-def _bundle(*, symbol="005930", strategy="intraday_momentum", macro=None, exit_price=70_350.0):
+# +160bps, not the old +50: the cost gate divides the SIGNAL's forecast by the all-in
+# cost now, so a fixture has to state an edge that genuinely clears it.
+def _bundle(*, symbol="005930", strategy="intraday_momentum", macro=None, exit_price=71_120.0):
     intent = SimpleNamespace(
         side="BUY",
         symbol=symbol,
@@ -541,6 +543,9 @@ def test_closed_position_records_a_realized_outcome(tmp_path):
     target = Holding(**{**holding.__dict__, "last_price": exit_price})
     exiting = manager.evaluate(_account(target), (), _bundle(), NOW + timedelta(seconds=2))
     assert exiting["phase"] == "EXITING"
+    # The broker confirming the exit FILL is what closes the position. A balance
+    # response that merely stopped listing the lot is not evidence of anything.
+    manager.mark_exit_filled("005930", exit_price, NOW + timedelta(seconds=3))
     flat = manager.evaluate(_account(), (), _bundle(), NOW + timedelta(seconds=3))
     assert flat["phase"] == "COOLDOWN"
 
@@ -549,7 +554,15 @@ def test_closed_position_records_a_realized_outcome(tmp_path):
     outcome = outcomes[0]
     # Gross must clear the target it was triggered by, and the round trip on top.
     assert outcome.realized_gross_bps > target_bps
-    assert outcome.realized_net_bps == outcome.realized_gross_bps - 28.0
+    # Charged at the venue's own fee policy, not at the configured KR reference
+    # constant. With no measured spread in this bundle the all-in cost IS the policy
+    # round trip; hardcoding 28.0 here is what let the live gate divide an edge by
+    # fees alone and call it sufficient.
+    from app.trading.strategy_session import _market_round_trip_cost_bps
+
+    policy_cost = _market_round_trip_cost_bps("005930", 28.0)
+    assert policy_cost >= 28.0
+    assert outcome.realized_net_bps == outcome.realized_gross_bps - policy_cost
     assert outcome.regime == "HIGH_VOL_TRENDING"
     assert outcome.exit_reason == "STRATEGY_PROFIT_TARGET"
 
@@ -570,14 +583,22 @@ def test_outcome_is_recorded_once_only(tmp_path):
         opened_at=NOW,
     )
     manager.evaluate(_account(holding), (), _bundle(), NOW + timedelta(seconds=1))
-    for offset in (2, 3, 4):
+    # The close has to be CONFIRMED before anything is recorded — a single absent
+    # balance response is a partial broker reply, not an exit. Once it is confirmed,
+    # every further flat observation must still leave exactly one outcome.
+    for offset in (200, 201, 202, 203):
         manager.evaluate(_account(), (), _bundle(), NOW + timedelta(seconds=offset))
     assert len(store.recent_outcomes("intraday_momentum", market="KR")) == 1
 
 
 def test_bandit_can_be_disabled_to_restore_first_admissible_election(tmp_path):
+    # 15 samples, not 25: past LongPromotionConfig.minimum_shadow_samples (20) a
+    # non-positive conservative edge demotes the arm out of live authority, and this
+    # test would then be measuring the deployment ladder rather than the election
+    # posture. The losing history is only here to prove the bandit is not what armed
+    # the proposal.
     store = _store(tmp_path)
-    for index in range(25):
+    for index in range(15):
         store.record(
             strategy_id="intraday_momentum",
             symbol="005930",

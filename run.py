@@ -10,6 +10,31 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+def _install_thread_dump_signal() -> None:
+    """Dump every thread's Python stack to stderr on SIGUSR1.
+
+    This process runs ~90 threads plus several asyncio loops, and its worst
+    failures are silent stalls rather than exceptions: on 2026-08-21 the KIS
+    market-data socket stayed ESTABLISHED with the kernel receive queue climbing
+    while nothing raised, and the only way to find out which await was wedged was
+    to read the stacks. ``py-spy`` cannot attach here because
+    ``kernel.yama.ptrace_scope`` is 1, so the process has to be able to tell us
+    itself. Read-only, costs nothing until the signal arrives.
+
+    Usage: ``kill -USR1 <pid>`` then read ``logs/run-server.err.log``.
+    """
+    import faulthandler
+    import signal
+
+    handler = getattr(signal, "SIGUSR1", None)
+    if handler is None:  # Windows has no SIGUSR1.
+        return
+    try:
+        faulthandler.register(handler, all_threads=True, chain=False)
+    except Exception:  # noqa: BLE001 - diagnostics must never block startup.
+        pass
+
+
 def _require_runtime_dependencies() -> None:
     """Fail before starting workers when a partial Python environment is used.
 
@@ -30,6 +55,7 @@ def _require_runtime_dependencies() -> None:
     )
 
 
+_install_thread_dump_signal()
 _require_runtime_dependencies()
 
 from app.run import main

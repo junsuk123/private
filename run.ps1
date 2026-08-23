@@ -792,8 +792,24 @@ Set-DefaultEnv "REALTIME_LOSS_REBUY_RETURN_THRESHOLD" "-0.004"
 Set-DefaultEnv "REALTIME_MAX_BUY_ORDERS_PER_CYCLE" "2"
 Set-DefaultEnv "REALTIME_BUY_WEIGHT" "0.4"
 Set-DefaultEnv "REALTIME_TAKE_PROFIT" "0.008"
-Set-DefaultEnv "AUTO_RELIABILITY_US_WARM_SYMBOLS" "6"
-Set-DefaultEnv "KIS_OVERSEAS_REALTIME_MAX_SYMBOLS" "6"
+# US realtime breadth. Six was leaving most of the account's KIS realtime budget
+# unused and starving the election: measured 2026-08-21, KRX streamed 171 distinct
+# symbols in 24h while the US side saw six, and the candidate filter's 10s/2-tick
+# admission gate can only ever pass a name that is actually subscribed -- so the
+# strategy election ran against ONE symbol during the US session.
+#
+# KIS bills realtime registrations per appkey and each symbol costs two (trade +
+# orderbook). The domestic collector already runs at KIS_REALTIME_MAX_SUBSCRIPTIONS
+# (40) without hitting OPSP0008, and KIS_REALTIME_SINGLE_SESSION means US and KRX
+# never stream at the same time -- the session owner election hands the socket to
+# exactly one market. So the US side can use the same budget: 16 symbols = 32
+# registrations, inside both that ceiling and the code's own min(20) cap.
+#
+# Safe to raise: _record_kis_overseas_realtime_progress watches for OPSP0008 and
+# halves the limit to the observed capacity, so an account with a smaller budget
+# self-corrects instead of opening partial subscriptions.
+Set-DefaultEnv "AUTO_RELIABILITY_US_WARM_SYMBOLS" "16"
+Set-DefaultEnv "KIS_OVERSEAS_REALTIME_MAX_SYMBOLS" "16"
 Set-DefaultEnv "REALTIME_US_ROTATION_POOL_MULTIPLIER" "3"
 # Keep each window for one full model-label horizon before rotating it.
 Set-DefaultEnv "REALTIME_US_WATCHLIST_RECHECK_SEC" "600"

@@ -51,11 +51,20 @@ class TestHealthyTape:
 
 
 class TestHardViolations:
-    def test_stale_data_forces_exit(self, supervisor):
-        verdict = supervisor.evaluate(observation(data_age_seconds=120.0))
+    def test_stale_data_blocks_a_new_entry(self, supervisor):
+        verdict = supervisor.evaluate(
+            observation(position_open=False, data_age_seconds=120.0)
+        )
         assert verdict.level is HaltLevel.HARD
         assert verdict.forces_exit
         assert any(code.startswith("DATA_STALE") for code in verdict.hard_reason_codes)
+
+    def test_stale_data_does_not_liquidate_committed_exposure(self, supervisor):
+        verdict = supervisor.evaluate(observation(data_age_seconds=120.0))
+        assert verdict.level is HaltLevel.SOFT
+        assert verdict.blocks_new_entries
+        assert not verdict.forces_exit
+        assert any(code.startswith("DATA_STALE") for code in verdict.soft_reason_codes)
 
     def test_stale_data_is_ignored_while_the_session_is_closed(self, supervisor):
         """Overnight staleness must not queue a market-open liquidation."""

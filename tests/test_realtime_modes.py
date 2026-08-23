@@ -26,6 +26,8 @@ from app.web import app
 class RealtimeModesTest(unittest.TestCase):
     def setUp(self) -> None:
         with web_module._live_lock:
+            web_module._operation_mode_state["live_preflight_pending"] = False
+            web_module._auto_reliability_state["manual_hold"] = False
             web_module._operation_mode_state["last_kis_connection"] = None
             web_module._operation_mode_state["live_trading_baseline_equity"] = None
             web_module._operation_mode_state["stable_account_basis"] = None
@@ -735,6 +737,82 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertTrue(data["live_trading_enabled_by_env"])
         self.assertTrue(data["runtime_gate"]["ok"])
         self.assertIn("RiskManager", data["live_trading_message"])
+
+    def test_live_trading_preflight_latch_releases_only_after_all_gates_pass(self) -> None:
+        client = TestClient(app)
+        calls: list[str] = []
+        engine = SimpleNamespace(
+            enable_buys=lambda reason: calls.append(f"enable:{reason}"),
+            disable_buys=lambda reason: calls.append(f"disable:{reason}"),
+        )
+        with (
+            patch.object(web_module, "_realtime_trading_engine", engine),
+            patch("app.web._start_kis_realtime_collector"),
+            patch("app.web._start_realtime_trading_engine"),
+            patch(
+                "app.web._kis_connection_probe",
+                side_effect=lambda **kwargs: (
+                    calls.append(f"probe:authorized={web_module._live_entries_authorized()}")
+                    or {"ok": True, "account_checked": True, "actual_deposit": 1_000_000}
+                ),
+            ),
+            patch(
+                "app.web.load_short_horizon_strategy_config",
+                return_value={"execution": {"live_trading_enabled": True}},
+            ),
+            patch(
+                "app.web.evaluate_live_runtime_gates",
+                return_value=SimpleNamespace(ok=True, failures=()),
+            ),
+            patch.dict(
+                "os.environ",
+                {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"},
+            ),
+        ):
+            data = client.post(
+                "/api/operation-mode/start", json={"mode": "live_trading"}
+            ).json()
+
+        self.assertEqual(data["live_trading_status"], "armed")
+        self.assertIn("probe:authorized=False", calls)
+        self.assertTrue(calls[-1].startswith("enable:"))
+        self.assertTrue(web_module._live_entries_authorized())
+
+    def test_failed_live_preflight_keeps_engine_buy_disabled(self) -> None:
+        client = TestClient(app)
+        calls: list[str] = []
+        engine = SimpleNamespace(
+            enable_buys=lambda reason: calls.append(f"enable:{reason}"),
+            disable_buys=lambda reason: calls.append(f"disable:{reason}"),
+        )
+        with (
+            patch.object(web_module, "_realtime_trading_engine", engine),
+            patch("app.web._start_kis_realtime_collector"),
+            patch("app.web._start_realtime_trading_engine"),
+            patch(
+                "app.web._kis_connection_probe",
+                return_value={"ok": False, "account_checked": False},
+            ),
+            patch(
+                "app.web.load_short_horizon_strategy_config",
+                return_value={"execution": {"live_trading_enabled": True}},
+            ),
+            patch(
+                "app.web.evaluate_live_runtime_gates",
+                return_value=SimpleNamespace(ok=True, failures=()),
+            ),
+            patch.dict(
+                "os.environ",
+                {"LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true"},
+            ),
+        ):
+            data = client.post(
+                "/api/operation-mode/start", json={"mode": "live_trading"}
+            ).json()
+
+        self.assertEqual(data["live_trading_status"], "blocked")
+        self.assertEqual(calls, ["disable:LIVE_TRADING_PREFLIGHT_BLOCKED"])
+        self.assertFalse(web_module._live_entries_authorized())
 
     def test_live_trading_start_preserves_cached_analysis_context(self) -> None:
         client = TestClient(app)
@@ -3238,6 +3316,110 @@ class RealtimeModesTest(unittest.TestCase):
             "realtime_trading_engine.live_trace",
         )
         self.assertFalse(result["ontology_allowed"])
+
+    def test_live_trading_visualization_builds_one_layer_per_broker_position(self) -> None:
+        basis = {
+            "positions": [
+                {
+                    "ticker": "001510", "market": "KR", "quantity": 1,
+                    "average_price": 3000, "last_price": 3010,
+                    "unrealized_pnl": 10, "currency": "KRW",
+                },
+                {
+                    "ticker": "010140", "market": "KR", "quantity": 2,
+                    "average_price": 20200, "last_price": 20300,
+                    "unrealized_pnl": 200, "currency": "KRW",
+                },
+            ]
+        }
+        session = {
+            "session_id": "session-live",
+            "selected_symbol": "001510",
+            "selected_strategy": "adaptive_anchored_vwap_reversion",
+            "phase": "OWNED",
+            "target_price": 3048,
+            "stop_loss_rate": 0.006,
+            "position_opened_at": "2026-08-21T02:20:00+00:00",
+            "selected_at": "2026-08-21T02:19:50+00:00",
+        }
+        journal = {
+            "recent_orders": [
+                {
+                    "event_type": "live_strategy_order_link",
+                    "recorded_at": "2026-08-21T02:21:00+00:00",
+                    "ticker": "010140", "side": "BUY", "quantity": 2,
+                    "limit_price": 20200,
+                    "strategy_id": "cross_sectional_relative_strength",
+                }
+            ]
+        }
+
+        def market_stream(symbol: str, *, limit: int) -> dict:
+            price = 3015 if symbol == "001510" else 20300
+            return {
+                "market": {
+                    "last_price": price,
+                    "feed_state": "LIVE_TRADE",
+                    "stale": False,
+                    "bars": [{
+                        "time": "2026-08-21T02:20:00+00:00",
+                        "open": price, "high": price, "low": price, "close": price,
+                    }],
+                    "second_bars": [],
+                }
+            }
+
+        with (
+            patch("app.web._last_live_account_basis", return_value=basis),
+            patch("app.web.build_strategy_market_stream", side_effect=market_stream),
+        ):
+            layers = web_module._live_trading_visualization_layers(
+                {"config": {"take_profit": 0.008, "stop_loss": 0.01}},
+                session=session,
+                journal=journal,
+            )
+
+        self.assertEqual([layer["symbol"] for layer in layers], ["001510", "010140"])
+        self.assertEqual(layers[0]["strategy_id"], "adaptive_anchored_vwap_reversion")
+        self.assertEqual(layers[0]["target_price"], 3048)
+        self.assertEqual(layers[1]["strategy_id"], "cross_sectional_relative_strength")
+        self.assertAlmostEqual(layers[1]["target_price"], 20361.6)
+        self.assertEqual(layers[1]["current_price"], 20300)
+
+    def test_live_trading_visualization_removes_layer_when_not_held(self) -> None:
+        now = datetime.now(timezone.utc)
+        journal = {
+            "submitted_orders": [
+                {
+                    "event_type": "live_order_submitted",
+                    "recorded_at": (now - timedelta(minutes=5)).isoformat(),
+                    "ticker": "001510", "market": "KR", "currency": "KRW",
+                    "side": "BUY", "quantity": 1, "limit_price": 3000,
+                    "status": "ACCEPTED",
+                },
+                {
+                    "event_type": "live_order_status",
+                    "recorded_at": now.isoformat(),
+                    "ticker": "001510", "market": "KR", "currency": "KRW",
+                    "side": "SELL", "filled_quantity": 1,
+                    "average_fill_price": 3030, "status": "FILLED",
+                },
+            ]
+        }
+        with (
+            patch("app.web._last_live_account_basis", return_value={"positions": []}),
+            patch(
+                "app.web.build_strategy_market_stream",
+                return_value={"market": {"last_price": 3030, "bars": [], "second_bars": []}},
+            ),
+        ):
+            layers = web_module._live_trading_visualization_layers(
+                {"config": {"take_profit": 0.008, "stop_loss": 0.01}},
+                session={},
+                journal=journal,
+            )
+
+        self.assertEqual(layers, [])
 
 
 if __name__ == "__main__":

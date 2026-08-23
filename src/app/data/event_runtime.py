@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -25,6 +26,11 @@ from app.routing.shadow_intelligence import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: Idle wait between bus polls. Long enough that an empty bus costs nothing,
+#: short enough that ``collector.done()`` is still noticed promptly.
+_BUS_IDLE_WAIT_SECONDS = 0.25
 
 
 #: 해외(미국) 실시간 TR 쌍과 세션 인식 subscription key. 값의 근거는
@@ -88,11 +94,11 @@ async def run_event_driven_kis_websocket_collector(
         if flags.ontology_router or flags.gnn_shadow
         else None
     )
-    slow_queue: asyncio.Queue[SlowIntelligenceSnapshot] | None = (
+    slow_queue: "asyncio.Queue[_SlowSnapshotRequest] | None" = (
         asyncio.Queue(maxsize=64) if slow_service is not None else None
     )
     slow_worker = (
-        asyncio.create_task(slow_intelligence_worker(slow_service, slow_queue))
+        asyncio.create_task(slow_intelligence_worker(slow_service, slow_queue, runtime))
         if slow_service is not None and slow_queue is not None
         else None
     )
@@ -120,21 +126,37 @@ async def run_event_driven_kis_websocket_collector(
                     symbol = str(getattr(event, "symbol", "") or "")
                     now_monotonic = time.monotonic()
                     last_enqueued = slow_snapshot_last_enqueued.get(symbol, 0.0)
-                    snapshot = (
-                        _slow_snapshot(runtime)
+                    # Only the cheap in-memory part happens here. Building the
+                    # full snapshot used to run on this event loop, and it issues
+                    # several SQLite queries against an 8GB store
+                    # (``_slow_context_bars`` -> ``recent_minute_bars``). At one
+                    # per second per symbol across six subscribed symbols that
+                    # consumed the loop, so the websocket reader sharing it never
+                    # got to call ``recv()``: the socket stayed ESTABLISHED with
+                    # the kernel receive queue climbing and US market data
+                    # stopped ~70s after every reconnect, with nothing raised.
+                    # Confirmed by a SIGUSR1 thread dump showing this loop parked
+                    # in ``recent_minute_bars``. The store work now happens in the
+                    # slow worker's thread. See
+                    # [[obaits-collector-busywait-starves-websocket]].
+                    request = (
+                        _slow_snapshot_request(runtime)
                         if symbol
                         and now_monotonic - last_enqueued >= slow_snapshot_interval
                         else None
                     )
-                    if snapshot is not None:
+                    if request is not None:
                         slow_snapshot_last_enqueued[symbol] = now_monotonic
                         if slow_queue.full():
                             with suppress(asyncio.QueueEmpty):
                                 slow_queue.get_nowait()
                                 slow_queue.task_done()
-                        slow_queue.put_nowait(snapshot)
+                        slow_queue.put_nowait(request)
             else:
-                await asyncio.sleep(0)
+                # Not ``sleep(0)``: that is a bare yield, so this loop spun as
+                # fast as the interpreter could run it and starved the websocket
+                # reader sharing this event loop. Wait for the producer instead.
+                await bus.wait_for_depth(_BUS_IDLE_WAIT_SECONDS)
         counts = await collector
         await runtime.wait_for_persistence()
         if slow_queue is not None:
@@ -170,23 +192,67 @@ async def runtime_persistence_worker(runtime: EventDrivenMarketRuntime) -> None:
 
 async def slow_intelligence_worker(
     service: ShadowIntelligenceService,
-    queue: asyncio.Queue[SlowIntelligenceSnapshot],
+    queue: "asyncio.Queue[_SlowSnapshotRequest]",
+    runtime: EventDrivenMarketRuntime,
 ) -> None:
+    """Build and evaluate slow snapshots entirely off the event loop.
+
+    Both halves run in a worker thread: assembling the snapshot queries the store
+    (which is what stalled the websocket reader when it ran on the loop), and the
+    inference is CPU work. ``_build_slow_snapshot`` only reads
+    ``runtime.store``, which opens its own connection per call, so it is safe
+    here — the mutable runtime state was already sampled on the loop.
+    """
     while True:
-        snapshot = await queue.get()
+        request = await queue.get()
         try:
             try:
-                await asyncio.to_thread(service.evaluate, snapshot)
+                await asyncio.to_thread(
+                    _build_and_evaluate_slow_snapshot, service, runtime, request
+                )
             except Exception:  # noqa: BLE001 - one bad inference must not kill all future samples.
                 logger.exception(
                     "slow intelligence inference failed for %s",
-                    snapshot.symbol,
+                    request.symbol,
                 )
         finally:
             queue.task_done()
 
 
-def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapshot | None:
+def _build_and_evaluate_slow_snapshot(
+    service: ShadowIntelligenceService,
+    runtime: EventDrivenMarketRuntime,
+    request: "_SlowSnapshotRequest",
+) -> None:
+    snapshot = _build_slow_snapshot(runtime, request)
+    if snapshot is None:
+        return
+    service.evaluate(snapshot)
+
+
+@dataclass(frozen=True)
+class _SlowSnapshotRequest:
+    """Everything sampled from mutable runtime state, frozen on the event loop.
+
+    Split out so the loop touches ONLY in-memory state. The store-backed half of
+    the old ``_slow_snapshot`` (``_runtime_strategy_graph_context``) now runs in
+    the slow worker's thread, where a slow SQLite query costs a delayed shadow
+    evaluation instead of a stalled market-data socket.
+    """
+
+    symbol: str
+    record_id: str
+    now: datetime
+    as_of: datetime
+    last_price: float
+    data_fresh: bool
+    sequence_uncertain: bool
+
+
+def _slow_snapshot_request(
+    runtime: EventDrivenMarketRuntime,
+) -> _SlowSnapshotRequest | None:
+    """Cheap, in-memory sample of the just-processed event. No store access."""
     event = runtime.last_processed_event
     if event is None:
         return None
@@ -197,26 +263,41 @@ def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapsho
     features = state.features(now, staleness_ms=5_000)
     if features is None:
         return None
+    return _SlowSnapshotRequest(
+        symbol=event.symbol,
+        record_id=str(event.record_id),
+        now=now,
+        as_of=features.as_of,
+        last_price=float(features.last_price),
+        data_fresh=bool(features.fresh),
+        sequence_uncertain=bool(features.sequence_uncertain),
+    )
+
+
+def _build_slow_snapshot(
+    runtime: EventDrivenMarketRuntime, request: _SlowSnapshotRequest
+) -> SlowIntelligenceSnapshot | None:
+    """Store-backed half. Must run off the event loop — it queries SQLite."""
     values = _runtime_strategy_graph_context(
         runtime,
-        event.symbol,
-        now,
-        features.last_price,
+        request.symbol,
+        request.now,
+        request.last_price,
     )
     if values is None:
         return None
     return SlowIntelligenceSnapshot(
-        snapshot_id=f"{event.symbol}:{event.record_id}",
-        symbol=event.symbol,
-        as_of=features.as_of,
-        valid_until=features.as_of + timedelta(seconds=5),
-        feature_snapshot_id=f"event:{event.record_id}",
+        snapshot_id=f"{request.symbol}:{request.record_id}",
+        symbol=request.symbol,
+        as_of=request.as_of,
+        valid_until=request.as_of + timedelta(seconds=5),
+        feature_snapshot_id=f"event:{request.record_id}",
         features=values,
-        data_fresh=features.fresh,
-        tradable=features.fresh and not features.sequence_uncertain,
+        data_fresh=request.data_fresh,
+        tradable=request.data_fresh and not request.sequence_uncertain,
         allowed_strategy_ids=STRATEGY_IDS,
         feature_schema_name=STRATEGY_GRAPH_CONTEXT_SCHEMA,
-        reference_price=max(0.0, float(features.last_price)),
+        reference_price=max(0.0, request.last_price),
     )
 
 

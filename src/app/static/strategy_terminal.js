@@ -2522,6 +2522,7 @@ async function fetchMarketStream() {
       terminalState.data.algorithm || null,
     );
     renderTradingChart(terminalState.data.market, terminalState.data.algorithm || null);
+    renderTradingLayers(terminalState.data);
     renderSecondAnalysis(terminalState.data.market);
     renderExecution(
       terminalState.data.execution || {},
@@ -2929,6 +2930,7 @@ function renderTerminal(data) {
   renderCandidates(data.candidates || [], data.strategy_session || {});
   renderInstrument(data.symbol, market, selection, algorithm);
   renderTradingChart(market, algorithm);
+  renderTradingLayers(data);
   renderSecondAnalysis(market);
   renderDecisionOntology(data.decision_ontology || {});
   renderOntology(selection, market);
@@ -3128,6 +3130,141 @@ function renderTradingChart(market, algorithm = null) {
   const useSeconds = terminalState.chartMode === 'seconds' && secondBars.length > 0;
   const bars = useSeconds ? secondBars.slice(-90) : (market.bars || []);
   renderChart(bars, algorithm, market.last_price, useSeconds ? 'seconds' : 'minutes');
+}
+
+function renderTradingLayers(data) {
+  const container = document.getElementById('trade-layer-grid');
+  const counter = document.getElementById('trade-layer-count');
+  if (!container || !counter) return;
+  const layers = Array.isArray(data?.trading_layers) ? data.trading_layers : [];
+  counter.textContent = `${layers.length} ACTIVE`;
+  if (!layers.length) {
+    container.innerHTML = '<div class="trade-layer-empty">전략이 종목을 채택하면 진입부터 청산까지 독립 레이어가 생성됩니다.</div>';
+    return;
+  }
+  container.innerHTML = layers.map((layer, index) => {
+    const realized = String(layer.pnl_kind || '').startsWith('REALIZED');
+    const pnl = Number(realized ? layer.realized_pnl : layer.unrealized_pnl || 0);
+    const rate = Number(layer.return_rate || 0);
+    const pnlClass = pnl > 0 ? 'profit' : pnl < 0 ? 'loss' : '';
+    const valueClass = pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '';
+    const currency = String(layer.currency || 'KRW');
+    const timeline = Array.isArray(layer.timeline) && layer.timeline.length
+      ? layer.timeline
+      : [
+        { kind: 'SELECTED', at: layer.opened_at, detail: layer.strategy_id },
+        { kind: layer.phase || 'OWNED', at: layer.market_data?.last_event_at, detail: '실시간 가격·청산 조건 감시' },
+      ];
+    return `
+      <article class="trade-layer ${pnlClass}" data-trade-layer="${index}">
+        <div class="trade-layer-summary">
+          <div class="trade-layer-head">
+            <div class="trade-layer-title">
+              <strong>${escapeHtml(layer.symbol || '-')} · ${formatInteger(layer.quantity)}주</strong>
+              <span>${escapeHtml(strategyLabels[layer.strategy_id] || layer.strategy_id || '전략 복구')} · ${escapeHtml(layer.market_data?.feed_state || 'FEED WAITING')}</span>
+            </div>
+            <span class="trade-layer-phase">${escapeHtml(layer.phase || 'OWNED')}</span>
+          </div>
+          <div class="trade-layer-stats">
+            <div><span>ENTRY</span><b>${formatPrice(layer.entry_price)}</b></div>
+            <div><span>LIVE</span><b>${formatPrice(layer.current_price)}</b></div>
+            <div><span>TARGET / STOP</span><b>${formatPrice(layer.target_price)} / ${formatPrice(layer.stop_price)}</b></div>
+            <div><span>${realized ? 'REALIZED GROSS' : 'UNREALIZED'}</span><b class="${valueClass}">${formatLayerPnl(pnl, currency)} · ${rate >= 0 ? '+' : ''}${(rate * 100).toFixed(2)}%</b></div>
+          </div>
+        </div>
+        <canvas class="trade-layer-chart" data-trade-layer-chart="${index}"></canvas>
+        <div class="trade-layer-timeline">
+          ${timeline.map((event) => `
+            <div class="trade-layer-event">
+              <b>${escapeHtml(event.kind || 'EVENT')}</b>
+              <small>${escapeHtml(shortClock(event.at))}</small>
+              <small title="${escapeHtml(event.detail || '')}">${escapeHtml(event.detail || '-')}</small>
+            </div>`).join('')}
+        </div>
+      </article>`;
+  }).join('');
+  layers.forEach((layer, index) => {
+    const canvas = container.querySelector(`[data-trade-layer-chart="${index}"]`);
+    if (!canvas) return;
+    const market = layer.symbol === data.symbol
+      ? { ...(layer.market_data || {}), ...(data.market || {}) }
+      : (layer.market_data || {});
+    const secondBars = market.second_bars || [];
+    const bars = terminalState.chartMode === 'seconds' && secondBars.length
+      ? secondBars.slice(-90)
+      : (market.bars || []).slice(-90);
+    drawTradingLayerChart(canvas, bars, layer);
+  });
+}
+
+function drawTradingLayerChart(canvas, bars, layer) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#091018';
+  ctx.fillRect(0, 0, width, height);
+  const pad = { left: 10, right: 58, top: 12, bottom: 19 };
+  const entry = Number(layer.entry_price);
+  const live = Number(layer.current_price);
+  const target = Number(layer.target_price);
+  const stop = Number(layer.stop_price);
+  const prices = bars.flatMap((bar) => [Number(bar.high), Number(bar.low)])
+    .concat([entry, live, target, stop]).filter((value) => Number.isFinite(value) && value > 0);
+  if (!prices.length) {
+    ctx.fillStyle = '#687b90';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('가격 데이터 대기', width / 2, height / 2);
+    return;
+  }
+  const rawMin = Math.min(...prices);
+  const rawMax = Math.max(...prices);
+  const span = Math.max(rawMax - rawMin, rawMax * .001, 1e-6);
+  const min = rawMin - span * .08;
+  const max = rawMax + span * .08;
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const y = (value) => pad.top + (max - Number(value)) / (max - min) * plotHeight;
+  ctx.strokeStyle = '#182534';
+  ctx.fillStyle = '#62758a';
+  ctx.font = '7px Consolas';
+  for (let line = 0; line <= 3; line += 1) {
+    const yy = pad.top + plotHeight * line / 3;
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(width - pad.right, yy); ctx.stroke();
+    ctx.fillText(formatPrice(max - (max - min) * line / 3), width - pad.right + 5, yy + 3);
+  }
+  const step = plotWidth / Math.max(1, bars.length - 1);
+  ctx.beginPath();
+  bars.forEach((bar, index) => {
+    const x = pad.left + step * index;
+    const yy = y(Number(bar.close));
+    if (index === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+  });
+  ctx.strokeStyle = '#39d7e7';
+  ctx.lineWidth = 1.35;
+  ctx.stroke();
+  if (Number.isFinite(entry) && entry > 0) drawLevel(ctx, width, height, pad, y, entry, '#9b8cff', 'ENTRY');
+  if (Number.isFinite(target) && target > 0) drawLevel(ctx, width, height, pad, y, target, '#42d392', 'TARGET');
+  if (Number.isFinite(stop) && stop > 0) drawLevel(ctx, width, height, pad, y, stop, '#ff6678', 'STOP');
+  if (Number.isFinite(live) && live > 0) {
+    const liveY = y(live);
+    ctx.fillStyle = live >= entry ? '#42d392' : '#ff6678';
+    ctx.shadowColor = ctx.fillStyle;
+    ctx.shadowBlur = 9;
+    ctx.beginPath(); ctx.arc(width - pad.right, liveY, 3.2, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.fillStyle = '#61758a';
+  ctx.font = '7px Consolas';
+  ctx.textAlign = 'left';
+  ctx.fillText(`OPEN ${shortClock(layer.opened_at)} · ${bars.length} BARS`, pad.left, height - 5);
+}
+
+function formatLayerPnl(value, currency) {
+  const amount = Number(value || 0);
+  if (String(currency).toUpperCase() === 'USD') {
+    return `${amount >= 0 ? '+' : '-'}$${Math.abs(amount).toFixed(2)}`;
+  }
+  return formatSignedKrw(amount);
 }
 
 function renderChart(bars, algorithm = null, referencePrice = null, timeframe = 'minutes') {
@@ -4346,6 +4483,7 @@ window.addEventListener('resize', () => {
       terminalState.data.market || {},
       terminalState.data.algorithm,
     );
+    renderTradingLayers(terminalState.data);
     renderSecondAnalysis(terminalState.data.market || {});
   }
   if (terminalState.diagnostics) {
@@ -4360,6 +4498,7 @@ document.querySelectorAll('[data-chart-mode]').forEach((button) => {
     });
     if (terminalState.data) {
       renderTradingChart(terminalState.data.market || {}, terminalState.data.algorithm);
+      renderTradingLayers(terminalState.data);
     }
   });
 });

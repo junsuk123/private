@@ -174,6 +174,19 @@ def _rejection_reason_counts(summary: dict[str, Any]) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
+def _note_sell_skip(summary: dict[str, Any], symbol: str, reason: str) -> None:
+    """Name the gate that skipped an exit, instead of only counting it.
+
+    ``skipped_cooldown`` has three independent sources on the sell side and three
+    more on the buy side. A held position that stops being evaluated for exit is
+    exactly the situation where the operator needs to know WHICH one is holding it,
+    and reading a bare counter cannot answer that.
+    """
+    skips = summary.setdefault("sell_skips", {})
+    if len(skips) < 12:
+        skips[str(symbol)] = reason
+
+
 def _record_rejection_reason_counts(summary: dict[str, Any], reason_codes: tuple[str, ...]) -> None:
     counts = summary.setdefault("rejection_reason_counts", {})
     if not isinstance(counts, dict):
@@ -268,6 +281,7 @@ class RealtimeTradingEngine:
         account_provider: Callable[[], AccountSnapshot | None],
         candidate_symbols_provider: Callable[[], tuple[str, ...]],
         session_open_provider: Callable[[], bool],
+        new_entries_authorized_provider: Callable[[], bool] | None = None,
         ontology_graph_provider: Callable[[], Any] | None = None,
         market_open_provider: Callable[[str, str], bool] | None = None,
         cycle_observer: Callable[[dict[str, Any]], None] | None = None,
@@ -282,6 +296,12 @@ class RealtimeTradingEngine:
         self.account_provider = account_provider
         self.candidate_symbols_provider = candidate_symbols_provider
         self.session_open_provider = session_open_provider
+        # Runtime operation mode is an execution authority, not dashboard
+        # metadata.  Keep SELL monitoring alive in learning/sell-only modes,
+        # while making a BUY impossible at both cycle and submit time.
+        self.new_entries_authorized_provider = (
+            new_entries_authorized_provider or (lambda: True)
+        )
         self.ontology_graph_provider = ontology_graph_provider
         # 종목별 시장 세션 게이트: 해당 종목의 거래소가 지금 열려 있는지(닫혀 있으면 주문 보류).
         self.market_open_provider = market_open_provider
@@ -312,11 +332,26 @@ class RealtimeTradingEngine:
         self._lock = threading.Lock()
         self._last_submit_monotonic: dict[str, float] = {}
         self._error_backoff_until: dict[str, float] = {}
+        # BUYs remain risk until the broker reports a terminal state.  Tracking
+        # only the strategy plan let an expired plan elect another symbol while
+        # its passive limit order was still resting at KIS.
+        self._open_buy_orders: dict[str, dict[str, Any]] = {}
         self._open_sell_orders: dict[str, dict[str, Any]] = {}
         self._sell_lock_until: dict[str, float] = {}
         # A terminal SELL fill outranks a lagging holdings snapshot.  Keep a
-        # symbol tombstoned until a later account cycle actually reports it flat.
-        self._terminal_sell_fills: set[str] = set()
+        # symbol tombstoned until a later account cycle actually reports it flat --
+        # but only for a bounded window. "Until flat" alone had no upper bound, and a
+        # balance row that never cleared (KIS returns the sold lot for minutes, and on
+        # DYN 2026-08-20 for hours) made the tombstone permanent: the holding could
+        # not be sold again by anyone, while the strategy session simultaneously
+        # refused to elect because it still saw a position. The tombstone exists to
+        # close the duplicate-order window after a fill, which is a seconds-scale
+        # concern; past that the balance row is the more credible witness.
+        self._terminal_sell_fills: dict[str, float] = {}
+        self._terminal_sell_fill_ttl = max(
+            30.0,
+            _env_float("REALTIME_TERMINAL_SELL_FILL_TOMBSTONE_SEC", 180.0),
+        )
         # 최근 매도 시각(monotonic) — 재매수 쿨다운(churn 억제)에 사용.
         self._recent_sell_monotonic: dict[str, float] = {}
         self._recent_buy_orders: dict[str, Deque[tuple[float, float]]] = {}
@@ -420,10 +455,25 @@ class RealtimeTradingEngine:
                 "max_orders_per_cycle": self.config.max_orders_per_cycle,
                 "max_buy_evaluations_per_cycle": self.config.max_buy_evaluations_per_cycle,
             }
-            status["buy_enabled"] = self._buy_enabled
-            status["buy_disabled_reason"] = self._buy_disabled_reason
+            mode_authorized = self._new_entries_authorized()
+            status["buy_control_enabled"] = self._buy_enabled
+            status["operation_mode_allows_entries"] = mode_authorized
+            status["buy_enabled"] = self._buy_enabled and mode_authorized
+            status["buy_disabled_reason"] = (
+                self._buy_disabled_reason
+                if mode_authorized
+                else "OPERATION_MODE_BLOCKS_NEW_ENTRIES"
+            )
             status["liquidation_requested"] = self._liquidation_requested
             status["liquidation_reason"] = self._liquidation_reason
+            status["open_buy_orders"] = [
+                {
+                    "symbol": symbol,
+                    "broker_order_id": item.get("broker_order_id"),
+                    "submitted_at": item.get("submitted_at"),
+                }
+                for symbol, item in self._open_buy_orders.items()
+            ]
             status["loss_cooldown_symbols"] = sorted(
                 symbol for symbol, until in self._loss_cooldown_until.items() if until > time.monotonic()
             )
@@ -545,9 +595,27 @@ class RealtimeTradingEngine:
         buy_submit_attempted = 0
         liquidation_mode = self._liquidation_requested
         buy_enabled = self._buy_enabled and os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        try:
+            operation_mode_allows_entries = bool(
+                self.new_entries_authorized_provider()
+            )
+        except Exception:  # noqa: BLE001 - unknown authority fails closed.
+            operation_mode_allows_entries = False
+        summary["operation_mode_allows_entries"] = operation_mode_allows_entries
+        if not operation_mode_allows_entries:
+            buy_enabled = False
+            self._buy_disabled_reason = "OPERATION_MODE_BLOCKS_NEW_ENTRIES"
+        elif self._buy_disabled_reason == "OPERATION_MODE_BLOCKS_NEW_ENTRIES":
+            self._buy_disabled_reason = None
         if liquidation_mode:
             buy_enabled = False
             self._buy_disabled_reason = self._liquidation_reason or "LIVE_TERMINATION_FULL_LIQUIDATION"
+        with self._lock:
+            open_buy_orders = tuple(self._open_buy_orders)
+        if open_buy_orders:
+            buy_enabled = False
+            self._buy_disabled_reason = "OPEN_BUY_ORDER_PENDING"
+            summary["open_buy_order_symbols"] = list(open_buy_orders)
         realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
         account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
         daily_loss_stop_krw = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0))
@@ -706,7 +774,14 @@ class RealtimeTradingEngine:
             for item in tuple(account.holdings or ())
             if int(getattr(item, "quantity", 0) or 0) > 0
         }
-        self._terminal_sell_fills.intersection_update(current_holding_symbols)
+        # Retired by a genuinely flat snapshot, and independently by the TTL so a
+        # balance row that outlives the fill claim becomes sellable again.
+        expiry_now = time.monotonic()
+        self._terminal_sell_fills = {
+            symbol: deadline
+            for symbol, deadline in self._terminal_sell_fills.items()
+            if symbol in current_holding_symbols and deadline > expiry_now
+        }
 
         # 1) 매도: 보유 포지션의 빠른 청산.
         for holding in tuple(account.holdings or ()):
@@ -718,6 +793,7 @@ class RealtimeTradingEngine:
                 break
             if holding_symbol in self._terminal_sell_fills:
                 summary["skipped_cooldown"] += 1
+                _note_sell_skip(summary, holding_symbol, "TERMINAL_SELL_FILL_TOMBSTONE")
                 continue
             if self.market_open_provider is not None and not self.market_open_provider(holding.ticker, holding.market or ""):
                 summary["skipped_market_closed"] += 1
@@ -726,9 +802,15 @@ class RealtimeTradingEngine:
             sell_lock_until = self._sell_lock_until.get(holding.ticker)
             if sell_lock_until is not None and time.monotonic() < sell_lock_until and not has_open_sell:
                 summary["skipped_cooldown"] += 1
+                _note_sell_skip(
+                    summary,
+                    holding_symbol,
+                    f"SELL_INFLIGHT_LOCK:{max(0.0, sell_lock_until - time.monotonic()):.0f}s",
+                )
                 continue  # 결제/가능수량 잠금이 풀릴 때까지 반복 재시도하지 않는다.
             if self._in_cooldown(holding.ticker) and not has_open_sell:
                 summary["skipped_cooldown"] += 1
+                _note_sell_skip(summary, holding_symbol, "SUBMIT_COOLDOWN_OR_ERROR_BACKOFF")
                 continue  # 최근 제출한 종목은 쿨다운 동안 재제출하지 않는다(중복/에러 방지).
             summary["sell_evaluated"] += 1
             session_exit_reason = (
@@ -1658,7 +1740,13 @@ class RealtimeTradingEngine:
                 symbol=symbol,
                 as_of=decision_time,
                 strategy_id=strategy_id,
-                position_open=position_open,
+                # ENTERING is already economically committed even before the
+                # account snapshot catches up with the broker fill. Treating it
+                # as flat let a transient stale tick issue an immediate SELL,
+                # locking in a round-trip-fee loss (DYN, 2026-08-20).
+                position_open=(
+                    position_open or phase in {"ENTERING", "OWNED", "EXITING"}
+                ),
                 data_age_seconds=data_age,
                 session_tradable=session_tradable,
                 broker_healthy=None,
@@ -1783,6 +1871,7 @@ class RealtimeTradingEngine:
         if str(side).upper() == "BUY" and (
             self._liquidation_requested
             or not self._buy_enabled
+            or not self._new_entries_authorized()
             or os.getenv("REALTIME_BUY_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}
         ):
             summary["blocked"] += 1
@@ -1824,6 +1913,14 @@ class RealtimeTradingEngine:
         event["execution_id"] = getattr(submission, "execution_id", None)
         event["status"] = getattr(submission, "status", None)
         event["broker_order_id"] = getattr(submission, "broker_order_id", None)
+        if side == "BUY" and getattr(submission, "broker_order_id", None):
+            with self._lock:
+                self._open_buy_orders[order.ticker] = {
+                    "broker_order_id": getattr(submission, "broker_order_id"),
+                    "order": order,
+                    "submitted_at": decision_time.isoformat(),
+                    "submitted_monotonic": time.monotonic(),
+                }
         if side == "SELL" and getattr(submission, "broker_order_id", None):
             self._open_sell_orders[order.ticker] = {
                 "broker_order_id": getattr(submission, "broker_order_id"),
@@ -1832,21 +1929,56 @@ class RealtimeTradingEngine:
             }
         self._record_submitted_order_for_performance(order, side)
         self._record(event)
+        strategy_id = ""
+        for reason in tuple(reason_codes or ()):
+            marker = "STRATEGY_OWNED:"
+            if marker in str(reason):
+                strategy_id = str(reason).split(marker, 1)[1].split(";", 1)[0].strip()
+                break
+        journal = getattr(self.coordinator, "journal", None)
+        if journal is not None and hasattr(journal, "record"):
+            try:
+                journal.record(
+                    "live_strategy_order_link",
+                    {
+                        "broker_order_id": getattr(submission, "broker_order_id", None),
+                        "ticker": order.ticker,
+                        "market": order.market,
+                        "side": side,
+                        "quantity": order.quantity,
+                        "limit_price": order.limit_price,
+                        "strategy_id": strategy_id or None,
+                        "reason_codes": tuple(reason_codes or ()),
+                    },
+                )
+            except Exception:  # noqa: BLE001 - observability cannot change execution outcome.
+                pass
         broker_order_id = str(getattr(submission, "broker_order_id", None) or "")
         if broker_order_id:
-            self._poll_submitted_order_status_async(broker_order_id, order.ticker)
+            self._poll_submitted_order_status_async(broker_order_id, order.ticker, order)
         return True
 
-    def _poll_submitted_order_status_async(self, broker_order_id: str, symbol: str) -> None:
+    def _new_entries_authorized(self) -> bool:
+        """Read the external operation-mode authority with fail-closed semantics."""
+        try:
+            return bool(self.new_entries_authorized_provider())
+        except Exception:  # noqa: BLE001 - an unreadable mode cannot authorize risk.
+            return False
+
+    def _poll_submitted_order_status_async(
+        self, broker_order_id: str, symbol: str, order: FinalOrder | None = None
+    ) -> None:
         thread = threading.Thread(
             target=self._poll_submitted_order_status,
-            args=(broker_order_id, symbol),
+            args=(broker_order_id, symbol, order),
             name=f"order-status-{symbol}-{broker_order_id}",
             daemon=True,
         )
         thread.start()
 
-    def _poll_submitted_order_status(self, broker_order_id: str, symbol: str) -> None:
+    def _poll_submitted_order_status(
+        self, broker_order_id: str, symbol: str, order: FinalOrder | None = None
+    ) -> None:
         try:
             snapshot = self.coordinator.poll_status(broker_order_id)
         except Exception as exc:  # noqa: BLE001 - status polling must not stop trading.
@@ -1865,17 +1997,25 @@ class RealtimeTradingEngine:
         observed_status = str(getattr(snapshot, "status", "UNKNOWN") or "UNKNOWN").upper()
         raw_side = getattr(raw, "side", None)
         raw_side = str(getattr(raw_side, "value", raw_side) or "").upper()
+        if not raw_side and order is not None:
+            raw_side = str(getattr(getattr(order, "side", None), "value", "") or "").upper()
         fill_price = float(getattr(raw, "price", 0.0) or 0.0)
         fill_time = getattr(raw, "executed_at", None)
         if not isinstance(fill_time, datetime):
             fill_time = getattr(snapshot, "observed_at", datetime.now(timezone.utc))
         if observed_status == "FILLED" and raw_side == "SELL":
-            self._terminal_sell_fills.add(symbol)
+            self._terminal_sell_fills[symbol] = (
+                time.monotonic() + self._terminal_sell_fill_ttl
+            )
             if self.strategy_session_manager is not None:
                 marker = getattr(self.strategy_session_manager, "mark_exit_filled", None)
                 if callable(marker):
                     marker(symbol, fill_price, fill_time)
-        if observed_status in {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+        terminal = observed_status in {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
+        if terminal and raw_side == "BUY":
+            with self._lock:
+                self._open_buy_orders.pop(symbol, None)
+        if terminal:
             self._open_sell_orders.pop(symbol, None)
             # Broker account snapshots can lag a terminal order status. Keep the
             # symbol locked briefly so a stale holding row cannot create/amend a
@@ -1884,6 +2024,44 @@ class RealtimeTradingEngine:
                 30.0,
                 min(120.0, self.config.sell_inflight_cooldown_sec),
             )
+        elif raw_side == "BUY" and order is not None:
+            execution_config = getattr(self.coordinator, "execution_config", None)
+            should_cancel = bool(
+                execution_config is not None
+                and getattr(execution_config, "cancel_stale_unfilled_orders", False)
+            )
+            with self._lock:
+                tracked = dict(self._open_buy_orders.get(symbol) or {})
+            submitted_at = float(tracked.get("submitted_monotonic") or 0.0)
+            max_age = float(getattr(execution_config, "max_unfilled_order_age_seconds", 0) or 0)
+            old_enough = submitted_at > 0.0 and time.monotonic() - submitted_at >= max_age
+            if should_cancel and old_enough:
+                try:
+                    canceled = self.coordinator.cancel_final_order(broker_order_id, order)
+                except Exception as exc:  # noqa: BLE001 - retain the lockout if cancellation is uncertain.
+                    self._record(
+                        {
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "symbol": symbol,
+                            "kind": "STATUS",
+                            "outcome": "stale_buy_cancel_error",
+                            "broker_order_id": broker_order_id,
+                            "detail": f"{exc.__class__.__name__}: {exc}",
+                        }
+                    )
+                else:
+                    observed_status = str(getattr(canceled, "status", "CANCELED") or "CANCELED").upper()
+                    with self._lock:
+                        self._open_buy_orders.pop(symbol, None)
+                    self._record(
+                        {
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "symbol": symbol,
+                            "kind": "STATUS",
+                            "outcome": "stale_buy_canceled",
+                            "broker_order_id": broker_order_id,
+                        }
+                    )
         self._record(
             {
                 "at": getattr(snapshot, "observed_at", datetime.now(timezone.utc)).isoformat(),

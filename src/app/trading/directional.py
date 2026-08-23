@@ -442,6 +442,13 @@ def parse_key_or_none(text: str) -> DirectionalStrategyKey | None:
 # --------------------------------------------------------------------------- #
 # Reason codes                                                                 #
 # --------------------------------------------------------------------------- #
+#: An arm was elected but its deployment state does not submit orders. Direction
+#: agnostic: the ladder gates LONG arms too, and reporting a long demotion as
+#: ``SHORT_STRATEGY_SHADOW_ONLY`` sent operators looking for a borrow problem that
+#: was not there.
+DEPLOYMENT_SHADOW_ONLY = "STRATEGY_DEPLOYMENT_SHADOW_ONLY"
+
+
 class ShortReasonCodes:
     """Every reason a short signal can fail to become an order, or lose rank.
 

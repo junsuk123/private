@@ -150,7 +150,7 @@ class StorageTest(unittest.TestCase):
             self.assertGreater(len(context.graph.triples()), 0)
             self.assertGreater(graph_saved["graph_triples"], 0)
 
-    def test_raw_records_saved_per_retrieved_at(self) -> None:
+    def test_raw_records_are_deduplicated_by_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LocalResearchStore(Path(tmp))
             base = datetime.now(timezone.utc)
@@ -174,14 +174,27 @@ class StorageTest(unittest.TestCase):
                 content_type="text/html",
                 payload="beta",
             )
+            record3 = RawSourceRecord(
+                source=SourceMetadata(
+                    source_name="dynamic_html",
+                    retrieved_at=base + timedelta(seconds=6),
+                    raw_url="https://example.test/dynamic",
+                    source_id="dynamic:example",
+                ),
+                content_type="text/html",
+                payload="beta",
+            )
 
             result1 = SimpleNamespace(events=(), raw_records=(record1,), market_snapshots=(), macro_metrics=())
             result2 = SimpleNamespace(events=(), raw_records=(record2,), market_snapshots=(), macro_metrics=())
+            result3 = SimpleNamespace(events=(), raw_records=(record3,), market_snapshots=(), macro_metrics=())
             save1 = store.save_research_result(result1)
             save2 = store.save_research_result(result2)
+            save3 = store.save_research_result(result3)
 
             self.assertEqual(save1["raw_records"], 1)
             self.assertEqual(save2["raw_records"], 1)
+            self.assertEqual(save3["raw_records"], 0)
             self.assertEqual(store.summary()["raw_records"], 2)
             self.assertTrue((Path(tmp) / "research.sqlite3").exists())
 

@@ -409,7 +409,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260820-live-ontology-gate-ui" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260821-multi-trade-layers-v1" />
   <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
   <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
@@ -881,6 +881,16 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       </aside>
     </section>
 
+    <section class="terminal-panel trade-layers" aria-live="polite">
+      <div class="trade-layers-head">
+        <div><span>LIVE STRATEGY POSITIONS</span><b>채택 전략별 거래·수익 실현 레이어</b></div>
+        <em id="trade-layer-count">0 ACTIVE</em>
+      </div>
+      <div class="trade-layer-grid" id="trade-layer-grid">
+        <div class="trade-layer-empty">전략이 종목을 채택하면 진입부터 청산까지 독립 레이어가 생성됩니다.</div>
+      </div>
+    </section>
+
     <section class="terminal-panel execution-panel">
       <div class="panel-head">
         <div>
@@ -902,11 +912,11 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260820-live-ontology-gate-ui"></script>
+  <script src="/static/strategy_terminal.js?v=20260821-multi-trade-layers-v1"></script>
   <script src="/static/operations_overview.js?v=20260812-gnn-trust-state-v1"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->
-  <script src="/static/terminal_layout.js?v=20260802-movable-frames-2"></script>
+  <script src="/static/terminal_layout.js?v=20260821-trade-layers-frame-v1"></script>
 </body>
 </html>
 """

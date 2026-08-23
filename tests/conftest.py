@@ -53,6 +53,7 @@ def isolated_process_wide_stores(tmp_path_factory):
             "CHANGE_POINT_STATE_PATH",
             "TRADING_STATE_DB_PATH",
             "ADAPTIVE_THRESHOLDS_STORE_PATH",
+            "DIRECTIONAL_SHADOW_STORE_PATH",
         )
     }
     os.environ["STRATEGY_PERFORMANCE_STORE_PATH"] = str(root / "strategy-performance.sqlite3")
@@ -68,6 +69,15 @@ def isolated_process_wide_stores(tmp_path_factory):
     # refuse a trade a signal-engine test asserted, so the suite's result depended
     # on how the real system happened to be doing that morning.
     os.environ["ADAPTIVE_THRESHOLDS_STORE_PATH"] = str(root / "adaptive-thresholds.sqlite3")
+    # The directional shadow tape. It is now READ by the cost authority every entry
+    # path consults (``app.cost.round_trip``), so leaving it pointed at the operator's
+    # store made the round-trip cost -- and therefore every trigger floor and every
+    # coverage verdict in the suite -- a function of that morning's live fills.
+    os.environ["DIRECTIONAL_SHADOW_STORE_PATH"] = str(root / "directional-shadow.sqlite3")
+
+    from app.cost import round_trip as _round_trip
+
+    _round_trip.reset_caches()
 
     # The singletons may already exist if an earlier import touched them.
     from app.graph import change_point

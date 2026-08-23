@@ -43,6 +43,7 @@ from app.trading.directional import (
     ExecutionProduct,
     PositionDirection,
     PositionEffect,
+    DEPLOYMENT_SHADOW_ONLY,
     ShortReasonCodes,
     StrategyDeploymentState,
     default_product,
@@ -136,24 +137,78 @@ def _measured_spread_bps(micro_result: Any, evidence_row: Mapping[str, Any] | No
 
 
 def _market_round_trip_cost_bps(symbol: str, fallback_bps: float) -> float:
-    """Resolve a missing cost estimate from the symbol's actual market.
+    """The venue fee policy's round trip for this symbol, in bps.
 
-    The legacy fallback is KRX-sized.  Reusing it for an overseas symbol makes a
-    US proposal look materially more profitable than the fee policy says it is.
-    Keep the configured fallback only for the genuinely unreadable-cost case.
+    Fees, tax, slippage and safety margin — everything the policy can state without
+    knowing which symbol it is. It does NOT include the bid-ask spread, which is
+    per-symbol and per-moment; :func:`_all_in_round_trip_cost_bps` adds that.
+
+    Both venues resolve through the fee policy. Short-circuiting KR to the
+    configured constant made every domestic proposal 28bps when the KRX policy says
+    33.8, and the constant is retained only as a floor so a resolvable cost can
+    never come out cheaper than the configured reference.
     """
-    # The configured fallback is deliberately the KRX reference and remains the
-    # compatibility authority for domestic proposals.  The defect was applying
-    # that same number to overseas orders.
-    if market_for_symbol(symbol) == "KR":
-        return max(0.0, float(fallback_bps))
     try:
         from app.technical.strategy_algorithms import round_trip_cost_bps
 
         measured = _optional_float(round_trip_cost_bps(symbol))
     except Exception:  # noqa: BLE001 - cost lookup must fail closed to config.
         measured = None
-    return max(0.0, measured if measured is not None else float(fallback_bps))
+    if measured is None:
+        return max(0.0, float(fallback_bps))
+    # Floored, not replaced: the configured reference is an operator-set minimum and
+    # a policy that resolves below it is a config gap, not a discount.
+    return max(0.0, measured, float(fallback_bps))
+
+
+def _all_in_round_trip_cost_bps(
+    symbol: str,
+    *,
+    fallback_bps: float,
+    model_estimate_bps: float | None = None,
+    micro_result: Any = None,
+    evidence_row: Mapping[str, Any] | None = None,
+) -> float:
+    """Everything a round trip actually costs, including the spread it crosses.
+
+    Why the spread has to be in here
+    --------------------------------
+    ``config/profitability_policy.yaml`` sets ``spread_rate`` to 0 for both venues,
+    because the spread is a property of the symbol and the moment rather than of the
+    fee schedule. Nothing then put it back, so the cost-coverage gate divided the
+    predicted edge by fees alone and called an edge smaller than one spread
+    "SUFFICIENT".
+
+    Measured on the 2026-08-21 KRX session, every arm the session took reported its
+    coverage against 28bps. Against the real all-in number four of the five were
+    below the 1.3 live threshold and three were below 1.0 — the cost was not even
+    covered — and all four lost money::
+
+        064260   gross 41bps / 52bps all-in = 0.79   traded, -73bps gross
+        025980   gross 43bps / 52bps all-in = 0.83   traded, -73bps gross
+        403870   gross 38bps / 44bps all-in = 0.86   ordered, unfilled
+        010140   gross 61bps / 59bps all-in = 1.03   traded, exited flat at entry
+        001510   gross 105bps / 51bps all-in = 2.08  the one that was worth taking
+
+    A buy crosses the spread to get in and the sell crosses it to get out, which is
+    one full spread over the round trip — charged once here, matching the
+    "spread and impact are charged once each" contract in
+    ``strategy_algorithms.round_trip_cost_bps``.
+
+    A model-supplied estimate is FLOORED rather than replaced. Cost estimates are
+    only dangerous when they are too low, and the trade-plan builder independently
+    reaches the same conclusion through ``SPREAD_CONSUMES_ALPHA`` — this makes the
+    election agree with the gate that already knew.
+    """
+    from app.cost.round_trip import all_in_round_trip_bps
+
+    floor_bps = all_in_round_trip_bps(
+        symbol,
+        spread_bps=_measured_spread_bps(micro_result, evidence_row),
+        fallback_bps=fallback_bps,
+    )
+    estimate = _optional_float(model_estimate_bps)
+    return max(floor_bps, estimate if estimate is not None else 0.0)
 
 
 def _cost_market_contract(symbol: str) -> tuple[str, str]:
@@ -523,6 +578,10 @@ class _ElectionProposal:
     # cycle. Model/ontology proposals remain observable, but algorithm-primary
     # live authority may never be inferred from their mere presence.
     algorithm_triggered: bool = False
+    # The signal's own forward GROSS move, in bps, for a proposal that stated one but
+    # no net figure. It is the last resort in ``predicted_gross_edge_bps``, and it
+    # exists so that "no net estimate" cannot silently become "use the exit barrier".
+    predicted_gross_move_bps: float | None = None
 
     @property
     def is_short(self) -> bool:
@@ -564,22 +623,37 @@ class _ElectionProposal:
         """
         edge = self.expected_net_return_bps
         if edge is None:
-            target_bps = self.target_return_rate * 10_000.0
-            if target_bps <= 0:
+            gross = self.predicted_gross_edge_bps(fallback_cost_bps)
+            if gross is None:
                 return None
-            edge = target_bps - self.resolved_cost_bps(fallback_cost_bps)
+            edge = gross - self.resolved_cost_bps(fallback_cost_bps)
         if self.gnn_required_for_edge and not self.gnn_actionable:
             edge -= max(0.0, float(gnn_absence_penalty_bps))
         return edge
 
     def predicted_gross_edge_bps(self, fallback_cost_bps: float = 0.0) -> float | None:
+        """How far the SIGNAL says price will move. Never a barrier.
+
+        The last resort used to be ``target_return_rate * 10_000``, and that made
+        every downstream cost test unfalsifiable. The target is defined by
+        ``exit_geometry`` as ``cost + 1.5 x (stop + cost)``, so dividing it by the
+        cost it was derived from asks whether 1.5 is greater than zero:
+
+            ratio = (cost + 1.5(stop + cost)) / cost      # 5.71 at 28/60bps
+
+        Raising the cost raised the numerator with it, which is why every arm on
+        2026-08-21 reported THIN or SUFFICIENT no matter what the tape charged.
+
+        A proposal with no forecast now returns ``None``, which
+        ``evaluate_cost_coverage`` bands UNKNOWN and no gate treats as live
+        eligible. Refusing to trade on an absent forecast is the whole point of
+        asking for one.
+        """
         if self.expected_net_return_bps is not None:
             return float(self.expected_net_return_bps) + self.resolved_cost_bps(
                 fallback_cost_bps
             )
-        if self.target_return_rate > 0:
-            return self.target_return_rate * 10_000.0
-        return None
+        return self.predicted_gross_move_bps
 
 
 @dataclass(frozen=True)
@@ -617,8 +691,68 @@ class StrategySessionConfig:
             _env_int("STRATEGY_SESSION_ARMED_TIMEOUT_SEC", 180),
         )
     )
+    # A position is CLOSED only when something says so. The holdings inquiry is a
+    # separate, lossy endpoint from the order endpoint: KIS intermittently returns a
+    # balance that omits a lot it still holds. Believing one such response ended the
+    # session mid-trade, wrote a phantom outcome, restarted the holding clock and
+    # re-adopted the same lot under the unknown-thesis fallback geometry — the
+    # 064260/010140 lifecycle on 2026-08-21, where one round trip produced six
+    # "realized" rows and a 1200s time stop on a 5400s thesis. An unexplained
+    # disappearance must therefore persist across several observations AND across
+    # more wall clock than one account-cache refresh before it is believed.
+    flat_confirm_observations: int = field(
+        default_factory=lambda: max(
+            1, _env_int("STRATEGY_SESSION_FLAT_CONFIRM_OBSERVATIONS", 3)
+        )
+    )
+    flat_confirm_seconds: float = field(
+        default_factory=lambda: max(
+            0.0, _env_float("STRATEGY_SESSION_FLAT_CONFIRM_SEC", 90.0)
+        )
+    )
+    # ``EXITING`` was the only phase with no way out. ``ENTERING`` has
+    # ``entry_timeout_seconds``, ``ARMED`` has ``armed_timeout_seconds``, ``COOLDOWN``
+    # has ``cooldown_until`` — but a session that reached EXITING depended entirely on
+    # an external observation to leave it, and two reachable states supply none:
+    #
+    #   1. A broker-confirmed exit FILL together with a balance row that keeps
+    #      reporting the lot. ``_reconcile_position`` then takes the "holding present"
+    #      branch forever, ``exit_reason_for`` refuses to emit a second SELL because
+    #      the fill is recorded, and no election can run because the phase is not
+    #      SCANNING. Observed on DYN 2026-08-20: 8h27m of total paralysis across BOTH
+    #      markets (``allowed_entry_candidates`` also returns nothing while any
+    #      holding exists), ended only when the balance finally dropped the row.
+    #   2. A supervisor HARD halt that moves ENTERING -> EXITING before the entry fill
+    #      was ever observed. ``position_seen`` is False and ``exit_filled_at`` is
+    #      unset, so the flat-reconciliation branch is skipped by its own guard and
+    #      nothing else touches the phase.
+    #
+    # Both are released after this window. The release is safe in either world: if the
+    # lot is genuinely still held, the very next SCANNING cycle re-adopts it through
+    # ``_adopt_existing_position`` with ``owned_position_memo`` restoring the thesis,
+    # so the exit rules re-arm instead of the position sitting unmanaged.
+    exit_reconcile_timeout_seconds: float = field(
+        default_factory=lambda: max(
+            30.0, _env_float("STRATEGY_SESSION_EXIT_RECONCILE_TIMEOUT_SEC", 180.0)
+        )
+    )
     invalidation_confirm_cycles: int = field(
         default_factory=lambda: max(1, _env_int("STRATEGY_SESSION_INVALIDATION_CYCLES", 3))
+    )
+    # A market-wide regime change is only an exit input when it is both strong and
+    # withdraws the strategy family that owns the position.  This keeps a routine
+    # ontology rotation from liquidating a healthy holding while still allowing a
+    # confirmed structural break to protect capital before the static stop is hit.
+    invalidation_change_point_probability: float = field(
+        default_factory=lambda: max(
+            0.5,
+            min(
+                1.0,
+                _env_float(
+                    "STRATEGY_SESSION_INVALIDATION_CHANGE_POINT_PROBABILITY", 0.70
+                ),
+            ),
+        )
     )
     require_live_gnn: bool = field(
         default_factory=lambda: os.getenv("STRATEGY_SESSION_REQUIRE_LIVE_GNN", "true").strip().lower()
@@ -735,6 +869,16 @@ class StrategySessionState:
     entry_submitted_at: str | None = None
     position_opened_at: str | None = None
     position_seen: bool = False
+    # Last holdings snapshot that actually contained ``selected_symbol``, and how
+    # many consecutive snapshots since then did not. Together they separate "the
+    # broker's balance response dropped a lot it still holds" from "the position is
+    # gone", which a single absent observation cannot distinguish.
+    position_last_seen_at: str | None = None
+    missing_holding_observations: int = 0
+    # The live thesis this lot was entered under, carried across a session reset so
+    # a re-adopted position is still managed with the geometry and the entry clock
+    # it was armed with, instead of the unknown-thesis fallback.
+    owned_position_memo: dict[str, Any] = field(default_factory=dict)
     entry_price: float | None = None
     target_price: float | None = None
     stop_price: float | None = None
@@ -769,9 +913,20 @@ class StrategySessionState:
     # Broker-confirmed terminal fill.  This is distinct from the requested time:
     # account balance endpoints may continue to show the sold lot for minutes.
     exit_filled_at: str | None = None
+    # When the session ENTERED the EXITING phase, by any route: an exit rule, a
+    # supervisor HARD halt, or a broker fill.  ``exit_requested_at`` cannot serve as
+    # this clock because the halt path never submits an exit order and therefore never
+    # sets it, which is exactly the case that used to strand the session with no
+    # timestamp to measure a timeout against.
+    exiting_since: str | None = None
     exit_reason: str | None = None
     cooldown_until: str | None = None
     invalidation_cycles: int = 0
+    invalidation_reason_codes: list[str] = field(default_factory=list)
+    # Macro/micro reasoning is throttled and the same bundle is returned to several
+    # engine ticks.  Count each bundle once; otherwise one observation could satisfy
+    # a three-cycle confirmation in three seconds without any new market evidence.
+    last_invalidation_evidence_at: str | None = None
     last_evaluated_at: str | None = None
     last_reason: str = "WAITING_FOR_ONTOLOGY_SELECTION"
     macro_regime: str | None = None
@@ -1387,6 +1542,9 @@ class StrategySessionManager:
             if graded == "HARD":
                 if self._state.phase in {"OWNED", "ENTERING"}:
                     self._state.phase = "EXITING"
+                    # No clock is passed to a supervisor verdict, and inventing one
+                    # here would disagree with the engine's decision time. The
+                    # reconciler stamps ``exiting_since`` on its first pass instead.
                     self._state.exit_reason = f"SUPERVISOR_HARD_HALT:{','.join(reason_codes) or 'UNSPECIFIED'}"
                     self._state.last_reason = self._state.exit_reason
                     self._persist()
@@ -1415,6 +1573,7 @@ class StrategySessionManager:
         with self._lock:
             if self._state.selected_symbol == str(symbol).upper():
                 self._state.phase = "EXITING"
+                self._state.exiting_since = self._state.exiting_since or _iso(now)
                 self._state.exit_requested_at = self._state.exit_requested_at or _iso(now)
                 self._state.last_reason = "EXIT_ORDER_SUBMITTED_AWAITING_FLAT"
                 self._persist()
@@ -1437,6 +1596,7 @@ class StrategySessionManager:
             if float(price or 0.0) > 0.0:
                 self._state.exit_price = float(price)
             self._state.phase = "EXITING"
+            self._state.exiting_since = self._state.exiting_since or _iso(moment)
             self._state.exit_filled_at = _iso(moment)
             self._state.last_reason = "EXIT_FILLED_AWAITING_ACCOUNT_FLAT"
             # Record now, while the true fill timestamp and price are available.
@@ -1526,6 +1686,20 @@ class StrategySessionManager:
         selected = state.selected_symbol
         holding = holdings.get(selected or "")
         if holding is not None:
+            if state.phase == "EXITING" and self._exiting_window_expired(now):
+                # The broker confirmed a terminal exit fill (or an exit was requested
+                # and no rule can fire again) yet the balance keeps returning the lot.
+                # The two endpoints contradict each other, and the previous behaviour
+                # trusted BOTH in the direction that blocks: the fill suppressed any
+                # further SELL, the balance row suppressed the flat transition, and the
+                # session stopped electing on either market until the row happened to
+                # disappear. Release it instead. If the lot really is still held the
+                # next SCANNING cycle re-adopts it from this same balance response and
+                # re-arms its exit rules, so neither reading is left unmanaged.
+                self._release_stranded_exit(now, "EXIT_UNRECONCILED_BALANCE_ROW_STALE")
+                return
+            state.missing_holding_observations = 0
+            state.position_last_seen_at = _iso(now)
             if state.phase in {"ARMED", "ENTERING"}:
                 state.phase = "OWNED"
                 state.position_seen = True
@@ -1560,18 +1734,173 @@ class StrategySessionManager:
                         )
                 state.last_reason = "POSITION_OWNED_MONITORING"
             self._evaluate_exit(holding, bundle, now)
+            # After the exit evaluation, so the memo carries the watermark this tick
+            # just advanced rather than the previous one.
+            self._remember_owned_position()
             return
 
-        if state.position_seen and state.phase in {"OWNED", "EXITING"}:
-            # The position just went flat, so this is the one moment the trade's
+        if state.phase == "EXITING" and not (
+            state.position_seen or state.exit_filled_at is not None
+        ):
+            # EXITING with no evidence that exposure ever existed. Reachable when a
+            # supervisor HARD halt promotes ENTERING -> EXITING before the entry fill
+            # is observed: the guard below excludes this state, no holding exists for
+            # ``exit_reason_for`` to act on, and ``entry_timeout_seconds`` no longer
+            # applies because the phase is no longer ENTERING. Nothing in the machine
+            # could leave it. There is nothing to close here, so release the election.
+            if self._exiting_window_expired(now):
+                self._reset_to_scanning("EXIT_RELEASED_NO_CONFIRMED_EXPOSURE")
+                return
+            state.last_reason = "EXIT_AWAITING_EXPOSURE_CONFIRMATION"
+            return
+
+        if (
+            state.phase in {"OWNED", "EXITING"}
+            and (state.position_seen or state.exit_filled_at is not None)
+        ):
+            if not self._flat_confirmed(now):
+                # The lot is missing from ONE balance response and nothing we did
+                # explains it. Hold the whole session — phase, geometry, entry clock
+                # and watermark — until the disappearance is corroborated. Closing
+                # here is what produced phantom outcomes and downgraded a live thesis
+                # to the fallback exit rule mid-position.
+                state.last_reason = "POSITION_MISSING_FROM_SNAPSHOT_UNCONFIRMED"
+                return
+            # The position went flat, so this is the one moment the trade's
             # realized outcome is knowable. Record it before the state is reset:
             # without this the conservative bandit has no history to learn from and
-            # every arm stays permanently cold.
+            # every arm stays permanently cold.  A confirmed exit fill is also
+            # authoritative evidence that exposure existed: fast overseas fills
+            # can complete before the slower holdings snapshot ever observes the
+            # position, leaving ``position_seen`` false indefinitely.
+            if not state.exit_reason:
+                # Nothing this session requested closed it. Say so in the record
+                # rather than storing an outcome with a blank reason, which is
+                # indistinguishable from a phantom row after the fact.
+                state.exit_reason = "POSITION_CLOSED_EXTERNALLY"
             self._record_outcome(now)
+            # The lot is gone for real, so the thesis frozen for it must not survive
+            # to be inherited by the next position that happens to share its symbol
+            # and average price.
+            state.owned_position_memo = {}
             state.phase = "COOLDOWN"
             state.cooldown_until = _iso(now + timedelta(seconds=self.config.cooldown_seconds))
+            state.exiting_since = None
             state.last_reason = "POSITION_FLAT_RESELECTION_COOLDOWN"
             state.exit_requested_at = state.exit_requested_at or _iso(now)
+
+    def _exiting_window_expired(self, now: datetime) -> bool:
+        """Has this session been EXITING longer than reconciliation can justify?
+
+        Measured from ``exiting_since``, which every route into the phase stamps. A
+        state file written before that field existed has none; treat the older
+        ``exit_filled_at``/``exit_requested_at`` as the clock so a session restored
+        mid-exit across the upgrade is still releasable rather than stranded forever.
+        """
+        state = self._state
+        started = (
+            _parse_time(state.exiting_since)
+            or _parse_time(state.exit_filled_at)
+            or _parse_time(state.exit_requested_at)
+        )
+        if started is None:
+            # No timestamp at all. Stamp one now rather than releasing on a clock we
+            # cannot read: the next pass measures a real window.
+            state.exiting_since = _iso(now)
+            return False
+        return (
+            now - started
+        ).total_seconds() >= self.config.exit_reconcile_timeout_seconds
+
+    def _release_stranded_exit(self, now: datetime, reason: str) -> None:
+        """Leave an EXITING phase that no observation can resolve.
+
+        Deliberately does NOT record an outcome. The fill that put the session here
+        already recorded one (``mark_exit_filled`` -> ``_record_outcome``), and a
+        second row for the same lot is the phantom-outcome defect that once turned one
+        round trip into six "realized" records. Cooldown rather than an immediate
+        reset, so a balance row that is merely lagging has one more window to clear
+        before the lot can be re-adopted.
+        """
+        state = self._state
+        state.exit_reason = state.exit_reason or reason
+        state.owned_position_memo = dict(state.owned_position_memo or {})
+        state.phase = "COOLDOWN"
+        state.cooldown_until = _iso(now + timedelta(seconds=self.config.cooldown_seconds))
+        state.exiting_since = None
+        # The fill claim is what suppressed any further SELL. Retiring it with the
+        # phase means a lot that turns out to still be held can be exited again.
+        state.exit_filled_at = None
+        state.last_reason = reason
+
+    def _flat_confirmed(self, now: datetime) -> bool:
+        """Is "the symbol is not in the holdings map" actually a closed position?
+
+        Two sources answer this, and only one of them is the balance inquiry.
+
+        A broker-confirmed exit FILL is authoritative and immediate. That is what
+        keeps a fast round trip from sitting in EXITING while the slower holdings
+        endpoint catches up.
+
+        A *requested* exit is not. Deciding to sell, or even having an order accepted,
+        says nothing about whether the lot is still held: 025980's stop-loss sell sat
+        unfilled above the market for ten minutes while the balance response kept
+        dropping and restoring the position, and treating "we asked to exit" as proof
+        turned each drop into another phantom close of a lot we still owned.
+
+        So absent a fill the balance inquiry is the only witness, and it is a lossy
+        one — KIS returns a partial portfolio often enough that a single absent
+        observation carries no information. It has to repeat, both across observations
+        and across more wall clock than one account-cache refresh, before it is
+        believed.
+        """
+        state = self._state
+        if state.exit_filled_at is not None:
+            return True
+        state.missing_holding_observations += 1
+        if state.missing_holding_observations < self.config.flat_confirm_observations:
+            return False
+        last_seen = _parse_time(state.position_last_seen_at)
+        if last_seen is None:
+            # Never observed in the balance at all. There is no "still held" claim to
+            # protect, so the observation count alone decides.
+            return True
+        return (now - last_seen).total_seconds() >= self.config.flat_confirm_seconds
+
+    def _remember_owned_position(self) -> None:
+        """Freeze the live thesis for this lot so a reset cannot downgrade it.
+
+        ``_adopt_existing_position`` rebuilds the session from the broker's balance
+        row, which carries a quantity and an average price and nothing else. Without
+        this memo the strategy id, the exit geometry it was armed with and — worst —
+        the true entry time are all lost, and the lot is re-managed as an unknown
+        thesis on a fresh 1200s clock.
+        """
+        state = self._state
+        strategy = resolve_strategy_id(state.selected_strategy)
+        if not strategy or not state.selected_symbol or not state.entry_price:
+            return
+        state.owned_position_memo = {
+            "symbol": state.selected_symbol,
+            "strategy_id": strategy,
+            "entry_price": float(state.entry_price),
+            "position_opened_at": state.position_opened_at,
+            "selected_direction": state.selected_direction,
+            "selected_execution_product": state.selected_execution_product,
+            "selected_deployment_state": state.selected_deployment_state,
+            "selection_source": state.selection_source,
+            "session_id": state.session_id,
+            "target_price": state.target_price,
+            "stop_price": state.stop_price,
+            "target_return_rate": state.target_return_rate,
+            "stop_loss_rate": state.stop_loss_rate,
+            "trailing_stop_rate": state.trailing_stop_rate,
+            "max_holding_seconds": state.max_holding_seconds,
+            "high_watermark_price": state.high_watermark_price,
+            "low_watermark_price": state.low_watermark_price,
+            "expected_cost_bps": state.expected_cost_bps,
+            "expected_net_return_bps": state.expected_net_return_bps,
+        }
 
     def _recall_imminent(self, now: datetime) -> bool:
         """Is the borrow's return deadline close enough to force a cover?
@@ -1686,6 +2015,133 @@ class StrategySessionManager:
             except Exception:  # noqa: BLE001 - evidence linkage cannot break exits.
                 pass
 
+    def _continuation_invalidation_evidence(
+        self, bundle: Any, symbol: str, strategy_id: str | None
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """Return one fresh, forward-looking reason set for an owned position.
+
+        Held symbols are deliberately included in every macro/micro reasoning run.
+        The micro reasoner can therefore detect momentum loss, VWAP breakdown,
+        volatility expansion, false breakouts and liquidity deterioration before a
+        frozen price stop is reached.  This method converts that existing advisory
+        output into strategy-lifecycle evidence; it does not invent a second signal.
+
+        The bundle timestamp is returned as the observation identity so a throttled
+        bundle can only advance confirmation once.
+        """
+        if bundle is None:
+            return None, ()
+        normalized = str(symbol or "").upper()
+        bundle_at = _parse_time(getattr(bundle, "timestamp", None))
+        evidence_id = _iso(bundle_at) if bundle_at is not None else None
+        reasons: list[str] = []
+
+        micro = next(
+            (
+                item
+                for item in tuple(getattr(bundle, "micro_results", ()) or ())
+                if str(getattr(item, "symbol", "") or "").upper() == normalized
+            ),
+            None,
+        )
+        if micro is not None:
+            raw_exit = getattr(micro, "exit_signal", None)
+            exit_signal = str(getattr(raw_exit, "value", raw_exit) or "").upper()
+            if exit_signal in {
+                "SELL_CANDIDATE",
+                "RISK_REDUCE",
+                "TAKE_PROFIT",
+                "TRAILING_STOP",
+            }:
+                reasons.append(f"MICRO_{exit_signal}")
+                micro_at = _parse_time(getattr(micro, "timestamp", None))
+                if micro_at is not None:
+                    evidence_id = _iso(micro_at)
+                reasons.extend(
+                    str(code)
+                    for code in tuple(getattr(micro, "reason_codes", ()) or ())
+                    if str(code)
+                )
+
+        # A high-probability structural break plus explicit withdrawal of the owning
+        # strategy is independent confirmation that its expected edge has expired.
+        macro = getattr(bundle, "macro_result", None)
+        change_probability = _optional_float(
+            getattr(macro, "change_point_probability", None)
+        )
+        if (
+            strategy_id
+            and _macro_permits(bundle, strategy_id) is False
+            and change_probability is not None
+            and change_probability
+            >= self.config.invalidation_change_point_probability
+        ):
+            # When no micro exit exists, identify the observation by the macro
+            # timestamp. A cached structural-break verdict must not be counted as
+            # several independent confirmations by the faster micro loop.
+            if not reasons:
+                macro_at = _parse_time(getattr(macro, "timestamp", None))
+                if macro_at is not None:
+                    evidence_id = _iso(macro_at)
+            reasons.extend(
+                (
+                    f"MACRO_WITHDREW_STRATEGY:{strategy_id}",
+                    f"REGIME_CHANGE_PROBABILITY:{change_probability:.3f}",
+                )
+            )
+
+        return evidence_id, tuple(dict.fromkeys(reasons))
+
+    def _confirmed_continuation_exit_reason(
+        self,
+        holding: Any,
+        bundle: Any,
+        *,
+        direction: PositionDirection,
+    ) -> str | None:
+        """Confirm thesis decay and classify the exit as profit protection/loss limit."""
+        state = self._state
+        evidence_id, reasons = self._continuation_invalidation_evidence(
+            bundle, state.selected_symbol or "", state.selected_strategy
+        )
+        # No timestamp means the producer cannot prove that this is new evidence.
+        # Fail closed for an automated early exit rather than counting loop ticks.
+        if evidence_id is None:
+            return None
+        if evidence_id == state.last_invalidation_evidence_at:
+            return None
+        state.last_invalidation_evidence_at = evidence_id
+        if reasons:
+            state.invalidation_cycles += 1
+            state.invalidation_reason_codes = list(reasons)
+        else:
+            # Continuation recovered on a genuinely newer observation. Requiring
+            # consecutive evidence filters one-off indicator noise.
+            state.invalidation_cycles = 0
+            state.invalidation_reason_codes = []
+            return None
+        if state.invalidation_cycles < self.config.invalidation_confirm_cycles:
+            return None
+
+        entry = float(getattr(holding, "average_price", 0.0) or 0.0)
+        mark = float(getattr(holding, "last_price", 0.0) or 0.0)
+        if entry <= 0.0 or mark <= 0.0:
+            return None
+        gross_bps = _directional_gross_bps(entry, mark, direction)
+        cost_bps = max(
+            0.0,
+            float(
+                state.expected_cost_bps
+                if state.expected_cost_bps is not None
+                else self.config.fallback_round_trip_cost_bps
+            ),
+        )
+        return (
+            "STRATEGY_EDGE_DECAY_PROFIT_PROTECT"
+            if gross_bps > cost_bps
+            else "STRATEGY_EDGE_DECAY_LOSS_LIMIT"
+        )
+
     def _evaluate_exit(self, holding: Any, bundle: Any, now: datetime) -> None:
         state = self._state
         if state.phase == "EXITING":
@@ -1769,6 +2225,13 @@ class StrategySessionManager:
         elif direction is PositionDirection.SHORT and self._recall_imminent(now):
             reason = "STRATEGY_SHORT_BORROW_RECALL"
 
+        if reason is None:
+            reason = self._confirmed_continuation_exit_reason(
+                holding,
+                bundle,
+                direction=direction,
+            )
+
         opened = _parse_time(state.position_opened_at) or getattr(holding, "opened_at", None)
         if (
             reason is None
@@ -1780,6 +2243,7 @@ class StrategySessionManager:
 
         if reason:
             state.phase = "EXITING"
+            state.exiting_since = state.exiting_since or _iso(now)
             state.exit_reason = reason
             state.exit_requested_at = _iso(now)
             state.last_reason = reason
@@ -1989,7 +2453,8 @@ class StrategySessionManager:
             decided = True
 
         if selected is not None:
-            self._arm(selected, now, macro, account=account)
+            if not self._arm(selected, now, macro, account=account):
+                return
             if v2_context_id:
                 runner = self._selector_v2
                 self._state.selector_v2_context_id = v2_context_id
@@ -2008,7 +2473,7 @@ class StrategySessionManager:
             return
         if proposals:
             self._state.last_reason = (
-                f"{ShortReasonCodes.SHADOW_ONLY}:"
+                f"{DEPLOYMENT_SHADOW_ONLY}:"
                 f"{','.join(sorted({p.strategy_id for p in proposals}))}"
             )
             return
@@ -2161,8 +2626,11 @@ class StrategySessionManager:
                 gross_edge = _optional_float(decision.get("expected_edge_bps"))
                 if gross_edge is None:
                     continue
-                expected_cost = _market_round_trip_cost_bps(
-                    symbol, self.config.fallback_round_trip_cost_bps
+                expected_cost = _all_in_round_trip_cost_bps(
+                    symbol,
+                    fallback_bps=self.config.fallback_round_trip_cost_bps,
+                    micro_result=micro_result,
+                    evidence_row=row,
                 )
                 geometry = _resolved_geometry(
                     strategy_id,
@@ -2304,6 +2772,7 @@ class StrategySessionManager:
             # it for a short. A single ``expected_exit > entry_price`` test would
             # silently discard every short's model target and fall back to the
             # geometry floor.
+            forecast_gross_bps: float | None = None
             if entry_price > 0 and expected_exit > 0:
                 favourable = (
                     expected_exit > entry_price
@@ -2311,6 +2780,10 @@ class StrategySessionManager:
                     else expected_exit < entry_price
                 )
                 if favourable:
+                    # The signal's OWN forward move. It was previously folded into
+                    # the target and then thrown away, which left the cost gate with
+                    # nothing to divide but the barrier.
+                    forecast_gross_bps = abs(expected_exit / entry_price - 1.0) * 10_000.0
                     target_rate = max(target_rate, abs(expected_exit / entry_price - 1.0))
             micro_result = next(
                 (
@@ -2320,11 +2793,13 @@ class StrategySessionManager:
                 ),
                 None,
             )
-            expected_cost = _optional_float(gnn.get("expected_cost_bps"))
-            if expected_cost is None:
-                expected_cost = _market_round_trip_cost_bps(
-                    symbol, self.config.fallback_round_trip_cost_bps
-                )
+            expected_cost = _all_in_round_trip_cost_bps(
+                symbol,
+                fallback_bps=self.config.fallback_round_trip_cost_bps,
+                model_estimate_bps=_optional_float(gnn.get("expected_cost_bps")),
+                micro_result=micro_result,
+                evidence_row=row if isinstance(row, Mapping) else None,
+            )
             geometry = _resolved_geometry(
                 selected_strategy,
                 expected_cost_bps=expected_cost,
@@ -2373,6 +2848,7 @@ class StrategySessionManager:
                         getattr(intent, "expected_net_return_bps", None)
                     ),
                     expected_cost_bps=expected_cost,
+                    predicted_gross_move_bps=forecast_gross_bps,
                     gnn_actionable=gnn_actionable,
                     gnn_action=gnn_action,
                     gnn_reason_codes=gnn_reason_codes,
@@ -2530,11 +3006,15 @@ class StrategySessionManager:
                         f"MACRO_BLOCKS_ELECTED_STRATEGY:{selected_strategy}"
                     )
                     continue
-                expected_cost = _optional_float(strategy_row.get("expected_cost_bps"))
-                if expected_cost is None:
-                    expected_cost = _market_round_trip_cost_bps(
-                        normalized, self.config.fallback_round_trip_cost_bps
-                    )
+                expected_cost = _all_in_round_trip_cost_bps(
+                    normalized,
+                    fallback_bps=self.config.fallback_round_trip_cost_bps,
+                    model_estimate_bps=_optional_float(
+                        strategy_row.get("expected_cost_bps")
+                    ),
+                    micro_result=micro_result,
+                    evidence_row=row if isinstance(row, Mapping) else None,
+                )
                 geometry = _resolved_geometry(
                     selected_strategy,
                     expected_cost_bps=expected_cost,
@@ -2557,6 +3037,7 @@ class StrategySessionManager:
                     self.config.fallback_target_return_rate,
                     profit_bps / 10_000.0,
                 )
+                forecast_gross_bps: float | None = None
                 if entry_price and expected_exit:
                     favourable = (
                         expected_exit > entry_price
@@ -2564,6 +3045,9 @@ class StrategySessionManager:
                         else expected_exit < entry_price
                     )
                     if favourable:
+                        forecast_gross_bps = (
+                            abs(expected_exit / entry_price - 1.0) * 10_000.0
+                        )
                         target_rate = max(
                             target_rate,
                             abs(expected_exit / entry_price - 1.0),
@@ -2627,6 +3111,7 @@ class StrategySessionManager:
                         ),
                         expected_net_return_bps=model_net,
                         expected_cost_bps=expected_cost,
+                        predicted_gross_move_bps=forecast_gross_bps,
                         gnn_actionable=row_actionable,
                         gnn_action=(
                             "ACTIVATE_STRATEGY" if row_actionable else gnn_action
@@ -2839,9 +3324,29 @@ class StrategySessionManager:
     ) -> StrategyDeploymentState:
         """Committed deployment state for one arm.
 
-        LONG arms keep the pre-existing behaviour exactly: the per-strategy
-        ``live_authorized`` flag maps to LIVE_FULL or SHADOW, so nothing about the
-        long path changes. SHORT arms are looked up per-arm in the promotion store.
+        The per-strategy ``live_authorized`` flag grants LONG arms LIVE_FULL, and it
+        still does — but it may no longer outrank a measured NEGATIVE edge.
+
+        The flag used to short-circuit before the evidence-based controller ran, so
+        that controller was consulted only for arms already switched off: the one
+        case where its answer could not matter. Measured 2026-08-21 over the stored
+        outcomes, ``evaluate_long_promotion`` returned SHADOW for every LONG strategy
+        in the catalogue, with conservative edges from -85 to -281bps, while all of
+        them were arming at LIVE_FULL. Against the tape those same signals produced a
+        forward return 21bps BELOW an unconditional entry on the same symbols
+        (``vwap_mean_reversion`` 93bps below, ``breakout_volume`` 118bps below). Full
+        size on a measured negative edge is not a risk posture, it is an arithmetic
+        mistake.
+
+        The demotion is deliberately narrow. "No evidence yet" is NOT "bad evidence":
+        a cold arm keeps whatever the operator's flag grants it, because the flag is
+        how a new thesis gets its first fills and the promotion ladder is how it
+        earns the rest. Only an arm the store can actually speak about — at least
+        ``minimum_shadow_samples`` outcomes — and whose conservative edge is
+        non-positive is pulled down to the rung it earned.
+
+        SHORT arms were already evidence-gated per-arm in the promotion store and are
+        unchanged.
 
         Any failure resolves to SHADOW. An unreadable deployment state must never
         authorise an order, and for a short that is the difference between a journal
@@ -2849,21 +3354,38 @@ class StrategySessionManager:
         """
         if direction is PositionDirection.LONG:
             authorized, _ = self._deployment_authorized(strategy_id)
-            if authorized:
-                return StrategyDeploymentState.LIVE_FULL
             try:
                 from app.technical.strategy_algorithms import strategy_shadow_authorized
-                from app.trading.long_strategy_promotion import evaluate_long_promotion
+                from app.trading.long_strategy_promotion import (
+                    LongPromotionConfig,
+                    evaluate_long_promotion,
+                )
 
-                if not strategy_shadow_authorized(
+                if not authorized and not strategy_shadow_authorized(
                     strategy_id, registry=self._algorithm_registry
                 ):
                     return StrategyDeploymentState.DISABLED
-                return evaluate_long_promotion(
+                decision = evaluate_long_promotion(
                     strategy_id, market, self.performance_store
-                ).state
+                )
             except Exception:  # noqa: BLE001 - fail closed to SHADOW.
                 return StrategyDeploymentState.SHADOW
+            if not authorized:
+                return decision.state
+            config = LongPromotionConfig.from_env()
+            measured_negative = (
+                decision.sample_count >= config.minimum_shadow_samples
+                and decision.conservative_edge_bps
+                <= config.minimum_shadow_conservative_edge_bps
+            )
+            if not measured_negative:
+                return StrategyDeploymentState.LIVE_FULL
+            # Demotion only: the flag is a ceiling, never a floor under evidence.
+            return min(
+                StrategyDeploymentState.LIVE_FULL,
+                decision.state,
+                key=lambda item: item.rank,
+            )
         try:
             from app.trading.short_strategy_promotion import default_promotion_controller
 
@@ -3274,7 +3796,7 @@ class StrategySessionManager:
         # a bug — refuse the trade and say so rather than resolving it optimistically.
         if not winner.submits_orders:
             self._state.last_reason = (
-                f"{ShortReasonCodes.SHADOW_ONLY}:{winner.strategy_id}"
+                f"{DEPLOYMENT_SHADOW_ONLY}:{winner.strategy_id}"
             )
             return None
         winner.conservative_edge_bps = selection.conservative_edge_bps
@@ -3287,12 +3809,24 @@ class StrategySessionManager:
         macro: Any = None,
         *,
         account: Any = None,
-    ) -> None:
+    ) -> bool:
         """Commit one proposal to ARMED, preserving the audit trail."""
         coverage = evaluate_cost_coverage(
             proposal.predicted_gross_edge_bps(self.config.fallback_round_trip_cost_bps),
             proposal.resolved_cost_bps(self.config.fallback_round_trip_cost_bps),
         )
+        # Selection may rank a proposal, but it may not waive the minimum
+        # economics required to survive round-trip costs.  Previously this
+        # assessment was written to the UI and then ignored, which allowed an
+        # INSUFFICIENT 1.269x DYN proposal to reach the live order path.
+        if not coverage.live_eligible:
+            ratio = "UNKNOWN" if coverage.ratio is None else f"{coverage.ratio:.3f}"
+            self._state.last_reason = (
+                f"ENTRY_COST_COVERAGE_REJECTED:{coverage.band.value}:{ratio}"
+            )
+            self._state.cost_coverage_ratio = coverage.ratio
+            self._state.cost_coverage_band = coverage.band.value
+            return False
         entry_price = proposal.entry_price
         # Direction-aware: a short's target sits BELOW the entry. The previous
         # unconditional ``* (1 + rate)`` would have armed a short whose "target" was
@@ -3387,6 +3921,7 @@ class StrategySessionManager:
             self._state.trade_plan_id = self._trade_plan.plan_id
             self._state.trade_plan_quantity = self._trade_plan.quantity
             self._state.trade_plan_expires_at = _iso(self._trade_plan.expires_at)
+        return True
 
     def _no_election_reason(
         self, evidence: Mapping[str, Any], intents: list[Any]
@@ -3699,13 +4234,29 @@ class StrategySessionManager:
         self, holdings: Mapping[str, Any], bundle: Any, now: datetime
     ) -> None:
         symbol, holding = next(iter(holdings.items()))
+        average = float(getattr(holding, "average_price", 0.0) or 0.0)
+        memo = self._owned_position_memo_for(symbol, average)
         strategy = "risk_managed_existing_position"
         for result in tuple(getattr(bundle, "micro_results", ()) or ()):
             if str(getattr(result, "symbol", "") or "").upper() == symbol:
-                strategy = str(getattr(getattr(result, "selected_strategy", None), "value", "") or strategy)
+                # The micro reasoner emits an ACTION, and ``hold``/``sell``/
+                # ``reduce_risk`` are not theses. Taking them verbatim named the
+                # session's strategy ``hold``, which resolves to no geometry row and
+                # silently re-armed the lot on the unknown-thesis fallback — a 60bps
+                # stop and a 1200s clock in place of the rule it was entered under.
+                resolved = resolve_strategy_id(
+                    getattr(getattr(result, "selected_strategy", None), "value", None)
+                    or getattr(result, "selected_strategy", None)
+                )
+                if resolved:
+                    strategy = resolved
                 break
-        average = float(getattr(holding, "average_price", 0.0) or 0.0)
-        opened = getattr(holding, "opened_at", None) or now
+        if memo:
+            # This is the same lot we were already managing. Its own thesis outranks
+            # anything re-derived from a bare balance row.
+            strategy = str(memo.get("strategy_id") or strategy)
+        opened = memo.get("position_opened_at") if memo else None
+        opened = _parse_time(opened) or getattr(holding, "opened_at", None) or now
         stop_bps, profit_bps, trailing_bps = _strategy_exit_bps(strategy)
         target_rate = max(
             self.config.fallback_target_return_rate,
@@ -3770,12 +4321,106 @@ class StrategySessionManager:
                 )
             ),
         )
+        self._state.position_last_seen_at = _iso(now)
+        self._state.owned_position_memo = dict(memo) if memo else {}
+        if memo:
+            self._restore_owned_position(memo, last_price=last_price, direction=direction)
+
+    def _owned_position_memo_for(
+        self, symbol: str, average_price: float
+    ) -> dict[str, Any]:
+        """The frozen thesis for this exact lot, or ``{}``.
+
+        Identity is (symbol, average price). A different average price is a
+        different lot — a partial fill, an add, or a position opened outside this
+        system — and inheriting the previous trade's barriers and entry clock would
+        manage it against a thesis it was never entered under.
+        """
+        memo = self._state.owned_position_memo or {}
+        if not isinstance(memo, Mapping) or not memo:
+            return {}
+        if str(memo.get("symbol") or "").upper() != str(symbol or "").upper():
+            return {}
+        remembered = _optional_float(memo.get("entry_price")) or 0.0
+        if remembered <= 0.0 or average_price <= 0.0:
+            return {}
+        if abs(average_price - remembered) > max(1e-9, remembered * 1e-4):
+            return {}
+        if not resolve_strategy_id(memo.get("strategy_id")):
+            return {}
+        return dict(memo)
+
+    def _restore_owned_position(
+        self,
+        memo: Mapping[str, Any],
+        *,
+        last_price: float,
+        direction: PositionDirection,
+    ) -> None:
+        """Put the armed exit contract back, exactly as the entry set it.
+
+        Re-deriving it from the table would already be closer than the fallback, but
+        it still would not be the same contract: the armed geometry was sized against
+        the cost and spread measured for THIS trade, and the watermark and the entry
+        clock have no table to be re-derived from at all.
+        """
+        state = self._state
+        state.session_id = str(memo.get("session_id") or state.session_id)
+        state.selection_source = str(
+            memo.get("selection_source") or "BROKER_POSITION_RECONCILIATION"
+        )
+        state.selected_deployment_state = str(
+            memo.get("selected_deployment_state") or state.selected_deployment_state
+        )
+        state.selected_execution_product = str(
+            memo.get("selected_execution_product") or state.selected_execution_product
+        )
+        for key in (
+            "target_price",
+            "stop_price",
+            "expected_cost_bps",
+            "expected_net_return_bps",
+        ):
+            value = _optional_float(memo.get(key))
+            if value is not None:
+                setattr(state, key, value)
+        for key in ("target_return_rate", "stop_loss_rate", "trailing_stop_rate"):
+            value = _optional_float(memo.get(key))
+            if value is not None and value > 0.0:
+                setattr(state, key, value)
+        holding_seconds = _optional_float(memo.get("max_holding_seconds"))
+        if holding_seconds is not None and holding_seconds > 0:
+            state.max_holding_seconds = int(holding_seconds)
+        # The favourable extreme survives too. Reseeding it from the entry would
+        # rearm a trailing stop the position had already moved past.
+        if direction is PositionDirection.LONG:
+            remembered = _optional_float(memo.get("high_watermark_price"))
+            state.high_watermark_price = max(
+                remembered or 0.0, state.high_watermark_price or 0.0, last_price
+            ) or None
+        else:
+            state.low_watermark_price = favourable_watermark(
+                _optional_float(memo.get("low_watermark_price"))
+                or state.low_watermark_price,
+                last_price or (state.entry_price or 0.0),
+                direction,
+            ) or None
+        # Keep a warning reason (multiple holdings, short without a loan date); only
+        # the plain adoption line is replaced, because it is no longer the truth.
+        if state.last_reason == "EXISTING_POSITION_ADOPTED":
+            state.last_reason = "EXISTING_POSITION_READOPTED_WITH_ARMED_THESIS"
 
     def _reset_to_scanning(self, reason: str) -> None:
+        # The memo outlives the reset on purpose. A reset that happens while the lot
+        # is still held (cooldown after an unconfirmed flat, a supervisor halt, a
+        # rejected exit) is exactly when re-adoption needs the thesis it is about to
+        # forget. ``_adopt_existing_position`` discards it unless the same lot at the
+        # same average price comes back.
         self._state = StrategySessionState(
             target_return_rate=self.config.fallback_target_return_rate,
             last_reason=reason,
             last_evaluated_at=self._state.last_evaluated_at,
+            owned_position_memo=dict(self._state.owned_position_memo or {}),
         )
 
     def _load(self) -> StrategySessionState:

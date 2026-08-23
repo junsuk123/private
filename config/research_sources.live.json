@@ -13,15 +13,43 @@
   "rss_feeds": [
     {
       "url": "https://www.federalreserve.gov/feeds/press_all.xml",
-      "event_type": "MACRO"
+      "event_type": "MACRO",
+      "max_items": 30
     },
     {
       "url": "https://www.bls.gov/feed/bls_latest.rss",
-      "event_type": "MACRO"
+      "event_type": "MACRO",
+      "max_items": 30,
+      "fetch_articles": false
     },
     {
       "url": "https://www.sec.gov/news/pressreleases.rss",
-      "event_type": "FINANCIAL"
+      "event_type": "FINANCIAL",
+      "max_items": 30
+    },
+    {
+      "url": "http://dart.fss.or.kr/api/todayRSS.xml",
+      "event_type": "DISCLOSURE",
+      "max_items": 50,
+      "fetch_articles": false
+    },
+    {
+      "url": "https://www.bok.or.kr/portal/bbs/P0000559/news.rss?menuNo=200690",
+      "event_type": "MACRO",
+      "max_items": 30,
+      "fetch_articles": false
+    },
+    {
+      "url": "https://www.bok.or.kr/portal/bbs/B0000501/news.rss?menuNo=201264",
+      "event_type": "MACRO",
+      "max_items": 30,
+      "fetch_articles": false
+    },
+    {
+      "url": "https://www.fsc.go.kr/about/fsc_bbs_rss/?fid=0111",
+      "event_type": "FINANCIAL",
+      "max_items": 30,
+      "article_limit": 3
     }
   ],
   "rss_fetch_articles": true,
@@ -83,7 +111,8 @@
       "period": "D",
       "start_date": "20260101",
       "end_date": "20261231",
-      "name": "kr_bank_of_korea_base_rate"
+      "name": "kr_bank_of_korea_base_rate",
+      "optional_without_api_key": true
     }
   ],
   "opendart_disclosures": []
