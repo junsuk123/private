@@ -327,17 +327,30 @@ class LiveTrainingPipelineTest(unittest.TestCase):
                     journal_path=journal,
                     registry=registry,
                 )
+                first_market_candidates = tuple(
+                    (registry.root / "KR").glob("live_short_horizon.*.json")
+                )
                 second = train_live_short_horizon_from_collected_features(
                     journal_path=journal,
                     registry=registry,
                 )
 
             candidates = tuple(registry.root.glob("live_short_horizon.*.json"))
+            second_market_candidates = tuple(
+                (registry.root / "KR").glob("live_short_horizon.*.json")
+            )
 
         self.assertFalse(first.get("training_skipped", False))
         self.assertTrue(second["training_skipped"])
         self.assertEqual(second["skip_reason"], "UNCHANGED_LABELLED_DATASET")
         self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(first_market_candidates), 1)
+        self.assertEqual(len(second_market_candidates), 1)
+        self.assertTrue(second["per_market"]["KR"]["training_skipped"])
+        self.assertEqual(
+            second["per_market"]["KR"]["skip_reason"],
+            "UNCHANGED_MARKET_LABELLED_DATASET",
+        )
 
     def test_changed_feature_values_force_retraining_even_when_labels_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

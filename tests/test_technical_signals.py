@@ -116,7 +116,10 @@ def _election(strategy_id: str):
         ),
         "cross_sectional_relative_strength": dict(sector_rank=1, sector_candidate_count=8),
         "gap_context": dict(
-            gap_rate=0.02, gap_submode="continuation", session_open_price=99.0
+            gap_rate=0.02,
+            gap_submode="continuation",
+            session_open_price=99.0,
+            minutes_since_session_open=15.0,
         ),
     }
     return ElectionContext(strategy_id, **extra.get(strategy_id, {}))
@@ -552,6 +555,22 @@ class TestCompositeEngine:
         assert rest_polled.direction == SignalDirection.BUY
         assert "ASK_HEAVY_ABSORPTION_CONFIRMED" in rest_polled.reason_codes
 
+        unavailable_spread_change = self.engine.evaluate_owned_strategy(
+            tick_features(
+                symbol="SOFI",
+                return_30s=0.0004,
+                orderbook_imbalance=-0.40,
+                # The live builder's finite placeholder when the five-second
+                # window has fewer than two order books.
+                spread_change_5s=0.0,
+                second_data_ready=False,
+                tick_count_5s=0,
+            ),
+            "liquidity_shock_reversal",
+        )
+        assert unavailable_spread_change.direction == SignalDirection.HOLD
+        assert "ASK_HEAVY_ABSORPTION_CONFIRMED" not in unavailable_spread_change.reason_codes
+
         still_falling = self.engine.evaluate_owned_strategy(
             tick_features(
                 symbol="SOFI",
@@ -616,9 +635,31 @@ class TestCompositeEngine:
         signal = self.engine.evaluate_owned_strategy(
             tick_features(),
             "gap_context",
-            ElectionContext("gap_context", gap_rate=-0.02, gap_submode="continuation"),
+            ElectionContext(
+                "gap_context",
+                gap_rate=-0.02,
+                gap_submode="continuation",
+                minutes_since_session_open=15.0,
+            ),
         )
         assert "GAP_CONTINUATION_REQUIRES_UP_GAP" in signal.reason_codes
+
+    def test_gap_context_rejects_a_stale_gap_after_opening_window(self):
+        from app.technical.strategy_algorithms import ElectionContext
+
+        signal = self.engine.evaluate_owned_strategy(
+            tick_features(),
+            "gap_context",
+            ElectionContext(
+                "gap_context",
+                gap_rate=0.02,
+                gap_submode="continuation",
+                session_open_price=99.0,
+                minutes_since_session_open=61.0,
+            ),
+        )
+
+        assert "GAP_OUTSIDE_OPENING_WINDOW" in signal.reason_codes
 
     def test_owned_strategy_no_longer_blocks_on_regime(self):
         """Regime/liquidity admissibility moved to the supervisor."""

@@ -145,3 +145,14 @@ def test_spec_declares_no_authorisation_api(registry: StrategyRegistry) -> None:
     spec = registry.require("intraday_momentum")
     assert not hasattr(spec, "submits_orders")
     assert not hasattr(spec, "live_authorized")
+
+
+def test_corrected_session_and_spread_rules_do_not_inherit_spec_v2_outcomes(
+    registry: StrategyRegistry,
+) -> None:
+    assert registry.require("gap_context").algorithm_version == (
+        "gap-context-v3-opening-window"
+    )
+    assert registry.require("liquidity_shock_reversal").algorithm_version == (
+        "liquidity-shock-v3-observed-spread"
+    )

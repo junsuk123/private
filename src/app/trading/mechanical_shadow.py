@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from app.cost.trading_cost_engine import TradingCostEngine
+from app.data.market_session import MarketPhase, market_phase
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.features.live_feature_frame import LiveFeatureFrame
 from app.strategy.exit_geometry import exit_geometry, resolve_exit_geometry
@@ -70,9 +71,21 @@ class MechanicalShadowCollector:
         frames: Iterable[LiveFeatureFrame],
         *,
         observed_at: datetime | None = None,
+        regime: str | None = None,
     ) -> MechanicalShadowCollection:
         now = _aware(observed_at or datetime.now(timezone.utc))
+        observed_regime = str(regime or "").strip().upper() or "UNKNOWN"
         evaluated = triggered = recorded = adopted = 0
+        # This thesis is calibrated against the continuous US order book.  The
+        # selection-evidence refresh also runs in pre/after-hours, where KIS can
+        # still quote/order but liquidity and the eventual evaluator cadence are
+        # materially different.  Those refreshes previously produced plans until
+        # 21:58 UTC (almost two hours after the regular close); with no later tape,
+        # the evaluator expired them at the next market transition and counted
+        # synthetic losses.  Keep extended-hours data flowing for exits and other
+        # consumers, but do not treat it as evidence for this regular-session arm.
+        if market_phase("US", now) is not MarketPhase.REGULAR:
+            return MechanicalShadowCollection()
         algorithm = get_algorithm(self.strategy_id)
         if algorithm is None:
             return MechanicalShadowCollection()
@@ -194,7 +207,14 @@ class MechanicalShadowCollector:
                     predicted_gross_edge_bps=decision.expected_edge_bps,
                     predicted_net_edge_bps=decision.expected_edge_bps - cost_bps,
                     predicted_success_probability=decision.confidence,
-                    regime="MECHANICAL_ABSORPTION_SHADOW",
+                    # Deployment promotion is evaluated per real market regime.
+                    # The former value, MECHANICAL_ABSORPTION_SHADOW, described
+                    # the collection path rather than the tape and consequently
+                    # made every one of these outcomes invisible to TREND_UP /
+                    # TREND_DOWN / RANGE_BOUND promotion queries.  Collection
+                    # identity already lives in model_version and reason_codes;
+                    # the regime column must retain its one semantic meaning.
+                    regime=observed_regime,
                     signal_reason_codes=(
                         *decision.reason_codes,
                         "GNN_INDEPENDENT_MECHANICAL_SHADOW",

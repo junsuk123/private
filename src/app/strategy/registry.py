@@ -185,6 +185,7 @@ _REQUIRED_ELECTION_INPUTS: dict[str, tuple[str, ...]] = {
     "cross_sectional_relative_strength": ("sector_rank", "sector_candidate_count"),
     "gap_context": (
         "gap_rate", "gap_submode", "session_open_price", "previous_close_price",
+        "minutes_since_session_open",
     ),
     "rvgi_box_breakout": (
         "rvgi", "rvgi_signal", "rvgi_diff", "rvgi_bullish_cross", "box_high", "box_low",
@@ -372,6 +373,14 @@ REGISTRY_VERSION = "spec-v2"
 # the older rule merely because the catalogue itself did not change.  Keep this
 # map narrow so unrelated strategies retain their compatible evidence.
 _ALGORITHM_VERSION_OVERRIDES: dict[str, str] = {
+    # v3 requires an exchange-aware opening clock.  The spec-v2 rule kept the
+    # previous-close gap actionable all day (and into after-hours), so its stored
+    # outcomes are not compatible evidence for the corrected opening thesis.
+    "gap_context": "gap-context-v3-opening-window",
+    # v3 requires an actually observed narrowing spread and regular-session
+    # collection.  spec-v2 interpreted the sparse-book 0.0 placeholder as
+    # contraction and journalled after the continuous market had closed.
+    "liquidity_shock_reversal": "liquidity-shock-v3-observed-spread",
     "residual_relative_strength": "residual-strength-v3-bear-cash-equity",
 }
 

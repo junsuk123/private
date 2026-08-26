@@ -23,7 +23,7 @@
 
 | 진입점 | 역할 |
 | --- | --- |
-| `run.ps1` | 표준 런처(Windows·Linux 공용). 포트 `8010` 고정, live 프로세스 플래그 설정, 관리 브라우저 창 연결, 창 종료 시 서버 종료 |
+| `run.ps1` | 표준 런처(Windows·Linux 공용). 기본 포트 `8010`, 충돌 시 범위 내 다른 포트 선택, live 프로세스 플래그 설정, 관리 브라우저 창 연결, 창 종료 시 서버 종료 |
 | `setup.ps1` | OS별 가상환경 생성·의존성 설치·import 검증(Windows `.venv`, Linux `.venv-linux`) |
 | `run.py` → `app.run:main` | `src`를 `sys.path`에 넣고 startup 점검 후 `uvicorn app.web:app` 기동 |
 | `packaging/raspberrypi/run.sh` | Pi CPU-only 런처 (read-only 기본값) |
@@ -113,7 +113,7 @@ V2 모듈은 주문을 만들거나 broker를 호출하지 않습니다. 승격�
 | `src/app/graph/` | custom KnowledgeGraph, FactTable, RDF/OWL/SHACL 레이어, 거시–미시 추론, theory vote, NPU evidence scorer |
 | `src/app/ontology/` | TTL 스키마와 closed-world 운영 게이트, trading domain reasoner, **전략 eligibility (hard mask + soft score, 실제 strategy id 기준)** |
 | `src/app/models/` | 라벨링, 학습 파이프라인, artifact registry, CPU/OpenVINO backend, strategy-utility R-GCN |
-| `src/app/strategy/`, `routing/` | 카탈로그 전략 expert(롱 17 + 숏 3, `STRATEGY_IDS` 기준), 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
+| `src/app/strategy/`, `routing/` | 카탈로그 전략 expert(롱 20 + 숏 3, `STRATEGY_IDS` 기준), 소유권 가드, strategy router, GNN 실시간 신뢰도, shadow comparison |
 | `src/app/strategy/spec.py`, `registry.py` | 전략 선언 계약(`StrategySpec`)과 실코드 파생 registry. lifecycle 권고는 migration flag 로만 적용 |
 | `src/app/strategy/proposal.py`, `proposal_engine.py` | `StrategyProposal` (수량·side·venue field 부재) 과 mask 이후 실행되는 proposal 생성기 |
 | `src/app/strategy/coverage.py` | 6축 context 버킷과 `STRATEGY_COVERAGE_GAP` 집계 |

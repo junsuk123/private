@@ -173,7 +173,11 @@ liquidity_shock_reversal:
   absorption_us_only: true
   max_absorption_orderbook_imbalance: -0.30
   min_absorption_return_30s_bps: 2.0
-  max_absorption_spread_change_5s: 0.0
+  # ``spread_change_5s=0`` is also the fail-closed finite placeholder when the
+  # REST-polled US book contributes fewer than two observations in five seconds.
+  # Require a measured contraction of at least 1bp; an unavailable change must
+  # never be reinterpreted as evidence that displayed supply was absorbed.
+  max_absorption_spread_change_5s: -0.01
   absorption_capture_fraction: 0.35
   absorption_horizon_seconds: 600
   max_absorption_horizon_seconds: 3600
@@ -203,6 +207,9 @@ cross_sectional_relative_strength:
 gap_context:
   live_authorized: false
   min_gap_rate: 0.01
+  # A gap is an opening-state thesis. Re-evaluating the same previous-close gap
+  # through the close/after-hours produced 46 US shadow entries and 46 losses.
+  max_minutes_since_session_open: 60.0
   min_volume_spike_ratio: 1.5
   min_aggressor_imbalance: 0.10
   horizon_seconds: 300.0

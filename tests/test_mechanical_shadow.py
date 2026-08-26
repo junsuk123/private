@@ -98,7 +98,9 @@ def test_absorption_signal_is_journaled_and_adopted_without_order_path():
         cooldown_seconds=600,
     )
 
-    result = collector.collect((_frame(now),), observed_at=now)
+    result = collector.collect(
+        (_frame(now),), observed_at=now, regime="TREND_UP"
+    )
 
     assert result.evaluated == result.triggered == result.recorded == result.adopted == 1
     plan = plan_store.plans[0]
@@ -109,6 +111,7 @@ def test_absorption_signal_is_journaled_and_adopted_without_order_path():
     # ``max_absorption_horizon_seconds``.
     assert 600 <= plan.max_holding_seconds <= 3600
     assert plan.deployment_state == "SHADOW"
+    assert plan.regime == "TREND_UP"
     # The invariant that matters, asserted at the cost actually measured rather than
     # at the KRX reference constant. Asserting only the reference is how the table
     # kept reading 1.53 while paying 0.83 on the tape it was being scored on.
@@ -122,6 +125,36 @@ def test_absorption_signal_is_journaled_and_adopted_without_order_path():
     duplicate = collector.collect((_frame(now + timedelta(seconds=30)),), observed_at=now + timedelta(seconds=30))
     assert duplicate.triggered == 1
     assert duplicate.recorded == duplicate.adopted == 0
+
+
+def test_absorption_without_market_regime_is_quarantined_as_unknown():
+    now = datetime(2026, 8, 3, 14, 30, tzinfo=timezone.utc)
+    plan_store = _PlanStore()
+    collector = MechanicalShadowCollector(
+        market_store=_MarketStore(_book(now)),
+        shadow_store=plan_store,
+        evaluation_service=_EvaluationService(),
+    )
+
+    result = collector.collect((_frame(now),), observed_at=now)
+
+    assert result.recorded == 1
+    assert plan_store.plans[0].regime == "UNKNOWN"
+
+
+def test_absorption_is_not_collected_outside_us_regular_session():
+    after_close = datetime(2026, 8, 3, 21, 58, tzinfo=timezone.utc)
+    plan_store = _PlanStore()
+    collector = MechanicalShadowCollector(
+        market_store=_MarketStore(_book(after_close)),
+        shadow_store=plan_store,
+        evaluation_service=_EvaluationService(),
+    )
+
+    result = collector.collect((_frame(after_close),), observed_at=after_close)
+
+    assert result == type(result)()
+    assert not plan_store.plans
 
 
 def test_raw_absorption_is_collected_when_sparse_rest_ticks_cannot_price_edge():

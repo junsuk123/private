@@ -10288,6 +10288,12 @@ def _strategy_session_selection_evidence(symbols: tuple[str, ...]) -> dict[str, 
       default_mechanical_shadow_collector().collect(
           frames.values(),
           observed_at=observed_at,
+          regime=str(
+              ((_latest_macro_micro_bundle() or {}).get("macro_result") or {}).get(
+                  "market_regime"
+              )
+              or "UNKNOWN"
+          ),
       )
     except Exception as exc:
       # The experimental collector is never allowed to starve the established
@@ -17775,7 +17781,7 @@ HTML = """
       const explicit = String(position.currency || '').toUpperCase();
       if (explicit) return explicit;
       const ticker = String(position.ticker || '');
-      return /^\d{6}$/.test(ticker) ? 'KRW' : 'USD';
+      return /^\\d{6}$/.test(ticker) ? 'KRW' : 'USD';
     }
 
     function splitInvestmentSummary(data = {}, summary = accountSnapshotSummary(data)) {

@@ -72,6 +72,7 @@ class ElectionContext:
     gap_submode: str | None = None
     session_open_price: float | None = None
     previous_close_price: float | None = None
+    minutes_since_session_open: float | None = None
     # rvgi_box_breakout (all frozen at election)
     rvgi: float | None = None
     rvgi_signal: float | None = None
@@ -175,6 +176,7 @@ class ElectionContext:
             "sector_candidate_count": self.sector_candidate_count,
             "gap_rate": self.gap_rate,
             "gap_submode": self.gap_submode,
+            "minutes_since_session_open": self.minutes_since_session_open,
             "rvgi": self.rvgi,
             "rvgi_signal": self.rvgi_signal,
             "rvgi_diff": self.rvgi_diff,
@@ -601,7 +603,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "absorption_us_only": 1.0,
         "max_absorption_orderbook_imbalance": -0.30,
         "min_absorption_return_30s_bps": 2.0,
-        "max_absorption_spread_change_5s": 0.0,
+        "max_absorption_spread_change_5s": -0.01,
         "absorption_capture_fraction": 0.35,
         "absorption_horizon_seconds": 600.0,
         "max_absorption_horizon_seconds": 3600.0,
@@ -624,6 +626,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
     },
     "gap_context": {
         "min_gap_rate": 0.01,
+        "max_minutes_since_session_open": 60.0,
         "min_volume_spike_ratio": 1.5,
         "min_aggressor_imbalance": 0.10,
         "horizon_seconds": 300.0,
@@ -1673,6 +1676,11 @@ class LiquidityShockReversalAlgorithm(TradingAlgorithm):
             >= self.p("min_absorption_return_30s_bps")
             and (f.orderbook_imbalance or 0.0)
             <= self.p("max_absorption_orderbook_imbalance")
+            # ``_second_level_features`` emits finite 0.0 when fewer than two
+            # order books exist in the five-second window.  Zero is therefore
+            # ambiguous (flat OR unavailable), not proof of contraction.  The
+            # configured bound is strictly negative so the comparison can only
+            # pass on a genuinely observed narrowing spread.
             and (f.spread_change_5s or 0.0)
             <= self.p("max_absorption_spread_change_5s")
         )
@@ -1976,6 +1984,14 @@ class GapContextAlgorithm(TradingAlgorithm):
     thesis = "an opening gap either continues on confirmation or fills after exhaustion"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        elapsed = context.minutes_since_session_open
+        if elapsed is None:
+            return self._reject(("GAP_SESSION_CLOCK_ABSENT",))
+        if elapsed < 0.0 or elapsed > self.p("max_minutes_since_session_open"):
+            return self._reject(
+                ("GAP_OUTSIDE_OPENING_WINDOW",),
+                minutes_since_session_open=round(float(elapsed), 3),
+            )
         gap = context.gap_rate
         submode = (context.gap_submode or "").strip().lower()
         if gap is None or not submode:

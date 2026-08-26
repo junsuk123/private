@@ -289,11 +289,14 @@ def _session_structure_context(now: datetime, symbol: str) -> dict[str, Any]:
 
     session = regular_session(symbol)
     remaining = session.minutes_to_continuous_close(now)
+    local_now = now.astimezone(session.zone)
+    elapsed = (local_now - session.session_open(now)).total_seconds() / 60.0
     return {
         "in_last_continuous_half_hour": session.in_last_continuous_half_hour(now),
         # Negative after the continuous close, which reads as "no time left" to every
         # consumer rather than wrapping around to a large positive number.
         "minutes_to_continuous_close": round(remaining, 3),
+        "minutes_since_session_open": round(elapsed, 3),
     }
 
 

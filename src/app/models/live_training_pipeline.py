@@ -493,6 +493,35 @@ def _train_per_market_models(
             by_market[str(row.get("market") or _row_market(str(row.get("ticker") or "")))].append(row)
         for market, market_rows in sorted(by_market.items()):
             market_registry = ModelArtifactRegistry(Path(base_root) / market)
+            # The combined trainer has an unchanged-dataset fast path, but this
+            # market split used to refit every market on every combined cycle.
+            # While KRX was open, an already-closed US dataset therefore emitted
+            # an identical losing challenger every few minutes and each copy was
+            # counted as independent evidence against the US incumbent.  Besides
+            # wasting a full fit, that inflated the consecutive-negative streak
+            # and could demote an otherwise unchanged market model before its next
+            # session.  Fingerprint each market slice independently: KR rows may
+            # change without making unchanged US rows a new US experiment.
+            dataset_fingerprint = _training_rows_fingerprint(market_rows)
+            previous = _latest_saved_payload(market_registry)
+            previous_training = (previous or {}).get("training_data") or {}
+            if (
+                previous
+                and dataset_fingerprint
+                and previous_training.get("dataset_fingerprint")
+                == dataset_fingerprint
+            ):
+                summary[market] = {
+                    "artifact_id": previous.get("artifact_id"),
+                    "row_count": len(market_rows),
+                    "live_eligible": previous.get("live_eligible"),
+                    "metrics": previous.get("metrics"),
+                    "root": str(market_registry.root),
+                    "training_skipped": True,
+                    "skip_reason": "UNCHANGED_MARKET_LABELLED_DATASET",
+                    "dataset_fingerprint": dataset_fingerprint,
+                }
+                continue
             artifact = train_live_short_horizon_model(
                 market_rows,
                 registry=market_registry,
@@ -503,12 +532,25 @@ def _train_per_market_models(
                     None if market_rows else "NO_COLLECTED_LIVE_FEATURE_FRAMES"
                 ),
             )
+            _annotate_saved_artifact(
+                artifact,
+                market_registry,
+                {
+                    "source": str(journal_path),
+                    "source_type": "collected_live_feature_frames_market_split",
+                    "market": market,
+                    "row_count": len(market_rows),
+                    "dataset_fingerprint": dataset_fingerprint,
+                },
+            )
             summary[market] = {
                 "artifact_id": artifact.get("artifact_id"),
                 "row_count": len(market_rows),
                 "live_eligible": artifact.get("live_eligible"),
                 "metrics": artifact.get("metrics"),
                 "root": str(market_registry.root),
+                "training_skipped": False,
+                "dataset_fingerprint": dataset_fingerprint,
             }
     except Exception as exc:  # noqa: BLE001 - the combined model must still ship.
         summary["error"] = f"{type(exc).__name__}:{exc}"
