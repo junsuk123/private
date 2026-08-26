@@ -148,6 +148,22 @@ def test_flags_re_admit_without_a_code_change() -> None:
     assert still_excluded == ()
 
 
+def test_plain_etfs_require_their_own_account_permission() -> None:
+    symbols = ["229200", "360750"]
+    names = {"229200": "KODEX 코스닥150", "360750": "TIGER 미국S&P500"}
+
+    blocked, excluded = filter_tradable(symbols, names, market="KR")
+    assert blocked == ()
+    assert {item.category for item in excluded} == {CATEGORY_ETF}
+    assert all("INSTRUMENT_ETF_NOT_PERMITTED" in item.reason_codes for item in excluded)
+
+    allowed, still_excluded = filter_tradable(
+        symbols, names, market="KR", etf_allowed=True
+    )
+    assert tuple(allowed) == tuple(symbols)
+    assert still_excluded == ()
+
+
 # --- Universe integration ----------------------------------------------------- #
 
 

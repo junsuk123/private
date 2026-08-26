@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from types import SimpleNamespace
 
 from app.config.selector_v2_flags import SelectorV2Flags
@@ -231,3 +232,31 @@ def test_runner_reports_effective_automatic_authority(tmp_path):
     assert snapshot["shadow_only"] is False
     assert snapshot["live_authority"] is True
     assert snapshot["order_size_fraction"] == 0.10
+
+
+def test_production_runner_keeps_kr_and_us_promotion_independent(
+    tmp_path, monkeypatch
+):
+    config = replace(
+        _config(tmp_path),
+        state_path=str(tmp_path / "selector-promotion.json"),
+    )
+    monkeypatch.setattr(
+        SelectorPromotionConfig,
+        "load",
+        classmethod(lambda cls, path="config/selector_v2_promotion.yaml": config),
+    )
+    runner = SelectorV2ShadowRunner(
+        flags=SelectorV2Flags(enabled=True, shadow_only=True, auto_promote=True),
+        counterfactual=SimpleNamespace(),
+    )
+    us = _groups()
+    runner._promotions["US"].evaluate(us, now=AT)
+    runner._promotions["US"].evaluate(us, now=AT + timedelta(minutes=5))
+
+    assert runner.live_authority_for("AAPL") is True
+    assert runner.order_size_fraction_for("US") == 0.10
+    assert runner.live_authority_for("005930") is False
+    assert runner.order_size_fraction_for("KR") == 0.0
+    assert (tmp_path / "selector-promotion.US.json").exists()
+    assert (tmp_path / "selector-promotion.KR.json").exists() is False

@@ -37,6 +37,21 @@ function opsNumber(value, digits = 0) {
   });
 }
 
+function opsOperatingModelMetric(activeModel, metric, digits = 3) {
+  const rawDirect = activeModel?.metrics?.[metric];
+  const direct = rawDirect == null ? Number.NaN : Number(rawDirect);
+  if (Number.isFinite(direct)) return direct.toFixed(digits);
+
+  const marketValues = Object.entries(activeModel?.market_models || {})
+    .map(([market, report]) => {
+      const rawValue = report?.metrics?.[metric];
+      const value = rawValue == null ? Number.NaN : Number(rawValue);
+      return Number.isFinite(value) ? `${market} ${value.toFixed(digits)}` : null;
+    })
+    .filter(Boolean);
+  return marketValues.length ? marketValues.join(' · ') : 'N/A';
+}
+
 function opsPercent(value, digits = 1) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return '-';
@@ -73,9 +88,24 @@ function opsSetBadge(id, tone, text) {
 }
 
 async function opsFetchJson(url) {
-  const response = await fetch(url, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`${url} · HTTP ${response.status}`);
-  return response.json();
+  let firstError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(url, { cache: 'no-store' });
+      if (response.ok) return response.json();
+      const error = new Error(`${url} · HTTP ${response.status}`);
+      if (![502, 503, 504].includes(response.status) || attempt > 0) throw error;
+      firstError = error;
+    } catch (error) {
+      if (attempt > 0) {
+        const detail = firstError ? `${firstError.message}; retry: ${error.message}` : error.message;
+        throw new Error(detail);
+      }
+      firstError = error;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+  }
+  throw firstError || new Error(`${url} · unknown fetch failure`);
 }
 
 function opsPrimaryBlocker(diag, reliability, gnn, trading) {
@@ -231,7 +261,7 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
   opsText('ops-model-state', activeModel.live_eligible ? '운영 가능' : '검증 중');
   opsText(
     'ops-ontology-note',
-    `연구 ${research.latest?.status || (research.active ? '진행 중' : '대기')} · 활성 모델 AUC ${opsNumber(activeModel.metrics?.auc, 3)} · 오류 ${diag?.last_error ? '있음' : '없음'}`,
+    `연구 ${research.latest?.status || (research.active ? '진행 중' : '대기')} · 활성 모델 AUC ${opsOperatingModelMetric(activeModel, 'auc', 3)} · 오류 ${diag?.last_error ? '있음' : '없음'}`,
   );
 
   opsSetBadge(

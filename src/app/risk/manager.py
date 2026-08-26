@@ -11,6 +11,7 @@ from app.audit import AuditLogger, log_path
 from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.data.instrument_eligibility import CATEGORY_DERIVATIVE as INSTRUMENT_DERIVATIVE
 from app.data.instrument_eligibility import CATEGORY_ETN as INSTRUMENT_ETN
+from app.data.instrument_eligibility import CATEGORY_ETF as INSTRUMENT_ETF
 from app.data.instrument_eligibility import CATEGORY_LEVERAGED_ETP as INSTRUMENT_LEVERAGED_ETP
 from app.data.instrument_eligibility import classify as classify_instrument
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
@@ -33,6 +34,9 @@ from app.market_affordability import (
     is_overseas_market as account_is_overseas_market,
     market_currency as account_market_currency,
 )
+from app.quant.adapters import quant_risk_factor
+from app.quant.config import default_quant_config
+from app.quant.contracts import QuantEvidence
 
 
 class RiskManager:
@@ -53,6 +57,7 @@ class RiskManager:
         market: MarketSnapshot,
         trades_today: int = 0,
         existing_pending_tickers: set[str] | None = None,
+        quant_evidence: tuple[QuantEvidence, ...] = (),
     ) -> RiskManagerResult:
         existing_pending_tickers = existing_pending_tickers or set()
         report = build_portfolio_report(account)
@@ -121,7 +126,9 @@ class RiskManager:
             market=str(getattr(intent, "market", "") or getattr(market, "market", "") or "") or None,
         )
         metadata["instrument_category"] = instrument.category
-        if instrument.tradable:
+        if instrument.category == INSTRUMENT_ETF:
+            checks["instrument_permitted"] = bool(self.rules.etf_trading_allowed)
+        elif instrument.tradable:
             checks["instrument_permitted"] = True
         elif instrument.category == INSTRUMENT_LEVERAGED_ETP:
             checks["instrument_permitted"] = bool(self.rules.leverage_etf_allowed)
@@ -132,7 +139,11 @@ class RiskManager:
             # layer cannot construct the order whatever the account may hold.
             checks["instrument_permitted"] = False
         if not checks["instrument_permitted"]:
-            metadata["instrument_reason_codes"] = list(instrument.reason_codes)
+            metadata["instrument_reason_codes"] = (
+                ["INSTRUMENT_ETF_NOT_PERMITTED"]
+                if instrument.category == INSTRUMENT_ETF
+                else list(instrument.reason_codes)
+            )
         # These two are the real gates, and they only bind on an order that needs them.
         # A SHORT EXIT is deliberately NOT gated: refusing to cover a short because the
         # account-level short flag was turned off would trap an open, unbounded-loss
@@ -208,6 +219,22 @@ class RiskManager:
             self.rules.max_single_stock_weight,
             self.rules.max_intraday_position_weight if intent.action == OrderAction.BUY else self.rules.max_single_stock_weight,
         )
+        quant_factor, quant_reasons = quant_risk_factor(
+            quant_evidence,
+            stale_after_ms=default_quant_config().stale_after_ms,
+        )
+        # The reference layer has no authority to enlarge a request. A parity
+        # failure drives new exposure to zero; stale/degraded evidence can only
+        # reduce it. Existing callers supplying no evidence retain prior behavior.
+        adjusted_weight *= quant_factor
+        metadata["quant_evidence"] = {
+            "count": len(quant_evidence),
+            "risk_factor": quant_factor,
+            "reason_codes": list(quant_reasons),
+        }
+        checks["quant_reference_not_authoritative"] = quant_factor <= 1.0
+        if intent.action == OrderAction.BUY and quant_evidence and quant_factor <= 0.0:
+            checks["quant_evidence_usable"] = False
         cash_available_for_market = _cash_available_for_market(account, market)
         if cash_available_for_market <= 0:
             currency = _market_currency(market)

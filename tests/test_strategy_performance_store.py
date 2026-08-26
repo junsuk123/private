@@ -64,6 +64,27 @@ def test_recent_outcomes_are_newest_first(tmp_path):
     assert store.recent_net_bps("intraday_momentum") == (30.0, -5.0, 10.0)
 
 
+def test_old_algorithm_or_payoff_versions_are_preserved_but_not_promotable(tmp_path):
+    store = _store(tmp_path)
+    assert store.record(
+        strategy_id="intraday_momentum",
+        symbol="005930",
+        market="KR",
+        regime="HIGH_VOL_TRENDING",
+        realized_net_bps=500.0,
+        recorded_at=NOW,
+        algorithm_version="spec-v1",
+        evaluation_version="legacy-payoff",
+    )
+    assert store.recent_outcomes("intraday_momentum", market="KR") == ()
+    historical = store.recent_outcomes(
+        "intraday_momentum", market="KR", compatible_only=False
+    )
+    assert len(historical) == 1
+    assert historical[0].algorithm_version == "spec-v1"
+    assert historical[0].evaluation_version == "legacy-payoff"
+
+
 def test_evidence_older_than_the_window_is_dropped(tmp_path):
     """The 21-day cutoff itself, asserted rather than assumed.
 

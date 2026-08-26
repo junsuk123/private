@@ -76,6 +76,26 @@ class LiveFeatureFrame:
 
 
 class LiveFeatureFrameBuilder:
+    @staticmethod
+    def historical_dependencies(*, market: str):
+        """Declare completed-bar needs to the demand-driven warmup coordinator."""
+        from app.data.minute_bar_warmup import HistoricalDependency
+        from app.features.strategy_graph_context import SESSION_CONTEXT_BARS
+
+        return (
+            HistoricalDependency(
+                component="feature:live_feature_frame",
+                timeframe_minutes=1,
+                minimum_observations=64,
+                preferred_observations=SESSION_CONTEXT_BARS,
+                required_fields=(
+                    "open", "high", "low", "close", "volume", "spread_bps",
+                    "orderbook_imbalance", "liquidity_score",
+                ),
+                market_constraints=(str(market).upper(),),
+            ),
+        )
+
     def __init__(
         self,
         store: RealtimeMarketDataStore,
@@ -609,10 +629,13 @@ def _slow_context_bars(store, symbol: str, decision_time: datetime):
         # open after roughly 13:00 KST, which would make the session block
         # unavailable for the back half of every session — precisely the hours the
         # opening-range and first-half-hour theses are evaluated against.
-        rows = store.recent_minute_bars(
+        reader = getattr(store, "reconciled_minute_bars", store.recent_minute_bars)
+        rows = reader(
             symbol,
             decision_time - timedelta(minutes=_ctx_session_bars()),
             limit=_ctx_session_bars(),
+            **({"market": "US" if not (symbol.isdigit() and len(symbol) == 6) else "KR"}
+               if hasattr(store, "reconciled_minute_bars") else {}),
         )
     except Exception:  # noqa: BLE001 - slow context fails closed, never raises.
         rows = ()
@@ -820,9 +843,10 @@ def _slow_technical_columns(
         "dmi_spread", "supertrend", "supertrend_direction",
         "supertrend_distance_bps", "rsi", "bb_percent_b", "bb_bandwidth",
         "keltner_mid", "keltner_upper", "keltner_lower", "keltner_position",
-        "keltner_bandwidth", "choppiness", "vwap", "vwap_distance_bps", "vwap_slope",
+        "keltner_bandwidth", "prior_keltner_squeeze_ratio", "choppiness", "vwap", "vwap_distance_bps", "vwap_slope",
         "relative_volume", "volume_spike_ratio", "donchian_high",
-        "donchian_low", "breakout_strength", "donchian_low_distance",
+        "donchian_low",
+        "breakout_strength", "donchian_low_distance",
         "false_breakout_risk", "atr_pct", "realized_volatility",
         "volatility_expansion",
     )
@@ -937,10 +961,13 @@ def _cached_previous_session_bars(
     if cached is not None:
         return cached
     try:
-        raw = store.recent_minute_bars(
+        reader = getattr(store, "reconciled_minute_bars", store.recent_minute_bars)
+        raw = reader(
             symbol,
             decision_time - timedelta(days=14),
             limit=1600,
+            **({"market": "US" if not (symbol.isdigit() and len(symbol) == 6) else "KR"}
+               if hasattr(store, "reconciled_minute_bars") else {}),
         )
     except Exception:  # noqa: BLE001 - unavailable context must fail closed.
         return None
@@ -1005,10 +1032,13 @@ def _session_structure_diagnostics(
     if previous is None:
         return {}
     try:
-        current_raw = store.recent_minute_bars(
+        reader = getattr(store, "reconciled_minute_bars", store.recent_minute_bars)
+        current_raw = reader(
             symbol,
             session_open - timedelta(hours=1),
             limit=1600,
+            **({"market": "US" if not (symbol.isdigit() and len(symbol) == 6) else "KR"}
+               if hasattr(store, "reconciled_minute_bars") else {}),
         )
     except Exception:  # noqa: BLE001 - unavailable context must fail closed.
         return {}

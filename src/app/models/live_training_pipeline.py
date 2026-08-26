@@ -25,6 +25,7 @@ DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
 DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH = Path("data/store/account_dashboard.sqlite3")
 DEFAULT_TRAINING_ROW_STORE_PATH = Path("data/store/live_training_rows.sqlite3")
+DEFAULT_TRADE_PLAN_LABEL_STORE_PATH = Path("data/store/trading_state.sqlite3")
 DEFAULT_NEWS_TRUST_PATH = Path("data/store/news_trust.json")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
 # Triple-barrier 라벨 기본값. "30초 뒤 첫 프레임 수익률" 단일 라벨은 노이즈(std~120bps)에
@@ -757,6 +758,7 @@ def build_live_training_rows_from_feature_journal(
         from app.strategy.exit_geometry import label_geometries
 
         strategy_geometries = dict(label_geometries())
+    plan_contracts = _load_trade_plan_label_contracts()
 
     rows: list[dict[str, Any]] = []
     for symbol, symbol_frames in by_symbol.items():
@@ -787,14 +789,37 @@ def build_live_training_rows_from_feature_journal(
                 continue
             if any(not math.isfinite(value) for value in features.values()):
                 continue
+            plan_contract = _trade_plan_contract_for_frame(
+                symbol, times[index], plan_contracts
+            )
+            frame_take_profit_bps = (
+                plan_contract["take_profit_bps"]
+                if plan_contract is not None
+                else take_profit_bps
+            )
+            frame_stop_loss_bps = (
+                plan_contract["stop_loss_bps"]
+                if plan_contract is not None
+                else stop_loss_bps
+            )
+            frame_horizon_seconds = (
+                plan_contract["horizon_seconds"]
+                if plan_contract is not None
+                else horizon_seconds
+            )
+            frame_label_basis = (
+                f"trade_plan:{plan_contract['plan_id']}"
+                if plan_contract is not None
+                else label_basis
+            )
             labelled = _triple_barrier_label(
                 ordered,
                 times,
                 prices,
                 index,
-                horizon_seconds=horizon_seconds,
-                take_profit_bps=take_profit_bps,
-                stop_loss_bps=stop_loss_bps,
+                horizon_seconds=frame_horizon_seconds,
+                take_profit_bps=frame_take_profit_bps,
+                stop_loss_bps=frame_stop_loss_bps,
             )
             if labelled is None:
                 # 가격 경로가 없으면(테스트/스토어 미비) 기존 단일-전방 라벨로 후퇴한다.
@@ -813,7 +838,7 @@ def build_live_training_rows_from_feature_journal(
                 "forward_net_return_bps": forward_net_return_bps,
                 "gross_forward_return_bps": gross_forward_return_bps,
                 "label_source": label_source,
-                "label_basis": label_basis,
+                "label_basis": frame_label_basis,
                 "ticker": symbol,
                 # Market is recorded on every row so the trainer can fit KR and US
                 # separately. Mixing them puts a ~28bps-cost population and a
@@ -831,10 +856,102 @@ def build_live_training_rows_from_feature_journal(
                     prices,
                     index,
                     strategy_geometries,
+                    market=_row_market(symbol),
+                    plan_contract=plan_contract,
                 )
             rows.append(row)
     adjusted = _market_adjust_rows(rows)
     return [row for row in adjusted if _row_has_plausible_label(row)]
+
+
+def _load_trade_plan_label_contracts(
+    path: str | Path | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Load immutable live exit contracts for point-in-time training labels.
+
+    Generic feature frames still receive generic strategy labels.  A frame that
+    actually produced an executable TradePlan must instead be labelled against that
+    plan's exact target, stop and clock; otherwise learning optimises a different trade
+    from the one whose outcome reaches the broker.
+    """
+    database = Path(
+        path
+        or os.getenv(
+            "TRADE_PLAN_LABEL_STORE_PATH", str(DEFAULT_TRADE_PLAN_LABEL_STORE_PATH)
+        )
+    )
+    if not database.exists():
+        return {}
+    contracts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    try:
+        with closing(sqlite3.connect(database)) as conn:
+            rows = conn.execute(
+                "select plan_id, created_at, symbol, strategy_id, payload_json "
+                "from trade_plan order by created_at"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return {}
+    for plan_id, created_at, symbol, strategy_id, payload_json in rows:
+        try:
+            payload = json.loads(payload_json or "{}")
+            take_profit_bps = (
+                float((payload.get("take_profit_rule") or {}).get("rate")) * 10_000.0
+            )
+            stop_loss_bps = (
+                float((payload.get("stop_loss_rule") or {}).get("rate")) * 10_000.0
+            )
+            horizon_seconds = float(
+                (payload.get("time_exit") or {}).get("max_holding_seconds")
+            )
+            moment = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            else:
+                moment = moment.astimezone(timezone.utc)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            moment is None
+            or take_profit_bps <= 0.0
+            or stop_loss_bps <= 0.0
+            or horizon_seconds <= 0.0
+        ):
+            continue
+        contracts[str(symbol or "").upper()].append(
+            {
+                "plan_id": str(plan_id),
+                "strategy_id": str(strategy_id or ""),
+                "created_at": moment,
+                "take_profit_bps": take_profit_bps,
+                "stop_loss_bps": stop_loss_bps,
+                "horizon_seconds": horizon_seconds,
+            }
+        )
+    return dict(contracts)
+
+
+def _trade_plan_contract_for_frame(
+    symbol: str,
+    frame_time: datetime | None,
+    contracts: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    if frame_time is None:
+        return None
+    tolerance = max(
+        0.5, _env_float("TRADE_PLAN_LABEL_FRAME_TOLERANCE_SECONDS", 10.0)
+    )
+    candidates = contracts.get(str(symbol or "").upper(), ())
+    if not candidates:
+        return None
+    nearest = min(
+        candidates,
+        key=lambda item: abs((item["created_at"] - frame_time).total_seconds()),
+    )
+    return (
+        nearest
+        if abs((nearest["created_at"] - frame_time).total_seconds()) <= tolerance
+        else None
+    )
 
 
 def _row_market(symbol: str) -> str:
@@ -848,6 +965,9 @@ def _per_strategy_labels(
     prices: list[float | None],
     index: int,
     geometries: dict[str, Any],
+    *,
+    market: str | None = None,
+    plan_contract: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """One triple-barrier label per strategy, using ITS OWN exit geometry.
 
@@ -857,8 +977,26 @@ def _per_strategy_labels(
     close the trade.
     """
     labels: dict[str, dict[str, Any]] = {}
+    resolved_cost = market_round_trip_cost_bps(market) if market else None
     for strategy_id, geometry in geometries.items():
+        if resolved_cost is not None:
+            from app.strategy.exit_geometry import resolve_exit_geometry
+
+            geometry = resolve_exit_geometry(
+                strategy_id, round_trip_cost_bps=resolved_cost
+            )
         barriers = geometry.as_label_barriers()
+        basis = f"strategy_exit_geometry:{strategy_id}"
+        if (
+            plan_contract is not None
+            and str(plan_contract.get("strategy_id") or "") == str(strategy_id)
+        ):
+            barriers = {
+                "take_profit_bps": float(plan_contract["take_profit_bps"]),
+                "stop_loss_bps": float(plan_contract["stop_loss_bps"]),
+                "horizon_seconds": float(plan_contract["horizon_seconds"]),
+            }
+            basis = f"trade_plan:{plan_contract['plan_id']}"
         labelled = _triple_barrier_label(
             ordered,
             times,
@@ -879,6 +1017,7 @@ def _per_strategy_labels(
             "take_profit_bps": barriers["take_profit_bps"],
             "stop_loss_bps": barriers["stop_loss_bps"],
             "horizon_seconds": barriers["horizon_seconds"],
+            "label_basis": basis,
         }
     return labels
 
@@ -1049,10 +1188,29 @@ def _trade_event_stats(db_path: str | Path) -> dict[str, Any]:
 
 
 def _observed_cost_bps(frame: dict[str, Any]) -> float:
+    """Use the same conservative round trip as entry and execution.
+
+    ``spread + 10bps`` materially underpriced both venues, especially US.  A row
+    could therefore be a training win and an execution-gate loss.  Persisted live
+    frames always carry a symbol; malformed offline rows fall back to the
+    market-level cost authority rather than becoming free trades.
+    """
     try:
         spread_bps = max(0.0, float(frame["values"].get("spread_bps", 0.0)))
     except (TypeError, ValueError, KeyError):
         spread_bps = 0.0
+    symbol = str(frame.get("symbol") or frame.get("ticker") or "").strip().upper()
+    if symbol:
+        try:
+            from app.cost.round_trip import all_in_round_trip_bps
+
+            return all_in_round_trip_bps(symbol, spread_bps=spread_bps)
+        except Exception:  # noqa: BLE001 - one lookup must not stop a training run.
+            pass
+    market = _row_market(symbol) if symbol else str(frame.get("market") or "US").upper()
+    market_cost = market_round_trip_cost_bps(market)
+    if market_cost is not None:
+        return max(float(market_cost), spread_bps)
     return spread_bps + 10.0
 
 

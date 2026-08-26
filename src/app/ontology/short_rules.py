@@ -185,10 +185,10 @@ def evaluate_short_facts(
 #
 # Two design points worth stating:
 #
-# * TREND_DOWN admits a LONG (``vwap_mean_reversion``). A falling index is not a
-#   reason to be structurally short-only — mean reversion is precisely the long thesis
-#   that survives a downtrend, and removing it would turn a directional filter into a
-#   directional bet.
+# * TREND_DOWN admits LONG cash-equity paths. ``vwap_mean_reversion`` covers a
+#   confirmed recovery; ``residual_relative_strength`` covers the stricter case
+#   where an individual low-beta stock is rising in absolute terms despite weak
+#   breadth. A falling index alone never grants either entry.
 # * HIGH_VOL_DISLOCATED admits NO new entry in EITHER direction, only closes. A
 #   dislocated book is not a short opportunity; it is a market whose prices are not
 #   information, and the correct response to "I cannot read the tape" is not "so I
@@ -208,10 +208,16 @@ REGIME_PERMITTED_ARMS: Mapping[str, tuple[str, ...]] = {
         "opening_range_breakdown:SHORT",
         "residual_relative_weakness:SHORT",
         "vwap_mean_reversion:LONG",
+        # Long-only bear-market path: the algorithm additionally requires
+        # positive absolute trend, positive market/sector-neutral residuals,
+        # weak breadth and low beta. It is not permission to buy a mere
+        # "least-bad decliner".
+        "residual_relative_strength:LONG",
     ),
     "HIGH_VOL_TRENDING_DOWN": (
         "market_intraday_momentum_short:SHORT",
         "opening_range_breakdown:SHORT",
+        "residual_relative_strength:LONG",
     ),
     "HIGH_VOL_TRENDING_UP": (
         "intraday_momentum:LONG",

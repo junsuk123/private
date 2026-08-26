@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.graph.macro_reasoner import build_sector_rank_table
 from app.schemas.domain import AccountSnapshot, Holding
 from app.strategy.exit_geometry import exit_geometry
@@ -19,6 +21,24 @@ from app.trading.strategy_session import StrategySessionConfig, StrategySessionM
 
 
 NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _legacy_live_authority_for_bandit_tests(monkeypatch):
+    for strategy_id in (
+        "intraday_momentum",
+        "breakout_volume",
+        "vwap_mean_reversion",
+        "cross_sectional_relative_strength",
+        "rvgi_box_breakout",
+        "bar_confirmed_vwap_recovery",
+    ):
+        monkeypatch.setenv(f"ALGO_{strategy_id.upper()}_LIVE_AUTHORIZED", "1")
+    yield
+    monkeypatch.undo()
+    from app.strategy.registry import reset_default_strategy_registry
+
+    reset_default_strategy_registry()
 
 
 def _store(tmp_path) -> StrategyPerformanceStore:
@@ -276,7 +296,10 @@ def test_untrusted_full_vector_is_retained_as_non_executable_shadow_arm(tmp_path
     assert "cross_sectional_relative_strength" in state["bandit_shadow_arms"]
 
 
-def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_path):
+def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_path, monkeypatch):
+    # This test isolates election authority, not exit economics.
+    monkeypatch.setenv("STRATEGY_SESSION_MIN_NET_REWARD_RISK", "0.0")
+    monkeypatch.setenv("STRATEGY_SESSION_MIN_NET_TARGET_BPS", "1.0")
     evidence = {
         "005930": {
             "as_of": NOW.isoformat(),
@@ -384,7 +407,9 @@ def test_validation_vector_cannot_create_outcome_without_algorithm_trigger(tmp_p
     assert "TICK_WINDOW_NOT_READY" in state["algorithm_evaluations"][0]["reason_codes"]
 
 
-def test_bar_confirmed_vwap_recovery_is_a_regular_gnn_bandit_arm(tmp_path):
+def test_bar_confirmed_vwap_recovery_is_a_regular_gnn_bandit_arm(tmp_path, monkeypatch):
+    # This test isolates bandit/deployment routing, not exit economics.
+    monkeypatch.setenv("STRATEGY_SESSION_MIN_NET_REWARD_RISK", "0.0")
     strategy_id = "bar_confirmed_vwap_recovery"
     evidence = {
         "005930": {

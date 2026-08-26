@@ -82,6 +82,10 @@ def test_model_reliability_uses_active_champion_not_rejected_challenger() -> Non
             "live_eligible": False,
             "metrics": {"auc": 0.60, "precision_at_k": 0.22},
             "reason_codes": ["METRICS_BELOW_LIVE_THRESHOLDS"],
+            "deployment": {
+                "promoted": False,
+                "reason": "DEPLOYABLE_HOLDOUT_SAMPLE_TOO_SMALL",
+            },
         }
         (root / "latest.json").write_text(json.dumps(active), encoding="utf-8")
         (root / "live_short_horizon.rejected.json").write_text(
@@ -105,6 +109,103 @@ def test_model_reliability_uses_active_champion_not_rejected_challenger() -> Non
     assert result["metrics"]["auc"] == 0.72
     assert result["latest_challenger"]["artifact_id"] == "rejected-challenger"
     assert result["latest_challenger"]["live_eligible"] is False
+    assert result["latest_challenger"]["promoted"] is False
+    assert result["latest_challenger"]["deployment_reason"] == (
+        "DEPLOYABLE_HOLDOUT_SAMPLE_TOO_SMALL"
+    )
+    assert "DEPLOYABLE_HOLDOUT_SAMPLE_TOO_SMALL" in (
+        result["latest_challenger"]["reason_codes"]
+    )
+
+
+def test_model_reliability_checks_the_market_model_served_by_inference() -> None:
+    now = datetime.now(timezone.utc)
+    calls: list[Path] = []
+
+    def reliability(_now: datetime, root: Path) -> dict:
+        calls.append(root)
+        return {
+            "ok": True,
+            "artifact_id": "kr-fresh",
+            "live_eligible": True,
+            "schema_matches": True,
+            "trust_level": "LIVE",
+            "reason_codes": [],
+        }
+
+    with (
+        patch.object(web_module, "_model_reliability_at_root", side_effect=reliability),
+        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true"}),
+    ):
+        result = web_module._latest_model_reliability(now, ("KRX",))
+
+    assert result["ok"] is True
+    assert result["required_markets"] == ["KR"]
+    assert result["artifact_id"] == "KR:kr-fresh"
+    assert calls == [Path("data/models/live_short_horizon/KR")]
+
+
+def test_one_stale_required_market_keeps_market_split_model_gate_closed() -> None:
+    now = datetime.now(timezone.utc)
+
+    def reliability(_now: datetime, root: Path) -> dict:
+        market = root.name
+        return {
+            "ok": market == "KR",
+            "artifact_id": f"{market.lower()}-model",
+            "live_eligible": True,
+            "schema_matches": True,
+            "trust_level": "LIVE" if market == "KR" else "SHADOW_ONLY",
+            "reason_codes": [] if market == "KR" else ["MODEL_AGE_EXCEEDED"],
+        }
+
+    with (
+        patch.object(web_module, "_model_reliability_at_root", side_effect=reliability),
+        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true"}),
+    ):
+        result = web_module._latest_model_reliability(now, ("KRX", "US"))
+
+    assert result["ok"] is False
+    assert result["failed_markets"] == ["US"]
+    assert result["trust_level"] == "SHADOW_ONLY"
+    assert result["reason_codes"] == ["US:MODEL_AGE_EXCEEDED"]
+
+
+def test_stale_market_model_uses_the_same_combined_fallback_as_inference() -> None:
+    now = datetime.now(timezone.utc)
+
+    def reliability(_now: datetime, root: Path) -> dict:
+        if root.name == "live_short_horizon":
+            return {
+                "ok": True,
+                "artifact_id": "combined-live",
+                "live_eligible": True,
+                "schema_matches": True,
+                "trust_level": "LIVE",
+                "reason_codes": [],
+            }
+        return {
+            "ok": False,
+            "artifact_id": "us-shadow",
+            "live_eligible": True,
+            "schema_matches": True,
+            "trust_level": "SHADOW_ONLY",
+            "reason_codes": ["MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL"],
+        }
+
+    with (
+        patch.object(web_module, "_model_reliability_at_root", side_effect=reliability),
+        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true"}),
+    ):
+        result = web_module._latest_model_reliability(now, ("US",))
+
+    assert result["ok"] is True
+    assert result["failed_markets"] == []
+    assert result["artifact_id"] == "US:combined-live"
+    assert result["market_models"]["US"]["serving_source"] == "combined_fallback"
+    assert result["market_models"]["US"]["preferred_market_model"]["artifact_id"] == (
+        "us-shadow"
+    )
 
 
 def test_successful_unchanged_training_heartbeat_keeps_incumbent_fresh() -> None:
@@ -630,3 +731,29 @@ def test_no_recent_trades_is_not_reported_as_minute_bar_warmup() -> None:
     assert detail["no_recent_trade_activity"] is True
     assert detail["warming_up"] is False
     assert detail["eta_minutes"] == 0
+
+
+def test_warmup_ignores_large_but_stale_bar_history() -> None:
+    """A resumed stale symbol must not hide the fresh symbols' real shortfall."""
+    now = datetime.now(timezone.utc)
+    bars = {
+        "STALE": tuple(
+            SimpleNamespace(minute_start=now - timedelta(minutes=30)) for _ in range(50)
+        ),
+        "FRESH": tuple(
+            SimpleNamespace(minute_start=now - timedelta(seconds=30)) for _ in range(7)
+        ),
+    }
+    store = SimpleNamespace(
+        active_symbols=lambda *args, **kwargs: ("STALE", "FRESH"),
+        recent_minute_bars=lambda symbol, *args, **kwargs: bars[symbol],
+        latest_orderbook=lambda *args, **kwargs: None,
+    )
+    with patch.object(web_module, "RealtimeMarketDataStore", lambda *a, **k: store), patch.object(
+        web_module, "_realtime_engine_account_snapshot", return_value=None
+    ):
+        detail = web_module._buy_candidate_warmup_detail()
+
+    assert detail["best_symbol"] == "FRESH"
+    assert detail["best_bars"] == 7
+    assert detail["warming_up"] is True

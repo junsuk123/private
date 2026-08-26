@@ -39,6 +39,15 @@ from app.backtesting import StreamingAcceleratedDemo, TimeScalerConfig, TimeMode
 from app.data.kis_realtime import run_kis_realtime_websocket_collector
 from app.data.llm_classifier import build_event_llm_classifier_from_env, configure_default_event_llm_env, event_llm_runtime_status
 from app.data.realtime_store import RealtimeMarketDataStore
+from app.data.minute_bar_warmup import (
+    HistoricalDataCoordinator,
+    RequirementResolver,
+)
+from app.data.kis_minute_history import (
+    KisMinuteHistoryProvider,
+    PersistentBarRepository,
+    expected_session_bar,
+)
 from app.execution import KisApiError, KisDevelopersApiClient, LiveExecutionCoordinator, MockKisDevelopersApi, PaperOrderExecutor
 from app.execution.kis_auth import build_kis_client, run_kis_health_check, validate_live_secret_file
 from app.execution.kis_errors import LiveExecutionBlocked
@@ -1036,6 +1045,8 @@ _realtime_candidate_filter_state: dict[str, Any] = {
     "reason_samples": {},
 }
 _pending_krx_buy_candidate_warmup: dict[str, float] = {}
+_minute_warmup_lock = threading.Lock()
+_minute_warmup_coordinator: HistoricalDataCoordinator | None = None
 _dashboard_krx_watch: dict[str, float] = {}
 _dashboard_krx_stale_recovery_at: dict[str, float] = {}
 _kis_realtime_collector_skipped_subscriptions: dict[tuple[str, str], float] = {}
@@ -1969,8 +1980,101 @@ def _auto_reliability_int(name: str, default: int, minimum: int = 1) -> int:
     return max(minimum, default)
 
 
-def _latest_model_reliability(now: datetime) -> dict[str, Any]:
-  root = Path("data/models/live_short_horizon")
+def _latest_model_reliability(
+    now: datetime,
+    market_groups: Sequence[str] = (),
+) -> dict[str, Any]:
+  """Check the exact market-specific/fallback chain used by live inference.
+
+  ``LiveSignalPredictor`` prefers ``KR/latest.json`` or ``US/latest.json`` and
+  falls back to the combined champion when the preferred artifact is missing or
+  stale.  Readiness must resolve the same chain; otherwise an unusable preferred
+  artifact can block activation even while inference safely serves the validated
+  combined champion.
+  """
+  normalized_markets = tuple(
+      dict.fromkeys(
+          "KR" if str(group).upper() in {"KR", "KRX"} else "US"
+          for group in market_groups
+          if str(group).upper() in {"KR", "KRX", "US"}
+      )
+  )
+  split_enabled = _env_bool_web("LIVE_MODEL_SPLIT_BY_MARKET", True)
+  if split_enabled and normalized_markets:
+    preferred_reports = {
+        market: _model_reliability_at_root(
+            now,
+            Path("data/models/live_short_horizon") / market,
+        )
+        for market in normalized_markets
+    }
+    reports = dict(preferred_reports)
+    if any(not report.get("ok") for report in preferred_reports.values()):
+      combined_report = _model_reliability_at_root(
+          now,
+          Path("data/models/live_short_horizon"),
+      )
+      for market, preferred in preferred_reports.items():
+        if preferred.get("ok"):
+          reports[market] = {**preferred, "serving_source": "market_specific"}
+        elif combined_report.get("ok"):
+          reports[market] = {
+              **combined_report,
+              "serving_source": "combined_fallback",
+              "preferred_market_model": preferred,
+          }
+        else:
+          reports[market] = {
+              **preferred,
+              "serving_source": "unavailable",
+              "combined_fallback": combined_report,
+          }
+    else:
+      reports = {
+          market: {**report, "serving_source": "market_specific"}
+          for market, report in preferred_reports.items()
+      }
+    failures = [market for market, report in reports.items() if not report.get("ok")]
+    trust_levels = {str(report.get("trust_level") or "UNUSABLE") for report in reports.values()}
+    aggregate_trust = (
+        ModelTrustLevel.UNUSABLE.value
+        if ModelTrustLevel.UNUSABLE.value in trust_levels
+        else ModelTrustLevel.SHADOW_ONLY.value
+        if ModelTrustLevel.SHADOW_ONLY.value in trust_levels
+        else ModelTrustLevel.LIVE.value
+    )
+    # Preserve the serving artifact's operational detail when exactly one market is
+    # active.  Diagnostics need its age, metrics and challenger data; returning only
+    # aggregate booleans made the dashboard fall back to the stale combined champion.
+    single_market_detail = (
+        dict(next(iter(reports.values()))) if len(reports) == 1 else {}
+    )
+    return {
+        **single_market_detail,
+        "ok": not failures,
+        "model_id": "live_short_horizon",
+        "model_role": "auto_reliability_entry_model",
+        "market_split": True,
+        "required_markets": list(normalized_markets),
+        "failed_markets": failures,
+        "trust_level": aggregate_trust,
+        "live_eligible": all(bool(report.get("live_eligible")) for report in reports.values()),
+        "schema_matches": all(bool(report.get("schema_matches")) for report in reports.values()),
+        "artifact_id": ",".join(
+            f"{market}:{report.get('artifact_id') or 'missing'}"
+            for market, report in reports.items()
+        ),
+        "reason_codes": [
+            f"{market}:{reason}"
+            for market, report in reports.items()
+            for reason in tuple(report.get("reason_codes") or ())
+        ],
+        "market_models": reports,
+    }
+  return _model_reliability_at_root(now, Path("data/models/live_short_horizon"))
+
+
+def _model_reliability_at_root(now: datetime, root: Path) -> dict[str, Any]:
   try:
     active_path = root / "latest.json"
     active = json.loads(active_path.read_text(encoding="utf-8"))
@@ -2071,6 +2175,18 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
     reason_codes.extend(canonical_staleness.reason_codes)
   if training_age_seconds > maximum_training_age:
     reason_codes.append("MODEL_TRAINING_STALE")
+  challenger_reason_codes = list(challenger.get("reason_codes") or ())
+  challenger_deployment = dict(challenger.get("deployment") or {})
+  challenger_deployment_reason = str(challenger_deployment.get("reason") or "").strip()
+  if (
+      challenger_deployment.get("promoted") is False
+      and challenger_deployment_reason
+      and challenger_deployment_reason not in challenger_reason_codes
+  ):
+    # Model-fit eligibility and deployment eligibility are separate contracts.
+    # Include the promotion gate so an intentional sample/economic rejection is
+    # visible in live diagnostics instead of looking like an unexplained veto.
+    challenger_reason_codes.append(challenger_deployment_reason)
   return {
       "ok": not reason_codes,
       "model_id": "live_short_horizon",
@@ -2095,11 +2211,16 @@ def _latest_model_reliability(now: datetime) -> dict[str, Any]:
       "latest_challenger": {
           "artifact_id": challenger.get("artifact_id"),
           "live_eligible": bool(challenger.get("live_eligible")),
-          "reason_codes": list(challenger.get("reason_codes") or ()),
+          "promoted": bool(challenger_deployment.get("promoted")),
+          "deployment_reason": challenger_deployment_reason or None,
+          "reason_codes": challenger_reason_codes,
           "metrics": {
               "auc": _number_or_zero((challenger.get("metrics") or {}).get("auc")),
               "precision_at_k": _number_or_zero(
                   (challenger.get("metrics") or {}).get("precision_at_k")
+              ),
+              "deployable_holdout_count": _number_or_zero(
+                  (challenger.get("metrics") or {}).get("deployable_holdout_count")
               ),
           },
       },
@@ -2325,7 +2446,7 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
       if conflict.severity == "FAIL"
   ]
   policy_ok = not policy_conflicts
-  model = _latest_model_reliability(now)
+  model = _latest_model_reliability(now, market_data_groups)
   market = _auto_market_health(now, market_data_groups)
   market["required_markets"] = list(market_data_groups)
   market["extended_order_markets"] = list(groups)
@@ -3866,6 +3987,9 @@ def _with_upside_supervision(payload: dict) -> dict:
   supervised = set(_upside_supervised_strategy_ids(metadata))
   checkpoint_live_authorized = bool(metadata.get("live_authorized"))
   payload["checkpoint_live_authorized"] = checkpoint_live_authorized
+  payload["checkpoint_live_authorized_markets"] = list(
+      metadata.get("live_authorized_markets") or ()
+  )
   payload["checkpoint_authorization_checks"] = dict(
       metadata.get("authorization_checks") or {}
   )
@@ -5709,7 +5833,13 @@ def _system_diagnostics_payload() -> dict[str, Any]:
     )
   # Reliability transitions are deliberately cadence-cached, but diagnostics must
   # show the artifact written moments ago rather than the previous 5-minute sample.
-  model_health = _latest_model_reliability(now)
+  # Display the same market-specific champion that auto reliability and live
+  # inference use.  The combined champion is only a fallback when there is no
+  # active market, and may legitimately be older than the KR/US serving models.
+  model_health = _latest_model_reliability(
+      now,
+      tuple(reliability.get("active_markets") or ()),
+  )
   challenger_health = dict(model_health.get("latest_challenger") or {})
   displayed_model = (
       challenger_health
@@ -5945,6 +6075,16 @@ def _system_diagnostics_payload() -> dict[str, Any]:
               "active_model": {
                   "artifact_id": model_health.get("artifact_id"),
                   "metrics": dict(model_health.get("metrics") or {}),
+                  # A split-market runtime has no honest single AUC. Preserve the
+                  # serving KR/US reports so the GUI can display both instead of
+                  # coercing the intentionally absent aggregate metric to 0.0000.
+                  "market_models": {
+                      str(market): dict(report)
+                      for market, report in dict(
+                          model_health.get("market_models") or {}
+                      ).items()
+                      if isinstance(report, dict)
+                  },
                   "age_seconds": model_health.get("age_seconds"),
                   "training_age_seconds": model_health.get("training_age_seconds"),
                   "training_heartbeat_at": model_health.get("training_heartbeat_at"),
@@ -7213,6 +7353,22 @@ def realtime_trading_status() -> JSONResponse:
   )
 
 
+@app.get("/api/realtime-trading/warmup-status")
+def realtime_trading_warmup_status() -> JSONResponse:
+  """Report global operation separately from per-symbol preparation."""
+  with _minute_warmup_lock:
+    service = _minute_warmup_coordinator
+  if service is None:
+    return _json({
+        "global_state": "SYSTEM_OPERATIONAL",
+        "active_warmup_tasks": 0,
+        "pending_warmup_tasks": 0,
+        "metrics": {},
+        "readiness": {"counts": {}, "symbols": {}},
+    })
+  return _json(service.status())
+
+
 def _status_with_engine_cycle_id(status: dict[str, Any] | None) -> dict[str, Any] | None:
   """Project the trace's immutable cycle id onto status read models only."""
   if not isinstance(status, dict):
@@ -7269,28 +7425,54 @@ def _buy_candidate_warmup_detail() -> dict:
   Reporting the shortfall and an ETA turns that from a mystery into a wait.
   """
   try:
-    required = max(
-        10, _auto_reliability_int("REALTIME_STRATEGY_MINUTE_HISTORY_BARS", 20, 10)
-    )
+    strategies = _warmup_applicable_strategy_ids()
+    service = _minute_warmup_service()
     store = RealtimeMarketDataStore()
     now = datetime.now(timezone.utc)
     since = now - timedelta(seconds=120)
+    maximum_bar_age_seconds = max(
+        60.0,
+        _env_float_web("REALTIME_STRATEGY_HISTORY_MAX_AGE_SEC", 180.0),
+    )
     # "Active" is measured over a 120-second trade window, which goes empty during a
     # call auction even though every symbol has hundreds of completed bars. Reporting
-    # that as "0/20 bars, ~20 minutes to go" sent the operator looking for a warm-up
+    # that as a fixed-count ETA sent the operator looking for a warm-up
     # that had finished hours earlier: on 2026-08-11 at 15:28 the ten live universe
     # names held 200-315 bars each while this panel read 0.
     active = tuple(store.active_symbols(since, limit=32))
-    best_symbol, best_bars = "", 0
+    best_symbol, best_bars, best_required = "", 0, 0
+    best_progress = -1.0
     for symbol in active:
+      group = "KR" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US"
+      requirement = service.resolver.resolve(
+          str(symbol), group, applicable_strategy_ids=strategies
+      )
+      required = requirement.minimum_observations
       try:
-        bars = store.recent_minute_bars(
-            symbol, now - timedelta(minutes=max(120, required * 3)), limit=max(120, required)
+        reader = getattr(store, "reconciled_minute_bars", store.recent_minute_bars)
+        bars = reader(
+            symbol,
+            now - timedelta(minutes=max(240, requirement.preferred_observations * 20)),
+            limit=requirement.preferred_observations,
+            **({"market": group} if hasattr(store, "reconciled_minute_bars") else {}),
         )
       except Exception:  # noqa: BLE001 - one unreadable symbol must not hide the rest.
         continue
-      if len(bars) > best_bars:
-        best_symbol, best_bars = str(symbol), len(bars)
+      # Count only a sequence the strategy feature gate can actually use. A rotated
+      # symbol may be trading again now while its newest persisted bar is hours old;
+      # choosing its larger historical count hid the real post-restart warm-up.
+      latest_bar = getattr(bars[-1], "minute_start", None) if bars else None
+      if latest_bar is None:
+        continue
+      try:
+        if max(0.0, (now - latest_bar).total_seconds()) > maximum_bar_age_seconds:
+          continue
+      except (TypeError, ValueError):
+        continue
+      progress = min(1.0, len(bars) / max(1, required))
+      if progress > best_progress:
+        best_symbol, best_bars, best_required = str(symbol), len(bars), required
+        best_progress = progress
     # Affordability is checked alongside warm-up because it is the other reason a
     # perfectly healthy, fully warmed-up universe still yields zero candidates —
     # and the two are indistinguishable from a bare "0 candidates". Measured case:
@@ -7330,13 +7512,17 @@ def _buy_candidate_warmup_detail() -> dict:
     # "wait 20 minutes" and "the market is not printing right now".
     no_recent_activity = not active
     return {
-        "warming_up": bool(active) and best_bars < required,
+        "warming_up": bool(active) and best_bars < best_required,
         "no_recent_trade_activity": no_recent_activity,
         "kr_continuous_session": _kr_trading_is_continuous(now),
         "best_symbol": best_symbol,
         "best_bars": best_bars,
-        "required_bars": required,
-        "eta_minutes": 0 if no_recent_activity else max(0, required - best_bars),
+        "required_bars": best_required,
+        # Backfill is asynchronous; this is a bar deficit, not a fictitious
+        # wall-clock promise that the tape will print once per minute.
+        "missing_bars": 0 if no_recent_activity else max(0, best_required - best_bars),
+        "eta_minutes": 0 if no_recent_activity else None,
+        "warmup_queue": service.status(),
         "krw_orderable": orderable["KRW"],
         "cheapest_candidate": krw_cheapest.get("symbol", ""),
         "cheapest_ask": float(krw_cheapest.get("ask") or 0.0),
@@ -7422,16 +7608,15 @@ def _entry_blockade_chain() -> list[dict]:
 
   count = int(summary.get("buy_candidate_count") or 0)
   # A bare "0 candidates" is not actionable. The overwhelmingly common cause is
-  # minute-bar warm-up: a candidate needs REALTIME_STRATEGY_MINUTE_HISTORY_BARS
-  # completed bars, which after a restart (or right after the open) simply have
-  # not accrued yet. Distinguishing "warming up" from "nothing qualifies" is the
-  # difference between waiting and debugging.
+  # Candidate-specific preparation: the required completed bars now come from the
+  # applicable strategies and feature/model metadata. Distinguishing asynchronous
+  # backfill from "nothing qualifies" is the difference between waiting and debugging.
   warmup = _buy_candidate_warmup_detail() if count == 0 else {}
   detail = f"매수 후보 {count}개"
   if count == 0 and warmup.get("no_recent_trade_activity"):
     # Checked BEFORE warm-up: with no trades in the window there is no "best
     # symbol" to be short of bars, and the warm-up branch would have rendered
-    # 0/20 with a 20-minute ETA for names that have been fully warm all day.
+    # a made-up fixed-count ETA for names that have been fully warm all day.
     detail = (
       "후보 0개 — 최근 120초간 체결 없음"
       + (
@@ -7442,9 +7627,9 @@ def _entry_blockade_chain() -> list[dict]:
     )
   elif count == 0 and warmup.get("warming_up"):
     detail = (
-      f"후보 0개 — 분봉 워밍업 중 "
+      f"후보 0개 — 수요 기반 분봉 준비 중 "
       f"({warmup['best_symbol']} {warmup['best_bars']}/{warmup['required_bars']}개, "
-      f"약 {warmup['eta_minutes']}분 후 충족 예상)"
+      f"부족 {warmup.get('missing_bars', 0)}개; 다른 준비 완료 종목은 독립 진행)"
     )
   elif count == 0 and warmup.get("unaffordable"):
     blocked = []
@@ -10378,7 +10563,26 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   permanently reports ``MACRO_INSUFFICIENT_DATA`` despite a healthy websocket.
   """
   max_age = max(5.0, _env_float_web("REALTIME_BUY_CANDIDATE_MAX_AGE_SEC", 120.0))
-  limit = max(1, _auto_reliability_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 8))
+  evaluation_limit = max(
+      1, _auto_reliability_int("REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE", 8)
+  )
+  # The engine applies symbol-local cooldowns after discovery. Returning exactly
+  # ``evaluation_limit`` names meant four losing-symbol cooldowns turned an
+  # eight-slot strategy universe into four names for the entire day, with no
+  # opportunity to backfill from otherwise healthy streaming symbols. The engine
+  # truncates the post-cooldown list back to its evaluation budget, so this reserve
+  # expands discovery coverage without expanding strategy/order risk.
+  backfill_reserve = max(
+      0,
+      _auto_reliability_int(
+          "REALTIME_BUY_CANDIDATE_BACKFILL_RESERVE", evaluation_limit, 0
+      ),
+  )
+  limit = min(32, evaluation_limit + backfill_reserve)
+  macro_micro_bundle = _fresh_macro_micro_bundle()
+  micro_hard_blocked = set(
+      _macro_micro_blocked_buy_candidates(macro_micro_bundle)
+  )
   try:
     since = datetime.now(timezone.utc) - timedelta(seconds=max_age)
     fresh = tuple(RealtimeMarketDataStore().active_symbols(since, limit=max(32, limit * 4)))
@@ -10443,12 +10647,24 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
   for symbol in ordered:
     normalized = str(symbol or "").upper()
     if normalized not in fresh_set:
+      _cancel_minute_warmup_if_irrelevant(normalized)
       reject("NOT_FRESH_IN_TICK_WINDOW", normalized)
       continue
+    # Generic HOLD/WAIT output is advisory and must not become a duplicate entry
+    # gate. Explicit data, liquidity, volatility, spread and execution-quality
+    # hard blocks are different: the legacy candidate provider already excluded
+    # them, but the low-latency engine provider did not. That split allowed a
+    # HIGH_VOLATILITY_TECHNICAL_BLOCK symbol to reach live strategy election.
+    if normalized in micro_hard_blocked:
+      _cancel_minute_warmup_if_irrelevant(normalized)
+      reject("MICRO_HARD_RISK_BLOCK", normalized)
+      continue
     if not _is_live_buy_candidate_symbol(symbol):
+      _cancel_minute_warmup_if_irrelevant(normalized)
       reject("INSTRUMENT_NOT_LIVE_BUY_ELIGIBLE", normalized)
       continue
     if not _is_open_live_market_ticker(symbol):
+      _cancel_minute_warmup_if_irrelevant(normalized)
       reject("MARKET_NOT_OPEN_FOR_NEW_ENTRY", normalized)
       continue
     group = _ticker_market_group_for_live_trading(symbol)
@@ -10471,9 +10687,13 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
         if store is not None
         else True
     )
-    bar_history_ready: bool | None = None
-    if store is not None and (not tick_window_ready or group == "KRX"):
-      bar_history_ready = _candidate_has_strategy_feature_history(symbol, store)
+    # Always start candidate-specific bar/model preparation in parallel. A ready
+    # tick-driven strategy may proceed while this is false; bar-driven strategies
+    # independently fail closed on their declared prerequisites.
+    bar_history_ready: bool | None = (
+        _candidate_has_strategy_feature_history(symbol, store)
+        if store is not None else None
+    )
     if store is not None and not tick_window_ready and not bar_history_ready:
       reject("STRATEGY_TICK_WINDOW_NOT_READY", normalized)
       continue
@@ -10485,9 +10705,8 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
         reject("BAR_ONLY_CANDIDATE_ORDERBOOK_STALE", normalized)
         continue
       note("ADMITTED_ON_BAR_HISTORY_WITHOUT_TICK_WINDOW", normalized)
-    if store is not None and group == "KRX" and bar_history_ready is False:
-      reject("STRATEGY_FEATURE_HISTORY_INSUFFICIENT", normalized)
-      continue
+    if store is not None and tick_window_ready and bar_history_ready is False:
+      note("ADMITTED_ON_TICK_WINDOW_WHILE_BAR_HISTORY_PREPARES", normalized)
     if (
         store is not None
         and group == "KRX"
@@ -10599,12 +10818,29 @@ def _candidate_has_ready_strategy_tick_window(
       if str(getattr(tick, "source", "") or "") == "kis_realtime_websocket"
       and getattr(getattr(tick, "meta", None), "is_tradeable", True) is not False
   ]
+  # Match LiveFeatureFrame exactly: its causal window and distinct-second test use
+  # ingestion time, not the exchange clock. KIS can deliver an exchange-timestamped
+  # burst late, so the old mixed clocks admitted a symbol the feature frame rejected.
   seconds = {
-      getattr(tick, "exchange_timestamp", None).replace(microsecond=0)
+      getattr(tick, "received_at", None).replace(microsecond=0)
       for tick in live_ticks
-      if getattr(tick, "exchange_timestamp", None) is not None
+      if getattr(tick, "received_at", None) is not None
   }
   if len(live_ticks) < 2 or len(seconds) < 2:
+    return False
+  five_second_cutoff = moment - timedelta(seconds=5)
+  tick_count_5s = sum(
+      1
+      for tick in live_ticks
+      if five_second_cutoff <= getattr(tick, "received_at", moment) <= moment
+  )
+  minimum_tick_count_5s = max(
+      1,
+      _auto_reliability_int(
+          "ALGO_SHARED_MIN_TICK_COUNT_5S", 3, 1
+      ),
+  )
+  if tick_count_5s < minimum_tick_count_5s:
     return False
   try:
     book = store.latest_orderbook(str(ticker or "").upper())
@@ -10919,9 +11155,11 @@ def _kis_overseas_realtime_collector_loop() -> None:
         if _kis_overseas_realtime_stop.wait(5.0):
           return
       elif counts.get("connection_closed"):
+        _record_minute_warmup_reconnect("US", symbols)
         if _kis_overseas_realtime_stop.wait(10.0):
           return
     except Exception as exc:
+      _record_minute_warmup_reconnect("US", symbols)
       with _live_lock:
         _kis_overseas_realtime_state.update(
             {
@@ -13110,10 +13348,27 @@ def _observe_dashboard_market_stream(ticker: str) -> None:
     stale_recovery = regular_feed_open
   with _live_lock:
     new_watch = symbol not in _dashboard_krx_watch
-    request_resubscribe = new_watch and regular_feed_open
+    # ``new_watch`` only describes the short-lived dashboard TTL. It says nothing
+    # about the websocket: ranked/session symbols often remain selected for five
+    # minutes. Treating every TTL renewal as a new subscription request caused the
+    # dashboard's 60s poll to interrupt an already-correct collector repeatedly.
+    already_selected = symbol in _kis_realtime_symbol_subscribed_at
+    request_resubscribe = new_watch and regular_feed_open and not already_selected
     _dashboard_krx_watch[symbol] = now + ttl
     last_recovery = _dashboard_krx_stale_recovery_at.get(symbol, 0.0)
-    if stale_recovery and (new_watch or now - last_recovery >= 10.0):
+    # Re-diffing an already-open websocket cannot manufacture trades for a quiet
+    # symbol. Polling the dashboard previously requested a resubscribe every 10s,
+    # continually churning the scarce subscription set and preventing new strategy
+    # candidates from accumulating a stable tick window. Keep the immediate request
+    # for a newly watched symbol, then let the collector's normal five-minute health
+    # cycle perform recovery unless explicitly configured otherwise.
+    stale_recovery_interval = max(
+        30.0,
+        _env_float_web("REALTIME_DASHBOARD_STALE_RESUBSCRIBE_SEC", 300.0),
+    )
+    if stale_recovery and not already_selected and (
+        new_watch or now - last_recovery >= stale_recovery_interval
+    ):
       _dashboard_krx_stale_recovery_at[symbol] = now
       request_resubscribe = request_resubscribe or not new_watch
   if request_resubscribe:
@@ -13263,29 +13518,135 @@ def _candidate_has_usable_live_liquidity(ticker: str, store: RealtimeMarketDataS
   return liquidity_score >= min_score
 
 
+def _minute_warmup_service() -> HistoricalDataCoordinator:
+  """One process-wide coordinator; every consumer shares its in-flight requests."""
+  global _minute_warmup_coordinator
+  with _minute_warmup_lock:
+    if _minute_warmup_coordinator is None:
+      from app.features.live_feature_frame import LiveFeatureFrameBuilder
+      from app.strategy.registry import default_strategy_registry
+
+      store = RealtimeMarketDataStore()
+      provider = KisMinuteHistoryProvider()
+      _minute_warmup_coordinator = HistoricalDataCoordinator(
+          repository=PersistentBarRepository(store),
+          fetch_bars=provider.fetch,
+          resolver=RequirementResolver(
+              default_strategy_registry(),
+              providers=(LiveFeatureFrameBuilder,),
+          ),
+          expected_bar=expected_session_bar,
+          event_sink=lambda payload: audit.record("minute_bar_warmup", payload),
+      )
+    return _minute_warmup_coordinator
+
+
+def _record_minute_warmup_reconnect(market: str, symbols: Sequence[str]) -> None:
+  """Preserve cached bars and mark only affected symbols for gap reconciliation."""
+  with _minute_warmup_lock:
+    service = _minute_warmup_coordinator
+  if service is not None:
+    service.reconnect(market, symbols, datetime.now(timezone.utc))
+
+
+def _cancel_minute_warmup_if_irrelevant(symbol: str) -> None:
+  with _minute_warmup_lock:
+    service = _minute_warmup_coordinator
+  if service is None:
+    return
+  market = "KR" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US"
+  service.cancel_if_irrelevant(str(symbol), market)
+
+
+def _warmup_applicable_strategy_ids() -> tuple[str, ...]:
+  """Resolve current ontology/regime arms without a source-code symbol list."""
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if engine is not None:
+    try:
+      session = engine.get_status().get("strategy_session") or {}
+      permitted = tuple(session.get("macro_permitted_strategy_ids") or ())
+      if permitted:
+        return permitted
+    except Exception:
+      pass
+  from app.strategy.registry import default_strategy_registry
+
+  return tuple(
+      spec.strategy_id
+      for spec in default_strategy_registry().all_specs()
+      if not spec.is_short and str(spec.lifecycle_state) != "DISABLED"
+  )
+
+
+def _minute_warmup_priority(symbol: str) -> int:
+  """Risk-critical data outranks speculative candidate preparation."""
+  normalized = str(symbol).upper().strip()
+  try:
+    account = _realtime_engine_account_snapshot()
+    held = {
+        str(getattr(item, "ticker", "") or "").upper().strip()
+        for item in tuple(getattr(account, "holdings", ()) or ())
+    } if account is not None else set()
+    if normalized in held:
+      return 0
+  except Exception:
+    pass
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  if engine is not None:
+    try:
+      state = engine.get_status().get("strategy_session") or {}
+      if normalized == str(state.get("selected_symbol") or "").upper().strip():
+        return 10
+    except Exception:
+      pass
+  return 50
+
+
 def _candidate_has_strategy_feature_history(
     ticker: str,
     store: RealtimeMarketDataStore,
+    *,
+    applicable_strategy_ids: Sequence[str] | None = None,
+    request_if_missing: bool = True,
 ) -> bool:
-  """Pre-filter candidates that cannot build the strategy feature frame."""
-  minimum_bars = max(
-      10,
-      _auto_reliability_int("REALTIME_STRATEGY_MINUTE_HISTORY_BARS", 20, 10),
-  )
+  """Dynamic per-candidate readiness; missing history is prepared asynchronously."""
+  group = "KR" if ticker.isdigit() and len(ticker) == 6 else "US"
+  strategies = tuple(applicable_strategy_ids or _warmup_applicable_strategy_ids())
+  try:
+    service = _minute_warmup_service()
+    requirement = service.resolver.resolve(
+        ticker,
+        group,
+        applicable_strategy_ids=strategies,
+    )
+  except Exception:
+    return False
   maximum_age_seconds = max(
       60.0,
       _env_float_web("REALTIME_STRATEGY_HISTORY_MAX_AGE_SEC", 180.0),
   )
   now = datetime.now(timezone.utc)
   try:
-    bars = store.recent_minute_bars(
+    bars = store.reconciled_minute_bars(
         ticker,
-        now - timedelta(minutes=max(120, minimum_bars * 3)),
-        limit=max(120, minimum_bars),
+        now - timedelta(minutes=max(240, requirement.preferred_observations * 20)),
+        limit=requirement.preferred_observations,
+        market=group,
     )
   except Exception:
-    return False
-  if len(bars) < minimum_bars:
+    bars = ()
+  if len(bars) < requirement.minimum_observations:
+    if request_if_missing:
+      # Existing positions and pending orders use smaller numeric priorities at
+      # their call sites; ordinary candidates remain independent background work.
+      service.request(
+          ticker,
+          group,
+          applicable_strategy_ids=strategies,
+          priority=_minute_warmup_priority(ticker),
+      )
     return False
   latest = getattr(bars[-1], "minute_start", None)
   if latest is None:
@@ -13294,7 +13655,17 @@ def _candidate_has_strategy_feature_history(
     age = max(0.0, (now - latest).total_seconds())
   except (TypeError, ValueError):
     return False
-  return age <= maximum_age_seconds
+  ready = age <= maximum_age_seconds
+  if ready:
+    service.observe_ready_cache(requirement, bars)
+  elif request_if_missing:
+    service.request(
+        ticker,
+        group,
+        applicable_strategy_ids=strategies,
+        priority=_minute_warmup_priority(ticker),
+    )
+  return ready
 
 
 def _candidate_affordable_with_buffer(ticker: str, market: MarketSnapshot, account: AccountSnapshot) -> bool:
@@ -13563,11 +13934,13 @@ def _refresh_domestic_ranking_symbols() -> None:
     # those requirements and flipping them re-admits the instruments with no code
     # change. Both default False, matching RiskRules' own defaults.
     derivatives_allowed = _env_flag("RISK_DERIVATIVES_ALLOWED", False)
+    etf_allowed = _env_flag("RISK_ETF_TRADING_ALLOWED", False)
     leverage_etf_allowed = _env_flag("RISK_LEVERAGE_ETF_ALLOWED", False)
     result = fetch_domestic_ranking_symbols(
       sources=sources,
       max_symbols=size * 3,
       derivatives_allowed=derivatives_allowed,
+      etf_allowed=etf_allowed,
       leverage_etf_allowed=leverage_etf_allowed,
     )
     # Reorder the turnover ranking by whether any strategy's cost-sized target is
@@ -13600,6 +13973,7 @@ def _refresh_domestic_ranking_symbols() -> None:
       size=size,
       names=dict(result.get("names") or {}),
       derivatives_allowed=derivatives_allowed,
+      etf_allowed=etf_allowed,
       leverage_etf_allowed=leverage_etf_allowed,
     )
     if feasibility:
@@ -14272,6 +14646,8 @@ def _kis_realtime_collector_loop() -> None:
       # means it closed.
       _mark_kis_realtime_ws(False)
       _record_kis_realtime_collector_result(counts)
+      if counts.get("connection_closed"):
+        _record_minute_warmup_reconnect("KR", symbols)
       if not _kis_realtime_collector_stop.is_set():
         if counts.get("appkey_already_in_use"):
           time.sleep(max(30.0, _env_float_web("KIS_REALTIME_APPKEY_IN_USE_BACKOFF_SEC", 90.0)))
@@ -14281,6 +14657,7 @@ def _kis_realtime_collector_loop() -> None:
           time.sleep(2.0)
     except Exception as exc:  # noqa: BLE001 - keep app startup alive and surface collector failures.
       _mark_kis_realtime_ws(False)
+      _record_minute_warmup_reconnect("KR", symbols)
       with _live_lock:
         _append_collection_log_unlocked(
             "error",

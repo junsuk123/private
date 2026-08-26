@@ -30,6 +30,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 from uuid import uuid4
 
+from app.cost.cost_coverage import minimum_trailing_net_bps
+
 __all__ = [
     "EVIDENCE_BACKTEST",
     "EVIDENCE_LIVE",
@@ -212,7 +214,24 @@ class ShadowPosition:
         if self._breached_stop(price):
             return self._close(price, at, ShadowExitReason.STOP)
         trailing = self._trailing_trigger()
-        if trailing is not None and self._breached_price(price, trailing, adverse=True):
+        target_gross_bps = (
+            self._return_bps(self.target_price)
+            if self.target_price is not None
+            else 0.0
+        )
+        trailing_required_gross_bps = self.cost_bps + minimum_trailing_net_bps(
+            target_gross_bps,
+            self.cost_bps,
+        )
+        trailing_locks_required_reward = (
+            trailing is not None
+            and self._return_bps(trailing) >= trailing_required_gross_bps
+        )
+        if (
+            trailing is not None
+            and trailing_locks_required_reward
+            and self._breached_price(price, trailing, adverse=True)
+        ):
             return self._close(trailing, at, ShadowExitReason.TRAILING)
         if self._breached_target(price):
             return self._close(self.target_price or price, at, ShadowExitReason.TARGET)

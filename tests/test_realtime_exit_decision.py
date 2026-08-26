@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -14,7 +14,11 @@ from app.schemas.domain import AccountSnapshot, Holding, MarketSnapshot, OrderSi
 from app.execution.kis_types import LiveOrderSubmission
 from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.schemas.domain import FinalOrder, OrderType
-from app.trading.realtime_trading_engine import RealtimeTradingEngine, RealtimeTradingConfig
+from app.trading.realtime_trading_engine import (
+    RealtimeTradingEngine,
+    RealtimeTradingConfig,
+    _freshest_market_data_age_seconds,
+)
 from app.trading.shared_decision_engine import SharedLiveDecisionEngine, _cost_context_for_holding
 
 
@@ -871,10 +875,12 @@ class _MissingFirstBookBuyDecisionEngine(_FixedBuyDecisionEngine):
 class _AmendAwareCoordinator:
     def __init__(self) -> None:
         self.submitted = []
+        self.idempotency_keys = []
         self.amended = []
 
-    def submit_final_order(self, order):
+    def submit_final_order(self, order, *, idempotency_key=None):
         self.submitted.append(order)
+        self.idempotency_keys.append(idempotency_key)
         return LiveOrderSubmission(
             execution_id="submit-1",
             idempotency_key="unit",
@@ -900,7 +906,7 @@ class _AmendAwareCoordinator:
 
 
 class _MarketClosedSellCoordinator(_AmendAwareCoordinator):
-    def submit_final_order(self, order):
+    def submit_final_order(self, order, *, idempotency_key=None):
         self.submitted.append(order)
         raise RuntimeError("KIS overseas order rejected: 주간거래 장운영시간이 아닙니다 APBK2995")
 
@@ -909,7 +915,7 @@ class _FailingBuyCoordinator:
     def __init__(self) -> None:
         self.submitted = []
 
-    def submit_final_order(self, order):
+    def submit_final_order(self, order, *, idempotency_key=None):
         self.submitted.append(order)
         raise RuntimeError("broker rejected")
 
@@ -1171,6 +1177,31 @@ class RealtimeSellAmendTest(unittest.TestCase):
             self.assertEqual(summary["reason"], "unit_shutdown")
             self.assertEqual(len(coordinator.submitted), 0)
             self.assertFalse(engine.get_status()["buy_enabled"])
+
+    def test_enabled_cycle_clears_stale_dynamic_buy_reason(self) -> None:
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 1_000_000.0},
+        )
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=_AmendAwareCoordinator(),
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            config=RealtimeTradingConfig(max_buy_orders_per_cycle=1),
+        )
+        engine._buy_disabled_reason = (  # noqa: SLF001 - reproduce stale prior-cycle telemetry.
+            "SUPERVISOR_HARD_HALT:DATA_STALE"
+        )
+
+        with patch.dict("os.environ", {"REALTIME_BUY_ENABLED": "true"}):
+            summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        self.assertFalse(summary.get("buy_disabled", False))
+        self.assertIsNone(engine.get_status()["buy_disabled_reason"])
 
     def test_full_liquidation_disables_buy_discovery_and_forces_sell_all(self) -> None:
         holding = Holding(
@@ -1627,6 +1658,45 @@ class InvestmentModeRealHoldingsTest(unittest.TestCase):
 
 
 class RebuyCooldownTest(unittest.TestCase):
+    def test_fresh_orderbook_prevents_false_stale_trade_halt(self) -> None:
+        now = datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc)
+        tick = SimpleNamespace(received_at=now - timedelta(seconds=45))
+        book = SimpleNamespace(received_at=now - timedelta(seconds=2))
+
+        age = _freshest_market_data_age_seconds(tick, book, now)
+
+        self.assertEqual(age, 2.0)
+
+    def test_trade_plan_scopes_identical_order_idempotency(self) -> None:
+        coordinator = _AmendAwareCoordinator()
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=coordinator,
+            account_provider=lambda: AccountSnapshot(cash=1_000_000.0, holdings=()),
+            candidate_symbols_provider=lambda: (),
+            session_open_provider=lambda: True,
+        )
+        order = FinalOrder("017670", "KR", OrderType.LIMIT, OrderSide.BUY, 1, 102_600.0)
+
+        first = engine._submission_idempotency_key(
+            order,
+            "BUY",
+            ("TRADE_PLAN:plan-first",),
+        )
+        retry = engine._submission_idempotency_key(
+            order,
+            "BUY",
+            ("TRADE_PLAN:plan-first",),
+        )
+        later_plan = engine._submission_idempotency_key(
+            order,
+            "BUY",
+            ("TRADE_PLAN:plan-second",),
+        )
+
+        self.assertEqual(first, retry)
+        self.assertNotEqual(first, later_plan)
+
     def test_recently_sold_ticker_is_not_rebought_within_cooldown(self) -> None:
         # A ticker sold moments ago must not be re-bought within the rebuy cooldown
         # (anti-churn), even if it reappears as a candidate and is no longer held.
@@ -1684,6 +1754,81 @@ class RebuyCooldownTest(unittest.TestCase):
         self.assertEqual(summary["buy_evaluated"], 0)
         self.assertEqual(summary["skipped_cooldown"], 1)
         self.assertEqual(summary["rejections"][0]["reason_codes"], ("RECENT_LOSS_SYMBOL_COOLDOWN",))
+
+    def test_recent_loss_symbol_is_removed_before_strategy_election(self) -> None:
+        import time as _time
+
+        account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})
+        manager = Mock()
+        manager.evaluate.return_value = {
+            "phase": "SCANNING",
+            "selected_symbol": None,
+            "selected_strategy": None,
+            "last_reason": "NO_CANDIDATE",
+        }
+        manager.allowed_buy_candidates.return_value = ()
+        manager.snapshot.return_value = manager.evaluate.return_value
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=_AmendAwareCoordinator(),
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: ("000660", "005930"),
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            strategy_session_manager=manager,
+            config=RealtimeTradingConfig(loss_rebuy_cooldown_sec=3600, submit_cooldown_sec=0),
+        )
+        engine._loss_cooldown_until["000660"] = _time.monotonic() + 3600
+
+        summary = engine.run_once(datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc))
+
+        manager.evaluate.assert_called_once()
+        self.assertEqual(manager.evaluate.call_args.args[1], ("005930",))
+        self.assertEqual(summary["buy_candidate_sample"], ["005930"])
+        self.assertEqual(summary["loss_cooldown_candidate_excluded"], ["000660"])
+
+    def test_symbol_exclusions_are_backfilled_before_election_budget_is_capped(self) -> None:
+        import time as _time
+
+        account = AccountSnapshot(
+            cash=1_000_000.0,
+            holdings=(),
+            cash_by_currency={"KRW": 1_000_000.0},
+        )
+        candidates = tuple(f"{index:06d}" for index in range(1, 13))
+        manager = Mock()
+        manager.evaluate.return_value = {
+            "phase": "SCANNING",
+            "selected_symbol": None,
+            "selected_strategy": None,
+            "last_reason": "NO_CANDIDATE",
+        }
+        manager.allowed_buy_candidates.return_value = ()
+        manager.snapshot.return_value = manager.evaluate.return_value
+        engine = RealtimeTradingEngine(
+            decision_engine=_FixedBuyDecisionEngine(),
+            coordinator=_AmendAwareCoordinator(),
+            account_provider=lambda: account,
+            candidate_symbols_provider=lambda: candidates,
+            session_open_provider=lambda: True,
+            market_open_provider=lambda ticker, market: True,
+            strategy_session_manager=manager,
+            config=RealtimeTradingConfig(
+                max_buy_evaluations_per_cycle=8,
+                loss_rebuy_cooldown_sec=3600,
+                submit_cooldown_sec=0,
+            ),
+        )
+        for symbol in candidates[:4]:
+            engine._loss_cooldown_until[symbol] = _time.monotonic() + 3600
+
+        summary = engine.run_once(
+            datetime(2026, 7, 2, 1, 0, tzinfo=timezone.utc)
+        )
+
+        self.assertEqual(manager.evaluate.call_args.args[1], candidates[4:12])
+        self.assertEqual(summary["buy_candidate_count"], 8)
+        self.assertEqual(summary["candidate_pool_count_before_exclusions"], 12)
 
     def test_cycle_summary_counts_rejection_reasons(self) -> None:
         account = AccountSnapshot(cash=1_000_000.0, holdings=(), cash_by_currency={"KRW": 1_000_000.0})

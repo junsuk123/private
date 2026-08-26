@@ -13,7 +13,8 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.data.realtime_store import RealtimeMarketDataStore
-from app.data.realtime_types import KIS_REALTIME_SOURCE, OrderbookLevel, RealtimeOrderbookSnapshot, RealtimeTradeTick
+from app.data.market_capabilities import FeedScope, MarketGroup, SessionId, Venue
+from app.data.realtime_types import FeedMetadata, KIS_REALTIME_SOURCE, OrderbookLevel, RealtimeOrderbookSnapshot, RealtimeTradeTick
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models import live_training_pipeline as pipeline
 from app.models.live_training_pipeline import (
@@ -618,6 +619,15 @@ def _training_row(
 
 
 def _seed_realtime_store(store: RealtimeMarketDataStore, now: datetime) -> None:
+    live_meta = FeedMetadata(
+        market_group=MarketGroup.KR,
+        exchange="KRX",
+        venue=Venue.KRX,
+        session=SessionId.KRX_REGULAR,
+        currency="KRW",
+        feed_scope=FeedScope.VENUE_SPECIFIC,
+        is_tradeable=True,
+    )
     store.save_ticks(
         tuple(
             RealtimeTradeTick(
@@ -628,6 +638,7 @@ def _seed_realtime_store(store: RealtimeMarketDataStore, now: datetime) -> None:
                 price=70000 + index * 10,
                 volume=100 + index,
                 sequence_key=f"tick:{index}",
+                meta=live_meta,
             )
             for index in range(13)
         )
@@ -641,6 +652,7 @@ def _seed_realtime_store(store: RealtimeMarketDataStore, now: datetime) -> None:
                 source=KIS_REALTIME_SOURCE,
                 levels=(OrderbookLevel(70100, 1000, 70150, 800),),
                 sequence_key="book:1",
+                meta=live_meta,
             ),
         )
     )

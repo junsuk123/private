@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Deque, Mapping, Sequence
 
 from app.config.selector_v2_flags import SelectorV2Flags
@@ -56,6 +57,21 @@ __all__ = ["SelectorV2ShadowRunner", "ShadowComparison", "load_utility_weights"]
 
 def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _market_group(market_or_symbol: object) -> str:
+    text = str(market_or_symbol or "").strip().upper()
+    if text in {"KR", "KRX", "KOSPI", "KOSDAQ"}:
+        return "KR"
+    if text in {"US", "USA", "NASD", "NASDAQ", "NYSE", "AMEX"}:
+        return "US"
+    return "KR" if text.isdigit() and len(text) == 6 else "US"
+
+
+def _market_promotion_state_path(path: str, market: str) -> str:
+    source = Path(path)
+    suffix = source.suffix or ".json"
+    return str(source.with_name(f"{source.stem}.{_market_group(market)}{suffix}"))
 
 
 def load_utility_weights(
@@ -156,15 +172,21 @@ class SelectorV2ShadowRunner:
             if counterfactual is not None
             else (CounterfactualEngine() if self._flags.counterfactual_enabled else None)
         )
-        self._promotion = (
-            promotion
-            if promotion is not None
-            else (
-                SelectorPromotionController(SelectorPromotionConfig.load())
-                if self._flags.auto_promote
-                else None
-            )
-        )
+        # Automatic authority is market-scoped.  A single persisted ladder mixed KR
+        # and US outcomes, so losses and readiness gaps in one venue could veto an
+        # otherwise valid selector in the other.  Explicitly injected controllers are
+        # retained for focused tests/backward-compatible callers; production creates
+        # independent durable controllers and never imports the contaminated legacy
+        # state into either one.
+        self._promotion = promotion
+        self._promotions: dict[str, SelectorPromotionController] = {}
+        if promotion is None and self._flags.auto_promote:
+            base = SelectorPromotionConfig.load()
+            for market in ("KR", "US"):
+                scoped_path = _market_promotion_state_path(base.state_path, market)
+                self._promotions[market] = SelectorPromotionController(
+                    replace(base, state_path=scoped_path)
+                )
         self._max_symbols = max(1, int(max_symbols_per_cycle))
         self._lock = threading.RLock()
         self._comparisons: Deque[ShadowComparison] = deque(maxlen=max(1, int(history_size)))
@@ -188,20 +210,53 @@ class SelectorV2ShadowRunner:
         """Effective authority, whether operator-forced or earned automatically."""
         return bool(
             self._flags.live_authority
-            or (self._promotion is not None and self._promotion.live_authority)
+            or any(item.live_authority for item in self._promotion_controllers())
         )
+
+    def live_authority_for(self, market_or_symbol: str) -> bool:
+        if self._flags.live_authority:
+            return True
+        controller = self._promotion_for(market_or_symbol)
+        return bool(controller is not None and controller.live_authority)
 
     @property
     def order_size_fraction(self) -> float:
         if self._flags.live_authority:
             return 1.0
-        return self._promotion.order_size_fraction if self._promotion is not None else 0.0
+        return max(
+            (item.order_size_fraction for item in self._promotion_controllers()),
+            default=0.0,
+        )
+
+    def order_size_fraction_for(self, market_or_symbol: str) -> float:
+        if self._flags.live_authority:
+            return 1.0
+        controller = self._promotion_for(market_or_symbol)
+        return controller.order_size_fraction if controller is not None else 0.0
 
     @property
     def authority_state(self) -> str:
         if self._flags.live_authority:
             return "LIVE"
-        return str(self._promotion.state) if self._promotion is not None else "SHADOW"
+        states = {str(item.state) for item in self._promotion_controllers()}
+        return next(iter(states)) if len(states) == 1 else "MIXED" if states else "SHADOW"
+
+    def authority_state_for(self, market_or_symbol: str) -> str:
+        if self._flags.live_authority:
+            return "LIVE"
+        controller = self._promotion_for(market_or_symbol)
+        return str(controller.state) if controller is not None else "SHADOW"
+
+    def _promotion_controllers(self) -> tuple[SelectorPromotionController, ...]:
+        if self._promotions:
+            return tuple(self._promotions.values())
+        return (self._promotion,) if self._promotion is not None else ()
+
+    def _promotion_for(self, market_or_symbol: str) -> SelectorPromotionController | None:
+        if self._promotion is not None:
+            return self._promotion
+        market = _market_group(market_or_symbol)
+        return self._promotions.get(market)
 
     @property
     def open_symbols(self) -> tuple[str, ...]:
@@ -400,18 +455,36 @@ class SelectorV2ShadowRunner:
 
     def evaluate_authority(self, now: datetime) -> dict[str, Any] | None:
         """Refresh the automatic ladder from resolved forward contexts."""
-        if self._promotion is None or self._counterfactual is None:
+        controllers = self._promotion_controllers()
+        if not controllers or self._counterfactual is None:
             return None
-        try:
-            decision = self._promotion.evaluate(
-                self._counterfactual.resolved_groups(limit=4000), now=_aware(now)
+        groups = tuple(self._counterfactual.resolved_groups(limit=4000))
+        # Explicitly injected legacy/test controller keeps its historical single
+        # ladder contract. Production controllers receive only their own venue.
+        if self._promotion is not None:
+            try:
+                return self._promotion.evaluate(groups, now=_aware(now)).as_dict()
+            except Exception as exc:  # noqa: BLE001
+                return self._promotion.suspend(
+                    f"{type(exc).__name__}:{exc}", now=_aware(now)
+                ).as_dict()
+
+        decisions: dict[str, Any] = {}
+        for market, controller in self._promotions.items():
+            scoped = tuple(
+                group
+                for group in groups
+                if _market_group(getattr(group, "market", "")) == market
             )
-            return decision.as_dict()
-        except Exception as exc:  # noqa: BLE001
-            # A broken evaluator must remove, never grant, selector authority.
-            return self._promotion.suspend(
-                f"{type(exc).__name__}:{exc}", now=_aware(now)
-            ).as_dict()
+            try:
+                decisions[market] = controller.evaluate(
+                    scoped, now=_aware(now)
+                ).as_dict()
+            except Exception as exc:  # noqa: BLE001
+                decisions[market] = controller.suspend(
+                    f"{type(exc).__name__}:{exc}", now=_aware(now)
+                ).as_dict()
+        return {"by_market": decisions}
 
     def expire_stale(self, now: datetime) -> int:
         if self._counterfactual is None:
@@ -441,7 +514,18 @@ class SelectorV2ShadowRunner:
         for item in comparisons:
             agreement_counts[item.agreement] = agreement_counts.get(item.agreement, 0) + 1
 
-        promotion = self._promotion.snapshot() if self._promotion is not None else None
+        promotion = (
+            self._promotion.snapshot()
+            if self._promotion is not None
+            else {
+                "by_market": {
+                    market: controller.snapshot()
+                    for market, controller in self._promotions.items()
+                }
+            }
+            if self._promotions
+            else None
+        )
         effective_live = self.live_authority
         return {
             "enabled": self._flags.enabled,
@@ -449,6 +533,14 @@ class SelectorV2ShadowRunner:
             "configured_shadow_only": self._flags.shadow_only,
             "live_authority": effective_live,
             "order_size_fraction": self.order_size_fraction,
+            "authority_by_market": {
+                market: {
+                    "state": self.authority_state_for(market),
+                    "live_authority": self.live_authority_for(market),
+                    "order_size_fraction": self.order_size_fraction_for(market),
+                }
+                for market in ("KR", "US")
+            },
             "auto_promotion": promotion,
             "flags": self._flags.as_dict(),
             "cycles": cycles,

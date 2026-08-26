@@ -95,6 +95,7 @@ def fetch_domestic_ranking_symbols(
     sources: tuple[str, ...] = ("volume_rank", "fluctuation", "volume_power"),
     max_symbols: int = 30,
     derivatives_allowed: bool = False,
+    etf_allowed: bool = False,
     leverage_etf_allowed: bool = False,
 ) -> dict[str, Any]:
     """Fetch KRX buy-discovery candidates from KIS domestic ranking APIs.
@@ -148,6 +149,7 @@ def fetch_domestic_ranking_symbols(
         names,
         market="KR",
         derivatives_allowed=derivatives_allowed,
+        etf_allowed=etf_allowed,
         leverage_etf_allowed=leverage_etf_allowed,
     )
     if max_symbols > 0:

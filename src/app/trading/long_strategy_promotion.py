@@ -47,10 +47,12 @@ def _env_float_at_least(name: str, floor: float) -> float:
 @dataclass(frozen=True)
 class LongPromotionConfig:
     enabled: bool = True
-    minimum_shadow_samples: int = 20
-    minimum_shadow_positive_samples: int = 3
+    minimum_shadow_samples: int = 30
+    minimum_shadow_positive_samples: int = 10
     minimum_shadow_days: int = 3
     minimum_shadow_conservative_edge_bps: float = 0.0
+    minimum_positive_day_fraction: float = 0.60
+    cost_stress_multiple: float = 1.25
     maximum_shadow_loss_streak: int = 2
     minimum_live_probe_samples: int = 30
     minimum_live_probe_positive_samples: int = 10
@@ -69,10 +71,17 @@ class LongPromotionConfig:
         # the safety floor documented above.
         return cls(
             enabled=_env_bool("LONG_STRATEGY_AUTO_PROMOTION_ENABLED", True),
-            minimum_shadow_samples=_env_int_at_least("LONG_PROMOTION_MIN_SHADOW_SAMPLES", 20),
-            minimum_shadow_positive_samples=_env_int_at_least("LONG_PROMOTION_MIN_SHADOW_POSITIVE", 3),
+            minimum_shadow_samples=_env_int_at_least("LONG_PROMOTION_MIN_SHADOW_SAMPLES", 30),
+            minimum_shadow_positive_samples=_env_int_at_least("LONG_PROMOTION_MIN_SHADOW_POSITIVE", 10),
             minimum_shadow_days=_env_int_at_least("LONG_PROMOTION_MIN_SHADOW_DAYS", 3),
             minimum_shadow_conservative_edge_bps=_env_float_at_least("LONG_PROMOTION_MIN_SHADOW_EDGE_BPS", 0.0),
+            minimum_positive_day_fraction=max(
+                0.60,
+                min(1.0, float(os.getenv("LONG_PROMOTION_MIN_POSITIVE_DAY_FRACTION", "0.60"))),
+            ),
+            cost_stress_multiple=_env_float_at_least(
+                "LONG_PROMOTION_COST_STRESS_MULTIPLE", 1.25
+            ),
             maximum_shadow_loss_streak=max(0, min(2, int(os.getenv("LONG_PROMOTION_MAX_LOSS_STREAK", "2")))),
             minimum_live_probe_samples=_env_int_at_least("LONG_PROMOTION_MIN_LIVE_SAMPLES", 30),
             minimum_live_probe_positive_samples=_env_int_at_least("LONG_PROMOTION_MIN_LIVE_POSITIVE", 10),
@@ -97,6 +106,8 @@ class LongPromotionDecision:
     conservative_edge_bps: float
     live_sample_count: int
     live_lower_confidence_bound_bps: float
+    positive_day_fraction: float = 0.0
+    cost_stressed_mean_net_bps: float = float("-inf")
 
 
 def _days(outcomes: Iterable[StrategyOutcome]) -> int:
@@ -114,11 +125,33 @@ def _lower_confidence_bound(outcomes: tuple[StrategyOutcome, ...]) -> float:
     return mean - 1.64 * math.sqrt(max(0.0, variance)) / math.sqrt(len(values))
 
 
+def _positive_day_fraction(outcomes: tuple[StrategyOutcome, ...]) -> float:
+    by_day: dict[object, list[float]] = {}
+    for item in outcomes:
+        by_day.setdefault(item.recorded_at.date(), []).append(float(item.realized_net_bps))
+    if not by_day:
+        return 0.0
+    return sum(sum(values) / len(values) > 0.0 for values in by_day.values()) / len(by_day)
+
+
+def _cost_stressed_mean(
+    outcomes: tuple[StrategyOutcome, ...], multiple: float
+) -> float:
+    stressed: list[float] = []
+    for item in outcomes:
+        if item.realized_gross_bps is None:
+            return float("-inf")
+        cost = max(0.0, float(item.realized_gross_bps) - float(item.realized_net_bps))
+        stressed.append(float(item.realized_gross_bps) - max(1.0, multiple) * cost)
+    return sum(stressed) / len(stressed) if stressed else float("-inf")
+
+
 def evaluate_long_promotion(
     strategy_id: str,
     market: str,
     store: StrategyPerformanceStore,
     *,
+    regime: str | None = None,
     config: LongPromotionConfig | None = None,
 ) -> LongPromotionDecision:
     cfg = config or LongPromotionConfig.from_env()
@@ -129,13 +162,27 @@ def evaluate_long_promotion(
         )
 
     outcomes = store.recent_outcomes(
-        strategy_id, market=market, direction="LONG", execution_product="CASH", limit=500
+        strategy_id,
+        market=market,
+        regime=regime,
+        direction="LONG",
+        execution_product="CASH",
+        limit=500,
     )
     posterior = store.posterior(
-        strategy_id, market=market, direction="LONG", execution_product="CASH"
+        strategy_id,
+        market=market,
+        regime=regime,
+        direction="LONG",
+        execution_product="CASH",
+        # Promotion evidence may never widen from the requested regime.  A
+        # TREND_UP history cannot authorize a TREND_DOWN order.
+        allow_regime_fallback=False,
     )
     positives = sum(item.realized_net_bps > 0.0 for item in outcomes)
     days = _days(outcomes)
+    positive_day_fraction = _positive_day_fraction(outcomes)
+    cost_stressed_mean = _cost_stressed_mean(outcomes, cfg.cost_stress_multiple)
     reasons: list[str] = []
     if len(outcomes) < cfg.minimum_shadow_samples:
         reasons.append("LONG_PROMOTION_SAMPLE_INSUFFICIENT")
@@ -145,6 +192,10 @@ def evaluate_long_promotion(
         reasons.append("LONG_PROMOTION_STABILITY_DAYS_INSUFFICIENT")
     if posterior.conservative_edge_bps <= cfg.minimum_shadow_conservative_edge_bps:
         reasons.append("LONG_PROMOTION_CONSERVATIVE_EDGE_NON_POSITIVE")
+    if positive_day_fraction < cfg.minimum_positive_day_fraction:
+        reasons.append("LONG_PROMOTION_OUT_OF_SAMPLE_STABILITY_INSUFFICIENT")
+    if cost_stressed_mean <= 0.0:
+        reasons.append("LONG_PROMOTION_COST_STRESS_FAILED")
     if posterior.loss_streak > cfg.maximum_shadow_loss_streak:
         reasons.append("LONG_PROMOTION_LOSS_STREAK")
 
@@ -182,6 +233,8 @@ def evaluate_long_promotion(
         conservative_edge_bps=float(posterior.conservative_edge_bps),
         live_sample_count=len(live),
         live_lower_confidence_bound_bps=live_lcb,
+        positive_day_fraction=positive_day_fraction,
+        cost_stressed_mean_net_bps=cost_stressed_mean,
     )
 
 

@@ -137,6 +137,21 @@ def cost_coverage_ratio(
     return edge / cost
 
 
+def minimum_trailing_net_bps(
+    target_bps: float,
+    cost_bps: float,
+    *,
+    configured_floor_bps: float = 5.0,
+) -> float:
+    """Minimum net reward a trailing exit may lock.
+
+    Requiring half of the target's post-cost reward prevents a cost-plus-5bp
+    trail from destroying otherwise positive target/stop reward geometry.
+    """
+    net_target = max(0.0, float(target_bps) - max(0.0, float(cost_bps)))
+    return max(0.0, float(configured_floor_bps), 0.5 * net_target)
+
+
 def evaluate_cost_coverage(
     predicted_gross_edge_bps: float | None,
     expected_all_in_cost_bps: float | None,

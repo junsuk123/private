@@ -62,11 +62,12 @@ def test_shadow_only_strategies_are_not_live_authorized(strategy_id: str) -> Non
     assert strategy_shadow_authorized(strategy_id) is True
 
 
-def test_established_strategies_stay_live_by_default() -> None:
-    """Strategies that never declared the knob must not become gated by this fix."""
+def test_established_strategies_also_start_evidence_gated() -> None:
+    """Catalogue age is not evidence of positive after-cost performance."""
     for strategy_id in ("intraday_momentum", "breakout_volume", "vwap_mean_reversion"):
-        assert strategy_id not in _DEPLOYMENT_GATED_STRATEGIES
-        assert strategy_live_authorized(strategy_id) is True
+        assert strategy_id in _DEPLOYMENT_GATED_STRATEGIES
+        assert strategy_live_authorized(strategy_id) is False
+        assert strategy_shadow_authorized(strategy_id) is True
 
 
 def test_unknown_strategy_is_never_live_authorized() -> None:
@@ -157,8 +158,8 @@ def test_exit_geometry_applies_beyond_rvgi_without_deleting_the_stop(tmp_path) -
     assert state.target_price is not None and state.target_price > 80_000.0
 
 
-def test_horizon_may_only_shorten(tmp_path) -> None:
-    """Shortening enforces a session deadline; lengthening would overrule the table."""
+def test_fill_time_does_not_recompute_or_shorten_the_frozen_horizon(tmp_path) -> None:
+    """The session deadline must already be frozen by election, never redone at fill."""
     manager = _manager(tmp_path)
     state = manager._state  # noqa: SLF001
     state.selected_strategy = "market_intraday_momentum"
@@ -175,8 +176,7 @@ def test_horizon_may_only_shorten(tmp_path) -> None:
 
     manager._apply_owned_exit_geometry(80_000.0)  # noqa: SLF001
 
-    assert state.max_holding_seconds < 1500, "must be flat before the auction"
-    assert state.max_holding_seconds <= 6 * 60
+    assert state.max_holding_seconds == 1500
 
 
 def test_no_selected_strategy_falls_back_to_the_rate_target(tmp_path) -> None:

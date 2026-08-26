@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.graph.macro_reasoner import build_sector_rank_table
 from app.schemas.domain import AccountSnapshot
 from app.trading.conservative_bandit import BanditConfig, ConservativeStrategyBandit
@@ -22,6 +24,17 @@ from app.trading.strategy_session import StrategySessionConfig, StrategySessionM
 # every test here fail on ``NEW_ENTRY_OUTSIDE_REGULAR_SESSION`` before election
 # is ever reached, which looks exactly like the posture not working.
 NOW = datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _authorize_strategy_under_election(monkeypatch):
+    """This module tests election posture after deployment authorization."""
+    monkeypatch.setenv("ALGO_INTRADAY_MOMENTUM_LIVE_AUTHORIZED", "1")
+    yield
+    monkeypatch.undo()
+    from app.strategy.registry import reset_default_strategy_registry
+
+    reset_default_strategy_registry()
 
 
 def _store(tmp_path) -> StrategyPerformanceStore:

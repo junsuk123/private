@@ -11,10 +11,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.data.market_data_health import evaluate_market_data_health
 from app.data.realtime_store import RealtimeMarketDataStore
 from app.data.realtime_types import (
+    FeedMetadata,
     KIS_REALTIME_SOURCE,
     OrderbookLevel,
     RealtimeOrderbookSnapshot,
     RealtimeTradeTick,
+)
+from app.data.market_capabilities import FeedScope, MarketGroup, SessionId, Venue
+
+
+LIVE_META = FeedMetadata(
+    market_group=MarketGroup.KR,
+    exchange="KRX",
+    venue=Venue.KRX,
+    session=SessionId.KRX_REGULAR,
+    currency="KRW",
+    feed_scope=FeedScope.VENUE_SPECIFIC,
+    is_tradeable=True,
 )
 
 
@@ -70,6 +83,7 @@ def _tick(at: datetime) -> RealtimeTradeTick:
         price=70000,
         volume=100,
         sequence_key=f"tick:{at.isoformat()}",
+        meta=LIVE_META,
     )
 
 
@@ -81,6 +95,7 @@ def _book(at: datetime) -> RealtimeOrderbookSnapshot:
         source=KIS_REALTIME_SOURCE,
         levels=(OrderbookLevel(bid_price=70000, bid_size=1000, ask_price=70100, ask_size=900),),
         sequence_key=f"book:{at.isoformat()}",
+        meta=LIVE_META,
     )
 
 

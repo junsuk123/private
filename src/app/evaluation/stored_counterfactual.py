@@ -12,9 +12,11 @@ from statistics import fmean
 from typing import Any, Mapping, Sequence
 
 from app.backtesting.event_simulator import EventDrivenFillSimulator
+from app.cost.round_trip import all_in_round_trip_bps
 from app.data.investor_flow_store import InvestorFlowStore, business_date_for
 from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
+from app.strategy.exit_geometry import resolve_exit_geometry
 from app.trading.contracts import Bar
 from app.trading.directional import parse_direction, stop_price, target_price
 from app.features.schemas import OHLCVBar
@@ -1248,13 +1250,6 @@ def build_labels(
                 plan = expert.propose(context)
                 triggered = plan is not None
                 strategy_future_bars = future_bars_by_strategy[expert.strategy_id]
-                if index + strategy_future_bars >= len(bars):
-                    # This strategy's own horizon runs past the end of the stored
-                    # series, so its outcome is unobservable at this bar. Skipping
-                    # it here is what keeps a long-horizon thesis from deleting
-                    # every short-horizon label in the dataset.
-                    continue
-                strategy_future = future[:strategy_future_bars]
                 # A strategy that did not fire is a useful classification
                 # negative, but it is not a hypothetical filled trade.  The
                 # previous implementation forced every expert to propose with
@@ -1262,6 +1257,12 @@ def build_labels(
                 # the real point-in-time context was inadmissible.  That
                 # contaminated the return/cost heads with fabricated losses.
                 if plan is not None:
+                    current_micro = micro_by_time.get(current.start_time)
+                    point_in_time_spread_bps = (
+                        current_micro.spread_bps
+                        if current_micro is not None
+                        else None
+                    )
                     baseline_cost = simulator.cost_engine.estimate(
                         symbol=symbol,
                         market=market,
@@ -1275,7 +1276,21 @@ def build_labels(
                         venue=venue,
                         instrument_type=instrument_type,
                     )
-                    cost_bps = baseline_cost.total_cost_rate * 10_000.0
+                    cost_bps = all_in_round_trip_bps(
+                        symbol,
+                        spread_bps=point_in_time_spread_bps,
+                        fallback_bps=baseline_cost.total_cost_rate * 10_000.0,
+                    )
+                    geometry = resolve_exit_geometry(
+                        expert.strategy_id,
+                        round_trip_cost_bps=cost_bps,
+                        spread_bps=point_in_time_spread_bps,
+                    )
+                    if config.align_strategy_horizons:
+                        strategy_future_bars = max(
+                            1,
+                            math.ceil(geometry.max_holding_seconds / 60.0) + 1,
+                        )
                     # Size BOTH barriers to the horizon's own volatility, floored
                     # at the round trip.
                     #
@@ -1301,12 +1316,8 @@ def build_labels(
                         sigma_bps=sigma_bps,
                         cost_bps=cost_bps,
                         safety_margin_bps=fee_policy.safety_margin_rate * 10_000.0,
-                        configured_target_bps=float(
-                            plan.profit_policy.get("bps", 0.0)
-                        ),
-                        configured_stop_bps=float(
-                            plan.initial_stop.get("bps", 0.0)
-                        ),
+                        configured_target_bps=geometry.take_profit_bps,
+                        configured_stop_bps=geometry.stop_loss_bps,
                     )
                     plan = replace(
                         plan,
@@ -1330,7 +1341,21 @@ def build_labels(
                                 parse_direction(plan.position_direction),
                             ),
                         },
+                        trailing_policy={
+                            **plan.trailing_policy,
+                            "bps": geometry.trailing_bps,
+                        },
+                        max_holding_seconds=(
+                            geometry.max_holding_seconds
+                            if config.align_strategy_horizons
+                            else plan.max_holding_seconds
+                        ),
                     )
+                if index + strategy_future_bars >= len(bars):
+                    # This strategy's cost-resolved horizon runs past the stored
+                    # series, so its outcome is genuinely unobservable.
+                    continue
+                strategy_future = future[:strategy_future_bars]
                 outcome = (
                     simulator.simulate(
                         plan,
@@ -1339,6 +1364,9 @@ def build_labels(
                         venue=venue,
                         market=market,
                         instrument_type=instrument_type,
+                        spread_bps=(
+                            point_in_time_spread_bps if plan is not None else None
+                        ),
                     )
                     if plan is not None
                     else None

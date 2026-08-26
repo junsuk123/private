@@ -870,9 +870,16 @@ class ContextRuntime:
         model = self._gnn.health(now=moment)
         data = self._freshness.report(now=moment)
         blocking = list(data.get("blocking_reasons", []))
+        data_state = str(data.get("worst_state") or "UNKNOWN").upper()
+        data_stale = data_state == "STALE"
         gate_state = (
             "BLOCK"
-            if blocking or not model.allows_new_entry or self.is_stale(now=moment)
+            if (
+                blocking
+                or data_stale
+                or not model.allows_new_entry
+                or self.is_stale(now=moment)
+            )
             else "PASS"
         )
         return {
@@ -888,11 +895,11 @@ class ContextRuntime:
             "VOLATILITY": _domestic_field(latest, "volatility"),
             "BREADTH": _domestic_field(latest, "breadth"),
             "LIQUIDITY": _domestic_field(latest, "liquidity"),
-            "DATA_AGE": data.get("worst_state"),
+            "DATA_AGE": data_state,
             "GNN_HEALTH": model.state.value,
             "FINAL_GATE": gate_state,
             "readiness": {
-                "data": data.get("worst_state"),
+                "data": data_state,
                 "model": model.state.value,
                 "cycle_stale": self.is_stale(now=moment),
                 "blocking_reasons": blocking,

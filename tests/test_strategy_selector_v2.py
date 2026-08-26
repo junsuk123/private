@@ -29,11 +29,24 @@ from app.routing.strategy_utility import (
     StrategyUtilityPrediction,
     TradingCostAdapter,
 )
-from app.strategy.registry import default_strategy_registry
+from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
+from app.strategy.registry import default_strategy_registry, reset_default_strategy_registry
 from app.technical.signals import TechnicalFeatureSet
 
 AT = datetime(2026, 8, 11, 4, 0, 0, tzinfo=timezone.utc)
 ELECTION_INPUTS = {"sector_rank": 1, "sector_candidate_count": 5}
+
+
+@pytest.fixture(autouse=True)
+def _authorize_long_strategies_for_selector_unit_tests(monkeypatch):
+    """These tests exercise ranking after deployment authority is granted."""
+    for strategy_id in STRATEGY_IDS:
+        if not is_short_strategy(strategy_id):
+            monkeypatch.setenv(f"ALGO_{strategy_id.upper()}_LIVE_AUTHORIZED", "1")
+    reset_default_strategy_registry()
+    yield
+    monkeypatch.undo()
+    reset_default_strategy_registry()
 
 
 def _features(**overrides) -> TechnicalFeatureSet:

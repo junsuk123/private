@@ -202,6 +202,19 @@ class TradingCostAdapter:
                     orderbook_snapshot=orderbook,
                 )
                 cost_bps = float(breakdown.total_cost_rate) * 10_000.0
+            # Floor model utility at the same p75 resolved-tape authority used by
+            # mechanical entry, labels and the execution gate.  The fee engine alone
+            # was materially optimistic on both venues. Borrow remains an independent
+            # short-side add-on.
+            from app.cost.round_trip import all_in_round_trip_bps
+
+            borrow_bps = _borrow_reference_bps() if is_short else 0.0
+            venue_cost = all_in_round_trip_bps(
+                str(symbol),
+                spread_bps=spread_bps,
+                fallback_bps=max(0.0, cost_bps - borrow_bps),
+            )
+            cost_bps = max(cost_bps, venue_cost + borrow_bps)
         except Exception:  # noqa: BLE001
             return CostEstimate(
                 strategy_id=str(strategy_id),

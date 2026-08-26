@@ -77,6 +77,7 @@ class TechnicalFeatureSet:
     keltner_lower: float | None = None
     keltner_position: float | None = None
     keltner_bandwidth: float | None = None
+    prior_keltner_squeeze_ratio: float | None = None
     choppiness: float | None = None
     # VWAP / volume
     vwap: float | None = None
@@ -650,9 +651,13 @@ class CompositeTechnicalSignalEngine:
         }
         # Per-strategy mechanical algorithms, built once. Imported lazily to
         # keep this module importable from the bar-only offline harnesses.
-        from app.technical.strategy_algorithms import build_algorithm_registry
+        from app.technical.strategy_algorithms import AlgorithmConfig, build_algorithm_registry
 
         self._algorithms = build_algorithm_registry()
+        self._algorithms_by_market = {
+            market: build_algorithm_registry(AlgorithmConfig(market=market))
+            for market in ("KR", "US")
+        }
 
     def evaluate(self, features: TechnicalFeatureSet) -> CompositeTechnicalSignal:
         regime_diag: RegimeDiagnostics = self.regime_classifier.classify(features.to_regime_input())
@@ -777,7 +782,11 @@ class CompositeTechnicalSignalEngine:
         strategy = str(strategy_id or "").strip().lower()
         regime_diag = self.regime_classifier.classify(features.to_regime_input())
         signals = {name: provider.evaluate(features) for name, provider in self.providers.items()}
-        algorithm = get_algorithm(strategy, registry=self._algorithms)
+        market = "KR" if features.symbol.isdigit() and len(features.symbol) == 6 else "US"
+        algorithm = get_algorithm(
+            strategy,
+            registry=self._algorithms_by_market.get(market, self._algorithms),
+        )
         if algorithm is None:
             return self._blocked(
                 features,

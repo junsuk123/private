@@ -325,6 +325,7 @@ class AutoTuningEngine:
             margin_trading_allowed=base_rules.margin_trading_allowed,
             short_selling_allowed=base_rules.short_selling_allowed,
             derivatives_allowed=base_rules.derivatives_allowed,
+            etf_trading_allowed=base_rules.etf_trading_allowed,
             leverage_etf_allowed=base_rules.leverage_etf_allowed,
             credit_loan_allowed=base_rules.credit_loan_allowed,
             llm_direct_order_execution_allowed=base_rules.llm_direct_order_execution_allowed,

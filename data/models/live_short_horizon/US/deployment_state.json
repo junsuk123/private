@@ -1,20 +1,20 @@
 {
-  "consecutive_negative_challengers": 0,
-  "last_challenger_artifact_id": "live_short_horizon.20260823T234456756680Z",
-  "last_challenger_at": "2026-08-23T23:44:56.906266+00:00",
-  "last_challenger_live_eligible": true,
+  "consecutive_negative_challengers": 109,
+  "last_challenger_artifact_id": "live_short_horizon.20260826T005450250899Z",
+  "last_challenger_at": "2026-08-26T00:54:50.251420+00:00",
+  "last_challenger_live_eligible": false,
   "last_challenger_promoted": false,
-  "last_challenger_top_k_net_bps": 16.343532141602466,
+  "last_challenger_top_k_net_bps": 0.0,
   "recent_challenger_top_k_net_bps": [
-    16.343532141602466,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485,
-    16.3382176085485
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
   ]
 }

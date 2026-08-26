@@ -59,6 +59,41 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _freshest_market_data_age_seconds(
+    tick: Any,
+    orderbook: Any,
+    decision_time: datetime,
+) -> float | None:
+    """Age of the freshest executable market observation.
+
+    Domestic stocks can legitimately print no trade for more than 15 seconds while
+    their order book continues to update.  Treating the last trade as the only data
+    clock made the supervisor hard-halt an otherwise fresh entry.  Either a received
+    trade or a received book proves that the live feed is current.
+    """
+    received_times: list[datetime] = []
+    for observation in (tick, orderbook):
+        if observation is None:
+            continue
+        for attribute in ("received_at", "captured_at"):
+            received = getattr(observation, attribute, None)
+            if not isinstance(received, datetime):
+                continue
+            received_times.append(
+                received if received.tzinfo else received.replace(tzinfo=timezone.utc)
+            )
+            break
+    if not received_times:
+        return None
+    reference = max(received_times)
+    moment = (
+        decision_time
+        if decision_time.tzinfo
+        else decision_time.replace(tzinfo=timezone.utc)
+    )
+    return max(0.0, (moment - reference).total_seconds())
+
+
 def _is_domestic_symbol_or_market(symbol: str, market: str = "") -> bool:
     ticker = str(symbol or "").strip().upper()
     market_name = str(market or "").strip().upper()
@@ -616,6 +651,13 @@ class RealtimeTradingEngine:
             buy_enabled = False
             self._buy_disabled_reason = "OPEN_BUY_ORDER_PENDING"
             summary["open_buy_order_symbols"] = list(open_buy_orders)
+        elif buy_enabled:
+            # Dynamic gate reasons are cycle-local diagnostics, not persistent
+            # authority.  Recompute them below and clear any verdict left by the
+            # previous symbol/session first.  Otherwise a flat SCANNING session can
+            # report ``buy_enabled=true`` alongside a stale supervisor halt even
+            # though candidate discovery is already running normally.
+            self._buy_disabled_reason = None
         realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
         account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
         daily_loss_stop_krw = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0))
@@ -661,6 +703,70 @@ class RealtimeTradingEngine:
                 cycle_buy_candidates = ()
                 summary["errors"] += 1
                 summary["reason"] = summary["reason"] or f"BUY_CANDIDATE_PROVIDER_ERROR:{exc.__class__.__name__}"
+
+        # Symbol-local exclusions are not election candidates. Keeping any of these
+        # only in the later order loop lets the closed-world session ARM an
+        # unexecutable symbol, lock out every alternative for the full plan window,
+        # and only then skip its order. Filter before macro/micro observation and
+        # strategy election; retain the later checks as race-safe submission guards.
+        now_monotonic = time.monotonic()
+        active_loss_cooldowns = {
+            symbol
+            for symbol, until in self._loss_cooldown_until.items()
+            if until > now_monotonic
+        }
+        loss_candidates: list[str] = []
+        ignored_candidates: list[str] = []
+        rebuy_candidates: list[str] = []
+        backoff_candidates: list[str] = []
+        eligible_candidates: list[str] = []
+        for symbol in cycle_buy_candidates:
+            if symbol in active_loss_cooldowns:
+                loss_candidates.append(symbol)
+            elif symbol in ignored_symbols:
+                ignored_candidates.append(symbol)
+            elif (
+                self.config.rebuy_cooldown_sec > 0
+                and (last_sell := self._recent_sell_monotonic.get(symbol)) is not None
+                and now_monotonic - last_sell < self.config.rebuy_cooldown_sec
+            ):
+                rebuy_candidates.append(symbol)
+            elif self._in_cooldown(symbol):
+                backoff_candidates.append(symbol)
+            else:
+                eligible_candidates.append(symbol)
+        if loss_candidates:
+            summary["loss_cooldown_candidate_excluded"] = list(loss_candidates)
+            for symbol in loss_candidates:
+                summary["skipped_cooldown"] += 1
+                self._append_rejection(
+                    summary,
+                    symbol,
+                    "BUY",
+                    ("RECENT_LOSS_SYMBOL_COOLDOWN",),
+                )
+        if ignored_candidates:
+            summary["ignored_candidate_excluded"] = list(ignored_candidates)
+            summary["skipped_ignored"] += len(ignored_candidates)
+        if rebuy_candidates:
+            summary["rebuy_cooldown_candidate_excluded"] = list(rebuy_candidates)
+            summary["skipped_cooldown"] += len(rebuy_candidates)
+        if backoff_candidates:
+            summary["backoff_candidate_excluded"] = list(backoff_candidates)
+            summary["skipped_cooldown"] += len(backoff_candidates)
+        # Discovery deliberately supplies a reserve. Apply all symbol-local
+        # exclusions first, then cap the usable universe. This is the backfill step
+        # that was missing: four cooldowns no longer consume four of eight slots.
+        cycle_buy_candidates = tuple(
+            eligible_candidates[: self.config.max_buy_evaluations_per_cycle]
+        )
+        summary["candidate_pool_count_before_exclusions"] = (
+            len(eligible_candidates)
+            + len(loss_candidates)
+            + len(ignored_candidates)
+            + len(rebuy_candidates)
+            + len(backoff_candidates)
+        )
         summary["buy_candidate_count"] = len(cycle_buy_candidates)
         summary["buy_candidate_sample"] = list(cycle_buy_candidates[:10])
         self._trace_stage(
@@ -1698,12 +1804,11 @@ class RealtimeTradingEngine:
                 orderbook = store.latest_orderbook(symbol)
             except Exception:  # noqa: BLE001 - a missing read is itself an observation.
                 tick = orderbook = None
-        data_age = None
-        if tick is not None:
-            received = getattr(tick, "received_at", None)
-            if isinstance(received, datetime):
-                reference = received if received.tzinfo else received.replace(tzinfo=timezone.utc)
-                data_age = max(0.0, (decision_time - reference).total_seconds())
+        data_age = _freshest_market_data_age_seconds(
+            tick,
+            orderbook,
+            decision_time,
+        )
 
         session_tradable = None
         if self.market_open_provider is not None:
@@ -1881,7 +1986,11 @@ class RealtimeTradingEngine:
             self._record(event)
             return False
         try:
-            submission = self.coordinator.submit_final_order(order)
+            idempotency_key = self._submission_idempotency_key(order, side, reason_codes)
+            submission = self.coordinator.submit_final_order(
+                order,
+                idempotency_key=idempotency_key,
+            )
         except LiveExecutionBlocked as exc:
             summary["blocked"] += 1
             event["outcome"] = "blocked"
@@ -1957,6 +2066,35 @@ class RealtimeTradingEngine:
         if broker_order_id:
             self._poll_submitted_order_status_async(broker_order_id, order.ticker, order)
         return True
+
+    def _submission_idempotency_key(
+        self,
+        order: FinalOrder,
+        side: str,
+        reason_codes: tuple[str, ...],
+    ) -> str | None:
+        """Scope a broker submission to its economic decision, not just its shape.
+
+        The coordinator's payload-only fallback correctly deduplicates an uncertain
+        retry, but it also made a later plan with the same symbol/price/quantity replay
+        the broker id of an already-cancelled order.  A TradePlan (or owned strategy
+        session for exits) is the stable identity of one economic decision.
+        """
+        for reason in tuple(reason_codes or ()):
+            marker = "TRADE_PLAN:"
+            if str(reason).startswith(marker):
+                plan_id = str(reason)[len(marker):].split(";", 1)[0].strip()
+                if plan_id:
+                    return f"trade-plan:{plan_id}:{str(side).upper()}"
+        manager = self.strategy_session_manager
+        if manager is not None:
+            try:
+                session_id = str((manager.snapshot() or {}).get("session_id") or "").strip()
+            except Exception:  # noqa: BLE001 - fallback remains safely idempotent.
+                session_id = ""
+            if session_id:
+                return f"strategy-session:{session_id}:{str(side).upper()}"
+        return None
 
     def _new_entries_authorized(self) -> bool:
         """Read the external operation-mode authority with fail-closed semantics."""

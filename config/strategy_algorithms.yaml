@@ -22,6 +22,15 @@
 # JSON, so nothing miscalculated, but anyone tuning a threshold against the
 # comment would have been 5 bps optimistic on every KRX round trip.
 
+# Optional market-specific overrides live under ``markets.KR`` / ``markets.US``.
+# No numeric override is populated until market-scoped forward validation supports
+# it; an empty map is intentional and prevents an unvalidated tuning guess from
+# changing live behavior. The loader and tests guarantee that future validated
+# overrides cannot leak from one venue into the other.
+markets:
+  KR: {}
+  US: {}
+
 # Market intraday momentum: 하루 1회 왕복. KRX 왕복비용 27.8bps 중 20bps가 법정
 # 거래세이고 이는 왕복마다 부과되므로, 전략의 왕복 횟수가 엣지만큼 중요하다.
 # 변동성 게이트는 논문의 최강 조건이면서 동시에 비용 조건이다 — 조용한 날의
@@ -45,6 +54,7 @@ market_intraday_momentum:
 # The RVOL gate carries the published edge; loosening it below ~1.5 turns this
 # into the unrestricted breakout, which the same research finds unprofitable.
 opening_range_breakout:
+  live_authorized: false
   min_relative_volume: 1.5
   min_breakout_excess_bps: 3.0
   min_aggressor_imbalance: 0.05
@@ -84,6 +94,7 @@ shared:
 
 # Tick order-flow continuation, confirmed by bar trend agreement.
 intraday_momentum:
+  live_authorized: false
   min_aggressor_imbalance: 0.15
   min_return_5s_bps: 2.0
   horizon_seconds: 180.0
@@ -93,6 +104,7 @@ intraday_momentum:
 
 # Structural range break; stop sits at the broken level, not at a bps constant.
 breakout_volume:
+  live_authorized: false
   min_volume_spike_ratio: 1.5
   min_breakout_excess_bps: 2.0
   acceptance_return_5s_bps: 1.0
@@ -104,6 +116,7 @@ breakout_volume:
 
 # Displacement below VWAP; target is VWAP itself, never an arbitrary bps target.
 vwap_mean_reversion:
+  live_authorized: false
   entry_deviation_bps: 25.0
   max_entry_deviation_bps: 150.0
   max_entry_zscore: 4.0
@@ -118,16 +131,15 @@ vwap_mean_reversion:
   target_capture_fraction: 0.7
   trailing_bps: 10.0
 
-# Slow-bar recovery for sparse premarket tapes. Unlike vwap_mean_reversion this
-# does not infer recovery from sub-second prints: a completed one-minute bar must
-# reclaim the fast EMA while MACD turns positive. Live deployment is enabled;
-# the common GNN trust, profitability, bandit, account-risk and session gates
-# still have to pass before an order can be submitted.
+# Slow-bar recovery for sparse tapes. Unlike vwap_mean_reversion this does not
+# infer recovery from sub-second prints: a completed one-minute bar must reclaim
+# the fast EMA while MACD turns positive. It remains shadow-only until its own
+# market-scoped after-cost outcomes earn automatic promotion.
 bar_confirmed_vwap_recovery:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  live_authorized: false
   min_displacement_bps: 75.0
   max_displacement_zscore: 15.0
   max_rsi: 45.0
@@ -147,7 +159,7 @@ bar_confirmed_vwap_recovery:
 liquidity_shock_reversal:
   enabled: true
   shadow_enabled: true
-  live_authorized: true
+  live_authorized: false
   shock_return_10s_bps: -40.0
   max_spread_change_5s: 0.0
   min_aggressor_imbalance: -0.35
@@ -169,6 +181,7 @@ liquidity_shock_reversal:
 # TTL-bounded repricing. Requires a point-in-time event feed; without one the
 # algorithm fails closed rather than guessing freshness.
 event_momentum:
+  live_authorized: false
   min_volume_spike_ratio: 2.0
   min_aggressor_imbalance: 0.10
   exhaustion_return_10s_bps: 120.0
@@ -178,6 +191,7 @@ event_momentum:
 
 # Requires a cross-sectional rank from the electing layer.
 cross_sectional_relative_strength:
+  live_authorized: false
   max_sector_rank: 3.0
   min_short_return_bps: 0.0
   min_aggressor_imbalance: 0.05
@@ -187,6 +201,7 @@ cross_sectional_relative_strength:
 
 # Exactly one submode per election; continuation and fade are never blended.
 gap_context:
+  live_authorized: false
   min_gap_rate: 0.01
   min_volume_spike_ratio: 1.5
   min_aggressor_imbalance: 0.10
@@ -200,7 +215,7 @@ rvgi_box_breakout:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  live_authorized: false
   rvgi_period: 10
   box_lookback: 20
   cross_confirm_bars: 3
@@ -219,8 +234,8 @@ rvgi_box_breakout:
   horizon_seconds: 300
 
 # --- Added for the current high-volatility, flow-driven tape -----------------
-# Deployment authorization is enabled. The common conservative bandit and
-# profitability gates still reject arms without a positive cost-adjusted edge.
+# These arms collect shadow evidence and must earn market-scoped promotion. Merely
+# registering a new strategy never grants deployment authority.
 
 # Market/sector-neutral leadership. Requires residual returns and an investor-flow
 # z-score from the electing layer; without them it fails closed rather than
@@ -230,7 +245,7 @@ residual_relative_strength:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  live_authorized: false
   min_residual_short_bps: 5.0
   min_residual_long_bps: 0.0
   max_sector_rank: 3.0
@@ -240,6 +255,23 @@ residual_relative_strength:
   require_flow_confirmation: true
   min_flow_zscore: 0.0
   max_change_point_probability: 0.5
+  # Long-only bear-market submode: individual cash equities only. A stock must
+  # rise in absolute terms as well as after market/sector beta removal.
+  bearish_mode_enabled: true
+  bearish_max_market_breadth: 0.45
+  bearish_max_market_beta: 0.85
+  bearish_min_residual_short_bps: 12.0
+  bearish_min_residual_long_bps: 8.0
+  bearish_min_absolute_return_bps: 5.0
+  bearish_min_vwap_premium_bps: 5.0
+  bearish_min_momentum_persistence: 0.55
+  bearish_min_relative_volume: 1.30
+  bearish_max_change_point_probability: 0.35
+  bearish_capture_fraction: 0.35
+  bearish_max_target_bps: 250.0
+  bearish_stop_volatility_multiple: 1.5
+  bearish_trailing_bps: 30.0
+  bearish_horizon_seconds: 10800
   horizon_seconds: 420.0
   stop_volatility_multiple: 2.0
   trailing_bps: 20.0
@@ -251,7 +283,7 @@ adaptive_anchored_vwap_reversion:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  live_authorized: false
   min_entry_zscore: 2.0
   max_entry_zscore: 6.0
   min_displacement_bps: 15.0
@@ -272,7 +304,7 @@ ofi_microprice_exhaustion_reversal:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
-  live_authorized: true
+  live_authorized: false
   shock_return_10s_bps: -35.0
   min_depth_ratio: 1.1
   min_orderbook_imbalance: 0.05

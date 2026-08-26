@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+quant-reference = [
+  "gs-quant==2.1.3"
+]
 npu = [
   "openvino"
 ]

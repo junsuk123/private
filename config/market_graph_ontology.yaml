@@ -129,6 +129,19 @@ edges:
   - {source: COMMODITY,     target: KR_MARKET,  relation: INFLUENCES, prior_strength: 0.30, lag_min: 0, lag_max: 960}
   - {source: US_SEMI,       target: US_EQUITY,  relation: LEADS,      prior_strength: 0.50, lag_min: 1, lag_max: 60}
 
+  # US factors must terminate on the US market as well as serving as overnight
+  # context for Korea.  Previously US_MARKET only had structural venue membership,
+  # so a NASDAQ/NYSE stock could not receive a macro message through the market node.
+  # The same shared ontology now activates the factor path appropriate to the target
+  # market; no separate US graph or model is required.
+  - {source: US_EQUITY,     target: US_MARKET,  relation: INFLUENCES,     prior_strength: 0.85, lag_min: 0, lag_max: 60}
+  - {source: US_SEMI,       target: US_MARKET,  relation: INFLUENCES,     prior_strength: 0.65, lag_min: 0, lag_max: 60}
+  - {source: INDEX_FUTURES, target: US_MARKET,  relation: LEADS,          prior_strength: 0.70, lag_min: 1, lag_max: 120}
+  - {source: VOLATILITY,    target: US_MARKET,  relation: INCREASES_RISK, prior_strength: 0.80, lag_min: 0, lag_max: 120}
+  - {source: US_RATES,      target: US_MARKET,  relation: INFLUENCES,     prior_strength: 0.55, lag_min: 0, lag_max: 480}
+  - {source: FX,            target: US_MARKET,  relation: INCREASES_RISK, prior_strength: 0.35, lag_min: 0, lag_max: 480}
+  - {source: COMMODITY,     target: US_MARKET,  relation: INFLUENCES,     prior_strength: 0.25, lag_min: 0, lag_max: 480}
+
   # -- venue structure (definitions: not learnable) ---------------------------
   - {source: KRX,    target: KR_MARKET, relation: BELONGS_TO}
   - {source: NXT,    target: KR_MARKET, relation: BELONGS_TO}

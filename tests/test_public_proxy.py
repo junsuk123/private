@@ -352,6 +352,47 @@ def test_non_root_paths_are_never_redirected(client):
     assert client.upstream.seen == [("GET", "/api/status")]
 
 
+def test_idempotent_read_retries_one_stale_upstream_connection(client, monkeypatch):
+    """A proxy that outlives a server restart must discard one dead pooled socket."""
+    import httpx
+
+    attempts = 0
+
+    async def _request(method, url, **kwargs):  # noqa: ANN001
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError("peer closed pooled connection")
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(client.upstream, "request", _request)
+
+    response = client.get("/api/status", headers={"X-App-Token": TOKEN})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert attempts == 2
+
+
+def test_persistent_upstream_failure_remains_fail_closed(client, monkeypatch):
+    import httpx
+
+    attempts = 0
+
+    async def _request(method, url, **kwargs):  # noqa: ANN001
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("loopback unavailable")
+
+    monkeypatch.setattr(client.upstream, "request", _request)
+
+    response = client.get("/api/status", headers={"X-App-Token": TOKEN})
+
+    assert response.status_code == 502
+    assert response.json()["error"] == "UPSTREAM_UNAVAILABLE"
+    assert attempts == 2
+
+
 # -- anonymous mode: gate 1 off, gate 2 must still hold ----------------------- #
 
 @pytest.fixture()

@@ -53,10 +53,11 @@ from uuid import uuid4
 DEFAULT_STORE_PATH = "data/store/strategy-performance.sqlite3"
 NO_TRADE_ARM = "no_trade"
 
-# v2 adds the directional columns. Rows written before it are backfilled to
-# ('LONG', 'CASH', 'live'), which is factually what they were: the only positions
-# the system could open were cash longs.
-_SCHEMA_VERSION = 2
+# v2 added directional columns. v3 versions the algorithm and payoff evaluator so
+# corrected geometry cannot be promoted on outcomes produced by older semantics.
+_SCHEMA_VERSION = 3
+LEGACY_EVIDENCE_VERSION = "legacy"
+CURRENT_EVALUATION_VERSION = "net-payoff-v2"
 
 # Where an outcome came from. The distinction is load-bearing for promotion: a
 # SHADOW outcome is a simulated fill and a LIVE outcome is a real one, and treating
@@ -100,6 +101,17 @@ def market_for_symbol(symbol: str) -> str:
     """6-digit numeric -> KR, everything else -> US (matches the routing rule)."""
     text = str(symbol or "").strip().upper()
     return "KR" if text.isdigit() and len(text) == 6 else "US"
+
+
+def _current_evidence_versions(strategy_id: str) -> tuple[str, str]:
+    """Resolve versions lazily to keep storage independent of registry startup."""
+    try:
+        from app.strategy.registry import default_strategy_registry
+
+        algorithm = default_strategy_registry().require(strategy_id).algorithm_version
+    except Exception:  # noqa: BLE001 - an unknown arm still gets a non-legacy version.
+        algorithm = "spec-v2"
+    return str(algorithm), CURRENT_EVALUATION_VERSION
 
 
 def normalize_regime(regime: str | None) -> str:
@@ -153,6 +165,8 @@ class StrategyOutcome:
     # every promotion statistic — a strategy cannot be promoted on trades it could
     # not have taken.
     signal_executable: bool = True
+    algorithm_version: str = LEGACY_EVIDENCE_VERSION
+    evaluation_version: str = LEGACY_EVIDENCE_VERSION
 
     @property
     def is_loss(self) -> bool:
@@ -371,6 +385,8 @@ class StrategyPerformanceStore:
         borrow_fee_bps: float | None = None,
         borrow_quantity: int | None = None,
         signal_executable: bool = True,
+        algorithm_version: str | None = None,
+        evaluation_version: str | None = None,
     ) -> bool:
         """Persist one closed outcome. Returns False when the store is unusable.
 
@@ -399,6 +415,13 @@ class StrategyPerformanceStore:
             else ("CREDIT_BORROW" if resolved_direction == "SHORT" else "CASH")
         )
         resolved_evaluation = str(evaluation_source or source or EVALUATION_SOURCE_LIVE).strip().lower()
+        current_algorithm, current_evaluation = _current_evidence_versions(strategy)
+        resolved_algorithm_version = str(
+            algorithm_version or current_algorithm
+        ).strip() or current_algorithm
+        resolved_evaluation_version = str(
+            evaluation_version or current_evaluation
+        ).strip() or current_evaluation
         row = (
             f"outcome-{uuid4().hex}",
             moment.isoformat(),
@@ -422,6 +445,8 @@ class StrategyPerformanceStore:
             _finite(borrow_fee_bps),
             None if borrow_quantity is None else int(borrow_quantity),
             int(bool(signal_executable)),
+            resolved_algorithm_version,
+            resolved_evaluation_version,
         )
         try:
             with self._lock, closing(self._connect()) as conn:
@@ -433,8 +458,9 @@ class StrategyPerformanceStore:
                         holding_seconds, slippage_error_bps, max_adverse_excursion_bps,
                         exit_reason, source,
                         direction, execution_product, deployment_state, evaluation_source,
-                        borrow_available, borrow_fee_bps, borrow_quantity, signal_executable
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        borrow_available, borrow_fee_bps, borrow_quantity, signal_executable,
+                        algorithm_version, evaluation_version
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     row,
                 )
@@ -481,6 +507,9 @@ class StrategyPerformanceStore:
         execution_product: str | None = None,
         evaluation_sources: Sequence[str] | None = None,
         executable_only: bool = True,
+        algorithm_version: str | None = None,
+        evaluation_version: str | None = None,
+        compatible_only: bool = True,
     ) -> tuple[StrategyOutcome, ...]:
         """Most recent closed outcomes for one arm.
 
@@ -500,6 +529,14 @@ class StrategyPerformanceStore:
             if evaluation_sources
             else None
         )
+        resolved_algorithm_version = algorithm_version
+        resolved_evaluation_version = evaluation_version
+        if compatible_only:
+            current_algorithm, current_evaluation = _current_evidence_versions(
+                str(strategy_id)
+            )
+            resolved_algorithm_version = resolved_algorithm_version or current_algorithm
+            resolved_evaluation_version = resolved_evaluation_version or current_evaluation
         # Evidence older than this is not wrong, it is no longer about this market.
         # Bucketed to the hour so the cache key is stable across calls within a
         # cycle instead of missing on every microsecond.
@@ -518,6 +555,8 @@ class StrategyPerformanceStore:
             str(execution_product).strip().upper() if execution_product else None,
             sources,
             bool(executable_only),
+            resolved_algorithm_version,
+            resolved_evaluation_version,
             cutoff,
         )
         cached = self._cached(key)
@@ -545,6 +584,12 @@ class StrategyPerformanceStore:
             # 1, but a NULL from a partially applied migration must not be silently
             # dropped from a LONG posterior that predates the column.
             clauses.append("(signal_executable is null or signal_executable != 0)")
+        if resolved_algorithm_version:
+            clauses.append("algorithm_version = ?")
+            params.append(str(resolved_algorithm_version))
+        if resolved_evaluation_version:
+            clauses.append("evaluation_version = ?")
+            params.append(str(resolved_evaluation_version))
         if cutoff is not None:
             clauses.append("recorded_at >= ?")
             params.append(cutoff)
@@ -554,7 +599,8 @@ class StrategyPerformanceStore:
             "realized_gross_bps, expected_net_bps, holding_seconds, slippage_error_bps, "
             "max_adverse_excursion_bps, exit_reason, source, direction, execution_product, "
             "deployment_state, evaluation_source, borrow_available, borrow_fee_bps, "
-            "borrow_quantity, signal_executable from strategy_outcomes "
+            "borrow_quantity, signal_executable, algorithm_version, evaluation_version "
+            "from strategy_outcomes "
             f"where {' and '.join(clauses)} order by recorded_at desc, rowid desc limit ?"
         )
         rows: Sequence[Any] = ()
@@ -586,6 +632,8 @@ class StrategyPerformanceStore:
                 borrow_fee_bps=_finite(row[18]),
                 borrow_quantity=None if row[19] is None else int(row[19]),
                 signal_executable=True if row[20] is None else bool(row[20]),
+                algorithm_version=str(row[21] or LEGACY_EVIDENCE_VERSION),
+                evaluation_version=str(row[22] or LEGACY_EVIDENCE_VERSION),
             )
             for row in rows
         )
@@ -729,6 +777,7 @@ class StrategyPerformanceStore:
         direction: str | None = None,
         execution_product: str | None = None,
         symbol: str | None = None,
+        allow_regime_fallback: bool = True,
     ) -> StrategyPosterior:
         """Shrunk posterior with an explicit pessimistic lower bound.
 
@@ -775,7 +824,7 @@ class StrategyPerformanceStore:
             direction=resolved_direction,
             execution_product=execution_product,
         )
-        if not outcomes and resolved_regime:
+        if not outcomes and resolved_regime and allow_regime_fallback:
             # Regime-conditioned history is the ideal; market-wide history is the
             # honest fallback, flagged so the caller can see it was widened. The
             # direction filter is deliberately preserved here.
@@ -1149,6 +1198,7 @@ class StrategyPerformanceStore:
                     """
                 )
                 self._migrate_directional_columns(conn)
+                self._migrate_evidence_version_columns(conn)
                 conn.execute(
                     "insert or ignore into schema_version(version) values (?)", (_SCHEMA_VERSION,)
                 )
@@ -1196,6 +1246,23 @@ class StrategyPerformanceStore:
                 "create index if not exists idx_outcomes_directional on strategy_outcomes("
                 "strategy_id, direction, market, regime, recorded_at desc)"
             )
+
+    @staticmethod
+    def _migrate_evidence_version_columns(conn: sqlite3.Connection) -> None:
+        """v2 -> v3: preserve old rows but mark them incompatible with new code."""
+        existing = {
+            str(row[1]) for row in conn.execute("pragma table_info(strategy_outcomes)").fetchall()
+        }
+        for column in ("algorithm_version", "evaluation_version"):
+            if column not in existing:
+                conn.execute(
+                    f"alter table strategy_outcomes add column {column} "
+                    f"text not null default '{LEGACY_EVIDENCE_VERSION}'"
+                )
+        conn.execute(
+            "create index if not exists idx_outcomes_evidence_version on strategy_outcomes("
+            "strategy_id, algorithm_version, evaluation_version, market, recorded_at desc)"
+        )
 
 
 _DEFAULT_STORE: StrategyPerformanceStore | None = None

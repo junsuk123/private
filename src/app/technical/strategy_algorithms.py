@@ -669,6 +669,25 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "require_flow_confirmation": 1.0,
         "min_flow_zscore": 0.0,
         "max_change_point_probability": 0.5,
+        # Long-only defensive submode for a falling broad market.  These are
+        # deliberately stricter than the ordinary residual-strength thresholds:
+        # "down less than the index" is not sufficient; the stock itself must be
+        # rising with a low beta and supportive completed-bar structure.
+        "bearish_mode_enabled": 1.0,
+        "bearish_max_market_breadth": 0.45,
+        "bearish_max_market_beta": 0.85,
+        "bearish_min_residual_short_bps": 12.0,
+        "bearish_min_residual_long_bps": 8.0,
+        "bearish_min_absolute_return_bps": 5.0,
+        "bearish_min_vwap_premium_bps": 5.0,
+        "bearish_min_momentum_persistence": 0.55,
+        "bearish_min_relative_volume": 1.30,
+        "bearish_max_change_point_probability": 0.35,
+        "bearish_capture_fraction": 0.35,
+        "bearish_max_target_bps": 250.0,
+        "bearish_stop_volatility_multiple": 1.5,
+        "bearish_trailing_bps": 30.0,
+        "bearish_horizon_seconds": 10800.0,
         "horizon_seconds": 420.0,
         "stop_volatility_multiple": 2.0,
         "trailing_bps": 20.0,
@@ -873,6 +892,19 @@ _DEFAULTS: dict[str, dict[str, float]] = {
     },
 }
 
+# Every catalogued strategy participates in the same evidence-gated deployment
+# contract.  Older strategies predated these keys, so YAML ``live_authorized:
+# false`` was silently ignored (AlgorithmConfig only overlays declared keys) and
+# ``strategy_live_authorized`` treated them as permanently live.  Supplying safe
+# deployment defaults makes the YAML authoritative and lets a SHADOW strategy earn
+# LIVE_PROBE through the market-scoped promotion controller.
+for _strategy_id in STRATEGY_IDS:
+    _deployment = _DEFAULTS[_strategy_id]
+    _deployment.setdefault("enabled", 1.0)
+    _deployment.setdefault("shadow_enabled", 1.0)
+    _deployment.setdefault("paper_enabled", 1.0)
+    _deployment.setdefault("live_authorized", 0.0)
+
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
@@ -887,15 +919,28 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 class AlgorithmConfig:
-    """Per-strategy thresholds: built-in default < YAML < environment.
+    """Per-strategy thresholds with optional KR/US overlays.
 
     Environment key format ``ALGO_<STRATEGY>_<PARAM>`` in upper case, e.g.
-    ``ALGO_LIQUIDITY_SHOCK_REVERSAL_SHOCK_RETURN_10S_BPS``. Effective values are
-    exposed through :meth:`as_dict` so the resolved policy is auditable.
+    ``ALGO_LIQUIDITY_SHOCK_REVERSAL_SHOCK_RETURN_10S_BPS``. A market-specific
+    instance also accepts ``ALGO_US_<STRATEGY>_<PARAM>``. Precedence is specific
+    env > global env > market YAML > base YAML > built-in default.
     """
 
-    def __init__(self, config_path: str | Path = DEFAULT_CONFIG_PATH) -> None:
+    def __init__(
+        self,
+        config_path: str | Path = DEFAULT_CONFIG_PATH,
+        *,
+        market: str | None = None,
+    ) -> None:
         overlay = _load_yaml(Path(config_path))
+        normalized_market = str(market or "").strip().upper() or None
+        market_sections: Mapping[str, Any] = {}
+        raw_markets = overlay.get("markets")
+        if normalized_market and isinstance(raw_markets, Mapping):
+            candidate = raw_markets.get(normalized_market)
+            if isinstance(candidate, Mapping):
+                market_sections = candidate
         resolved: dict[str, dict[str, float]] = {}
         for section, defaults in _DEFAULTS.items():
             values = dict(defaults)
@@ -907,17 +952,33 @@ class AlgorithmConfig:
                             values[key] = float(value)
                         except (TypeError, ValueError):
                             continue
+            market_overlay = market_sections.get(section)
+            if isinstance(market_overlay, Mapping):
+                for key, value in market_overlay.items():
+                    if key in values:
+                        try:
+                            values[key] = float(value)
+                        except (TypeError, ValueError):
+                            continue
             for key in list(values):
                 env_key = f"ALGO_{section}_{key}".upper()
                 raw = os.getenv(env_key)
-                if raw is None:
-                    continue
-                try:
-                    values[key] = float(raw)
-                except (TypeError, ValueError):
-                    continue
+                if raw is not None:
+                    try:
+                        values[key] = float(raw)
+                    except (TypeError, ValueError):
+                        pass
+                if normalized_market:
+                    market_env_key = f"ALGO_{normalized_market}_{section}_{key}".upper()
+                    market_raw = os.getenv(market_env_key)
+                    if market_raw is not None:
+                        try:
+                            values[key] = float(market_raw)
+                        except (TypeError, ValueError):
+                            pass
             resolved[section] = values
         self._values = resolved
+        self.market = normalized_market
 
     def get(self, section: str, key: str) -> float:
         return float(self._values.get(section, {}).get(key, _DEFAULTS[section][key]))
@@ -1742,6 +1803,14 @@ class EventMomentumAlgorithm(TradingAlgorithm):
     strategy_id = "event_momentum"
     thesis = "fresh material information keeps repricing until its TTL expires"
 
+    @staticmethod
+    def _volatility_basis(f: TechnicalFeatureSet) -> tuple[float | None, int, str]:
+        """Use one causal volatility basis for both entry and exit geometry."""
+        tick_ready = bool(f.tick_data_ready and f.realized_volatility_10s is not None)
+        if tick_ready:
+            return f.realized_volatility_10s, 10, "tick"
+        return f.realized_volatility, 60, "bar"
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
         # Event evidence comes from the electing ontology; absence fails closed.
         if not context.event_fresh:
@@ -1765,8 +1834,7 @@ class EventMomentumAlgorithm(TradingAlgorithm):
                     ("EVENT_MOVE_ALREADY_EXHAUSTED",),
                     return_10s_bps=round(move_bps, 3),
                 )
-            volatility = f.realized_volatility_10s
-            window_seconds = 10
+            volatility, window_seconds, _ = self._volatility_basis(f)
             confirmation = "EVENT_TICK_REPRICING_CONFIRMED"
         else:
             # US data is REST/book + completed bars. A fresh positive event can
@@ -1783,8 +1851,7 @@ class EventMomentumAlgorithm(TradingAlgorithm):
             )
             if not bar_up:
                 return self._reject(("EVENT_BAR_TREND_NOT_CONFIRMING",))
-            volatility = f.realized_volatility
-            window_seconds = 60
+            volatility, window_seconds, _ = self._volatility_basis(f)
             confirmation = "EVENT_BAR_REPRICING_CONFIRMED"
 
         remaining = max(0.0, ttl - age)
@@ -1816,9 +1883,11 @@ class EventMomentumAlgorithm(TradingAlgorithm):
             else 0.0
         )
         horizon = int(min(self.horizon_seconds, remaining)) or self.horizon_seconds
+        volatility, window_seconds, basis = self._volatility_basis(f)
         edge = tick_expected_move_bps(
-            f.realized_volatility_10s,
+            volatility,
             horizon,
+            window_seconds=window_seconds,
             capture_fraction=self.config.shared("capture_fraction"),
         )
         return ExitRule(
@@ -1827,7 +1896,7 @@ class EventMomentumAlgorithm(TradingAlgorithm):
             target_price=entry_price * (1.0 + edge / 10_000.0) if edge else None,
             trailing_bps=self.p("trailing_bps"),
             max_holding_seconds=horizon,
-            stop_basis="tick_volatility_multiple",
+            stop_basis=f"{basis}_volatility_multiple",
             target_basis="event_horizon_expected_move",
         )
 
@@ -2168,7 +2237,30 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
     strategy_id = "residual_relative_strength"
     thesis = "idiosyncratic strength net of market and sector beta persists while flow confirms it"
 
+    @staticmethod
+    def _bearish_mode(context: ElectionContext) -> bool:
+        return str(context.market_trend or "").strip().upper() in {
+            "TREND_DOWN",
+            "HIGH_VOL_TRENDING_DOWN",
+        }
+
+    def _bearish_edge(self, f: TechnicalFeatureSet) -> float:
+        volatility = f.realized_volatility or f.realized_volatility_10s
+        window = 60 if f.realized_volatility else 10
+        return min(
+            self.p("bearish_max_target_bps"),
+            tick_expected_move_bps(
+                volatility,
+                int(self.p("bearish_horizon_seconds")),
+                window_seconds=window,
+                capture_fraction=self.p("bearish_capture_fraction"),
+            ),
+        )
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        bearish = self._bearish_mode(context)
+        if bearish and self.p("bearish_mode_enabled") < 1.0:
+            return self._reject(("BEAR_MARKET_LONG_ONLY_MODE_DISABLED",))
         short_residual = context.residual_return_short_bps
         long_residual = context.residual_return_long_bps
         if not _present(short_residual, long_residual):
@@ -2178,25 +2270,73 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
         if rank is None or universe is None or universe <= 1:
             return self._reject(("RESIDUAL_SECTOR_RANK_ABSENT",))
         change_point = context.change_point_probability
+        maximum_change_point = (
+            self.p("bearish_max_change_point_probability")
+            if bearish
+            else self.p("max_change_point_probability")
+        )
         if (
             change_point is not None
-            and change_point > self.p("max_change_point_probability")
+            and change_point > maximum_change_point
         ):
             return self._reject(
                 ("RESIDUAL_STRENGTH_REGIME_UNSTABLE",), change_point_probability=change_point
             )
-        if short_residual < self.p("min_residual_short_bps"):
+        minimum_short_residual = max(
+            self.p("min_residual_short_bps"),
+            self.p("bearish_min_residual_short_bps") if bearish else 0.0,
+        )
+        minimum_long_residual = max(
+            self.p("min_residual_long_bps"),
+            self.p("bearish_min_residual_long_bps") if bearish else 0.0,
+        )
+        if short_residual < minimum_short_residual:
             return self._reject(
                 ("RESIDUAL_SHORT_HORIZON_NOT_POSITIVE",), residual_return_short_bps=short_residual
             )
-        if long_residual < self.p("min_residual_long_bps"):
+        if long_residual < minimum_long_residual:
             return self._reject(
                 ("RESIDUAL_LONG_HORIZON_NOT_POSITIVE",), residual_return_long_bps=long_residual
             )
         if rank > int(self.p("max_sector_rank")):
             return self._reject(("RESIDUAL_SECTOR_RANK_TOO_LOW",), sector_rank=rank, universe=universe)
+        if bearish:
+            breadth = context.market_breadth
+            if breadth is None:
+                return self._reject(("BEAR_MARKET_BREADTH_ABSENT",))
+            if breadth > self.p("bearish_max_market_breadth"):
+                return self._reject(
+                    ("BEAR_MARKET_BREADTH_NOT_WEAK",), market_breadth=breadth
+                )
+            beta = context.market_beta
+            if beta is None:
+                return self._reject(("BEAR_MARKET_BETA_ABSENT",))
+            if beta > self.p("bearish_max_market_beta"):
+                return self._reject(("BEAR_MARKET_BETA_TOO_HIGH",), market_beta=beta)
+            absolute_return_bps = float(f.short_return or 0.0) * 10_000.0
+            if absolute_return_bps < self.p("bearish_min_absolute_return_bps"):
+                return self._reject(
+                    ("BEAR_MARKET_ABSOLUTE_STRENGTH_MISSING",),
+                    absolute_return_bps=round(absolute_return_bps, 3),
+                )
+            if (
+                f.vwap_distance_bps is None
+                or f.vwap_distance_bps < self.p("bearish_min_vwap_premium_bps")
+            ):
+                return self._reject(("BEAR_MARKET_PRICE_NOT_ABOVE_VWAP",))
+            if not _present(f.ema_fast, f.ema_slow) or float(f.ema_fast) <= float(f.ema_slow):
+                return self._reject(("BEAR_MARKET_COMPLETED_BAR_TREND_NOT_POSITIVE",))
+            if (
+                f.momentum_persistence is None
+                or f.momentum_persistence < self.p("bearish_min_momentum_persistence")
+            ):
+                return self._reject(("BEAR_MARKET_MOMENTUM_NOT_PERSISTENT",))
         relative_volume = f.relative_volume
-        if relative_volume is None or relative_volume < self.p("min_relative_volume"):
+        minimum_relative_volume = max(
+            self.p("min_relative_volume"),
+            self.p("bearish_min_relative_volume") if bearish else 0.0,
+        )
+        if relative_volume is None or relative_volume < minimum_relative_volume:
             return self._reject(
                 (rc.VOLUME_CONFIRMATION_MISSING, "RESIDUAL_VOLUME_NOT_CONFIRMED"),
                 relative_volume=relative_volume,
@@ -2228,7 +2368,10 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
                     ("RESIDUAL_INVESTOR_FLOW_NEGATIVE",), flow_zscores=flow_scores
                 )
 
-        edge = self._volatility_edge(f)
+        edge = self._bearish_edge(f) if bearish else self._volatility_edge(f)
+        horizon = (
+            int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds
+        )
         rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
         residual_score = _clamp(short_residual / 30.0)
         return self._fire(
@@ -2236,7 +2379,12 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
             score=_clamp(0.45 * rank_score + 0.35 * residual_score + 0.2 * _clamp(microprice_edge)),
             confidence=_clamp(0.3 + 0.4 * rank_score + 0.2 * residual_score),
             edge_bps=edge,
-            reasons=("RESIDUAL_STRENGTH_CONFIRMED", "MARKET_AND_SECTOR_NEUTRAL_LEADER"),
+            reasons=(
+                "RESIDUAL_STRENGTH_CONFIRMED",
+                "MARKET_AND_SECTOR_NEUTRAL_LEADER",
+                *(("BEAR_MARKET_LONG_ONLY_DEFENSIVE_STRENGTH",) if bearish else ()),
+            ),
+            horizon_seconds=horizon,
             residual_return_short_bps=round(short_residual, 3),
             residual_return_long_bps=round(long_residual, 3),
             sector_rank=rank,
@@ -2247,12 +2395,24 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
+        bearish = self._bearish_mode(context)
+        edge = self._bearish_edge(f) if bearish else self._volatility_edge(f)
         return ExitRule(
             strategy_id=self.strategy_id,
-            stop_price=self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
-            target_price=entry_price * (1.0 + self._volatility_edge(f) / 10_000.0),
-            trailing_bps=self.p("trailing_bps"),
-            max_holding_seconds=self.horizon_seconds,
+            stop_price=self._volatility_stop(
+                entry_price,
+                f,
+                self.p("bearish_stop_volatility_multiple")
+                if bearish
+                else self.p("stop_volatility_multiple"),
+            ),
+            target_price=entry_price * (1.0 + edge / 10_000.0),
+            trailing_bps=(
+                self.p("bearish_trailing_bps") if bearish else self.p("trailing_bps")
+            ),
+            max_holding_seconds=(
+                int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds
+            ),
             stop_basis="tick_volatility_multiple",
             target_basis="tick_volatility_expected_move",
         )
@@ -2267,6 +2427,19 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
         edge = f.microprice_edge_bps
         if edge is not None and edge < 0 and (f.return_5s or 0.0) < 0:
             codes.append("RESIDUAL_MICROPRICE_TURNED_OFFERED")
+        if self._bearish_mode(context):
+            if f.short_return is not None and float(f.short_return) <= 0.0:
+                codes.append("BEAR_MARKET_ABSOLUTE_STRENGTH_LOST")
+            if (
+                f.vwap_distance_bps is not None
+                and float(f.vwap_distance_bps) <= 0.0
+            ):
+                codes.append("BEAR_MARKET_VWAP_SUPPORT_LOST")
+            if (
+                _present(f.ema_fast, f.ema_slow)
+                and float(f.ema_fast) <= float(f.ema_slow)
+            ):
+                codes.append("BEAR_MARKET_COMPLETED_BAR_TREND_LOST")
         return tuple(codes)
 
 
@@ -3377,6 +3550,24 @@ class RangeSupportReversionAlgorithm(TradingAlgorithm):
     strategy_id = "range_support_reversion"
     thesis = "price pressed against its 20-bar range floor reverts before it breaks"
 
+    def _target_edge_bps(self, entry_price: float, f: TechnicalFeatureSet) -> float:
+        """Exact attainable edge to the target emitted by :meth:`exit_rule`."""
+        if entry_price <= 0.0:
+            return 0.0
+        horizon_minutes = max(1.0, self.horizon_seconds / 60.0)
+        attainable = float(f.atr_pct or 0.0) * 10_000.0 * math.sqrt(horizon_minutes)
+        attainable_capture = attainable * self.p("target_capture_fraction")
+        if f.donchian_high is None or f.donchian_low is None:
+            return max(0.0, attainable_capture)
+        midpoint = (float(f.donchian_high) + float(f.donchian_low)) / 2.0
+        structural = (
+            max(0.0, midpoint - entry_price)
+            / entry_price
+            * 10_000.0
+            * self.p("target_capture_fraction")
+        )
+        return min(attainable_capture, structural)
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
         if not _present(f.price, f.donchian_low, f.donchian_low_distance, f.atr_pct):
             return self._reject(("RANGE_SUPPORT_INPUTS_MISSING",))
@@ -3427,10 +3618,7 @@ class RangeSupportReversionAlgorithm(TradingAlgorithm):
         span = None
         if f.donchian_high is not None and f.donchian_low is not None:
             span = (float(f.donchian_high) - float(f.donchian_low)) / max(1e-9, float(f.price))
-        edge = min(
-            attainable_bps * self.p("target_capture_fraction"),
-            (span * 10_000.0 * self.p("target_capture_fraction")) if span else attainable_bps,
-        )
+        edge = self._target_edge_bps(float(f.price), f)
         # Closer to the floor is a better location, and that is the only thing this
         # thesis claims to know.
         score = _clamp(1.0 - distance_bps / max(1e-9, self.p("max_low_distance_bps")))
@@ -3449,11 +3637,8 @@ class RangeSupportReversionAlgorithm(TradingAlgorithm):
     def exit_rule(self, entry_price, f, context) -> ExitRule:
         # Structural target: the middle of the range the entry was taken at the floor
         # of. Falls back to the geometry target when the channel is unavailable.
-        target = None
-        if f.donchian_high is not None and f.donchian_low is not None:
-            mid = (float(f.donchian_high) + float(f.donchian_low)) / 2.0
-            if mid > entry_price:
-                target = entry_price + self.p("target_capture_fraction") * (mid - entry_price)
+        edge_bps = self._target_edge_bps(entry_price, f)
+        target = entry_price * (1.0 + edge_bps / 10_000.0) if edge_bps > 0.0 else None
         return ExitRule(
             strategy_id=self.strategy_id,
             stop_price=self._volatility_stop(
@@ -3628,13 +3813,13 @@ class KeltnerVolatilityBreakoutAlgorithm(TradingAlgorithm):
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
         required = (
-            f.price, f.keltner_upper, f.keltner_bandwidth, f.bb_bandwidth,
+            f.price, f.keltner_upper, f.prior_keltner_squeeze_ratio,
             f.volatility_expansion, f.adx, f.dmi_spread, f.relative_volume,
             f.vwap_distance_bps, f.atr_pct, f.liquidity_score, f.spread_bps,
         )
         if not _present(*required):
             return self._reject(("KELTNER_BREAKOUT_INPUTS_MISSING",))
-        squeeze_ratio = float(f.bb_bandwidth) / max(1e-12, float(f.keltner_bandwidth))
+        squeeze_ratio = float(f.prior_keltner_squeeze_ratio)
         if squeeze_ratio > self.p("max_squeeze_ratio"):
             return self._reject(("KELTNER_PRIOR_COMPRESSION_MISSING",), squeeze_ratio=squeeze_ratio)
         if float(f.price) <= float(f.keltner_upper):
@@ -3820,7 +4005,8 @@ def strategy_direction(strategy_id: str) -> str:
 
 
 # Strategies whose deployment is gated by their own ``live_authorized`` knob.
-# Everything else is live by default; these must earn it with per-regime samples.
+# Every catalogue member declares the knob through the safe defaults above; a
+# missing YAML section therefore starts SHADOW rather than silently becoming live.
 #
 # DERIVED from the defaults, never hand-listed. It used to be a literal set, and it
 # fell out of sync the moment strategies were added: ``opening_range_breakout`` and

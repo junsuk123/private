@@ -557,6 +557,11 @@ class RiskRules:
     margin_trading_allowed: bool = False
     short_selling_allowed: bool = False
     derivatives_allowed: bool = False
+    # This account cannot place ETF orders, including unleveraged cash ETFs.
+    # Kept separate from ``leverage_etf_allowed`` because the broker permissions
+    # and operator policy are distinct: allowing ordinary ETFs must never imply
+    # permission for leveraged or inverse ETPs.
+    etf_trading_allowed: bool = False
     leverage_etf_allowed: bool = False
     credit_loan_allowed: bool = False
     # Block BUYs of warrants / units / rights (non-common-equity instruments).

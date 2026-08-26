@@ -35,6 +35,17 @@ def test_every_catalogued_strategy_has_a_spec(registry: StrategyRegistry) -> Non
         assert registry.get(strategy_id) is not None
 
 
+def test_every_strategy_declares_market_scope(registry: StrategyRegistry) -> None:
+    """Omission must not silently mean portable across KR and US."""
+    for spec in registry.all_specs():
+        assert spec.allowed_markets, spec.strategy_id
+        assert set(spec.allowed_markets) <= {"KR", "US"}
+    assert registry.require("overnight_gap_carry").allowed_markets == ("US",)
+    assert registry.require("range_support_reversion").allowed_markets == ("KR",)
+    assert not registry.require("overnight_gap_carry").permits_market("KR")
+    assert not registry.require("range_support_reversion").permits_market("US")
+
+
 def test_required_features_are_real_feature_fields(registry: StrategyRegistry) -> None:
     """A renamed feature must not leave a dead requirement behind."""
     known = {member.name for member in fields(TechnicalFeatureSet)}
@@ -78,6 +89,14 @@ def test_short_strategies_are_pinned_to_research(registry: StrategyRegistry) -> 
         assert spec.is_short
         assert spec.lifecycle_state is StrategyLifecycleState.RESEARCH
         assert not spec.lifecycle_state.is_live_candidate
+
+
+def test_unproven_long_strategies_start_shadow(registry: StrategyRegistry) -> None:
+    registry = StrategyRegistry()
+    assert all(
+        spec.lifecycle_state is StrategyLifecycleState.SHADOW
+        for spec in registry.long_specs()
+    )
 
 
 def test_families_span_more_than_one_group(registry: StrategyRegistry) -> None:

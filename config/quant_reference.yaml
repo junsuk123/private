@@ -1,0 +1,17 @@
+# Local live computation policy. GS Quant is never loaded by this path.
+activation_mode: auto
+minimum_python_major: 3
+minimum_python_minor: 10
+auto_disable_consecutive_errors: 3
+auto_retry_cooldown_seconds: 300
+price_window: 20
+return_window: 20
+rsi_window: 14
+ema_fast: 12
+ema_slow: 26
+macd_signal: 9
+bollinger_stddev: 2.0
+annualization: 252
+stale_after_ms: 120000
+cache_size: 10000
+schema_version: quant-evidence-v1

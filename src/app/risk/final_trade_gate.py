@@ -203,6 +203,9 @@ class GateInputs:
     drawdown_ratio: float | None = None
     #: Fraction of equity the strategy asked for, before any gate applies.
     requested_position_fraction: float | None = None
+    #: Advisory quant layer multiplier. It is clamped to [0, 1], so it can never
+    #: widen a position or supersede any hard gate / exposure ceiling.
+    quant_evidence_factor: float | None = None
 
     decision_id: str | None = None
     sector: str | None = None
@@ -610,12 +613,15 @@ class FinalTradeGate:
                 str(inputs.model_health_state or "").strip().upper(), 1.0
             )
         )
+        quant_factor = _finite(inputs.quant_evidence_factor)
+        quant_factor = 1.0 if quant_factor is None else max(0.0, min(1.0, quant_factor))
         return {
             "model_confidence": round(confidence, 6),
             "regime_factor": round(regime_factor, 6),
             "liquidity_factor": round(liquidity_factor, 6),
             "risk_factor": round(soft_factor, 6),
             "model_health_factor": round(health_factor, 6),
+            "quant_evidence_factor": round(quant_factor, 6),
         }
 
     def _apply_limits(

@@ -2557,6 +2557,21 @@ async function fetchSystemDiagnostics() {
   }
 }
 
+function formatOperatingModelMetric(activeModel, metric, digits = 4) {
+  const rawDirect = activeModel?.metrics?.[metric];
+  const direct = rawDirect == null ? Number.NaN : Number(rawDirect);
+  if (Number.isFinite(direct)) return direct.toFixed(digits);
+
+  const marketValues = Object.entries(activeModel?.market_models || {})
+    .map(([market, report]) => {
+      const rawValue = report?.metrics?.[metric];
+      const value = rawValue == null ? Number.NaN : Number(rawValue);
+      return Number.isFinite(value) ? `${market} ${value.toFixed(digits)}` : null;
+    })
+    .filter(Boolean);
+  return marketValues.length ? marketValues.join(' · ') : 'N/A';
+}
+
 function renderSystemDiagnostics(data) {
   terminalState.diagnostics = data;
   const score = Number(data.score || 0);
@@ -2604,7 +2619,6 @@ function renderSystemDiagnostics(data) {
   const training = flows.training || {};
   const metrics = training.metrics || {};
   const activeModel = training.active_model || {};
-  const activeMetrics = activeModel.metrics || {};
   const deployment = training.deployment || {};
   const market = flows.market_data || {};
   const healthy = market.healthy || {};
@@ -2613,8 +2627,8 @@ function renderSystemDiagnostics(data) {
   const evidence = [
     [
       '운영 모델',
-      `AUC ${Number(activeMetrics.auc || 0).toFixed(4)}`,
-      `Precision@K ${Number(activeMetrics.precision_at_k || 0).toFixed(4)} · 실거래 적용 중`,
+      `AUC ${formatOperatingModelMetric(activeModel, 'auc')}`,
+      `Precision@K ${formatOperatingModelMetric(activeModel, 'precision_at_k')} · 실거래 적용 중`,
     ],
     [
       '모델 갱신 상태',

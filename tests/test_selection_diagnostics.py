@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.technical.selection_diagnostics import (
@@ -197,6 +199,49 @@ class TestCycleSnapshotAdapter:
         )
 
         assert collector.records[0].stage is SelectionStage.LIVE_NOT_AUTHORIZED
+
+    def test_positive_trigger_rejected_by_exit_cost_is_horizon_unviable(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "288980",
+                "strategy_id": "cross_sectional_relative_strength",
+                "triggered": True,
+                "expected_edge_bps": 81.069,
+                "horizon_seconds": 420,
+                "reason_codes": [
+                    "CROSS_SECTIONAL_LEADER",
+                    "EXIT_TARGET_DOES_NOT_CLEAR_COST",
+                ],
+                "diagnostics": {
+                    "attainable_target_bps": 81.069,
+                    "expected_cost_bps": 81.316,
+                    "minimum_net_target_bps": 25.0,
+                },
+            }],
+            session={},
+        )
+
+        record = collector.records[0]
+        assert record.stage is SelectionStage.HORIZON_COST_UNVIABLE
+        assert record.rule_net_bps == pytest.approx(-0.247)
+        assert record.required_net_bps == 25.0
+        assert collector.funnel()["trigger"] == 1
+        assert collector.funnel()["horizon_viable"] == 0
+
+    def test_downtrend_reversion_rejection_is_macro_not_trigger_failure(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "005930",
+                "strategy_id": "vwap_mean_reversion",
+                "triggered": True,
+                "expected_edge_bps": 90.0,
+                "reason_codes": ["LONG_REVERSION_BLOCKED_IN_DOWNTREND"],
+            }],
+            session={"macro_regime": "TREND_DOWN"},
+        )
+
+        assert collector.records[0].stage is SelectionStage.MACRO_BLOCKED
+        assert collector.funnel()["trigger"] == 1
 
     def test_negative_bandit_edge_is_profitability_not_macro_block(self):
         collector = collector_from_algorithm_evaluations(

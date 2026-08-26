@@ -19,6 +19,46 @@ from app.graph.builders import build_market_graph
 
 
 class RiskManagerTest(unittest.TestCase):
+    def test_plain_etf_buy_is_blocked_by_account_policy(self) -> None:
+        now = datetime.now(timezone.utc)
+        market = MarketSnapshot(
+            ticker="229200",
+            market="KOSPI",
+            company_name="KODEX 코스닥150",
+            sector="ETF",
+            last_price=12_000,
+            average_daily_trading_value=100_000_000_000,
+            volatility_20d=0.02,
+            source=SourceMetadata(
+                source_name="KIS",
+                retrieved_at=now,
+                observed_at=now,
+                is_realtime=True,
+            ),
+        )
+        intent = OrderIntent(
+            ticker="229200",
+            market="KR",
+            action=OrderAction.BUY,
+            suggested_weight=0.01,
+            confidence=0.9,
+            valid_until=now + timedelta(minutes=5),
+            reasoning_summary=("unit",),
+            supporting_factors=("unit",),
+            contradicting_factors=(),
+            source_data_ids=("unit",),
+        )
+
+        result = RiskManager(RiskRules()).validate(
+            intent, AccountSnapshot(cash=10_000_000, holdings=()), market
+        )
+
+        self.assertFalse(result.checks["instrument_permitted"])
+        self.assertEqual(
+            result.metadata["instrument_reason_codes"],
+            ["INSTRUMENT_ETF_NOT_PERMITTED"],
+        )
+
     def test_keeps_live_trading_disabled_but_allows_paper_final_order(self) -> None:
         account = AccountSnapshot(cash=10_000_000, holdings=())
         markets = collect_sample_market()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
 from app.strategy.exit_geometry import all_geometries, exit_bps, exit_geometry, max_holding_seconds
 from app.technical.signals import TechnicalFeatureSet
@@ -96,7 +98,7 @@ def test_sparse_tick_signal_uses_completed_minute_volatility_for_edge():
 # --------------------------------------------------------------------------- #
 # Catalog / deployment                                                         #
 # --------------------------------------------------------------------------- #
-def test_new_strategies_are_registered_and_live_authorized():
+def test_new_strategies_are_registered_and_start_shadow_authorized():
     added = (
         "residual_relative_strength",
         "adaptive_anchored_vwap_reversion",
@@ -106,15 +108,42 @@ def test_new_strategies_are_registered_and_live_authorized():
     registry = build_algorithm_registry()
     for strategy_id in added:
         assert strategy_id in registry
-        assert strategy_live_authorized(strategy_id) is True
+        assert strategy_live_authorized(strategy_id) is False
         assert strategy_shadow_authorized(strategy_id) is True
 
 
-def test_completed_bar_vwap_recovery_is_registered_and_live_authorized():
+def test_algorithm_config_isolates_market_overrides(tmp_path, monkeypatch):
+    path = tmp_path / "algorithms.yaml"
+    path.write_text(
+        "intraday_momentum:\n"
+        "  min_return_5s_bps: 2\n"
+        "markets:\n"
+        "  KR:\n"
+        "    intraday_momentum:\n"
+        "      min_return_5s_bps: 4\n"
+        "  US:\n"
+        "    intraday_momentum:\n"
+        "      min_return_5s_bps: 8\n",
+        encoding="utf-8",
+    )
+    assert AlgorithmConfig(path, market="KR").get(
+        "intraday_momentum", "min_return_5s_bps"
+    ) == 4.0
+    assert AlgorithmConfig(path, market="US").get(
+        "intraday_momentum", "min_return_5s_bps"
+    ) == 8.0
+    assert AlgorithmConfig(path).get("intraday_momentum", "min_return_5s_bps") == 2.0
+    monkeypatch.setenv("ALGO_US_INTRADAY_MOMENTUM_MIN_RETURN_5S_BPS", "9")
+    assert AlgorithmConfig(path, market="US").get(
+        "intraday_momentum", "min_return_5s_bps"
+    ) == 9.0
+
+
+def test_completed_bar_vwap_recovery_is_registered_and_starts_shadow_authorized():
     strategy_id = "bar_confirmed_vwap_recovery"
     assert strategy_id in STRATEGY_IDS
     assert strategy_id in ALGORITHM_IDS
-    assert strategy_live_authorized(strategy_id) is True
+    assert strategy_live_authorized(strategy_id) is False
     assert strategy_shadow_authorized(strategy_id) is True
     assert strategy_id in all_geometries()
 
@@ -180,7 +209,7 @@ def test_keltner_breakout_requires_compression_expansion_and_volume():
     decision = get_algorithm(strategy_id).entry(
         _features(
             symbol="INTC", price=103.0, keltner_upper=102.0,
-            keltner_bandwidth=0.04, bb_bandwidth=0.035,
+            prior_keltner_squeeze_ratio=0.875,
             volatility_expansion=1.6, adx=28.0, dmi_spread=12.0,
             relative_volume=2.0, vwap_distance_bps=55.0, atr_pct=0.007,
             liquidity_score=0.85, spread_bps=8.0,
@@ -189,6 +218,61 @@ def test_keltner_breakout_requires_compression_expansion_and_volume():
     )
     assert decision.triggered is True, decision.reason_codes
     assert "KELTNER_UPPER_BREAKOUT" in decision.reason_codes
+
+
+def test_keltner_does_not_treat_current_expansion_as_prior_compression():
+    strategy_id = "keltner_volatility_breakout"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", price=103.0, keltner_upper=102.0,
+            prior_keltner_squeeze_ratio=1.5,
+            volatility_expansion=1.6, adx=28.0, dmi_spread=12.0,
+            relative_volume=2.0, vwap_distance_bps=55.0, atr_pct=0.007,
+            liquidity_score=0.85, spread_bps=8.0,
+        ),
+        _context(strategy_id, change_point_probability=0.2),
+    )
+    assert decision.triggered is False
+    assert "KELTNER_PRIOR_COMPRESSION_MISSING" in decision.reason_codes
+
+
+def test_range_support_entry_edge_matches_the_emitted_exit_target():
+    strategy_id = "range_support_reversion"
+    algorithm = get_algorithm(strategy_id)
+    features = _features(
+        symbol="047770", price=100.0, donchian_low=100.0, donchian_high=104.0,
+        donchian_low_distance=0.0, atr_pct=0.004, liquidity_score=0.8,
+        spread_bps=8.0,
+    )
+    decision = algorithm.entry(features, _context(strategy_id))
+    exit_rule = algorithm.exit_rule(100.0, features, _context(strategy_id))
+    target_edge = (float(exit_rule.target_price) / 100.0 - 1.0) * 10_000.0
+    assert decision.triggered is True
+    assert decision.expected_edge_bps == pytest.approx(target_edge)
+    # Midpoint is 102; capturing half of that distance is a 100bp target, not
+    # half of the full 400bp channel span (the old 200bp overstatement).
+    assert target_edge == pytest.approx(100.0)
+
+
+def test_event_exit_uses_completed_bar_volatility_when_ticks_are_unavailable():
+    strategy_id = "event_momentum"
+    algorithm = get_algorithm(strategy_id)
+    features = _features(
+        symbol="AAPL", second_data_ready=0.0, tick_count_5s=0.0,
+        realized_volatility_10s=None, realized_volatility=0.004,
+        volume_spike_ratio=3.0, macd_histogram=0.2, ema_fast=101.0,
+        ema_slow=100.0, short_return=0.001,
+    )
+    context = _context(
+        strategy_id, event_fresh=True, event_age_seconds=60.0,
+        event_ttl_seconds=1800.0,
+    )
+    decision = algorithm.entry(features, context)
+    exit_rule = algorithm.exit_rule(100.0, features, context)
+    target_edge = (float(exit_rule.target_price) / 100.0 - 1.0) * 10_000.0
+    assert decision.triggered is True
+    assert target_edge == pytest.approx(decision.expected_edge_bps)
+    assert exit_rule.stop_basis == "bar_volatility_multiple"
 
 
 def test_choppiness_reversion_requires_a_nondirectional_oversold_extreme():
@@ -423,6 +507,70 @@ def test_residual_strength_rejects_an_offered_book():
     )
     assert not decision.triggered
     assert "RESIDUAL_MICROPRICE_NOT_SUPPORTIVE" in decision.reason_codes
+
+
+def _bear_market_long_features(**overrides):
+    base = dict(
+        short_return=0.002,
+        vwap_distance_bps=35.0,
+        ema_fast=70_250.0,
+        ema_slow=70_000.0,
+        momentum_persistence=0.72,
+        relative_volume=1.8,
+    )
+    base.update(overrides)
+    return _features(**base)
+
+
+def _bear_market_long_context(**overrides):
+    base = dict(
+        market_trend="TREND_DOWN",
+        market_breadth=0.30,
+        market_beta=0.70,
+        residual_return_short_bps=22.0,
+        residual_return_long_bps=16.0,
+    )
+    base.update(overrides)
+    return _residual_context(**base)
+
+
+def test_bear_market_long_only_strength_fires_on_positive_absolute_low_beta_leader():
+    algorithm = get_algorithm("residual_relative_strength")
+    features = _bear_market_long_features()
+    context = _bear_market_long_context()
+    decision = algorithm.entry(features, context)
+    rule = algorithm.exit_rule(float(features.price), features, context)
+
+    assert decision.triggered, decision.reason_codes
+    assert "BEAR_MARKET_LONG_ONLY_DEFENSIVE_STRENGTH" in decision.reason_codes
+    assert decision.horizon_seconds == 10_800
+    assert rule.max_holding_seconds == decision.horizon_seconds
+    target_bps = (float(rule.target_price) / float(features.price) - 1.0) * 10_000.0
+    assert decision.expected_edge_bps == pytest.approx(target_bps)
+
+
+def test_bear_market_long_only_does_not_buy_a_less_bad_decliner():
+    algorithm = get_algorithm("residual_relative_strength")
+    decision = algorithm.entry(
+        _bear_market_long_features(short_return=-0.001),
+        _bear_market_long_context(),
+    )
+
+    assert not decision.triggered
+    assert "BEAR_MARKET_ABSOLUTE_STRENGTH_MISSING" in decision.reason_codes
+
+
+def test_bear_market_long_only_rejects_high_beta_and_missing_breadth():
+    algorithm = get_algorithm("residual_relative_strength")
+    high_beta = algorithm.entry(
+        _bear_market_long_features(), _bear_market_long_context(market_beta=1.20)
+    )
+    missing_breadth = algorithm.entry(
+        _bear_market_long_features(), _bear_market_long_context(market_breadth=None)
+    )
+
+    assert "BEAR_MARKET_BETA_TOO_HIGH" in high_beta.reason_codes
+    assert "BEAR_MARKET_BREADTH_ABSENT" in missing_breadth.reason_codes
 
 
 # --------------------------------------------------------------------------- #
@@ -758,5 +906,5 @@ def test_algorithm_config_exposes_the_new_sections():
         "adaptive_anchored_vwap_reversion",
         "ofi_microprice_exhaustion_reversal",
     ):
-        assert resolved[strategy_id]["live_authorized"] == 1.0
+        assert resolved[strategy_id]["live_authorized"] == 0.0
         assert resolved[strategy_id]["shadow_enabled"] == 1.0

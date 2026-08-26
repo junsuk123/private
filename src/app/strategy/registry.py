@@ -166,7 +166,7 @@ _REQUIRED_FEATURES: dict[str, tuple[str, ...]] = {
         "vwap_distance_bps",
     ),
     "keltner_volatility_breakout": (
-        "adx", "atr_pct", "bb_bandwidth", "dmi_spread", "keltner_bandwidth",
+        "adx", "atr_pct", "dmi_spread", "prior_keltner_squeeze_ratio",
         "keltner_upper", "liquidity_score", "price", "relative_volume",
         "spread_bps", "volatility_expansion", "vwap_distance_bps",
     ),
@@ -294,13 +294,23 @@ _ALLOWED_SESSIONS: dict[str, tuple[str, ...]] = {
     "overnight_gap_carry": ("regular",),
 }
 
-# Market restrictions that exist in the code rather than in preference.
+# Market applicability is explicit even when a thesis is portable.  An empty tuple
+# means "any market" in :class:`StrategySpec`; using it for the whole catalogue made
+# an omitted declaration indistinguishable from a deliberate cross-market decision.
 #
-# ``liquidity_shock_reversal`` carries ``absorption_us_only: 1.0``, but that gates ONE
-# of its two branches, so the strategy as a whole stays market-agnostic and this map
-# does not restrict it. Nothing else in the catalogue restricts by market, and adding a
-# restriction here would be a trading decision disguised as a spec.
-_ALLOWED_MARKETS: dict[str, tuple[str, ...]] = {}
+# Profitability is deliberately NOT encoded here.  A portable strategy can be
+# demoted independently in KR and US by the market-scoped deployment controller.
+_ALLOWED_MARKETS: dict[str, tuple[str, ...]] = {
+    strategy_id: ("KR", "US") for strategy_id in STRATEGY_IDS
+}
+_ALLOWED_MARKETS.update(
+    {
+        # Derived from the US close-to-open tape and US settlement-cost geometry.
+        "overnight_gap_carry": ("US",),
+        # Derived from the KRX tradable universe; US outcomes are a new hypothesis.
+        "range_support_reversion": ("KR",),
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +366,14 @@ _APPLY_RECOMMENDATIONS_ENV = "STRATEGY_LIFECYCLE_APPLY_RECOMMENDATIONS"
 
 #: Version stamped onto every spec built from this module. Bump when the declared
 #: requirements change, so a stored selection can be matched to the spec that produced it.
-REGISTRY_VERSION = "spec-v1"
+REGISTRY_VERSION = "spec-v2"
+
+# A strategy whose payoff semantics change must not inherit outcomes produced by
+# the older rule merely because the catalogue itself did not change.  Keep this
+# map narrow so unrelated strategies retain their compatible evidence.
+_ALGORITHM_VERSION_OVERRIDES: dict[str, str] = {
+    "residual_relative_strength": "residual-strength-v3-bear-cash-equity",
+}
 
 
 def _apply_recommendations() -> bool:
@@ -420,7 +437,9 @@ class StrategyRegistry:
                 allowed_sessions=_ALLOWED_SESSIONS.get(strategy_id, ()),
                 allowed_markets=_ALLOWED_MARKETS.get(strategy_id, ()),
                 lifecycle_state=self._lifecycle_for(strategy_id),
-                algorithm_version=REGISTRY_VERSION,
+                algorithm_version=_ALGORITHM_VERSION_OVERRIDES.get(
+                    strategy_id, REGISTRY_VERSION
+                ),
                 validation_version=_validation_version(strategy_id),
                 notes=self._notes_for(strategy_id),
             )

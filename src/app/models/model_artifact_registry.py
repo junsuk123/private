@@ -348,6 +348,13 @@ def _meets_absolute_economics(candidate: dict[str, Any]) -> tuple[bool, str]:
         return False, "TOP_K_NET_RETURN_NON_POSITIVE"
     if minimum_net > 0.0 and top_k_net < minimum_net:
         return False, "TOP_K_NET_RETURN_BELOW_RUNTIME_MINIMUM"
+    if _finite_metric(metrics, "runtime_policy_aligned_evaluation") >= 1.0:
+        minimum_deployable = max(
+            2,
+            int(_env_float("LIVE_MODEL_MIN_DEPLOYABLE_HOLDOUT_ROWS", 10.0)),
+        )
+        if _finite_metric(metrics, "top_k_count") < minimum_deployable:
+            return False, "DEPLOYABLE_HOLDOUT_SAMPLE_TOO_SMALL"
 
     min_precision = _env_float("LIVE_MODEL_PROMOTION_MIN_PRECISION_AT_K", 0.0)
     if min_precision > 0.0 and _finite_metric(metrics, "precision_at_k") < min_precision:

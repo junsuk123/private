@@ -74,7 +74,7 @@ class ShadowComparisonRecorder:
             int(
                 max_bytes
                 if max_bytes is not None
-                else os.getenv("SHADOW_COMPARISON_MAX_BYTES", str(256 * 1024 * 1024))
+                else os.getenv("SHADOW_COMPARISON_MAX_BYTES", str(64 * 1024 * 1024))
             ),
         )
         self.backup_count = max(1, int(backup_count))

@@ -168,7 +168,14 @@ LIVE_SHORT_HORIZON_SCHEMA = FeatureSchema(
     # graded demotion keeps entries running on the ontology/bandit path. Forcing
     # the old artifact onto the new vector would make every weight read the wrong
     # column, which is worse than trading without a model.
-    version="live_short_horizon_v6_indicator_families",
+    # v7 intentionally changes the contract hash without changing tensor columns.
+    # Labels now subtract the same market-specific all-in round trip used by entry
+    # and execution instead of ``spread + 10bps``.  Serving a v6 artifact would keep
+    # the optimistic regression head alive after the accounting fix, so existing
+    # artifacts and materialized rows must retire and rebuild from freshly labelled
+    # frames.  Schema identity covers the complete supervised-data contract, not only
+    # vector width.
+    version="live_short_horizon_v7_all_in_cost_labels",
     feature_names=LIVE_FEATURE_NAMES,
     dtypes=tuple("float64" for _ in LIVE_FEATURE_NAMES),
 )

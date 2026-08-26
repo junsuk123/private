@@ -370,10 +370,33 @@ async def _proxy(request: Request) -> Response:
             {"error": "UPSTREAM_TIMEOUT", "detail": "The local server did not respond in time."},
             status_code=504,
         )
-    except httpx.HTTPError as exc:
-        return JSONResponse(
-            {"error": "UPSTREAM_UNAVAILABLE", "detail": str(exc)}, status_code=502
-        )
+    except httpx.HTTPError as first_exc:
+        # This process deliberately outlives the live server.  After a live-server
+        # restart, a pooled loopback keep-alive socket can be half-closed: the first
+        # read gets RemoteProtocolError/ReadError even though a new connection would
+        # succeed immediately.  Every method reaching this point is GET or HEAD, so
+        # one transport retry is idempotent and cannot duplicate an order or mutation.
+        try:
+            upstream = await client.request(
+                request.method, path, params=query, headers=headers
+            )
+        except httpx.TimeoutException:
+            return JSONResponse(
+                {
+                    "error": "UPSTREAM_TIMEOUT",
+                    "detail": "The local server did not respond in time after reconnecting.",
+                },
+                status_code=504,
+            )
+        except httpx.HTTPError as retry_exc:
+            return JSONResponse(
+                {
+                    "error": "UPSTREAM_UNAVAILABLE",
+                    "detail": str(retry_exc),
+                    "first_error": str(first_exc),
+                },
+                status_code=502,
+            )
 
     relayed = {
         key: value

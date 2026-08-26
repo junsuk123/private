@@ -22,11 +22,14 @@ from app.models.strategy_utility.strategy_graph import (
     RELATION_NAMES,
     STRATEGY_NODE_COUNT,
     strategy_relation_adjacency,
+    strategy_ids_for_market,
+    strategy_market_mask,
 )
 from app.routing.shadow_intelligence import (
     COMPATIBILITY_UNAVAILABLE_REASONS,
     STRATEGY_IDS,
 )
+from app.strategy.catalog import is_short_strategy
 
 
 def train_counterfactual_checkpoint(
@@ -168,22 +171,22 @@ def train_counterfactual_checkpoint(
     # actually enforces; this only asks that the checkpoint taught at least one.
     strategy_coverage = bool(supervised_strategy_ids)
     skill_verdict = _skill_verdict(validation_metrics)
-    live_shadow_authorized = bool(
+    base_authorization_ready = bool(
         authorize_live_shadow
-        # Must match what the serving path emits TODAY, not a schema name frozen
-        # into this module. Same literal, same failure mode, as the runtime check
-        # in ``authorization_checks`` below.
         and input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
         and len(rows) >= minimum_rows
         and len(grouped) >= minimum_snapshots
         and strategy_coverage
-        # The operator contract is explicit: a compatible checkpoint is not a
-        # profitable checkpoint.  Real-time GNN authority remains SHADOW until
-        # both ranking skill and a positive after-cost selected edge are
-        # established on the purged validation set.
-        and skill_verdict["selection_ranking_skill_established"]
-        and skill_verdict["selection_net_edge_established"]
     )
+    market_authorization_checks, live_authorized_markets = (
+        _market_authorization_verdicts(
+            validation_metrics,
+            base_ready=base_authorization_ready,
+        )
+    )
+    # Backward-compatible aggregate for older consumers. Current order routing
+    # reads ``live_authorized_markets`` and cannot cross-authorize KR and US.
+    live_shadow_authorized = bool(live_authorized_markets)
     report = {
         "checkpoint": str(checkpoint),
         "rows": len(rows),
@@ -253,6 +256,7 @@ def train_counterfactual_checkpoint(
             )
         ),
         "live_authorized": live_shadow_authorized,
+        "live_authorized_markets": live_authorized_markets,
         "authorization_scope": "ontology_gnn_realtime_trust_gated_execution",
         "authorization_checks": {
             "requested": bool(authorize_live_shadow),
@@ -273,6 +277,7 @@ def train_counterfactual_checkpoint(
             # use an unproven checkpoint as a shadow estimator, but never as an
             # order authority.
             **skill_verdict,
+            "by_market": market_authorization_checks,
             **_context_field_coverage(rows, input_feature_schema),
         },
         "config": asdict(config),
@@ -522,6 +527,41 @@ def _skill_verdict(metrics: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _market_authorization_verdicts(
+    validation_metrics: dict[str, object],
+    *,
+    base_ready: bool,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """Resolve checkpoint authority independently for KRX and US evidence."""
+    checks: dict[str, dict[str, object]] = {}
+    authorized_markets: list[str] = []
+    for market, prefix in (("KRX", "krx"), ("US", "us")):
+        market_metrics = {
+            key.removeprefix(f"{prefix}_"): value
+            for key, value in validation_metrics.items()
+            if key.startswith(f"{prefix}_selection_")
+        }
+        verdict = _skill_verdict(market_metrics)
+        validation_rows = int(
+            validation_metrics.get(f"{prefix}_selection_rows") or 0
+        )
+        authorized = bool(
+            base_ready
+            and validation_rows >= 20
+            and verdict["selection_ranking_skill_established"]
+            and verdict["selection_net_edge_established"]
+        )
+        checks[market] = {
+            "selection_rows": validation_rows,
+            "minimum_selection_rows": 20,
+            **verdict,
+            "live_authorized": authorized,
+        }
+        if authorized:
+            authorized_markets.append(market)
+    return checks, authorized_markets
+
+
 @dataclass(frozen=True)
 class _Snapshot:
     """One (symbol, timestamp) row of the fixed-shape training grid."""
@@ -535,6 +575,51 @@ class _Snapshot:
     attractive: bool
     nets: np.ndarray
     filled: np.ndarray
+
+
+def _market_purged_split(
+    snapshots: list[_Snapshot],
+    *,
+    train_fraction: float = 0.8,
+) -> tuple[list[_Snapshot], list[_Snapshot], int]:
+    """Build independently purged chronological KR and US holdouts.
+
+    A single global boundary let the market with the newest tape occupy the
+    entire validation set. In production that yielded 280 US selection rows and
+    zero KR rows. Each market now keeps its own chronological boundary, so
+    collection time in one market cannot erase validation for the other.
+    """
+    by_market: dict[str, list[_Snapshot]] = {"KRX": [], "US": []}
+    for item in snapshots:
+        market = "KRX" if item.symbol.isdigit() and len(item.symbol) == 6 else "US"
+        by_market[market].append(item)
+
+    train: list[_Snapshot] = []
+    validation: list[_Snapshot] = []
+    purged = 0
+    for market_rows in by_market.values():
+        market_rows.sort(key=lambda item: item.as_of)
+        if len(market_rows) < 2:
+            train.extend(market_rows)
+            continue
+        split = max(
+            1,
+            min(len(market_rows) - 1, int(len(market_rows) * train_fraction)),
+        )
+        market_validation = market_rows[split:]
+        boundary = market_validation[0].as_of
+        market_train = [
+            item for item in market_rows[:split] if item.label_end <= boundary
+        ]
+        purged += split - len(market_train)
+        if not market_train:
+            market_train = market_rows[:split]
+            purged -= split
+        train.extend(market_train)
+        validation.extend(market_validation)
+    train.sort(key=lambda item: item.as_of)
+    validation.sort(key=lambda item: item.as_of)
+    return train, validation, max(0, purged)
 
 
 def _rank_auc(scores: np.ndarray, outcomes: np.ndarray) -> float | None:
@@ -698,9 +783,11 @@ def _fit_strategy_relation_graph(
             [_target_mask(row) for row in ordered],
             dtype=np.float32,
         )
+        market_strategy_ids = set(strategy_ids_for_market(str(symbol)))
         attractive = any(
             row.triggered and row.filled and row.net_return_bps > 0
             for row in ordered
+            if row.strategy_id in market_strategy_ids
         )
         snapshots.append(
             _Snapshot(
@@ -725,19 +812,9 @@ def _fit_strategy_relation_graph(
             fitted[strategy_id] += 1
     if len(snapshots) < 2:
         raise ValueError("strategy relation graph requires complete multi-strategy snapshots")
-    snapshots.sort(key=lambda item: item.as_of)
-    split = max(1, min(len(snapshots) - 1, int(len(snapshots) * 0.8)))
-    validation = snapshots[split:]
-    # PURGE. A label resolves ``horizon`` after its snapshot, so training rows
-    # near the boundary have outcomes drawn from inside the validation window.
-    # Without this the split leaks — measured at 32 of 2,877 rows on the current
-    # data — and validation scores its own training labels.
-    boundary = validation[0].as_of
-    train = [item for item in snapshots[:split] if item.label_end <= boundary]
-    purged_rows = split - len(train)
-    if not train:
-        train = snapshots[:split]
-        purged_rows = 0
+    train, validation, purged_rows = _market_purged_split(snapshots)
+    if not validation:
+        raise ValueError("strategy relation graph requires a validation market")
     train_context = np.asarray([item.context for item in train], dtype=np.float32)
     train_x = np.concatenate(
         (
@@ -755,6 +832,12 @@ def _fit_strategy_relation_graph(
         [item.target_masks for item in train],
         dtype=np.float32,
     )
+    train_market_mask = np.asarray(
+        [strategy_market_mask(item.symbol) for item in train],
+        dtype=np.float32,
+    )
+    train_x *= train_market_mask[:, :, None]
+    train_target_mask *= train_market_mask[:, :, None]
     train_loss_weight = np.ones_like(train_y, dtype=np.float32)
     # Profitable post-cost outcomes are intentionally rare.  Without
     # class-balanced weighting the success head minimizes loss by predicting
@@ -762,16 +845,18 @@ def _fit_strategy_relation_graph(
     # rare usable edges.  Balance only the success classification head; P&L
     # regression remains trained on realized fills through target_mask.
     for strategy_position in range(STRATEGY_NODE_COUNT):
-        positive = train_y[:, strategy_position, 0] > 0.0
+        observed = train_target_mask[:, strategy_position, 0] > 0.0
+        positive = observed & (train_y[:, strategy_position, 0] > 0.0)
+        negative = observed & ~positive
         positive_count = int(positive.sum())
-        negative_count = int((~positive).sum())
+        negative_count = int(negative.sum())
         if positive_count and negative_count:
             total = positive_count + negative_count
             train_loss_weight[positive, strategy_position, 0] = min(
                 20.0,
                 total / (2.0 * positive_count),
             )
-            train_loss_weight[~positive, strategy_position, 0] = (
+            train_loss_weight[negative, strategy_position, 0] = (
                 total / (2.0 * negative_count)
             )
     krx_flag = _krx_flag_index(train_context.shape[1])
@@ -786,7 +871,10 @@ def _fit_strategy_relation_graph(
         ).astype(np.float32)
     else:
         sample_weights = np.ones(len(train), dtype=np.float32)
-    adjacency = strategy_relation_adjacency()
+    train_adjacency = np.asarray(
+        [strategy_relation_adjacency(market=item.symbol) for item in train],
+        dtype=np.float32,
+    )
     model = FixedShapeStrategyUtilityModel(config)
     initial_relations = model.relation_weights.copy()
     learning_rate = 0.003
@@ -809,7 +897,8 @@ def _fit_strategy_relation_graph(
             target = train_y[indexes]
             target_mask = train_target_mask[indexes]
             loss_weight = train_loss_weight[indexes]
-            messages = np.einsum("rij,bjf->brif", adjacency, x, optimize=True)
+            adjacency = train_adjacency[indexes]
+            messages = np.einsum("brij,bjf->brif", adjacency, x, optimize=True)
             relational = np.einsum(
                 "brnf,rfh->bnh",
                 messages,
@@ -883,7 +972,7 @@ def _fit_strategy_relation_graph(
                     / (np.sqrt(corrected_second) + 1e-8)
                 )
 
-    full_hidden = _graph_hidden(model, train_x, adjacency)
+    full_hidden = _graph_hidden(model, train_x, train_adjacency)
     no_trade_targets = np.repeat(
         np.asarray(
             [-2.0 if item.attractive else 2.0 for item in train],
@@ -918,7 +1007,17 @@ def _fit_strategy_relation_graph(
         [item.target_masks for item in validation],
         dtype=np.float32,
     )
-    validation_hidden = _graph_hidden(model, validation_x, adjacency)
+    validation_market_mask = np.asarray(
+        [strategy_market_mask(item.symbol) for item in validation],
+        dtype=np.float32,
+    )
+    validation_x *= validation_market_mask[:, :, None]
+    validation_target_mask *= validation_market_mask[:, :, None]
+    validation_adjacency = np.asarray(
+        [strategy_relation_adjacency(market=item.symbol) for item in validation],
+        dtype=np.float32,
+    )
+    validation_hidden = _graph_hidden(model, validation_x, validation_adjacency)
     validation_prediction = np.einsum(
         "bnh,nhk->bnk",
         validation_hidden,
@@ -934,29 +1033,26 @@ def _fit_strategy_relation_graph(
     )
     # Direction accuracy is meaningless without its majority-class baseline.
     #
-    # Channel 0's mask is 1.0 for EVERY cell by construction (see
-    # ``_target_mask``) and that is deliberate -- a strategy that never fired is
-    # a genuine classification negative. The consequence is that the
-    # (snapshot x strategy) grid is overwhelmingly trivial negatives, so a head
-    # answering "not a success" everywhere scores near-perfectly.
-    #
-    # Measured 2026-08-08 on the live checkpoint: 1,622 of 57,552 label cells
-    # triggered (2.82%), so the constant "not a success" predictor scores
-    # 97.18% while the reported figure was 95.58% -- BELOW its own baseline.
-    # The number tracked the trigger rate, not skill, and nothing in the report
-    # said so. Masking is NOT the fix (the mask is all ones); publishing the
-    # baseline is, plus a second figure restricted to REALIZED cells where
-    # success/failure is a real outcome rather than "never fired".
+    # Channel 0 is conditional on a realized fill, matching the decoder's hurdle
+    # model: channel 5 predicts whether the strategy fills, while channel 0 asks
+    # whether that filled trade wins. Treating every non-trigger as a loss made
+    # those two heads contradictory and overwhelmed the rare payoff evidence.
     #
     # Channel 5's target is the filled indicator (+2 filled / -2 not), so the
     # realized mask is read straight off the validation targets.
     predicted_success = validation_prediction[..., 0] > 0
     actual_success = validation_target[..., 0] > 0
-    realized_cells = validation_target[..., 5] > 0
-    all_cells = np.ones_like(actual_success, dtype=bool)
+    realized_cells = (validation_target[..., 5] > 0) & (
+        validation_market_mask > 0
+    )
+    observed_success_cells = validation_target_mask[..., 0] > 0
 
     def _cells(row_mask: np.ndarray | None) -> np.ndarray:
-        return all_cells if row_mask is None else all_cells & row_mask[:, None]
+        return (
+            observed_success_cells
+            if row_mask is None
+            else observed_success_cells & row_mask[:, None]
+        )
 
     def _accuracy(cells: np.ndarray) -> float | None:
         if not bool(cells.any()):
@@ -979,8 +1075,15 @@ def _fit_strategy_relation_graph(
     # measurement the accuracy figures above cannot make: a head that ranks
     # correctly but sits on the wrong side of its threshold scores below the
     # majority baseline while still separating winners from losers.
-    filled_mask = np.asarray([item.filled for item in validation], dtype=bool)
-    selection_scores = validation_prediction[..., 0][filled_mask].astype(np.float64)
+    filled_mask = np.asarray([item.filled for item in validation], dtype=bool) & (
+        validation_market_mask > 0
+    )
+    # Authorization must rank the value the live selector trades, not just the
+    # win logit. Payoff magnitude matters: a high chance of a tiny win is not a
+    # better trade than a slightly lower chance of a much larger net payoff.
+    selection_scores = _expected_net_from_raw(validation_prediction)[
+        filled_mask
+    ].astype(np.float64)
     selection_nets = np.asarray(
         [item.nets for item in validation], dtype=np.float64
     )[filled_mask]
@@ -1009,6 +1112,14 @@ def _fit_strategy_relation_graph(
     return model, fitted, {
         "train_snapshots": len(train),
         "validation_snapshots": len(validation),
+        "krx_train_snapshots": sum(
+            item.symbol.isdigit() and len(item.symbol) == 6 for item in train
+        ),
+        "us_train_snapshots": sum(
+            not (item.symbol.isdigit() and len(item.symbol) == 6) for item in train
+        ),
+        "krx_validation_snapshots": int(validation_is_krx.sum()),
+        "us_validation_snapshots": int((~validation_is_krx).sum()),
         # Training rows dropped because their label resolved after the split.
         "purged_train_snapshots": purged_rows,
         "raw_head_mse": raw_mse,
@@ -1027,7 +1138,7 @@ def _fit_strategy_relation_graph(
             realized_cells
         ),
         "success_direction_realized_cells": int(realized_cells.sum()),
-        "success_direction_total_cells": int(actual_success.size),
+        "success_direction_total_cells": int(observed_success_cells.sum()),
         "krx_success_direction_accuracy": _accuracy(_cells(validation_is_krx)),
         "us_success_direction_accuracy": _accuracy(_cells(~validation_is_krx)),
         "krx_training_weight": (
@@ -1048,7 +1159,12 @@ def _graph_hidden(
     x: np.ndarray,
     adjacency: np.ndarray,
 ) -> np.ndarray:
-    messages = np.einsum("rij,bjf->brif", adjacency, x, optimize=True)
+    if adjacency.ndim == 3:
+        messages = np.einsum("rij,bjf->brif", adjacency, x, optimize=True)
+    elif adjacency.ndim == 4:
+        messages = np.einsum("brij,bjf->brif", adjacency, x, optimize=True)
+    else:
+        raise ValueError(f"unexpected strategy adjacency shape: {adjacency.shape}")
     relational = np.einsum(
         "brnf,rfh->bnh",
         messages,
@@ -1057,6 +1173,20 @@ def _graph_hidden(
     )
     self_part = np.einsum("bnf,fh->bnh", x, model.self_weight, optimize=True)
     return np.maximum(relational + self_part, 0.0)
+
+
+def _expected_net_from_raw(raw: np.ndarray) -> np.ndarray:
+    """Decode the payoff heads used by live utility, excluding uncertainty."""
+    probability = 1.0 / (1.0 + np.exp(-np.clip(raw[..., 0], -60.0, 60.0)))
+    downside = np.logaddexp(0.0, raw[..., 3]) * 15.0
+    upside = np.logaddexp(0.0, raw[..., 4]) * 20.0
+    expected_net = probability * upside - (1.0 - probability) * downside
+    for position, strategy_id in enumerate(STRATEGY_IDS):
+        if is_short_strategy(strategy_id):
+            expected_net[..., position] -= (
+                np.logaddexp(0.0, raw[..., position, 8]) * 10.0
+            )
+    return expected_net
 
 
 def _checkpoint_hash(path: Path) -> str:
@@ -1144,7 +1274,10 @@ def _target_mask(row: CounterfactualLabel) -> tuple[float, ...]:
     borrow_cost_observed = is_short if row.borrow_cost_bps is not None else 0.0
     borrow_locate_observed = is_short if row.borrow_available is not None else 0.0
     return (
-        1.0,
+        # Win probability is conditional on a realized fill. Reachability has
+        # its own supervised head at channel 5; an untriggered strategy is
+        # unknown payoff, not a realized loss.
+        realized,
         realized,
         realized,
         negative,

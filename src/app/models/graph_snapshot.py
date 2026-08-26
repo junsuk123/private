@@ -526,6 +526,26 @@ class GraphSnapshotBuilder:
                         learnable=False,
                     )
                 )
+            market_node = _MARKET_NODE.get(str(observation.market_group).upper())
+            if market_node and market_node in known:
+                # TRADED_ON/BELONGS_TO correctly describe stock -> venue -> market,
+                # but they are structural and directional.  They cannot carry the
+                # market state back to the stock.  A learnable market -> stock edge is
+                # the causal path through which US factors affect a US candidate and
+                # KR factors affect a KR candidate in the shared heterogeneous GNN.
+                edges.append(
+                    OntologyEdge(
+                        source_id=market_node,
+                        target_id=node_id,
+                        relation="INFLUENCES",
+                        prior_strength=_GENERATED_INFLUENCE_PRIOR,
+                        learnable=True,
+                        attributes={
+                            "generated": True,
+                            "reason": "target_market_context",
+                        },
+                    )
+                )
 
         for observation in stocks:
             source = stock_nodes.get(observation.ticker)

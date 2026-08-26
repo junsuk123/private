@@ -21,10 +21,40 @@ from app.routing.shadow_intelligence import (
     _shadow_route,
     slow_snapshot_from_live_feature_frame,
 )
+from app.models.strategy_utility.strategy_graph import (
+    strategy_ids_for_market,
+    strategy_market_mask,
+    strategy_relation_adjacency,
+)
 from app.strategy.catalog import STRATEGY_IDS
 
 
 NOW = datetime(2026, 7, 27, 1, 0, tzinfo=timezone.utc)
+
+
+def test_strategy_graph_keeps_one_model_but_scopes_nodes_by_target_market() -> None:
+    kr_ids = set(strategy_ids_for_market("005930"))
+    us_ids = set(strategy_ids_for_market("AAPL"))
+
+    assert "range_support_reversion" in kr_ids
+    assert "range_support_reversion" not in us_ids
+    assert "overnight_gap_carry" not in kr_ids
+    assert "overnight_gap_carry" in us_ids
+
+    kr_mask = strategy_market_mask("KRX")
+    us_mask = strategy_market_mask("US")
+    range_index = STRATEGY_IDS.index("range_support_reversion")
+    overnight_index = STRATEGY_IDS.index("overnight_gap_carry")
+    assert kr_mask[range_index] == 1.0 and us_mask[range_index] == 0.0
+    assert kr_mask[overnight_index] == 0.0 and us_mask[overnight_index] == 1.0
+
+
+def test_market_inapplicable_strategy_has_no_graph_messages() -> None:
+    us_adjacency = strategy_relation_adjacency(market="AAPL")
+    range_index = STRATEGY_IDS.index("range_support_reversion")
+
+    assert not us_adjacency[:, range_index, :].any()
+    assert not us_adjacency[:, :, range_index].any()
 
 
 def test_live_entry_points_use_current_graph_context_dimension() -> None:
@@ -400,6 +430,37 @@ def test_authorized_checkpoint_with_matching_schema_emits_live_shadow_evidence(
     assert len(result.cpu_evidence) == len(STRATEGY_IDS)
     assert result.comparison.decisions[-1].path == "cpu_gnn"
     assert "GNN_REALTIME_TRUST_NOT_READY" in result.comparison.decisions[-1].reason_codes
+
+
+def test_checkpoint_authority_is_scoped_to_its_validated_market(
+    tmp_path, monkeypatch
+) -> None:
+    seed = ShadowIntelligenceService(
+        feature_dim=12,
+        minimum_interval_seconds=0,
+        comparison_path=tmp_path / "seed.jsonl",
+    )
+    checkpoint = seed.model.save_checkpoint(tmp_path / "market-model.npz")
+    checkpoint.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "input_feature_schema": "realtime_microstructure_v1",
+                "live_authorized": True,
+                "live_authorized_markets": ["US"],
+                "strategy_ids": list(STRATEGY_IDS),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REFACTOR_GNN_CHECKPOINT", str(checkpoint))
+    service = ShadowIntelligenceService(
+        feature_dim=12,
+        minimum_interval_seconds=0,
+        comparison_path=tmp_path / "shadow.jsonl",
+    )
+
+    assert service._checkpoint_live_authorized_for("AAPL") is True
+    assert service._checkpoint_live_authorized_for("005930") is False
 
 
 def test_zero_compatibility_strategies_are_closed_world_blocked(tmp_path) -> None:

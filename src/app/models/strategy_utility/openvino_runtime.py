@@ -34,9 +34,26 @@ class OpenVinoStrategyUtilityRuntime:
         requested_device: str = "CPU",
         allow_cpu_fallback: bool = True,
     ) -> None:
-        import openvino as ov
-
         self.reference = reference
+        try:
+            import openvino as ov
+        except ImportError as exc:
+            # OpenVINO is an optional ``npu`` extra, while the order-free shadow
+            # evaluator is part of the base runtime.  A base install must retain
+            # the deterministic NumPy reference path instead of preventing the
+            # entire event collector from starting.
+            self.core = None
+            self.compiled = None
+            self.status = OpenVinoUtilityStatus(
+                requested_device=requested_device,
+                compiled_devices=("CPU",),
+                fallback_reason=f"OpenVINO unavailable; using NumPy CPU: {exc}",
+                compile_ms=0.0,
+                model_hash=_model_hash(reference),
+                precision="FP32",
+            )
+            return
+
         self.core = ov.Core()
         graph = _build_graph(reference)
         started = time.perf_counter()
@@ -75,6 +92,8 @@ class OpenVinoStrategyUtilityRuntime:
         strategy_mask: np.ndarray,
     ) -> StrategyUtilityOutput:
         self.reference._validate(x, adjacency, node_mask, strategy_mask)
+        if self.compiled is None:
+            return self.reference.infer(x, adjacency, node_mask, strategy_mask)
         result = self.compiled(
             {
                 "features": x.astype(np.float32, copy=False),

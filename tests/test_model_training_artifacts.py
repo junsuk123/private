@@ -24,6 +24,12 @@ class ModelTrainingArtifactsTest(unittest.TestCase):
         self.assertTrue(artifact["live_eligible"], artifact["reason_codes"])
         self.assertEqual(latest.feature_schema_hash, LIVE_SHORT_HORIZON_SCHEMA.schema_hash)
         self.assertGreater(artifact["metrics"]["auc"], 0.55)
+        self.assertEqual(artifact["metrics"]["runtime_policy_aligned_evaluation"], 1.0)
+        self.assertGreater(artifact["metrics"]["deployable_holdout_count"], 0.0)
+        self.assertLessEqual(
+            artifact["metrics"]["top_k_count"],
+            artifact["metrics"]["top_k_target_count"],
+        )
 
     def test_latest_is_cached_and_reloads_on_change(self) -> None:
         import json
@@ -181,6 +187,27 @@ class AbsoluteEconomicsPromotionTest(unittest.TestCase):
         self.assertFalse(weak["deployment"]["promoted"])
         self.assertEqual(
             weak["deployment"]["reason"], "TOP_K_NET_RETURN_BELOW_RUNTIME_MINIMUM"
+        )
+
+    def test_runtime_aligned_policy_requires_enough_deployable_holdout_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = ModelArtifactRegistry(tmp)
+            sparse = _artifact("sparse", auc=0.90, precision=1.0, top_k_return=25.0)
+            sparse["metrics"].update(
+                {
+                    "runtime_policy_aligned_evaluation": 1.0,
+                    "top_k_count": 1.0,
+                    "validation_example_count": 2000.0,
+                    "validation_symbol_count": 20.0,
+                    "holdout_evaluated": 1.0,
+                }
+            )
+            registry.save(sparse)
+
+        self.assertFalse(sparse["deployment"]["promoted"])
+        self.assertEqual(
+            sparse["deployment"]["reason"],
+            "DEPLOYABLE_HOLDOUT_SAMPLE_TOO_SMALL",
         )
 
     def test_absolute_floor_also_applies_when_replacing_a_stale_incumbent(self):

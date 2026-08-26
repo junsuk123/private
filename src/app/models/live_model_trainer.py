@@ -143,12 +143,34 @@ def train_live_short_horizon_model(
                 initial_bias=initial_h[1],
                 epochs=_incremental_classification_epochs(),
             )
+            initial_ret_h = _warm_start_scaled_parameters(
+                warm_start_artifact,
+                "regression",
+                feature_names,
+                train_means,
+                train_scales,
+            )
+            ret_weights_h, ret_bias_h = _fit_linear(
+                [x_train_scaled[index] for index in update_train_indices],
+                [returns[train_idx[index]] for index in update_train_indices],
+                initial_weights=initial_ret_h[0],
+                initial_bias=initial_ret_h[1],
+                epochs=_incremental_regression_epochs(),
+            )
         else:
             weights_h, bias_h = _fit_logistic(x_train_scaled, y_train_purged)
+            ret_weights_h, ret_bias_h = _fit_linear(
+                x_train_scaled,
+                [returns[index] for index in train_idx],
+            )
         eval_labels = y_val
         eval_returns = [returns[index] for index in val_idx]
         eval_probs = [
             _sigmoid(_dot(row, weights_h) + bias_h)
+            for row in x_val_scaled
+        ]
+        eval_expected_returns = [
+            _dot(row, ret_weights_h) + ret_bias_h
             for row in x_val_scaled
         ]
     else:
@@ -174,12 +196,31 @@ def train_live_short_horizon_model(
                 initial_bias=initial_preview[1],
                 epochs=_incremental_classification_epochs(),
             )
+            initial_ret_preview = _warm_start_scaled_parameters(
+                warm_start_artifact,
+                "regression",
+                feature_names,
+                means,
+                scales,
+            )
+            ret_weights_preview, ret_bias_preview = _fit_linear(
+                [x_scaled[index] for index in update_indices],
+                [returns[index] for index in update_indices],
+                initial_weights=initial_ret_preview[0],
+                initial_bias=initial_ret_preview[1],
+                epochs=_incremental_regression_epochs(),
+            )
         else:
             weights_preview, bias_preview = _fit_logistic(x_scaled, y)
+            ret_weights_preview, ret_bias_preview = _fit_linear(x_scaled, returns)
         eval_labels = y
         eval_returns = returns
         eval_probs = [
             _sigmoid(_dot(row, weights_preview) + bias_preview)
+            for row in x_scaled
+        ]
+        eval_expected_returns = [
+            _dot(row, ret_weights_preview) + ret_bias_preview
             for row in x_scaled
         ]
     # Deployment parameters use all available rows only after holdout metrics have
@@ -223,9 +264,37 @@ def train_live_short_horizon_model(
         weights, bias = _fit_logistic(x_scaled, y)
         ret_weights, ret_bias = _fit_linear(x_scaled, returns)
     auc = auc_like_score(eval_labels, eval_probs)
-    top_k = _top_k_count(len(eval_labels))
-    precision_at_k = _precision_at_k(eval_labels, eval_probs, top_k)
-    avg_return_top = _avg_return_top(eval_returns, eval_probs, top_k)
+    top_k_target = _top_k_count(len(eval_labels))
+    probability_threshold = 0.51
+    expected_return_threshold = 10.0
+    deployable = [
+        index
+        for index, (probability, expected) in enumerate(
+            zip(eval_probs, eval_expected_returns, strict=True)
+        )
+        if probability >= probability_threshold
+        and expected >= expected_return_threshold
+    ]
+    # Match the serving contract: the runtime requires BOTH heads to clear their
+    # thresholds, then prefers the greatest predicted net return. Evaluating the
+    # promotion candidate on probability rank alone certified a different policy
+    # from the one that would actually be allowed to submit an order.
+    selected = sorted(
+        deployable,
+        key=lambda index: (eval_expected_returns[index], eval_probs[index]),
+        reverse=True,
+    )[:top_k_target]
+    top_k = len(selected)
+    precision_at_k = (
+        sum(eval_labels[index] for index in selected) / top_k if top_k else 0.0
+    )
+    avg_return_top = (
+        sum(eval_returns[index] for index in selected) / top_k if top_k else 0.0
+    )
+    avg_predicted_return_top = (
+        sum(eval_expected_returns[index] for index in selected) / top_k
+        if top_k else 0.0
+    )
     min_auc = _env_float("LIVE_MODEL_MIN_AUC", 0.55)
     min_precision = _env_float("LIVE_MODEL_MIN_PRECISION_AT_K", 0.35)
     min_avg_return = _env_float("LIVE_MODEL_MIN_AVG_RETURN_BPS", 0.0)
@@ -239,7 +308,11 @@ def train_live_short_horizon_model(
         "precision_at_k": precision_at_k,
         "avg_forward_net_return_bps_top_k": avg_return_top,
         "top_k_count": float(top_k),
+        "top_k_target_count": float(top_k_target),
         "top_k_fraction": top_k / max(1.0, float(len(eval_labels))),
+        "deployable_holdout_count": float(len(deployable)),
+        "avg_predicted_net_return_bps_top_k": avg_predicted_return_top,
+        "runtime_policy_aligned_evaluation": 1.0,
         "example_count": float(len(rows)),
         "validation_example_count": float(len(val_idx)) if holdout_evaluated else 0.0,
         "validation_symbol_count": float(validation_symbol_count) if holdout_evaluated else 0.0,

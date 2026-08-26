@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.backtesting.event_simulator import EventDrivenFillSimulator
 from app.trading.contracts import Bar, TradePlan
 
@@ -61,6 +63,29 @@ def test_cost_adjusted_counterfactual_and_no_trade_label() -> None:
     assert no_trade.net_return_bps == 0
 
 
+def test_simulator_uses_shared_all_in_cost_and_stored_spread(monkeypatch) -> None:
+    seen: list[tuple[str, float | None, float]] = []
+
+    def shared_cost(symbol, *, spread_bps=None, fallback_bps=0.0):
+        seen.append((symbol, spread_bps, fallback_bps))
+        return 73.7
+
+    monkeypatch.setattr(
+        "app.backtesting.event_simulator.all_in_round_trip_bps",
+        shared_cost,
+    )
+    outcome = EventDrivenFillSimulator().simulate(
+        _plan(),
+        (_bar(0, 99, 101, 100), _bar(1, 100, 104, 103)),
+        as_of=NOW,
+        spread_bps=7.5,
+    )
+
+    assert outcome.cost_bps == pytest.approx(73.7)
+    assert seen
+    assert all(symbol == "005930" and spread == 7.5 for symbol, spread, _ in seen)
+
+
 def test_same_bar_stop_and_target_uses_conservative_stop() -> None:
     outcome = EventDrivenFillSimulator().simulate(
         _plan(), (_bar(0, 97, 104, 102),), as_of=NOW
@@ -91,7 +116,7 @@ def test_incomplete_future_is_censored_not_fake_time_exit() -> None:
 def test_simulator_replays_trailing_stop_from_prior_watermark() -> None:
     plan = replace(
         _plan(),
-        profit_policy={"price": 110},
+        profit_policy={"price": 103.4},
         trailing_policy={"bps": 100},
         max_holding_seconds=300,
     )

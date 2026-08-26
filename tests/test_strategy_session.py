@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from app.schemas.domain import AccountSnapshot, Holding
 from app.trading.directional import PositionDirection
 from app.trading.strategy_session import (
@@ -15,6 +17,36 @@ from app.technical.strategy_algorithms import round_trip_cost_bps
 
 
 NOW = datetime(2026, 7, 28, 1, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _legacy_live_authority_for_session_state_machine_tests(monkeypatch):
+    """These tests exercise ownership after an already-authorised election.
+
+    Production now starts every unproven arm in SHADOW. Explicit test authority
+    keeps the state-machine fixtures focused on their original subject.
+    """
+    for strategy_id in (
+        "intraday_momentum",
+        "breakout_volume",
+        "vwap_mean_reversion",
+        "liquidity_shock_reversal",
+        "event_momentum",
+        "cross_sectional_relative_strength",
+        "gap_context",
+        "rvgi_box_breakout",
+        "residual_relative_strength",
+        "adaptive_anchored_vwap_reversion",
+        "ofi_microprice_exhaustion_reversal",
+        "opening_range_breakout",
+        "bar_confirmed_vwap_recovery",
+    ):
+        monkeypatch.setenv(f"ALGO_{strategy_id.upper()}_LIVE_AUTHORIZED", "1")
+    yield
+    monkeypatch.undo()
+    from app.strategy.registry import reset_default_strategy_registry
+
+    reset_default_strategy_registry()
 
 
 def _config(tmp_path, **overrides):
@@ -225,6 +257,39 @@ def test_throttled_bundle_is_counted_only_once_for_invalidation(tmp_path):
     assert repeated["invalidation_cycles"] == 1
 
 
+def test_cost_blind_time_exit_gets_one_bounded_extension_when_thesis_is_intact(
+    tmp_path,
+):
+    manager = StrategySessionManager(config=_config(tmp_path))
+    holding = Holding(
+        ticker="005930",
+        market="KR",
+        company_name="Samsung",
+        sector="Technology",
+        quantity=1,
+        average_price=70_000.0,
+        last_price=70_000.0,
+        opened_at=NOW,
+    )
+    manager.evaluate(_account(holding), (), _bundle(), NOW)
+    state = manager._state  # noqa: SLF001
+    state.max_holding_seconds = 60
+    state.expected_cost_bps = 28.0
+    state.invalidation_cycles = 0
+    state.invalidation_reason_codes = []
+
+    manager._evaluate_exit(holding, None, NOW + timedelta(seconds=61))  # noqa: SLF001
+
+    assert state.phase == "OWNED"
+    assert state.holding_extension_used is True
+    assert state.holding_extension_seconds == 60
+    assert state.max_holding_seconds == 120
+
+    manager._evaluate_exit(holding, None, NOW + timedelta(seconds=121))  # noqa: SLF001
+    assert state.phase == "EXITING"
+    assert state.exit_reason == "STRATEGY_MAX_HOLDING_TIME"
+
+
 def test_confirmed_edge_decay_protects_net_profit_before_static_target(tmp_path):
     manager = StrategySessionManager(
         config=_config(tmp_path, invalidation_confirm_cycles=2),
@@ -335,8 +400,11 @@ def test_production_config_disables_duplicate_bandit_authority_by_default(
     assert config.bandit_enabled is False
 
 
-def test_algorithm_catalogue_is_evaluated_when_gnn_vector_is_empty(tmp_path):
+def test_algorithm_catalogue_is_evaluated_when_gnn_vector_is_empty(tmp_path, monkeypatch):
     """A checkpoint/schema failure must not turn implemented strategies into 0/0."""
+    # This test isolates deterministic authority from the independent exit-economics
+    # threshold, which has dedicated coverage elsewhere.
+    monkeypatch.setenv("STRATEGY_SESSION_MIN_NET_REWARD_RISK", "0.0")
 
     class _Decision:
         def as_dict(self):
@@ -357,6 +425,16 @@ def test_algorithm_catalogue_is_evaluated_when_gnn_vector_is_empty(tmp_path):
 
         def entry(self, features, context):
             return _Decision()
+
+        def exit_rule(self, entry_price, features, context):
+            return SimpleNamespace(
+                target_price=entry_price * 1.009,
+                stop_price=entry_price * 0.995,
+                trailing_bps=20.0,
+                max_holding_seconds=180,
+                target_basis="test_forecast",
+                stop_basis="test_stop",
+            )
 
     manager = StrategySessionManager(
         config=_config(

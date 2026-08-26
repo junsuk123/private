@@ -1488,6 +1488,60 @@ class RealtimeModesTest(unittest.TestCase):
                 web_module._dashboard_krx_watch.clear()
                 web_module._dashboard_krx_watch.update(previous_watch)
 
+    def test_dashboard_stale_polling_does_not_churn_subscription_set(self) -> None:
+        from app.data.market_session import MarketPhase
+
+        with web_module._live_lock:
+            previous_watch = dict(web_module._dashboard_krx_watch)
+            previous_recovery = dict(web_module._dashboard_krx_stale_recovery_at)
+            web_module._dashboard_krx_watch.clear()
+            web_module._dashboard_krx_stale_recovery_at.clear()
+        try:
+            with (
+                patch("app.data.market_session.market_phase", return_value=MarketPhase.REGULAR),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch("app.web._request_kis_realtime_collector_resubscribe") as request,
+                patch("app.web.time.monotonic", side_effect=(100.0, 120.0)),
+            ):
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = None
+                web_module._observe_dashboard_market_stream("396500")
+                web_module._observe_dashboard_market_stream("396500")
+
+            request.assert_called_once_with("dashboard_stream", ("396500",))
+        finally:
+            with web_module._live_lock:
+                web_module._dashboard_krx_watch.clear()
+                web_module._dashboard_krx_watch.update(previous_watch)
+                web_module._dashboard_krx_stale_recovery_at.clear()
+                web_module._dashboard_krx_stale_recovery_at.update(previous_recovery)
+
+    def test_dashboard_ttl_renewal_does_not_resubscribe_selected_symbol(self) -> None:
+        from app.data.market_session import MarketPhase
+
+        with web_module._live_lock:
+            previous_watch = dict(web_module._dashboard_krx_watch)
+            previous_selected = dict(web_module._kis_realtime_symbol_subscribed_at)
+            web_module._dashboard_krx_watch.clear()
+            web_module._kis_realtime_symbol_subscribed_at["396500"] = time.time()
+        try:
+            with (
+                patch("app.data.market_session.market_phase", return_value=MarketPhase.REGULAR),
+                patch("app.web.RealtimeMarketDataStore") as store_cls,
+                patch("app.web._request_kis_realtime_collector_resubscribe") as request,
+            ):
+                store_cls.return_value.latest_tick.return_value = None
+                store_cls.return_value.latest_orderbook.return_value = None
+                web_module._observe_dashboard_market_stream("396500")
+
+            request.assert_not_called()
+        finally:
+            with web_module._live_lock:
+                web_module._dashboard_krx_watch.clear()
+                web_module._dashboard_krx_watch.update(previous_watch)
+                web_module._kis_realtime_symbol_subscribed_at.clear()
+                web_module._kis_realtime_symbol_subscribed_at.update(previous_selected)
+
     def test_kis_realtime_collector_symbols_include_held_and_context_krx_names(self) -> None:
         account = AccountSnapshot(
             cash=100000.0,
@@ -1602,6 +1656,66 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(candidates, ("HST", "HUYA"))
         broker_discovery.assert_not_called()
 
+    def test_realtime_engine_candidate_provider_includes_cooldown_backfill_reserve(self) -> None:
+        symbols = tuple(f"TICK{index}" for index in range(12))
+        with (
+            patch("app.web.RealtimeMarketDataStore") as store_cls,
+            patch("app.web._cached_context_buy_candidates", return_value=()),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch(
+                "app.web._prioritize_realtime_buy_candidates",
+                side_effect=lambda values, **_: tuple(values),
+            ),
+            patch("app.web._is_live_buy_candidate_symbol", return_value=True),
+            patch("app.web._is_open_live_market_ticker", return_value=True),
+            patch("app.web._ticker_market_group_for_live_trading", return_value="US"),
+            patch("app.web._candidate_has_ready_strategy_tick_window", return_value=True),
+            patch("app.web._realtime_engine_account_snapshot", return_value=None),
+            patch.dict(
+                "os.environ",
+                {
+                    "REALTIME_MAX_BUY_EVALUATIONS_PER_CYCLE": "4",
+                    "REALTIME_BUY_CANDIDATE_BACKFILL_RESERVE": "4",
+                },
+            ),
+        ):
+            store_cls.return_value.active_symbols.return_value = symbols
+            candidates = web_module._realtime_engine_buy_candidates()
+
+        self.assertEqual(candidates, symbols[:8])
+
+    def test_realtime_engine_candidates_exclude_current_micro_hard_risk(self) -> None:
+        with (
+            patch("app.web.RealtimeMarketDataStore") as store_cls,
+            patch("app.web._fresh_macro_micro_bundle", return_value={"timestamp": "fresh"}),
+            patch(
+                "app.web._macro_micro_blocked_buy_candidates",
+                return_value=("001510",),
+            ),
+            patch("app.web._cached_context_buy_candidates", return_value=()),
+            patch("app.web._cached_domestic_ranking_symbols", return_value=()),
+            patch(
+                "app.web._prioritize_realtime_buy_candidates",
+                side_effect=lambda symbols, **_: tuple(symbols),
+            ),
+            patch("app.web._is_live_buy_candidate_symbol", return_value=True),
+            patch("app.web._is_open_live_market_ticker", return_value=True),
+            patch("app.web._ticker_market_group_for_live_trading", return_value="KRX"),
+            patch("app.web._is_live_market_core_open", return_value=True),
+            patch("app.web._candidate_has_ready_strategy_tick_window", return_value=True),
+            patch("app.web._candidate_has_strategy_feature_history", return_value=True),
+            patch("app.web._candidate_has_fresh_buy_orderbook", return_value=True),
+            patch("app.web._realtime_engine_account_snapshot", return_value=None),
+        ):
+            store_cls.return_value.active_symbols.return_value = ("001510", "003280")
+            candidates = web_module._realtime_engine_buy_candidates()
+
+        self.assertEqual(candidates, ("003280",))
+        self.assertEqual(
+            web_module._realtime_candidate_filter_state["reason_counts"],
+            {"ACCOUNT_OR_STORE_UNAVAILABLE_NOT_FILTERED": 1, "MICRO_HARD_RISK_BLOCK": 1},
+        )
+
     def test_realtime_engine_us_candidates_match_current_overseas_subscriptions(self) -> None:
         with (
             patch("app.web.RealtimeMarketDataStore") as store_cls,
@@ -1649,7 +1763,7 @@ class RealtimeModesTest(unittest.TestCase):
             "SOFI", Store(), now=now
         )
 
-    def test_strategy_tick_window_accepts_two_seconds_and_a_fresh_book(self) -> None:
+    def test_strategy_tick_window_requires_algorithm_five_second_print_floor(self) -> None:
         now = datetime.now(timezone.utc)
 
         class Store:
@@ -1657,10 +1771,33 @@ class RealtimeModesTest(unittest.TestCase):
                 return tuple(
                     SimpleNamespace(
                         source="kis_realtime_websocket",
+                        received_at=now - timedelta(seconds=seconds),
                         exchange_timestamp=now - timedelta(seconds=seconds),
                         meta=SimpleNamespace(is_tradeable=True),
                     )
                     for seconds in (1, 2)
+                )
+
+            def latest_orderbook(self, symbol):
+                return SimpleNamespace(received_at=now - timedelta(seconds=1))
+
+        assert not web_module._candidate_has_ready_strategy_tick_window(
+            "INTC", Store(), now=now
+        )
+
+    def test_strategy_tick_window_accepts_three_recent_ingestion_seconds(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        class Store:
+            def recent_ticks(self, symbol, since, *, until=None):
+                return tuple(
+                    SimpleNamespace(
+                        source="kis_realtime_websocket",
+                        received_at=now - timedelta(seconds=seconds),
+                        exchange_timestamp=now - timedelta(seconds=seconds + 20),
+                        meta=SimpleNamespace(is_tradeable=True),
+                    )
+                    for seconds in (1, 2, 3)
                 )
 
             def latest_orderbook(self, symbol):

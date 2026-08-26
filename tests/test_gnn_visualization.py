@@ -130,7 +130,7 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     # strategy_terminal.js against a changed payload contract. There were two
     # markers here from successive features; the older one only recorded which
     # release last touched the file, and every bump broke it.
-    assert "20260821-multi-trade-layers-v1" in page.text
+    assert "20260824-split-model-metrics-v1" in page.text
 
 
 def test_gnn_auto_rotation_is_default_on_persistent_and_pauses_for_manual_control() -> None:

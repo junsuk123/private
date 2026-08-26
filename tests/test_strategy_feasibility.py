@@ -22,12 +22,24 @@ from app.trading.strategy_feasibility import (
     SymbolFeasibility,
     attainable_move_bps,
     evaluate_symbol,
+    enabled_strategy_horizons,
     rank_by_feasibility,
     sigma_1m_bps,
 )
 
 # 40-minute and 120-minute horizons, in seconds.
 STRATEGIES = {"liquidity_shock_reversal": 2400.0, "opening_range_breakout": 7200.0}
+
+
+def test_shadow_strategies_shape_discovery_without_crossing_market_scope() -> None:
+    kr = enabled_strategy_horizons("KR")
+    us = enabled_strategy_horizons("US")
+    assert kr, "shadow-only deployment must not disable feasibility ranking"
+    assert us
+    assert "range_support_reversion" in kr
+    assert "range_support_reversion" not in us
+    assert "overnight_gap_carry" not in kr
+    assert "overnight_gap_carry" in us
 
 
 def _closes(count: int, *, step_bps: float, start: float = 100.0) -> list[float]:

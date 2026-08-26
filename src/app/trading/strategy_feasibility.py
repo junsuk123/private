@@ -283,24 +283,29 @@ def rank_by_feasibility(
     return tuple(sorted(symbols, key=key))
 
 
-def enabled_strategy_horizons() -> dict[str, float]:
-    """Catalogued LONG strategies that may actually be deployed, with their horizons.
+def enabled_strategy_horizons(market: str | None = None) -> dict[str, float]:
+    """Catalogued LONG discovery strategies, with their horizons.
 
-    Reads the same authority election does, so a strategy turned off in config stops
-    influencing which symbols are held.
+    Shadow-enabled strategies belong here because feasibility ranks the discovery
+    universe; it grants no execution authority. Market scope still comes from the
+    strategy registry, so a KRX-only thesis cannot influence a US candidate.
     """
     try:
         from app.strategy.catalog import STRATEGY_IDS, is_short_strategy
         from app.strategy.exit_geometry import exit_geometry
-        from app.technical.strategy_algorithms import strategy_live_authorized
+        from app.strategy.registry import default_strategy_registry
+        from app.technical.strategy_algorithms import strategy_shadow_authorized
     except Exception:  # noqa: BLE001 - discovery must not break on an import error.
         return {}
     horizons: dict[str, float] = {}
+    specs = default_strategy_registry()
     for strategy_id in STRATEGY_IDS:
         if is_short_strategy(strategy_id):
             continue
         try:
-            if not strategy_live_authorized(strategy_id):
+            if not strategy_shadow_authorized(strategy_id):
+                continue
+            if market and not specs.require(strategy_id).permits_market(market):
                 continue
             horizons[strategy_id] = float(exit_geometry(strategy_id).max_holding_seconds)
         except Exception:  # noqa: BLE001
@@ -332,8 +337,8 @@ def measure(
     Best-effort throughout: a symbol whose bars cannot be read is UNKNOWN, never
     infeasible. Discovery is not allowed to fail because a measurement did.
     """
-    horizons = dict(strategies or enabled_strategy_horizons())
-    if not horizons:
+    explicit_horizons = dict(strategies) if strategies is not None else None
+    if explicit_horizons == {}:
         return {}
     moment = now or datetime.now(timezone.utc)
     since = moment - timedelta(days=lookback_days or _env_int("FEASIBILITY_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS))
@@ -376,6 +381,11 @@ def measure(
             market_store, symbol
         )
         market = _market_of(symbol)
+        horizons = (
+            explicit_horizons
+            if explicit_horizons is not None
+            else enabled_strategy_horizons(market)
+        )
         results[symbol] = evaluate_symbol(
             symbol,
             closes=closes,

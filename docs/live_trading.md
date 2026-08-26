@@ -468,7 +468,7 @@ python scripts/check_market_session_readiness.py --with-kis   # KIS_READINESS_AL
 | 상태 | 필수 증거 | 주문 크기 상한 |
 |---|---|---:|
 | `SHADOW` | 기준 미달 또는 보수적 순엣지 ≤ 0 | 0% |
-| `LIVE_PROBE` | ≥20 표본, ≥3 양수익, ≥3 거래일, 보수적 순엣지 > 0 | 10% |
+| `LIVE_PROBE` | 동일 시장·레짐에서 ≥30 표본, ≥10 양수익, ≥3 거래일, 보수적 순엣지 > 0, 양(+) 거래일 ≥60%, 1.25x 비용 스트레스 후 순엣지 > 0 | 10% |
 | `LIVE_LIMITED` | 추가로 실제 체결 ≥30, ≥10 양수익, ≥10 거래일, live LCB > 0 | 35% |
 | `LIVE_FULL` | 실제 체결 ≥60, ≥20 양수익, ≥20 거래일, live LCB > 5bp | 100% |
 
@@ -476,3 +476,7 @@ python scripts/check_market_session_readiness.py --with-kis   # KIS_READINESS_AL
 bandit, GNN trust, `ProfitabilityGate`, 리스크, 세션, 잔고, 주문 중복 검사가 독립적으로 다시
 승인해야 합니다. 최근 연속 손실이 3회가 되거나 보수적 하한이 0 이하로 내려가면 자동으로
 `SHADOW`로 복귀합니다.
+
+ETF 주문 권한이 없는 계좌는 `RISK_ETF_TRADING_ALLOWED=false`를 유지합니다. 국내 후보는 KIS
+종목명으로, 미국 후보는 `scripts/collect_us_instrument_catalog.py`가 수집한 Nasdaq Trader 공식
+ETF 플래그로 discovery와 최종 RiskManager에서 이중 차단됩니다.

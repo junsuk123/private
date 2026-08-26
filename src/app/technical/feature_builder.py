@@ -81,6 +81,24 @@ def build_technical_feature_set(
     dmi = ti.dmi_adx(bars, cfg.atr_period) if bars else None
     supertrend = ti.supertrend(bars) if bars else None
     keltner = ti.keltner_channels(bars) if bars else None
+    # Compression must precede expansion. Measure it on completed bars ending
+    # before the recent-volatility window; the current envelope can already be
+    # expanded by the breakout and is not evidence of a prior squeeze.
+    prior_keltner_squeeze_ratio = None
+    prior_bars = bars[: -cfg.vol_recent_window] if len(bars) > cfg.vol_recent_window else ()
+    if prior_bars:
+        prior_boll = ti.bollinger(ti.closes(prior_bars), cfg.bb_period)
+        prior_keltner = ti.keltner_channels(prior_bars)
+        if (
+            prior_boll.ok
+            and prior_keltner.ok
+            and prior_boll.bandwidth is not None
+            and prior_keltner.bandwidth is not None
+            and prior_keltner.bandwidth > 0.0
+        ):
+            prior_keltner_squeeze_ratio = (
+                float(prior_boll.bandwidth) / float(prior_keltner.bandwidth)
+            )
     choppiness = ti.choppiness_index(bars, cfg.atr_period) if bars else None
 
     vwap_now = ti.vwap(bars) if bars else None
@@ -183,6 +201,7 @@ def build_technical_feature_set(
         keltner_lower=keltner.lower if keltner and keltner.ok else None,
         keltner_position=keltner.position if keltner and keltner.ok else None,
         keltner_bandwidth=keltner.bandwidth if keltner and keltner.ok else None,
+        prior_keltner_squeeze_ratio=prior_keltner_squeeze_ratio,
         choppiness=choppiness,
         vwap=vwap_now,
         vwap_distance_bps=vwap_distance_bps,
@@ -282,6 +301,7 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         keltner_lower=slow("keltner_lower"),
         keltner_position=slow("keltner_position"),
         keltner_bandwidth=slow("keltner_bandwidth"),
+        prior_keltner_squeeze_ratio=slow("prior_keltner_squeeze_ratio"),
         choppiness=slow("choppiness"),
         vwap=slow("vwap", vwap),
         vwap_distance_bps=slow(

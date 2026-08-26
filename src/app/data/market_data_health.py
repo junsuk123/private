@@ -36,6 +36,9 @@ def evaluate_market_data_health(
             reasons.append("QUOTE_STALE")
         if quote_source.source != KIS_REALTIME_SOURCE:
             reasons.append("QUOTE_SOURCE_NOT_KIS_REALTIME")
+        eligible, metadata_reasons = quote_source.meta.is_live_buy_eligible()
+        if not eligible:
+            reasons.extend(metadata_reasons)
 
     if orderbook is None:
         reasons.append("ORDERBOOK_COUNT_ZERO")
@@ -45,11 +48,16 @@ def evaluate_market_data_health(
             reasons.append("ORDERBOOK_STALE")
         if orderbook.source != KIS_REALTIME_SOURCE:
             reasons.append("ORDERBOOK_SOURCE_NOT_KIS_REALTIME")
+        eligible, metadata_reasons = orderbook.meta.is_live_buy_eligible()
+        if not eligible:
+            reasons.extend(metadata_reasons)
 
     source_quality_score = 1.0 if not reasons or all("STALE" in reason for reason in reasons) else 0.0
     if source_quality_score < minimum_source_quality_score:
         reasons.append("SOURCE_QUALITY_TOO_LOW")
 
+    authoritative = orderbook or quote_source
+    meta = authoritative.meta if authoritative is not None else None
     health = MarketDataHealth(
         symbol=symbol,
         checked_at=now,
@@ -63,6 +71,12 @@ def evaluate_market_data_health(
         source_quality_score=source_quality_score,
         ok_for_live_buy=not reasons,
         reason_codes=tuple(dict.fromkeys(reasons)),
+        market_group=(meta.market_group.value if meta and meta.market_group else ""),
+        venue=(meta.venue.value if meta else ""),
+        session=(meta.session.value if meta else ""),
+        feed_scope=(meta.feed_scope.value if meta else ""),
+        depth_level_count=(len(orderbook.levels) if orderbook is not None else 0),
+        is_consolidated=bool(meta.is_consolidated) if meta else False,
     )
     store.save_health(health)
     return health

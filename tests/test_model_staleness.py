@@ -8,6 +8,7 @@ from app.models.model_staleness import (
     MODEL_AGE_EXCEEDED,
     MODEL_CONSECUTIVE_NEGATIVE_CHALLENGERS,
     MODEL_CREATED_AT_UNKNOWN,
+    MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL,
     MODEL_FEATURE_DRIFT,
     MODEL_FRESH,
     MODEL_REGIME_MISMATCH,
@@ -65,6 +66,20 @@ def test_feature_drift_expires_the_model():
     )
     assert verdict.stale
     assert MODEL_FEATURE_DRIFT in verdict.reason_codes
+
+
+def test_runtime_aligned_model_with_one_deployable_row_is_shadow_only():
+    verdict = evaluate_model_staleness(
+        _payload(
+            runtime_policy_aligned_evaluation=1.0,
+            top_k_count=1.0,
+        ),
+        now=NOW,
+        config=CONFIG,
+    )
+    assert verdict.stale
+    assert MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL in verdict.reason_codes
+    assert verdict.trust_level is ModelTrustLevel.SHADOW_ONLY
 
 
 def test_repeated_negative_challengers_expire_a_confident_incumbent():

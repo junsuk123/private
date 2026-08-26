@@ -392,7 +392,9 @@ def test_in_flight_walks_are_lost_on_restart_rather_than_replayed(tmp_path) -> N
     first = ShadowEvaluationService(
         simulator=_simulator(),
         shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
-        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        performance_store=StrategyPerformanceStore(
+            tmp_path / "perf.sqlite3", clock=lambda: NOW
+        ),
     )
     first.evaluate_tick({}, now=NOW, new_plans=[_plan()])
     assert first.status()["open_plans"] == 1
@@ -403,6 +405,32 @@ def test_in_flight_walks_are_lost_on_restart_rather_than_replayed(tmp_path) -> N
         performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
     )
     assert second.status()["open_plans"] == 0
+
+
+def test_capacity_overflow_is_deferred_instead_of_orphaned(tmp_path) -> None:
+    service = ShadowEvaluationService(
+        simulator=_simulator(),
+        shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
+        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        max_open_plans=1,
+    )
+    second = dataclasses.replace(_plan(), plan_id="deferred-plan")
+
+    first_stats = service.evaluate_tick({}, now=NOW, new_plans=[_plan(), second])
+    assert first_stats.adopted == 1
+    assert first_stats.open_plans == 1
+
+    # The active walk expires first. On the following cycle the overflow plan is
+    # still owned by the service and is adopted without being re-supplied by the
+    # session manager.
+    service.evaluate_tick({}, now=NOW + timedelta(seconds=4000))
+    third_stats = service.evaluate_tick({}, now=NOW + timedelta(seconds=4001))
+    assert third_stats.adopted == 1
+    assert third_stats.resolved == 1
+    assert any(
+        item["plan_id"] == "deferred-plan"
+        for item in service.shadow_store.outcomes(limit=10)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -604,7 +632,9 @@ def test_signal_to_promotion_evidence_in_one_pass(tmp_path) -> None:
     service = ShadowEvaluationService(
         simulator=_simulator(),
         shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
-        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        performance_store=StrategyPerformanceStore(
+            tmp_path / "perf.sqlite3", clock=lambda: NOW
+        ),
     )
     service.evaluate_tick({}, now=NOW, new_plans=[_plan(regime="TREND_DOWN")])
     service.evaluate_tick(

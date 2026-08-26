@@ -633,7 +633,9 @@ def _controller(tmp_path) -> ShortStrategyPromotionController:
             }
         ),
         state_store=DeploymentStateStore(tmp_path / "dep.sqlite3"),
-        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        performance_store=StrategyPerformanceStore(
+            tmp_path / "perf.sqlite3", clock=lambda: NOW
+        ),
         shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
         borrow_store=BorrowSnapshotStore(tmp_path / "borrow.sqlite3"),
     )
@@ -1385,7 +1387,9 @@ def _service(tmp_path) -> "ShadowEvaluationService":
     return ShadowEvaluationService(
         simulator=ShadowFillSimulator(entry_slippage_bps=0.0, exit_slippage_bps=0.0),
         shadow_store=ShadowPlanStore(tmp_path / "shadow.sqlite3"),
-        performance_store=StrategyPerformanceStore(tmp_path / "perf.sqlite3"),
+        performance_store=StrategyPerformanceStore(
+            tmp_path / "perf.sqlite3", clock=lambda: NOW
+        ),
     )
 
 

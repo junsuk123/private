@@ -8,7 +8,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TypeAlias
+from typing import Any, Callable, TypeAlias
 
 from app.data.realtime_types import (
     FeedMetadata,
@@ -446,14 +446,16 @@ class EventDrivenMarketRuntime:
         *,
         store: object | None = None,
         persistence_capacity: int = 8192,
+        completed_bar_sink: Callable[[RealtimeMinuteBar, MarketEvent], Any] | None = None,
     ) -> None:
         self.bus = bus
         self.store = store
+        self.completed_bar_sink = completed_bar_sink
         self.state = MarketState()
         self._bars: dict[tuple[str, str], IncrementalMinuteBarBuilder] = {}
         self._pending_books: dict[tuple[str, tuple[object, ...]], RealtimeOrderbookSnapshot] = {}
         self._persistence: asyncio.Queue[
-            tuple[MarketEvent, RealtimeMinuteBar | None]
+            tuple[MarketEvent, RealtimeMinuteBar | None, bool]
         ] = asyncio.Queue(maxsize=persistence_capacity)
         self._fast_path_events = 0
         self._rejected_events = 0
@@ -477,6 +479,7 @@ class EventDrivenMarketRuntime:
             self._rejected_events += 1
             return False
         completed_bar = None
+        bar_is_closed = False
         if isinstance(event, RealtimeTradeTick):
             # builder 는 (symbol, stream) 단위다. 스트림을 섞으면 venue 가 다른 체결이
             # 한 bar 로 합산되고 거래량이 이중 계산된다.
@@ -486,6 +489,7 @@ class EventDrivenMarketRuntime:
                 IncrementalMinuteBarBuilder(event.symbol),
             )
             completed_bar = builder.update(event)
+            bar_is_closed = completed_bar is not None
             pending = self._pending_books.get(
                 (event.symbol, _paired_feed_key(event.meta))
             )
@@ -519,7 +523,7 @@ class EventDrivenMarketRuntime:
                     completed_bar = self._current_bar_if_due(builder_key, builder)
         if self.store is not None:
             try:
-                self._persistence.put_nowait((event, completed_bar))
+                self._persistence.put_nowait((event, completed_bar, bar_is_closed))
                 self._persistence_enqueued += 1
             except asyncio.QueueFull:
                 # Market-state truth remains in memory; persistence loss is
@@ -610,20 +614,25 @@ class EventDrivenMarketRuntime:
 
     def _persist_batch(
         self,
-        batch: list[tuple[MarketEvent, RealtimeMinuteBar | None]],
+        batch: list[tuple[MarketEvent, RealtimeMinuteBar | None, bool]],
     ) -> None:
         ticks = tuple(
-            event for event, _bar in batch if isinstance(event, RealtimeTradeTick)
+            event for event, _bar, _closed in batch if isinstance(event, RealtimeTradeTick)
         )
         books = tuple(
             event
-            for event, _bar in batch
+            for event, _bar, _closed in batch
             if isinstance(event, RealtimeOrderbookSnapshot)
         )
-        bars = tuple(bar for _event, bar in batch if bar is not None)
+        bars = tuple(bar for _event, bar, _closed in batch if bar is not None)
         if ticks:
             self.store.save_ticks(ticks)  # type: ignore[attr-defined]
         if books:
             self.store.save_orderbooks(books)  # type: ignore[attr-defined]
         if bars:
             self.store.save_minute_bars(bars)  # type: ignore[attr-defined]
+        sink = self.completed_bar_sink
+        if sink is not None:
+            for event, bar, closed in batch:
+                if closed and bar is not None:
+                    sink(bar, event)

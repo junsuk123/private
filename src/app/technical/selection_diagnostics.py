@@ -370,6 +370,32 @@ def collector_from_algorithm_evaluations(
                 reason_codes=reasons,
                 detail="recorded expected edge is non-positive",
             )
+        elif "EXIT_TARGET_DOES_NOT_CLEAR_COST" in reasons:
+            # The algorithm DID fire.  Exit-contract feasibility subsequently
+            # rejected the setup because its causal target could not pay the
+            # measured round trip plus the minimum net buffer.  Calling this a
+            # trigger failure hid the exact bottleneck and made the funnel report
+            # zero triggers even when the strategy logic worked correctly.
+            diagnostics = item.get("diagnostics") or {}
+            cost = _finite(diagnostics.get("expected_cost_bps"))
+            target = _finite(diagnostics.get("attainable_target_bps")) or edge
+            minimum_net = _finite(diagnostics.get("minimum_net_target_bps"))
+            record.mark(
+                SelectionStage.HORIZON_COST_UNVIABLE,
+                reason_codes=reasons,
+                rule_gross_bps=target,
+                all_in_cost_bps=cost,
+                rule_net_bps=(target - cost) if cost is not None else None,
+                required_net_bps=minimum_net,
+                cost_coverage_ratio=(target / cost) if cost and cost > 0.0 else None,
+                detail="trigger fired but its attainable exit target did not clear cost",
+            )
+        elif "LONG_REVERSION_BLOCKED_IN_DOWNTREND" in reasons:
+            record.mark(
+                SelectionStage.MACRO_BLOCKED,
+                reason_codes=reasons,
+                detail="long reversion trigger was incompatible with the downtrend regime",
+            )
         elif symbol == selected_symbol and strategy_id == selected_strategy:
             record.mark(SelectionStage.SELECTED, reason_codes=session_reasons)
         elif (bandit := bandit_by_pair.get((symbol, strategy_id))) is not None and not bool(

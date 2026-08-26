@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import numpy as np
 import pytest
 
+from app.models.graph_snapshot import GraphSnapshotBuilder, StockNodeObservation
 from app.models.temporal_hetero_gnn import REGIME_LABELS, STRATEGY_FAMILIES
 from app.ontology.market_graph import (
     NODE_TYPES,
@@ -52,6 +55,47 @@ def test_stale_data_invalidates_every_entry_family(graph: MarketGraph) -> None:
     }
     # DEFENSIVE is the stance of holding, so it is not invalidated by stale data.
     assert invalidated == set(STRATEGY_FAMILIES) - {"DEFENSIVE"}
+
+
+def test_us_market_has_explicit_factor_paths(graph: MarketGraph) -> None:
+    sources = {
+        edge.source_id
+        for edge in graph.edges(target="US_MARKET")
+        if edge.relation in {"INFLUENCES", "LEADS", "INCREASES_RISK"}
+    }
+    assert {
+        "US_EQUITY",
+        "US_SEMI",
+        "INDEX_FUTURES",
+        "VOLATILITY",
+        "US_RATES",
+    } <= sources
+
+
+def test_target_market_state_can_flow_back_to_its_stock() -> None:
+    snapshot = GraphSnapshotBuilder(time_steps=2).build(
+        captured_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        stocks=[
+            StockNodeObservation(
+                ticker="AAPL",
+                market_group="US",
+                venue="NASDAQ",
+            )
+        ],
+    )
+
+    edge = snapshot.graph.edges(
+        relation="INFLUENCES",
+        source="US_MARKET",
+        target="STOCK::AAPL",
+    )
+    assert len(edge) == 1
+    assert edge[0].learnable is True
+    assert not snapshot.graph.edges(
+        relation="INFLUENCES",
+        source="KR_MARKET",
+        target="STOCK::AAPL",
+    )
 
 
 # --------------------------------------------------------------------------- #

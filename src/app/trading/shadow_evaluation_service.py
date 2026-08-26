@@ -101,6 +101,12 @@ class ShadowEvaluationService:
         self.max_open_plans = max(1, int(max_open_plans))
         self._lock = threading.RLock()
         self._adopted: set[str] = set()
+        # Overflow remains eligible for adoption on a later cycle.  The session
+        # manager hands ownership of its pending list to this service, so merely
+        # stopping at ``max_open_plans`` permanently orphaned the rest of that
+        # batch in the durable journal.  Keeping a bounded active walk set is still
+        # the safety invariant; deferring a plan does not simulate or score it.
+        self._deferred: dict[str, ShadowTradePlan] = {}
         # Rolling short-rescue tally. The promotion gate reads a RATE, and the only
         # place that can observe the numerator is the election loop, so it is
         # accumulated here rather than recomputed from storage.
@@ -123,22 +129,26 @@ class ShadowEvaluationService:
         adopted = 0
         resolved: list[ShadowOutcome] = []
         with self._lock:
-            for plan in plans:
+            pending = tuple(self._deferred.values()) + tuple(plans)
+            self._deferred = {}
+            for plan in pending:
                 if plan.plan_id in self._adopted:
                     continue
                 if self.simulator.open_plan_count >= self.max_open_plans:
-                    logger.warning(
-                        "shadow evaluation at capacity (%d); plan %s left unresolved",
-                        self.max_open_plans,
-                        plan.plan_id,
-                    )
-                    break
+                    self._deferred.setdefault(plan.plan_id, plan)
+                    continue
                 self._adopted.add(plan.plan_id)
                 outcome = self.simulator.submit(plan)
                 adopted += 1
                 if outcome is not None:
                     self._persist(outcome)
                     resolved.append(outcome)
+            if self._deferred:
+                logger.warning(
+                    "shadow evaluation at capacity (%d); %d plans deferred",
+                    self.max_open_plans,
+                    len(self._deferred),
+                )
         return adopted, tuple(resolved)
 
     # -- per-tick evaluation ------------------------------------------------- #

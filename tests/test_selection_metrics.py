@@ -10,14 +10,38 @@ tells the two apart.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
 import pytest
 
+from app.evaluation.stored_counterfactual import CounterfactualLabel
 from app.models.strategy_utility.training import (
+    _Snapshot,
+    _market_authorization_verdicts,
+    _market_purged_split,
+    _expected_net_from_raw,
     _rank_auc,
     _selection_metrics,
     _skill_verdict,
+    _target_mask,
 )
+from app.strategy.catalog import STRATEGY_IDS
+
+
+def _snapshot(symbol: str, day: int) -> _Snapshot:
+    as_of = datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(days=day)
+    return _Snapshot(
+        as_of=as_of,
+        label_end=as_of + timedelta(hours=1),
+        symbol=symbol,
+        context=np.zeros(2, dtype=np.float32),
+        targets=np.zeros((1, 1), dtype=np.float32),
+        target_masks=np.ones((1, 1), dtype=np.float32),
+        attractive=False,
+        nets=np.zeros(1, dtype=np.float32),
+        filled=np.zeros(1, dtype=bool),
+    )
 
 
 def test_rank_auc_matches_hand_computed_values() -> None:
@@ -27,6 +51,24 @@ def test_rank_auc_matches_hand_computed_values() -> None:
     assert _rank_auc(np.array([1.0, 1.0, 1.0]), np.array([True, False, False])) == 0.5
     # Undefined without both classes.
     assert _rank_auc(np.array([1.0, 2.0]), np.array([True, True])) is None
+
+
+def test_authorization_score_uses_payoff_not_win_probability_alone() -> None:
+    raw = np.zeros((1, len(STRATEGY_IDS), 11), dtype=np.float32)
+    high_probability_tiny_payoff = STRATEGY_IDS.index("intraday_momentum")
+    lower_probability_large_payoff = STRATEGY_IDS.index("breakout_volume")
+
+    raw[0, high_probability_tiny_payoff, 0] = 2.0
+    raw[0, high_probability_tiny_payoff, 4] = -6.0
+    raw[0, lower_probability_large_payoff, 0] = 0.0
+    raw[0, lower_probability_large_payoff, 4] = 3.0
+
+    scores = _expected_net_from_raw(raw)
+
+    assert (
+        scores[0, lower_probability_large_payoff]
+        > scores[0, high_probability_tiny_payoff]
+    )
 
 
 def test_perfect_ranking_is_detected_where_accuracy_would_fail() -> None:
@@ -152,6 +194,74 @@ def test_verdict_is_false_when_metrics_are_absent() -> None:
     verdict = _skill_verdict({})
     assert verdict["selection_ranking_skill_established"] is False
     assert verdict["selection_net_edge_established"] is False
+
+
+def test_market_holdouts_are_independent_when_us_tape_is_newer() -> None:
+    snapshots = [
+        *[_snapshot("005930", day) for day in range(10)],
+        *[_snapshot("AAPL", 30 + day) for day in range(10)],
+    ]
+
+    train, validation, _purged = _market_purged_split(snapshots)
+
+    assert {item.symbol for item in validation} == {"005930", "AAPL"}
+    assert sum(item.symbol == "005930" for item in validation) == 2
+    assert sum(item.symbol == "AAPL" for item in validation) == 2
+    assert {item.symbol for item in train} == {"005930", "AAPL"}
+
+
+def test_market_authority_does_not_cross_authorize() -> None:
+    passing = {
+        "selection_rows": 100,
+        "selection_auc_ci_low": 0.60,
+        "selection_auc_within_symbol_null": 0.52,
+        "selection_auc_permutation_p": 0.01,
+        "selection_top_decile_net_p_nonpositive": 0.01,
+    }
+    failing = {
+        **passing,
+        "selection_auc_ci_low": 0.45,
+        "selection_auc_permutation_p": 0.50,
+    }
+    metrics = {
+        **{f"krx_{key}": value for key, value in passing.items()},
+        **{f"us_{key}": value for key, value in failing.items()},
+    }
+
+    checks, markets = _market_authorization_verdicts(metrics, base_ready=True)
+
+    assert markets == ["KRX"]
+    assert checks["KRX"]["live_authorized"] is True
+    assert checks["US"]["live_authorized"] is False
+
+
+def test_untriggered_strategy_is_not_mislabeled_as_a_realized_loss() -> None:
+    at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    untriggered = CounterfactualLabel(
+        as_of=at,
+        label_end=at + timedelta(minutes=5),
+        symbol="AAPL",
+        strategy_id="intraday_momentum",
+        triggered=False,
+        filled=False,
+        net_return_bps=0.0,
+        cost_bps=50.0,
+        exit_reason="NO_TRIGGER",
+    )
+    realized_loss = CounterfactualLabel(
+        as_of=at,
+        label_end=at + timedelta(minutes=5),
+        symbol="AAPL",
+        strategy_id="intraday_momentum",
+        triggered=True,
+        filled=True,
+        net_return_bps=-25.0,
+        cost_bps=50.0,
+        exit_reason="INITIAL_STOP",
+    )
+
+    assert _target_mask(untriggered)[0] == 0.0
+    assert _target_mask(realized_loss)[0] == 1.0
 
 
 def test_constant_and_weak_context_flags_are_reported() -> None:

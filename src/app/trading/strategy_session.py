@@ -29,6 +29,7 @@ from app.strategy.exit_geometry import FALLBACK_GEOMETRY_KEY
 from app.strategy.exit_geometry import exit_bps as _strategy_exit_bps
 from app.strategy.exit_geometry import exit_geometry as _exit_geometry
 from app.strategy.exit_geometry import max_holding_seconds as _strategy_max_holding_seconds
+from app.cost.cost_coverage import minimum_trailing_net_bps as _trailing_net_floor
 from app.strategy.exit_geometry import resolve_exit_geometry as _resolve_exit_geometry
 from app.trading.conservative_bandit import (
     BANDIT_EVIDENCE_WARMUP,
@@ -582,6 +583,11 @@ class _ElectionProposal:
     # no net figure. It is the last resort in ``predicted_gross_edge_bps``, and it
     # exists so that "no net estimate" cannot silently become "use the exit barrier".
     predicted_gross_move_bps: float | None = None
+    # Point-in-time exit contract resolved from the SAME feature frame that fired
+    # the entry.  This is audit metadata; the executable values are the four rate /
+    # horizon fields above.  Keeping the bases here lets training and diagnostics
+    # prove that the live plan did not fall back to a generic table after election.
+    exit_contract: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_short(self) -> bool:
@@ -909,6 +915,11 @@ class StrategySessionState:
     max_holding_seconds: int = field(
         default_factory=lambda: _fallback_exit_geometry().max_holding_seconds
     )
+    # One bounded grace period is allowed when the clock expires below break-even
+    # but fresh continuation evidence still says the thesis is intact. Persisting
+    # this bit prevents a restart from granting the same extension repeatedly.
+    holding_extension_used: bool = False
+    holding_extension_seconds: int = 0
     exit_requested_at: str | None = None
     # Broker-confirmed terminal fill.  This is distinct from the requested time:
     # account balance endpoints may continue to show the sold lot for minutes.
@@ -1056,9 +1067,14 @@ class StrategySessionManager:
         # hundreds of times in one election cycle, delaying the first cycle by
         # minutes. Environment/config is already frozen when this manager is
         # constructed, so resolve it once and reuse it consistently.
-        from app.technical.strategy_algorithms import build_algorithm_registry
+        from app.technical.strategy_algorithms import AlgorithmConfig, build_algorithm_registry
 
         self._algorithm_registry = build_algorithm_registry()
+        self._default_algorithm_registry = self._algorithm_registry
+        self._algorithm_registries = {
+            market: build_algorithm_registry(AlgorithmConfig(market=market))
+            for market in ("KR", "US")
+        }
         self._lock = threading.RLock()
         self._state = self._load()
         # Shadow plans journaled this cycle, awaiting adoption by
@@ -1332,6 +1348,8 @@ class StrategySessionManager:
                 evidence_row=proposal.evidence_row,
                 symbol=proposal.symbol,
             )
+            if proposal.exit_contract:
+                context["exit_contract"] = dict(proposal.exit_contract)
             builder = getattr(self, "_plan_builder", None)
             if builder is None:
                 builder = TradePlanBuilder()
@@ -1896,6 +1914,8 @@ class StrategySessionManager:
             "stop_loss_rate": state.stop_loss_rate,
             "trailing_stop_rate": state.trailing_stop_rate,
             "max_holding_seconds": state.max_holding_seconds,
+            "holding_extension_used": state.holding_extension_used,
+            "holding_extension_seconds": state.holding_extension_seconds,
             "high_watermark_price": state.high_watermark_price,
             "low_watermark_price": state.low_watermark_price,
             "expected_cost_bps": state.expected_cost_bps,
@@ -2198,14 +2218,26 @@ class StrategySessionManager:
         trailing_locked_gross_bps = _directional_gross_bps(
             average_price, resolved_trailing, direction
         )
-        trailing_required_gross_bps = max(
+        expected_cost_bps = max(
             0.0,
             float(
                 state.expected_cost_bps
                 if state.expected_cost_bps is not None
                 else self.config.fallback_round_trip_cost_bps
             ),
-        ) + _minimum_trailing_net_bps(state.selected_strategy)
+        )
+        target_gross_bps = _directional_gross_bps(
+            average_price,
+            float(state.target_price or average_price),
+            direction,
+        )
+        trailing_required_gross_bps = expected_cost_bps + _trailing_net_floor(
+            target_gross_bps,
+            expected_cost_bps,
+            configured_floor_bps=_minimum_trailing_net_bps(
+                state.selected_strategy
+            ),
+        )
 
         reason: str | None = None
         if target_reached(last_price, state.target_price, direction):
@@ -2239,7 +2271,42 @@ class StrategySessionManager:
             and (now - (opened if opened.tzinfo else opened.replace(tzinfo=timezone.utc))).total_seconds()
             >= state.max_holding_seconds
         ):
-            reason = "STRATEGY_MAX_HOLDING_TIME"
+            gross_bps = _directional_gross_bps(
+                average_price, last_price, direction
+            )
+            cost_bps = max(
+                0.0,
+                float(
+                    state.expected_cost_bps
+                    if state.expected_cost_bps is not None
+                    else self.config.fallback_round_trip_cost_bps
+                ),
+            )
+            time_boxed = state.selected_strategy in {
+                "market_intraday_momentum",
+                "market_intraday_momentum_short",
+                "overnight_gap_carry",
+            }
+            thesis_intact = (
+                state.invalidation_cycles == 0
+                and not state.invalidation_reason_codes
+            )
+            if (
+                not time_boxed
+                and not state.holding_extension_used
+                and thesis_intact
+                and gross_bps < cost_bps
+            ):
+                extension = min(
+                    300,
+                    max(60, int(max(1, state.max_holding_seconds) * 0.25)),
+                )
+                state.max_holding_seconds += extension
+                state.holding_extension_used = True
+                state.holding_extension_seconds = extension
+                state.last_reason = "HOLDING_TIME_EXTENDED_TO_BREAK_EVEN"
+            else:
+                reason = "STRATEGY_MAX_HOLDING_TIME"
 
         if reason:
             state.phase = "EXITING"
@@ -2390,6 +2457,11 @@ class StrategySessionManager:
             self._evidence_proposals(tradable_candidates, evidence, bundle, now)
         )
         proposals = self._deduplicate_joint_proposals(proposals)
+        proposals = [
+            proposal
+            for proposal in proposals
+            if self._freeze_proposal_exit_contract(proposal, now, macro)
+        ]
 
         # Journal every SHADOW-state proposal before selection runs. This is how a
         # short accumulates the forward evidence it needs: the signal fired, the
@@ -2444,9 +2516,13 @@ class StrategySessionManager:
         v2_results = self._observe_selector_v2(
             tradable_candidates, evidence, bundle, now, legacy_selected
         )
+        v2_authorized_results = self._selector_v2_authorized_results(v2_results)
+        v2_had_authority = bool(v2_authorized_results)
         v2_context_id: str | None = None
-        if self._selector_v2_live_authority():
-            v2_selected, v2_context_id = self._selector_v2_live_choice(v2_results, proposals)
+        if v2_had_authority:
+            v2_selected, v2_context_id = self._selector_v2_live_choice(
+                v2_authorized_results, proposals
+            )
             selected = v2_selected
             if selected is None:
                 v2_context_id = None
@@ -2457,18 +2533,30 @@ class StrategySessionManager:
                 return
             if v2_context_id:
                 runner = self._selector_v2
+                market_key = selected.symbol
                 self._state.selector_v2_context_id = v2_context_id
                 self._state.selector_v2_authority_state = str(
-                    getattr(runner, "authority_state", "SHADOW")
+                    runner.authority_state_for(market_key)
+                    if hasattr(runner, "authority_state_for")
+                    else getattr(runner, "authority_state", "SHADOW")
                 )
                 self._state.selector_v2_order_size_fraction = max(
-                    0.0, min(1.0, float(getattr(runner, "order_size_fraction", 0.0) or 0.0))
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            runner.order_size_fraction_for(market_key)
+                            if hasattr(runner, "order_size_fraction_for")
+                            else getattr(runner, "order_size_fraction", 0.0)
+                            or 0.0
+                        ),
+                    ),
                 )
                 self._state.selection_source = "SELECTOR_V2"
             return
         if decided:
             # A selector ran and chose nothing; it owns the reason string.
-            if self._selector_v2_live_authority():
+            if v2_had_authority:
                 self._state.last_reason = "SELECTOR_V2_NO_TRADE"
             return
         if proposals:
@@ -2524,6 +2612,27 @@ class StrategySessionManager:
         runner = self._selector_v2
         return bool(runner is not None and getattr(runner, "live_authority", False))
 
+    def _selector_v2_authorized_results(
+        self, results: tuple[Any, ...]
+    ) -> tuple[Any, ...]:
+        """Only results whose own venue earned selector authority.
+
+        A KR promotion must not let V2 override the legacy US election (or vice
+        versa).  Older injected runners expose only the aggregate property and keep
+        their prior behaviour for tests and replay.
+        """
+        runner = self._selector_v2
+        if runner is None:
+            return ()
+        market_check = getattr(runner, "live_authority_for", None)
+        if not callable(market_check):
+            return results if getattr(runner, "live_authority", False) else ()
+        return tuple(
+            item
+            for item in results
+            if market_check(str(getattr(item, "symbol", "") or ""))
+        )
+
     @staticmethod
     def _selector_v2_live_choice(
         results: tuple[Any, ...], proposals: list["_ElectionProposal"]
@@ -2541,20 +2650,59 @@ class StrategySessionManager:
             and getattr(item, "selected_strategy", None)
         ]
         if not selected_results:
-            return None, None
-        result = max(
-            selected_results,
-            key=lambda item: (
-                float(getattr(item, "utility"))
-                if getattr(item, "utility", None) is not None
-                else -float("inf")
-            ),
-        )
+            # Static catalogue lifecycle is an observation label, not the final
+            # execution authority. A strategy that started SHADOW can later earn a
+            # market-scoped LIVE_PROBE from forward outcomes; the independently built
+            # proposal below is the proof. Preserve V2's economics by accepting only a
+            # ranked candidate that clears both its NO_TRADE bar and lower bound.
+            promoted_candidates: list[tuple[Any, Any]] = []
+            executable = {
+                (proposal.symbol, proposal.strategy_id)
+                for proposal in proposals
+                if proposal.submits_orders
+            }
+            for item in results:
+                threshold = float(
+                    getattr(getattr(item, "no_trade_verdict", None), "no_trade_utility_bps", 0.0)
+                    or 0.0
+                )
+                symbol = str(getattr(item, "symbol", "") or "").upper()
+                for candidate in tuple(getattr(item, "ranked_candidates", ()) or ()):
+                    key = (symbol, str(getattr(candidate, "strategy_id", "") or ""))
+                    if (
+                        key in executable
+                        and bool(getattr(candidate, "eligible", False))
+                        and bool(getattr(candidate, "entry_ready", False))
+                        and float(getattr(candidate, "final_utility_bps", -float("inf")))
+                        > threshold
+                        and float(
+                            getattr(candidate, "lower_confidence_bound_bps", -float("inf"))
+                        )
+                        > 0.0
+                    ):
+                        promoted_candidates.append((item, candidate))
+            if not promoted_candidates:
+                return None, None
+            result, candidate = max(
+                promoted_candidates,
+                key=lambda pair: float(pair[1].final_utility_bps),
+            )
+            selected_strategy = str(candidate.strategy_id)
+        else:
+            result = max(
+                selected_results,
+                key=lambda item: (
+                    float(getattr(item, "utility"))
+                    if getattr(item, "utility", None) is not None
+                    else -float("inf")
+                ),
+            )
+            selected_strategy = str(result.selected_strategy)
         winner = next(
             (
                 proposal
                 for proposal in proposals
-                if proposal.strategy_id == str(result.selected_strategy)
+                if proposal.strategy_id == selected_strategy
                 and proposal.symbol == str(getattr(result, "symbol", "")).upper()
                 and proposal.submits_orders
             ),
@@ -3193,7 +3341,7 @@ class StrategySessionManager:
                 **{key: value for key, value in raw_features.items() if key in feature_names}
             )
             algorithm = get_algorithm(
-                strategy_id, registry=self._algorithm_registry
+                strategy_id, registry=self._algorithm_registry_for_symbol(symbol)
             )
             if algorithm is None:
                 decision = {
@@ -3258,6 +3406,199 @@ class StrategySessionManager:
             self._state.algorithm_evaluations.append({"symbol": symbol, **decision})
         return decision
 
+    def _freeze_proposal_exit_contract(
+        self,
+        proposal: "_ElectionProposal",
+        now: datetime,
+        macro: Any,
+    ) -> bool:
+        """Resolve one attainable, cost-positive exit contract at election time.
+
+        The old path sized a generic target from cost (normally 225-245bps on KRX),
+        then called the strategy again *after fill* with an empty feature object.  The
+        second call could only recover the strategy's short clock/trailing value, so a
+        five-minute thesis was asked to reach a multi-hour target.  Resolve the rule
+        here, from the exact frame that fired entry, and mutate the proposal once before
+        selection/journalling.  Everything downstream merely persists these values.
+        """
+        def reject(code: str, **diagnostics: Any) -> bool:
+            for item in self._state.algorithm_evaluations:
+                if (
+                    str(item.get("symbol") or "").upper() == proposal.symbol
+                    and str(item.get("strategy_id") or "") == proposal.strategy_id
+                ):
+                    reasons = list(item.get("reason_codes") or ())
+                    if code not in reasons:
+                        reasons.append(code)
+                    item["reason_codes"] = reasons
+                    detail = dict(item.get("diagnostics") or {})
+                    detail.update(diagnostics)
+                    item["diagnostics"] = detail
+                    break
+            return False
+
+        entry = _optional_float(proposal.entry_price)
+        row = proposal.evidence_row
+        raw = row.get("technical_features") if isinstance(row, Mapping) else None
+        if not isinstance(raw, Mapping):
+            # Historical/replay fixtures predate point-in-time feature capture.
+            # They remain observable under their stored contract but production
+            # cannot reach this branch because fresh selection evidence always
+            # includes ``technical_features``.
+            return True
+        if entry is None or entry <= 0.0:
+            return reject("EXIT_CONTRACT_ENTRY_PRICE_MISSING")
+
+        # A long reversion thesis in an established downtrend is not reversion yet.
+        # Requiring the macro state to recover prevents the repeated pattern observed
+        # live: enter adaptive VWAP in TREND_DOWN, then liquidate ~2 minutes later on
+        # the same VWAP breakdown that was already present at election.
+        reversion_longs = {
+            "vwap_mean_reversion",
+            "adaptive_anchored_vwap_reversion",
+            "bar_confirmed_vwap_recovery",
+            "range_support_reversion",
+            "choppiness_range_reversion",
+        }
+        regime = str(proposal.macro_regime or self._state.macro_regime or "").upper()
+        if (
+            proposal.direction is PositionDirection.LONG
+            and proposal.strategy_id in reversion_longs
+            and regime == "TREND_DOWN"
+        ):
+            return reject("LONG_REVERSION_BLOCKED_IN_DOWNTREND", macro_regime=regime)
+
+        try:
+            from app.technical.signals import TechnicalFeatureSet
+            from app.technical.strategy_algorithms import ElectionContext, get_algorithm
+
+            feature_names = TechnicalFeatureSet.__dataclass_fields__.keys()
+            features = TechnicalFeatureSet(
+                **{key: value for key, value in raw.items() if key in feature_names}
+            )
+            context = self._election_context(
+                proposal.strategy_id,
+                now,
+                intent=proposal.intent,
+                candidate_count=proposal.candidate_count,
+                micro_result=proposal.micro_result,
+                evidence_row=row,
+                macro=macro,
+                symbol=proposal.symbol,
+                change_point_probability=self._state.change_point_probability,
+                borrow_snapshot=proposal.borrow_snapshot,
+            )
+            allowed = ElectionContext.__dataclass_fields__.keys()
+            payload = {
+                key: value
+                for key, value in context.items()
+                if key in allowed and key != "elected_at"
+            }
+            payload["strategy_id"] = proposal.strategy_id
+            payload["elected_at"] = now
+            algorithm = get_algorithm(
+                proposal.strategy_id,
+                registry=self._algorithm_registry_for_symbol(proposal.symbol),
+            )
+            if algorithm is None:
+                return reject("EXIT_CONTRACT_ALGORITHM_MISSING")
+            rule = algorithm.exit_rule(
+                entry, features, ElectionContext(**payload)
+            )
+        except Exception as exc:
+            return reject(f"EXIT_CONTRACT_ERROR:{type(exc).__name__}")
+
+        sign = proposal.direction.sign
+        structural_target_bps: float | None = None
+        target = _optional_float(rule.target_price)
+        if target is not None and (target - entry) * sign > 0.0:
+            structural_target_bps = abs(target / entry - 1.0) * 10_000.0
+
+        forecast_bps = proposal.predicted_gross_edge_bps(
+            self.config.fallback_round_trip_cost_bps
+        )
+        attainable = [
+            value
+            for value in (structural_target_bps, forecast_bps)
+            if value is not None and value > 0.0
+        ]
+        if not attainable:
+            return reject("EXIT_TARGET_NOT_RESOLVABLE")
+        target_bps = min(attainable)
+        cost_bps = proposal.resolved_cost_bps(
+            self.config.fallback_round_trip_cost_bps
+        )
+        minimum_net_bps = max(
+            1.0, _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 5.0)
+        )
+        if target_bps <= cost_bps + minimum_net_bps:
+            return reject(
+                "EXIT_TARGET_DOES_NOT_CLEAR_COST",
+                attainable_target_bps=round(target_bps, 3),
+                expected_cost_bps=round(cost_bps, 3),
+                minimum_net_target_bps=round(minimum_net_bps, 3),
+            )
+
+        stop = _optional_float(rule.stop_price)
+        dynamic_stop_bps: float | None = None
+        if stop is not None and (entry - stop) * sign > 0.0:
+            dynamic_stop_bps = abs(stop / entry - 1.0) * 10_000.0
+        spread_bps = _measured_spread_bps(proposal.micro_result, row)
+        spread_stop_floor = 3.0 * spread_bps if spread_bps and spread_bps > 0 else 0.0
+        # A missing structural stop retains the already resolved common geometry;
+        # a measured one replaces it but may never sit inside ordinary spread noise.
+        stop_bps = (
+            max(dynamic_stop_bps, spread_stop_floor)
+            if dynamic_stop_bps is not None
+            else max(proposal.stop_loss_rate * 10_000.0, spread_stop_floor)
+        )
+        if stop_bps <= 0.0:
+            return reject("EXIT_STOP_NOT_RESOLVABLE")
+
+        net_reward = target_bps - cost_bps
+        net_risk = stop_bps + cost_bps
+        minimum_net_rr = max(
+            0.0, _env_float("STRATEGY_SESSION_MIN_NET_REWARD_RISK", 1.0)
+        )
+        if net_reward / max(1e-9, net_risk) < minimum_net_rr:
+            return reject(
+                "EXIT_NET_REWARD_RISK_TOO_LOW",
+                attainable_target_bps=round(target_bps, 3),
+                stop_bps=round(stop_bps, 3),
+                expected_cost_bps=round(cost_bps, 3),
+                net_reward_risk_ratio=round(net_reward / max(1e-9, net_risk), 4),
+                required_net_reward_risk_ratio=round(minimum_net_rr, 4),
+            )
+
+        trailing_bps = _optional_float(rule.trailing_bps)
+        if trailing_bps is None or trailing_bps <= 0.0:
+            trailing_bps = proposal.trailing_stop_rate * 10_000.0
+        if spread_bps and spread_bps > 0.0:
+            trailing_bps = max(trailing_bps, 1.5 * spread_bps)
+        trailing_bps = min(trailing_bps, max(1.0, stop_bps - 1.0))
+        holding = int(rule.max_holding_seconds or proposal.max_holding_seconds)
+        if holding <= 0:
+            return reject("EXIT_HORIZON_NOT_RESOLVABLE")
+
+        proposal.target_return_rate = target_bps / 10_000.0
+        proposal.stop_loss_rate = stop_bps / 10_000.0
+        proposal.trailing_stop_rate = trailing_bps / 10_000.0
+        proposal.max_holding_seconds = holding
+        proposal.exit_contract = {
+            "resolved_at": _iso(now),
+            "target_basis": str(getattr(rule, "target_basis", "") or ""),
+            "stop_basis": str(getattr(rule, "stop_basis", "") or ""),
+            "structural_target_bps": structural_target_bps,
+            "forecast_gross_bps": forecast_bps,
+            "target_bps": target_bps,
+            "stop_bps": stop_bps,
+            "trailing_bps": trailing_bps,
+            "max_holding_seconds": holding,
+            "expected_cost_bps": cost_bps,
+            "net_reward_risk_ratio": net_reward / max(1e-9, net_risk),
+        }
+        return True
+
     @staticmethod
     def _deduplicate_joint_proposals(
         proposals: list["_ElectionProposal"],
@@ -3296,7 +3637,16 @@ class StrategySessionManager:
                 selected[key] = proposal
         return list(selected.values())
 
-    def _deployment_authorized(self, strategy_id: str) -> tuple[bool, str]:
+    def _algorithm_registry_for_symbol(self, symbol: str) -> Mapping[str, Any]:
+        """Resolved venue policy, preserving explicit test/operator injection."""
+        if self._algorithm_registry is not self._default_algorithm_registry:
+            return self._algorithm_registry
+        market = market_for_symbol(symbol)
+        return self._algorithm_registries.get(market, self._algorithm_registry)
+
+    def _deployment_authorized(
+        self, strategy_id: str, market: str | None = None
+    ) -> tuple[bool, str]:
         """Is this strategy authorised for LIVE deployment (not just enabled)?
 
         Deployment-gated strategies (RVGI box breakout and the three added for the
@@ -3312,7 +3662,8 @@ class StrategySessionManager:
             from app.technical.strategy_algorithms import strategy_live_authorized
 
             if strategy_live_authorized(
-                strategy_id, registry=self._algorithm_registry
+                strategy_id,
+                registry=self._algorithm_registries.get(market, self._algorithm_registry),
             ):
                 return True, ""
         except Exception:  # noqa: BLE001 - a lookup failure must fail closed.
@@ -3320,7 +3671,11 @@ class StrategySessionManager:
         return False, f"STRATEGY_NOT_LIVE_AUTHORIZED:{strategy_id}"
 
     def _directional_deployment_state(
-        self, strategy_id: str, direction: PositionDirection, market: str
+        self,
+        strategy_id: str,
+        direction: PositionDirection,
+        market: str,
+        regime: str | None = None,
     ) -> StrategyDeploymentState:
         """Committed deployment state for one arm.
 
@@ -3352,8 +3707,20 @@ class StrategySessionManager:
         authorise an order, and for a short that is the difference between a journal
         entry and a borrowed position.
         """
+        # Market scope is a hard structural gate shared by every election path.
+        # Enforcing it only in SelectorV2's ontology mask still allowed the legacy
+        # mechanical path to arm a US-only thesis on KRX (and vice versa).
+        try:
+            from app.strategy.registry import default_strategy_registry
+
+            spec = default_strategy_registry().get(strategy_id)
+            if spec is not None and not spec.permits_market(market):
+                return StrategyDeploymentState.DISABLED
+        except Exception:  # noqa: BLE001 - an unreadable scope must fail closed.
+            return StrategyDeploymentState.DISABLED
+
         if direction is PositionDirection.LONG:
-            authorized, _ = self._deployment_authorized(strategy_id)
+            authorized, _ = self._deployment_authorized(strategy_id, market)
             try:
                 from app.technical.strategy_algorithms import strategy_shadow_authorized
                 from app.trading.long_strategy_promotion import (
@@ -3362,11 +3729,15 @@ class StrategySessionManager:
                 )
 
                 if not authorized and not strategy_shadow_authorized(
-                    strategy_id, registry=self._algorithm_registry
+                    strategy_id,
+                    registry=self._algorithm_registries.get(market, self._algorithm_registry),
                 ):
                     return StrategyDeploymentState.DISABLED
                 decision = evaluate_long_promotion(
-                    strategy_id, market, self.performance_store
+                    strategy_id,
+                    market,
+                    self.performance_store,
+                    regime=regime,
                 )
             except Exception:  # noqa: BLE001 - fail closed to SHADOW.
                 return StrategyDeploymentState.SHADOW
@@ -3411,7 +3782,12 @@ class StrategySessionManager:
         direction = parse_direction(strategy_direction(strategy_id))
         product = default_product(direction)
         market = market_for_symbol(symbol)
-        deployment_state = self._directional_deployment_state(strategy_id, direction, market)
+        deployment_state = self._directional_deployment_state(
+            strategy_id,
+            direction,
+            market,
+            regime=self._state.macro_regime,
+        )
         if direction is PositionDirection.LONG:
             return direction, product, deployment_state, None, ()
         snapshot, reasons = self._borrow_context(symbol, now)
@@ -3911,6 +4287,10 @@ class StrategySessionManager:
                 borrow_snapshot=proposal.borrow_snapshot,
             ),
         )
+        if proposal.exit_contract:
+            self._state.election_context["exit_contract"] = dict(
+                proposal.exit_contract
+            )
         # The plan is the durable, immutable output of this election. Building it here —
         # inside _arm, with the account in hand — is what moves cost, sizing and risk in
         # front of the selection instead of behind it. A failure to build one is not
@@ -4059,6 +4439,23 @@ class StrategySessionManager:
             spread_percentile = getattr(macro, "spread_percentile", None)
             if spread_percentile is not None:
                 context["spread_percentile"] = float(spread_percentile)
+            # Directional regime facts are useful to LONG strategies too.  They
+            # previously existed only inside ``_short_election_context``, which
+            # made a long-only defensive-strength thesis impossible to state: the
+            # algorithm could measure residual leadership but could not know that
+            # the broad market was falling.
+            raw_regime = getattr(macro, "market_regime", None)
+            regime = getattr(raw_regime, "value", raw_regime)
+            if regime:
+                context["market_trend"] = str(regime)
+            macro_diagnostics = getattr(macro, "diagnostics", None)
+            breadth = _optional_float(
+                macro_diagnostics.get("market_breadth")
+                if isinstance(macro_diagnostics, Mapping)
+                else None
+            )
+            if breadth is not None:
+                context["market_breadth"] = breadth
         diagnostics = getattr(micro_result, "diagnostics", None)
         if isinstance(diagnostics, Mapping):
             age = diagnostics.get("event_age_seconds")
@@ -4142,86 +4539,30 @@ class StrategySessionManager:
         return context
 
     def _apply_owned_exit_geometry(self, entry_price: float) -> None:
-        """Resolve the elected algorithm's structural exit rule at fill time.
+        """Resolve absolute prices from the exit contract frozen before entry.
 
-        Applies to EVERY elected strategy. It used to special-case
-        ``rvgi_box_breakout`` and give everything else a flat percentage target,
-        which silently discarded each algorithm's own stop/target structure — the
-        docstring already claimed the general behaviour the code did not implement.
-
-        The concrete hazard that exposed it: ``market_intraday_momentum`` shrinks its
-        holding horizon toward the KRX continuous close so the position is flat
-        before the 15:20 single-price auction. With the rule uncalled, that horizon
-        never reached the session state and the position could be carried into the
-        auction — the exact outcome its unit tests forbid.
+        Strategy logic must not run here.  The plan was elected from a complete,
+        point-in-time feature frame; at fill time only the actual paid price is new.
+        Re-running ``exit_rule`` here with a price-only feature object previously
+        changed 4,767s/37.5bps into 300s/16bps while leaving the 245bps target intact.
         """
         state = self._state
         direction = parse_direction(state.selected_direction)
-        if not state.selected_strategy or entry_price <= 0:
-            state.target_price = _directional_target_price(
-                entry_price, state.target_return_rate, direction
-            )
+        if entry_price <= 0:
             return
-        try:
-            from app.technical.signals import TechnicalFeatureSet
-            from app.technical.strategy_algorithms import ElectionContext, get_algorithm
-
-            algorithm = get_algorithm(
-                state.selected_strategy, registry=self._algorithm_registry
-            )
-            if algorithm is None:
-                return
-            allowed = ElectionContext.__dataclass_fields__.keys()
-            payload = {
-                key: value
-                for key, value in state.election_context.items()
-                if key in allowed and key != "elected_at"
-            }
-            payload["strategy_id"] = state.selected_strategy
-            rule = algorithm.exit_rule(
-                entry_price,
-                TechnicalFeatureSet(symbol=state.selected_symbol or "", price=entry_price),
-                ElectionContext(**payload),
-            )
-            # Only ADOPT values the rule actually resolved. The rule is built from a
-            # bare feature set (no realized volatility at fill time), so a
-            # volatility-derived stop comes back as None for most algorithms —
-            # assigning it blindly would DELETE the stop and leave the position
-            # unprotected. The exit-geometry table stays authoritative unless the
-            # algorithm produced something better.
-            if rule.stop_price and rule.stop_price > 0:
-                state.stop_price = rule.stop_price
-            # The algorithm's target is on its own direction's favourable side, and
-            # ``target_return_rate`` is a positive magnitude. Comparing
-            # ``rule.target_price > entry_price`` for a short would read its correct
-            # (lower) target as "no target" and fall back to the geometry floor.
-            algorithm_target_rate = 0.0
-            if rule.target_price and rule.target_price > 0:
-                favourable = (
-                    rule.target_price > entry_price
-                    if direction is PositionDirection.LONG
-                    else rule.target_price < entry_price
-                )
-                if favourable:
-                    algorithm_target_rate = abs(rule.target_price / entry_price - 1.0)
-            state.target_return_rate = max(
-                state.target_return_rate,
-                algorithm_target_rate,
-            )
-            state.target_price = _directional_target_price(
-                entry_price, state.target_return_rate, direction
-            )
-            if rule.trailing_bps and float(rule.trailing_bps) > 0:
-                state.trailing_stop_rate = float(rule.trailing_bps) / 10_000.0
-            # A horizon may only be SHORTENED here. Lengthening it would let an
-            # algorithm quietly overrule the table's holding limit; shortening is how
-            # a session-boxed thesis (flat before the 15:20 auction) is enforced.
-            rule_holding = int(rule.max_holding_seconds or 0)
-            if 0 < rule_holding < int(state.max_holding_seconds or rule_holding):
-                state.max_holding_seconds = rule_holding
-        except Exception:  # noqa: BLE001 - persisted fallback exits remain authoritative.
-            state.target_price = _directional_target_price(
-                entry_price, state.target_return_rate, direction
+        plan = self._trade_plan
+        if plan is not None and plan.strategy_id == state.selected_strategy:
+            rules = plan.exit_rules
+            state.target_return_rate = float(rules.take_profit_rate)
+            state.stop_loss_rate = float(rules.stop_loss_rate)
+            state.trailing_stop_rate = float(rules.trailing_rate or 0.0)
+            state.max_holding_seconds = int(rules.max_holding_seconds)
+        state.target_price = _directional_target_price(
+            entry_price, state.target_return_rate, direction
+        )
+        if not state.stop_price:
+            state.stop_price = _directional_stop_price(
+                entry_price, state.stop_loss_rate, direction
             )
 
     def _fresh_evidence(self, row: Mapping[str, Any], now: datetime) -> bool:
@@ -4391,6 +4732,9 @@ class StrategySessionManager:
         holding_seconds = _optional_float(memo.get("max_holding_seconds"))
         if holding_seconds is not None and holding_seconds > 0:
             state.max_holding_seconds = int(holding_seconds)
+        state.holding_extension_used = bool(memo.get("holding_extension_used", False))
+        extension_seconds = _optional_float(memo.get("holding_extension_seconds"))
+        state.holding_extension_seconds = max(0, int(extension_seconds or 0))
         # The favourable extreme survives too. Reseeding it from the entry would
         # rearm a trailing stop the position had already moved past.
         if direction is PositionDirection.LONG:

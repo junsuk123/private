@@ -75,11 +75,35 @@ async def run_event_driven_kis_websocket_collector(
 ) -> dict[str, Any]:
     """Run KIS ingestion with DB work outside the WebSocket callback."""
     store = collector_kwargs.pop("store", None) or RealtimeMarketDataStore()
+    quant_sink = collector_kwargs.pop("quant_sink", None)
+    quant_activation: dict[str, Any]
+    if quant_sink is None:
+        try:
+            from app.quant.runtime import build_quant_sink
+
+            quant_sink, decision = build_quant_sink(market_store=store)
+            quant_activation = decision.as_dict()
+        except Exception as exc:  # noqa: BLE001 - optional evidence cannot stop KIS ingestion.
+            quant_activation = {
+                "enabled": False,
+                "mode": "auto",
+                "conditions": [],
+                "unavailable_reason": f"{type(exc).__name__}:{exc}",
+            }
+            logger.exception("quant reference layer initialization failed; KIS ingestion continues")
+    else:
+        quant_activation = {
+            "enabled": True,
+            "mode": "injected",
+            "conditions": ["injected_sink"],
+            "unavailable_reason": None,
+        }
     bus = BoundedMarketEventBus(event_bus_capacity)
     runtime = EventDrivenMarketRuntime(
         bus,
         store=store,
         persistence_capacity=persistence_capacity,
+        completed_bar_sink=quant_sink,
     )
     workers = [
         asyncio.create_task(runtime_persistence_worker(runtime))
@@ -177,6 +201,11 @@ async def run_event_driven_kis_websocket_collector(
         "event_runtime": vars(runtime.stats()),
         "mode": "event_driven",
         "slow_intelligence_enabled": slow_service is not None,
+        "quant_reference": (
+            {**quant_activation, **quant_sink.health()}
+            if quant_sink is not None and callable(getattr(quant_sink, "health", None))
+            else quant_activation
+        ),
     }
 
 

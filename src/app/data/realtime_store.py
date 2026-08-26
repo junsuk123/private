@@ -634,9 +634,24 @@ class RealtimeMarketDataStore:
                     "minute_bar",
                     bar.symbol,
                     bar.minute_start.isoformat(),
-                    "realtime_aggregation",
+                    (
+                        "kis_historical_backfill"
+                        if bar.meta.feed_scope.value == "HISTORICAL"
+                        else "realtime_aggregation"
+                    ),
                     json.dumps(
-                        {"close": bar.close, "volume": bar.volume, "trade_count": bar.trade_count},
+                        {
+                            "close": bar.close,
+                            "volume": bar.volume,
+                            "trade_count": bar.trade_count,
+                            "ingested_at": datetime.now(timezone.utc).isoformat(),
+                            "quality_status": (
+                                "VALIDATED_HISTORICAL"
+                                if bar.meta.feed_scope.value == "HISTORICAL"
+                                else "LIVE_AGGREGATED"
+                            ),
+                            "stream_id": bar.stream_id,
+                        },
                         ensure_ascii=True,
                     ),
                 )
@@ -1090,6 +1105,120 @@ class RealtimeMarketDataStore:
             for row in rows
         )
         return tuple(reversed(bars))
+
+    def reconciled_minute_bars(
+        self,
+        symbol: str,
+        since: datetime,
+        *,
+        limit: int = 120,
+        market: str = "",
+    ) -> tuple[RealtimeMinuteBar, ...]:
+        """Return one venue-consistent history with live rows overlaying REST history.
+
+        Historical backfill is a different feed scope and therefore a different
+        ``stream_id``.  :meth:`recent_minute_bars` correctly refuses to mix streams,
+        but rolling indicators need the older official history followed by the live
+        stream.  This method performs that reconciliation explicitly and safely:
+
+        * never combines different market groups or venues;
+        * keeps one row per minute;
+        * prefers tradeable/live rows at the historical-to-live boundary;
+        * leaves metadata intact, so historical rows can never masquerade as a live
+          quote at the execution freshness gate.
+        """
+        requested_market = str(market or "").upper().strip()
+        aliases = {"KRX": "KR", "KR": "KR", "US": "US"}
+        normalized_market = aliases.get(requested_market, requested_market)
+        with closing(self._connect()) as conn:
+            venue_row = conn.execute(
+                """
+                select venue
+                from realtime_minute_bars
+                where symbol = ? and minute_start >= ?
+                  and (? = '' or market_group = ? or market_group = '')
+                  and is_tradeable = 1
+                order by minute_start desc
+                limit 1
+                """,
+                (symbol, since.isoformat(), normalized_market, normalized_market),
+            ).fetchone()
+            if venue_row is None:
+                venue_row = conn.execute(
+                    """
+                    select venue
+                    from realtime_minute_bars
+                    where symbol = ? and minute_start >= ?
+                      and (? = '' or market_group = ? or market_group = '')
+                    group by venue
+                    order by count(*) desc, max(minute_start) desc
+                    limit 1
+                    """,
+                    (symbol, since.isoformat(), normalized_market, normalized_market),
+                ).fetchone()
+            if venue_row is None:
+                return ()
+            selected_venue = str(venue_row[0] or "UNKNOWN")
+            rows = conn.execute(
+                """
+                select symbol, minute_start, open, high, low, close, volume, vwap,
+                       trade_count, spread_bps, orderbook_imbalance, liquidity_score,
+                       volatility, last_update_age_ms, source_record_ids_json,
+                       """ + _METADATA_SELECT + """
+                from realtime_minute_bars
+                where symbol = ? and minute_start >= ? and venue = ?
+                  and (? = '' or market_group = ? or market_group = '')
+                order by minute_start desc
+                limit ?
+                """,
+                (
+                    symbol,
+                    since.isoformat(),
+                    selected_venue,
+                    normalized_market,
+                    normalized_market,
+                    max(int(limit) * 3, int(limit)),
+                ),
+            ).fetchall()
+        candidates = [
+            RealtimeMinuteBar(
+                symbol=row[0],
+                minute_start=_parse_dt(row[1]),
+                open=float(row[2]),
+                high=float(row[3]),
+                low=float(row[4]),
+                close=float(row[5]),
+                volume=int(row[6]),
+                vwap=float(row[7]),
+                trade_count=int(row[8]),
+                spread_bps=float(row[9]),
+                orderbook_imbalance=float(row[10]),
+                liquidity_score=float(row[11]),
+                volatility=float(row[12]),
+                last_update_age_ms=float(row[13]),
+                source_record_ids=tuple(json.loads(row[14] or "[]")),
+                meta=_metadata_from_tail(row, 15),
+            )
+            for row in rows
+        ]
+        if not candidates:
+            return ()
+        by_minute: dict[datetime, RealtimeMinuteBar] = {}
+        for bar in candidates:
+            old = by_minute.get(bar.minute_start)
+            rank = (
+                int(bar.meta.is_tradeable),
+                int(bar.meta.feed_scope.value != "HISTORICAL"),
+                bar.trade_count,
+            )
+            old_rank = (
+                int(old.meta.is_tradeable),
+                int(old.meta.feed_scope.value != "HISTORICAL"),
+                old.trade_count,
+            ) if old is not None else (-1, -1, -1)
+            if rank > old_rank:
+                by_minute[bar.minute_start] = bar
+        return tuple(sorted(by_minute.values(), key=lambda bar: bar.minute_start)[-max(1, int(limit)):])
 
     def counts_since(self, symbol: str, since: datetime) -> tuple[int, int]:
         with closing(self._connect()) as conn:

@@ -29,6 +29,7 @@ from app.models.strategy_utility.strategy_graph import (
     diagonal_strategy_mask,
     strategy_node_features,
     strategy_relation_adjacency,
+    strategy_ids_for_market,
 )
 from app.ontology.operational_gate import (
     ClosedWorldOntologyGate,
@@ -235,6 +236,7 @@ class ShadowIntelligenceService:
         self.upside_supervised_strategy_ids: tuple[str, ...] = ()
         self.upside_authorized_strategy_markets: dict[str, tuple[str, ...]] = {}
         self.live_authorized = False
+        self.live_authorized_markets: tuple[str, ...] = ()
         self.authorization_scope = "none"
         self.checkpoint_hash: str | None = None
         if self.checkpoint_loaded:
@@ -255,6 +257,18 @@ class ShadowIntelligenceService:
                     str(item) for item in metadata.get("strategy_ids", ())
                 )
                 self.live_authorized = bool(metadata.get("live_authorized"))
+                declared_markets = metadata.get("live_authorized_markets")
+                if isinstance(declared_markets, (list, tuple)):
+                    self.live_authorized_markets = tuple(
+                        market
+                        for market in (str(item).upper() for item in declared_markets)
+                        if market in {"KRX", "US"}
+                    )
+                    self.live_authorized = bool(self.live_authorized_markets)
+                elif self.live_authorized:
+                    # Legacy cards carried only the aggregate flag. Newly trained
+                    # cards always carry explicit market authority.
+                    self.live_authorized_markets = ("KRX", "US")
                 self.authorization_scope = str(
                     metadata.get("authorization_scope") or "none"
                 )
@@ -329,6 +343,10 @@ class ShadowIntelligenceService:
             )
         )
 
+    def _checkpoint_live_authorized_for(self, symbol: str) -> bool:
+        market = "KRX" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US"
+        return market in self.live_authorized_markets
+
     def evaluate(
         self,
         snapshot: SlowIntelligenceSnapshot,
@@ -382,6 +400,9 @@ class ShadowIntelligenceService:
         )
         realtime_trust = self.trust_evaluator.evaluate(snapshot.as_of)
         npu_evidence: tuple[StrategyUtilityEvidence, ...] = ()
+        checkpoint_live_authorized = self._checkpoint_live_authorized_for(
+            snapshot.symbol
+        )
         decisions = [
             ShadowDecision("legacy", legacy_action, None, None, ("LEGACY_OBSERVED",)),
             ShadowDecision(
@@ -401,7 +422,7 @@ class ShadowIntelligenceService:
                 realtime_trust=realtime_trust,
                 evidence=cpu_evidence,
                 checkpoint_hash=self.checkpoint_hash,
-                checkpoint_live_authorized=self.live_authorized,
+                checkpoint_live_authorized=checkpoint_live_authorized,
             ),
         ]
         if self.npu is not None:
@@ -420,7 +441,7 @@ class ShadowIntelligenceService:
                     realtime_trust=realtime_trust,
                     evidence=npu_evidence,
                     checkpoint_hash=self.checkpoint_hash,
-                    checkpoint_live_authorized=self.live_authorized,
+                    checkpoint_live_authorized=checkpoint_live_authorized,
                 )
             )
         comparison = self.recorder.compare(
@@ -432,7 +453,7 @@ class ShadowIntelligenceService:
                 cpu_evidence,
                 checkpoint_hash=self.checkpoint_hash,
                 realtime_trust=realtime_trust,
-                checkpoint_live_authorized=self.live_authorized,
+                checkpoint_live_authorized=checkpoint_live_authorized,
             ),
         )
         return ShadowIntelligenceResult(
@@ -472,13 +493,15 @@ class ShadowIntelligenceService:
             "tradable": _fact(snapshot, "tradable", snapshot.tradable),
         }
         compatibility, expressible = _compatibility_with_provenance(snapshot.features)
+        market_strategy_ids = set(strategy_ids_for_market(snapshot.symbol))
         for strategy_id in STRATEGY_IDS:
             compatibility_score = compatibility.get(strategy_id, 0.0)
             unavailable = strategy_id not in expressible
             facts[f"allow:{strategy_id}"] = _fact(
                 snapshot,
                 f"allow:{strategy_id}",
-                strategy_id in snapshot.allowed_strategy_ids,
+                strategy_id in snapshot.allowed_strategy_ids
+                and strategy_id in market_strategy_ids,
             )
             facts[f"compat:{strategy_id}"] = _fact(
                 snapshot,
@@ -519,13 +542,21 @@ class ShadowIntelligenceService:
 
     def _inputs(self, snapshot: SlowIntelligenceSnapshot, allowed: tuple[str, ...]):
         if self.graph_mode:
+            allowed = tuple(
+                strategy_id
+                for strategy_id in allowed
+                if strategy_id in set(strategy_ids_for_market(snapshot.symbol))
+            )
             x = strategy_node_features(snapshot.features).reshape(
                 1,
                 1,
                 STRATEGY_NODE_COUNT,
                 -1,
             )
-            adjacency = strategy_relation_adjacency(allowed).reshape(
+            adjacency = strategy_relation_adjacency(
+                allowed,
+                market=snapshot.symbol,
+            ).reshape(
                 1,
                 1,
                 len(RELATION_NAMES),

@@ -38,9 +38,15 @@ _REVERSION = {
 
 def strategy_relation_adjacency(
     allowed_strategy_ids: tuple[str, ...] = STRATEGY_IDS,
+    *,
+    market: str | None = None,
 ) -> np.ndarray:
-    """Ontology-defined topology; numeric message weights are learned by R-GCN."""
-    allowed = set(allowed_strategy_ids)
+    """Ontology-defined topology for the active target-market subgraph.
+
+    Relation transforms remain shared. What changes is the active graph: a thesis
+    whose ontology scope excludes the target market cannot send or receive messages.
+    """
+    allowed = set(allowed_strategy_ids) & set(strategy_ids_for_market(market))
     adjacency = np.zeros(
         (len(RELATION_NAMES), STRATEGY_NODE_COUNT, STRATEGY_NODE_COUNT),
         dtype=np.float32,
@@ -72,6 +78,38 @@ def strategy_relation_adjacency(
         degrees,
         out=np.zeros_like(adjacency),
         where=degrees > 0,
+    )
+
+
+def strategy_ids_for_market(market: str | None) -> tuple[str, ...]:
+    """Return strategies whose ontology permits a market name or symbol."""
+    if market is None:
+        return STRATEGY_IDS
+    text = str(market or "").strip().upper()
+    market_key = (
+        "KR"
+        if text in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}
+        or (text.isdigit() and len(text) == 6)
+        else "US"
+    )
+    # Avoid making technical algorithm configuration an import-time dependency.
+    from app.strategy.registry import default_strategy_registry
+
+    registry = default_strategy_registry()
+    return tuple(
+        strategy_id
+        for strategy_id in STRATEGY_IDS
+        if (spec := registry.get(strategy_id)) is not None
+        and spec.permits_market(market_key)
+    )
+
+
+def strategy_market_mask(market: str | None) -> np.ndarray:
+    """One ontology market-applicability value per strategy node."""
+    allowed = set(strategy_ids_for_market(market))
+    return np.asarray(
+        [1.0 if strategy_id in allowed else 0.0 for strategy_id in STRATEGY_IDS],
+        dtype=np.float32,
     )
 
 

@@ -9,12 +9,16 @@ for finding exactly the trades the executor loses on.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.live_training_pipeline import (
     _label_barriers,
+    _load_trade_plan_label_contracts,
+    _observed_cost_bps,
     _row_market,
+    _trade_plan_contract_for_frame,
     build_live_training_rows_from_feature_journal,
 )
 from app.strategy.exit_geometry import exit_geometry
@@ -113,6 +117,18 @@ def test_market_is_recorded_on_every_row(tmp_path, monkeypatch):
     assert _row_market("MSFT") == "US"
 
 
+def test_label_cost_uses_shared_all_in_round_trip(monkeypatch):
+    seen = {}
+
+    def fake_all_in(symbol, *, spread_bps=None, fallback_bps=0.0):
+        seen.update(symbol=symbol, spread_bps=spread_bps)
+        return 73.7
+
+    monkeypatch.setattr("app.cost.round_trip.all_in_round_trip_bps", fake_all_in)
+    assert _observed_cost_bps(_frame("AAPL", 0, 200.0)) == 73.7
+    assert seen == {"symbol": "AAPL", "spread_bps": 5.0}
+
+
 def test_per_strategy_labels_use_each_strategys_own_barriers(tmp_path, monkeypatch):
     monkeypatch.setenv("LIVE_LABEL_PER_STRATEGY", "true")
     monkeypatch.setenv("LIVE_LABEL_MARKET_ADJUST", "false")
@@ -148,3 +164,39 @@ def test_per_strategy_labels_are_off_by_default(tmp_path, monkeypatch):
     assert rows
     assert "strategy_labels" not in rows[0]
     assert rows[0]["label_basis"].startswith("strategy_exit_geometry:")
+
+
+def test_trade_plan_contract_is_the_label_authority_for_its_signal_frame(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "trading_state.sqlite3"
+    payload = {
+        "take_profit_rule": {"rate": 0.008},
+        "stop_loss_rule": {"rate": 0.0035},
+        "time_exit": {"max_holding_seconds": 240},
+    }
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "create table trade_plan (plan_id text, created_at text, symbol text, "
+            "strategy_id text, payload_json text)"
+        )
+        conn.execute(
+            "insert into trade_plan values (?, ?, ?, ?, ?)",
+            (
+                "plan-exact",
+                (NOW + timedelta(seconds=4)).isoformat(),
+                "005930",
+                "adaptive_anchored_vwap_reversion",
+                json.dumps(payload),
+            ),
+        )
+    monkeypatch.setenv("TRADE_PLAN_LABEL_STORE_PATH", str(database))
+
+    contracts = _load_trade_plan_label_contracts()
+    contract = _trade_plan_contract_for_frame("005930", NOW, contracts)
+
+    assert contract is not None
+    assert contract["plan_id"] == "plan-exact"
+    assert contract["take_profit_bps"] == 80.0
+    assert contract["stop_loss_bps"] == 35.0
+    assert contract["horizon_seconds"] == 240.0

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.cost import TradingCostEngine
+from app.cost.round_trip import all_in_round_trip_bps
 from app.trading.contracts import Bar, TradePlan
 from app.trading.directional import (
     PositionDirection,
@@ -15,6 +16,7 @@ from app.trading.directional import (
     trailing_breached,
     trailing_price,
 )
+from app.cost.cost_coverage import minimum_trailing_net_bps
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class EventDrivenFillSimulator:
         venue: str = "KRX",
         market: str = "KR",
         instrument_type: str = "domestic_stock",
+        spread_bps: float | None = None,
     ) -> CounterfactualOutcome:
         future = tuple(
             sorted(
@@ -93,13 +96,20 @@ class EventDrivenFillSimulator:
             entry_price=limit,
             expected_exit_price=limit,
             quantity=plan.proposed_quantity,
+            orderbook_snapshot=_orderbook_from_spread(limit, spread_bps),
         )
-        trailing_activation_bps = (
-            baseline_cost.total_cost_rate * 10_000.0
-            + max(
-                0.0,
-                float(plan.trailing_policy.get("minimum_net_bps", 5.0)),
-            )
+        baseline_cost_bps = all_in_round_trip_bps(
+            plan.symbol,
+            spread_bps=spread_bps,
+            fallback_bps=baseline_cost.total_cost_rate * 10_000.0,
+        )
+        target_gross_bps = gross_return_bps(limit, target, direction)
+        trailing_activation_bps = baseline_cost_bps + minimum_trailing_net_bps(
+            target_gross_bps,
+            baseline_cost_bps,
+            configured_floor_bps=float(
+                plan.trailing_policy.get("minimum_net_bps", 5.0)
+            ),
         )
         deadline = entry_bar.start_time.timestamp() + plan.max_holding_seconds
         exit_price = entry_bar.close
@@ -171,6 +181,7 @@ class EventDrivenFillSimulator:
             entry_price=limit,
             expected_exit_price=exit_price,
             quantity=plan.proposed_quantity,
+            orderbook_snapshot=_orderbook_from_spread(limit, spread_bps),
         )
         if direction is PositionDirection.LONG:
             mae_bps = min((low / limit - 1 for low in lows), default=0.0) * 10_000
@@ -178,7 +189,14 @@ class EventDrivenFillSimulator:
         else:
             mae_bps = min((1 - high / limit for high in highs), default=0.0) * 10_000
             mfe_bps = max((1 - low / limit for low in lows), default=0.0) * 10_000
-        cost_bps = cost.total_cost_rate * 10_000
+        # Labels must pay the same point-in-time all-in round trip used by live
+        # selection. The fee engine alone neither applies the venue-tape floor nor
+        # knows the stored spread unless it is supplied explicitly.
+        cost_bps = all_in_round_trip_bps(
+            plan.symbol,
+            spread_bps=spread_bps,
+            fallback_bps=cost.total_cost_rate * 10_000.0,
+        )
         return CounterfactualOutcome(
             as_of=as_of,
             symbol=plan.symbol,
@@ -251,3 +269,18 @@ def _empty_outcome(
         mfe_bps=0,
         holding_seconds=0,
     )
+
+
+def _orderbook_from_spread(
+    price: float,
+    spread_bps: float | None,
+) -> dict[str, float] | None:
+    """Reconstruct the book shape the cost engine expects from a stored spread."""
+    if price <= 0.0 or spread_bps is None or spread_bps <= 0.0:
+        return None
+    half_spread = price * float(spread_bps) / 20_000.0
+    bid = price - half_spread
+    ask = price + half_spread
+    if bid <= 0.0 or ask <= bid:
+        return None
+    return {"bid_price": bid, "ask_price": ask}

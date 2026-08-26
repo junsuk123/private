@@ -40,6 +40,7 @@ MODEL_FEATURE_DRIFT = "MODEL_FEATURE_DRIFT_EXCEEDED"
 MODEL_CONSECUTIVE_NEGATIVE_CHALLENGERS = "MODEL_CONSECUTIVE_NEGATIVE_CHALLENGERS"
 MODEL_REGIME_MISMATCH = "MODEL_REGIME_MISMATCH"
 MODEL_CREATED_AT_UNKNOWN = "MODEL_CREATED_AT_UNKNOWN"
+MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL = "MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL"
 MODEL_FRESH = "MODEL_FRESH"
 
 
@@ -181,6 +182,19 @@ def evaluate_model_staleness(
     if drift is not None and drift > cfg.max_feature_drift_score:
         reasons.append(MODEL_FEATURE_DRIFT)
 
+    metrics = payload.get("metrics") or {}
+    # New artifacts evaluate the exact two-head runtime policy. A large general
+    # validation set can still leave only one row that the runtime would actually
+    # admit; one lucky row is not live evidence. Legacy artifacts did not record
+    # the alignment flag, so this cannot retroactively reinterpret their metrics.
+    if _finite(metrics.get("runtime_policy_aligned_evaluation")) == 1.0:
+        deployable_count = _finite(metrics.get("top_k_count")) or 0.0
+        minimum_deployable = max(
+            2, _env_int("LIVE_MODEL_MIN_DEPLOYABLE_HOLDOUT_ROWS", 10)
+        )
+        if deployable_count < minimum_deployable:
+            reasons.append(MODEL_DEPLOYABLE_SAMPLE_TOO_SMALL)
+
     negative_streak = consecutive_negative_challengers
     if negative_streak is None:
         negative_streak = 0
@@ -221,6 +235,9 @@ def evaluate_model_staleness(
             "max_age_seconds": cfg.max_age_seconds,
             "max_feature_drift_score": cfg.max_feature_drift_score,
             "consecutive_negative_challenger_limit": cfg.consecutive_negative_challengers,
+            "minimum_deployable_holdout_rows": max(
+                2, _env_int("LIVE_MODEL_MIN_DEPLOYABLE_HOLDOUT_ROWS", 10)
+            ),
         },
     )
 

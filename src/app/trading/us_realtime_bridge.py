@@ -294,7 +294,26 @@ def _first_float(mapping: dict[str, Any], *keys: str) -> float | None:
 
 def _fetch_overseas_quote(symbol: str, market_hint: str = "") -> dict[str, Any]:
     exchange = _exchange_code(symbol, market_hint)
-    params = {"AUTH": "", "EXCD": exchange, "SYMB": symbol.upper()}
+    # KIS publishes the daytime book under the BA* exchange family. Querying the
+    # otherwise-correct NAS/NYS/AMS code during that window succeeds (rt_cd=0) but
+    # returns pbid1=pask1=0, so the bridge used to report every symbol as an
+    # INVALID_BID_ASK_FIELDS error.  Use the same canonical session mapping as the
+    # overseas WebSocket subscriber instead of treating a syntactically successful
+    # empty night book as live data.
+    try:
+        from app.data.kis_realtime import (
+            US_DAYTIME_EXCHANGE_CODES,
+            is_us_daytime_quote_session,
+        )
+
+        quote_exchange = (
+            US_DAYTIME_EXCHANGE_CODES.get(exchange, exchange)
+            if is_us_daytime_quote_session()
+            else exchange
+        )
+    except Exception:  # noqa: BLE001 - session lookup fails closed to the base venue.
+        quote_exchange = exchange
+    params = {"AUTH": "", "EXCD": quote_exchange, "SYMB": symbol.upper()}
 
     detail = _kis_get(
         "/uapi/overseas-price/v1/quotations/price-detail",
@@ -316,7 +335,7 @@ def _fetch_overseas_quote(symbol: str, market_hint: str = "") -> dict[str, Any]:
 
     return {
         "symbol": symbol.upper(),
-        "exchange": exchange,
+        "exchange": quote_exchange,
         "detail": detail,
         "orderbook": orderbook,
         "orderbook_errors": errors,

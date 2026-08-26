@@ -88,14 +88,23 @@ def test_short_direction_sign_is_applied_once() -> None:
 
 
 def test_trailing_stop_arms_only_after_a_favourable_move() -> None:
-    position = _position(trailing_bps=50.0, target_price=200.0, stop_price=1.0)
+    position = _position(trailing_bps=50.0, target_price=101.6, stop_price=99.4)
     # Straight down from entry: the trailing stop must not fire from the entry price.
     assert position.update(99.8, AT + timedelta(seconds=5)) is None
     # Up, then back through the trail.
-    assert position.update(101.0, AT + timedelta(seconds=10)) is None
-    outcome = position.update(100.3, AT + timedelta(seconds=15))
+    assert position.update(101.5, AT + timedelta(seconds=10)) is None
+    outcome = position.update(100.8, AT + timedelta(seconds=15))
     assert outcome is not None
     assert outcome.exit_reason == ShadowExitReason.TRAILING
+
+
+def test_trailing_does_not_turn_target_geometry_into_a_tiny_win() -> None:
+    position = _position(trailing_bps=50.0, target_price=101.6, stop_price=99.4)
+    assert position.update(101.0, AT + timedelta(seconds=10)) is None
+
+    # The old shadow resolver exited here for about +21bp net while a stopped
+    # loser pays roughly -88bp. That payoff asymmetry contaminated realtime trust.
+    assert position.update(100.3, AT + timedelta(seconds=15)) is None
 
 
 def test_quote_before_the_signal_cannot_resolve_a_position() -> None:

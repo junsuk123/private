@@ -90,6 +90,7 @@ def resolve_universe(
     hysteresis_multiplier: float = DEFAULT_HYSTERESIS_MULTIPLIER,
     names: Mapping[str, str] | None = None,
     derivatives_allowed: bool = False,
+    etf_allowed: bool = False,
     leverage_etf_allowed: bool = False,
 ) -> UniverseDecision:
     """Hold one KRX universe for the whole session instead of re-picking it.
@@ -149,6 +150,7 @@ def resolve_universe(
             resolved_names,
             market="KR",
             derivatives_allowed=derivatives_allowed,
+            etf_allowed=etf_allowed,
             leverage_etf_allowed=leverage_etf_allowed,
         )
 

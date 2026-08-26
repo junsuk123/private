@@ -126,3 +126,8 @@ def test_any_open_buy_blocks_election_of_additional_entry_risk():
     assert result["buy_disabled"] is True
     assert result["buy_disabled_reason"] == "OPEN_BUY_ORDER_PENDING"
     assert result["open_buy_order_symbols"] == ["FIRST"]
+
+    engine._open_buy_orders.clear()
+    engine.run_once()
+
+    assert engine.get_status()["buy_disabled_reason"] is None
