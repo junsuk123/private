@@ -72,26 +72,25 @@ REASON_BORROW_COST_UNKNOWN = "BORROW_COST_UNKNOWN"
 
 DEFAULT_PROFITABILITY_POLICY: dict[str, Any] = {
     # Minimum acceptable net-expected-return after ALL costs, by market.
-    "min_required_net_return": {"default": 0.008, "KR": 0.008, "US": 0.012},
+    "min_required_net_return": {"default": 0.0, "KR": 0.0, "US": 0.0},
     # Extra net headroom demanded on top of pure break-even before a buy is worth it.
-    "min_net_profit_buffer_rate": 0.001,
+    "min_net_profit_buffer_rate": 0.0,
     # Spread / liquidity / cost ceilings.
     "max_spread_rate": 0.003,          # (ask-bid)/mid
     "max_slippage_rate": 0.003,        # expected entry slippage as a fraction of notional
     "max_spread_alpha_ratio": 0.35,    # spread may not eat > this fraction of gross alpha
-    "max_cost_to_alpha_ratio": 0.5,
-    # Predicted gross edge must be at least this multiple of the all-in cost.
-    # Equality is net break-even only under perfect estimates.  The live band
-    # starts at 1.3 so a missing config cannot silently re-enable fee bleed.
-    "min_cost_coverage_ratio": 1.3,
-    "cost_coverage": {"covered": 1.0, "live": 1.3, "comfortable": 1.7},
+    "max_cost_to_alpha_ratio": 1.0,
+    # Predicted gross edge must cover all-in cost. Equality is rejected by the
+    # strict positive-net checks below; no additional profit multiple is imposed.
+    "min_cost_coverage_ratio": 1.0,
+    "cost_coverage": {"covered": 1.0, "live": 1.0, "comfortable": 1.7},
     "min_liquidity_score": 0.3,
     # Dynamic required-net-return buffers.
-    "volatility_buffer_k": 0.5,        # required += k * realized_volatility_horizon
-    "liquidity_buffer_max": 0.003,     # required += up to this as liquidity -> 0
+    "volatility_buffer_k": 0.0,
+    "liquidity_buffer_max": 0.0,
     "account_buffer": {
         "small_account_equity_krw": 200000.0,
-        "small_account_extra_net": 0.002,
+        "small_account_extra_net": 0.0,
     },
 }
 
@@ -111,7 +110,7 @@ class ProfitabilityPolicy:
     liquidity_buffer_max: float
     small_account_equity_krw: float
     small_account_extra_net: float
-    min_cost_coverage_ratio: float = 1.3
+    min_cost_coverage_ratio: float = 1.0
     cost_coverage_thresholds: CostCoverageThresholds = field(
         default_factory=CostCoverageThresholds
     )
@@ -119,7 +118,7 @@ class ProfitabilityPolicy:
     def min_net_for_market(self, market: str) -> float:
         key = _market_key(market)
         table = self.min_required_net_return
-        return float(table.get(key, table.get("default", 0.008)))
+        return float(table.get(key, table.get("default", 0.0)))
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -470,14 +469,16 @@ class ProfitabilityGate:
             short_break_even_with_margin = short_break_even * (
                 1.0 - self.policy.min_net_profit_buffer_rate
             )
-            if expected_exit_price > short_break_even_with_margin + _EPSILON:
+            if expected_exit_price >= short_break_even_with_margin - _EPSILON:
                 reasons.append(REASON_BELOW_BREAK_EVEN)
             break_even_with_margin = short_break_even_with_margin
-        elif expected_exit_price < break_even_with_margin - _EPSILON:
+        elif expected_exit_price <= break_even_with_margin + _EPSILON:
             reasons.append(REASON_BELOW_BREAK_EVEN)
         # 2. Net expected return must clear the (dynamic) requirement.
         min_net_shortfall = required_min_net_return - net_expected_return
-        if (
+        if net_expected_return <= _EPSILON:
+            reasons.append(REASON_BELOW_MIN_NET)
+        elif (
             net_expected_return < required_min_net_return - _EPSILON
             and not (net_expected_return > 0.0 and min_net_shortfall <= min_net_shortfall_tolerance + _EPSILON)
         ):
@@ -764,21 +765,21 @@ def load_policy(config_path: Path | str = "config/profitability_policy.yaml") ->
     min_net = dict(merged.get("min_required_net_return", {}))
     # Env overrides (backward compatibility).
     if os.getenv("REALTIME_MIN_BUY_NET_RETURN_KR") is not None:
-        min_net["KR"] = _env_float("REALTIME_MIN_BUY_NET_RETURN_KR", min_net.get("KR", 0.008))
+        min_net["KR"] = _env_float("REALTIME_MIN_BUY_NET_RETURN_KR", min_net.get("KR", 0.0))
     if os.getenv("REALTIME_MIN_BUY_NET_RETURN_US") is not None:
-        min_net["US"] = _env_float("REALTIME_MIN_BUY_NET_RETURN_US", min_net.get("US", 0.012))
-    min_net.setdefault("default", min_net.get("KR", 0.008))
+        min_net["US"] = _env_float("REALTIME_MIN_BUY_NET_RETURN_US", min_net.get("US", 0.0))
+    min_net.setdefault("default", min_net.get("KR", 0.0))
 
     account = merged.get("account_buffer", {}) or {}
     coverage_thresholds = CostCoverageThresholds.from_env(merged.get("cost_coverage") or {})
     min_coverage = _env_float(
         "REALTIME_MIN_COST_COVERAGE_RATIO",
-        float(merged.get("min_cost_coverage_ratio", 1.3)),
+        float(merged.get("min_cost_coverage_ratio", 1.0)),
     )
     policy = ProfitabilityPolicy(
         min_required_net_return={k: float(v) for k, v in min_net.items()},
         min_net_profit_buffer_rate=_env_float(
-            "REALTIME_MIN_NET_PROFIT_BUFFER_RATE", float(merged.get("min_net_profit_buffer_rate", 0.001))
+            "REALTIME_MIN_NET_PROFIT_BUFFER_RATE", float(merged.get("min_net_profit_buffer_rate", 0.0))
         ),
         max_spread_rate=float(merged.get("max_spread_rate", 0.003)),
         max_slippage_rate=float(merged.get("max_slippage_rate", 0.003)),

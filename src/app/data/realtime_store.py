@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -8,6 +8,8 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from app.paths import realtime_market_database_path
 
 from app.data.realtime_types import (
     FeedMetadata,
@@ -92,10 +94,10 @@ def _metadata_from_tail(row: Any, start: int) -> FeedMetadata:
 
 
 class RealtimeMarketDataStore:
-    _last_prune_monotonic = 0.0
-
-    def __init__(self, db_path: str | Path = "data/store/realtime_market_data.sqlite3") -> None:
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        self.db_path = (
+            Path(db_path) if db_path is not None else realtime_market_database_path()
+        )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
 
@@ -209,11 +211,14 @@ class RealtimeMarketDataStore:
             )
             conn.commit()
             self._migrate(conn)
-        now = time.monotonic()
-        if now - self.__class__._last_prune_monotonic >= 3600:
-            self.prune_operational_history()
-            self.prune_market_history()
-            self.__class__._last_prune_monotonic = now
+        # No retention prune here. init_db runs on every construction, so pruning from it
+        # deleted past-retention rows in the same call that had just migrated them
+        # forward -- schema_migrations then recorded rows_before == rows_after for rows
+        # that were already gone, and a caller could not observe the migration result at
+        # all. It was gated on a class attribute starting at 0.0 compared against
+        # time.monotonic() (time since boot), so it fired on the first construction in
+        # every process. Retention now runs on a schedule from
+        # _prune_realtime_store_history in app/web.py, next to the WAL checkpoint.
 
     # ------------------------------------------------------------------ #
     # 스키마 마이그레이션
@@ -251,6 +256,7 @@ class RealtimeMarketDataStore:
 
         기존 행은 어느 venue/session 에서 왔는지 알 수 없으므로 ``metadata_inferred=1``
         로 표시된다. 그 행들은 신규 진입 근거와 high-trust 학습 표본에서 제외된다.
+
         """
         current = self._current_version(conn)
         if current >= SCHEMA_VERSION:
@@ -634,24 +640,9 @@ class RealtimeMarketDataStore:
                     "minute_bar",
                     bar.symbol,
                     bar.minute_start.isoformat(),
-                    (
-                        "kis_historical_backfill"
-                        if bar.meta.feed_scope.value == "HISTORICAL"
-                        else "realtime_aggregation"
-                    ),
+                    "realtime_aggregation",
                     json.dumps(
-                        {
-                            "close": bar.close,
-                            "volume": bar.volume,
-                            "trade_count": bar.trade_count,
-                            "ingested_at": datetime.now(timezone.utc).isoformat(),
-                            "quality_status": (
-                                "VALIDATED_HISTORICAL"
-                                if bar.meta.feed_scope.value == "HISTORICAL"
-                                else "LIVE_AGGREGATED"
-                            ),
-                            "stream_id": bar.stream_id,
-                        },
+                        {"close": bar.close, "volume": bar.volume, "trade_count": bar.trade_count},
                         ensure_ascii=True,
                     ),
                 )
@@ -699,36 +690,6 @@ class RealtimeMarketDataStore:
                 int(health.depth_level_count),
             ),
         )
-
-    def checkpoint_wal(self) -> int | None:
-        """Fully checkpoint and truncate the write-ahead log.
-
-        Returns the bytes reclaimed, or ``None`` when the WAL could not be reset
-        (a reader still holds an older snapshot). Never raises for that case: it
-        is a normal outcome and the caller retries later.
-
-        ``TRUNCATE`` is deliberate. ``wal_autocheckpoint`` copies frames back into
-        the database but cannot shrink the WAL file while any reader is attached,
-        and this store always has readers, so the file grew for a whole session
-        (~16MB/min, observed at 282MB) until every reader was searching a huge WAL
-        index and ``recent_minute_bars`` effectively hung.
-        """
-        wal_path = Path(f"{self.db_path}-wal")
-        try:
-            before = wal_path.stat().st_size
-        except OSError:
-            before = 0
-        with closing(self._connect()) as conn:
-            try:
-                conn.execute("pragma wal_checkpoint(truncate)")
-            except sqlite3.OperationalError:
-                # Busy: another connection holds the write lock right now.
-                return None
-        try:
-            after = wal_path.stat().st_size
-        except OSError:
-            after = 0
-        return max(0, before - after)
 
     def prune_operational_history(self, *, retention_hours: int | None = None) -> int:
         hours = (
@@ -800,6 +761,42 @@ class RealtimeMarketDataStore:
             except sqlite3.OperationalError:
                 pass
             return int(conn.total_changes - before)
+
+    def checkpoint_wal(self) -> int | None:
+        """Checkpoint and truncate this store's write-ahead log; return bytes reclaimed.
+
+        ``wal_autocheckpoint`` only fires on a writer's commit and can never reset the
+        file while any reader holds an older snapshot -- and this store always has
+        readers (the trading engine, the feature frames, the dashboards). Left alone the
+        WAL grows for the whole session, and every reader then pays to search an
+        ever-larger WAL index. See ``_checkpoint_realtime_store_wal`` in app/web.py for
+        the measured failure this prevents.
+
+        ``TRUNCATE`` rather than ``PASSIVE``: passive leaves the file in place even when
+        it copies nearly every frame, and the file size is the part that hurts.
+
+        Returns ``None`` when the checkpoint could not complete -- SQLite reports busy
+        while another connection is mid-write -- so the caller does not report a
+        reclaim that did not happen. The next pass retries; nothing is lost by waiting.
+        """
+        wal_path = self.db_path.with_name(self.db_path.name + "-wal")
+        try:
+            before = wal_path.stat().st_size
+        except OSError:
+            before = 0
+        with closing(self._connect()) as conn:
+            try:
+                row = conn.execute("pragma wal_checkpoint(truncate)").fetchone()
+            except sqlite3.OperationalError:
+                return None
+        # (busy, log_frames, checkpointed_frames); busy=1 means it did not run.
+        if row is not None and int(row[0]) != 0:
+            return None
+        try:
+            after = wal_path.stat().st_size
+        except OSError:
+            after = 0
+        return max(0, before - after)
 
     def backfill_source_events(self, *, retention_hours: int | None = None) -> int:
         hours = max(
@@ -1112,53 +1109,21 @@ class RealtimeMarketDataStore:
         since: datetime,
         *,
         limit: int = 120,
-        market: str = "",
+        market: str | None = None,
     ) -> tuple[RealtimeMinuteBar, ...]:
-        """Return one venue-consistent history with live rows overlaying REST history.
+        """Join historical coverage with live bars without crossing venues.
 
-        Historical backfill is a different feed scope and therefore a different
-        ``stream_id``.  :meth:`recent_minute_bars` correctly refuses to mix streams,
-        but rolling indicators need the older official history followed by the live
-        stream.  This method performs that reconciliation explicitly and safely:
-
-        * never combines different market groups or venues;
-        * keeps one row per minute;
-        * prefers tradeable/live rows at the historical-to-live boundary;
-        * leaves metadata intact, so historical rows can never masquerade as a live
-          quote at the execution freshness gate.
+        A single-stream read cannot warm a model from history and then overlay
+        the live boundary.  Select the best-covered exchange first, then choose
+        the highest-trust row for each minute (live/tradeable beats historical).
         """
-        requested_market = str(market or "").upper().strip()
-        aliases = {"KRX": "KR", "KR": "KR", "US": "US"}
-        normalized_market = aliases.get(requested_market, requested_market)
+        market_value = str(getattr(market, "value", market) or "").upper()
+        where = "symbol = ? and minute_start >= ?"
+        params: list[Any] = [symbol, since.isoformat()]
+        if market_value:
+            where += " and market_group = ?"
+            params.append(market_value)
         with closing(self._connect()) as conn:
-            venue_row = conn.execute(
-                """
-                select venue
-                from realtime_minute_bars
-                where symbol = ? and minute_start >= ?
-                  and (? = '' or market_group = ? or market_group = '')
-                  and is_tradeable = 1
-                order by minute_start desc
-                limit 1
-                """,
-                (symbol, since.isoformat(), normalized_market, normalized_market),
-            ).fetchone()
-            if venue_row is None:
-                venue_row = conn.execute(
-                    """
-                    select venue
-                    from realtime_minute_bars
-                    where symbol = ? and minute_start >= ?
-                      and (? = '' or market_group = ? or market_group = '')
-                    group by venue
-                    order by count(*) desc, max(minute_start) desc
-                    limit 1
-                    """,
-                    (symbol, since.isoformat(), normalized_market, normalized_market),
-                ).fetchone()
-            if venue_row is None:
-                return ()
-            selected_venue = str(venue_row[0] or "UNKNOWN")
             rows = conn.execute(
                 """
                 select symbol, minute_start, open, high, low, close, volume, vwap,
@@ -1166,21 +1131,61 @@ class RealtimeMarketDataStore:
                        volatility, last_update_age_ms, source_record_ids_json,
                        """ + _METADATA_SELECT + """
                 from realtime_minute_bars
-                where symbol = ? and minute_start >= ? and venue = ?
-                  and (? = '' or market_group = ? or market_group = '')
-                order by minute_start desc
-                limit ?
+                where """ + where + """
+                order by minute_start asc
                 """,
-                (
-                    symbol,
-                    since.isoformat(),
-                    selected_venue,
-                    normalized_market,
-                    normalized_market,
-                    max(int(limit) * 3, int(limit)),
-                ),
+                tuple(params),
             ).fetchall()
-        candidates = [
+        if not rows:
+            return ()
+
+        def venue_key(row: Any) -> tuple[str, str]:
+            meta = _metadata_from_tail(row, 15)
+            # Broker exchange codes distinguish NAS/NYS while venue is a useful
+            # fallback for older rows whose exchange column was blank.
+            return (
+                meta.market_group.value if meta.market_group else "",
+                meta.exchange.upper() or meta.venue.value,
+            )
+
+        coverage: dict[tuple[str, str], set[str]] = {}
+        tradeable_rows: dict[tuple[str, str], int] = {}
+        for row in rows:
+            key = venue_key(row)
+            coverage.setdefault(key, set()).add(str(row[1]))
+            meta = _metadata_from_tail(row, 15)
+            tradeable_rows[key] = tradeable_rows.get(key, 0) + int(meta.is_tradeable)
+        selected_venue = max(
+            coverage,
+            key=lambda key: (len(coverage[key]), tradeable_rows.get(key, 0), key),
+        )
+
+        scope_priority = {
+            "FREE_REALTIME": 5,
+            "VENUE_SPECIFIC": 5,
+            "UNIFIED": 4,
+            "REST_SNAPSHOT": 3,
+            "HISTORICAL": 2,
+            "UNKNOWN": 0,
+        }
+        chosen: dict[str, Any] = {}
+        chosen_rank: dict[str, tuple[int, int, int]] = {}
+        for row in rows:
+            if venue_key(row) != selected_venue:
+                continue
+            meta = _metadata_from_tail(row, 15)
+            minute = str(row[1])
+            rank = (
+                int(meta.is_tradeable),
+                scope_priority.get(meta.feed_scope.value, 0),
+                int(row[8] or 0),
+            )
+            if minute not in chosen or rank > chosen_rank[minute]:
+                chosen[minute] = row
+                chosen_rank[minute] = rank
+
+        selected_rows = [chosen[key] for key in sorted(chosen)][-max(0, int(limit)) :]
+        return tuple(
             RealtimeMinuteBar(
                 symbol=row[0],
                 minute_start=_parse_dt(row[1]),
@@ -1199,26 +1204,8 @@ class RealtimeMarketDataStore:
                 source_record_ids=tuple(json.loads(row[14] or "[]")),
                 meta=_metadata_from_tail(row, 15),
             )
-            for row in rows
-        ]
-        if not candidates:
-            return ()
-        by_minute: dict[datetime, RealtimeMinuteBar] = {}
-        for bar in candidates:
-            old = by_minute.get(bar.minute_start)
-            rank = (
-                int(bar.meta.is_tradeable),
-                int(bar.meta.feed_scope.value != "HISTORICAL"),
-                bar.trade_count,
-            )
-            old_rank = (
-                int(old.meta.is_tradeable),
-                int(old.meta.feed_scope.value != "HISTORICAL"),
-                old.trade_count,
-            ) if old is not None else (-1, -1, -1)
-            if rank > old_rank:
-                by_minute[bar.minute_start] = bar
-        return tuple(sorted(by_minute.values(), key=lambda bar: bar.minute_start)[-max(1, int(limit)):])
+            for row in selected_rows
+        )
 
     def counts_since(self, symbol: str, since: datetime) -> tuple[int, int]:
         with closing(self._connect()) as conn:

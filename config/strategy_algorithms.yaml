@@ -23,12 +23,19 @@
 # comment would have been 5 bps optimistic on every KRX round trip.
 
 # Optional market-specific overrides live under ``markets.KR`` / ``markets.US``.
-# No numeric override is populated until market-scoped forward validation supports
-# it; an empty map is intentional and prevents an unvalidated tuning guess from
-# changing live behavior. The loader and tests guarantee that future validated
-# overrides cannot leak from one venue into the other.
+# Overrides require market-scoped forward evidence and never leak to the other
+# venue.  A deployment-only LIVE_PROBE grant may appear here without changing the
+# strategy's signal thresholds or granting LIVE_FULL.
 markets:
-  KR: {}
+  KR:
+    # The only bounded live bootstrap in the catalogue.  The stored causal KRX
+    # replay for the same 4,500-second contract has 13 fills, +28.2bps mean net
+    # after all-in cost, and a positive final chronological quarter.  That is not
+    # enough for full authority, so this grants LIVE_PROBE (10% size ceiling), not
+    # LIVE_FULL.  US remains shadow-only and every negative-evidence arm remains
+    # unorderable.
+    breakout_volume:
+      live_probe_authorized: true
   US: {}
 
 # Market intraday momentum: 하루 1회 왕복. KRX 왕복비용 27.8bps 중 20bps가 법정
@@ -56,7 +63,11 @@ market_intraday_momentum:
 opening_range_breakout:
   live_authorized: false
   min_relative_volume: 1.5
+  # A range break hours after the open is ordinary intraday momentum, not ORB.
+  min_minutes_since_session_open: 30.0
+  max_minutes_since_session_open: 120.0
   min_breakout_excess_bps: 3.0
+  max_breakout_excess_bps: 60.0
   min_aggressor_imbalance: 0.05
   stop_buffer_bps: 8.0
   trailing_bps: 30.0
@@ -84,20 +95,24 @@ shared:
   # the trigger layer's was structurally wrong.
   min_expected_edge_bps: 8.0
   cost_aware_floor_enabled: 1.0
-  # 1.0 = the edge must cover its round trip exactly once. Raise it to demand
-  # the edge exceed cost by a margin; both terms are estimates, so equality is
-  # a loss whenever either is off.
+  # 1.0 = charge the complete buy+sell round trip exactly once.
   cost_floor_multiple: 1.0
-  # The selector already requires net edge > 0 after this full round trip.
-  # A second fixed buffer duplicated that decision and is intentionally zero.
+  # No additional profit hurdle: any strictly positive expected return after
+  # the complete round-trip cost is economically eligible.
   min_net_buffer_bps: 0.0
+  # Volatility is an attainable move, not a directional expectation. Discount
+  # it by the strategy's point-in-time confidence before cost comparison.
+  confidence_weighted_edge_enabled: 1.0
 
 # Tick order-flow continuation, confirmed by bar trend agreement.
 intraday_momentum:
   live_authorized: false
   min_aggressor_imbalance: 0.15
   min_return_5s_bps: 2.0
-  horizon_seconds: 180.0
+  max_return_5s_bps: 40.0
+  # Unified with the label/exit contract.  The former 180s forecast was compared
+  # with 3600s training barriers, structurally understating attainable gross edge.
+  horizon_seconds: 3600.0
   stop_volatility_multiple: 1.5
   trailing_bps: 12.0
   reverse_aggressor_exit: -0.25
@@ -107,9 +122,10 @@ breakout_volume:
   live_authorized: false
   min_volume_spike_ratio: 1.5
   min_breakout_excess_bps: 2.0
+  max_breakout_excess_bps: 35.0
   acceptance_return_5s_bps: 1.0
   min_aggressor_imbalance: 0.05
-  horizon_seconds: 300.0
+  horizon_seconds: 4500.0
   stop_buffer_bps: 8.0
   trailing_bps: 15.0
   failure_tolerance_bps: 10.0
@@ -125,7 +141,7 @@ vwap_mean_reversion:
   min_recovery_return_5s_bps: 1.0
   min_aggressor_imbalance: 0.05
   min_book_improvement: 0.0
-  horizon_seconds: 240.0
+  horizon_seconds: 3600.0
   max_horizon_seconds: 5400.0
   stop_volatility_multiple: 2.0
   target_capture_fraction: 0.7
@@ -140,6 +156,9 @@ bar_confirmed_vwap_recovery:
   shadow_enabled: true
   paper_enabled: true
   live_authorized: false
+  # Explicit operator-authorised bounded risk: at most the global 10% LIVE_PROBE
+  # size, automatically demoted if enough measured outcomes become negative.
+  live_probe_authorized: true
   min_displacement_bps: 75.0
   max_displacement_zscore: 15.0
   max_rsi: 45.0
@@ -147,16 +166,37 @@ bar_confirmed_vwap_recovery:
   min_momentum_persistence: 0.30
   min_liquidity_score: 0.40
   max_spread_bps: 25.0
-  target_capture_fraction: 0.50
+  # The exit rule targets VWAP; entry economics must price that same full path.
+  target_capture_fraction: 1.00
   stop_volatility_multiple: 2.5
   trailing_bps: 30.0
   horizon_seconds: 5400.0
   # Equal to horizon_seconds: the structural-edge clock resolves to the base
   # horizon unless this is deliberately raised.
   max_horizon_seconds: 5400.0
+  # Falling-market relief reversal. Reuses this strategy id so model output
+  # indices and synced GNN checkpoints remain compatible.
+  bearish_mode_enabled: true
+  bearish_max_market_breadth: 0.45
+  bearish_max_change_point_probability: 0.35
+  bearish_min_displacement_bps: 120.0
+  bearish_max_displacement_zscore: 8.0
+  bearish_min_recovery_return_5s_bps: 2.0
+  bearish_min_aggressor_imbalance: 0.05
+  bearish_min_book_improvement: 0.0
+  bearish_max_spread_change_5s: 0.0
+  bearish_target_capture_fraction: 0.70
+  bearish_stop_volatility_multiple: 1.5
+  bearish_trailing_bps: 25.0
+  bearish_horizon_seconds: 7200
+  bearish_max_horizon_seconds: 10800
 
 # Mechanical sub-minute drop; requires the spread to be contracting again.
 liquidity_shock_reversal:
+  # Quarantined from live authority: 1,089 US shadow outcomes average roughly
+  # -111bps net and the loss is present before costs as well.  It remains visible
+  # in shadow so the catalogue has no silent branch and a genuinely changed v4
+  # rule can accumulate fresh, version-scoped evidence.
   enabled: true
   shadow_enabled: true
   live_authorized: false
@@ -164,7 +204,7 @@ liquidity_shock_reversal:
   max_spread_change_5s: 0.0
   min_aggressor_imbalance: -0.35
   min_orderbook_imbalance: 0.0
-  horizon_seconds: 120.0
+  horizon_seconds: 2400.0
   retrace_fraction: 0.4
   stop_buffer_bps: 6.0
   trailing_bps: 14.0
@@ -189,7 +229,7 @@ event_momentum:
   min_volume_spike_ratio: 2.0
   min_aggressor_imbalance: 0.10
   exhaustion_return_10s_bps: 120.0
-  horizon_seconds: 420.0
+  horizon_seconds: 5400.0
   stop_volatility_multiple: 2.0
   trailing_bps: 20.0
 
@@ -199,7 +239,22 @@ cross_sectional_relative_strength:
   max_sector_rank: 3.0
   min_short_return_bps: 0.0
   min_aggressor_imbalance: 0.05
-  horizon_seconds: 420.0
+  # Long-only defensive-strength mode for TREND_DOWN. "Falling less" does not
+  # qualify: the stock must itself rise above VWAP with low market beta.
+  bearish_mode_enabled: true
+  bearish_max_market_breadth: 0.45
+  bearish_max_market_beta: 0.90
+  bearish_min_absolute_return_bps: 5.0
+  bearish_min_vwap_premium_bps: 5.0
+  bearish_min_momentum_persistence: 0.55
+  bearish_min_relative_volume: 1.0
+  bearish_max_change_point_probability: 0.35
+  bearish_capture_fraction: 0.45
+  bearish_max_target_bps: 250.0
+  bearish_horizon_seconds: 10800
+  bearish_stop_volatility_multiple: 1.5
+  bearish_trailing_bps: 30.0
+  horizon_seconds: 5400.0
   stop_volatility_multiple: 2.0
   trailing_bps: 18.0
 
@@ -212,7 +267,7 @@ gap_context:
   max_minutes_since_session_open: 60.0
   min_volume_spike_ratio: 1.5
   min_aggressor_imbalance: 0.10
-  horizon_seconds: 300.0
+  horizon_seconds: 4500.0
   fill_capture_fraction: 0.5
   stop_buffer_bps: 10.0
   trailing_bps: 16.0
@@ -238,7 +293,7 @@ rvgi_box_breakout:
   stop_atr_multiple: 1.0
   failure_tolerance_bps: 12.0
   trailing_bps: 15.0
-  horizon_seconds: 300
+  horizon_seconds: 3600
 
 # --- Added for the current high-volatility, flow-driven tape -----------------
 # These arms collect shadow evidence and must earn market-scoped promotion. Merely
@@ -279,7 +334,7 @@ residual_relative_strength:
   bearish_stop_volatility_multiple: 1.5
   bearish_trailing_bps: 30.0
   bearish_horizon_seconds: 10800
-  horizon_seconds: 420.0
+  horizon_seconds: 5400.0
   stop_volatility_multiple: 2.0
   trailing_bps: 20.0
 
@@ -301,7 +356,7 @@ adaptive_anchored_vwap_reversion:
   max_target_bps: 150.0
   stop_zscore_multiple: 1.5
   trailing_bps: 16.0
-  horizon_seconds: 300.0
+  horizon_seconds: 3600.0
 
 # Exhaustion reversal triggered by the BOOK turning (OFI slope, depth recovery,
 # microprice above mid), not by the price having fallen. Shortest holding window
@@ -324,7 +379,7 @@ ofi_microprice_exhaustion_reversal:
   retrace_fraction: 0.35
   stop_buffer_bps: 6.0
   trailing_bps: 14.0
-  horizon_seconds: 150.0
+  horizon_seconds: 1800.0
 
 # ---------------------------------------------------------------------------
 # Indicator family periods.
@@ -469,21 +524,28 @@ overnight_gap_carry:
   trailing_bps: 45.0
   horizon_seconds: 64800.0
 
-# Multi-hour, completed-bar continuation. It intentionally does not read 1s/5s
-# ticks, so sparse pre/after-market sessions can produce honest shadow outcomes.
+# Multi-hour completed-bar trend pullback.  The legacy id is retained so stored
+# schemas remain compatible, but version-scoped promotion evidence starts fresh.
 bar_trend_continuation:
   enabled: true
   shadow_enabled: true
   paper_enabled: true
   live_authorized: false
-  min_ema_separation_bps: 12.0
-  min_vwap_premium_bps: 8.0
-  min_momentum_persistence: 0.60
-  min_relative_volume: 1.20
-  min_liquidity_score: 0.50
+  min_ma50_slope_bps: 0.0
+  min_ma200_slope_bps: -0.10
+  min_pullback_atr: -1.00
+  max_pullback_atr: 0.75
+  min_short_return: -0.03
+  max_short_return: 0.006
+  min_rsi: 38.0
+  max_rsi: 72.0
+  min_relative_volume: 0.15
+  max_relative_volume: 1.25
+  min_liquidity_score: 0.25
   max_spread_bps: 35.0
   max_change_point_probability: 0.55
-  target_capture_fraction: 0.60
+  target_atr_multiple: 1.80
+  max_target_bps: 240.0
   stop_volatility_multiple: 2.5
   trailing_bps: 40.0
   horizon_seconds: 10800.0
@@ -500,7 +562,9 @@ supertrend_dmi_continuation:
   min_adx: 25.0
   min_dmi_spread: 5.0
   min_supertrend_distance_bps: 5.0
+  max_supertrend_distance_bps: 250.0
   min_vwap_premium_bps: 5.0
+  max_vwap_premium_bps: 175.0
   min_relative_volume: 1.15
   min_momentum_persistence: 0.60
   min_liquidity_score: 0.50
@@ -521,6 +585,8 @@ keltner_volatility_breakout:
   min_adx: 22.0
   min_relative_volume: 1.40
   min_vwap_premium_bps: 5.0
+  max_vwap_premium_bps: 175.0
+  max_breakout_extension_bps: 40.0
   min_liquidity_score: 0.55
   max_spread_bps: 30.0
   max_change_point_probability: 0.50

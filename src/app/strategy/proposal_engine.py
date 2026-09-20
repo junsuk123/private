@@ -88,7 +88,8 @@ class StrategyProposalEngine:
         registry: StrategyRegistry | None = None,
         algorithm_registry: Mapping[str, Any] | None = None,
     ) -> None:
-        self._registry = registry or default_strategy_registry()
+        self._registry = registry
+        self._market_algorithms: dict[str, Mapping[str, Any]] = {}
         # Built once. ``build_algorithm_registry`` re-reads YAML and instantiates every
         # algorithm; doing that per cycle per symbol was measurable overhead in the
         # existing ``_mechanical_entry_verdict``, which calls ``get_algorithm`` (and
@@ -132,10 +133,11 @@ class StrategyProposalEngine:
                 skipped={strategy_id: PROPOSAL_NO_FEATURES for strategy_id in eligible},
             )
 
-        algorithms = self._algorithm_registry()
+        algorithms = self._algorithm_registry(context.market)
+        registry = self._registry or default_strategy_registry(context.market)
         proposals: list[StrategyProposal] = []
         for strategy_id in eligible:
-            spec = self._registry.get(strategy_id)
+            spec = registry.get(strategy_id)
             if spec is None:
                 skipped[strategy_id] = PROPOSAL_NOT_ELIGIBLE
                 continue
@@ -161,12 +163,17 @@ class StrategyProposalEngine:
         )
 
     # -- internals ---------------------------------------------------------- #
-    def _algorithm_registry(self) -> Mapping[str, Any]:
-        if self._algorithms is None:
-            from app.technical.strategy_algorithms import build_algorithm_registry
+    def _algorithm_registry(self, market: str | None = None) -> Mapping[str, Any]:
+        if self._algorithms is not None:
+            return self._algorithms
+        from app.data.market_capabilities import normalize_market_group
+        from app.technical.strategy_algorithms import AlgorithmConfig, build_algorithm_registry
 
-            self._algorithms = build_algorithm_registry()
-        return self._algorithms
+        group = normalize_market_group(str(market or ""))
+        key = group.value if group is not None else ""
+        if key not in self._market_algorithms:
+            self._market_algorithms[key] = build_algorithm_registry(AlgorithmConfig(market=key))
+        return self._market_algorithms[key]
 
     def _propose(
         self,
@@ -186,6 +193,7 @@ class StrategyProposalEngine:
             election_inputs=election_inputs,
         )
         triggered = bool(decision.get("triggered", False))
+        cost_viable = decision.get("cost_viable") is not False
         horizon = int(decision.get("horizon_seconds") or spec.horizon_seconds)
         edge_bps = _finite(decision.get("expected_edge_bps"))
         reference = context.symbol.reference_price or _finite(
@@ -207,6 +215,7 @@ class StrategyProposalEngine:
             symbol=context.symbol_id,
             eligible=True,
             entry_ready=triggered,
+            cost_viable=cost_viable,
             raw_signal_strength=_finite(decision.get("score")) or 0.0,
             confidence=_finite(decision.get("confidence")) or 0.0,
             expected_horizon_seconds=horizon,
@@ -283,6 +292,8 @@ class StrategyProposalEngine:
             "change_point_probability": context.macro.change_point_probability,
             "relative_volume": context.symbol.relative_volume,
             "market_breadth": context.cross_sectional.market_breadth,
+            "market_trend": context.macro.market_regime,
+            "minutes_since_session_open": context.temporal.minutes_from_open,
             "liquidity_score": context.microstructure.liquidity_score,
             "spread_bps": context.microstructure.spread_bps,
             "sector_rank": context.cross_sectional.relative_strength_rank,

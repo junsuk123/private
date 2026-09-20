@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -175,6 +175,8 @@ class GlobalContext:
     groups: Mapping[str, GlobalGroupScore] = field(default_factory=dict)
     coverage: float = 0.0
     reason_codes: tuple[str, ...] = ()
+    market: str | None = None
+    indicator_relations: tuple[Mapping[str, Any], ...] = ()
 
     def numeric_features(self) -> dict[str, float]:
         values: dict[str, float] = {"global_confidence": self.confidence}
@@ -194,6 +196,8 @@ class GlobalContext:
     def as_dict(self) -> dict[str, Any]:
         return {
             "context_id": self.context_id,
+            "market": self.market,
+            "indicator_relations": [dict(item) for item in self.indicator_relations],
             "captured_at": _aware(self.captured_at).isoformat(),
             "direction": self.direction,
             "momentum": self.momentum,
@@ -366,7 +370,22 @@ class GlobalContextBuilder:
         *,
         captured_at: datetime,
         context_id: str | None = None,
+        market: str | None = None,
     ) -> GlobalContext:
+        if market is not None:
+            from app.ontology.indicator_graph import evaluate_market_indicators
+
+            items = tuple(observations)
+            relations = evaluate_market_indicators(items, market, captured_at=captured_at)
+            usable = tuple(item for item, relation in zip(items, relations) if relation.usable)
+            result = self.build(usable, captured_at=captured_at, context_id=context_id)
+            return replace(
+                result, market=market,
+                indicator_relations=tuple(item.as_dict() for item in relations),
+                reason_codes=tuple(dict.fromkeys((*result.reason_codes, *(
+                    code for relation in relations for code in relation.reason_codes
+                )))),
+            )
         now = _aware(captured_at)
         reasons: list[str] = []
         by_group: dict[str, list[tuple[IndicatorObservation, IndicatorGroupConfig]]] = {}

@@ -14,6 +14,7 @@ from app import web
 from app.runtime import DataEnvironment, default_environment
 from app.schemas.domain import MarketSnapshot, RawSourceRecord, SourceMetadata
 from app.storage import LocalResearchStore, ModelArtifactStore
+from app.paths import runtime_store_root
 
 
 class RealtimeUnifiedEnvironmentTest(unittest.TestCase):
@@ -103,7 +104,10 @@ class RealtimeUnifiedEnvironmentTest(unittest.TestCase):
             loaded = web._analysis_research_for_current_mode(store)
 
             self.assertEqual([item.payload for item in loaded.raw_records], ["realtime input"])
-            self.assertEqual(web._current_data_policy()["analysis_input_stores"], ["data/store"])
+            self.assertEqual(
+                web._current_data_policy()["analysis_input_stores"],
+                [runtime_store_root().as_posix()],
+            )
 
 
 if __name__ == "__main__":

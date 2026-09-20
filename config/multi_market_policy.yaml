@@ -1,0 +1,27 @@
+schema_version: 1
+# Research priors, not performance claims or live-deployment grants. Existing
+# ontology, cost, liquidity, evidence and session gates must all still pass.
+# No derivative, leverage, inverse or short thesis is present in these profiles.
+markets:
+  KR:
+    maximum_position_weight: 0.15
+    regimes:
+      TREND: [residual_relative_strength, bar_trend_continuation]
+      TREND_UP: [breakout_volume, residual_relative_strength, bar_trend_continuation, supertrend_dmi_continuation]
+      RANGE: [range_support_reversion, bar_confirmed_vwap_recovery, choppiness_range_reversion]
+      TREND_DOWN: [residual_relative_strength, bar_confirmed_vwap_recovery]
+      HIGH_VOL: [bar_confirmed_vwap_recovery, residual_relative_strength]
+      RECOVERY: [bar_confirmed_vwap_recovery, breakout_volume]
+      STRESS: []
+      UNKNOWN: []
+  US:
+    maximum_position_weight: 0.12
+    regimes:
+      TREND: [bar_trend_continuation, supertrend_dmi_continuation, residual_relative_strength]
+      TREND_UP: [opening_range_breakout, bar_trend_continuation, keltner_volatility_breakout, market_intraday_momentum]
+      RANGE: [adaptive_anchored_vwap_reversion, range_support_reversion, choppiness_range_reversion]
+      TREND_DOWN: [residual_relative_strength]
+      HIGH_VOL: [bar_confirmed_vwap_recovery, residual_relative_strength]
+      RECOVERY: [bar_confirmed_vwap_recovery, supertrend_dmi_continuation]
+      STRESS: []
+      UNKNOWN: []

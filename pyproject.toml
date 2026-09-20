@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "OBAITS - Ontology Based AI Trading System: safe, auditable ontology-driven automated trading."
 requires-python = ">=3.11"
 dependencies = [
+    "exchange-calendars",
   "fastapi",
   "httpx",
   "numpy",
@@ -23,6 +24,9 @@ quant-reference = [
 ]
 npu = [
   "openvino"
+]
+cuda = [
+  "torch"
 ]
 local-llm = [
   "accelerate",

@@ -1,0 +1,25 @@
+{
+  "measured_at_utc": "2026-09-20T13:19:56.821875+00:00",
+  "scope": "synthetic model microbenchmark; excludes market feed, strategy, risk and broker latency",
+  "openvino_version": "2026.3.1-22476-759c5a6ab8c-releases/2026/3",
+  "openvino_devices": {
+    "CPU": "Intel(R) Core(TM) Ultra 7 155H",
+    "GPU": "Intel(R) Arc(TM) Graphics (iGPU)",
+    "NPU": "Intel(R) AI Boost"
+  },
+  "nvidia_smi_devices": [],
+  "torch_installed": false,
+  "requested_device": "AUTO",
+  "actual_model_backend": "NPU",
+  "fallback_reason": null,
+  "feature_dim": 62,
+  "hidden_units": 64,
+  "output_dim": 2,
+  "batch_size": 1,
+  "parameter_count": 4286,
+  "iterations": 100,
+  "cold_compile_ms": 547.349,
+  "warm_inference_median_ms": 0.62,
+  "warm_inference_p95_ms": 0.719,
+  "maximum_absolute_difference_vs_numpy": 0.00016948580741882324
+}

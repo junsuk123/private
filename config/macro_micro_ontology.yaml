@@ -51,13 +51,13 @@ micro:
 
 strategy_permissions:
   TREND_UP:
-    allow: [momentum, breakout, vwap_pullback]
+    allow: [momentum, breakout, vwap_pullback, relative_strength, relative_weakness]
     block: [aggressive_countertrend_reversion]
   TREND_DOWN:
-    allow: [sell, reduce_risk, defensive_hold, mean_reversion, vwap_reversion, relative_strength]
+    allow: [sell, reduce_risk, defensive_hold, mean_reversion, vwap_reversion, relative_strength, momentum_short, breakdown, relative_weakness]
     block: [weak_breakout_buy, low_volume_momentum_buy, intraday_momentum, event_momentum, gap_context, breakout_volume, rvgi_box_breakout]
   RANGE_BOUND:
-    allow: [mean_reversion, vwap_reversion]
+    allow: [mean_reversion, vwap_reversion, relative_strength, relative_weakness]
     block: [late_breakout_chasing]
   # Unclassifiable high volatility keeps the blanket ban.
   HIGH_VOLATILITY_RISK:
@@ -66,7 +66,7 @@ strategy_permissions:
   # Violent but directional: relative strength and confirmed momentum can still be
   # valid; buying dips into a one-sided move cannot.
   HIGH_VOL_TRENDING:
-    allow: [sell, reduce_risk, hold, relative_strength, momentum]
+    allow: [sell, reduce_risk, hold, relative_strength, relative_weakness, momentum, momentum_short, breakdown]
     block: [mean_reversion, vwap_reversion, aggressive_countertrend_reversion, late_breakout_chasing]
   # Violent overshoot with a functioning book: normalised reversion belongs here,
   # momentum does not (it buys the top of the bounce).

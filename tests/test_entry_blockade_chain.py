@@ -164,6 +164,147 @@ def test_missing_legacy_micro_result_does_not_block_independent_algorithms(
     assert "독립 전략 알고리즘 1개 평가" in chain["micro_buy_intents"]["detail"]
 
 
+def test_decision_dag_exposes_parallel_branches_and_serial_order_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _closed_market_status()
+    status["last_summary"] = {
+        "buy_candidate_count": 1,
+        "buy_candidate_sample": ["INTC"],
+        "live_armed": True,
+        "strategy_session": {
+            "phase": "SCANNING",
+            "bandit_selected_arm": "no_trade",
+            "candidate_diagnostics": [],
+            "algorithm_evaluations": [
+                {
+                    "symbol": "INTC",
+                    "strategy_id": "intraday_momentum",
+                    "triggered": False,
+                    "reason_codes": ["TEST_HOLD"],
+                    "branch_index": 0,
+                }
+            ],
+            "strategy_evaluation_mode": "PARALLEL_MAP",
+            "strategy_evaluation_workers": 4,
+            "strategy_evaluation_branch_count": 13,
+            "strategy_evaluation_duration_ms": 7.5,
+        },
+    }
+    monkeypatch.setattr(web, "_realtime_trading_engine", _Engine(status), raising=False)
+    monkeypatch.setattr(
+        web, "_realtime_trading_worker", SimpleNamespace(is_alive=lambda: True), raising=False
+    )
+
+    chain = web._entry_blockade_chain()
+    dag = web._entry_decision_dag(chain)
+    layers = {layer["id"]: layer for layer in dag["layers"]}
+
+    assert layers["candidate_fanout"]["policy"] == "FAN_OUT_ANY"
+    assert layers["context_map"]["parallel"] is True
+    assert layers["strategy_cartesian"]["policy"] == "PARALLEL_CARTESIAN_MAP"
+    assert layers["strategy_cartesian"]["nodes"][0]["label"] == (
+        "INTC × intraday_momentum"
+    )
+    assert layers["atomic_commit"]["policy"] == "ALL_SERIAL_COMMIT"
+    assert layers["atomic_commit"]["parallel"] is False
+    assert dag["telemetry"]["strategy_evaluation_workers"] == 4
+
+
+def test_decision_dag_marks_macro_mismatch_as_a_size_limited_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = {
+        "strategy_session": {
+            "phase": "ARMED",
+            "selected_symbol": "AAPL",
+            "selected_strategy": "intraday_momentum",
+            "bandit_selected_arm": "intraday_momentum",
+            "selection_authority": "DETERMINISTIC_ALGORITHM",
+            "risk_tolerance_mode": "MACRO_MISMATCH_PROBE",
+            "risk_tolerance_size_fraction": 0.10,
+            "risk_tolerance_reason_codes": ["MACRO_CONTEXT_MISMATCH_ACCEPTED"],
+            "halt_level": "NONE",
+            "macro_mismatch_probe_enabled": True,
+            "macro_mismatch_probe_size_fraction": 0.10,
+        }
+    }
+    monkeypatch.setattr(web, "_realtime_trading_engine", _Engine(status), raising=False)
+    chain = [
+        {
+            "stage": "strategy_election",
+            "ok": True,
+            "detail": "probe",
+            "data": {
+                "algorithm_evaluations": [
+                    {
+                        "symbol": "AAPL",
+                        "strategy_id": "intraday_momentum",
+                        "triggered": True,
+                        "cost_viable": True,
+                        "expected_edge_bps": 90.0,
+                        "risk_tolerance_probe": True,
+                        "risk_size_fraction": 0.10,
+                    }
+                ]
+            },
+        }
+    ]
+
+    dag = web._entry_decision_dag(chain)
+    layers = {layer["id"]: layer for layer in dag["layers"]}
+
+    assert layers["strategy_cartesian"]["nodes"][0]["status"] == "probe"
+    assert layers["selection_merge"]["nodes"][0]["status"] == "probe"
+    assert layers["selection_merge"]["nodes"][0]["metadata"]["risk_size_fraction"] == 0.10
+    assert dag["telemetry"]["macro_mismatch_probe_enabled"] is True
+
+
+def test_decision_dag_never_connects_stale_foreign_strategy_rows_to_domestic_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        web,
+        "_realtime_trading_engine",
+        _Engine({"strategy_session": {"phase": "SCANNING", "bandit_selected_arm": "no_trade"}}),
+        raising=False,
+    )
+    chain = [
+        {
+            "stage": "buy_candidates",
+            "ok": True,
+            "detail": "domestic candidates",
+            "data": {
+                "engine_cycle_id": "cycle-kr-1",
+                "sample": ["005930", "000660"],
+                "candidate_filter_selected_symbols": ["005930", "000660"],
+            },
+        },
+        {
+            "stage": "strategy_election",
+            "ok": False,
+            "detail": "retained diagnostics",
+            "data": {
+                "algorithm_evaluations": [
+                    {"symbol": "SOFI", "strategy_id": "intraday_momentum", "triggered": False},
+                    {"symbol": "005930", "strategy_id": "vwap_mean_reversion", "triggered": False},
+                ]
+            },
+        },
+    ]
+
+    dag = web._entry_decision_dag(chain)
+    layers = {layer["id"]: layer for layer in dag["layers"]}
+    labels = [node["label"] for node in layers["strategy_cartesian"]["nodes"]]
+
+    assert dag["cycle_id"] == "cycle-kr-1"
+    assert dag["advancing_symbols"] == ["000660", "005930"]
+    assert len(labels) == 1
+    assert labels[0].startswith("005930")
+    assert labels[0].endswith("vwap_mean_reversion")
+    assert all("SOFI" not in label for label in labels)
+
+
 def test_missing_bandit_fields_still_report_stale_code(monkeypatch: pytest.MonkeyPatch) -> None:
     status = _closed_market_status()
     status["strategy_session"] = {"phase": "SCANNING"}
@@ -225,6 +366,8 @@ def test_candidate_blockade_exposes_same_cycle_filter_reasons(
     assert data["candidate_filter_reason_samples"] == {
         "INSUFFICIENT_USD_ORDERABLE_CASH": ["F", "SOFI"]
     }
+    assert data["candidate_filter_selected_symbols"] == []
+    assert data["candidate_filter_admission_note_counts"] == {}
     assert "micro_buy_intents" not in chain
     assert "strategy_election" not in chain
 

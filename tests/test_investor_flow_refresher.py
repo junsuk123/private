@@ -20,6 +20,23 @@ from app.data.investor_flow_collector import (
 from app.data.investor_flow_store import InvestorFlowStore
 
 
+def test_corrupt_investor_flow_store_is_quarantined_and_recreated(tmp_path) -> None:
+    path = tmp_path / "flow.sqlite3"
+    path.write_bytes(b"not a sqlite database")
+
+    with pytest.warns(RuntimeWarning, match="Recovered corrupt investor-flow"):
+        store = InvestorFlowStore(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("pragma quick_check").fetchone()[0] == "ok"
+        assert connection.execute("pragma journal_mode").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    assert store.recovery_event is not None
+    assert len(tuple(tmp_path.glob("flow.sqlite3.corrupt.*"))) == 1
+
+
 def _bar_database(tmp_path, rows: dict[str, int]):
     path = tmp_path / "bars.sqlite3"
     conn = sqlite3.connect(path)
@@ -64,6 +81,9 @@ class _FakeClient:
             },
         )
 
+    def get_domestic_intraday_investor_flow_estimate(self, symbol: str):
+        return ({"input_time": "1120", "frgn_estimate": "12", "orgn_estimate": "8"},)
+
 
 def test_worklist_comes_from_the_bar_store_not_a_hardcoded_universe(tmp_path) -> None:
     """Collecting flow for a symbol the labeller discards is wasted API budget."""
@@ -91,8 +111,10 @@ def test_refresh_writes_every_eligible_symbol(tmp_path) -> None:
     assert set(client.calls) == {"005930", "000660"}
     assert result.symbols_attempted == 2
     assert result.rows_written == 4
+    assert result.intraday_snapshots_written == 2
     assert result.failures == []
     assert result.coverage["symbols"] == 2
+    assert result.coverage["intraday"]["symbols"] == 2
 
 
 def test_one_bad_symbol_does_not_abort_the_sweep(tmp_path) -> None:
@@ -151,6 +173,7 @@ def test_refresh_is_idempotent_and_corrects_the_current_day(tmp_path) -> None:
     history = store.history("005930")
     assert len(history) == 2, "re-running must not duplicate business days"
     assert store.coverage()["rows"] == 2
+    assert store.intraday_coverage()["rows"] == 1
 
 
 def test_missing_bar_database_does_not_raise(tmp_path) -> None:

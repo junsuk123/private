@@ -420,6 +420,17 @@ class RegimeStrategySelector:
             elif contribution < -0.05:
                 conflicting.append(f"REGIME:{label}={probability:.2f}")
 
+        # The multi-label ledger stays intact, but family routing follows the
+        # hysteresis-stabilised projection.  This is a soft bias, not a veto:
+        # symbol-level evidence can still win, while one noisy observation can
+        # no longer flip the whole strategy family.
+        routing_bias = self._routing_bias(regime.routing_regime, family)
+        regime_term += routing_bias
+        if routing_bias > 0.0:
+            supporting.append(f"STABLE_REGIME:{regime.routing_regime}")
+        elif routing_bias < 0.0:
+            conflicting.append(f"STABLE_REGIME:{regime.routing_regime}")
+
         ontology_term = 0.0
         phase_node = _PHASE_NODE.get(str(session_phase or "").upper())
         if phase_node:
@@ -491,6 +502,23 @@ class RegimeStrategySelector:
             conflicting_factors=tuple(dict.fromkeys(conflicting)),
             ontology_relations=tuple(relations),
         )
+
+    @staticmethod
+    def _routing_bias(routing_regime: str | None, family: str) -> float:
+        regime = str(routing_regime or "").upper()
+        if regime == "RISK_OFF":
+            return 0.35 if family == "DEFENSIVE" else -0.20
+        if regime.startswith("TREND_"):
+            if family in {"TREND", "RELATIVE_STRENGTH"}:
+                return 0.12
+            if family == "MEAN_REVERSION":
+                return -0.10
+        if regime.startswith("RANGE_"):
+            if family in {"MEAN_REVERSION", "ORDER_FLOW"}:
+                return 0.10
+            if family == "BREAKOUT":
+                return -0.08
+        return 0.0
 
     def _hard_exclusions(
         self, family: str, risk_conditions: Mapping[str, float]

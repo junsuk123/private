@@ -56,6 +56,51 @@ def test_reliability_evaluator_requires_every_hard_gate() -> None:
     assert result["score"] == 1.0
 
 
+def test_shadow_only_model_does_not_block_deterministic_live_promotion() -> None:
+    policy = SimpleNamespace(conflicts=lambda: [])
+    stale_model = {
+        "ok": False,
+        "schema_matches": True,
+        "trust_level": "SHADOW_ONLY",
+        "reason_codes": ["MODEL_AGE_EXCEEDED"],
+    }
+    with (
+        patch.object(
+            web_module,
+            "_cached_kis_connection_probe",
+            return_value={"ok": True, "account_checked": True, "actual_equity": 200_000},
+        ),
+        patch.object(
+            web_module,
+            "evaluate_live_runtime_gates",
+            return_value=SimpleNamespace(ok=True, failures=()),
+        ),
+        patch.object(
+            web_module,
+            "load_short_horizon_strategy_config",
+            return_value={"execution": {"live_trading_enabled": True}},
+        ),
+        patch.object(web_module, "_env_flag", return_value=True),
+        patch.object(web_module.TradingPolicySnapshot, "from_environment", return_value=policy),
+        patch.object(web_module, "_latest_model_reliability", return_value=stale_model),
+        patch.object(web_module, "_auto_market_health", return_value={"ok": True}),
+        patch.object(web_module, "_active_live_market_groups", return_value=("US",)),
+        patch.dict(
+            "os.environ",
+            {
+                "AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK": "true",
+                "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION": "true",
+                "STRATEGY_SESSION_GNN_DIRECT_ELECTION": "false",
+            },
+        ),
+    ):
+        result = web_module._evaluate_auto_reliability()
+
+    assert result["ready"] is True
+    assert result["components"]["model"]["native_ok"] is False
+    assert result["components"]["model"]["degraded_fallback_active"] is True
+
+
 def test_market_health_is_vacuously_ready_when_no_core_feed_is_required() -> None:
     result = web_module._auto_market_health(datetime.now(timezone.utc), ())
 
@@ -93,7 +138,7 @@ def test_model_reliability_uses_active_champion_not_rejected_challenger() -> Non
             encoding="utf-8",
         )
         with (
-            patch.object(web_module, "Path", return_value=root),
+            patch.dict("os.environ", {"LIVE_MODEL_ARTIFACT_ROOT": str(root)}),
             patch.dict(
                 "os.environ",
                 {
@@ -118,9 +163,10 @@ def test_model_reliability_uses_active_champion_not_rejected_challenger() -> Non
     )
 
 
-def test_model_reliability_checks_the_market_model_served_by_inference() -> None:
+def test_model_reliability_checks_the_market_model_served_by_inference(tmp_path) -> None:
     now = datetime.now(timezone.utc)
     calls: list[Path] = []
+    model_root = tmp_path / "data/models/live_short_horizon"
 
     def reliability(_now: datetime, root: Path) -> dict:
         calls.append(root)
@@ -135,14 +181,33 @@ def test_model_reliability_checks_the_market_model_served_by_inference() -> None
 
     with (
         patch.object(web_module, "_model_reliability_at_root", side_effect=reliability),
-        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true"}),
+        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true", "LIVE_MODEL_ARTIFACT_ROOT": str(model_root)}),
     ):
         result = web_module._latest_model_reliability(now, ("KRX",))
 
     assert result["ok"] is True
     assert result["required_markets"] == ["KR"]
     assert result["artifact_id"] == "KR:kr-fresh"
-    assert calls == [Path("data/models/live_short_horizon/KR")]
+    assert calls == [model_root / "KR"]
+
+
+def test_model_reliability_default_root_matches_machine_local_inference(tmp_path, monkeypatch) -> None:
+    from app.models.model_artifact_registry import ModelArtifactRegistry
+
+    monkeypatch.delenv("LIVE_MODEL_ARTIFACT_ROOT", raising=False)
+    monkeypatch.setenv("REALTIME_STORE_ROOT", str(tmp_path / "machine-local"))
+    monkeypatch.setenv("LIVE_MODEL_SPLIT_BY_MARKET", "true")
+    calls = []
+    def reliability(now, root):
+        calls.append(root)
+        return {"ok": True, "artifact_id": root.name, "live_eligible": True,
+            "schema_matches": True, "trust_level": "LIVE", "reason_codes": []}
+    with patch.object(web_module, "_model_reliability_at_root", side_effect=reliability):
+        result = web_module._latest_model_reliability(datetime.now(timezone.utc), ("KRX", "US"))
+    model_root = ModelArtifactRegistry().root
+    assert model_root == tmp_path / "machine-local/models/live_short_horizon"
+    assert calls == [model_root / "KR", model_root / "US"]
+    assert result["ok"] is True
 
 
 def test_one_stale_required_market_keeps_market_split_model_gate_closed() -> None:
@@ -171,8 +236,9 @@ def test_one_stale_required_market_keeps_market_split_model_gate_closed() -> Non
     assert result["reason_codes"] == ["US:MODEL_AGE_EXCEEDED"]
 
 
-def test_stale_market_model_uses_the_same_combined_fallback_as_inference() -> None:
+def test_stale_market_model_uses_the_same_combined_fallback_as_inference(tmp_path) -> None:
     now = datetime.now(timezone.utc)
+    model_root = tmp_path / "data/models/live_short_horizon"
 
     def reliability(_now: datetime, root: Path) -> dict:
         if root.name == "live_short_horizon":
@@ -195,7 +261,7 @@ def test_stale_market_model_uses_the_same_combined_fallback_as_inference() -> No
 
     with (
         patch.object(web_module, "_model_reliability_at_root", side_effect=reliability),
-        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true"}),
+        patch.dict("os.environ", {"LIVE_MODEL_SPLIT_BY_MARKET": "true", "LIVE_MODEL_ARTIFACT_ROOT": str(model_root)}),
     ):
         result = web_module._latest_model_reliability(now, ("US",))
 
@@ -244,7 +310,7 @@ def test_successful_unchanged_training_heartbeat_keeps_incumbent_fresh() -> None
             )
         try:
             with (
-                patch.object(web_module, "Path", return_value=root),
+                patch.dict("os.environ", {"LIVE_MODEL_ARTIFACT_ROOT": str(root)}),
                 patch.dict(
                     "os.environ",
                     {"AUTO_RELIABILITY_MODEL_MAX_AGE_SECONDS": "1800"},
@@ -290,7 +356,7 @@ def test_recent_running_training_cycle_is_a_healthy_heartbeat() -> None:
             )
         try:
             with (
-                patch.object(web_module, "Path", return_value=root),
+                patch.dict("os.environ", {"LIVE_MODEL_ARTIFACT_ROOT": str(root)}),
                 patch.dict(
                     "os.environ",
                     {"LIVE_TRAINING_RUNNING_HEARTBEAT_MAX_SECONDS": "900"},
@@ -323,7 +389,7 @@ def test_model_reliability_rejects_canonically_stale_incumbent() -> None:
         (root / "live_short_horizon.stale.json").write_text(
             json.dumps(artifact), encoding="utf-8"
         )
-        with patch.object(web_module, "Path", return_value=root):
+        with patch.dict("os.environ", {"LIVE_MODEL_ARTIFACT_ROOT": str(root)}):
             result = web_module._latest_model_reliability(now)
 
     assert result["ok"] is False

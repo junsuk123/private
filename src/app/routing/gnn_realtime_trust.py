@@ -14,6 +14,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 from app.cost import TradingCostEngine
+from app.paths import realtime_market_database_path
 from app.routing.actions import is_actionable_strategy_route
 from app.strategy.catalog import is_short_strategy
 from app.strategy.exit_geometry import (
@@ -73,7 +74,7 @@ class GnnRealtimeTrustEvaluator:
         self,
         *,
         comparison_path: str | Path = "logs/refactor-shadow-comparison.jsonl",
-        database_path: str | Path = "data/store/realtime_market_data.sqlite3",
+        database_path: str | Path | None = None,
         checkpoint_metadata_path: str | Path = (
             "data/models/strategy_utility/rgcn_shadow.json"
         ),
@@ -86,7 +87,7 @@ class GnnRealtimeTrustEvaluator:
         background_process: bool = False,
     ) -> None:
         self.comparison_path = Path(comparison_path)
-        self.database_path = Path(database_path)
+        self.database_path = Path(database_path or realtime_market_database_path())
         self.checkpoint_metadata_path = Path(checkpoint_metadata_path)
         self.use_strategy_horizons = horizon_seconds is None
         self.horizon_seconds = max(

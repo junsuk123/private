@@ -82,6 +82,21 @@ def test_selectable_requires_both_eligibility_and_readiness() -> None:
     assert _proposal().selectable
     assert not _proposal(eligible=False).selectable
     assert not _proposal(entry_ready=False).selectable
+    assert not _proposal(cost_viable=False).selectable
+
+
+def test_cost_rejected_trigger_remains_observable_but_not_selectable() -> None:
+    proposal = _proposal(
+        entry_ready=True,
+        cost_viable=False,
+        expected_gross_edge_bps=12.0,
+        strategy_reason_codes=("EDGE_BELOW_COST_FLOOR",),
+    )
+
+    assert proposal.entry_ready is True
+    assert proposal.expected_gross_edge_bps == 12.0
+    assert proposal.selectable is False
+    assert proposal.as_dict()["cost_viable"] is False
 
 
 def test_non_positive_prices_are_rejected_at_construction() -> None:

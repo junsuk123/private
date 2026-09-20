@@ -1273,6 +1273,30 @@ class KisDevelopersApiClient:
         rows.sort(key=lambda row: row["business_date"])
         return tuple(rows)
 
+    def get_domestic_intraday_investor_flow_estimate(
+        self, ticker: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Raw point-in-time foreign/institution estimate for one KRX symbol.
+
+        KIS documents this as a manually accumulated intraday estimate with a
+        small number of scheduled updates, not as the finalized daily series.
+        Keeping the raw rows and observation time allows later causal feature
+        extraction without pretending the final daily total was known at open.
+        """
+        symbol = str(ticker or "").strip()
+        if not (symbol.isdigit() and len(symbol) == 6):
+            return ()
+        response = self._get(
+            "/uapi/domestic-stock/v1/quotations/investor-trend-estimate",
+            tr_id="HHPTJ04160200",
+            params={"MKSC_SHRN_ISCD": symbol},
+        )
+        self._ensure_success(response, "KIS intraday investor-flow estimate failed")
+        raw = response.get("output2") or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        return tuple(dict(row) for row in raw if isinstance(row, dict))
+
     def _get_overseas_market_snapshot(
         self,
         ticker: str,
@@ -2112,12 +2136,37 @@ class KisDevelopersApiClient:
         row: dict[str, Any],
         order: FinalOrder | None,
     ) -> MockKisExecution:
-        quantity = int(_to_float(row.get("tot_ccld_qty") or row.get("ord_qty") or 0))
+        ordered_quantity = int(_to_float(row.get("ord_qty") or 0))
+        quantity = int(_to_float(row.get("tot_ccld_qty") or 0))
+        canceled_quantity = int(_to_float(row.get("cncl_cfrm_qty") or 0))
+        rejected_quantity = int(_to_float(row.get("rjct_qty") or 0))
+        remaining_quantity = (
+            int(_to_float(row.get("rmn_qty") or 0))
+            if "rmn_qty" in row
+            else max(0, ordered_quantity - quantity - canceled_quantity - rejected_quantity)
+        )
         price = _to_float(row.get("avg_prvs") or row.get("ord_unpr") or 0)
         ticker = str(row.get("pdno") or (order.ticker if order else ""))
         side_code = str(row.get("sll_buy_dvsn_cd") or "")
         side = order.side if order else (OrderSide.SELL if side_code == "01" else OrderSide.BUY)
-        status = "FILLED" if quantity > 0 else "OPEN"
+        cancel_flag = str(row.get("cncl_yn") or "").strip().upper() in {"Y", "1", "TRUE"}
+        if quantity > 0 and remaining_quantity <= 0:
+            status = "FILLED"
+        elif quantity > 0:
+            status = "PARTIALLY_FILLED"
+        elif remaining_quantity > 0:
+            status = "OPEN"
+        elif canceled_quantity > 0 or cancel_flag:
+            status = "CANCELED"
+        elif rejected_quantity > 0:
+            status = "REJECTED"
+        elif ordered_quantity > 0:
+            # KIS can report zero fill, zero remaining and no cancel flag after
+            # an exchange-side expiry.  Calling that OPEN creates an immortal
+            # duplicate-order lock and repeated cancel attempts with APBK0918.
+            status = "EXPIRED"
+        else:
+            status = "UNKNOWN"
         return MockKisExecution(
             order_id=order_id,
             ticker=ticker,

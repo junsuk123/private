@@ -110,6 +110,7 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
         # Opening-range breakout. Relative volume is a hard precondition of that
         # thesis ("stocks in play"), so it belongs in the all-inputs-strong fixture.
         "opening_range_breakout": 0.9,
+        "opening_range_entry_window": 1.0,
         "relative_volume": 0.9,
         # Market intraday momentum. The window flag is session structure, so an
         # all-inputs-strong fixture must place the moment INSIDE the entry window.
@@ -152,6 +153,9 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
     # Inverting it globally would simply move the failure to the breakout expert.
     per_strategy_quantiles = {
         "range_support_reversion": {**quantiles, "box_position": 0.05},
+        # Continuation enters a quiet pullback inside an established trend;
+        # maximal current return and volume describe a different thesis.
+        "bar_trend_continuation": {**quantiles, "return": 0.5, "volume": 0.5},
         # The CHOP thesis wants the opposite persistence regime from every trend
         # expert. Keep the shared strong fixture and override only that fact.
         "choppiness_range_reversion": {
@@ -186,7 +190,9 @@ def test_every_catalogued_expert_creates_an_independent_trade_plan() -> None:
     )
     expected = len(STRATEGY_IDS)
     assert len(plans) == expected
-    assert all(plan is not None for plan in plans)
+    assert all(plan is not None for plan in plans), [
+        expert.strategy_id for expert, plan in zip(ALL_EXPERT_TYPES, plans) if plan is None
+    ]
     assert len({plan.strategy_id for plan in plans if plan}) == expected
     assert len({plan.strategy_instance_id for plan in plans if plan}) == expected
     # Each plan's broker side must match its declared direction/effect: an OPEN LONG is
@@ -272,6 +278,7 @@ def test_opening_range_breakout_requires_stocks_in_play() -> None:
     def _context(**overrides: float) -> ExpertContext:
         quantiles = {
             "opening_range_breakout": 0.9,
+            "opening_range_entry_window": 1.0,
             "relative_volume": 0.9,
             "volume": 0.9,
             "liquidity": 0.9,

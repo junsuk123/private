@@ -47,7 +47,7 @@ from __future__ import annotations
 import math
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -89,6 +89,9 @@ class SymbolFeasibility:
     strategy_id: str = ""
     #: Per-strategy headroom, best first. The pair matters, not just the symbol.
     per_strategy: tuple[tuple[str, float], ...] = ()
+    candidate_score: float | None = None
+    candidate_rank: int | None = None
+    candidate_components: Mapping[str, float] | None = None
 
     @property
     def score(self) -> float:
@@ -111,6 +114,9 @@ class SymbolFeasibility:
                 {"strategy_id": name, "headroom_bps": round(value, 1)}
                 for name, value in self.per_strategy
             ],
+            "candidate_score": _round(self.candidate_score),
+            "candidate_rank": self.candidate_rank,
+            "candidate_components": dict(self.candidate_components or {}),
         }
 
 
@@ -276,9 +282,18 @@ def rank_by_feasibility(
     """
     order = {symbol: index for index, symbol in enumerate(symbols)}
 
-    def key(symbol: str) -> tuple[float, int]:
+    verdict_rank = {VERDICT_FEASIBLE: 2, VERDICT_UNKNOWN: 1, VERDICT_INFEASIBLE: 0}
+
+    def key(symbol: str) -> tuple[float, float, float, int]:
         entry = feasibility.get(symbol)
-        return (-(entry.score if entry is not None else 0.0), order.get(symbol, 0))
+        if entry is None:
+            return (-1.0, -0.5, 0.0, order.get(symbol, 0))
+        return (
+            -float(verdict_rank.get(entry.verdict, 1)),
+            -float(entry.candidate_score if entry.candidate_score is not None else 0.5),
+            -entry.score,
+            order.get(symbol, 0),
+        )
 
     return tuple(sorted(symbols, key=key))
 
@@ -363,6 +378,7 @@ def measure(
             cost_engine = None
 
     results: dict[str, SymbolFeasibility] = {}
+    rank_observations = []
     for raw in symbols:
         symbol = str(raw or "").strip().upper()
         if not symbol or symbol in results:
@@ -398,6 +414,42 @@ def measure(
             minimum_bars=floor_bars,
             minimum_horizon_windows=floor_windows,
         )
+        try:
+            from app.routing.candidate_ranker import observation_from_closes
+
+            liquidity = (
+                1.0 / (1.0 + max(0.0, float(spread)) / 20.0)
+                if spread is not None else None
+            )
+            spread_penalty = (
+                min(0.25, max(0.0, float(spread) - 35.0) / 200.0)
+                if spread is not None else 0.0
+            )
+            rank_observations.append(
+                observation_from_closes(
+                    symbol,
+                    closes,
+                    liquidity_score=liquidity,
+                    penalties={"wide_spread": spread_penalty},
+                )
+            )
+        except Exception:  # noqa: BLE001 - explainable rank is advisory.
+            pass
+    if rank_observations:
+        try:
+            from app.routing.candidate_ranker import rank_candidates
+
+            for ranked in rank_candidates(rank_observations):
+                current = results.get(ranked.symbol)
+                if current is not None:
+                    results[ranked.symbol] = replace(
+                        current,
+                        candidate_score=ranked.score,
+                        candidate_rank=ranked.rank,
+                        candidate_components=dict(ranked.components),
+                    )
+        except Exception:  # noqa: BLE001 - retain feasibility-only ordering.
+            pass
     return results
 
 

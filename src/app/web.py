@@ -56,7 +56,10 @@ from app.goals import GoalRequest, NegotiatedGoal, assess_goal, build_compromise
 from app.config import LiveConfigError, load_live_trading_safety_config, load_order_execution_config
 from app.config.refactor_flags import RefactorFeatureFlags
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
-from app.features.strategy_graph_context import STRATEGY_GRAPH_CONTEXT_DIM
+from app.features.strategy_graph_context import (
+    STRATEGY_GRAPH_CONTEXT_DIM,
+    STRATEGY_GRAPH_CONTEXT_SCHEMA,
+)
 from app.models.gnn_runtime import (
     DEFAULT_CHECKPOINT_PATH as DEFAULT_GNN_CHECKPOINT_PATH,
 )
@@ -71,6 +74,11 @@ from app.models.live_training_pipeline import (
 )
 from app.models.live_signal_predictor import live_signal_model_inference_enabled
 from app.pipeline import build_analysis_context
+from app.paths import (
+    realtime_market_database_path,
+    runtime_database_path,
+    runtime_store_root,
+)
 from app.research import ResearchRunResult, ResearchService
 from app.realtime import OperationModeManager, RealtimeAccelerationPolicy, ShortHorizonRiskPolicy
 from app.realtime.learning import (
@@ -246,8 +254,11 @@ LIVE_TRAINING_INTERVAL_SECONDS = max(60, int(os.getenv("LIVE_TRAINING_INTERVAL_S
 # 진입이 전부 막히므로, 서버가 뜨면 곧바로 한 번 학습하고 이후 주기적으로 재학습한다.
 # 학습은 별도 프로세스에서 저우선순위로 돌린다 — 이 적합은 CPU를 오래 점유하고,
 # 트레이딩 루프는 지연에 민감하다.
-AUTO_START_TEMPORAL_GNN_TRAINING = os.getenv("AUTO_START_TEMPORAL_GNN_TRAINING", "true").lower() not in {"0", "false", "no", "off"}
+AUTO_START_TEMPORAL_GNN_TRAINING = os.getenv("AUTO_START_TEMPORAL_GNN_TRAINING", "false").lower() not in {"0", "false", "no", "off"}
 TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS = max(600, int(os.getenv("TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS", "21600")))
+TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS = max(
+    0, int(os.getenv("TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS", "0"))
+)
 TEMPORAL_GNN_TRAINING_LIMIT = max(50, int(os.getenv("TEMPORAL_GNN_TRAINING_LIMIT", "400")))
 TEMPORAL_GNN_TRAINING_EPOCHS = max(1, int(os.getenv("TEMPORAL_GNN_TRAINING_EPOCHS", "12")))
 TEMPORAL_GNN_TRAINING_POPULATION = max(2, int(os.getenv("TEMPORAL_GNN_TRAINING_POPULATION", "8")))
@@ -916,6 +927,7 @@ _account_service = AccountDashboardService(
 app.include_router(
     create_account_router(
         service=_account_service,
+        operations_provider=lambda: _operations_overview_provider(),
         refactor_provider=build_refactor_dashboard,
         market_view_provider=_strategy_market_view_with_live_session,
         market_stream_provider=lambda symbol, limit: build_strategy_market_stream(
@@ -1131,7 +1143,7 @@ def _kis_account_cache_seconds() -> float:
 
 
 def _get_store_root() -> Path:
-  return Path(os.getenv("REALTIME_STORE_ROOT", "data/store"))
+  return runtime_store_root()
 
 
 def _principal_config_path() -> Path:
@@ -2004,7 +2016,7 @@ def _latest_model_reliability(
     preferred_reports = {
         market: _model_reliability_at_root(
             now,
-            Path("data/models/live_short_horizon") / market,
+            ModelArtifactRegistry().root / market,
         )
         for market in normalized_markets
     }
@@ -2012,7 +2024,7 @@ def _latest_model_reliability(
     if any(not report.get("ok") for report in preferred_reports.values()):
       combined_report = _model_reliability_at_root(
           now,
-          Path("data/models/live_short_horizon"),
+          ModelArtifactRegistry().root,
       )
       for market, preferred in preferred_reports.items():
         if preferred.get("ok"):
@@ -2071,7 +2083,7 @@ def _latest_model_reliability(
         ],
         "market_models": reports,
     }
-  return _model_reliability_at_root(now, Path("data/models/live_short_horizon"))
+  return _model_reliability_at_root(now, ModelArtifactRegistry().root)
 
 
 def _model_reliability_at_root(now: datetime, root: Path) -> dict[str, Any]:
@@ -2283,7 +2295,7 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
       120,
   )
   us_age = _auto_reliability_int("AUTO_RELIABILITY_US_MAX_AGE_SECONDS", 90)
-  database = Path(os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"))
+  database = realtime_market_database_path()
   healthy: dict[str, list[str]] = {"KRX": [], "US": []}
   # No core entry session means there is no realtime feed to require. Market
   # session gates still reject new orders, while the reliability controller can
@@ -2406,6 +2418,19 @@ def _auto_market_health(now: datetime, groups: tuple[str, ...]) -> dict[str, Any
   }
 
 
+def _deterministic_model_fallback_allowed(model: Mapping[str, Any]) -> bool:
+  """Whether a demoted learned scorer may yield to deterministic strategies."""
+  return bool(
+      _env_bool_web("AUTO_RELIABILITY_MODEL_DEGRADED_FALLBACK", True)
+      and _env_bool_web("STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION", True)
+      and not _env_bool_web("STRATEGY_SESSION_GNN_DIRECT_ELECTION", False)
+      and not model.get("ok")
+      and model.get("schema_matches") is True
+      and str(model.get("trust_level") or "")
+      == ModelTrustLevel.SHADOW_ONLY.value
+  )
+
+
 def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
   now = now or datetime.now(timezone.utc)
   groups = _active_live_market_groups(now)
@@ -2419,7 +2444,7 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
       if group != "KRX" or _is_live_market_core_open("KRX", now)
   )
   owner = _kis_realtime_session_owner(now)
-  if owner in {"KRX", "US"}:
+  if owner in {"KRX", "US"} and not _multiplexed_realtime_enabled():
     # A KIS AppKey permits one realtime WebSocket session. During overlapping
     # KRX/US-daytime windows only the elected owner can produce fresh WS books;
     # do not make the deliberately idle market a reliability hard gate.
@@ -2447,6 +2472,19 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
   ]
   policy_ok = not policy_conflicts
   model = _latest_model_reliability(now, market_data_groups)
+  # The learned scorer and deterministic strategy branches are peers.  A stale
+  # but schema-compatible model is already demoted to SHADOW_ONLY by the artifact
+  # registry and therefore cannot price an entry; it must not also turn off the
+  # independent deterministic branch.  Without this effective readiness a model-
+  # only failure could keep an already-live process running, but could never
+  # promote a learning process back to live -- a sticky bootstrap deadlock.
+  deterministic_fallback = _deterministic_model_fallback_allowed(model)
+  model_component = {
+      **model,
+      "native_ok": bool(model.get("ok")),
+      "degraded_fallback_active": deterministic_fallback,
+      "ok": bool(model.get("ok")) or deterministic_fallback,
+  }
   market = _auto_market_health(now, market_data_groups)
   market["required_markets"] = list(market_data_groups)
   market["extended_order_markets"] = list(groups)
@@ -2455,7 +2493,7 @@ def _evaluate_auto_reliability(now: datetime | None = None) -> dict[str, Any]:
       "runtime": {"ok": bool(runtime.ok), "weight": 0.15, "failures": list(runtime.failures)},
       "config": {"ok": config_ok, "weight": 0.10},
       "risk_policy": {"ok": policy_ok, "weight": 0.15, "failures": policy_conflicts},
-      "model": {**model, "weight": 0.20},
+      "model": {**model_component, "weight": 0.20},
       "market_data": {**market, "weight": 0.20},
   }
   score = sum(float(item["weight"]) for item in components.values() if item.get("ok"))
@@ -2952,6 +2990,11 @@ _temporal_gnn_heartbeat: dict[str, Any] = {
     "checkpoint": None,
     "health_state": None,
     "error": None,
+    # Declared up front so /api/live-training/status has the same shape before the
+    # first cycle finishes as it does after one.
+    "refused": None,
+    "blocks_new_entries": False,
+    "training_examples": None,
 }
 # 주기적 백그라운드 학습 워커: 수집·트레이딩과 독립된 스레드.
 _live_training_worker: threading.Thread | None = None
@@ -3053,6 +3096,16 @@ def _stop_asset_history_sampler() -> None:
 def _startup_live_worker() -> None:
     RealtimeAccelerationPolicy().apply_process_hints()
     configure_default_event_llm_env()
+    # A process stop can happen after a plan is armed but before the session's
+    # next reconciliation tick.  Expire those clock-dead, never-opened plans at
+    # the same boundary that restores all live workers so the durable dashboard
+    # does not report historical ARMED plans as current opportunities forever.
+    try:
+      from app.trading.trade_plan import default_trade_plan_store
+
+      default_trade_plan_store().expire_stale()
+    except Exception:  # noqa: BLE001 - store maintenance must not block startup.
+      pass
     try:
       llm_status = event_llm_runtime_status()
       llm_status["probe_skipped"] = True
@@ -3224,8 +3277,58 @@ def _context_refresh_loop() -> None:
             except Exception:  # noqa: BLE001 - recorded inside refresh(); never fatal.
                 pass
         _maintain_trading_state_storage()
+        _prune_realtime_store_history()
         _checkpoint_realtime_store_wal()
         _context_refresh_stop.wait(CONTEXT_REFRESH_INTERVAL_SECONDS)
+
+
+_realtime_prune_at = 0.0
+_realtime_prune_lock = threading.Lock()
+
+
+def _prune_realtime_store_history() -> None:
+  """Apply the realtime store's retention windows on a schedule.
+
+  This used to live in ``RealtimeMarketDataStore.init_db``, which runs on every
+  construction -- including the one that had just migrated the file. The prune then
+  deleted past-retention rows the migration had carried forward, so
+  ``schema_migrations`` recorded rows_before == rows_after for rows that were already
+  gone. Retention is maintenance and belongs on the maintenance loop, next to the WAL
+  checkpoint whose growth it bounds.
+
+  Ordered before the checkpoint on purpose: pruning is what makes the WAL worth
+  truncating, and a checkpoint that runs first has to copy pages the prune is about to
+  delete.
+  """
+  global _realtime_prune_at
+  interval = max(300.0, _env_float_web("REALTIME_STORE_PRUNE_SEC", 3600.0))
+  now_monotonic = time.monotonic()
+  with _realtime_prune_lock:
+    if _realtime_prune_at and now_monotonic - _realtime_prune_at < interval:
+      return
+    # Unlike the checkpoint, this does not run on the first pass. time.monotonic() is
+    # time since boot, so a 0.0 baseline is always "overdue" -- and a delete sweep over
+    # every retention table while the feeds are still filling their first minute is the
+    # wrong thing to do at startup.
+    first_pass = not _realtime_prune_at
+    _realtime_prune_at = now_monotonic
+  if first_pass:
+    return
+  try:
+    store = RealtimeMarketDataStore()
+    operational = store.prune_operational_history()
+    market = store.prune_market_history()
+  except Exception as exc:  # noqa: BLE001 - maintenance must never affect trading.
+    audit.record(
+        "realtime_store_prune_error",
+        {"error": f"{type(exc).__name__}: {exc}"},
+    )
+    return
+  if operational or market:
+    audit.record(
+        "realtime_store_history_pruned",
+        {"operational_rows": int(operational), "market_rows": int(market)},
+    )
 
 
 _realtime_wal_checkpoint_at = 0.0
@@ -4077,6 +4180,7 @@ def _with_gnn_runtime_observability(
         **_live_shadow_state,
         "errors": dict(_live_shadow_state.get("errors") or {}),
     }
+    service = _live_shadow_service
   completed_at = _parse_iso_datetime(shadow.get("last_success_at"))
   completion_age = (
       max(0.0, (observed_at - completed_at).total_seconds())
@@ -4103,6 +4207,26 @@ def _with_gnn_runtime_observability(
   # that have matured and successfully joined to realized outcomes.
   payload["validation_count"] = int(payload.get("sample_count") or 0)
   payload["validation_count_as_of"] = payload.get("evaluated_at")
+  payload["inference_errors"] = dict(shadow.get("errors") or {})
+  model_schema = str(getattr(service, "model_input_schema", "") or "")
+  contract_reasons = list(
+      getattr(service, "checkpoint_contract_reasons", ()) or ()
+  )
+  checkpoint_error = str(getattr(service, "checkpoint_error", "") or "")
+  if checkpoint_error:
+    contract_reasons.append(checkpoint_error)
+  if service is not None and model_schema != STRATEGY_GRAPH_CONTEXT_SCHEMA:
+    contract_reasons.append("GNN_FEATURE_SCHEMA_MISMATCH")
+  payload["runtime_feature_schema"] = STRATEGY_GRAPH_CONTEXT_SCHEMA
+  payload["checkpoint_feature_schema"] = model_schema or None
+  payload["inference_contract_reason_codes"] = list(
+      dict.fromkeys(contract_reasons)
+  )
+  payload["inference_contract_ready"] = bool(
+      service is not None
+      and getattr(service, "checkpoint_loaded", False)
+      and not payload["inference_contract_reason_codes"]
+  )
   return payload
 
 
@@ -4495,25 +4619,113 @@ def _safe_live_training_status_fast() -> dict[str, Any]:
     available at ``/api/live-training/status``. The realtime runtime endpoint is
     polled frequently, so it only checks the registry pointer.
     """
-    try:
-        artifact = ModelArtifactRegistry().load_latest_live_eligible()
-    except Exception as exc:  # noqa: BLE001 - status endpoint should report, not fail.
-        return {
-            "ok": False,
-            "pipeline": "collect_features_train_save_predict",
-            "model_saved": False,
-            "latest_live_eligible_exists": False,
-            "error": f"{exc.__class__.__name__}: {exc}",
-            "fast_status": True,
-        }
+    serving = _fast_serving_model_status()
+    available = list(serving["available_markets"])
+    artifact_ids = [
+        str(serving["market_models"][market].get("artifact_id") or "")
+        for market in available
+    ]
+    artifact_ids = list(dict.fromkeys(item for item in artifact_ids if item))
     return {
-        "ok": True,
+        "ok": serving["ok"],
+        "partial": serving["partial"],
         "pipeline": "collect_features_train_save_predict",
-        "model_saved": True,
-        "latest_live_eligible_exists": bool(getattr(artifact, "live_eligible", False)),
-        "latest_live_eligible_model_artifact_id": artifact.artifact_id,
-        "feature_schema_hash": artifact.feature_schema_hash,
+        "model_saved": bool(available),
+        "latest_live_eligible_exists": bool(available),
+        "latest_live_eligible_model_artifact_id": (
+            artifact_ids[0] if len(artifact_ids) == 1 else ",".join(artifact_ids) or None
+        ),
+        "available_markets": available,
+        "failed_markets": list(serving["failed_markets"]),
+        "market_models": serving["market_models"],
         "fast_status": True,
+    }
+
+
+def _fast_serving_model_status(
+    *,
+    root: str | Path | None = None,
+    markets: Sequence[str] = ("KR", "US"),
+) -> dict[str, Any]:
+    """Resolve the same market-model fallback chain as ``LiveSignalPredictor``.
+
+    Training writes a combined artifact plus independent KR/US artifacts.  Checking
+    only the combined ``latest.json`` made the dashboard report that inference was
+    unavailable while the predictor was correctly serving a fresh KR champion.  It
+    also hid the opposite case: one market can be unavailable while the other works.
+    """
+    base_root = Path(root) if root is not None else ModelArtifactRegistry().root
+    split_enabled = _env_bool_web("LIVE_MODEL_SPLIT_BY_MARKET", True)
+    normalized_markets = tuple(
+        dict.fromkeys(
+            "KR" if str(market).upper() in {"KR", "KRX"} else "US"
+            for market in markets
+            if str(market).upper() in {"KR", "KRX", "US"}
+        )
+    ) or ("KR", "US")
+    targets = normalized_markets if split_enabled else ("COMBINED",)
+    combined_registry = ModelArtifactRegistry(base_root)
+    combined_result: tuple[Any | None, str | None] | None = None
+
+    def load(registry: ModelArtifactRegistry) -> tuple[Any | None, str | None]:
+      try:
+        return registry.load_latest_live_eligible(), None
+      except Exception as exc:  # noqa: BLE001 - diagnostics report the refusal.
+        return None, f"{exc.__class__.__name__}: {exc}"
+
+    reports: dict[str, dict[str, Any]] = {}
+    for market in targets:
+      artifact = None
+      preferred_error = None
+      source = "combined"
+      if split_enabled:
+        artifact, preferred_error = load(ModelArtifactRegistry(base_root / market))
+        source = "market_specific"
+      if artifact is None:
+        if combined_result is None:
+          combined_result = load(combined_registry)
+        artifact, combined_error = combined_result
+        source = "combined_fallback" if artifact is not None and split_enabled else "combined"
+      else:
+        combined_error = None
+      if artifact is None:
+        reports[market] = {
+            "ok": False,
+            "serving_source": "unavailable",
+            "artifact_id": None,
+            "preferred_error": preferred_error,
+            "combined_error": combined_error,
+            "error": preferred_error or combined_error,
+        }
+        continue
+      finite_weights = all(
+          math.isfinite(float(value))
+          for value in (*artifact.weights, *artifact.expected_return_weights)
+      )
+      finite_bias = math.isfinite(float(artifact.bias)) and math.isfinite(
+          float(artifact.expected_return_bias)
+      )
+      finite_parameters = finite_weights and finite_bias
+      reports[market] = {
+          "ok": finite_parameters,
+          "serving_source": source,
+          "artifact_id": artifact.artifact_id,
+          "path": str(artifact.path),
+          "created_at": artifact.created_at,
+          "feature_schema_hash": artifact.feature_schema_hash,
+          "live_eligible": bool(artifact.live_eligible),
+          "finite_parameters": finite_parameters,
+          "error": None if finite_parameters else "MODEL_PARAMETERS_NOT_FINITE",
+          "preferred_error": preferred_error,
+      }
+    available = [market for market, report in reports.items() if report.get("ok")]
+    failed = [market for market, report in reports.items() if not report.get("ok")]
+    return {
+        "ok": not failed,
+        "partial": bool(available and failed),
+        "available_markets": available,
+        "failed_markets": failed,
+        "market_models": reports,
     }
 
 
@@ -4571,22 +4783,14 @@ def _validate_live_signal_predictor() -> dict[str, Any]:
           "error": "LIVE_SIGNAL_MODEL_INFERENCE_DISABLED",
           "uses_live_eligible_model": False,
       }
-    registry = ModelArtifactRegistry()
-    try:
-      artifact = registry.load_latest_live_eligible()
-    except Exception as exc:  # noqa: BLE001
-      return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}", "uses_live_eligible_model": False}
-    metrics = dict(getattr(artifact, "metrics", {}) or {})
-    finite_weights = all(math.isfinite(float(value)) for value in (*artifact.weights, *artifact.expected_return_weights))
-    finite_bias = math.isfinite(float(artifact.bias)) and math.isfinite(float(artifact.expected_return_bias))
+    serving = _fast_serving_model_status()
     return {
-        "ok": bool(artifact.live_eligible and finite_weights and finite_bias),
-        "artifact_id": artifact.artifact_id,
-        "path": str(artifact.path),
-        "uses_live_eligible_model": artifact.live_eligible,
-        "feature_schema_hash": artifact.feature_schema_hash,
-        "metrics": metrics,
-        "finite_parameters": finite_weights and finite_bias,
+        "ok": serving["ok"],
+        "partial": serving["partial"],
+        "uses_live_eligible_model": bool(serving["available_markets"]),
+        "available_markets": serving["available_markets"],
+        "failed_markets": serving["failed_markets"],
+        "market_models": serving["market_models"],
     }
 
 
@@ -4614,6 +4818,7 @@ def live_training_status_api() -> JSONResponse:
         **heartbeat,
         "enabled": AUTO_START_TEMPORAL_GNN_TRAINING,
         "interval_seconds": TEMPORAL_GNN_TRAINING_INTERVAL_SECONDS,
+        "startup_delay_seconds": TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS,
         "running": bool(_temporal_gnn_worker is not None and _temporal_gnn_worker.is_alive()),
         "checkpoint_path": str(DEFAULT_GNN_CHECKPOINT_PATH),
         "checkpoint_exists": DEFAULT_GNN_CHECKPOINT_PATH.exists(),
@@ -4665,17 +4870,28 @@ def _safe_live_training_status() -> dict[str, Any]:
     latest_live_id = latest_live.get("artifact_id") if isinstance(latest_live, dict) else None
     latest_live_eligible = bool(status.get("latest_live_eligible_exists"))
     inference_enabled = live_signal_model_inference_enabled()
+    serving = _fast_serving_model_status()
     quality = _live_training_quality_summary(latest_saved, latest_live, status.get("training_rows"))
     return {
         **status,
-        "ok": True,
+        "ok": bool(
+            status.get("realtime_store_exists")
+            and status.get("feature_journal_exists")
+            and (not inference_enabled or serving["ok"])
+        ),
+        "collection_ok": bool(
+            status.get("realtime_store_exists") and status.get("feature_journal_exists")
+        ),
         "pipeline": "collect_features_train_save_predict",
         "auto_training_enabled": True,
         "model_saved": bool(latest_saved_id or latest_live_eligible),
         "latest_model_artifact_id": latest_saved_id,
         "latest_live_eligible_model_artifact_id": latest_live_id,
         "inference_enabled": inference_enabled,
-        "inference_uses_latest_live_eligible": inference_enabled and latest_live_eligible,
+        "inference_uses_latest_live_eligible": bool(
+            inference_enabled and serving["available_markets"]
+        ),
+        "serving_models": serving,
         "quality": quality,
     }
 
@@ -4788,6 +5004,7 @@ def _live_flags_status_payload(applied: bool = False) -> dict[str, Any]:
 def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str, Any]:
     gates: dict[str, bool] = {}
     failures: dict[str, str] = {}
+    degradations: dict[str, str] = {}
 
     def record(name: str, ok: bool, reason: str | None = None) -> None:
       gates[name] = ok
@@ -4816,7 +5033,23 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
             else f"FEATURE_SCHEMA_MISMATCH expected={LIVE_SHORT_HORIZON_SCHEMA.schema_hash} actual={artifact.feature_schema_hash}",
         )
       except Exception as exc:  # noqa: BLE001 - UI readiness should summarize every gate.
-        record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
+        # Keep the operator-facing readiness card consistent with the actual
+        # auto-reliability authority. A stale, schema-compatible SHADOW model is
+        # not allowed to score entries, but it also must not be displayed as a
+        # global order blockade when deterministic algorithms own election.
+        fallback = False
+        if str(exc).startswith("LATEST_MODEL_STALE"):
+          try:
+            groups = _active_live_market_groups(datetime.now(timezone.utc))
+            model = _latest_model_reliability(datetime.now(timezone.utc), groups)
+            fallback = _deterministic_model_fallback_allowed(model)
+          except Exception:  # noqa: BLE001 - retain the original fail-closed gate.
+            fallback = False
+        if fallback:
+          record("live_eligible_model", True)
+          degradations["live_eligible_model"] = "DETERMINISTIC_STRATEGY_FALLBACK"
+        else:
+          record("live_eligible_model", False, _live_model_readiness_failure_message(exc))
     else:
       record("live_signal_model_inference_disabled", True)
     secrets = validate_live_secret_file()
@@ -4832,7 +5065,12 @@ def _web_live_readiness_summary(*, include_kis_health: bool = False) -> dict[str
         record("kis_health", False, exc.__class__.__name__)
     else:
       record("kis_health_deferred", True)
-    return {"ok": not failures, "gates": gates, "failures": failures}
+    return {
+        "ok": not failures,
+        "gates": gates,
+        "failures": failures,
+        "degradations": degradations,
+    }
 
 
 def _kis_secret_file_gate_ok(secrets: dict[str, bool]) -> bool:
@@ -5374,7 +5612,7 @@ def _live_training_history(
   use_cache: bool = True,
 ) -> dict[str, Any]:
   """Return real completed training cycles, never synthetic epoch progress."""
-  model_root = root or Path("data/models/live_short_horizon")
+  model_root = root or ModelArtifactRegistry().root
   history_limit = max(2, min(240, int(limit)))
   cache_key = str(model_root.resolve())
   now_monotonic = time.monotonic()
@@ -5419,6 +5657,15 @@ def _live_training_history(
         training_data.get("materialized_row_count")
         or row_count
     )
+    cumulative_row_count = int(
+        training_data.get("cumulative_materialized_row_count")
+        or materialized_row_count
+    )
+    if points:
+      cumulative_row_count = max(
+          cumulative_row_count,
+          int(points[-1].get("cumulative_rows") or 0),
+      )
     points.append(
         {
             "timestamp": artifact.get("created_at"),
@@ -5430,6 +5677,7 @@ def _live_training_history(
             ),
             "training_rows": row_count,
             "materialized_rows": materialized_row_count,
+            "cumulative_rows": cumulative_row_count,
             "fresh_rows": int(training_data.get("fresh_row_count") or 0),
             "new_rows": int(training_data.get("new_materialized_row_count") or 0),
             "positive_labels": int(metrics.get("positive_labels") or 0),
@@ -5458,15 +5706,21 @@ def _live_training_history(
   latest = points[-1] if points else {}
   previous = points[-2] if len(points) > 1 else {}
   rows = int(latest.get("training_rows") or 0)
+  # ``training_rows`` is a rolling, de-overlapped model window. Once the raw
+  # materialized pool reaches its retention cap, replacing dense old observations
+  # with sparse new ones can legitimately make this window smaller. It is therefore
+  # not a cumulative counter. Intake is measured from each artifact's accepted
+  # ``new_rows`` instead of resetting the rate whenever the usable window shrinks.
+  rate_points = points
   first_timestamp: datetime | None = None
   last_timestamp: datetime | None = None
-  if points:
+  if rate_points:
     try:
       first_timestamp = datetime.fromisoformat(
-          str(points[0].get("timestamp") or "").replace("Z", "+00:00")
+          str(rate_points[0].get("timestamp") or "").replace("Z", "+00:00")
       )
       last_timestamp = datetime.fromisoformat(
-          str(points[-1].get("timestamp") or "").replace("Z", "+00:00")
+          str(rate_points[-1].get("timestamp") or "").replace("Z", "+00:00")
       )
       if first_timestamp.tzinfo is None:
         first_timestamp = first_timestamp.replace(tzinfo=timezone.utc)
@@ -5480,8 +5734,8 @@ def _live_training_history(
       if first_timestamp is not None and last_timestamp is not None
       else 0.0
   )
-  row_growth = int(latest.get("materialized_rows") or 0) - int(
-      (points[0] if points else {}).get("materialized_rows") or 0
+  accepted_rows = sum(
+      max(0, int(point.get("new_rows") or 0)) for point in rate_points[1:]
   )
   vectorized = rows >= 1_000
   incremental_mode = str(latest.get("training_mode") or "") == "incremental"
@@ -5547,12 +5801,20 @@ def _live_training_history(
           - int(previous.get("training_rows") or 0),
           "materialized_rows": int(latest.get("materialized_rows") or 0)
           - int(previous.get("materialized_rows") or 0),
+          "cumulative_rows": int(latest.get("cumulative_rows") or 0)
+          - int(previous.get("cumulative_rows") or 0),
       },
-      "rows_per_hour": row_growth / elapsed_hours if elapsed_hours > 0 else 0.0,
+      "rows_per_hour": accepted_rows / elapsed_hours if elapsed_hours > 0 else 0.0,
       "window_hours": elapsed_hours,
+      "row_count_semantics": {
+          "training_rows": "ROLLING_DEOVERLAPPED_MODEL_WINDOW",
+          "materialized_rows": "ROLLING_RAW_RETENTION_POOL",
+          "cumulative_rows": "MONOTONIC_LIFETIME_ACCEPTED_ROWS",
+          "new_rows": "ACCEPTED_THIS_CYCLE",
+      },
       "note": (
-          "차트는 완료된 실제 학습 사이클을 표시합니다. 짧은 배치 학습이므로 "
-          "실행 중 에포크 진행률은 생성하지 않습니다."
+          "누적 수집 행은 보존 상한과 관계없이 증가합니다. 유효 학습 윈도우는 "
+          "중복 간격 제거 후의 현재 학습 표본이며 별도로 표시합니다."
       ),
   }
   if use_cache:
@@ -5851,7 +6113,8 @@ def _system_diagnostics_payload() -> dict[str, Any]:
       **dict((latest_training or {}).get("counts") or {}),
   }
   try:
-    with closing(sqlite3.connect("data/store/live_training_rows.sqlite3")) as conn:
+    from app.models.live_training_pipeline import DEFAULT_TRAINING_ROW_STORE_PATH
+    with closing(sqlite3.connect(DEFAULT_TRAINING_ROW_STORE_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
       training_counts["materialized_training_rows"] = int(
           conn.execute(
               """
@@ -5930,8 +6193,8 @@ def _system_diagnostics_payload() -> dict[str, Any]:
     summary = "아래 워커 상태와 최근 활동을 확인하세요."
 
   file_states = {
-      "research_store": _diagnostic_file_state(Path("data/store/research.sqlite3"), now),
-      "realtime_store": _diagnostic_file_state(Path("data/store/realtime_market_data.sqlite3"), now),
+      "research_store": _diagnostic_file_state(runtime_database_path("research.sqlite3"), now),
+      "realtime_store": _diagnostic_file_state(realtime_market_database_path(), now),
       "feature_journal": _diagnostic_file_state(Path("logs/live-feature-frames.jsonl"), now),
       "decision_log": _diagnostic_file_state(Path("logs/decision-log.jsonl"), now),
   }
@@ -6199,6 +6462,61 @@ def _overlay_system_diagnostics_live_state(payload: dict[str, Any]) -> dict[str,
     result["headline"] = "보유 종목 안전 감시는 실행 중이고, 신규 매수는 차단되어 있습니다."
     result["summary"] = "학습 모드에서는 매도 위험 감시만 유지하고 신규 주문 승격을 대기합니다."
   return result
+
+
+def _operations_overview_provider() -> dict[str, Any]:
+  """Read existing state only; UI polling must never refresh a broker or model."""
+  from app.operations_dashboard import build_operations_overview
+  from app.strategy.market_policy import build_market_operating_plans
+  from app.paths import runtime_store_root
+
+  now = datetime.now(timezone.utc)
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+    running = bool(_realtime_trading_worker and _realtime_trading_worker.is_alive())
+  status = engine.get_status() if engine is not None else {}
+  summary = status.get("last_summary") or {}
+  session = status.get("strategy_session") or summary.get("strategy_session") or {}
+  context = _context_runtime
+  cycles = context.latest_by_market() if context is not None and hasattr(context, "latest_by_market") else {}
+  regimes = {group: cycle.regime.dominant for group, cycle in cycles.items()}
+  plans = build_market_operating_plans(regimes, now_utc=now)
+  markets = {}
+  for group, plan in plans.items():
+    cycle = cycles.get(group)
+    markets[group] = {
+        **plan.as_dict(), "phase": ", ".join(plan.active_sessions) or "CLOSED",
+        "allows_new_entry": bool(plan.live_entry_sessions),
+        "reason": ", ".join(plan.reason_codes),
+        "strategy_ids": list(plan.preferred_strategy_ids),
+        "source": "KIS WebSocket + 시장별 출처 검증 지표",
+        "updated_at": cycle.captured_at.isoformat() if cycle else None,
+    }
+  predictor = getattr(getattr(engine, "decision_engine", None), "predictor", None)
+  model = predictor.status() if predictor is not None and hasattr(predictor, "status") else {}
+  active = _operation_mode_state.get("active")
+  active = _to_jsonable(active) if active is not None else {}
+  mode = active.get("mode") if isinstance(active, dict) else None
+  armed = status.get("buy_enabled") is True and mode == "live_trading"
+  chain = [
+      {"stage": "engine", "ok": running, "detail": "실시간 엔진 실행 중" if running else "엔진 시작 대기"},
+      {"stage": "live_armed", "ok": armed, "detail": status.get("buy_disabled_reason") or ("실거래 모드" if armed else "실거래 권한 대기")},
+      {"stage": "market_session", "ok": any(p.live_entry_sessions for p in plans.values()), "detail": "국장·미장 세션과 주문 경로를 개별 확인"},
+      {"stage": "buy_candidates", "ok": int(summary.get("buy_candidate_count") or 0) > 0, "detail": f"평가 후보 {int(summary.get('buy_candidate_count') or 0)}개"},
+      {"stage": "strategy_election", "ok": bool(session.get("selected_symbol")), "detail": summary.get("reason") or session.get("phase") or "전략 평가 대기"},
+  ]
+  return build_operations_overview(
+      trading={"running": running, "status": status}, blockade={"chain": chain}, markets=markets,
+      mode=mode, orders=status.get("recent_events") or (), now=now,
+      runtime={
+          "backend": model.get("backend"), "requested_backend": model.get("requested_device"),
+          "device": model.get("backend"), "latency_ms": model.get("latency_ms"),
+          "fallback_reason": model.get("fallback_reason"), "state_path": str(runtime_store_root()),
+          "model": {"version": model.get("artifact_id"), "updated_at": model.get("updated_at"),
+                    "status": "READY" if model.get("approved") else "WAITING",
+                    "reason": ", ".join(model.get("reason_codes") or ())},
+      },
+  )
 
 
 def _market_session_capability_payload() -> dict[str, Any]:
@@ -7612,6 +7930,13 @@ def _entry_blockade_chain() -> list[dict]:
   # applicable strategies and feature/model metadata. Distinguishing asynchronous
   # backfill from "nothing qualifies" is the difference between waiting and debugging.
   warmup = _buy_candidate_warmup_detail() if count == 0 else {}
+  if count > 0:
+    # Keep unfinished candidate lanes visible after one symbol advances. The
+    # GUI uses ANY semantics: one ready lane advances while the rest keep warming.
+    with _minute_warmup_lock:
+      warmup_service = _minute_warmup_coordinator
+    if warmup_service is not None:
+      warmup["warmup_queue"] = warmup_service.status()
   detail = f"매수 후보 {count}개"
   if count == 0 and warmup.get("no_recent_trade_activity"):
     # Checked BEFORE warm-up: with no trades in the window there is no "best
@@ -7660,11 +7985,20 @@ def _entry_blockade_chain() -> list[dict]:
       "candidate_filter_selected_count": (
           int(filter_state.get("selected_count") or 0) if filter_matches_cycle else None
       ),
+      "candidate_filter_selected_symbols": (
+          list(filter_state.get("selected_symbols") or ()) if filter_matches_cycle else []
+      ),
       "candidate_filter_reason_counts": (
           dict(filter_state.get("reason_counts") or {}) if filter_matches_cycle else {}
       ),
       "candidate_filter_reason_samples": (
           dict(filter_state.get("reason_samples") or {}) if filter_matches_cycle else {}
+      ),
+      "candidate_filter_admission_note_counts": (
+          dict(filter_state.get("admission_note_counts") or {}) if filter_matches_cycle else {}
+      ),
+      "candidate_filter_admission_note_samples": (
+          dict(filter_state.get("admission_note_samples") or {}) if filter_matches_cycle else {}
       ),
   }
   _link(
@@ -7756,6 +8090,9 @@ def _entry_blockade_chain() -> list[dict]:
     triggered_algorithms = [
       row for row in algorithm_evaluations if bool(row.get("triggered"))
     ]
+    cost_viable_algorithms = [
+      row for row in triggered_algorithms if row.get("cost_viable") is not False
+    ]
     algorithm_rejection_counts: dict[str, int] = {}
     for row in algorithm_evaluations:
       for code in tuple(row.get("reason_codes") or ()):
@@ -7769,7 +8106,11 @@ def _entry_blockade_chain() -> list[dict]:
     best_pair = ranked_evaluations[0] if ranked_evaluations else None
     change_probability = session.get("change_point_probability")
     if picked:
+      risk_mode = str(session.get("risk_tolerance_mode") or "NORMAL").upper()
+      risk_fraction = float(session.get("risk_tolerance_size_fraction") or 1.0)
       election_detail = f"선택된 종목×전략: {arm}"
+      if risk_mode != "NORMAL":
+        election_detail += f" · 제한 탐색 진입 최대 {risk_fraction * 100:.0f}%"
     elif "BANDIT_CHANGE_POINT_STAND_DOWN" in bandit_reasons:
       probability_text = (
         f" {float(change_probability) * 100:.1f}%"
@@ -7784,7 +8125,8 @@ def _entry_blockade_chain() -> list[dict]:
       )
     elif algorithm_evaluations:
       election_detail = (
-        f"전략별 실제 진입 트리거 {len(triggered_algorithms)}/{len(algorithm_evaluations)}"
+        f"기계적 트리거 {len(triggered_algorithms)}/{len(algorithm_evaluations)}"
+        f" · 비용 통과 {len(cost_viable_algorithms)}/{len(triggered_algorithms)}"
         " · 미충족 조합은 성과 표본에서 제외"
       )
     else:
@@ -7799,10 +8141,18 @@ def _entry_blockade_chain() -> list[dict]:
           else session.get("bandit_conservative_edge_bps")
        ),
        "is_exploration": session.get("bandit_is_exploration"),
+       "risk_tolerance_mode": session.get("risk_tolerance_mode", "NORMAL"),
+       "risk_tolerance_size_fraction": session.get(
+           "risk_tolerance_size_fraction", 1.0
+       ),
+       "risk_tolerance_reason_codes": list(
+           session.get("risk_tolerance_reason_codes") or ()
+       ),
        "reason_codes": bandit_reasons,
        "change_point_probability": change_probability,
        "best_pair": best_pair,
        "algorithm_triggered_count": len(triggered_algorithms),
+       "algorithm_cost_viable_count": len(cost_viable_algorithms),
        "algorithm_evaluated_count": len(algorithm_evaluations),
        "algorithm_rejection_counts": dict(sorted(algorithm_rejection_counts.items())),
        "algorithm_evaluations": algorithm_evaluations[:48],
@@ -7826,6 +8176,427 @@ def _entry_blockade_chain() -> list[dict]:
   )
 
   return chain
+
+
+def _entry_decision_dag(chain: list[dict]) -> dict[str, Any]:
+  """Build the operator-facing hierarchical decision DAG for one live cycle.
+
+  Nodes inside FAN_OUT/MAP layers are independent.  Only explicit merge layers
+  combine their outputs.  Risk, cash ownership and broker submission remain a
+  serial commit because parallel writes there could over-allocate the account.
+  """
+  by_stage = {str(item.get("stage") or ""): item for item in chain}
+  context_runtime = get_context_runtime()
+  try:
+    regime_view = dict(context_runtime.regime_view() or {}) if context_runtime else {}
+    ranked_view = dict(context_runtime.candidates_view(limit=24) or {}) if context_runtime else {}
+  except Exception:  # noqa: BLE001 - dashboard enrichment is advisory.
+    regime_view, ranked_view = {}, {}
+
+  def _node(
+      node_id: str,
+      label: str,
+      status: str,
+      detail: str,
+      **metadata: Any,
+  ) -> dict[str, Any]:
+    return {
+        "id": node_id,
+        "label": label,
+        "status": status,
+        "detail": detail,
+        "metadata": metadata,
+    }
+
+  def _link_node(stage: str, label: str) -> dict[str, Any]:
+    item = by_stage.get(stage)
+    return _node(
+        stage,
+        label,
+        "pass" if item and item.get("ok") else "blocked" if item else "pending",
+        str((item or {}).get("detail") or "아직 평가되지 않음"),
+        stage=stage,
+    )
+
+  candidate_link = by_stage.get("buy_candidates") or {}
+  candidate_data = dict(candidate_link.get("data") or {})
+  selected = {
+      str(symbol or "").upper()
+      for symbol in (
+          list(candidate_data.get("candidate_filter_selected_symbols") or ())
+          + list(candidate_data.get("sample") or ())
+      )
+      if str(symbol or "").strip()
+  }
+  # ``selected`` is the lineage contract for every downstream GUI layer.  The
+  # session manager intentionally retains its last detailed evaluation for
+  # diagnostics, while the candidate provider publishes a fresh set every
+  # engine cycle.  Rendering the retained rows without this intersection made
+  # today's domestic candidate layer appear to feed yesterday's US strategy
+  # rows even though those symbols were never connected in the live pipeline.
+  advancing_symbols = set(selected)
+  queue_rows = dict(
+      ((candidate_data.get("warmup_queue") or {}).get("readiness") or {}).get("symbols")
+      or {}
+  )
+  rejected_by_symbol: dict[str, list[str]] = {}
+  for reason, symbols in dict(
+      candidate_data.get("candidate_filter_reason_samples") or {}
+  ).items():
+    for symbol in symbols or ():
+      rejected_by_symbol.setdefault(str(symbol).upper(), []).append(str(reason))
+  candidate_symbols = sorted(
+      selected
+      | {str(key).split(":")[-1].upper() for key in queue_rows}
+      | set(rejected_by_symbol)
+  )[:24]
+  candidate_nodes: list[dict[str, Any]] = []
+  for symbol in candidate_symbols:
+    queue = next(
+        (
+            row for key, row in queue_rows.items()
+            if str((row or {}).get("symbol") or str(key).split(":")[-1]).upper() == symbol
+        ),
+        {},
+    )
+    observations = int((queue or {}).get("observations") or 0)
+    required = int((queue or {}).get("minimum_observations") or 0)
+    reasons = rejected_by_symbol.get(symbol, [])
+    if symbol in selected:
+      status, detail = "pass", "준비 완료 · 다음 계층으로 독립 진행"
+    elif reasons:
+      status, detail = "blocked", " · ".join(reasons[:2])
+    else:
+      status = "running" if queue else "pending"
+      detail = f"분봉 {observations}/{required}" if required else "시장 데이터 준비 대기"
+    candidate_nodes.append(
+        _node(
+            f"candidate:{symbol}",
+            symbol,
+            status,
+            detail,
+            symbol=symbol,
+            observations=observations,
+            required=required,
+            reason_codes=reasons,
+        )
+    )
+  if not candidate_nodes:
+    candidate_nodes.append(
+        _node("candidate:none", "NO CANDIDATE", "pending", "후보 스트림 대기")
+    )
+
+  routing = dict(regime_view.get("routing") or {})
+  raw_regime = str(routing.get("raw_regime") or regime_view.get("dominant") or "UNKNOWN")
+  stable_regime = str(routing.get("regime") or raw_regime)
+  regime_nodes = [
+      _node(
+          "regime:stable",
+          "시장 상태·레짐",
+          "pass" if stable_regime != "UNKNOWN" else "pending",
+          f"원시 {raw_regime} → 안정화 {stable_regime}",
+          raw_regime=raw_regime,
+          stable_regime=stable_regime,
+          confidence=routing.get("confidence"),
+          probabilities=dict(routing.get("probabilities") or {}),
+          reason_codes=list(routing.get("reasons") or ()),
+      )
+  ]
+
+  ranking_nodes = []
+  for item in sorted(
+      list(ranked_view.get("candidates") or ()),
+      key=lambda row: int(row.get("candidate_rank") or 999999),
+  )[:24]:
+    symbol = str(item.get("ticker") or "UNKNOWN").upper()
+    if advancing_symbols and symbol not in advancing_symbols:
+      continue
+    score = item.get("candidate_score")
+    rank = item.get("candidate_rank")
+    detail = (
+        f"순위 {rank} · 후보점수 {float(score):.3f} · {item.get('strategy') or 'WAIT'}"
+        if isinstance(score, (int, float)) else "후보 순위 산출 대기"
+    )
+    ranking_nodes.append(
+        _node(
+            f"rank:{symbol}", symbol,
+            "pass" if isinstance(score, (int, float)) else "pending",
+            detail,
+            symbol=symbol,
+            candidate_rank=rank,
+            candidate_score=score,
+            score_components=dict(item.get("candidate_score_components") or {}),
+        )
+    )
+  if not ranking_nodes:
+    ranking_nodes.append(
+        _node("rank:pending", "후보 순위", "pending", "횡단면 점수 산출 대기")
+    )
+
+  context_link = by_stage.get("micro_buy_intents") or {}
+  context_data = dict(context_link.get("data") or {})
+  diagnostics = list(context_data.get("candidate_diagnostics") or ())
+  context_nodes = []
+  for item in diagnostics[:24]:
+    symbol = str(item.get("symbol") or "").upper()
+    if advancing_symbols and symbol not in advancing_symbols:
+      continue
+    hard_blocked = symbol in set(context_data.get("hard_blocked_symbols") or ())
+    context_nodes.append(
+        _node(
+            f"context:{symbol}",
+            symbol or "UNKNOWN",
+            "blocked" if hard_blocked else "pass",
+            (
+                f"{item.get('micro_regime') or 'UNKNOWN'} · "
+                f"{item.get('selected_strategy') or 'HOLD'}"
+            ),
+            symbol=symbol,
+            reason_codes=list(item.get("reason_codes") or ()),
+        )
+    )
+  if not context_nodes:
+    context_nodes.append(
+        _node(
+            "context:pending",
+            "MACRO + MICRO",
+            "pending",
+            str(context_link.get("detail") or "후보별 컨텍스트 평가 대기"),
+        )
+    )
+
+  election_link = by_stage.get("strategy_election") or {}
+  election_data = dict(election_link.get("data") or {})
+  evaluations = [
+      item
+      for item in list(election_data.get("algorithm_evaluations") or ())
+      if not advancing_symbols
+      or str(item.get("symbol") or "").upper() in advancing_symbols
+  ]
+  strategy_nodes = []
+  for index, item in enumerate(evaluations[:64]):
+    symbol = str(item.get("symbol") or "").upper()
+    strategy = str(item.get("strategy_id") or "UNKNOWN")
+    triggered = bool(item.get("triggered"))
+    viable = item.get("cost_viable") is not False
+    risk_probe = bool(item.get("risk_tolerance_probe"))
+    status = (
+        "probe" if triggered and viable and risk_probe
+        else "pass" if triggered and viable
+        else "blocked"
+    )
+    reasons = list(item.get("reason_codes") or ())
+    edge = item.get("expected_edge_bps")
+    diagnostics = dict(item.get("diagnostics") or {})
+    minimum_edge = diagnostics.get("minimum_edge_bps")
+    detail = (
+        (
+            f"제한 탐색 후보 · 엣지 {float(edge):.1f}bp · "
+            f"최대 {float(item.get('risk_size_fraction') or 0.10) * 100:.0f}%"
+        )
+        if triggered and viable and risk_probe and isinstance(edge, (int, float))
+        else (
+            f"비용 미달 · 예상 {float(edge):.1f}bp / 필요 {float(minimum_edge):.1f}bp"
+        )
+        if triggered and not viable and isinstance(edge, (int, float))
+        and isinstance(minimum_edge, (int, float))
+        else f"트리거 · 엣지 {float(edge):.1f}bp"
+        if triggered and isinstance(edge, (int, float))
+        else " · ".join(str(code) for code in reasons[:2]) or "조건 미충족"
+    )
+    strategy_nodes.append(
+        _node(
+            f"strategy:{symbol}:{strategy}:{index}",
+            f"{symbol} × {strategy}",
+            status,
+            detail,
+            symbol=symbol,
+            strategy_id=strategy,
+            triggered=triggered,
+            cost_viable=viable,
+            macro_context_permitted=item.get("macro_context_permitted"),
+            risk_tolerance_probe=risk_probe,
+            risk_size_fraction=item.get("risk_size_fraction"),
+            expected_edge_bps=edge,
+            minimum_edge_bps=minimum_edge,
+            branch_index=item.get("branch_index", index),
+            reason_codes=reasons,
+        )
+    )
+  if not strategy_nodes:
+    strategy_nodes.append(
+        _node(
+            "strategy:pending",
+            "종목 × 전략",
+            "pending",
+            "상위 계층을 통과한 조합의 독립 평가 대기",
+        )
+    )
+
+  with _realtime_trading_lock:
+    engine = _realtime_trading_engine
+  status = dict(engine.get_status() or {}) if engine is not None else {}
+  summary = dict(status.get("last_summary") or {})
+  session = dict(summary.get("strategy_session") or status.get("strategy_session") or {})
+  selected_arm = session.get("bandit_selected_arm")
+  selected_symbol = session.get("selected_symbol")
+  selection_ok = bool(selected_arm and selected_arm != "no_trade") or bool(selected_symbol)
+  if (
+      advancing_symbols
+      and selected_symbol
+      and str(selected_symbol).upper() not in advancing_symbols
+      and str(session.get("phase") or "SCANNING").upper() in {"SCANNING", "ARMED"}
+  ):
+    selection_ok = False
+    selected_arm = None
+    selected_symbol = None
+  risk_mode = str(session.get("risk_tolerance_mode") or "NORMAL").upper()
+  risk_fraction = float(session.get("risk_tolerance_size_fraction") or 1.0)
+  selection_nodes = [
+      _node(
+          "selection:rank",
+          str(session.get("selection_authority") or "전략 순위·선출"),
+          (
+              "probe" if selection_ok and risk_mode != "NORMAL"
+              else "pass" if selection_ok
+              else "blocked" if election_link
+              else "pending"
+          ),
+          (
+              f"{selected_symbol or '-'} × {selected_arm or session.get('selected_strategy') or 'NO_TRADE'}"
+              + (
+                  f" · 제한 탐색 {risk_fraction * 100:.0f}%"
+                  if selection_ok and risk_mode != "NORMAL"
+                  else ""
+              )
+          ),
+          selected_symbol=selected_symbol,
+          selected_strategy=selected_arm or session.get("selected_strategy"),
+          risk_tolerance_mode=risk_mode,
+          risk_size_fraction=risk_fraction,
+          reason_codes=list(session.get("risk_tolerance_reason_codes") or ()),
+      )
+  ]
+
+  halt_level = str(session.get("halt_level") or "NONE").upper()
+  plan = session.get("trade_plan")
+  phase = str(session.get("phase") or "UNKNOWN")
+  commit_nodes = [
+      _node(
+          "commit:risk",
+          "감독·리스크·자금",
+          "blocked" if halt_level == "HARD" else "probe" if selection_ok and risk_mode != "NORMAL" else "pass" if selection_ok else "pending",
+          f"halt={halt_level} · plan={'READY' if plan else 'LEGACY/WAIT'}"
+          + (f" · 주문상한 {risk_fraction * 100:.0f}%" if selection_ok and risk_mode != "NORMAL" else ""),
+          halt_reason_codes=list(session.get("halt_reason_codes") or ()),
+      ),
+      _node(
+          "commit:broker",
+          "주문 원자 커밋",
+          "pass" if phase in {"ENTERING", "OWNED", "EXITING"} else "pending",
+          f"세션 {phase} · 계좌 단위 직렬 제출",
+          phase=phase,
+      ),
+  ]
+
+  layers = [
+      {
+          "id": "runtime_safety",
+          "label": "런타임·전역 안전",
+          "policy": "ALL",
+          "parallel": False,
+          "description": "전역 안전 가드는 모두 통과해야 합니다.",
+          "nodes": [
+              _link_node("engine_running", "엔진"),
+              _link_node("live_armed", "라이브 무장"),
+              _link_node("market_session", "시장 세션"),
+          ],
+      },
+      {
+          "id": "candidate_fanout",
+          "label": "후보 준비",
+          "policy": "FAN_OUT_ANY",
+          "parallel": True,
+          "description": "준비된 종목은 다른 종목을 기다리지 않습니다.",
+          "nodes": candidate_nodes,
+      },
+      {
+          "id": "regime_router",
+          "label": "시장 상태·레짐",
+          "policy": "HYSTERESIS_ROUTE",
+          "parallel": False,
+          "description": "원시 레짐은 연속 관측·유지시간을 거쳐 안정화되며 RISK_OFF만 즉시 반영됩니다.",
+          "nodes": regime_nodes,
+      },
+      {
+          "id": "candidate_ranking",
+          "label": "후보 횡단면 순위 (WHAT)",
+          "policy": "PARALLEL_SCORE_ALL",
+          "parallel": True,
+          "description": "모멘텀·변동성·상대강도·장기추세·유동성 점수를 종목별로 독립 계산합니다.",
+          "nodes": ranking_nodes,
+      },
+      {
+          "id": "context_map",
+          "label": "후보별 컨텍스트",
+          "policy": "MAP_PER_SYMBOL",
+          "parallel": True,
+          "description": "각 종목이 이전 계층 결과와 결합해 독립 판별됩니다.",
+          "nodes": context_nodes,
+      },
+      {
+          "id": "strategy_cartesian",
+          "label": "종목 × 전략",
+          "policy": "PARALLEL_CARTESIAN_MAP",
+          "parallel": True,
+          "description": "허용된 모든 종목×전략 조합을 독립 실행합니다.",
+          "nodes": strategy_nodes,
+      },
+      {
+          "id": "selection_merge",
+          "label": "전략 선출",
+          "policy": "RANK_SELECT_ONE",
+          "parallel": False,
+          "description": "독립 결과가 여기서만 순위화되어 하나로 합류합니다.",
+          "nodes": selection_nodes,
+      },
+      {
+          "id": "atomic_commit",
+          "label": "리스크·실행",
+          "policy": "ALL_SERIAL_COMMIT",
+          "parallel": False,
+          "description": "현금과 포지션 중복 사용을 막기 위해 주문만 원자적으로 커밋합니다.",
+          "nodes": commit_nodes,
+      },
+  ]
+  return {
+      "version": 3,
+      "execution_model": "HIERARCHICAL_PARALLEL_DAG",
+      "cycle_id": candidate_data.get("engine_cycle_id"),
+      "advancing_symbols": sorted(advancing_symbols),
+      "layers": layers,
+      "edges": [
+          {"from": layers[index]["id"], "to": layers[index + 1]["id"]}
+          for index in range(len(layers) - 1)
+      ],
+      "telemetry": {
+          "strategy_evaluation_mode": session.get("strategy_evaluation_mode", "SERIAL"),
+          "strategy_evaluation_workers": session.get("strategy_evaluation_workers", 1),
+          "strategy_evaluation_branch_count": session.get(
+              "strategy_evaluation_branch_count", len(evaluations)
+          ),
+          "strategy_evaluation_duration_ms": session.get(
+              "strategy_evaluation_duration_ms"
+          ),
+          "macro_mismatch_probe_enabled": session.get(
+              "macro_mismatch_probe_enabled", False
+          ),
+          "macro_mismatch_probe_size_fraction": session.get(
+              "macro_mismatch_probe_size_fraction", 0.0
+          ),
+          "risk_tolerance_mode": risk_mode,
+      },
+  }
 
 
 @app.get("/api/investor-flow/status")
@@ -7966,8 +8737,9 @@ def realtime_trading_entry_blockade() -> JSONResponse:
   """Single-call answer to "왜 아직 거래가 없나"."""
   try:
     chain = _entry_blockade_chain()
+    decision_dag = _entry_decision_dag(chain)
   except Exception as exc:  # noqa: BLE001 - diagnostics must never 500 the dashboard.
-    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}", "chain": []})
+    return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}", "chain": [], "decision_dag": {}})
   blocker = next((link for link in chain if not link["ok"]), None)
   return _json(
     {
@@ -7976,6 +8748,7 @@ def realtime_trading_entry_blockade() -> JSONResponse:
       "blocking_stage": blocker["stage"] if blocker else None,
       "blocking_detail": blocker["detail"] if blocker else None,
       "chain": chain,
+      "decision_dag": decision_dag,
     }
   )
 
@@ -8718,7 +9491,19 @@ def _live_order_journal_snapshot(path: str | Path | None = None, limit: int = 20
 
 def _enrich_live_order_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     attempts: dict[str, dict[str, Any]] = {}
+    strategy_by_order: dict[str, str] = {}
+    # ``live_order_submitted`` is journalled before its strategy-link companion,
+    # so collect the explicit link first and then enrich the chronological pass.
+    for event in events:
+      payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+      if str(event.get("event_type") or "") != "live_strategy_order_link":
+        continue
+      order_id = str(payload.get("broker_order_id") or payload.get("order_id") or "")
+      strategy_id = str(payload.get("strategy_id") or "").strip()
+      if order_id and strategy_id:
+        strategy_by_order[order_id] = strategy_id
     enriched: list[dict[str, Any]] = []
+    active_strategy_by_ticker: dict[str, str] = {}
     for event in events:
       copied = dict(event)
       payload = dict(copied.get("payload") or {}) if isinstance(copied.get("payload"), dict) else {}
@@ -8734,8 +9519,32 @@ def _enrich_live_order_events(events: list[dict[str, Any]]) -> list[dict[str, An
         attempt = attempts.get(primary_key) or attempts.get(execution_key)
         if attempt and "order" not in payload and isinstance(attempt.get("order"), dict):
           payload["order"] = attempt["order"]
-          copied["payload"] = payload
+      order = payload.get("order") if isinstance(payload.get("order"), dict) else {}
+      raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+      ticker = str(
+          payload.get("ticker") or order.get("ticker") or raw.get("ticker") or ""
+      ).upper()
+      order_id = str(
+          payload.get("broker_order_id")
+          or payload.get("order_id")
+          or raw.get("order_id")
+          or ""
+      )
+      side = str(payload.get("side") or order.get("side") or raw.get("side") or "").upper()
+      strategy_id = str(payload.get("strategy_id") or "").strip()
+      if not strategy_id and order_id:
+        strategy_id = strategy_by_order.get(order_id, "")
+      if not strategy_id and ticker:
+        strategy_id = active_strategy_by_ticker.get(ticker, "")
+      if strategy_id:
+        payload["strategy_id"] = strategy_id
+        if ticker and side == "BUY":
+          active_strategy_by_ticker[ticker] = strategy_id
+      copied["payload"] = payload
       enriched.append(copied)
+      status = str(payload.get("status") or raw.get("status") or "").upper()
+      if ticker and side == "SELL" and status == "FILLED":
+        active_strategy_by_ticker.pop(ticker, None)
     return enriched
 
 
@@ -9673,7 +10482,11 @@ def _run_weekend_brief_once() -> dict[str, Any]:
   from app.research.weekend_brief import us_session_move_bps
 
   us_move, proxy = us_session_move_bps(window)
-  signals = collect_weekend_signals(window, us_session_move_bps=us_move)
+  signals = collect_weekend_signals(
+      window,
+      research_db=LocalResearchStore().db_path,
+      us_session_move_bps=us_move,
+  )
   prior = build_monday_prior(signals, computed_at=now)
   store.save_prior(prior)
   payload = {
@@ -9730,6 +10543,7 @@ def _run_weekend_enrichment(window: Any) -> dict[str, Any]:
     events = load_saturated_events(
         since_iso=window.start.astimezone(timezone.utc).isoformat(),
         until_iso=window.end.astimezone(timezone.utc).isoformat(),
+        research_db=LocalResearchStore().db_path,
         limit=limit,
     )
     if events:
@@ -9961,6 +10775,16 @@ def _run_temporal_gnn_training_once() -> dict[str, Any]:
     environment[variable] = str(TEMPORAL_GNN_TRAINING_THREADS)
   global _temporal_gnn_child
   try:
+    process_isolation = (
+        {
+            "creationflags": (
+                getattr(_subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(_subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+            )
+        }
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
     child = _subprocess.Popen(
         _temporal_gnn_training_command(),
         cwd=str(root),
@@ -9968,7 +10792,7 @@ def _run_temporal_gnn_training_once() -> dict[str, Any]:
         stdout=_subprocess.PIPE,
         stderr=_subprocess.PIPE,
         text=True,
-        start_new_session=True,
+        **process_isolation,
     )
   except Exception as exc:  # noqa: BLE001 - 학습 실패가 서버를 죽여서는 안 된다.
     return {"error": f"{exc.__class__.__name__}: {exc}"}
@@ -9999,6 +10823,12 @@ def _run_temporal_gnn_training_once() -> dict[str, Any]:
   if not payload:
     tail = (stderr or stdout or "").strip().splitlines()
     payload = {"error": tail[-1] if tail else f"exit {child.returncode} with no report"}
+  # The trainer prints a valid report on paths it still exits non-zero from, and the
+  # exit code is the only thing separating them: `refused` accompanies BOTH a
+  # data-insufficiency refusal (exit 1, runtime stays OFFLINE and new entries stay
+  # blocked) and a benign "another run holds the lock" skip (exit 0). Without this the
+  # caller cannot tell those apart, so both were reported as a healthy cycle.
+  payload.setdefault("exit_code", child.returncode)
   return payload
 
 
@@ -10015,6 +10845,30 @@ def _terminate_temporal_gnn_child() -> None:
     child = _temporal_gnn_child
   if child is None or child.poll() is not None:
     return
+  if os.name == "nt":
+    # Windows has neither killpg nor POSIX sessions. taskkill /T is the native
+    # process-tree equivalent and prevents a trainer helper from being orphaned.
+    try:
+      _subprocess.run(
+          ["taskkill", "/PID", str(child.pid), "/T", "/F"],
+          check=False,
+          stdout=_subprocess.DEVNULL,
+          stderr=_subprocess.DEVNULL,
+          timeout=10,
+      )
+    except Exception:  # noqa: BLE001 - fall back to the direct child handle.
+      try:
+        child.kill()
+      except Exception:
+        pass
+    try:
+      child.wait(timeout=5.0)
+    except Exception:
+      try:
+        child.kill()
+      except Exception:
+        pass
+    return
   try:
     os.killpg(os.getpgid(child.pid), _signal.SIGTERM)
   except (ProcessLookupError, PermissionError, AttributeError, OSError):
@@ -10028,7 +10882,10 @@ def _terminate_temporal_gnn_child() -> None:
     try:
       os.killpg(os.getpgid(child.pid), _signal.SIGKILL)
     except Exception:  # noqa: BLE001
-      pass
+      try:
+        child.kill()
+      except Exception:
+        pass
 
 
 def _reload_temporal_gnn_runtime() -> str | None:
@@ -10051,6 +10908,17 @@ def _temporal_gnn_training_loop() -> None:
   # Train immediately, then on the interval: a restart is exactly when the checkpoint is
   # most likely to be missing, and waiting six hours to discover that leaves the runtime
   # OFFLINE — which blocks every new entry — for the whole of that window.
+  # A valid checkpoint is loaded synchronously by the runtime.  On constrained
+  # machines, immediately launching a CPU evolutionary fit beside server startup
+  # and the short-horizon trainer can starve HTTP/strategy threads for minutes.
+  # Missing checkpoints still train immediately; existing ones honour a bounded
+  # startup delay configured by the cross-machine launcher.
+  if (
+      DEFAULT_GNN_CHECKPOINT_PATH.exists()
+      and TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS > 0
+      and _temporal_gnn_stop.wait(TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS)
+  ):
+    return
   while not _temporal_gnn_stop.is_set():
     with _live_lock:
       _temporal_gnn_heartbeat.update(
@@ -10062,6 +10930,17 @@ def _temporal_gnn_training_loop() -> None:
     health_state: str | None = None
     if promoted:
       health_state = _reload_temporal_gnn_runtime()
+
+    refused = str(report.get("refused") or "").strip() or None
+    # A refusal that exits non-zero is not a quiet no-op: the trainer says so itself
+    # ("The runtime stays OFFLINE, which blocks new entries and leaves exits working").
+    # Reporting ok=True for it made a blocked system look identical to a healthy one
+    # whose challenger simply lost to the incumbent.
+    blocking_refusal = (
+        bool(refused)
+        and int(report.get("exit_code") or 0) != 0
+        and not DEFAULT_GNN_CHECKPOINT_PATH.exists()
+    )
 
     if error:
       status, message = "error", f"컨텍스트 GNN 학습 실패: {error}"
@@ -10081,11 +10960,14 @@ def _temporal_gnn_training_loop() -> None:
       _temporal_gnn_heartbeat.update(
           {
               "finished_at": datetime.now(timezone.utc).isoformat(),
-              "ok": not error,
+              "ok": not error and not blocking_refusal,
               "promoted": promoted,
               "checkpoint": report.get("checkpoint"),
               "health_state": health_state,
               "error": error,
+              "refused": refused,
+              "blocks_new_entries": blocking_refusal,
+              "training_examples": report.get("training_examples"),
           }
       )
       _append_collection_log_unlocked(
@@ -10198,6 +11080,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       plan_provider=strategy_session_manager.trade_plan_for,
       orderable_cash_provider=_live_orderable_cash_for_order,
       sellable_quantity_provider=_live_sellable_quantity_for_order,
+      cash_equity_only=True,
   )
   return RealtimeTradingEngine(
       decision_engine=decision_engine,
@@ -10251,7 +11134,8 @@ def _live_sellable_quantity_for_order(order: Any) -> int | None:
     ticker = str(getattr(order, "ticker", "") or "").upper()
     for holding in tuple(getattr(account, "holdings", ()) or ()):
       if str(getattr(holding, "ticker", "") or "").upper() == ticker:
-        return max(0, int(getattr(holding, "quantity", 0) or 0))
+        sellable = getattr(holding, "sellable_quantity", None)
+        return max(0, int(sellable if sellable is not None else getattr(holding, "quantity", 0) or 0))
     return 0
   except Exception:  # noqa: BLE001
     return None
@@ -10677,7 +11561,7 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
     if group == "US" and subscribed_us and normalized not in subscribed_us:
       reject("NOT_IN_ACTIVE_US_SUBSCRIPTION_SET", normalized)
       continue
-    if group == "KRX" and not _is_live_market_core_open("KRX"):
+    if group == "KRX" and _env_flag("REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY", False) and not _is_live_market_core_open("KRX"):
       reject("KRX_CORE_SESSION_CLOSED", normalized)
       continue
     # Only 8 of the 23 registered algorithms consult the sub-second tick window
@@ -10737,8 +11621,9 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
       reject(reason, normalized)
       continue
     selected.append(symbol)
-    if len(selected) >= limit:
-      break
+
+  from app.data.multi_market_stream import fair_market_symbols
+  selected = list(fair_market_symbols(selected, limit))
 
   trace = _current_live_reasoning_trace() or {}
   snapshot = {
@@ -10746,6 +11631,7 @@ def _realtime_engine_buy_candidates() -> tuple[str, ...]:
       "engine_cycle_id": trace.get("cycle_id"),
       "input_count": len(ordered),
       "selected_count": len(selected),
+      "selected_symbols": list(selected),
       "source_counts": {
           "fresh_symbols": len(fresh_set),
           "active_us_subscription_symbols": len(subscribed_us),
@@ -10840,12 +11726,12 @@ def _candidate_has_ready_strategy_tick_window(
       for tick in live_ticks
       if five_second_cutoff <= getattr(tick, "received_at", moment) <= moment
   )
-  minimum_tick_count_5s = max(
-      1,
-      _auto_reliability_int(
-          "ALGO_SHARED_MIN_TICK_COUNT_5S", 3, 1
-      ),
-  )
+  # Candidate admission and the algorithms must use one source of truth. The old
+  # local default was 3 while strategy_algorithms.yaml declared 2, so a window an
+  # algorithm could evaluate was rejected before it reached the algorithm.
+  from app.technical.strategy_algorithms import shared_minimum_tick_count_5s
+
+  minimum_tick_count_5s = shared_minimum_tick_count_5s()
   if tick_count_5s < minimum_tick_count_5s:
     return False
   try:
@@ -11043,6 +11929,11 @@ def _kis_overseas_realtime_collector_loop() -> None:
   from app.data.kis_realtime import is_us_daytime_quote_session
 
   while not _kis_overseas_realtime_stop.is_set():
+    if _multiplexed_realtime_enabled():
+      # One domestic worker owns the socket for both protocols.
+      if _kis_overseas_realtime_stop.wait(5.0):
+        return
+      continue
     if _kis_realtime_session_owner() not in {"US", "BOTH"}:
       with _live_lock:
         _kis_overseas_realtime_state.update(
@@ -11903,6 +12794,7 @@ def _compact_strategy_session(session: Any) -> dict[str, Any]:
       "gnn_action", "bandit_selected_arm", "bandit_conservative_edge_bps",
       "bandit_is_exploration", "bandit_evaluated_at", "cost_coverage_ratio",
       "cost_coverage_band", "change_point_probability", "halt_level",
+      "risk_tolerance_mode", "risk_tolerance_size_fraction",
       "selection_authority", "selector_v2_context_id",
       "selector_v2_authority_state", "position_seen", "entry_price",
       "target_price", "stop_price", "exit_reason", "invalidation_cycles",
@@ -11912,6 +12804,7 @@ def _compact_strategy_session(session: Any) -> dict[str, Any]:
   for key in (
       "gnn_reason_codes", "ontology_reason_codes", "bandit_reason_codes",
       "halt_reason_codes", "bandit_shadow_arms", "invalidation_reason_codes",
+      "risk_tolerance_reason_codes",
   ):
     if key in session:
       compact[key] = list(session.get(key) or ())[:24]
@@ -12403,9 +13296,7 @@ def _recent_affordable_us_watchlist(
   )
   if price_cap_usd <= 0 or limit <= 0:
     return ()
-  database = database or Path(
-      os.getenv("REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3")
-  )
+  database = database or realtime_market_database_path()
   if not database.exists():
     return ()
   now = datetime.now(timezone.utc)
@@ -14020,9 +14911,7 @@ def _apply_domestic_print_density(
   try:
     from app.trading.print_density import rank_by_print_density
 
-    database = os.getenv(
-        "REALTIME_MARKET_DATA_DB", "data/store/realtime_market_data.sqlite3"
-    )
+    database = realtime_market_database_path()
     with _live_lock:
       cursor = int(_domestic_ranking_cache.get("density_cursor") or 0)
     selected, next_cursor, stats = rank_by_print_density(
@@ -14531,7 +15420,130 @@ def _rest_snapshot_fallback_refresh(symbols: tuple[str, ...], group: str) -> dic
   )
 
 
+def _multiplexed_realtime_enabled() -> bool:
+  return AUTO_START_KIS_REALTIME_COLLECTOR and _env_flag("KIS_REALTIME_SINGLE_SESSION", True) and _env_flag("KIS_REALTIME_MULTIPLEXED", True)
+
+
+_multiplexed_realtime_state: dict[str, Any] = {}
+
+
+def _multiplexed_realtime_symbols() -> tuple[str, ...]:
+  from app.data.multi_market_stream import subscription_symbols
+  from app.data.market_session import MarketPhase, market_phase, streaming_phase
+  from app.data.kis_realtime import is_us_daytime_quote_session
+
+  kr_open = streaming_phase("KRX", include_nxt=True) is not MarketPhase.CLOSED
+  us_open = _env_flag("KIS_OVERSEAS_REALTIME_ENABLED", True) and (
+      market_phase("US") is not MarketPhase.CLOSED or is_us_daytime_quote_session()
+  )
+  account = _realtime_engine_account_snapshot()
+  held = tuple(h.ticker for h in (getattr(account, "holdings", ()) or ()))
+  configured_budget = max(2, _auto_reliability_int("KIS_REALTIME_MAX_SUBSCRIPTIONS", 40))
+  observed = _multiplexed_realtime_state.get("observed_capacity")
+  observed_at = float(_multiplexed_realtime_state.get("observed_capacity_at") or 0)
+  budget = min(configured_budget, int(observed)) if observed and time.monotonic() - observed_at < 600 else configured_budget
+  return subscription_symbols(
+      _kis_realtime_collector_symbols() if kr_open else (),
+      _kis_overseas_realtime_symbols() if us_open else (),
+      held=held,
+      max_subscriptions=budget,
+  )
+
+
+def _kis_multiplexed_realtime_collector_loop() -> None:
+  """One socket, two independently planned markets, off-socket discovery."""
+  from app.data.event_runtime import run_event_driven_kis_websocket_collector
+  from app.data.multi_market_stream import market_group, subscription_key, subscription_tr_ids
+
+  stop = _kis_realtime_collector_stop
+  planner_stop = threading.Event()
+  plan: dict[str, Any] = {"symbols": ()}
+
+  def refresh_plan() -> None:
+    while not planner_stop.is_set() and not stop.is_set():
+      try:
+        symbols = _multiplexed_realtime_symbols()
+        plan["symbols"] = symbols
+        plan["updated_at"] = datetime.now(timezone.utc).isoformat()
+        plan["error"] = None
+      except Exception as exc:
+        # Failed discovery must be visible. Quote freshness remains authoritative.
+        plan["error"] = type(exc).__name__
+      planner_stop.wait(15.0)
+
+  def progress(counts: dict[str, Any]) -> None:
+    if not _live_lock.acquire(blocking=False):
+      return
+    try:
+      symbols = plan["symbols"]
+      connected = int(counts.get("messages") or 0) > 0 and not counts.get("connection_closed")
+      if _kis_realtime_ws_state.get("connected") is not connected:
+        _kis_realtime_ws_state["changed_at"] = datetime.now(timezone.utc).isoformat()
+      _kis_realtime_ws_state["connected"] = bool(connected)
+      accepted = int(counts.get("subscriptions_accepted") or 0)
+      if counts.get("subscription_limit_reached") and accepted >= 2:
+        _multiplexed_realtime_state.update({"observed_capacity": accepted - accepted % 2, "observed_capacity_at": time.monotonic()})
+      _multiplexed_realtime_state.update({
+          "running": connected, "symbols": list(symbols), "counts": dict(counts),
+          "updated_at": plan.get("updated_at"), "error": plan.get("error"),
+          "transport": "single_websocket", "markets": ["KR", "US"],
+      })
+      _kis_overseas_realtime_state.update({
+          "running": connected, "symbols": tuple(s for s in symbols if market_group(s) == "US"),
+          "session": "multiplexed", "last_error": plan.get("error"),
+          "counts": dict(counts), "counts_scope": "KR_US_SHARED_SOCKET",
+          "last_success_at": datetime.now(timezone.utc).isoformat() if connected else None,
+      })
+    finally:
+      _live_lock.release()
+
+  planner = threading.Thread(target=refresh_plan, name="kis-multi-market-plan", daemon=True)
+  planner.start()
+  try:
+    while not stop.is_set():
+      if not plan["symbols"]:
+        if stop.wait(1.0):
+          break
+        continue
+      try:
+        progress({})
+        counts = asyncio.run(_run_collector_cycle_with_cap(
+            run_event_driven_kis_websocket_collector(
+                symbols=plan["symbols"], symbols_provider=lambda: plan["symbols"],
+                store=RealtimeMarketDataStore(), client=_kis_realtime_collector_client(),
+                stop_event=stop, resubscribe_event=_kis_realtime_collector_resubscribe,
+                max_runtime_seconds=15.0, subscription_tr_ids=(),
+                subscription_tr_ids_factory=subscription_tr_ids,
+                subscription_key_factory=subscription_key, progress_callback=progress,
+                session_active_provider=lambda: bool(plan["symbols"]),
+            ), cap_seconds=_collector_cycle_cap_seconds(),
+        ))
+        progress(counts)
+        delay = 90.0 if counts.get("appkey_already_in_use") else 3.0
+      except Exception as exc:
+        with _live_lock:
+          _multiplexed_realtime_state.update({"running": False, "error": type(exc).__name__})
+          _append_collection_log_unlocked("error", f"KIS multiplexed collector: {type(exc).__name__}")
+        delay = 10.0
+      finally:
+        _mark_kis_realtime_ws(False)
+        with _live_lock:
+          _multiplexed_realtime_state["running"] = False
+          _kis_overseas_realtime_state["running"] = False
+      if stop.wait(delay):
+        break
+  finally:
+    planner_stop.set()
+    planner.join(timeout=2.0)
+    with _live_lock:
+      _multiplexed_realtime_state["running"] = False
+      _kis_overseas_realtime_state["running"] = False
+
+
 def _kis_realtime_collector_loop() -> None:
+  if _multiplexed_realtime_enabled():
+    _kis_multiplexed_realtime_collector_loop()
+    return
   from app.data.market_session import MarketPhase, market_phase
 
   resubscribe_seconds = max(30.0, float(os.getenv("REALTIME_COLLECTOR_RESUBSCRIBE_SECONDS", "300")))
@@ -16127,7 +17139,12 @@ def _run_live_trading_execution_cycle(context: Any) -> dict[str, Any]:
     audit.record("live_trading_execution_blocked", summary)
     return summary
 
-  coordinator = LiveExecutionCoordinator(KisDevelopersApiClient(paper=False, enabled=True))
+  coordinator = LiveExecutionCoordinator(
+      KisDevelopersApiClient(paper=False, enabled=True),
+      orderable_cash_provider=_live_orderable_cash_for_order,
+      sellable_quantity_provider=_live_sellable_quantity_for_order,
+      cash_equity_only=True,
+  )
   session_key = _live_trading_session_key()
   max_submissions = _live_max_auto_order_submissions_per_cycle()
   for order in executable_orders:

@@ -4,6 +4,7 @@ import sys
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,35 @@ from app.storage import LocalResearchStore
 
 
 class StorageTest(unittest.TestCase):
+    def test_corrupt_database_is_quarantined_and_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "research.sqlite3").write_bytes(b"not a sqlite database")
+
+            with self.assertWarnsRegex(RuntimeWarning, "Recovered corrupt research"):
+                store = LocalResearchStore(root)
+
+            with closing(sqlite3.connect(store.db_path)) as conn:
+                self.assertEqual(conn.execute("pragma quick_check").fetchone()[0], "ok")
+                self.assertIsNotNone(
+                    conn.execute(
+                        "select name from sqlite_master where type='table' and name='records'"
+                    ).fetchone()
+                )
+            self.assertIsNotNone(store.recovery_event)
+            self.assertEqual(len(tuple(root.glob("research.sqlite3.corrupt.*"))), 1)
+
+    def test_explicit_delete_journal_mode_is_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                "os.environ", {"RESEARCH_SQLITE_JOURNAL_MODE": "DELETE"}, clear=False
+            ):
+                store = LocalResearchStore(Path(tmp))
+                with closing(sqlite3.connect(store.db_path)) as conn:
+                    journal_mode = conn.execute("pragma journal_mode").fetchone()[0]
+
+            self.assertEqual(journal_mode, "delete")
+
     def test_static_universe_snapshot_refresh_replaces_same_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LocalResearchStore(Path(tmp))

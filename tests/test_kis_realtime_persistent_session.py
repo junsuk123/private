@@ -110,6 +110,47 @@ class TestFrames:
 
 
 class TestPersistentSession:
+    def test_multiplexed_subscription_order_preserves_market_budget(self, patched):
+        _run(
+            symbols=["000660", "AAPL", "005930", "MSFT"], stop_event=_StopAfter(1),
+            subscription_tr_ids_factory=lambda symbol: ("HDFSCNT0",) if symbol.isalpha() else ("H0STCNT0",),
+        )
+        assert [key for key, _ in patched.frames("1")] == ["000660", "AAPL", "005930", "MSFT"]
+
+    def test_watchdog_cancellation_releases_registrations(self, patched, monkeypatch):
+        async def never_receives():
+            await asyncio.Future()
+        monkeypatch.setattr(patched, "recv", never_receives)
+
+        async def scenario():
+            task = asyncio.create_task(run_kis_realtime_websocket_collector(
+                symbols=["005930"], store=SimpleNamespace(),
+                subscription_tr_ids=("H0STCNT0", "H0STASP0"),
+            ))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        asyncio.run(scenario())
+        assert set(patched.frames("2")) == {("005930", "H0STCNT0"), ("005930", "H0STASP0")}
+
+    def test_mixed_markets_share_one_approval_and_release_matching_protocols(self, patched, monkeypatch):
+        issued = []
+        monkeypatch.setattr(kis_realtime, "issue_websocket_approval_key", lambda client: issued.append(1) or "KEY")
+        _run(
+            symbols=["005930", "AAPL"], stop_event=_StopAfter(1),
+            subscription_tr_ids_factory=lambda symbol: ("HDFSCNT0", "HDFSASP0") if symbol == "AAPL" else ("H0STCNT0", "H0STASP0"),
+            subscription_key_factory=lambda symbol: "DNASAAPL" if symbol == "AAPL" else symbol,
+        )
+        assert len(issued) == 1
+        expected = {("005930", "H0STCNT0"), ("005930", "H0STASP0"), ("DNASAAPL", "HDFSCNT0"), ("DNASAAPL", "HDFSASP0")}
+        assert set(patched.frames("1")) == expected
+        assert set(patched.frames("2")) == expected
+
+    def test_empty_plan_releases_previous_market(self, patched):
+        _run(symbols=["005930"], symbols_provider=lambda: (), resubscribe_event=_OneShotEvent(), stop_event=_StopAfter(3))
+        assert len(patched.frames("2")) == 2
+
     def test_registrations_are_released_on_normal_exit(self, patched):
         counts = _run(symbols=["005930"], stop_event=_StopAfter(1))
         assert patched.frames("1") == [("005930", "H0STCNT0"), ("005930", "H0STASP0")]

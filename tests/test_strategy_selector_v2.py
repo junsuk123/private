@@ -18,12 +18,15 @@ from app.routing.no_trade_policy import (
 )
 from app.routing.ontology_strategy_mask import MASK_DISABLED, OntologyStrategyMask
 from app.routing.strategy_selector import (
+    SELECTION_REASON_COST_FLOOR_REJECTED,
     SELECTION_REASON_ENTRY_NOT_READY,
     SELECTION_REASON_LIFECYCLE_NOT_LIVE,
     SELECTION_VERSION,
     StrategySelectorV2,
     UtilityWeights,
 )
+from app.strategy.proposal import StrategyProposal
+from app.strategy.proposal_engine import ProposalEngineResult
 from app.routing.strategy_utility import (
     CostEstimate,
     StrategyUtilityPrediction,
@@ -142,6 +145,32 @@ class _NoBanditAdapter:
         return {}
 
 
+class _CostRejectedProposalEngine:
+    def evaluate(self, context, *, eligible_strategy_ids, **_kwargs):
+        strategy_id = next(iter(eligible_strategy_ids))
+        proposal = StrategyProposal(
+            proposal_id="cost-rejected-1",
+            context_id=context.context_id,
+            strategy_id=strategy_id,
+            symbol=context.symbol_id,
+            eligible=True,
+            entry_ready=True,
+            cost_viable=False,
+            raw_signal_strength=0.8,
+            confidence=0.7,
+            expected_horizon_seconds=300,
+            reference_entry_price=context.symbol.reference_price,
+            expected_gross_edge_bps=12.0,
+            strategy_reason_codes=("EDGE_BELOW_COST_FLOOR",),
+        )
+        return ProposalEngineResult(
+            context_id=context.context_id,
+            symbol=context.symbol_id,
+            proposals=(proposal,),
+            skipped={},
+        )
+
+
 def _selector(**overrides) -> StrategySelectorV2:
     registry = default_strategy_registry()
     kwargs = {
@@ -178,11 +207,12 @@ def test_weak_edge_produces_no_trade_and_that_is_normal() -> None:
 
 def test_no_trade_utility_is_the_minimum_edge_bar() -> None:
     policy = NoTradePolicy(config=NoTradePolicyConfig())
-    assert policy.no_trade_utility_bps(market="KR") == 10.0
-    assert policy.no_trade_utility_bps(market="US") == 20.0
-    # Per-market, per-horizon, and higher when the cost was not measured.
-    assert policy.no_trade_utility_bps(market="KR", horizon_seconds=120.0) > 10.0
-    assert policy.no_trade_utility_bps(market="KR", measured=False) > 10.0
+    # Costs have already been subtracted; current policy requires a strictly
+    # positive lower bound without charging a second fixed market hurdle.
+    assert policy.no_trade_utility_bps(market="KR") == 0.0
+    assert policy.no_trade_utility_bps(market="US") == 0.0
+    assert policy.no_trade_utility_bps(market="KR", horizon_seconds=120.0) == 0.0
+    assert policy.no_trade_utility_bps(market="KR", measured=False) > 0.0
 
 
 def test_lower_bound_rule_can_veto_a_positive_mean() -> None:
@@ -257,6 +287,20 @@ def test_entry_not_ready_is_ranked_but_not_selectable() -> None:
         assert not item.selectable
         assert SELECTION_REASON_ENTRY_NOT_READY in item.reason_codes
     assert result.selected_strategy not in {item.strategy_id for item in not_ready}
+
+
+def test_cost_rejected_trigger_is_ranked_for_diagnostics_but_never_selected() -> None:
+    result = _selector(proposal_engine=_CostRejectedProposalEngine()).select(
+        _context(), election_inputs=ELECTION_INPUTS
+    )
+
+    assert result.decision == "NO_TRADE"
+    assert len(result.ranked_candidates) == 1
+    candidate = result.ranked_candidates[0]
+    assert candidate.entry_ready is True
+    assert candidate.cost_viable is False
+    assert candidate.selectable is False
+    assert SELECTION_REASON_COST_FLOOR_REJECTED in candidate.reason_codes
 
 
 def test_non_live_lifecycle_is_ranked_but_not_selectable() -> None:

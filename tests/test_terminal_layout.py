@@ -185,7 +185,7 @@ def test_stored_file_is_json_with_the_declared_schema(tmp_path: Path) -> None:
 
 
 def test_terminal_page_ships_the_layout_controls(tmp_path: Path) -> None:
-    page = _client(tmp_path).get("/account").text
+    page = _client(tmp_path).get("/account/advanced").text
 
     assert 'id="layout-save"' in page
     assert 'id="layout-reset"' in page

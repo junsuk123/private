@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
+os.environ.setdefault("OBAITS_PROJECT_ROOT", str(ROOT))
+os.chdir(ROOT)
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+# Resolve the per-machine runtime store before importing app.run. Several
+# modules construct their default database paths at import time.
+from app.paths import activate_project_root
+
+activate_project_root()
 
 
 def _install_thread_dump_signal() -> None:

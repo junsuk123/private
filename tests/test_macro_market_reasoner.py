@@ -49,6 +49,9 @@ class TestRegimeClassification:
         r = _reasoner().reason(_inp(index_snapshots={"KOSPI": {"trend": -0.004}}, market_breadth=0.4))
         assert r.market_regime == MarketRegime.TREND_DOWN
         assert "sell" in r.allowed_micro_strategies
+        assert "momentum_short" in r.allowed_micro_strategies
+        assert "breakdown" in r.allowed_micro_strategies
+        assert "relative_weakness" in r.allowed_micro_strategies
         assert "weak_breakout_buy" in r.blocked_micro_strategies
 
     def test_unclassifiable_high_volatility_blocks_buy(self):

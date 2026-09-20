@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 
 from app.routing.gnn_realtime_trust import (
     GnnRealtimeTrustEvaluator,
@@ -921,6 +922,16 @@ def test_gnn_runtime_observability_separates_inference_from_validation(
             "errors": {},
         },
     )
+    monkeypatch.setattr(
+        web,
+        "_live_shadow_service",
+        SimpleNamespace(
+            checkpoint_loaded=True,
+            checkpoint_error=None,
+            checkpoint_contract_reasons=(),
+            model_input_schema=web.STRATEGY_GRAPH_CONTEXT_SCHEMA,
+        ),
+    )
 
     payload = web._with_gnn_runtime_observability(
         {"sample_count": 202, "evaluated_at": "2026-08-13T14:38:12+00:00"},
@@ -933,6 +944,8 @@ def test_gnn_runtime_observability_separates_inference_from_validation(
     assert payload["prediction_persisted_count"] == 321
     assert payload["validation_count"] == 202
     assert payload["validation_count_as_of"] == "2026-08-13T14:38:12+00:00"
+    assert payload["inference_contract_ready"] is True
+    assert payload["checkpoint_feature_schema"] == web.STRATEGY_GRAPH_CONTEXT_SCHEMA
 
 
 def test_trust_pool_does_not_fork_the_multithreaded_server() -> None:

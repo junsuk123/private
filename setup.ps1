@@ -15,9 +15,9 @@
   project directory is synchronised between machines and a venv is portable across
   neither the OS nor the interpreter that built it.
 
-  Optional accelerator and local-LLM extras are installed only when asked for,
-  because they are large and the project runs correctly without them - device
-  placement falls back to CPU on its own (see app/realtime/device_plan.py).
+  Accelerator extras are selected from this machine's architecture and visible
+  devices. Use -BaseOnly for a deliberately minimal CPU installation. Runtime
+  placement still falls back to CPU (see app/realtime/device_plan.py).
 
 .EXAMPLE
   ./setup.ps1
@@ -31,6 +31,8 @@ param(
   [switch]$WithLocalLlm,
   # Everything optional.
   [switch]$All,
+  # Install only the portable base dependencies; skip automatic accelerator extras.
+  [switch]$BaseOnly,
   # Rebuild the virtual environment from scratch.
   [switch]$Recreate,
   # Build the local-LLM extra against a specific CUDA wheel index, e.g. "cu128".
@@ -150,10 +152,18 @@ if (-not $uv) {
     Write-Ok "installing with uv"
 }
 
-# Extras are additive, so build the install target once and install once.
+# Extras are additive. On ordinary x64 PCs OpenVINO is installed automatically so
+# Intel CPU/GPU/NPU discovery is available. A visible NVIDIA GPU also enables the
+# small-model PyTorch extra; language models are installed only when requested.
 $extras = @()
-if ($WithNpu -or $All) { $extras += "npu" }
+$isX64 = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -eq "X64"
+$nvidia = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+$autoNpu = (-not $BaseOnly) -and $isX64
+$autoCuda = (-not $BaseOnly) -and [bool]$nvidia
+if ($WithNpu -or $All -or $autoNpu) { $extras += "npu" }
+if ($autoCuda -or $All) { $extras += "cuda" }
 if ($WithLocalLlm -or $All) { $extras += "local-llm" }
+$extras = @($extras | Select-Object -Unique)
 $target = if ($extras.Count -gt 0) { ".[" + ($extras -join ",") + "]" } else { "." }
 
 Write-Step "Installing project ($target)"
@@ -162,7 +172,9 @@ if ($LASTEXITCODE -ne 0) { throw "Install failed for $target" }
 Write-Ok "dependencies installed"
 
 if ($extras.Count -eq 0) {
-  Write-Host "    (optional extras skipped; ./setup.ps1 -All installs OpenVINO + local LLM)" -ForegroundColor DarkGray
+  Write-Host "    (accelerator extras skipped; remove -BaseOnly or use -All to enable them)" -ForegroundColor DarkGray
+} elseif ($autoNpu -or $autoCuda) {
+  Write-Ok "auto-selected extras for this machine: $($extras -join ', ')"
 }
 
 # --- CUDA wheel selection -----------------------------------------------------
@@ -171,7 +183,7 @@ if ($extras.Count -eq 0) {
 # cuda_available=False with a "driver is too old" warning, so the GPU silently
 # does nothing while everything still appears to work. -CudaWheels pins the wheel
 # index to the CUDA version the installed driver actually supports.
-if ($CudaWheels -and ($extras -contains "local-llm")) {
+if ($CudaWheels -and (($extras -contains "cuda") -or ($extras -contains "local-llm"))) {
   Write-Step "Reinstalling torch from the $CudaWheels wheel index"
   Install-Packages --upgrade --index-url "https://download.pytorch.org/whl/$CudaWheels" torch
   if ($LASTEXITCODE -ne 0) { throw "Could not install torch from the $CudaWheels index." }
@@ -184,7 +196,7 @@ $env:PYTHONPATH = "src"
 # interpret $-names and escapes inside Python source; the previous version used it
 # and its f-string separator arrived at Python as a stray backslash, so this whole
 # verification step died with a SyntaxError instead of checking anything.
-& $python -c @'
+$verification = @'
 import sys
 sys.path.insert(0, "src")
 import app.web  # the server entrypoint must import cleanly
@@ -207,7 +219,21 @@ else:
         # is reported rather than left for someone to notice in a latency graph.
         print(f"    torch {torch.__version__}: CUDA unavailable (running on CPU)")
 '@
-if ($LASTEXITCODE -ne 0) { throw "Verification failed - the project does not import cleanly." }
+$verificationPath = Join-Path ([System.IO.Path]::GetTempPath()) "obaits-setup-verify-$PID.py"
+try {
+  # Windows PowerShell 5.1 strips embedded quotes while marshalling a multi-line
+  # native -c argument. A temporary UTF-8 script keeps Python source byte-for-byte.
+  [System.IO.File]::WriteAllText(
+    $verificationPath,
+    $verification,
+    (New-Object System.Text.UTF8Encoding($false))
+  )
+  & $python $verificationPath
+  if ($LASTEXITCODE -ne 0) { throw "Verification failed - the project does not import cleanly." }
+} finally {
+  Remove-Item -LiteralPath $verificationPath -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host ""
-Write-Host "Setup complete. Start the server with:  ./run.ps1" -ForegroundColor Green
+$startCommand = if ($onWindows) { ".\run.bat" } else { "./run.ps1" }
+Write-Host "Setup complete. Start the server with:  $startCommand" -ForegroundColor Green

@@ -75,6 +75,7 @@ __all__ = [
 SELECTION_VERSION = "selector-v2.0.0"
 
 SELECTION_REASON_ENTRY_NOT_READY = "CANDIDATE_ENTRY_NOT_READY"
+SELECTION_REASON_COST_FLOOR_REJECTED = "CANDIDATE_COST_FLOOR_REJECTED"
 SELECTION_REASON_LIFECYCLE_NOT_LIVE = "CANDIDATE_LIFECYCLE_NOT_LIVE"
 SELECTION_REASON_HARD_BLOCKED = "CANDIDATE_HARD_BLOCKED"
 SELECTION_REASON_NO_PREDICTION = "CANDIDATE_NO_UTILITY_PREDICTION"
@@ -146,6 +147,7 @@ class RankedStrategyCandidate:
     cost_measured: bool
     utility_source: str
     model_version: str
+    cost_viable: bool = True
     reason_codes: tuple[str, ...] = ()
     proposal_id: str = ""
     lifecycle_state: str = ""
@@ -169,6 +171,7 @@ class RankedStrategyCandidate:
         return bool(
             self.eligible
             and self.entry_ready
+            and self.cost_viable
             and SELECTION_REASON_LIFECYCLE_NOT_LIVE not in self.reason_codes
         )
 
@@ -178,6 +181,7 @@ class RankedStrategyCandidate:
             "symbol": self.symbol,
             "eligible": self.eligible,
             "entry_ready": self.entry_ready,
+            "cost_viable": self.cost_viable,
             "selectable": self.selectable,
             "expected_gross_return_bps": round(self.expected_gross_return_bps, 3),
             "expected_cost_bps": round(self.expected_cost_bps, 3),
@@ -494,6 +498,8 @@ class StrategySelectorV2:
                 reasons.append(SELECTION_REASON_NO_PREDICTION)
             if not proposal.entry_ready:
                 reasons.append(SELECTION_REASON_ENTRY_NOT_READY)
+            if not proposal.cost_viable:
+                reasons.append(SELECTION_REASON_COST_FLOOR_REJECTED)
             lifecycle = spec.lifecycle_state if spec is not None else StrategyLifecycleState.RESEARCH
             if not lifecycle.is_live_candidate:
                 reasons.append(SELECTION_REASON_LIFECYCLE_NOT_LIVE)
@@ -560,6 +566,7 @@ class StrategySelectorV2:
                     model_version=(
                         prediction.model_version if prediction is not None else "none"
                     ),
+                    cost_viable=proposal.cost_viable,
                     reason_codes=tuple(dict.fromkeys(reasons)),
                     proposal_id=proposal.proposal_id,
                     lifecycle_state=str(lifecycle),

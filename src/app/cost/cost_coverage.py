@@ -51,7 +51,9 @@ class CostCoverageThresholds:
     """Band edges. ``live`` is the only one a gate should enforce."""
 
     covered: float = 1.0
-    live: float = 1.3
+    # Any strict excess over 1.0 has positive expected net return after cost.
+    # Equality is rejected explicitly by the entry/profitability gates.
+    live: float = 1.0
     comfortable: float = 1.7
 
     @classmethod

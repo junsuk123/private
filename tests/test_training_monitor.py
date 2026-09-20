@@ -22,6 +22,8 @@ def _write_artifact(
     new_rows: int,
     auc: float,
     promoted: bool = False,
+    materialized_rows: int | None = None,
+    cumulative_rows: int | None = None,
 ) -> None:
     artifact_id = f"live_short_horizon.{stamp}"
     (root / f"{artifact_id}.json").write_text(
@@ -39,6 +41,10 @@ def _write_artifact(
                 },
                 "training_data": {
                     "row_count": rows,
+                    "materialized_row_count": materialized_rows or rows,
+                    "cumulative_materialized_row_count": (
+                        cumulative_rows or materialized_rows or rows
+                    ),
                     "fresh_row_count": rows - 2,
                     "new_materialized_row_count": new_rows,
                 },
@@ -87,8 +93,149 @@ def test_training_history_reports_real_cycle_change(tmp_path: Path) -> None:
     assert result["rows_per_hour"] == 300.0
 
 
+def test_training_rate_uses_usable_model_rows_during_store_replacement(
+    tmp_path: Path,
+) -> None:
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120100000000Z",
+        minute=1,
+        rows=1_000,
+        materialized_rows=20_500,
+        new_rows=100,
+        auc=0.55,
+    )
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120600000000Z",
+        minute=6,
+        rows=1_100,
+        materialized_rows=20_400,
+        new_rows=100,
+        auc=0.56,
+    )
+
+    result = web_module._live_training_history(
+        root=tmp_path,
+        limit=10,
+        use_cache=False,
+    )
+
+    assert result["change"]["materialized_rows"] == -100
+    assert result["change"]["training_rows"] == 100
+    assert result["rows_per_hour"] == 1_200.0
+
+
+def test_training_rate_uses_new_intake_across_recipe_reset(tmp_path: Path) -> None:
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120100000000Z",
+        minute=1,
+        rows=5_000,
+        new_rows=100,
+        auc=0.55,
+    )
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120600000000Z",
+        minute=6,
+        rows=1_000,
+        new_rows=100,
+        auc=0.56,
+    )
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T121100000000Z",
+        minute=11,
+        rows=1_100,
+        new_rows=100,
+        auc=0.57,
+    )
+
+    result = web_module._live_training_history(
+        root=tmp_path,
+        limit=10,
+        use_cache=False,
+    )
+
+    assert result["window_hours"] == 10 / 60
+    assert result["rows_per_hour"] == 1_200.0
+
+
+def test_training_rate_counts_new_intake_when_usable_window_shrinks(
+    tmp_path: Path,
+) -> None:
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120100000000Z",
+        minute=1,
+        rows=49_000,
+        materialized_rows=100_000,
+        new_rows=400,
+        auc=0.55,
+    )
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120600000000Z",
+        minute=6,
+        rows=48_900,
+        materialized_rows=100_000,
+        new_rows=500,
+        auc=0.56,
+    )
+
+    result = web_module._live_training_history(
+        root=tmp_path,
+        limit=10,
+        use_cache=False,
+    )
+
+    assert result["change"]["training_rows"] == -100
+    assert result["rows_per_hour"] == 6_000.0
+    assert (
+        result["row_count_semantics"]["training_rows"]
+        == "ROLLING_DEOVERLAPPED_MODEL_WINDOW"
+    )
+
+
+def test_training_history_exposes_monotonic_cumulative_ingestion(tmp_path: Path) -> None:
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120100000000Z",
+        minute=1,
+        rows=49_000,
+        materialized_rows=100_000,
+        cumulative_rows=120_000,
+        new_rows=400,
+        auc=0.55,
+    )
+    _write_artifact(
+        tmp_path,
+        stamp="20260728T120600000000Z",
+        minute=6,
+        rows=48_900,
+        materialized_rows=100_000,
+        cumulative_rows=120_500,
+        new_rows=500,
+        auc=0.56,
+    )
+
+    result = web_module._live_training_history(
+        root=tmp_path,
+        limit=10,
+        use_cache=False,
+    )
+
+    assert result["latest"]["cumulative_rows"] == 120_500
+    assert result["change"]["cumulative_rows"] == 500
+    assert (
+        result["row_count_semantics"]["cumulative_rows"]
+        == "MONOTONIC_LIFETIME_ACCEPTED_ROWS"
+    )
+
+
 def test_strategy_terminal_includes_training_monitor() -> None:
-    response = TestClient(app).get("/account")
+    response = TestClient(app).get("/account/advanced")
 
     assert response.status_code == 200
     assert 'id="training-performance-chart"' in response.text
@@ -106,7 +253,7 @@ def test_strategy_terminal_includes_training_monitor() -> None:
 
 
 def test_diagnostics_score_is_labeled_as_infrastructure_not_tradability() -> None:
-    response = TestClient(app).get("/account")
+    response = TestClient(app).get("/account/advanced")
     root = Path(__file__).parents[1]
     script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
         encoding="utf-8"
@@ -118,7 +265,7 @@ def test_diagnostics_score_is_labeled_as_infrastructure_not_tradability() -> Non
     assert "실거래 승격 기준" not in script
 
 
-def test_operations_overview_requires_checkpoint_and_trusted_strategy_for_execution() -> None:
+def test_operations_overview_respects_the_active_gnn_authority_role() -> None:
     script = (
         Path(__file__).parents[1]
         / "src"
@@ -127,12 +274,14 @@ def test_operations_overview_requires_checkpoint_and_trusted_strategy_for_execut
         / "operations_overview.js"
     ).read_text(encoding="utf-8")
 
-    assert "gnn?.checkpoint_live_authorized === true" in script
-    assert "trusted.length > 0" in script
+    assert "opsGnnRequiredForSelection(session)" in script
+    assert "const gnnExecutionReady = !gnnRequired" in script
+    assert "보조 · 결정론 전략 독립" in script
+    assert "통과 전에는 전략 소유권과 주문이 차단됩니다" not in script
 
 
 def test_decision_ontology_graph_has_graph_only_fullscreen_control() -> None:
-    response = TestClient(app).get("/account")
+    response = TestClient(app).get("/account/advanced")
     root = Path(__file__).parents[1]
     script = (root / "src" / "app" / "static" / "strategy_terminal.js").read_text(
         encoding="utf-8"

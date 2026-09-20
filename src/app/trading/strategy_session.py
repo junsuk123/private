@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,8 +109,7 @@ def _cost_aware_profit_bps(
         expected_cost_bps = 0.0
     minimum_net_bps = max(
         0.0,
-        _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 25.0),
-        expected_cost_bps,
+        _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 0.0),
     )
     return max(
         float(configured_profit_bps),
@@ -591,6 +592,12 @@ class _ElectionProposal:
     # horizon fields above.  Keeping the bases here lets training and diagnostics
     # prove that the live plan did not fall back to a generic table after election.
     exit_contract: dict[str, Any] = field(default_factory=dict)
+    # A symbol-level setup may disagree with the market-wide regime while still
+    # carrying a complete, cost-positive thesis.  Such an arm is observable and
+    # orderable only as a bounded probe; the mismatch may reduce size but no
+    # longer deletes the branch before its own algorithm gets to speak.
+    risk_tolerance_probe: bool = False
+    risk_size_fraction: float = 1.0
 
     @property
     def is_short(self) -> bool:
@@ -775,6 +782,41 @@ class StrategySessionConfig:
         ).strip().lower()
         not in {"0", "false", "no", "off"}
     )
+    # Market regime is context, not a second strategy trigger.  When enabled, a
+    # macro-disallowed family is still evaluated independently; it can be chosen
+    # only when its own mechanical setup fires and clears the full round-trip
+    # cost, and its order size is capped below.  Global BLOCK_BUY/risk/session
+    # gates remain authoritative outside this selector.
+    macro_mismatch_probe_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "STRATEGY_SESSION_MACRO_MISMATCH_PROBE_ENABLED", "true"
+        ).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    macro_mismatch_probe_size_fraction: float = field(
+        default_factory=lambda: max(
+            0.0,
+            min(
+                0.25,
+                _env_float("STRATEGY_SESSION_MACRO_MISMATCH_PROBE_SIZE_FRACTION", 0.10),
+            ),
+        )
+    )
+    # Each (symbol, strategy) trigger is a pure, independent branch.  Keep the
+    # pool bounded by the host CPU count so the same code scales up on the GPU
+    # workstation without oversubscribing a smaller Synology-synchronised PC.
+    strategy_evaluation_workers: int = field(
+        default_factory=lambda: max(
+            1,
+            min(
+                16,
+                _env_int(
+                    "STRATEGY_EVALUATION_WORKERS",
+                    min(8, max(1, os.cpu_count() or 1)),
+                ),
+            ),
+        )
+    )
     selection_evidence_max_age_seconds: int = field(
         default_factory=lambda: max(
             10,
@@ -958,6 +1000,10 @@ class StrategySessionState:
     # This is distinct from bandit_evaluations: the latter contains only pairs
     # that first passed their strategy's own mechanical entry algorithm.
     algorithm_evaluations: list[dict[str, Any]] = field(default_factory=list)
+    strategy_evaluation_mode: str = "SERIAL"
+    strategy_evaluation_workers: int = 1
+    strategy_evaluation_branch_count: int = 0
+    strategy_evaluation_duration_ms: float | None = None
     # Slow context captured at election time and handed to the owning
     # algorithm. Fields the electing layer cannot supply stay absent, and the
     # algorithms that need them fail closed rather than assume a value.
@@ -973,6 +1019,12 @@ class StrategySessionState:
     # conservative_edge_bps on an ARMED position has no way to tell a deliberate
     # minimum-size probe from a selection bug.
     bandit_is_exploration: bool = False
+    # Explicitly separate an operator-approved, size-limited regime mismatch
+    # from ordinary bandit exploration so the GUI and audit trail can explain
+    # why a trade below full size was allowed.
+    risk_tolerance_mode: str = "NORMAL"
+    risk_tolerance_size_fraction: float = 1.0
+    risk_tolerance_reason_codes: list[str] = field(default_factory=list)
     bandit_reason_codes: list[str] = field(default_factory=list)
     bandit_evaluations: list[dict[str, Any]] = field(default_factory=list)
     bandit_shadow_arms: list[str] = field(default_factory=list)
@@ -1206,6 +1258,10 @@ class StrategySessionManager:
                 selector_cap = min(
                     selector_cap, self.config.bandit_exploration_size_fraction
                 )
+            if self._state.risk_tolerance_mode != "NORMAL":
+                selector_cap = min(
+                    selector_cap, self._state.risk_tolerance_size_fraction
+                )
             # Automatically promoted long theses enter through a size-limited
             # probe.  The selector may impose an even smaller cap; neither layer
             # can enlarge the other layer's grant.
@@ -1318,6 +1374,26 @@ class StrategySessionManager:
 
             default_trade_plan_store().save(plan)
         except Exception:  # noqa: BLE001 - persistence failure must not stop trading.
+            return
+
+    def _set_trade_plan_status(self, status: str) -> None:
+        """Persist a lifecycle transition for the session-owned frozen plan."""
+        plan = self._trade_plan
+        if plan is None:
+            return
+        try:
+            from app.trading.trade_plan import TradePlanStatus
+
+            resolved = TradePlanStatus(str(status).upper())
+            if plan.status is resolved:
+                return
+            # A terminal broker result is authoritative.  Never move a closed or
+            # cancelled historical plan back into a working state.
+            if plan.terminal:
+                return
+            self._trade_plan = plan.with_status(resolved)
+            self._save_trade_plan(self._trade_plan)
+        except Exception:  # noqa: BLE001 - observability cannot stop reconciliation.
             return
 
     def _build_trade_plan(
@@ -1522,6 +1598,10 @@ class StrategySessionManager:
             selector_cap = min(
                 selector_cap, self.config.bandit_exploration_size_fraction
             )
+        if self._state.risk_tolerance_mode != "NORMAL":
+            selector_cap = min(
+                selector_cap, self._state.risk_tolerance_size_fraction
+            )
         return max(0.0, min(1.0, min(cap, selector_cap)))
 
     @staticmethod
@@ -1588,6 +1668,7 @@ class StrategySessionManager:
                 self._state.phase = "ENTERING"
                 self._state.entry_submitted_at = _iso(now)
                 self._state.last_reason = "ENTRY_ORDER_SUBMITTED"
+                self._set_trade_plan_status("ENTERING")
                 self._persist()
 
     def mark_exit_submitted(self, symbol: str, now: datetime) -> None:
@@ -1598,6 +1679,22 @@ class StrategySessionManager:
                 self._state.exit_requested_at = self._state.exit_requested_at or _iso(now)
                 self._state.last_reason = "EXIT_ORDER_SUBMITTED_AWAITING_FLAT"
                 self._persist()
+
+    def mark_entry_terminal(self, symbol: str, status: str, now: datetime) -> None:
+        """Release an unfilled entry immediately on a terminal broker status."""
+        normalized = str(symbol or "").upper()
+        terminal = str(status or "").upper()
+        if terminal not in {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}:
+            return
+        with self._lock:
+            if (
+                self._state.selected_symbol != normalized
+                or self._state.phase not in {"ARMED", "ENTERING"}
+            ):
+                return
+            self._state.last_evaluated_at = _iso(now)
+            self._reset_to_scanning(f"ENTRY_ORDER_{terminal}")
+            self._persist()
 
     def mark_exit_filled(self, symbol: str, price: float, now: datetime) -> None:
         """Adopt the broker's terminal exit fill before balance reconciliation.
@@ -1620,6 +1717,7 @@ class StrategySessionManager:
             self._state.exiting_since = self._state.exiting_since or _iso(moment)
             self._state.exit_filled_at = _iso(moment)
             self._state.last_reason = "EXIT_FILLED_AWAITING_ACCOUNT_FLAT"
+            self._set_trade_plan_status("CLOSED")
             # Record now, while the true fill timestamp and price are available.
             # A later flat balance reconciliation is idempotent via outcome_recorded.
             self._record_outcome(moment)
@@ -1651,6 +1749,26 @@ class StrategySessionManager:
             # true and conclude a pessimistic bound and a NO_TRADE option were in
             # play when neither is.
             payload["gnn_direct_election"] = self.config.gnn_direct_election
+            payload["algorithm_primary_election"] = (
+                self.config.algorithm_primary_election
+            )
+            payload["macro_mismatch_probe_enabled"] = (
+                self.config.macro_mismatch_probe_enabled
+            )
+            payload["macro_mismatch_probe_size_fraction"] = (
+                self.config.macro_mismatch_probe_size_fraction
+            )
+            # The deterministic catalogue remains an independent authority when
+            # it is primary.  An unpromoted GNN is then useful shadow evidence,
+            # not a global entry blockade.  Publish this explicitly so the GUI
+            # does not infer authority from ``require_live_gnn`` alone.
+            payload["gnn_gate_required_for_selection"] = bool(
+                self.config.gnn_direct_election
+                or (
+                    self.config.require_live_gnn
+                    and not self.config.algorithm_primary_election
+                )
+            )
             # The plan is the real authority downstream, so it belongs in the snapshot
             # every dashboard reads. Without it the UI would still be describing the
             # pre-refactor path in which the gates decided after election.
@@ -1730,6 +1848,11 @@ class StrategySessionManager:
                     or now
                 )
                 state.entry_price = float(getattr(holding, "average_price", 0.0) or 0.0)
+                quantity = int(getattr(holding, "quantity", 0) or 0)
+                if state.entry_price > 0.0 and quantity > 0:
+                    self.note_plan_entry_fill(
+                        state.selected_symbol or "", state.entry_price, quantity
+                    )
                 # Adopt the BROKER's direction and loan date, not our own belief. The
                 # broker is authoritative on what the position actually is, and a
                 # disagreement here is precisely the condition the promotion
@@ -1800,6 +1923,7 @@ class StrategySessionManager:
                 # indistinguishable from a phantom row after the fact.
                 state.exit_reason = "POSITION_CLOSED_EXTERNALLY"
             self._record_outcome(now)
+            self._set_trade_plan_status("CLOSED")
             # The lot is gone for real, so the thesis frozen for it must not survive
             # to be inherited by the next position that happens to share its symbol
             # and average price.
@@ -2736,6 +2860,7 @@ class StrategySessionManager:
         """
         proposals: list[_ElectionProposal] = []
         micro_results = tuple(getattr(bundle, "micro_results", ()) or ())
+        jobs: list[dict[str, Any]] = []
         for raw_symbol in candidates:
             symbol = str(raw_symbol or "").upper()
             row = evidence.get(symbol) if isinstance(evidence, Mapping) else None
@@ -2753,25 +2878,109 @@ class StrategySessionManager:
                 None,
             )
             for strategy_id in STRATEGY_IDS:
-                if _macro_permits(bundle, strategy_id) is False:
+                macro_permitted = _macro_permits(bundle, strategy_id)
+                if (
+                    macro_permitted is False
+                    and not self.config.macro_mismatch_probe_enabled
+                ):
                     continue
                 direction, product, deployment_state, borrow_snapshot, borrow_reasons = (
                     self._resolve_direction_context(strategy_id, symbol, now)
                 )
                 if deployment_state is StrategyDeploymentState.DISABLED:
                     continue
-                decision = self._mechanical_entry_verdict(
-                    symbol=symbol,
-                    strategy_id=strategy_id,
-                    evidence_row=row,
-                    now=now,
-                    macro=getattr(bundle, "macro_result", None),
-                    intent=None,
-                    micro_result=micro_result,
-                    candidate_count=len(candidates),
-                    borrow_snapshot=borrow_snapshot,
+                jobs.append(
+                    {
+                        "symbol": symbol,
+                        "strategy_id": strategy_id,
+                        "evidence_row": row,
+                        "raw_features": raw_features,
+                        "now": now,
+                        "macro": getattr(bundle, "macro_result", None),
+                        "intent": None,
+                        "micro_result": micro_result,
+                        "candidate_count": len(candidates),
+                        "borrow_snapshot": borrow_snapshot,
+                        "direction": direction,
+                        "product": product,
+                        "deployment_state": deployment_state,
+                        "borrow_reasons": borrow_reasons,
+                        "macro_permitted": macro_permitted,
+                    }
                 )
-                if not decision or not bool(decision.get("triggered")):
+
+        def evaluate(job: Mapping[str, Any]) -> dict[str, Any] | None:
+            decision = self._mechanical_entry_verdict(
+                symbol=str(job["symbol"]),
+                strategy_id=str(job["strategy_id"]),
+                evidence_row=job["evidence_row"],
+                now=job["now"],
+                macro=job["macro"],
+                intent=job["intent"],
+                micro_result=job["micro_result"],
+                candidate_count=int(job["candidate_count"]),
+                borrow_snapshot=job["borrow_snapshot"],
+                record=False,
+            )
+            if decision is None:
+                return None
+            enriched = dict(decision)
+            macro_permitted = job.get("macro_permitted")
+            risk_probe = macro_permitted is False
+            enriched["macro_context_permitted"] = macro_permitted
+            enriched["risk_tolerance_probe"] = risk_probe
+            enriched["risk_size_fraction"] = (
+                self.config.macro_mismatch_probe_size_fraction
+                if risk_probe
+                else 1.0
+            )
+            return enriched
+
+        started = time.perf_counter()
+        worker_count = min(self.config.strategy_evaluation_workers, len(jobs))
+        if worker_count > 1:
+            # ``executor.map`` preserves input order.  Branch computation is
+            # concurrent, while diagnostics and proposal creation below are
+            # committed deterministically on the owning session thread.
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="strategy-eval",
+            ) as executor:
+                decisions = list(executor.map(evaluate, jobs))
+        else:
+            decisions = [evaluate(job) for job in jobs]
+        self._state.strategy_evaluation_mode = (
+            "PARALLEL_MAP" if worker_count > 1 else "SERIAL"
+        )
+        self._state.strategy_evaluation_workers = max(1, worker_count)
+        self._state.strategy_evaluation_branch_count = len(jobs)
+        self._state.strategy_evaluation_duration_ms = round(
+            (time.perf_counter() - started) * 1000.0,
+            3,
+        )
+
+        for branch_index, (job, decision) in enumerate(zip(jobs, decisions)):
+                symbol = str(job["symbol"])
+                strategy_id = str(job["strategy_id"])
+                row = job["evidence_row"]
+                raw_features = job["raw_features"]
+                micro_result = job["micro_result"]
+                direction = job["direction"]
+                product = job["product"]
+                deployment_state = job["deployment_state"]
+                borrow_snapshot = job["borrow_snapshot"]
+                borrow_reasons = job["borrow_reasons"]
+                if decision is not None:
+                    self._record_algorithm_evaluation(
+                        symbol,
+                        decision,
+                        branch_index=branch_index,
+                    )
+                if (
+                    not decision
+                    or not bool(decision.get("triggered"))
+                    or decision.get("cost_viable") is False
+                ):
                     continue
 
                 gross_edge = _optional_float(decision.get("expected_edge_bps"))
@@ -2796,7 +3005,11 @@ class StrategySessionManager:
                     _ElectionProposal(
                         symbol=symbol,
                         strategy_id=strategy_id,
-                        source="ONTOLOGY_ALGORITHM_ELECTION",
+                        source=(
+                            "MACRO_MISMATCH_ALGORITHM_PROBE"
+                            if bool(decision.get("risk_tolerance_probe"))
+                            else "ONTOLOGY_ALGORITHM_ELECTION"
+                        ),
                         entry_price=entry_price,
                         target_return_rate=max(
                             self.config.fallback_target_return_rate,
@@ -2812,7 +3025,13 @@ class StrategySessionManager:
                         gnn_actionable=False,
                         gnn_action="AUXILIARY_PENDING",
                         gnn_reason_codes=["GNN_AUXILIARY_TO_ALGORITHM_ELECTION"],
-                        ontology_reason_codes=["MACRO_ONTOLOGY_PERMITTED"],
+                        ontology_reason_codes=[
+                            (
+                                "MACRO_CONTEXT_MISMATCH_PROBE"
+                                if bool(decision.get("risk_tolerance_probe"))
+                                else "MACRO_ONTOLOGY_PERMITTED"
+                            )
+                        ],
                         macro_regime=str(self._state.macro_regime or ""),
                         micro_regime=str(
                             getattr(
@@ -2825,7 +3044,11 @@ class StrategySessionManager:
                         candidate_count=len(candidates),
                         micro_result=micro_result,
                         evidence_row=row,
-                        last_reason="ONTOLOGY_ALGORITHM_STRATEGY_ARMED",
+                        last_reason=(
+                            "MACRO_MISMATCH_RISK_PROBE_ARMED"
+                            if bool(decision.get("risk_tolerance_probe"))
+                            else "ONTOLOGY_ALGORITHM_STRATEGY_ARMED"
+                        ),
                         direction=direction,
                         position_effect=PositionEffect.OPEN,
                         execution_product=product,
@@ -2834,6 +3057,12 @@ class StrategySessionManager:
                         borrow_reason_codes=borrow_reasons,
                         gnn_required_for_edge=False,
                         algorithm_triggered=True,
+                        risk_tolerance_probe=bool(
+                            decision.get("risk_tolerance_probe")
+                        ),
+                        risk_size_fraction=float(
+                            decision.get("risk_size_fraction") or 1.0
+                        ),
                     )
                 )
         return proposals
@@ -2973,7 +3202,10 @@ class StrategySessionManager:
                 candidate_count=len(intents),
                 borrow_snapshot=borrow_snapshot,
             )
-            if mechanical is not None and not mechanical.get("triggered", False):
+            if mechanical is not None and (
+                not mechanical.get("triggered", False)
+                or mechanical.get("cost_viable") is False
+            ):
                 continue
             proposals.append(
                 _ElectionProposal(
@@ -3217,7 +3449,10 @@ class StrategySessionManager:
                         strategy_row.get("expected_net_return_bps")
                     ),
                 )
-                if mechanical is not None and not mechanical.get("triggered", False):
+                if mechanical is not None and (
+                    not mechanical.get("triggered", False)
+                    or mechanical.get("cost_viable") is False
+                ):
                     continue
                 # Historical/replay rows can lack the feature vector required to
                 # prove an algorithm trigger.  Keep those untrusted validation
@@ -3320,6 +3555,7 @@ class StrategySessionManager:
         candidate_count: int,
         borrow_snapshot: Any,
         predicted_net_edge_bps: float | None = None,
+        record: bool = True,
     ) -> dict[str, Any] | None:
         """Run the strategy's own entry trigger before scoring or journalling.
 
@@ -3395,10 +3631,20 @@ class StrategySessionManager:
                 "reason_codes": [f"STRATEGY_ENTRY_EVALUATION_ERROR:{type(exc).__name__}"],
                 "diagnostics": {},
             }
-        # The algorithm-primary path and a trusted GNN path may inspect the same
-        # pair in one cycle. It is one evaluation, not two denominator samples.
-        key = (str(symbol).upper(), str(strategy_id))
-        if not any(
+        if record:
+            self._record_algorithm_evaluation(symbol, decision)
+        return decision
+
+    def _record_algorithm_evaluation(
+        self,
+        symbol: str,
+        decision: Mapping[str, Any],
+        *,
+        branch_index: int | None = None,
+    ) -> None:
+        """Commit one branch result after parallel computation, once per pair."""
+        key = (str(symbol).upper(), str(decision.get("strategy_id") or ""))
+        if any(
             (
                 str(item.get("symbol") or "").upper(),
                 str(item.get("strategy_id") or ""),
@@ -3406,8 +3652,12 @@ class StrategySessionManager:
             == key
             for item in self._state.algorithm_evaluations
         ):
-            self._state.algorithm_evaluations.append({"symbol": symbol, **decision})
-        return decision
+            return
+        row = {"symbol": str(symbol).upper(), **dict(decision)}
+        row["execution_mode"] = self._state.strategy_evaluation_mode
+        if branch_index is not None:
+            row["branch_index"] = int(branch_index)
+        self._state.algorithm_evaluations.append(row)
 
     def _freeze_proposal_exit_contract(
         self,
@@ -3459,7 +3709,10 @@ class StrategySessionManager:
         reversion_longs = {
             "vwap_mean_reversion",
             "adaptive_anchored_vwap_reversion",
-            "bar_confirmed_vwap_recovery",
+            # bar_confirmed_vwap_recovery owns a separate TREND_DOWN relief
+            # submode. It demands completed-bar recovery plus observed tick,
+            # book and spread normalisation, so it is not the blind dip-buy path
+            # this blanket guard is meant to stop.
             "range_support_reversion",
             "choppiness_range_reversion",
         }
@@ -3532,7 +3785,7 @@ class StrategySessionManager:
             self.config.fallback_round_trip_cost_bps
         )
         minimum_net_bps = max(
-            1.0, _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 5.0)
+            0.0, _env_float("STRATEGY_SESSION_MIN_NET_TARGET_BPS", 0.0)
         )
         if target_bps <= cost_bps + minimum_net_bps:
             return reject(
@@ -3725,13 +3978,20 @@ class StrategySessionManager:
         if direction is PositionDirection.LONG:
             authorized, _ = self._deployment_authorized(strategy_id, market)
             try:
-                from app.technical.strategy_algorithms import strategy_shadow_authorized
+                from app.technical.strategy_algorithms import (
+                    strategy_live_probe_authorized,
+                    strategy_shadow_authorized,
+                )
                 from app.trading.long_strategy_promotion import (
                     LongPromotionConfig,
                     evaluate_long_promotion,
                 )
 
-                if not authorized and not strategy_shadow_authorized(
+                probe_authorized = strategy_live_probe_authorized(
+                    strategy_id,
+                    registry=self._algorithm_registries.get(market, self._algorithm_registry),
+                )
+                if not authorized and not probe_authorized and not strategy_shadow_authorized(
                     strategy_id,
                     registry=self._algorithm_registries.get(market, self._algorithm_registry),
                 ):
@@ -3744,7 +4004,7 @@ class StrategySessionManager:
                 )
             except Exception:  # noqa: BLE001 - fail closed to SHADOW.
                 return StrategyDeploymentState.SHADOW
-            if not authorized:
+            if not authorized and not probe_authorized:
                 return decision.state
             config = LongPromotionConfig.from_env()
             measured_negative = (
@@ -3752,7 +4012,9 @@ class StrategySessionManager:
                 and decision.conservative_edge_bps
                 <= config.minimum_shadow_conservative_edge_bps
             )
-            if not measured_negative:
+            if probe_authorized and not measured_negative:
+                return StrategyDeploymentState.LIVE_PROBE
+            if authorized and not measured_negative:
                 return StrategyDeploymentState.LIVE_FULL
             # Demotion only: the flag is a ceiling, never a floor under evidence.
             return min(
@@ -3980,9 +4242,48 @@ class StrategySessionManager:
         """Select only arms whose owned deterministic algorithm fired this cycle."""
         algorithm_arms = [item for item in proposals if item.algorithm_triggered]
         if not algorithm_arms:
-            self._state.last_reason = "NO_MECHANICAL_STRATEGY_TRIGGER"
+            triggered = [
+                item
+                for item in self._state.algorithm_evaluations
+                if bool(item.get("triggered"))
+            ]
+            if triggered and all(
+                item.get("cost_viable") is False for item in triggered
+            ):
+                self._state.last_reason = "NO_COST_VIABLE_MECHANICAL_STRATEGY"
+            elif triggered:
+                self._state.last_reason = "NO_ADMISSIBLE_TRIGGERED_STRATEGY"
+            else:
+                self._state.last_reason = "NO_MECHANICAL_STRATEGY_TRIGGER"
             return None
-        return self._forward_edge_choice(algorithm_arms, now)
+        chosen = self._forward_edge_choice(algorithm_arms, now)
+        if chosen is None:
+            return None
+        edge = chosen.predicted_net_edge_bps(
+            0.0, self.config.fallback_round_trip_cost_bps
+        )
+        self._state.bandit_selected_arm = chosen.strategy_id
+        self._state.bandit_conservative_edge_bps = edge
+        self._state.bandit_evaluated_at = _iso(now)
+        self._state.bandit_reason_codes = [
+            "DETERMINISTIC_ALGORITHM",
+            "FULL_ROUND_TRIP_COST_CLEARED",
+        ]
+        if chosen.risk_tolerance_probe:
+            self._state.bandit_is_exploration = True
+            self._state.risk_tolerance_mode = "MACRO_MISMATCH_PROBE"
+            self._state.risk_tolerance_size_fraction = max(
+                0.0, min(1.0, float(chosen.risk_size_fraction))
+            )
+            self._state.risk_tolerance_reason_codes = [
+                "MACRO_CONTEXT_MISMATCH_ACCEPTED",
+                "FULL_ROUND_TRIP_COST_CLEARED",
+                "HARD_RISK_GATES_RETAINED",
+            ]
+            self._state.bandit_reason_codes.extend(
+                self._state.risk_tolerance_reason_codes
+            )
+        return chosen
 
     # -- legacy bandit scoring (explicit non-primary comparison runs only) -- #
     def _reset_bandit_diagnostics(self) -> None:
@@ -3994,8 +4295,15 @@ class StrategySessionManager:
         self._state.bandit_evaluations = []
         self._state.bandit_shadow_arms = []
         self._state.bandit_evaluated_at = None
+        self._state.risk_tolerance_mode = "NORMAL"
+        self._state.risk_tolerance_size_fraction = 1.0
+        self._state.risk_tolerance_reason_codes = []
         self._state.directional_comparison = {}
         self._state.algorithm_evaluations = []
+        self._state.strategy_evaluation_mode = "SERIAL"
+        self._state.strategy_evaluation_workers = 1
+        self._state.strategy_evaluation_branch_count = 0
+        self._state.strategy_evaluation_duration_ms = None
 
     def _gnn_direct_choice(
         self,
@@ -4198,7 +4506,11 @@ class StrategySessionManager:
         # economics required to survive round-trip costs.  Previously this
         # assessment was written to the UI and then ignored, which allowed an
         # INSUFFICIENT 1.269x DYN proposal to reach the live order path.
-        if not coverage.live_eligible:
+        if (
+            not coverage.live_eligible
+            or coverage.ratio is None
+            or coverage.ratio <= 1.0
+        ):
             ratio = "UNKNOWN" if coverage.ratio is None else f"{coverage.ratio:.3f}"
             self._state.last_reason = (
                 f"ENTRY_COST_COVERAGE_REJECTED:{coverage.band.value}:{ratio}"
@@ -4265,6 +4577,11 @@ class StrategySessionManager:
             bandit_selected_arm=self._state.bandit_selected_arm,
             bandit_conservative_edge_bps=proposal.conservative_edge_bps,
             bandit_is_exploration=self._state.bandit_is_exploration,
+            risk_tolerance_mode=self._state.risk_tolerance_mode,
+            risk_tolerance_size_fraction=self._state.risk_tolerance_size_fraction,
+            risk_tolerance_reason_codes=list(
+                self._state.risk_tolerance_reason_codes
+            ),
             bandit_reason_codes=list(self._state.bandit_reason_codes),
             bandit_evaluations=list(self._state.bandit_evaluations),
             bandit_shadow_arms=list(self._state.bandit_shadow_arms),
@@ -4310,6 +4627,15 @@ class StrategySessionManager:
         self, evidence: Mapping[str, Any], intents: list[Any]
     ) -> str:
         if self.config.algorithm_primary_election and self._state.algorithm_evaluations:
+            triggered = [
+                item
+                for item in self._state.algorithm_evaluations
+                if bool(item.get("triggered"))
+            ]
+            if triggered and all(
+                item.get("cost_viable") is False for item in triggered
+            ):
+                return "NO_COST_VIABLE_MECHANICAL_STRATEGY"
             if not any(
                 bool(item.get("triggered"))
                 for item in self._state.algorithm_evaluations
@@ -4763,6 +5089,8 @@ class StrategySessionManager:
         # rejected exit) is exactly when re-adoption needs the thesis it is about to
         # forget. ``_adopt_existing_position`` discards it unless the same lot at the
         # same average price comes back.
+        self._set_trade_plan_status("CANCELLED")
+        self._trade_plan = None
         self._state = StrategySessionState(
             target_return_rate=self.config.fallback_target_return_rate,
             last_reason=reason,
@@ -4806,9 +5134,34 @@ class StrategySessionManager:
     def _persist(self) -> None:
         path = Path(self.config.state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(asdict(self._state), ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
+        # Synology Drive and Windows indexing can briefly hold the destination
+        # open. A fixed ``strategy-session.json.tmp`` also lets a second process
+        # on the shared code space collide with this writer. Use a unique sibling
+        # and retry only the transient sharing violation; every other failure
+        # still propagates and disables new entries fail-closed.
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp"
         )
-        os.replace(temporary, path)
+        try:
+            temporary.write_text(
+                json.dumps(
+                    asdict(self._state),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt >= 4:
+                        raise
+                    time.sleep(0.02 * (2**attempt))
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass

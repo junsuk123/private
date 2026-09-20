@@ -15,6 +15,7 @@ from typing import Any
 
 from app.config.refactor_profile import load_refactor_profile
 from app.features import session_structure
+from app.paths import PROJECT_ROOT, realtime_market_database_path
 from app.strategy.experts import ALL_EXPERT_TYPES
 
 
@@ -22,6 +23,17 @@ _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
 _MARKET_SERIES_CACHE_CONDITION = threading.Condition()
 _MARKET_SERIES_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _MARKET_SERIES_REFRESHING: set[tuple[str, str]] = set()
+
+
+def _realtime_database(base: Path) -> Path:
+    """Use an injected fixture root offline and the canonical local DB live."""
+
+    try:
+        if base.resolve() == PROJECT_ROOT.resolve():
+            return realtime_market_database_path()
+    except OSError:
+        pass
+    return base / "data/store/realtime_market_data.sqlite3"
 
 
 def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
@@ -204,7 +216,7 @@ def build_strategy_market_view(
     requested = str(symbol or "").strip().upper()
     if requested and not _SYMBOL_PATTERN.fullmatch(requested):
         raise ValueError("invalid symbol")
-    market_database = base / "data/store/realtime_market_data.sqlite3"
+    market_database = _realtime_database(base)
     selected = requested or _default_symbol(shadow, lifecycle, market_database) or ""
     safe_limit = max(30, min(390, int(limit or 180)))
     market = _market_series(
@@ -270,7 +282,7 @@ def build_strategy_market_stream(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "symbol": selected,
         "market": _market_series(
-            Path(root) / "data/store/realtime_market_data.sqlite3",
+            _realtime_database(Path(root)),
             selected,
             safe_limit,
         ),
@@ -1232,6 +1244,7 @@ def _algorithm(strategy_id: str) -> dict[str, Any] | None:
             "trailing_bps": config.trailing_bps,
             "max_holding_seconds": config.max_holding_seconds,
             "visual_indicators": _visual_indicators(expert.strategy_id),
+            "operating_modes": _operating_modes(expert.strategy_id),
         }
     return None
 
@@ -1243,7 +1256,13 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "vwap_mean_reversion": ["VWAP", "MA5", "MA20", "Deviation"],
         "liquidity_shock_reversal": ["Spread", "Orderbook Imbalance", "VWAP", "Volume"],
         "event_momentum": ["Event Time", "VWAP", "MA5", "Volume"],
-        "cross_sectional_relative_strength": ["Relative Strength", "MA20", "VWAP"],
+        "cross_sectional_relative_strength": [
+            "Relative Strength", "Market Beta", "Market Breadth", "EMA", "VWAP"
+        ],
+        "bar_confirmed_vwap_recovery": [
+            "VWAP Dislocation", "Completed-bar EMA/MACD", "Trade Flow",
+            "Book Delta", "Spread Change", "Market Breadth",
+        ],
         "gap_context": ["Session Open", "Gap", "VWAP", "Volume"],
         "rvgi_box_breakout": ["RVGI", "RVGI Signal", "Box High", "Box Low", "Volume"],
         "opening_range_breakout": ["Opening Range High", "Opening Range Low", "Relative Volume"],
@@ -1253,9 +1272,30 @@ def _visual_indicators(strategy_id: str) -> list[str]:
         "residual_relative_weakness": ["Sector Rank", "Residual Return", "Borrow"],
         "overnight_gap_carry": ["Close Clock", "VWAP Premium", "Day Volatility"],
         "range_support_reversion": ["20-bar Range Low", "Range Mid", "ATR", "Volume"],
-        "bar_trend_continuation": ["EMA Fast/Slow", "MACD", "VWAP", "Relative Volume"],
+        "bar_trend_continuation": [
+            "MA20/50/200", "MA50/200 Slope", "MACD", "RSI",
+            "Pullback to MA20", "Volume Contraction",
+        ],
     }
     return mapping.get(strategy_id, ["MA5", "MA20", "VWAP", "Volume"])
+
+
+def _operating_modes(strategy_id: str) -> list[str]:
+    """Human-readable parallel branches shown in the GUI strategy graph."""
+    return {
+        "cross_sectional_relative_strength": [
+            "NORMAL: sector-leading relative strength",
+            "BEAR: low-beta absolute strength above VWAP",
+        ],
+        "bar_confirmed_vwap_recovery": [
+            "NORMAL: completed-bar VWAP recovery",
+            "BEAR: panic relief after trade/book/spread normalisation",
+        ],
+        "residual_relative_strength": [
+            "NORMAL: positive residual trend",
+            "BEAR: low-beta positive residual and absolute strength",
+        ],
+    }.get(strategy_id, [])
 
 
 def _decision_ontology(
@@ -1578,8 +1618,9 @@ def _decision_ontology(
             ("liquidity", ">=", .65),
         ],
         "bar_trend_continuation": [
-            ("return", ">=", .8),
-            ("volume", ">=", .65),
+            ("momentum_persistence_long", ">=", .8),
+            ("return", "<=", .8),
+            ("volume", "<=", .65),
             ("liquidity", ">=", .65),
         ],
     }
@@ -1619,6 +1660,7 @@ def _decision_ontology(
                 "final_selected": expert.strategy_id == final_strategy and final_action != "NO_TRADE",
                 "requirements": checks,
                 "visual_indicators": _visual_indicators(expert.strategy_id),
+                "operating_modes": _operating_modes(expert.strategy_id),
             }
         )
     sources = [

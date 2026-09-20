@@ -228,7 +228,11 @@ class MechanicalShadowCollector:
                     deployment_state="SHADOW",
                     diagnostics={
                         "order_submission_capable": False,
-                        "algorithm_live_triggered": decision.triggered,
+                        "algorithm_pattern_triggered": decision.triggered,
+                        "algorithm_cost_viable": decision.cost_viable,
+                        "algorithm_live_triggered": bool(
+                            decision.triggered and decision.cost_viable is not False
+                        ),
                         "source": "validated_live_feature_frame",
                         "return_30s_bps": (features.return_30s or 0.0) * 10_000.0,
                         "orderbook_imbalance": features.orderbook_imbalance,

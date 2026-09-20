@@ -92,26 +92,27 @@ class RssCollectionResult:
     raw_records: tuple[RawSourceRecord, ...]
 
 
-def extract_focus_sections(text: str, preferred_title: str | None = None) -> dict[str, Any]:
+def extract_focus_sections(text: str, *, preferred_title: str | None = None) -> dict[str, Any]:
+    """Headline, a short summary and the numeric sentences of a page body.
+
+    ``preferred_title`` is the title the caller already knows for this source. A
+    rendered page echoes its heading into the extracted text - often twice, once from
+    ``<title>`` and once from ``<h1>`` - and without it that echo consumes the summary
+    budget and every sentence of real content is pushed out. Given the title, the leading
+    echo is dropped and the title becomes the headline, so the summary carries body text.
+    """
     compact = " ".join(text.split())
+    if preferred_title:
+        compact = _strip_leading_title(compact, preferred_title)
     if not compact:
         return {
-            "headline": "",
+            "headline": (preferred_title or "").strip()[:180],
             "summary": "",
             "numeric_highlights": (),
         }
 
-    # Government and regulator pages commonly prepend thousands of characters of
-    # navigation.  Their article heading appears again immediately before the
-    # actual body, so the last exact heading is a reliable, source-agnostic anchor.
-    title = " ".join(str(preferred_title or "").split())
-    if title:
-        positions = [match.start() for match in re.finditer(re.escape(title), compact, re.IGNORECASE)]
-        if positions:
-            compact = compact[positions[-1] :]
-    compact = compact[:5000]
-    sentences = [item.strip() for item in re.split(r"(?<=[.!?。])\s+", compact) if item.strip()]
-    headline = sentences[0] if sentences else compact[:160]
+    sentences = [item.strip() for item in re.split(r"(?<=[.!?])\s+", compact) if item.strip()]
+    headline = (preferred_title or "").strip() or (sentences[0] if sentences else compact[:160])
     summary = " ".join(sentences[:3]) if sentences else compact[:300]
     numeric = [sentence for sentence in sentences if re.search(r"\d|%|\$|USD|KRW|bps", sentence, re.IGNORECASE)]
 
@@ -132,6 +133,7 @@ class RssNewsCollector:
         known_tickers: dict[str, str] | None = None,
         llm_classifier: JsonEventLLMClassifier | None = None,
         max_llm_items: int | None = None,
+        item_limit: int | None = None,
     ) -> tuple[ClassifiedEvent, ...]:
         return self.collect_with_articles(
             feed_url,
@@ -139,6 +141,7 @@ class RssNewsCollector:
             llm_classifier=llm_classifier,
             max_llm_items=max_llm_items,
             fetch_articles=False,
+            item_limit=item_limit,
         ).events
 
     def collect_with_articles(
@@ -149,20 +152,22 @@ class RssNewsCollector:
         max_llm_items: int | None = None,
         fetch_articles: bool = False,
         article_limit: int | None = None,
-        item_limit: int | None = None,
         event_type: EventType = EventType.NEWS,
+        item_limit: int | None = None,
     ) -> RssCollectionResult:
         response = self.client.get_text(feed_url)
         root = ET.fromstring(response.text)
         events: list[ClassifiedEvent] = []
         raw_records: list[RawSourceRecord] = []
 
-        items = root.findall(".//item")
-        if item_limit is not None:
-            items = items[: max(0, int(item_limit))]
-        for index, item in enumerate(items):
-            title = _plain_text(_xml_text(item, "title"))
-            description = _plain_text(_xml_text(item, "description"))
+        for index, item in enumerate(root.findall(".//item")):
+            # A feed decides how many items it publishes; the caller decides how many it
+            # pays to classify. Breaking rather than filtering keeps the article fetches
+            # and LLM calls inside the cap too, which is where the cost actually is.
+            if not _within_limit(index, item_limit):
+                break
+            title = _xml_text(item, "title")
+            description = _xml_text(item, "description")
             link = _xml_text(item, "link") or response.url
             source = source_now("rss", link, f"rss:{_stable_id(link + title)}")
             body = description
@@ -171,7 +176,7 @@ class RssNewsCollector:
                 try:
                     article_record = HtmlResearchCollector(self.client).collect(link)
                     raw_records.append(article_record)
-                    sections = extract_focus_sections(article_record.payload, preferred_title=title)
+                    sections = extract_focus_sections(article_record.payload)
                     article_body = sections["summary"] or article_record.payload[:1200]
                     if sections["numeric_highlights"]:
                         article_body = f"{article_body} {' '.join(sections['numeric_highlights'])}".strip()
@@ -186,7 +191,7 @@ class RssNewsCollector:
                     source=source,
                     event_type=event_type,
                     known_tickers=known_tickers,
-                    event_date=_parse_rss_date(_rss_date_text(item)),
+                    event_date=_parse_item_date(item),
                     llm_classifier=llm_classifier if max_llm_items is None or index < max_llm_items else None,
                 )
             )
@@ -567,26 +572,6 @@ def _xml_text(item: ET.Element, tag: str) -> str:
     return (node.text or "").strip() if node is not None else ""
 
 
-def _rss_date_text(item: ET.Element) -> str:
-    value = _xml_text(item, "pubDate")
-    if value:
-        return value
-    for node in item:
-        if str(node.tag).split("}")[-1].lower() in {"date", "published", "updated"}:
-            text = (node.text or "").strip()
-            if text:
-                return text
-    return ""
-
-
-def _plain_text(value: str) -> str:
-    if "<" not in value and "&" not in value:
-        return " ".join(value.split())
-    parser = TextExtractor()
-    parser.feed(value)
-    return " ".join(parser.text().split())
-
-
 def _parse_rss_date(value: str) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
@@ -595,11 +580,65 @@ def _parse_rss_date(value: str) -> datetime:
 
         return parsedate_to_datetime(value)
     except (TypeError, ValueError):
+        return datetime.now(timezone.utc)
+
+
+# RSS 2.0 says pubDate, Atom says published/updated, and a feed built on Dublin Core
+# says dc:date with an ISO 8601 value. Real feeds use all of them, so the item date is
+# read by local element name and parsed in both dialects. Guessing "now" instead is not
+# harmless: event_date drives the recency weighting and the freshness gates.
+_ITEM_DATE_TAGS = ("pubDate", "date", "published", "updated")
+
+
+def _strip_leading_title(compact: str, title: str) -> str:
+    """Drop repeated leading occurrences of ``title`` from already-compacted text."""
+    needle = " ".join(str(title).split())
+    if not needle:
+        return compact
+    remaining = compact
+    while remaining[: len(needle)].casefold() == needle.casefold():
+        remaining = remaining[len(needle) :].lstrip(" -|:–—")
+    return remaining or compact
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _namespaced_text(item: ET.Element, name: str) -> str:
+    wanted = name.lower()
+    for child in item:
+        if isinstance(child.tag, str) and _local_name(child.tag).lower() == wanted:
+            return (child.text or "").strip()
+    return ""
+
+
+def _parse_iso_date(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _parse_item_date(item: ET.Element) -> datetime:
+    for tag in _ITEM_DATE_TAGS:
+        value = _namespaced_text(item, tag)
+        if not value:
+            continue
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(value)
         except (TypeError, ValueError):
-            return datetime.now(timezone.utc)
+            parsed = None
+        if parsed is None:
+            parsed = _parse_iso_date(value)
+        if parsed is not None:
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def _parse_yyyymmdd(value: str) -> datetime:

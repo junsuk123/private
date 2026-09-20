@@ -320,6 +320,7 @@ const gnnRelationStyle = {
 // zero, because "nothing was rejected here" and "we never looked" are different
 // facts and only one of them is good news.
 const GNN_PIPELINE_STAGES = [
+  { id: 'EVALUATION_ERROR', label: 'STRATEGY ERROR', color: 0xff5f74 },
   { id: 'RAW_CANDIDATE', label: '① 수집 · 원시 후보', color: 0x8178ff },
   { id: 'FEATURE_UNAVAILABLE', label: '② 특징 생성', color: 0x8fa4ff },
   { id: 'STRATEGY_TRIGGER_FALSE', label: '③ 전략 트리거', color: 0xf6d778 },
@@ -2744,9 +2745,14 @@ function renderTrainingMonitor(training) {
 
   const rowsPerHour = Number(history.rows_per_hour || 0);
   document.getElementById('training-row-rate').textContent =
-    `${rowsPerHour.toFixed(rowsPerHour >= 10 ? 0 : 1)} 행/시간`;
+    `${rowsPerHour.toFixed(rowsPerHour >= 10 ? 0 : 1)} 신규행/시간`;
   document.getElementById('training-new-rows').textContent =
-    `${latest.training_mode === 'incremental' ? '증분 학습' : '전체 학습'} ${formatInteger(latest.incremental_rows || latest.training_rows || 0)}행 · 누적 ${formatInteger(latest.materialized_rows || latest.training_rows || 0)}행 · 모델 윈도우 ${formatInteger(latest.training_rows || 0)}행`;
+    `이번 주기 신규 ${formatInteger(latest.new_rows || 0)}행 · 유효 윈도우 ${formatInteger(latest.training_rows || 0)}행 · 원시 보존 풀 ${formatInteger(latest.materialized_rows || 0)}행`;
+
+  // Keep the four row concepts explicit: intake and cumulative history must not
+  // be confused with the bounded active pool or the de-overlapped fit window.
+  document.getElementById('training-new-rows').textContent =
+    `이번 주기 신규 ${formatInteger(latest.new_rows || 0)}행 · 누적 수집 ${formatInteger(latest.cumulative_rows || latest.materialized_rows || 0)}행 · 유효 학습 ${formatInteger(latest.training_rows || 0)}행 · 작업 풀 ${formatInteger(latest.materialized_rows || 0)}행`;
 
   const promoted = Boolean(latest.promoted);
   const eligible = Boolean(latest.live_eligible);
@@ -2806,6 +2812,14 @@ function drawTrainingPerformanceChart(points) {
 function drawTrainingDataChart(points) {
   const canvas = document.getElementById('training-data-chart');
   if (!canvas) return;
+  canvas.setAttribute('aria-label', '누적 학습 데이터와 신규 유입 차트');
+  const title = canvas.closest('.training-chart-card')?.querySelector('.training-chart-title');
+  if (title) {
+    const heading = title.querySelector('b');
+    const legend = title.querySelector('span');
+    if (heading) heading.textContent = '누적 학습 데이터';
+    if (legend) legend.innerHTML = '<i class="rows"></i>누적 수집 <i class="new-rows"></i>신규 유입';
+  }
   const { ctx, width, height } = prepareCanvas(canvas);
   ctx.clearRect(0, 0, width, height);
   const pad = { left: 42, right: 12, top: 12, bottom: 22 };
@@ -2815,7 +2829,10 @@ function drawTrainingDataChart(points) {
     drawEmptyTrainingChart(ctx, width, height);
     return;
   }
-  const rowValues = points.map((point) => Number(point.materialized_rows || point.training_rows || 0));
+  // Plot the monotonic lifetime-ingestion counter. The bounded active pool and
+  // de-overlapped model window remain visible in the KPI text instead of being
+  // mislabelled as accumulation and appearing to lose collected data.
+  const rowValues = points.map((point) => Number(point.cumulative_rows || point.materialized_rows || 0));
   const newValues = points.map((point) => Number(point.new_rows || 0));
   const rowMin = Math.min(...rowValues);
   const rowMax = Math.max(...rowValues);
@@ -2829,7 +2846,7 @@ function drawTrainingDataChart(points) {
     const barHeight = Number(point.new_rows || 0) / newMax * plotHeight * .42;
     ctx.fillRect(xAt(index) - barWidth / 2, pad.top + plotHeight - barHeight, barWidth, barHeight);
   });
-  drawTrainingLine(ctx, points, xAt, (point) => rowY(point.materialized_rows || point.training_rows), '#42d392');
+  drawTrainingLine(ctx, points, xAt, (point) => rowY(point.cumulative_rows || point.materialized_rows || 0), '#42d392');
   ctx.fillStyle = '#708196';
   ctx.font = '7px Consolas';
   ctx.textAlign = 'right';
@@ -3789,7 +3806,9 @@ function renderDecisionOntology(trace) {
       value: item.gate
         ? noCandidateSymbols ? '후보 0건' : '선택 전략 없음'
         : item.ontology_selected ? '온톨로지 선택' : item.final_selected ? '최종 선택' : '후보',
-      description: item.thesis,
+      description: [item.thesis, ...(item.operating_modes || [])]
+        .filter(Boolean)
+        .join(' / '),
       rows: item.gate
         ? [['판단 경로', finalDecision.path || '-'], ['차단 사유', reasonCodes.join(' · ') || 'NO_SELECTED_STRATEGY']]
         : (item.requirements || []).map((rule) => [

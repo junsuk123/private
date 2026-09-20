@@ -46,12 +46,25 @@ from app.graph.macro_micro_common import (
 # Default per-regime micro-strategy permissions (overridden by
 # config/macro_micro_ontology.yaml at wiring time — Phase 7).
 DEFAULT_STRATEGY_PERMISSIONS: dict[str, dict[str, tuple[str, ...]]] = {
-    MarketRegime.TREND_UP.value: {"allow": ("momentum", "breakout", "vwap_pullback"), "block": ("aggressive_countertrend_reversion",)},
+    MarketRegime.TREND_UP.value: {
+        "allow": (
+            "momentum",
+            "breakout",
+            "vwap_pullback",
+            "relative_strength",
+            # Beta-neutral stock-specific weakness is independently valid even
+            # while the broad index rises.  Do not allow the coarse ``short``
+            # family here: that would also admit directional breakdown shorts.
+            "relative_weakness",
+        ),
+        "block": ("aggressive_countertrend_reversion",),
+    },
     MarketRegime.BREAKOUT_MARKET.value: {"allow": ("breakout", "momentum", "vwap_pullback"), "block": ("late_breakout_chasing",)},
     # A falling index is not itself a closed-world ban on every long entry.
     # Permit only strategies whose thesis can still be valid in a weak tape:
-    # liquid mean reversion and stock-specific relative strength.  Directional
-    # momentum/breakout remains excluded unless the regime changes.
+    # liquid mean reversion and stock-specific relative strength. Long directional
+    # momentum/breakout remains excluded; explicitly short-directional families
+    # are admitted to their own downstream evidence and borrow gates.
     MarketRegime.TREND_DOWN.value: {
         "allow": (
             "sell",
@@ -60,6 +73,11 @@ DEFAULT_STRATEGY_PERMISSIONS: dict[str, dict[str, tuple[str, ...]]] = {
             "mean_reversion",
             "vwap_reversion",
             "relative_strength",
+            # Direction-specific families must survive the macro pre-filter so
+            # their own borrow, tape and cost gates can evaluate independently.
+            "momentum_short",
+            "breakdown",
+            "relative_weakness",
         ),
         "block": (
             "weak_breakout_buy",
@@ -71,13 +89,30 @@ DEFAULT_STRATEGY_PERMISSIONS: dict[str, dict[str, tuple[str, ...]]] = {
             "rvgi_box_breakout",
         ),
     },
-    MarketRegime.RANGE_BOUND.value: {"allow": ("mean_reversion", "vwap_reversion"), "block": ("late_breakout_chasing",)},
+    MarketRegime.RANGE_BOUND.value: {
+        "allow": (
+            "mean_reversion",
+            "vwap_reversion",
+            "relative_strength",
+            "relative_weakness",
+        ),
+        "block": ("late_breakout_chasing",),
+    },
     MarketRegime.HIGH_VOLATILITY_RISK.value: {"allow": ("sell", "reduce_risk", "hold"), "block": ("new_buy",)},
     # --- High-volatility sub-regimes -------------------------------------------
     # High volatility with a persistent direction. A confirmed relative-strength
     # or momentum thesis can still be valid; countertrend reversion cannot.
     MarketRegime.HIGH_VOL_TRENDING.value: {
-        "allow": ("sell", "reduce_risk", "hold", "relative_strength", "momentum"),
+        "allow": (
+            "sell",
+            "reduce_risk",
+            "hold",
+            "relative_strength",
+            "relative_weakness",
+            "momentum",
+            "momentum_short",
+            "breakdown",
+        ),
         "block": (
             "mean_reversion",
             "vwap_reversion",

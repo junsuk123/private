@@ -321,7 +321,11 @@ def _strategy_supervision(
     supervision: dict[str, dict[str, int | bool]] = {}
     for strategy_id in STRATEGY_IDS:
         selected = [row for row in rows if row.strategy_id == strategy_id]
-        realized = [row for row in selected if row.triggered and row.filled]
+        realized = [
+            row
+            for row in selected
+            if row.outcome_observed and row.triggered and row.filled
+        ]
         upside = [row for row in realized if row.net_return_bps > 0]
         supervision[strategy_id] = {
             "labels": len(selected),
@@ -339,8 +343,12 @@ def _label_outcome_summary(
     summary: dict[str, dict[str, float | int | str | None]] = {}
     for strategy_id in STRATEGY_IDS:
         selected = [row for row in rows if row.strategy_id == strategy_id]
-        simulated_filled = [row for row in selected if row.filled]
-        filled = [row for row in selected if row.triggered and row.filled]
+        simulated_filled = [row for row in selected if row.outcome_observed and row.filled]
+        filled = [
+            row
+            for row in selected
+            if row.outcome_observed and row.triggered and row.filled
+        ]
         positive = [row for row in filled if row.net_return_bps > 0]
         negative = [row for row in filled if row.net_return_bps < 0]
         mean_net = (
@@ -545,15 +553,21 @@ def _market_authorization_verdicts(
         validation_rows = int(
             validation_metrics.get(f"{prefix}_selection_rows") or 0
         )
+        validation_symbols = int(
+            validation_metrics.get(f"{prefix}_selection_symbols") or 0
+        )
         authorized = bool(
             base_ready
             and validation_rows >= 20
+            and validation_symbols >= 5
             and verdict["selection_ranking_skill_established"]
             and verdict["selection_net_edge_established"]
         )
         checks[market] = {
             "selection_rows": validation_rows,
             "minimum_selection_rows": 20,
+            "selection_symbols": validation_symbols,
+            "minimum_selection_symbols": 5,
             **verdict,
             "live_authorized": authorized,
         }
@@ -785,7 +799,10 @@ def _fit_strategy_relation_graph(
         )
         market_strategy_ids = set(strategy_ids_for_market(str(symbol)))
         attractive = any(
-            row.triggered and row.filled and row.net_return_bps > 0
+            row.outcome_observed
+            and row.triggered
+            and row.filled
+            and row.net_return_bps > 0
             for row in ordered
             if row.strategy_id in market_strategy_ids
         )
@@ -804,7 +821,11 @@ def _fit_strategy_relation_graph(
                     [float(row.net_return_bps) for row in ordered], dtype=np.float32
                 ),
                 filled=np.asarray(
-                    [bool(row.triggered and row.filled) for row in ordered], dtype=bool
+                    [
+                        bool(row.outcome_observed and row.triggered and row.filled)
+                        for row in ordered
+                    ],
+                    dtype=bool,
                 ),
             )
         )
@@ -1262,6 +1283,11 @@ def _raw_target(row: CounterfactualLabel) -> tuple[float, ...]:
 
 
 def _target_mask(row: CounterfactualLabel) -> tuple[float, ...]:
+    if not row.outcome_observed:
+        # Trigger reachability and epistemic uncertainty are known at decision
+        # time. Payoff, fill, cost and borrow outcomes are not, so they must not
+        # receive a gradient from a censored future window.
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
     realized = 1.0 if row.triggered and row.filled else 0.0
     positive = 1.0 if realized and row.net_return_bps > 0.0 else 0.0
     negative = 1.0 if realized and row.net_return_bps <= 0.0 else 0.0

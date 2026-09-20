@@ -634,7 +634,8 @@ class GraphSnapshotBuilder:
         values: dict[str, dict[str, float]] = {}
 
         if domestic_context is not None:
-            values["KR_MARKET"] = _drop_none(
+            market_node = _MARKET_NODE.get(domestic_context.market.upper(), "KR_MARKET")
+            values[market_node] = _drop_none(
                 {
                     "direction": domestic_context.direction,
                     "breadth": domestic_context.breadth,
@@ -648,14 +649,14 @@ class GraphSnapshotBuilder:
                 }
             )
         if global_context is not None:
-            values["US_MARKET"] = _drop_none(
+            values.setdefault("US_MARKET", _drop_none(
                 {
                     "direction": global_context.direction,
                     "volatility": global_context.volatility,
                     "confidence": global_context.confidence,
                     "global_agreement": global_context.global_alignment,
                 }
-            )
+            ))
             for node in graph.nodes_of_type("MacroFactor"):
                 group_name = node.attributes.get(self._MACRO_GROUP_ATTRIBUTE)
                 score = global_context.groups.get(str(group_name)) if group_name else None

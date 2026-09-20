@@ -14,7 +14,7 @@ schema_version: 1
 
 calendar:
   # 이 스냅샷의 버전. artifact metadata 에 기록되어 "어느 캘린더로 학습/거래했는지" 추적된다.
-  version: "2026-08-04.1"
+  version: "2026-09-20.1"
   source: "KRX/NYSE 공표 일정 수기 스냅샷 (외부 provider 미설치 환경의 fallback)"
   # 커버리지를 벗어난 날짜는 신규 진입 fail-closed (SESSION_CALENDAR_STALE).
   # 청산 경로는 별도 평가한다.
@@ -196,7 +196,8 @@ sessions:
     maximum_position_weight: 0.05
 
   NXT_REGULAR:
-    window: { tz: Asia/Seoul, start: "09:00", end: "15:20" }
+    # NXT official trading system + KIS best-execution guide, verified 2026-09-20.
+    window: { tz: Asia/Seoul, start: "09:00:30", end: "15:20" }
     data_enabled: true
     new_entry_enabled: false
     exit_enabled: true
@@ -208,7 +209,9 @@ sessions:
     maximum_position_weight: 0.15
 
   NXT_POST:
-    window: { tz: Asia/Seoul, start: "15:30", end: "20:00" }
+    # Order acceptance starts 15:30, continuous executions only start 15:40.
+    # This engine has no NXT opening-auction entry strategy.
+    window: { tz: Asia/Seoul, start: "15:40", end: "20:00" }
     data_enabled: true
     new_entry_enabled: false
     exit_enabled: true

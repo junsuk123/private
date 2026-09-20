@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
+from app.paths import runtime_store_root
 from app.runtime import DataEnvironment
 
 
@@ -73,7 +74,7 @@ class OperationModeManager:
                 OperationMode.LIVE_TRADING: "Realtime trading gate",
             }[selected],
             guardrails=(
-                "Use one unified realtime data store only: data/store.",
+                f"Use one unified realtime research store only: {runtime_store_root()}.",
                 "Synthetic and simulation data are not valid inputs for learning or live trading.",
                 "Learning and information collection continue while the server is running.",
                 "Paper trading modes are removed and normalized to live trading.",

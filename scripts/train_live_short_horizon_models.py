@@ -10,18 +10,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models.live_model_trainer import train_live_short_horizon_model
 from app.models.model_artifact_registry import ModelArtifactRegistry
+from app.paths import runtime_database_path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train fitted live short-horizon models.")
     parser.add_argument("--dataset", type=Path, default=None, help="JSONL rows with features, label, forward_net_return_bps.")
     parser.add_argument("--demo-fixture", action="store_true", help="Generate deterministic fitted fixture data for dry-run validation.")
-    parser.add_argument("--model-dir", type=Path, default=Path("data/models/live_short_horizon"))
+    parser.add_argument("--model-dir", type=Path, default=None, help="Defaults to this machine's runtime model registry.")
     args = parser.parse_args()
 
     rows = _demo_rows() if args.demo_fixture else _load_rows(args.dataset)
-    if args.demo_fixture and args.model_dir == Path("data/models/live_short_horizon"):
-        args.model_dir = Path("data/models/live_short_horizon_demo")
+    if args.model_dir is None:
+        args.model_dir = (runtime_database_path("models/live_short_horizon_demo")
+                          if args.demo_fixture else ModelArtifactRegistry().root)
     artifact = train_live_short_horizon_model(
         rows,
         registry=ModelArtifactRegistry(args.model_dir),

@@ -21,6 +21,7 @@ Kelly cap nor the multiplicative weight can be exceeded.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -61,6 +62,7 @@ class SizingInputs:
     p_win: float | None = None
     avg_win_net: float | None = None
     avg_loss_net: float | None = None
+    market: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,7 +89,9 @@ class PositionSizer:
     def size(self, inputs: SizingInputs) -> SizingResult:
         cfg = self.config
         # Negative expectancy => zero size (defense in depth; the gate blocks these).
-        if inputs.net_expected_return <= 0.0:
+        values = (inputs.net_expected_return, inputs.target_net_return, inputs.confidence_score, inputs.liquidity_score, inputs.account_drawdown_rate)
+        values += tuple(value for value in (inputs.p_win, inputs.avg_win_net, inputs.avg_loss_net) if value is not None)
+        if any(not math.isfinite(float(value)) for value in values) or inputs.net_expected_return <= 0.0:
             return SizingResult(0.0, 0.0, 0.0, 0.0, 0.0, inputs.confidence_score, inputs.liquidity_score, 0.0, 0.0)
 
         p_win = _clamp(inputs.p_win if inputs.p_win is not None else cfg["default_p_win"], 0.0, 1.0)
@@ -120,7 +124,13 @@ class PositionSizer:
         )
         # Neither the multiplicative weight nor the Kelly cap may be exceeded.
         weight = min(weight, fractional_kelly if fractional_kelly > 0 else weight)
-        weight = _clamp(weight, float(cfg["min_position_weight"]), float(cfg["max_position_weight"]))
+        if inputs.p_win is not None and fractional_kelly <= 0:
+            # Observed negative Kelly evidence must not take the no-history pilot.
+            weight = 0.0
+        cap = min(1.0, float(cfg["max_position_weight"]))
+        if inputs.market:
+            cap = min(cap, market_position_cap(inputs.market))
+        weight = max(0.0, min(cap, weight))
 
         return SizingResult(
             position_weight=weight,
@@ -139,6 +149,17 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
+def market_position_cap(market: str) -> float:
+    from app.data.market_capabilities import normalize_market_group
+    from app.strategy.market_policy import load_market_profiles
+
+    group = normalize_market_group(market)
+    key = getattr(group, "value", group)
+    if key not in {"KR", "US"}:
+        return 0.0
+    return min(1.0, max(0.0, float(load_market_profiles()[key]["maximum_position_weight"])))
+
+
 def _load_config(config_path: Path | str) -> dict[str, Any]:
     merged = dict(DEFAULT_POSITION_SIZING_CONFIG)
     # Env backward compatibility.
@@ -155,6 +176,10 @@ def _load_config(config_path: Path | str) -> dict[str, Any]:
                 merged.update({k: v for k, v in loaded.items() if k in DEFAULT_POSITION_SIZING_CONFIG})
         except Exception:  # noqa: BLE001
             logger.warning("Failed to load %s; using defaults + env", path)
+    # Explicit machine-local overrides win over the synced defaults.
+    for key, variable in (("base_position_weight", "REALTIME_BUY_WEIGHT"), ("max_position_weight", "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT"), ("small_account_equity_krw", "REALTIME_SMALL_ACCOUNT_EQUITY_KRW")):
+        merged[key] = _env_float(variable, merged[key])
+    merged["max_position_weight"] = _clamp(merged["max_position_weight"], 0.0, 1.0)
     return merged
 
 

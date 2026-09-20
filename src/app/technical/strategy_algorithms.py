@@ -33,6 +33,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -240,6 +241,11 @@ class AlgorithmDecision:
     horizon_seconds: int
     reason_codes: tuple[str, ...] = ()
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    # ``triggered`` answers only whether the strategy's market-pattern thesis fired.
+    # Cost feasibility is deliberately separate: collapsing the two erased positive
+    # gross signals from proposal/coverage telemetry and made an economic rejection
+    # look like a missing mechanical trigger.
+    cost_viable: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -251,6 +257,7 @@ class AlgorithmDecision:
             "horizon_seconds": self.horizon_seconds,
             "reason_codes": list(self.reason_codes),
             "diagnostics": dict(self.diagnostics),
+            "cost_viable": self.cost_viable,
         }
 
 
@@ -419,19 +426,25 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # the edge exceed cost by that multiple, which is the honest posture when
         # both terms are estimates: equality is a loss once either is off.
         "cost_floor_multiple": 1.0,
-        # No second safety margin here. The full round-trip cost is already
-        # charged below and the deterministic selector separately requires a
-        # strictly positive net edge. An additional buffer duplicated the same
-        # decision and suppressed otherwise profitable triggers.
+        # A merely positive forecast is not deployable once edge/cost estimates
+        # move by ordinary error. Require a meaningful net cushion at the
+        # algorithm boundary; the latest US trigger measured +0.013bp after cost.
         "min_net_buffer_bps": 0.0,
         # Escape hatch for replaying historical configs: 0 restores the old
         # constant floor. Not for making a strategy trade again — a strategy that
         # only fires below its cost floor has no edge to recover.
         "cost_aware_floor_enabled": 1.0,
+        # Volatility describes how far a symbol may travel, not the probability
+        # that this thesis gets the direction right.  The old gate compared the
+        # full volatility move with cost, so any volatile symbol could pass even
+        # with a low-confidence signal.  Scale the gross opportunity by the
+        # strategy's own point-in-time confidence before calling it expected edge.
+        "confidence_weighted_edge_enabled": 1.0,
     },
     "intraday_momentum": {
         "min_aggressor_imbalance": 0.15,
         "min_return_5s_bps": 2.0,
+        "max_return_5s_bps": 40.0,
         "horizon_seconds": 180.0,
         "stop_volatility_multiple": 1.5,
         "trailing_bps": 12.0,
@@ -440,6 +453,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
     "breakout_volume": {
         "min_volume_spike_ratio": 1.5,
         "min_breakout_excess_bps": 2.0,
+        "max_breakout_excess_bps": 35.0,
         "acceptance_return_5s_bps": 1.0,
         "min_aggressor_imbalance": 0.05,
         "horizon_seconds": 300.0,
@@ -467,6 +481,7 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
         "live_authorized": 1.0,
+        "live_probe_authorized": 0.0,
         "min_displacement_bps": 75.0,
         "max_displacement_zscore": 15.0,
         "max_rsi": 45.0,
@@ -474,7 +489,11 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "min_momentum_persistence": 0.30,
         "min_liquidity_score": 0.40,
         "max_spread_bps": 25.0,
-        "target_capture_fraction": 0.50,
+        # Non-bearish confirmation already requires a completed-bar EMA reclaim
+        # and positive MACD.  Its declared exit target is VWAP itself, so valuing
+        # only half that path understated the same trade by 50% and made every US
+        # setup fail known costs before the bounded deployment ladder could act.
+        "target_capture_fraction": 1.0,
         "stop_volatility_multiple": 2.5,
         "trailing_bps": 30.0,
         "horizon_seconds": 5400.0,
@@ -483,6 +502,24 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # base horizon, so the resolved clock stays exactly what it was before the
         # knob existed — raising it is a deliberate tuning decision, not a repair.
         "max_horizon_seconds": 5400.0,
+        # Panic-state relief reversal. In TREND_DOWN a completed-bar turn alone
+        # is not evidence that forced selling ended, so the bearish submode also
+        # requires tick recovery, buy aggression, book improvement and a spread
+        # that is no longer widening.
+        "bearish_mode_enabled": 1.0,
+        "bearish_max_market_breadth": 0.45,
+        "bearish_max_change_point_probability": 0.35,
+        "bearish_min_displacement_bps": 120.0,
+        "bearish_max_displacement_zscore": 8.0,
+        "bearish_min_recovery_return_5s_bps": 2.0,
+        "bearish_min_aggressor_imbalance": 0.05,
+        "bearish_min_book_improvement": 0.0,
+        "bearish_max_spread_change_5s": 0.0,
+        "bearish_target_capture_fraction": 0.70,
+        "bearish_stop_volatility_multiple": 1.5,
+        "bearish_trailing_bps": 25.0,
+        "bearish_horizon_seconds": 7200.0,
+        "bearish_max_horizon_seconds": 10800.0,
     },
     "range_support_reversion": {
         "enabled": 1.0,
@@ -518,14 +555,21 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "shadow_enabled": 1.0,
         "paper_enabled": 1.0,
         "live_authorized": 0.0,
-        "min_ema_separation_bps": 12.0,
-        "min_vwap_premium_bps": 8.0,
-        "min_momentum_persistence": 0.60,
-        "min_relative_volume": 1.20,
-        "min_liquidity_score": 0.50,
+        "min_ma50_slope_bps": 0.0,
+        "min_ma200_slope_bps": -0.10,
+        "min_pullback_atr": -1.00,
+        "max_pullback_atr": 0.75,
+        "min_short_return": -0.03,
+        "max_short_return": 0.006,
+        "min_rsi": 38.0,
+        "max_rsi": 72.0,
+        "min_relative_volume": 0.15,
+        "max_relative_volume": 1.25,
+        "min_liquidity_score": 0.25,
         "max_spread_bps": 35.0,
         "max_change_point_probability": 0.55,
-        "target_capture_fraction": 0.60,
+        "target_atr_multiple": 1.80,
+        "max_target_bps": 240.0,
         "stop_volatility_multiple": 2.5,
         "trailing_bps": 40.0,
         "horizon_seconds": 10800.0,
@@ -538,7 +582,9 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "min_adx": 25.0,
         "min_dmi_spread": 5.0,
         "min_supertrend_distance_bps": 0.0,
+        "max_supertrend_distance_bps": 250.0,
         "min_vwap_premium_bps": 5.0,
+        "max_vwap_premium_bps": 175.0,
         "min_relative_volume": 1.0,
         "min_momentum_persistence": 0.55,
         "min_liquidity_score": 0.45,
@@ -559,6 +605,8 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "min_adx": 20.0,
         "min_relative_volume": 1.50,
         "min_vwap_premium_bps": 5.0,
+        "max_vwap_premium_bps": 175.0,
+        "max_breakout_extension_bps": 40.0,
         "min_liquidity_score": 0.50,
         "max_spread_bps": 35.0,
         "max_change_point_probability": 0.45,
@@ -620,6 +668,23 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         "max_sector_rank": 3.0,
         "min_short_return_bps": 0.0,
         "min_aggressor_imbalance": 0.05,
+        # Long-only bear-tape submode. Raw rank is insufficient in a falling
+        # market: the name must itself be rising, low-beta and supported by
+        # completed-bar structure. A multi-hour clock gives the hypothesis a
+        # chance to cover this account's US round-trip cost.
+        "bearish_mode_enabled": 1.0,
+        "bearish_max_market_breadth": 0.45,
+        "bearish_max_market_beta": 0.90,
+        "bearish_min_absolute_return_bps": 5.0,
+        "bearish_min_vwap_premium_bps": 5.0,
+        "bearish_min_momentum_persistence": 0.55,
+        "bearish_min_relative_volume": 1.0,
+        "bearish_max_change_point_probability": 0.35,
+        "bearish_capture_fraction": 0.45,
+        "bearish_max_target_bps": 250.0,
+        "bearish_horizon_seconds": 10800.0,
+        "bearish_stop_volatility_multiple": 1.5,
+        "bearish_trailing_bps": 30.0,
         "horizon_seconds": 420.0,
         "stop_volatility_multiple": 2.0,
         "trailing_bps": 18.0,
@@ -794,9 +859,12 @@ _DEFAULTS: dict[str, dict[str, float]] = {
         # published result, not a nicety. Practitioner studies place the useful
         # threshold at 1.5-2.0x average volume; 1.5 is the permissive end.
         "min_relative_volume": 1.5,
+        "min_minutes_since_session_open": 30.0,
+        "max_minutes_since_session_open": 120.0,
         # How far past the opening-range high counts as a real break rather than a
         # wick, expressed in bps of the range width.
         "min_breakout_excess_bps": 3.0,
+        "max_breakout_excess_bps": 60.0,
         # Order flow must agree with the break; a breakout into selling is the
         # classic false break.
         "min_aggressor_imbalance": 0.05,
@@ -906,6 +974,11 @@ for _strategy_id in STRATEGY_IDS:
     _deployment.setdefault("enabled", 1.0)
     _deployment.setdefault("shadow_enabled", 1.0)
     _deployment.setdefault("paper_enabled", 1.0)
+    # Explicit, size-limited bootstrap authority.  This is deliberately separate
+    # from ``live_authorized``: the latter means LIVE_FULL and used to be the only
+    # way to obtain the first real fill, forcing a cold strategy to jump directly
+    # from shadow observations to full authority.
+    _deployment.setdefault("live_probe_authorized", 0.0)
     _deployment.setdefault("live_authorized", 0.0)
 
 
@@ -991,6 +1064,22 @@ class AlgorithmConfig:
 
     def as_dict(self) -> dict[str, dict[str, float]]:
         return {section: dict(values) for section, values in self._values.items()}
+
+
+@lru_cache(maxsize=1)
+def shared_minimum_tick_count_5s() -> int:
+    """Return the algorithms' one authoritative five-second print floor.
+
+    Candidate admission and each tick-driven strategy must read the same value.
+    Rounding upward preserves a fractional configured minimum as a real event count.
+    The process-level cache is safe because algorithm configuration is resolved at
+    startup; tests or reload tooling can clear it explicitly below.
+    """
+    return max(1, int(math.ceil(AlgorithmConfig().shared("min_tick_count_5s"))))
+
+
+def reset_algorithm_config_cache() -> None:
+    shared_minimum_tick_count_5s.cache_clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -1225,22 +1314,44 @@ class TradingAlgorithm:
         # Historical edge calibration remains recorded for analysis, but does
         # not rewrite a deterministic strategy's point-in-time edge or veto its
         # trigger. Learned estimates are auxiliary throughout the live path.
-        if edge_bps < minimum:
-            # Distinct reason code from the old constant-floor rejection: an edge
-            # that cannot cover its market's costs is a different diagnosis from
-            # one below an arbitrary threshold, and the dashboard has to be able
-            # to tell an operator which of the two happened.
+        # Break-even is not profit. The configured floor is the full buy+sell
+        # round-trip cost, so require a strict excess even when the extra buffer
+        # is zero.
+        if edge_bps <= minimum:
+            # The MARKET PATTERN fired; economics rejected it. Preserve the gross
+            # edge and trigger so proposal coverage and the diagnostic funnel can
+            # reach their dedicated cost stage. Legacy/live selection separately
+            # requires ``cost_viable`` and therefore remains fail-closed.
             below_cost = floor_diagnostics.get("floor_basis") == "round_trip_cost"
-            return self._reject(
-                (
-                    *reasons,
-                    rc.TECHNICAL_EDGE_NON_POSITIVE,
-                    "EDGE_BELOW_COST_FLOOR" if below_cost else "EDGE_BELOW_ALGORITHM_FLOOR",
+            economic_reason = (
+                "EDGE_BELOW_COST_FLOOR"
+                if below_cost
+                else "EDGE_BELOW_ALGORITHM_FLOOR"
+            )
+            edge_reasons = (
+                (*reasons, rc.TECHNICAL_EDGE_NON_POSITIVE, economic_reason)
+                if edge_bps <= 0.0
+                else (*reasons, economic_reason)
+            )
+            return AlgorithmDecision(
+                strategy_id=self.strategy_id,
+                triggered=True,
+                score=_clamp(score),
+                confidence=_clamp(confidence),
+                expected_edge_bps=max(0.0, float(edge_bps)),
+                horizon_seconds=(
+                    max(1, int(horizon_seconds))
+                    if horizon_seconds is not None
+                    else self.horizon_seconds
                 ),
-                expected_edge_bps=round(edge_bps, 3),
-                minimum_edge_bps=round(minimum, 3),
-                **floor_diagnostics,
-                **diagnostics,
+                reason_codes=tuple(dict.fromkeys(edge_reasons)),
+                diagnostics={
+                    "expected_edge_bps": round(edge_bps, 3),
+                    "minimum_edge_bps": round(minimum, 3),
+                    **floor_diagnostics,
+                    **diagnostics,
+                },
+                cost_viable=False,
             )
         return AlgorithmDecision(
             strategy_id=self.strategy_id,
@@ -1255,7 +1366,20 @@ class TradingAlgorithm:
             ),
             reason_codes=tuple(dict.fromkeys(reasons)),
             diagnostics={**floor_diagnostics, **diagnostics},
+            cost_viable=True,
         )
+
+    def _directional_edge(self, opportunity_bps: float, confidence: float) -> float:
+        """Convert an unsigned volatility opportunity into directional expectancy.
+
+        Structural targets (VWAP, range midpoint, shock retracement) already encode
+        a thesis-specific captured move and must not be discounted twice.  Call this
+        only for strategies whose raw edge is an unsigned volatility envelope.
+        """
+        raw = max(0.0, float(opportunity_bps))
+        if self.config.shared("confidence_weighted_edge_enabled") <= 0.0:
+            return raw
+        return raw * _clamp(float(confidence))
 
     def _volatility_stop(self, entry_price: float, f: TechnicalFeatureSet, multiple: float) -> float | None:
         volatility = f.realized_volatility_10s or f.realized_volatility
@@ -1282,6 +1406,11 @@ class IntradayMomentumAlgorithm(TradingAlgorithm):
         aggressor = f.aggressor_imbalance_5s or 0.0
         if return_5s_bps < self.p("min_return_5s_bps"):
             return self._reject(("MOMENTUM_TICK_RETURN_TOO_WEAK",), return_5s_bps=return_5s_bps)
+        if return_5s_bps > self.p("max_return_5s_bps"):
+            return self._reject(
+                ("MOMENTUM_MOVE_ALREADY_EXTENDED",),
+                return_5s_bps=round(return_5s_bps, 3),
+            )
         if aggressor < self.p("min_aggressor_imbalance"):
             return self._reject((rc.MOMENTUM_WEAKENED, "AGGRESSOR_FLOW_NOT_BUY_SIDE"), aggressor=aggressor)
         # Bar context is direction agreement only, not an admissibility gate.
@@ -1290,16 +1419,19 @@ class IntradayMomentumAlgorithm(TradingAlgorithm):
         if f.ema_fast is not None and f.ema_slow is not None and f.ema_fast < f.ema_slow:
             return self._reject((rc.MOMENTUM_WEAKENED, "BAR_TREND_DISAGREES"))
 
-        edge = self._volatility_edge(f)
         score = _clamp(0.5 * _clamp(aggressor) + 0.5 * _clamp(return_5s_bps / 20.0))
+        confidence = _clamp(0.4 + 0.6 * _clamp(aggressor))
+        opportunity = self._volatility_edge(f)
+        edge = self._directional_edge(opportunity, confidence)
         return self._fire(
             symbol=f.symbol,
             score=score,
-            confidence=_clamp(0.4 + 0.6 * _clamp(aggressor)),
+            confidence=confidence,
             edge_bps=edge,
             reasons=(rc.MOMENTUM_CONFIRMED, "TICK_ORDER_FLOW_CONTINUATION"),
             return_5s_bps=round(return_5s_bps, 3),
             aggressor_imbalance_5s=round(aggressor, 4),
+            raw_volatility_opportunity_bps=round(opportunity, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -1338,6 +1470,11 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
         breakout_excess_bps = float(f.breakout_strength) * 10_000.0
         if breakout_excess_bps < self.p("min_breakout_excess_bps"):
             return self._reject(("PRICE_BELOW_BREAKOUT_LEVEL",), breakout_strength=f.breakout_strength)
+        if breakout_excess_bps > self.p("max_breakout_excess_bps"):
+            return self._reject(
+                (rc.FALSE_BREAKOUT_RISK_HIGH, "BREAKOUT_ENTRY_TOO_EXTENDED"),
+                breakout_excess_bps=round(breakout_excess_bps, 3),
+            )
         volume_ratio = f.volume_spike_ratio
         if volume_ratio is None or volume_ratio < self.p("min_volume_spike_ratio"):
             return self._reject((rc.VOLUME_CONFIRMATION_MISSING,), volume_spike_ratio=volume_ratio)
@@ -1357,12 +1494,18 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
         if aggressor is None or aggressor < self.p("min_aggressor_imbalance"):
             return self._reject((rc.FALSE_BREAKOUT_RISK_HIGH, "BREAKOUT_NOT_FLOW_CONFIRMED"))
 
-        edge = self._volatility_edge(f)
         score = _clamp(0.5 * _clamp(volume_ratio / 3.0) + 0.5 * _clamp(aggressor))
+        confidence = _clamp(
+            0.35
+            + 0.4 * _clamp(volume_ratio / 3.0)
+            + 0.25 * _clamp(aggressor)
+        )
+        opportunity = self._volatility_edge(f)
+        edge = self._directional_edge(opportunity, confidence)
         return self._fire(
             symbol=f.symbol,
             score=score,
-            confidence=_clamp(0.35 + 0.4 * _clamp(volume_ratio / 3.0) + 0.25 * _clamp(aggressor)),
+            confidence=confidence,
             edge_bps=edge,
             reasons=(rc.BREAKOUT_CONFIRMED, "BREAKOUT_ACCEPTED_ON_TICKS"),
             donchian_high=f.donchian_high,
@@ -1370,6 +1513,7 @@ class BreakoutVolumeAlgorithm(TradingAlgorithm):
             return_5s_bps=round(return_5s_bps, 3),
             volume_spike_ratio=volume_ratio,
             aggressor_imbalance_5s=round(aggressor, 4),
+            raw_volatility_opportunity_bps=round(opportunity, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -1523,7 +1667,29 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
     strategy_id = "bar_confirmed_vwap_recovery"
     thesis = "a deep VWAP dislocation recovers after the completed one-minute trend turns"
 
+    @staticmethod
+    def _bearish_mode(context: ElectionContext) -> bool:
+        regime = str(context.market_trend or "").strip().upper()
+        if regime in {
+            "TREND_DOWN",
+            "HIGH_VOL_TRENDING_DOWN",
+            "STRONG_TREND_DOWN",
+            "BEAR",
+            "RISK_OFF",
+        }:
+            return True
+        # The macro ontology intentionally represents high-volatility direction
+        # and breadth separately.  HIGH_VOL_TRENDING therefore has no _UP/_DOWN
+        # suffix; weak breadth is the causal fact that makes this the bearish arm.
+        return regime in {"HIGH_VOL_TRENDING", "HIGH_VOL_MEAN_REVERTING"} and (
+            context.market_breadth is not None
+            and float(context.market_breadth) <= 0.45
+        )
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        bearish = self._bearish_mode(context)
+        if bearish and self.p("bearish_mode_enabled") < 1.0:
+            return self._reject(("BEAR_MARKET_RELIEF_MODE_DISABLED",))
         required = (
             f.price,
             f.vwap,
@@ -1540,7 +1706,12 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
             return self._reject(("BAR_VWAP_RECOVERY_INPUTS_MISSING",))
 
         displacement = float(f.vwap_distance_bps)
-        if displacement > -self.p("min_displacement_bps"):
+        minimum_displacement = (
+            self.p("bearish_min_displacement_bps")
+            if bearish
+            else self.p("min_displacement_bps")
+        )
+        if displacement > -minimum_displacement:
             return self._reject(
                 ("BAR_VWAP_DISPLACEMENT_TOO_SMALL",),
                 vwap_distance_bps=round(displacement, 3),
@@ -1548,7 +1719,12 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
         zscore = f.vwap_zscore
         if zscore is None:
             return self._reject(("BAR_VWAP_VOLATILITY_SCALE_MISSING",))
-        if abs(zscore) > self.p("max_displacement_zscore"):
+        maximum_zscore = (
+            self.p("bearish_max_displacement_zscore")
+            if bearish
+            else self.p("max_displacement_zscore")
+        )
+        if abs(zscore) > maximum_zscore:
             return self._reject(
                 ("BAR_VWAP_DISLOCATION_TOO_EXTREME",),
                 vwap_zscore=round(zscore, 3),
@@ -1556,8 +1732,54 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
         if float(f.rsi) > self.p("max_rsi"):
             return self._reject(("BAR_VWAP_NOT_OVERSOLD",), rsi=round(float(f.rsi), 3))
 
-        # The completed-bar turn is the entry clock. No 1s/5s return, tick count,
-        # aggressor flow, or order-book delta participates in this decision.
+        # In a falling market this is a liquidity-provision hypothesis, not a
+        # generic dip buy. Require the panic state to be measurable and stable,
+        # then require price, trades, depth and spread to agree that forced
+        # selling is being absorbed. Missing evidence fails closed.
+        if bearish:
+            breadth = context.market_breadth
+            if breadth is None:
+                return self._reject(("BEAR_MARKET_BREADTH_ABSENT",))
+            if float(breadth) > self.p("bearish_max_market_breadth"):
+                return self._reject(
+                    ("BEAR_MARKET_BREADTH_NOT_WEAK",), market_breadth=breadth
+                )
+            change_point = context.change_point_probability
+            if (
+                change_point is not None
+                and float(change_point)
+                > self.p("bearish_max_change_point_probability")
+            ):
+                return self._reject(
+                    ("BEAR_MARKET_RELIEF_REGIME_UNSTABLE",),
+                    change_point_probability=change_point,
+                )
+            ready, reasons = self._tick_ready(f)
+            if not ready:
+                return self._reject(("BEAR_RELIEF_TICK_CONFIRMATION_MISSING", *reasons))
+            if not _present(
+                f.return_5s,
+                f.aggressor_imbalance_5s,
+                f.orderbook_imbalance_change_5s,
+                f.spread_change_5s,
+            ):
+                return self._reject(("BEAR_RELIEF_MICROSTRUCTURE_INPUTS_MISSING",))
+            recovery_bps = float(f.return_5s) * 10_000.0
+            if recovery_bps < self.p("bearish_min_recovery_return_5s_bps"):
+                return self._reject(
+                    ("BEAR_RELIEF_PRICE_NOT_RECOVERING",),
+                    recovery_return_5s_bps=round(recovery_bps, 3),
+                )
+            if float(f.aggressor_imbalance_5s) < self.p("bearish_min_aggressor_imbalance"):
+                return self._reject(("BEAR_RELIEF_BUY_FLOW_NOT_CONFIRMED",))
+            if float(f.orderbook_imbalance_change_5s) < self.p("bearish_min_book_improvement"):
+                return self._reject(("BEAR_RELIEF_BOOK_NOT_IMPROVING",))
+            if float(f.spread_change_5s) > self.p("bearish_max_spread_change_5s"):
+                return self._reject(("BEAR_RELIEF_SPREAD_STILL_WIDENING",))
+
+        # The completed-bar turn is the primary entry clock.  Outside a bearish
+        # tape it does not depend on sub-second data; the bear-relief submode above
+        # additionally requires observed trade, book and spread normalisation.
         if float(f.price) < float(f.ema_fast):
             return self._reject(
                 ("BAR_VWAP_FAST_EMA_NOT_RECLAIMED",),
@@ -1585,8 +1807,21 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
                 spread_bps=round(float(f.spread_bps), 3),
             )
 
-        edge = abs(displacement) * self.p("target_capture_fraction")
-        score = _clamp(abs(zscore) / self.p("max_displacement_zscore"))
+        capture = (
+            self.p("bearish_target_capture_fraction")
+            if bearish
+            else self.p("target_capture_fraction")
+        )
+        edge = abs(displacement) * capture
+        score = _clamp(abs(zscore) / maximum_zscore)
+        horizon = self._horizon_for_structural_edge(
+            f,
+            edge,
+            int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds,
+            int(self.p("bearish_max_horizon_seconds"))
+            if bearish
+            else int(self.p("max_horizon_seconds")),
+        )
         return self._fire(
             symbol=f.symbol,
             score=score,
@@ -1597,41 +1832,64 @@ class BarConfirmedVwapRecoveryAlgorithm(TradingAlgorithm):
                 + 0.20 * float(f.liquidity_score)
             ),
             edge_bps=edge,
-            reasons=("BAR_CONFIRMED_VWAP_RECOVERY", "COMPLETED_MINUTE_TREND_TURNED"),
+            horizon_seconds=horizon,
+            reasons=(
+                "BAR_CONFIRMED_VWAP_RECOVERY",
+                "COMPLETED_MINUTE_TREND_TURNED",
+                *(("BEAR_MARKET_RELIEF_REVERSAL",) if bearish else ()),
+            ),
             vwap_distance_bps=round(displacement, 3),
             vwap_zscore=round(zscore, 3),
-            target_capture_fraction=self.p("target_capture_fraction"),
+            target_capture_fraction=capture,
             price=round(float(f.price), 6),
             ema_fast=round(float(f.ema_fast), 6),
             macd_histogram=round(float(f.macd_histogram), 8),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
+        bearish = self._bearish_mode(context)
+        capture = (
+            self.p("bearish_target_capture_fraction")
+            if bearish
+            else self.p("target_capture_fraction")
+        )
         target = (
             entry_price
-            + self.p("target_capture_fraction") * (float(f.vwap) - entry_price)
+            + capture * (float(f.vwap) - entry_price)
             if f.vwap is not None and f.vwap > entry_price
             else None
         )
         # Same capture fraction the entry sized its edge with; ``exit_rule`` had no
         # such local and raised NameError for every elected position.
-        edge = abs(float(f.vwap_distance_bps or 0.0)) * self.p("target_capture_fraction")
+        edge = abs(float(f.vwap_distance_bps or 0.0)) * capture
         horizon = self._horizon_for_structural_edge(
             f,
             edge,
-            self.horizon_seconds,
-            int(self.p("max_horizon_seconds")),
+            int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds,
+            int(self.p("bearish_max_horizon_seconds"))
+            if bearish
+            else int(self.p("max_horizon_seconds")),
         )
         return ExitRule(
             strategy_id=self.strategy_id,
             stop_price=self._volatility_stop(
-                entry_price, f, self.p("stop_volatility_multiple")
+                entry_price,
+                f,
+                self.p("bearish_stop_volatility_multiple")
+                if bearish
+                else self.p("stop_volatility_multiple"),
             ),
             target_price=target,
-            trailing_bps=self.p("trailing_bps"),
+            trailing_bps=(
+                self.p("bearish_trailing_bps") if bearish else self.p("trailing_bps")
+            ),
             max_holding_seconds=horizon,
             stop_basis="completed_bar_volatility_multiple",
-            target_basis="partial_recovery_to_session_vwap",
+            target_basis=(
+                "bear_relief_partial_recovery_to_session_vwap"
+                if bearish
+                else "partial_recovery_to_session_vwap"
+            ),
         )
 
     def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
@@ -1925,7 +2183,62 @@ class CrossSectionalRelativeStrengthAlgorithm(TradingAlgorithm):
     strategy_id = "cross_sectional_relative_strength"
     thesis = "the strongest name in a supportive sector keeps outperforming"
 
+    @staticmethod
+    def _bearish_mode(context: ElectionContext) -> bool:
+        regime = str(context.market_trend or "").strip().upper()
+        if regime in {
+            "TREND_DOWN",
+            "HIGH_VOL_TRENDING_DOWN",
+            "STRONG_TREND_DOWN",
+            "BEAR",
+            "RISK_OFF",
+        }:
+            return True
+        return regime in {"HIGH_VOL_TRENDING", "HIGH_VOL_MEAN_REVERTING"} and (
+            context.market_breadth is not None
+            and float(context.market_breadth) <= 0.45
+        )
+
+    def _rank_confidence(
+        self,
+        f: TechnicalFeatureSet,
+        context: ElectionContext,
+        short_return_bps: float,
+    ) -> tuple[float, float]:
+        rank = int(context.sector_rank or 1)
+        universe = max(2, int(context.sector_candidate_count or 2))
+        relative_volume = max(0.0, float(f.relative_volume or 0.0))
+        rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
+        score = _clamp(
+            0.6 * rank_score + 0.4 * _clamp(short_return_bps / 30.0)
+        )
+        confidence = _clamp(
+            0.3 + 0.4 * rank_score + 0.15 * _clamp(relative_volume / 3.0)
+        )
+        return score, confidence
+
+    def _bearish_edge(
+        self, f: TechnicalFeatureSet, context: ElectionContext
+    ) -> float:
+        short_return_bps = float(f.short_return or 0.0) * 10_000.0
+        _score, confidence = self._rank_confidence(f, context, short_return_bps)
+        volatility = f.realized_volatility or f.realized_volatility_10s
+        window_seconds = 60 if f.realized_volatility else 10
+        opportunity = min(
+            self.p("bearish_max_target_bps"),
+            tick_expected_move_bps(
+                volatility,
+                int(self.p("bearish_horizon_seconds")),
+                window_seconds=window_seconds,
+                capture_fraction=self.p("bearish_capture_fraction"),
+            ),
+        )
+        return self._directional_edge(opportunity, confidence)
+
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
+        bearish = self._bearish_mode(context)
+        if bearish and self.p("bearish_mode_enabled") < 1.0:
+            return self._reject(("BEAR_MARKET_CROSS_SECTIONAL_MODE_DISABLED",))
         rank = context.sector_rank
         universe = context.sector_candidate_count
         if rank is None or universe is None or universe <= 1:
@@ -1942,27 +2255,113 @@ class CrossSectionalRelativeStrengthAlgorithm(TradingAlgorithm):
         ):
             return self._reject(("RELATIVE_STRENGTH_FLOW_NOT_CONFIRMED",))
 
-        edge = self._volatility_edge(f)
-        rank_score = _clamp(1.0 - (rank - 1) / max(1, universe - 1))
+        if bearish:
+            breadth = context.market_breadth
+            if breadth is None:
+                return self._reject(("BEAR_MARKET_BREADTH_ABSENT",))
+            if float(breadth) > self.p("bearish_max_market_breadth"):
+                return self._reject(
+                    ("BEAR_MARKET_BREADTH_NOT_WEAK",), market_breadth=breadth
+                )
+            beta = context.market_beta
+            if beta is None:
+                return self._reject(("BEAR_MARKET_BETA_ABSENT",))
+            if float(beta) > self.p("bearish_max_market_beta"):
+                return self._reject(
+                    ("BEAR_MARKET_BETA_TOO_HIGH",), market_beta=beta
+                )
+            change_point = context.change_point_probability
+            if (
+                change_point is not None
+                and float(change_point)
+                > self.p("bearish_max_change_point_probability")
+            ):
+                return self._reject(
+                    ("BEAR_MARKET_REGIME_UNSTABLE",),
+                    change_point_probability=change_point,
+                )
+            if short_return_bps < self.p("bearish_min_absolute_return_bps"):
+                return self._reject(
+                    ("BEAR_MARKET_ABSOLUTE_STRENGTH_MISSING",),
+                    absolute_return_bps=round(short_return_bps, 3),
+                )
+            if (
+                f.vwap_distance_bps is None
+                or float(f.vwap_distance_bps)
+                < self.p("bearish_min_vwap_premium_bps")
+            ):
+                return self._reject(("BEAR_MARKET_PRICE_NOT_ABOVE_VWAP",))
+            if not _present(f.ema_fast, f.ema_slow) or float(f.ema_fast) <= float(f.ema_slow):
+                return self._reject(("BEAR_MARKET_COMPLETED_BAR_TREND_NOT_POSITIVE",))
+            if (
+                f.momentum_persistence is None
+                or float(f.momentum_persistence)
+                < self.p("bearish_min_momentum_persistence")
+            ):
+                return self._reject(("BEAR_MARKET_MOMENTUM_NOT_PERSISTENT",))
+            if (
+                f.relative_volume is None
+                or float(f.relative_volume) < self.p("bearish_min_relative_volume")
+            ):
+                return self._reject(("BEAR_MARKET_VOLUME_NOT_CONFIRMED",))
+
+        # Relative volume strengthens confidence but is not a hard prerequisite for
+        # this slow cross-sectional thesis. The previous implementation referenced
+        # an undefined local here, raising NameError exactly for the top-ranked names.
+        score, confidence = self._rank_confidence(f, context, short_return_bps)
+        edge = (
+            self._bearish_edge(f, context)
+            if bearish
+            else self._directional_edge(self._volatility_edge(f), confidence)
+        )
+        horizon = (
+            int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds
+        )
         return self._fire(
             symbol=f.symbol,
-            score=_clamp(0.6 * rank_score + 0.4 * _clamp(short_return_bps / 30.0)),
-            confidence=_clamp(0.3 + 0.5 * rank_score),
+            score=score,
+            confidence=confidence,
             edge_bps=edge,
-            reasons=("CROSS_SECTIONAL_LEADER", "RELATIVE_STRENGTH_CONFIRMED"),
+            horizon_seconds=horizon,
+            reasons=(
+                "CROSS_SECTIONAL_LEADER",
+                "RELATIVE_STRENGTH_CONFIRMED",
+                *(
+                    ("BEAR_MARKET_CROSS_SECTIONAL_DEFENSIVE_STRENGTH",)
+                    if bearish
+                    else ()
+                ),
+            ),
             sector_rank=rank,
             sector_candidate_count=universe,
+            market_beta=context.market_beta,
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
+        bearish = self._bearish_mode(context)
+        edge = self._bearish_edge(f, context) if bearish else self._volatility_edge(f)
         return ExitRule(
             strategy_id=self.strategy_id,
-            stop_price=self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
-            target_price=entry_price * (1.0 + self._volatility_edge(f) / 10_000.0),
-            trailing_bps=self.p("trailing_bps"),
-            max_holding_seconds=self.horizon_seconds,
+            stop_price=self._volatility_stop(
+                entry_price,
+                f,
+                self.p("bearish_stop_volatility_multiple")
+                if bearish
+                else self.p("stop_volatility_multiple"),
+            ),
+            target_price=entry_price * (1.0 + edge / 10_000.0),
+            trailing_bps=(
+                self.p("bearish_trailing_bps") if bearish else self.p("trailing_bps")
+            ),
+            max_holding_seconds=(
+                int(self.p("bearish_horizon_seconds")) if bearish else self.horizon_seconds
+            ),
             stop_basis="tick_volatility_multiple",
-            target_basis="tick_volatility_expected_move",
+            target_basis=(
+                "bear_defensive_expected_move"
+                if bearish
+                else "tick_volatility_expected_move"
+            ),
         )
 
     def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
@@ -2255,10 +2654,19 @@ class ResidualRelativeStrengthAlgorithm(TradingAlgorithm):
 
     @staticmethod
     def _bearish_mode(context: ElectionContext) -> bool:
-        return str(context.market_trend or "").strip().upper() in {
+        regime = str(context.market_trend or "").strip().upper()
+        if regime in {
             "TREND_DOWN",
             "HIGH_VOL_TRENDING_DOWN",
-        }
+            "STRONG_TREND_DOWN",
+            "BEAR",
+            "RISK_OFF",
+        }:
+            return True
+        return regime in {"HIGH_VOL_TRENDING", "HIGH_VOL_MEAN_REVERTING"} and (
+            context.market_breadth is not None
+            and float(context.market_breadth) <= 0.45
+        )
 
     def _bearish_edge(self, f: TechnicalFeatureSet) -> float:
         volatility = f.realized_volatility or f.realized_volatility_10s
@@ -2765,6 +3173,19 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
                 minimum=self.p("min_relative_volume"),
             )
 
+        elapsed = context.minutes_since_session_open
+        if elapsed is None:
+            return self._reject(("ORB_SESSION_CLOCK_ABSENT",))
+        if not (
+            self.p("min_minutes_since_session_open")
+            <= elapsed
+            <= self.p("max_minutes_since_session_open")
+        ):
+            return self._reject(
+                ("ORB_OUTSIDE_ENTRY_WINDOW",),
+                minutes_since_session_open=round(float(elapsed), 3),
+            )
+
         span = high - low
         excess_bps = (price - high) / span * 10_000.0
         if excess_bps < self.p("min_breakout_excess_bps"):
@@ -2772,6 +3193,11 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
                 ("ORB_RANGE_NOT_CLEARED",),
                 excess_bps=round(excess_bps, 3),
                 opening_range_high=high,
+            )
+        if excess_bps > self.p("max_breakout_excess_bps"):
+            return self._reject(
+                ("ORB_ENTRY_TOO_EXTENDED",),
+                excess_bps=round(excess_bps, 3),
             )
         if f.tick_data_ready and self._below_minimum(
             f.aggressor_imbalance_5s, self.p("min_aggressor_imbalance")
@@ -2785,22 +3211,32 @@ class OpeningRangeBreakoutAlgorithm(TradingAlgorithm):
                 ("ORB_STRUCTURAL_BREAK",), change_point_probability=change_point
             )
 
-        edge = self._volatility_edge(f)
+        breakout_strength = _clamp(
+            excess_bps / max(self.p("max_breakout_excess_bps"), 1.0)
+        )
+        flow_strength = _clamp(max(0.0, float(f.aggressor_imbalance_5s or 0.0)))
+        volume_strength = _clamp(float(relative_volume) / 3.0)
+        score = _clamp(
+            0.45 * breakout_strength
+            + 0.35 * volume_strength
+            + 0.20 * flow_strength
+        )
+        confidence = _clamp(0.30 + 0.50 * score + 0.15 * volume_strength)
+        opportunity = self._volatility_edge(f)
+        edge = self._directional_edge(opportunity, confidence)
         # A wider opening range is a stronger in-play signal, but it also means a
-        # wider stop; the score reflects flow agreement and RVOL, not range width.
+        # wider stop; the score reflects breakout quality, flow agreement and RVOL.
         return self._fire(
             symbol=f.symbol,
-            score=_clamp(
-                0.5 * _clamp(relative_volume / 3.0)
-                + 0.5 * _clamp((f.aggressor_imbalance_5s or 0.0) + 0.5)
-            ),
-            confidence=_clamp(0.3 + 0.4 * _clamp(relative_volume / 3.0)),
+            score=score,
+            confidence=confidence,
             edge_bps=edge,
             reasons=("ORB_RANGE_CLEARED_IN_PLAY",),
             relative_volume=relative_volume,
             excess_bps=round(excess_bps, 3),
             opening_range_high=high,
             opening_range_low=low,
+            raw_volatility_opportunity_bps=round(opportunity, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -3669,44 +4105,70 @@ class RangeSupportReversionAlgorithm(TradingAlgorithm):
 
 
 class BarTrendContinuationAlgorithm(TradingAlgorithm):
-    """Multi-hour continuation using completed one-minute bars only.
+    """Trend pullback on completed bars (legacy id retained for compatibility).
 
-    This is the coverage strategy for sparse pre/after-market tapes. It never
-    substitutes quote changes for trades and never requires a 1s/5s window.
+    The old rule bought persistent, high-volume strength above VWAP, which made
+    it a late continuation/chasing strategy.  This version separates *what* to
+    trade (20/50/200 MA structure and long-ex-recent momentum) from *when* to
+    enter (a quiet retracement to MA20 with RSI/MACD confirmation).  It remains
+    shadow-only until version-scoped after-cost evidence earns promotion.
     """
 
     strategy_id = "bar_trend_continuation"
-    thesis = "persistent minute-bar strength above VWAP continues over a multi-hour horizon"
+    thesis = "an established 20/50/200-bar uptrend resumes after a low-volume pullback"
 
     def entry(self, f: TechnicalFeatureSet, context: ElectionContext) -> AlgorithmDecision:
         if not _present(
             f.price,
-            f.ema_fast,
-            f.ema_slow,
+            f.ma20,
+            f.ma50,
+            f.ma200,
+            f.ma50_slope_bps,
+            f.ma200_slope_bps,
             f.macd_histogram,
-            f.vwap_distance_bps,
-            f.momentum_persistence,
+            f.short_return,
+            f.rsi,
             f.relative_volume,
             f.atr_pct,
             f.liquidity_score,
             f.spread_bps,
         ):
-            return self._reject(("BAR_TREND_INPUTS_MISSING",))
+            return self._reject(("TREND_PULLBACK_INPUTS_MISSING",))
 
         price = float(f.price)
-        ema_fast = float(f.ema_fast)
-        ema_slow = float(f.ema_slow)
-        separation_bps = (ema_fast / max(1e-9, ema_slow) - 1.0) * 10_000.0
-        if separation_bps < self.p("min_ema_separation_bps"):
-            return self._reject(("BAR_TREND_EMA_SEPARATION_WEAK",), ema_separation_bps=separation_bps)
-        if price < ema_fast or float(f.macd_histogram) <= 0.0:
-            return self._reject(("BAR_TREND_DIRECTION_NOT_CONFIRMED",))
-        if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
-            return self._reject(("BAR_TREND_NOT_ABOVE_VWAP",), vwap_distance_bps=f.vwap_distance_bps)
-        if float(f.momentum_persistence) < self.p("min_momentum_persistence"):
-            return self._reject(("BAR_TREND_NOT_PERSISTENT",), momentum_persistence=f.momentum_persistence)
-        if float(f.relative_volume) < self.p("min_relative_volume"):
-            return self._reject(("BAR_TREND_VOLUME_NOT_CONFIRMED",), relative_volume=f.relative_volume)
+        ma20, ma50, ma200 = float(f.ma20), float(f.ma50), float(f.ma200)
+        if not (ma20 > ma50 > ma200):
+            return self._reject(("TREND_PULLBACK_MA_STRUCTURE_NOT_BULLISH",))
+        if (
+            float(f.ma50_slope_bps) <= self.p("min_ma50_slope_bps")
+            or float(f.ma200_slope_bps) <= self.p("min_ma200_slope_bps")
+        ):
+            return self._reject(
+                ("TREND_PULLBACK_LONG_TREND_NOT_RISING",),
+                ma50_slope_bps=f.ma50_slope_bps,
+                ma200_slope_bps=f.ma200_slope_bps,
+            )
+        if float(f.macd_histogram) <= 0.0:
+            return self._reject(("TREND_PULLBACK_MACD_NOT_CONFIRMED",))
+        atr_price = max(1e-9, price * float(f.atr_pct))
+        pullback_atr = (price - ma20) / atr_price
+        if not self.p("min_pullback_atr") <= pullback_atr <= self.p("max_pullback_atr"):
+            return self._reject(
+                ("TREND_PULLBACK_NOT_NEAR_MA20",),
+                pullback_atr=round(pullback_atr, 4),
+            )
+        short_return = float(f.short_return)
+        if not self.p("min_short_return") <= short_return <= self.p("max_short_return"):
+            return self._reject(("TREND_PULLBACK_RETRACE_OUT_OF_RANGE",), short_return=short_return)
+        rsi = float(f.rsi)
+        if not self.p("min_rsi") <= rsi <= self.p("max_rsi"):
+            return self._reject(("TREND_PULLBACK_RSI_OUT_OF_RANGE",), rsi=rsi)
+        relative_volume = float(f.relative_volume)
+        if not self.p("min_relative_volume") <= relative_volume <= self.p("max_relative_volume"):
+            return self._reject(
+                ("TREND_PULLBACK_VOLUME_NOT_CONTRACTING",),
+                relative_volume=relative_volume,
+            )
         if float(f.liquidity_score) < self.p("min_liquidity_score"):
             return self._reject(("BAR_TREND_LIQUIDITY_TOO_LOW",), liquidity_score=f.liquidity_score)
         if float(f.spread_bps) > self.p("max_spread_bps"):
@@ -3715,44 +4177,64 @@ class BarTrendContinuationAlgorithm(TradingAlgorithm):
         if change_point is not None and change_point > self.p("max_change_point_probability"):
             return self._reject(("BAR_TREND_STRUCTURAL_BREAK",), change_point_probability=change_point)
 
-        horizon_minutes = max(1.0, self.horizon_seconds / 60.0)
-        attainable_bps = float(f.atr_pct) * math.sqrt(horizon_minutes) * 10_000.0
-        edge = attainable_bps * self.p("target_capture_fraction")
-        score = _clamp(
-            0.30 * _clamp(separation_bps / 50.0)
-            + 0.25 * _clamp((float(f.momentum_persistence) - 0.5) * 2.0)
-            + 0.25 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
-            + 0.20 * float(f.liquidity_score)
+        structural_bps = (
+            max(0.0, (float(f.donchian_high) / price - 1.0) * 10_000.0)
+            if f.donchian_high is not None and float(f.donchian_high) > price
+            else 0.0
         )
+        atr_target_bps = float(f.atr_pct) * self.p("target_atr_multiple") * 10_000.0
+        opportunity_bps = min(
+            self.p("max_target_bps"), max(structural_bps, atr_target_bps)
+        )
+        trend_quality = _clamp(
+            (float(f.ma50_slope_bps) + float(f.ma200_slope_bps)) / 40.0
+        )
+        score = _clamp(
+            0.30 * trend_quality
+            + 0.25 * _clamp(1.0 - abs(pullback_atr) / 0.75)
+            + 0.20 * _clamp(1.0 - relative_volume / max(0.01, self.p("max_relative_volume")))
+            + 0.25 * float(f.liquidity_score)
+        )
+        confidence = _clamp(
+            0.30 + 0.45 * score + 0.20 * float(f.liquidity_score)
+        )
+        edge = self._directional_edge(opportunity_bps, confidence)
         return self._fire(
             symbol=f.symbol,
             score=score,
-            confidence=_clamp(0.30 + 0.45 * score + 0.20 * float(f.liquidity_score)),
+            confidence=confidence,
             edge_bps=edge,
-            reasons=("BAR_TREND_CONTINUATION", "COMPLETED_MINUTE_TREND_CONFIRMED"),
-            ema_separation_bps=round(separation_bps, 3),
-            vwap_distance_bps=round(float(f.vwap_distance_bps), 3),
-            relative_volume=round(float(f.relative_volume), 3),
-            attainable_bps=round(attainable_bps, 3),
+            reasons=("TREND_PULLBACK_READY", "COMPLETED_BAR_PULLBACK_CONFIRMED"),
+            pullback_atr=round(pullback_atr, 4),
+            relative_volume=round(relative_volume, 3),
+            ma50_slope_bps=round(float(f.ma50_slope_bps), 3),
+            ma200_slope_bps=round(float(f.ma200_slope_bps), 3),
+            structural_target_bps=round(structural_bps, 3),
+            raw_opportunity_bps=round(opportunity_bps, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
-        edge = float(f.atr_pct or 0.0) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
+        edge = min(
+            self.p("max_target_bps"),
+            float(f.atr_pct or 0.0) * self.p("target_atr_multiple") * 10_000.0,
+        )
         return ExitRule(
             strategy_id=self.strategy_id,
             stop_price=self._volatility_stop(entry_price, f, self.p("stop_volatility_multiple")),
-            target_price=entry_price * (1.0 + edge * self.p("target_capture_fraction") / 10_000.0),
+            target_price=entry_price * (1.0 + edge / 10_000.0),
             trailing_bps=self.p("trailing_bps"),
             max_holding_seconds=self.horizon_seconds,
             stop_basis="completed_bar_volatility_multiple",
-            target_basis="multi_hour_bar_volatility_move",
+            target_basis="pullback_atr_recovery",
         )
 
     def invalidation(self, f, context, *, entry_price=None) -> tuple[str, ...]:
-        if f.ema_fast is not None and f.ema_slow is not None and f.ema_fast <= f.ema_slow:
-            return ("BAR_TREND_EMA_CROSSED_DOWN",)
+        if f.ma20 is not None and f.ma50 is not None and f.ma20 <= f.ma50:
+            return ("TREND_PULLBACK_MA20_CROSSED_DOWN",)
+        if f.price is not None and f.ma50 is not None and f.price < f.ma50:
+            return ("TREND_PULLBACK_PRICE_LOST_MA50",)
         if f.macd_histogram is not None and f.macd_histogram < 0:
-            return ("BAR_TREND_MACD_REVERSED",)
+            return ("TREND_PULLBACK_MACD_REVERSED",)
         return ()
 
 
@@ -3777,8 +4259,18 @@ class SupertrendDmiContinuationAlgorithm(TradingAlgorithm):
             return self._reject(("SUPER_DMI_TREND_STRENGTH_LOW",), adx=f.adx, dmi_spread=f.dmi_spread)
         if float(f.supertrend_distance_bps) < self.p("min_supertrend_distance_bps"):
             return self._reject(("SUPER_DMI_PRICE_BELOW_TREND_LINE",))
+        if float(f.supertrend_distance_bps) > self.p("max_supertrend_distance_bps"):
+            return self._reject(
+                ("SUPER_DMI_ENTRY_TOO_EXTENDED",),
+                supertrend_distance_bps=f.supertrend_distance_bps,
+            )
         if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
             return self._reject(("SUPER_DMI_VWAP_NOT_CONFIRMED",))
+        if float(f.vwap_distance_bps) > self.p("max_vwap_premium_bps"):
+            return self._reject(
+                ("SUPER_DMI_VWAP_EXTENSION_TOO_HIGH",),
+                vwap_distance_bps=f.vwap_distance_bps,
+            )
         if float(f.relative_volume) < self.p("min_relative_volume"):
             return self._reject(("SUPER_DMI_VOLUME_NOT_CONFIRMED",))
         if float(f.momentum_persistence) < self.p("min_momentum_persistence"):
@@ -3788,18 +4280,21 @@ class SupertrendDmiContinuationAlgorithm(TradingAlgorithm):
         if context.change_point_probability is not None and context.change_point_probability > self.p("max_change_point_probability"):
             return self._reject(("SUPER_DMI_STRUCTURAL_BREAK",))
         attainable = float(f.atr_pct) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
-        edge = attainable * self.p("target_capture_fraction")
         score = _clamp(
             0.35 * _clamp((float(f.adx) - self.p("min_adx")) / 25.0)
             + 0.25 * _clamp(float(f.dmi_spread) / 30.0)
             + 0.20 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
             + 0.20 * _clamp((float(f.momentum_persistence) - 0.5) * 2.0)
         )
+        confidence = _clamp(0.35 + 0.5 * score)
+        raw_opportunity = attainable * self.p("target_capture_fraction")
+        edge = self._directional_edge(raw_opportunity, confidence)
         return self._fire(
-            symbol=f.symbol, score=score, confidence=_clamp(0.35 + 0.5 * score),
+            symbol=f.symbol, score=score, confidence=confidence,
             edge_bps=edge, reasons=("SUPERTREND_UP", "DMI_ADX_TREND_CONFIRMED"),
             adx=round(float(f.adx), 3), dmi_spread=round(float(f.dmi_spread), 3),
             relative_volume=round(float(f.relative_volume), 3),
+            raw_volatility_opportunity_bps=round(raw_opportunity, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -3840,6 +4335,14 @@ class KeltnerVolatilityBreakoutAlgorithm(TradingAlgorithm):
             return self._reject(("KELTNER_PRIOR_COMPRESSION_MISSING",), squeeze_ratio=squeeze_ratio)
         if float(f.price) <= float(f.keltner_upper):
             return self._reject(("KELTNER_UPPER_BAND_NOT_BROKEN",))
+        breakout_extension_bps = (
+            float(f.price) / max(1e-9, float(f.keltner_upper)) - 1.0
+        ) * 10_000.0
+        if breakout_extension_bps > self.p("max_breakout_extension_bps"):
+            return self._reject(
+                ("KELTNER_ENTRY_TOO_EXTENDED",),
+                breakout_extension_bps=round(breakout_extension_bps, 3),
+            )
         if float(f.volatility_expansion) < self.p("min_volatility_expansion"):
             return self._reject(("KELTNER_VOLATILITY_NOT_EXPANDING",))
         if float(f.adx) < self.p("min_adx") or float(f.dmi_spread) <= 0:
@@ -3848,23 +4351,32 @@ class KeltnerVolatilityBreakoutAlgorithm(TradingAlgorithm):
             return self._reject(("KELTNER_RELATIVE_VOLUME_LOW",))
         if float(f.vwap_distance_bps) < self.p("min_vwap_premium_bps"):
             return self._reject(("KELTNER_VWAP_NOT_CONFIRMED",))
+        if float(f.vwap_distance_bps) > self.p("max_vwap_premium_bps"):
+            return self._reject(
+                ("KELTNER_VWAP_EXTENSION_TOO_HIGH",),
+                vwap_distance_bps=f.vwap_distance_bps,
+            )
         if float(f.liquidity_score) < self.p("min_liquidity_score") or float(f.spread_bps) > self.p("max_spread_bps"):
             return self._reject(("KELTNER_EXECUTION_QUALITY_LOW",))
         if context.change_point_probability is not None and context.change_point_probability > self.p("max_change_point_probability"):
             return self._reject(("KELTNER_STRUCTURAL_BREAK",))
         attainable = float(f.atr_pct) * math.sqrt(max(1.0, self.horizon_seconds / 60.0)) * 10_000.0
-        edge = attainable * self.p("target_capture_fraction")
         score = _clamp(
             0.30 * _clamp((float(f.relative_volume) - 1.0) / 2.0)
             + 0.25 * _clamp((float(f.volatility_expansion) - 1.0) / 2.0)
             + 0.25 * _clamp(float(f.adx) / 50.0)
             + 0.20 * _clamp(float(f.dmi_spread) / 30.0)
         )
+        confidence = _clamp(0.30 + 0.55 * score)
+        raw_opportunity = attainable * self.p("target_capture_fraction")
+        edge = self._directional_edge(raw_opportunity, confidence)
         return self._fire(
-            symbol=f.symbol, score=score, confidence=_clamp(0.30 + 0.55 * score),
+            symbol=f.symbol, score=score, confidence=confidence,
             edge_bps=edge, reasons=("KELTNER_UPPER_BREAKOUT", "VOLATILITY_EXPANSION_CONFIRMED"),
             squeeze_ratio=round(squeeze_ratio, 4),
             volatility_expansion=round(float(f.volatility_expansion), 4),
+            breakout_extension_bps=round(breakout_extension_bps, 3),
+            raw_volatility_opportunity_bps=round(raw_opportunity, 3),
         )
 
     def exit_rule(self, entry_price, f, context) -> ExitRule:
@@ -3891,8 +4403,16 @@ class ChoppinessRangeReversionAlgorithm(TradingAlgorithm):
         )
         if not _present(*required):
             return self._reject(("CHOP_REVERSION_INPUTS_MISSING",))
-        if float(f.choppiness) < self.p("min_choppiness") or float(f.adx) > self.p("max_adx"):
-            return self._reject(("CHOP_RANGE_REGIME_NOT_CONFIRMED",))
+        min_choppiness = self.p("min_choppiness")
+        max_adx = self.p("max_adx")
+        if float(f.choppiness) < min_choppiness or float(f.adx) > max_adx:
+            return self._reject(
+                ("CHOP_RANGE_REGIME_NOT_CONFIRMED",),
+                choppiness=round(float(f.choppiness), 3),
+                min_choppiness=round(float(min_choppiness), 3),
+                adx=round(float(f.adx), 3),
+                max_adx=round(float(max_adx), 3),
+            )
         if float(f.rsi) > self.p("max_rsi") or float(f.bb_percent_b) > self.p("max_percent_b"):
             return self._reject(("CHOP_OVERSOLD_EXTREME_MISSING",))
         if float(f.vwap_distance_bps) > -self.p("min_vwap_discount_bps"):
@@ -3974,6 +4494,8 @@ MACRO_FAMILY_BY_STRATEGY: dict[str, tuple[str, ...]] = {
     "cross_sectional_relative_strength": ("relative_strength", "momentum"),
     "gap_context": ("momentum", "breakout"),
     "breakout_volume": ("breakout",),
+    "opening_range_breakout": ("breakout", "momentum"),
+    "market_intraday_momentum": ("momentum",),
     "vwap_mean_reversion": ("vwap_reversion", "mean_reversion"),
     "liquidity_shock_reversal": ("mean_reversion",),
     # Hybrid thesis: the location is mean reversion, but the entry clock is a
@@ -4091,6 +4613,27 @@ def strategy_live_authorized(
     if strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:
         return True
     return algorithm.p("enabled") >= 1.0 and algorithm.p("live_authorized") >= 1.0
+
+
+def strategy_live_probe_authorized(
+    strategy_id: str,
+    *,
+    registry: Mapping[str, TradingAlgorithm] | None = None,
+) -> bool:
+    """Whether the operator granted only the bounded LIVE_PROBE rung.
+
+    A probe is not an alias for full live authority.  The session converts this
+    flag to :class:`StrategyDeploymentState.LIVE_PROBE`, whose position-size cap
+    is applied once by the trade-plan builder.
+    """
+    algorithm = get_algorithm(strategy_id, registry=registry)
+    if algorithm is None or strategy_id not in _DEPLOYMENT_GATED_STRATEGIES:
+        return False
+    return (
+        algorithm.p("enabled") >= 1.0
+        and algorithm.p("live_probe_authorized") >= 1.0
+        and algorithm.p("live_authorized") < 1.0
+    )
 
 
 def strategy_shadow_authorized(

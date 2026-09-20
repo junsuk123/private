@@ -7,6 +7,7 @@ const opsReasonLabels = {
   MARKET_DATA_NOT_READY: '실시간 체결·호가 신선도 부족',
   GNN_NOT_LIVE_AUTHORIZED: 'GNN 실시간 신뢰도 미승격',
   NO_MECHANICAL_STRATEGY_TRIGGER: '전략별 실제 진입 조건 대기',
+  NO_COST_VIABLE_MECHANICAL_STRATEGY: '기계적 조건 충족 · 비용 하한 미달',
   NO_ADMISSIBLE_TRIGGERED_STRATEGY: '발동 전략의 실행 권한·차입 조건 미충족',
   NO_POSITIVE_NET_GNN_EDGE: 'GNN 검증 완료 · 현재 양의 순효율 후보 없음',
   GNN_POSITIVE_EDGE_AWAITING_ENTRY_VALIDATION: '양의 순효율 후보 실시간 결과 검증 중',
@@ -70,6 +71,15 @@ function opsReason(code) {
   return opsReasonLabels[raw] || raw || '-';
 }
 
+function opsGnnRequiredForSelection(session) {
+  if (typeof session?.gnn_gate_required_for_selection === 'boolean') {
+    return session.gnn_gate_required_for_selection;
+  }
+  const authority = String(session?.selection_authority || '').toUpperCase();
+  return authority === 'GNN_DIRECT'
+    || (session?.require_live_gnn === true && authority !== 'DETERMINISTIC_ALGORITHM');
+}
+
 function opsSetGate(key, tone, title, detail) {
   const gate = document.querySelector(`[data-ops-gate="${key}"]`);
   if (!gate) return;
@@ -126,24 +136,26 @@ function opsPrimaryBlocker(diag, reliability, gnn, trading) {
       detail: `${missing} 시장에서 신선한 체결과 호가가 기준 종목 수만큼 필요합니다.`,
     };
   }
-  if (gnn?.checkpoint_live_authorized !== true) {
+  const session = trading?.status?.strategy_session || {};
+  const gnnRequired = opsGnnRequiredForSelection(session);
+  if (gnnRequired && gnn?.checkpoint_live_authorized !== true) {
     return {
       tone: 'waiting',
       title: 'GNN SHADOW ONLY',
       detail: 'The checkpoint is not live-authorized. Inference may continue, but order authority remains blocked.',
     };
   }
-  if (!gnn?.passed) {
+  if (gnnRequired && !gnn?.passed) {
     const sampleCount = Number(gnn?.sample_count || 0);
     const minimum = Number(gnn?.minimum_samples || 0);
     const mainReason = (gnn?.reason_codes || [])[0];
     return {
       tone: 'waiting',
       title: 'GNN 실시간 검증 진행 중',
-      detail: `표본 ${sampleCount}/${minimum} · ${opsReason(mainReason)}. 통과 전에는 전략 소유권과 주문이 차단됩니다.`,
+      detail: `표본 ${sampleCount}/${minimum} · ${opsReason(mainReason)}. 현재 선택 모드에서는 이 게이트 통과가 필요합니다.`,
     };
   }
-  if (!(gnn?.trusted_strategy_ids || []).length) {
+  if (gnnRequired && !(gnn?.trusted_strategy_ids || []).length) {
     const calibrated = gnn?.calibrated_strategy_ids || [];
     return {
       tone: 'waiting',
@@ -151,7 +163,6 @@ function opsPrimaryBlocker(diag, reliability, gnn, trading) {
       detail: `보정 신뢰 통과 ${calibrated.length}개 · 실제 시장에서 양의 순효율이 반복 검증된 전략만 주문 권한을 받습니다.`,
     };
   }
-  const session = trading?.status?.strategy_session || {};
   if (!trading?.running) {
     return {
       tone: 'waiting',
@@ -163,7 +174,9 @@ function opsPrimaryBlocker(diag, reliability, gnn, trading) {
     return {
       tone: 'waiting',
       title: '전략 선택 근거 탐색 중',
-      detail: `${opsReason(session.last_reason)} · 실시간 데이터에서 온톨로지와 GNN이 합의할 전략을 찾고 있습니다.`,
+      detail: gnnRequired
+        ? `${opsReason(session.last_reason)} · 온톨로지와 GNN 실행 게이트를 함께 통과할 전략을 찾고 있습니다.`
+        : `${opsReason(session.last_reason)} · 결정론 전략은 독립 평가 중이며 GNN은 보조 검증으로 수집됩니다.`,
     };
   }
   return {
@@ -186,6 +199,8 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
   const summary = trading?.status?.last_summary || {};
   const trusted = gnn?.trusted_strategy_ids || [];
   const calibrated = gnn?.calibrated_strategy_ids || [];
+  const gnnRequired = opsGnnRequiredForSelection(session);
+  const gnnContractReady = gnn?.inference_contract_ready !== false;
   const gnnHasScore = gnn?.score_available === true
     || Number(gnn?.sample_count || 0) > 0;
   const overall = opsPrimaryBlocker(diag, reliability, gnn, trading);
@@ -223,15 +238,19 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
   );
   opsSetGate(
     'gnn',
-    trusted.length ? 'pass' : (gnn?.passed ? 'warn' : 'block'),
-    trusted.length ? '진입 신뢰 통과' : (gnn?.passed ? '모델 보정 통과' : '검증 대기'),
-    `점수 ${gnnHasScore ? opsNumber(gnn?.score, 3) : 'N/A'} · 보정 ${calibrated.length} · 진입 ${trusted.length}`,
+    trusted.length ? 'pass' : (gnnRequired && (!gnnContractReady || !gnn?.passed) ? 'block' : 'warn'),
+    trusted.length
+      ? '진입 신뢰 통과'
+      : (!gnnContractReady ? '스키마 계약 불일치' : (gnnRequired ? '필수 검증 대기' : '보조 검증 수집')),
+    `역할 ${gnnRequired ? '필수' : '보조'} · 점수 ${gnnHasScore ? opsNumber(gnn?.score, 3) : 'N/A'} · 성숙 ${opsNumber(gnn?.sample_count)}/${opsNumber(gnn?.minimum_samples)}`,
+  );
+  const gnnExecutionReady = !gnnRequired || (
+    gnn?.checkpoint_live_authorized === true && trusted.length > 0
   );
   const executionReady = Boolean(
     trading?.running
     && trading?.buy_enabled
-    && gnn?.checkpoint_live_authorized === true
-    && trusted.length > 0
+    && gnnExecutionReady
     && session?.selected_strategy,
   );
   opsSetGate(
@@ -266,21 +285,30 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
 
   opsSetBadge(
     'ops-gnn-state',
-    trusted.length ? 'pass' : 'warn',
+    trusted.length ? 'pass' : (gnnRequired && !gnnContractReady ? 'block' : 'warn'),
     trusted.length
       ? 'ENTRY READY'
-      : (gnn?.checkpoint_live_authorized === false
-        ? 'SHADOW ONLY'
-        : (gnn?.passed ? 'CALIBRATED' : 'COLLECTING')),
+      : (!gnnContractReady
+        ? 'SCHEMA BLOCKED'
+        : (gnn?.checkpoint_live_authorized === false
+        ? (gnnRequired ? 'SHADOW ONLY' : 'AUX SHADOW')
+        : (gnn?.passed ? 'CALIBRATED' : 'COLLECTING'))),
   );
   opsText('ops-gnn-score', gnnHasScore ? opsNumber(gnn?.score, 3) : 'N/A');
-  opsText('ops-gnn-samples', `표본 ${opsNumber(gnn?.sample_count)}/${opsNumber(gnn?.minimum_samples)}`);
+  opsText(
+    'ops-gnn-samples',
+    `성숙 ${opsNumber(gnn?.sample_count)}/${opsNumber(gnn?.minimum_samples)}`
+      + ` · 예측저장 ${opsNumber(gnn?.prediction_persisted_count)}`
+      + ` · ${gnn?.inference_active ? '추론 ACTIVE' : '추론 대기'}`,
+  );
   const strategyRows = Object.values(gnn?.strategy_metrics || {});
   const upsideSupervised = (gnn?.upside_supervised_strategy_ids || []).length;
+  const trainingStrategyCount = Object.keys(gnn?.training_strategy_market_metrics || {}).length;
   opsText(
     'ops-gnn-trusted',
-    `진입 허용 ${trusted.length ? trusted.join(', ') : '없음'} · 보정 통과 ${calibrated.length}`
-      + ` · 상승 학습 ${upsideSupervised}/${strategyRows.length || '-'}`
+    `${gnnRequired ? '선택 필수 게이트' : '결정론 전략과 독립된 보조 게이트'} · `
+      + `진입 허용 ${trusted.length ? trusted.join(', ') : '없음'} · 보정 통과 ${calibrated.length}`
+      + ` · 상승 학습 ${upsideSupervised}/${trainingStrategyCount || strategyRows.length || '-'}`
       + ` · ${gnn?.outcome_validation_method === 'directional_strategy_policy_replay_v2' ? '방향별 실행정책 재현' : '구형 예측 검증'}`,
   );
   const progress = Math.min(100, Math.max(0, Number(gnn?.sample_count || 0) / Math.max(1, Number(gnn?.minimum_samples || 1)) * 100));
@@ -427,7 +455,12 @@ function renderOperationsOverview({ diag, reliability, trading, gnn, mode, macro
 
   opsText('ops-mode', String(mode?.active?.mode || reliability?.mode || '-').toUpperCase());
   opsText('ops-reliability', `${opsNumber(reliability?.score, 2)} / ${opsNumber(reliability?.threshold, 2)} · ${reliability?.ready ? '통과' : '대기'}`);
-  opsText('ops-gnn-required', session.require_live_gnn === true ? '필수 · 강제' : (trading?.running ? '비활성' : '엔진 시작 후 확인'));
+  opsText(
+    'ops-gnn-required',
+    gnnRequired
+      ? '필수 · 선택 권한'
+      : (trading?.running ? '보조 · 결정론 전략 독립' : '엔진 시작 후 확인'),
+  );
   opsText('ops-engine-cycles', opsNumber(trading?.status?.cycles || 0));
   opsText('ops-current-reason', opsReason(session.last_reason || (reliability?.reasons || [])[0] || (gnn?.reason_codes || [])[0]));
 }
@@ -561,6 +594,10 @@ function blockadeTags(link) {
 }
 
 function renderEntryBlockade(payload) {
+  if (typeof window.renderEntryBlockadeGraph === 'function') {
+    window.renderEntryBlockadeGraph(payload);
+    return;
+  }
   const list = document.getElementById('blockade-chain');
   const headline = document.getElementById('blockade-headline');
   const verdict = document.getElementById('blockade-verdict');

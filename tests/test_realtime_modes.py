@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from app.realtime import OperationMode, OperationModeManager, ShortHorizonRiskPolicy
+from app.paths import runtime_store_root
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, MarketSnapshot, OrderAction, OrderIntent, OrderSide, OrderType, SourceMetadata
 from app.storage import StoredResearch
 from app import web as web_module
@@ -179,7 +180,9 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertFalse(state.synthetic_data_allowed)
         self.assertFalse(state.live_orders_allowed)
         self.assertTrue(state.training_allowed)
-        self.assertIn("Use one unified realtime data store only: data/store.", state.guardrails)
+        self.assertTrue(
+            any("Use one unified realtime research store only:" in item for item in state.guardrails)
+        )
 
     def test_us_market_holiday_closes_us_group_but_not_krx(self) -> None:
         holiday_kst = datetime(2026, 7, 3, 5, 0, tzinfo=timezone.utc)  # 14:00 KST, Jul 3 ET holiday
@@ -290,7 +293,10 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertTrue(data["ok"])
         self.assertEqual(data["training_status"], "continuous_collection_started")
-        self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
+        self.assertEqual(
+            data["data_policy"]["analysis_input_stores"],
+            [runtime_store_root().as_posix()],
+        )
         start_worker.assert_called_once_with("learning")
 
     def test_paper_api_request_starts_live_trading_mode(self) -> None:
@@ -314,7 +320,10 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(data["requested_mode"], "paper_trading")
         self.assertEqual(data["mode_normalized_from"], "paper_trading")
         self.assertEqual(data["kis_connection"]["mode"], "live")
-        self.assertEqual(data["data_policy"]["analysis_input_stores"], ["data/store"])
+        self.assertEqual(
+            data["data_policy"]["analysis_input_stores"],
+            [runtime_store_root().as_posix()],
+        )
         start_demo.assert_not_called()
         start_worker.assert_not_called()
         realtime_collector.assert_called_once()
@@ -1712,6 +1721,10 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(candidates, ("003280",))
         self.assertEqual(
+            web_module._realtime_candidate_filter_state["selected_symbols"],
+            ["003280"],
+        )
+        self.assertEqual(
             web_module._realtime_candidate_filter_state["reason_counts"],
             {"ACCOUNT_OR_STORE_UNAVAILABLE_NOT_FILTERED": 1, "MICRO_HARD_RISK_BLOCK": 1},
         )
@@ -1763,7 +1776,7 @@ class RealtimeModesTest(unittest.TestCase):
             "SOFI", Store(), now=now
         )
 
-    def test_strategy_tick_window_requires_algorithm_five_second_print_floor(self) -> None:
+    def test_strategy_tick_window_accepts_configured_two_print_floor(self) -> None:
         now = datetime.now(timezone.utc)
 
         class Store:
@@ -1781,7 +1794,7 @@ class RealtimeModesTest(unittest.TestCase):
             def latest_orderbook(self, symbol):
                 return SimpleNamespace(received_at=now - timedelta(seconds=1))
 
-        assert not web_module._candidate_has_ready_strategy_tick_window(
+        assert web_module._candidate_has_ready_strategy_tick_window(
             "INTC", Store(), now=now
         )
 
@@ -2512,6 +2525,49 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertTrue(data["event_llm"]["probe_skipped"])
         self.assertEqual(data["live_training"], {"ok": True, "fast_status": True})
 
+    def test_fast_training_status_matches_market_specific_serving_chain(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        def artifact(artifact_id: str, created_at: datetime) -> dict[str, object]:
+            return {
+                "artifact_id": artifact_id,
+                "created_at": created_at.isoformat(),
+                "feature_schema_hash": "schema",
+                "feature_names": ["feature"],
+                "classification": {"weights": [0.1], "bias": 0.0},
+                "regression": {"weights": [0.2], "bias": 0.0},
+                "thresholds": {},
+                "metrics": {},
+                "live_eligible": True,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.mkdir(exist_ok=True)
+            (root / "latest.json").write_text(
+                json.dumps(artifact("combined-stale", now - timedelta(days=2))),
+                encoding="utf-8",
+            )
+            (root / "KR").mkdir()
+            (root / "KR" / "latest.json").write_text(
+                json.dumps(artifact("kr-fresh", now)),
+                encoding="utf-8",
+            )
+            status = web_module._fast_serving_model_status(root=root)
+
+        self.assertFalse(status["ok"])
+        self.assertTrue(status["partial"])
+        self.assertEqual(status["available_markets"], ["KR"])
+        self.assertEqual(status["failed_markets"], ["US"])
+        self.assertEqual(
+            status["market_models"]["KR"]["serving_source"],
+            "market_specific",
+        )
+        self.assertIn(
+            "MODEL_AGE_EXCEEDED",
+            status["market_models"]["US"]["combined_error"],
+        )
+
     def test_kiosk_orderable_cash_uses_cached_basis_only(self) -> None:
         basis = {
             "orderable_cash_by_currency": {"KRW": 120000.0, "USD": 12.5},
@@ -2679,6 +2735,43 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(snapshot["blocked_count"], 1)
         self.assertEqual(snapshot["recent_orders"][0]["ticker"], "005930")
         self.assertEqual(snapshot["recent_executions"][0]["broker_order_id"], "OVRS000010")
+
+    def test_strategy_link_enriches_the_preceding_submitted_order_and_exit(self) -> None:
+        events = [
+            {
+                "event_type": "live_order_submitted",
+                "recorded_at": "2026-08-24T00:00:00+00:00",
+                "payload": {
+                    "order": {"ticker": "005930", "market": "KR", "side": "BUY", "quantity": 1, "limit_price": 70000},
+                    "broker_order_id": "BUY-1",
+                    "status": "SUBMITTED",
+                },
+            },
+            {
+                "event_type": "live_strategy_order_link",
+                "recorded_at": "2026-08-24T00:00:00.1+00:00",
+                "payload": {
+                    "ticker": "005930",
+                    "side": "BUY",
+                    "broker_order_id": "BUY-1",
+                    "strategy_id": "breakout_volume",
+                },
+            },
+            {
+                "event_type": "live_order_submitted",
+                "recorded_at": "2026-08-24T01:00:00+00:00",
+                "payload": {
+                    "order": {"ticker": "005930", "market": "KR", "side": "SELL", "quantity": 1, "limit_price": 71000},
+                    "broker_order_id": "SELL-1",
+                    "status": "SUBMITTED",
+                },
+            },
+        ]
+
+        enriched = web_module._enrich_live_order_events(events)
+
+        self.assertEqual(enriched[0]["payload"]["strategy_id"], "breakout_volume")
+        self.assertEqual(enriched[2]["payload"]["strategy_id"], "breakout_volume")
 
     def test_live_trading_progress_exposes_runtime_gate_and_order_journal(self) -> None:
         client = TestClient(app)
@@ -3289,7 +3382,7 @@ class RealtimeModesTest(unittest.TestCase):
             return {"ok": True, "healthy": {"US": ["AAPL", "MSFT"], "KRX": []}}
 
         with (
-            patch("app.web._active_live_market_groups", return_value=("US", "KRX")),
+            patch("app.web._active_live_market_groups", return_value=("KRX",)),
             patch("app.web._cached_kis_connection_probe", return_value={
                 "ok": True,
                 "account_checked": True,
@@ -3314,7 +3407,7 @@ class RealtimeModesTest(unittest.TestCase):
         self.assertEqual(result["components"]["market_data"]["required_markets"], [])
         self.assertEqual(
             result["components"]["market_data"]["extended_order_markets"],
-            ["US", "KRX"],
+            ["KRX"],
         )
 
     def test_reliability_requires_us_ticks_during_us_core_session(self) -> None:
@@ -3327,7 +3420,7 @@ class RealtimeModesTest(unittest.TestCase):
             return {"ok": True, "healthy": {"US": ["AAPL", "MSFT"], "KRX": []}}
 
         with (
-            patch("app.web._active_live_market_groups", return_value=("US", "KRX")),
+            patch("app.web._active_live_market_groups", return_value=("US",)),
             patch("app.web._cached_kis_connection_probe", return_value={
                 "ok": True,
                 "account_checked": True,
@@ -3347,6 +3440,55 @@ class RealtimeModesTest(unittest.TestCase):
 
         self.assertEqual(captured, [("US",)])
         self.assertEqual(result["components"]["market_data"]["required_markets"], ["US"])
+
+    def test_reliability_checks_both_feeds_during_multiplexed_daytime_overlap(self) -> None:
+        """At 14:00 KST, US daytime and KRX regular feeds both matter in multiplex mode."""
+        overlap = datetime(2026, 7, 1, 5, 0, tzinfo=timezone.utc)
+
+        for multiplexed, us_fresh in ((True, True), (True, False), (False, False)):
+            with self.subTest(multiplexed=multiplexed, us_fresh=us_fresh):
+                captured: list[tuple[str, ...]] = []
+
+                def market_health(_now, groups):
+                    captured.append(tuple(groups))
+                    healthy = {"US": ["AAPL"] if us_fresh else [], "KRX": ["005930"]}
+                    return {"ok": all(healthy[group] for group in groups), "healthy": healthy}
+
+                with (
+                    patch("app.web._multiplexed_realtime_enabled", return_value=multiplexed),
+                    patch("app.web._cached_kis_connection_probe", return_value={
+                        "ok": True,
+                        "account_checked": True,
+                        "actual_equity": 200000.0,
+                    }),
+                    patch("app.web.evaluate_live_runtime_gates", return_value=SimpleNamespace(ok=True, failures=())),
+                    patch("app.web.load_short_horizon_strategy_config", return_value={
+                        "execution": {"live_trading_enabled": True},
+                    }),
+                    patch("app.web.TradingPolicySnapshot") as policy,
+                    patch("app.web._latest_model_reliability", return_value={"ok": True}) as model,
+                    patch("app.web._auto_market_health", side_effect=market_health),
+                    patch.dict("os.environ", {
+                        "LIVE_TRADING_ENABLED": "true", "KIS_LIVE_ENABLED": "true",
+                        "KIS_REALTIME_SINGLE_SESSION": "true",
+                    }),
+                ):
+                    policy.from_environment.return_value.conflicts.return_value = ()
+                    # Use the actual calendar/session service rather than inventing
+                    # overlap by mocking both markets open at an impossible time.
+                    self.assertEqual(web_module._active_live_market_groups(overlap), ("US", "KRX"))
+                    self.assertEqual(web_module._kis_realtime_session_owner(overlap), "KRX")
+                    result = web_module._evaluate_auto_reliability(overlap)
+
+                required = ("US", "KRX") if multiplexed else ("KRX",)
+                self.assertEqual(captured, [required])
+                model.assert_called_once_with(overlap, required)
+                self.assertEqual(result["components"]["market_data"]["required_markets"], list(required))
+                self.assertEqual(result["components"]["market_data"]["extended_order_markets"], ["US", "KRX"])
+                self.assertEqual(result["ready"], us_fresh or not multiplexed)
+                self.assertEqual(
+                    "MARKET_DATA_NOT_READY" in result["reasons"], multiplexed and not us_fresh,
+                )
 
     def test_live_affordable_krx_discovery_default_limit_is_broader_for_small_cash(self) -> None:
         stored = StoredResearch(

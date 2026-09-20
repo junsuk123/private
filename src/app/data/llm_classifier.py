@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 from datetime import datetime, time
 from pathlib import Path
@@ -50,13 +51,23 @@ class JsonEventLLMClassifier:
         )
         data = _parse_json_object(payload)
         sentiment = _sentiment(str(data.get("sentiment", "NEUTRAL")))
+        event_labels = _ground_event_labels(
+            tuple(
+                str(item).strip()[:80]
+                for item in data.get("event_labels", [])
+                if str(item).strip()
+            )[:8],
+            title=title,
+            body=body,
+        )
+        tickers = _normalize_llm_tickers(data.get("tickers", ()), known_tickers)
         return EventLLMClassification(
             sentiment=sentiment,
             summary=str(data.get("summary") or body[:280]).strip()[:700],
             key_facts=tuple(str(item).strip()[:180] for item in data.get("key_facts", []) if str(item).strip())[:8],
-            event_labels=tuple(str(item).strip()[:80] for item in data.get("event_labels", []) if str(item).strip())[:8],
+            event_labels=event_labels,
             companies=tuple(str(item).strip()[:120] for item in data.get("companies", []) if str(item).strip())[:12],
-            tickers=tuple(str(item).strip().upper()[:20] for item in data.get("tickers", []) if str(item).strip())[:12],
+            tickers=tickers,
             sectors=tuple(str(item).strip()[:80] for item in data.get("sectors", []) if str(item).strip())[:8],
             confidence=max(0.0, min(1.0, float(data.get("confidence", 0.5)))),
             model=self.client.model,
@@ -118,19 +129,26 @@ class LocalOpenAICompatibleChatClient:
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> str:
         timeout_seconds = _request_timeout_seconds()
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0,
-                "max_tokens": _request_max_tokens(),
-                "stream": False,
-                "response_format": {"type": "json_object"},
-            }
-        ).encode("utf-8")
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": _request_max_tokens(),
+            "stream": False,
+            "response_format": {"type": "json_object"},
+        }
+        # Qwen3-class models think by default. Event extraction needs the final
+        # JSON, not an internal reasoning trace consuming the complete token
+        # budget. Ollama's OpenAI-compatible API exposes this as
+        # ``reasoning_effort=none``. Keep it opt-in so other compatible servers
+        # that do not implement the field remain usable.
+        reasoning_effort = _request_reasoning_effort()
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint,
             data=body,
@@ -418,6 +436,70 @@ def _local_llm_reachable(endpoint: str | None = None) -> tuple[bool, str]:
     return False, detail
 
 
+def _ollama_installed_models(endpoint: str) -> tuple[dict[str, Any], ...] | None:
+    """Return Ollama's local catalogue, or ``None`` for a non-Ollama endpoint."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(endpoint)
+    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "http://127.0.0.1:11434"
+    try:
+        with urllib.request.urlopen(base + "/api/tags", timeout=2.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - llama.cpp and other local servers are valid.
+        return None
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return tuple(row for row in rows if isinstance(row, dict))
+
+
+def _local_model_quality_key(row: dict[str, Any]) -> tuple[float, float, float]:
+    """Rank text-instruction models without mistaking embeddings for chat LLMs."""
+    name = str(row.get("name") or row.get("model") or "").lower()
+    family = 4.0 if "qwen3.5" in name else 3.0 if "qwen3" in name else 2.0 if "qwen2.5" in name else 1.0
+    parameter_match = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)b(?:\b|[-_:])", name)
+    parameters = float(parameter_match.group(1)) if parameter_match else 0.0
+    instruct = 1.0 if "instruct" in name else 0.0
+    return (parameters, family, instruct)
+
+
+def _resolve_local_ollama_model(
+    configured_model: str,
+    endpoint: str,
+) -> tuple[str, bool, tuple[str, ...]]:
+    """Resolve a synced config against models installed on this particular PC.
+
+    Synology shares ``config/local_llm.env`` between unlike machines. A model
+    name valid on an RTX desktop must not turn into repeated HTTP 404 responses
+    on a laptop. Prefer the configured model when present; otherwise select the
+    strongest installed text model and expose that fallback in diagnostics.
+    """
+    rows = _ollama_installed_models(endpoint)
+    if rows is None:
+        return configured_model, False, ()
+    names = tuple(
+        str(row.get("name") or row.get("model") or "").strip()
+        for row in rows
+        if str(row.get("name") or row.get("model") or "").strip()
+    )
+    if configured_model in names:
+        return configured_model, False, names
+    excluded = ("embed", "rerank", "vision", "-vl", "coder", "code-")
+    eligible = [
+        row
+        for row in rows
+        if not any(
+            token in str(row.get("name") or row.get("model") or "").lower()
+            for token in excluded
+        )
+    ]
+    if not eligible:
+        return configured_model, False, names
+    best = max(eligible, key=_local_model_quality_key)
+    resolved = str(best.get("name") or best.get("model") or configured_model).strip()
+    return resolved, resolved != configured_model, names
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -526,7 +608,10 @@ def build_event_llm_classifier_from_env() -> JsonEventLLMClassifier | None:
             reachable, _detail = _local_llm_reachable(endpoint)
             if not reachable:
                 return None
-        return JsonEventLLMClassifier(LocalOpenAICompatibleChatClient(model=model, endpoint=endpoint))
+        resolved_model, _fallback, _installed = _resolve_local_ollama_model(model, endpoint)
+        return JsonEventLLMClassifier(
+            LocalOpenAICompatibleChatClient(model=resolved_model, endpoint=endpoint)
+        )
     if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
         device = os.getenv("LLM_EVENT_DEVICE", "auto").strip()
         max_new_tokens = int(os.getenv("LLM_EVENT_MAX_NEW_TOKENS", "512"))
@@ -617,8 +702,20 @@ def event_llm_runtime_status() -> dict[str, Any]:
         )
         status["endpoint"] = endpoint
         reachable, detail = _local_llm_reachable(endpoint)
-        status["available"] = reachable
-        status["reason"] = None if reachable else f"local LLM unavailable: {detail}"
+        if not reachable:
+            status["reason"] = f"local LLM unavailable: {detail}"
+            return status
+        resolved_model, fallback, installed = _resolve_local_ollama_model(model, endpoint)
+        status["configured_model"] = model
+        status["model"] = resolved_model
+        status["model_fallback_active"] = fallback
+        status["installed_models"] = installed
+        status["available"] = bool(resolved_model in installed) if installed else True
+        status["reason"] = (
+            None
+            if status["available"]
+            else f"configured local model is not installed: {model}"
+        )
         return status
     if provider in {"embedded", "inprocess", "transformers", "local-model", "openvino-llm", "multimodal"}:
         model_path = Path(model)
@@ -645,6 +742,11 @@ companies: array
 tickers: array
 sectors: array
 confidence: number between 0 and 1
+Choose only event labels directly supported by the text; do not add a secondary
+label merely because it is often associated with the primary event.
+AnalystUpgrade requires an explicit analyst rating or target-price change.
+ProductLaunchPositive requires an explicit product launch or unveiling.
+EarningsSurprisePositive requires reported earnings that explicitly beat expectations.
 Do not invent facts. Use NEUTRAL and low confidence when the text is ambiguous."""
 
 
@@ -677,6 +779,11 @@ def _request_max_tokens() -> int:
         return max(64, int(os.getenv("LLM_EVENT_RESPONSE_MAX_TOKENS", "180")))
     except ValueError:
         return 180
+
+
+def _request_reasoning_effort() -> str | None:
+    value = os.getenv("LLM_EVENT_REASONING_EFFORT", "").strip().lower()
+    return value if value in {"none", "low", "medium", "high"} else None
 
 
 def _chat_prompt(tokenizer: Any, system_prompt: str, user_prompt: str) -> str:
@@ -728,3 +835,87 @@ def _sentiment(value: str) -> SentimentDirection:
     if normalized == "NEGATIVE":
         return SentimentDirection.NEGATIVE
     return SentimentDirection.NEUTRAL
+
+
+_LABEL_EVIDENCE_TERMS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "EarningsSurprisePositive": (
+        ("earnings", "beat"), ("earnings", "above expectations"),
+        ("실적", "예상 상회"), ("어닝", "서프라이즈"),
+    ),
+    "GuidanceLowered": (
+        ("guidance", "lower"), ("guidance", "cut"),
+        ("가이던스", "하향"), ("전망", "하향"),
+    ),
+    "MajorSupplyContract": (
+        ("supply", "contract"), ("supply", "agreement"),
+        ("공급", "계약"), ("납품", "계약"),
+    ),
+    "AnalystUpgrade": (
+        ("analyst", "upgrade"), ("analyst", "target price"),
+        ("brokerage", "upgrade"), ("증권사", "상향"),
+        ("애널리스트", "상향"), ("목표가", "상향"),
+    ),
+    "LitigationRiskHigh": (
+        ("litigation",), ("lawsuit",), ("legal action",),
+        ("소송",), ("법적 조치",),
+    ),
+    "RegulatoryPenaltyNegative": (
+        ("regulatory penalty",), ("regulator", "fine"),
+        ("규제", "과징금"), ("규제", "벌금"),
+    ),
+    "ProductLaunchPositive": (
+        ("product launch",), ("launched", "product"), ("unveil",),
+        ("제품", "출시"), ("신제품", "공개"),
+    ),
+    "RumorRisk": (
+        ("rumor",), ("unconfirmed",), ("speculation",),
+        ("루머",), ("미확인",),
+    ),
+}
+
+
+def _ground_event_labels(
+    labels: tuple[str, ...],
+    *,
+    title: str,
+    body: str,
+) -> tuple[str, ...]:
+    """Drop specific semantic labels unsupported by an explicit source phrase.
+
+    Small local models are useful for extraction but sometimes append a label
+    that is merely correlated with the event (a supply contract became an
+    analyst upgrade during hardware validation). Those labels feed graph edges,
+    so each known high-impact label needs direct lexical evidence in the source.
+    Unknown future labels remain available rather than being silently erased.
+    """
+    text = f"{title}\n{body}".lower()
+    grounded: list[str] = []
+    for label in labels:
+        evidence_groups = _LABEL_EVIDENCE_TERMS.get(label)
+        if evidence_groups and not any(
+            all(term.lower() in text for term in group)
+            for group in evidence_groups
+        ):
+            continue
+        grounded.append(label)
+    return tuple(grounded)
+
+
+def _normalize_llm_tickers(
+    values: Any,
+    known_tickers: dict[str, str],
+) -> tuple[str, ...]:
+    """Keep ticker-shaped identifiers and repair ``TICKER=company`` echoes."""
+    known = {str(item).strip().upper() for item in known_tickers if str(item).strip()}
+    result: list[str] = []
+    for item in values if isinstance(values, (list, tuple)) else ():
+        value = str(item).strip().upper()
+        if "=" in value:
+            prefix = value.split("=", 1)[0].strip()
+            if prefix in known:
+                value = prefix
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,19}", value):
+            continue
+        if value not in result:
+            result.append(value)
+    return tuple(result[:12])

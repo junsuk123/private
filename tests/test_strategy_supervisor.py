@@ -197,6 +197,23 @@ class TestMacroPermissionTranslation:
         assert macro_strategy_permitted("event_momentum", (), ("momentum",)) is False
         assert macro_strategy_permitted("intraday_momentum", ("momentum",), ("momentum",)) is False
 
+    def test_directional_arms_survive_the_macro_prefilter_independently(self):
+        from app.technical.strategy_algorithms import macro_strategy_permitted
+
+        trend_down = (
+            "mean_reversion",
+            "vwap_reversion",
+            "relative_strength",
+            "momentum_short",
+            "breakdown",
+            "relative_weakness",
+        )
+        assert macro_strategy_permitted("market_intraday_momentum_short", trend_down, ()) is True
+        assert macro_strategy_permitted("opening_range_breakdown", trend_down, ()) is True
+        assert macro_strategy_permitted("residual_relative_weakness", trend_down, ()) is True
+        # The broad long momentum family remains outside TREND_DOWN.
+        assert macro_strategy_permitted("intraday_momentum", trend_down, ()) is False
+
     def test_absent_lists_are_unanswerable_not_a_withdrawal(self):
         from app.technical.strategy_algorithms import macro_strategy_permitted
 

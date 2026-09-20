@@ -384,7 +384,7 @@ def test_storing_evidence_never_changes_state() -> None:
 def test_one_loss_does_not_demote() -> None:
     monitor = StrategyDriftMonitor(config=StrategyDriftConfig(minimum_samples=20))
     monitor.record(strategy_id="s", net_return_bps=-300.0, at=AT, is_live=True)
-    proposals = monitor.demotion_proposals({"s": StrategyLifecycleState.LIVE})
+    proposals = monitor.demotion_proposals({"s": StrategyLifecycleState.LIVE}, now=AT)
     assert proposals == ()
 
 
@@ -398,7 +398,11 @@ def test_sustained_negative_ev_demotes_one_rung() -> None:
             cost_bps=28.0,
             is_live=True,
         )
-    proposals = monitor.demotion_proposals({"s": StrategyLifecycleState.LIVE})
+    # Evaluate at the fixture's decision time. Wall-clock evaluation eventually
+    # ages all observations out of the deliberately bounded 30-day window.
+    proposals = monitor.demotion_proposals(
+        {"s": StrategyLifecycleState.LIVE}, now=AT + timedelta(minutes=30)
+    )
     assert len(proposals) == 1
     assert proposals[0].to_state is StrategyLifecycleState.DEGRADED
     assert "DRIFT_ROLLING_NET_EV_NEGATIVE" in proposals[0].reason_codes

@@ -29,6 +29,7 @@ class SelectionStage(str, Enum):
     """Pipeline order. The first stage a candidate fails is its cause."""
 
     RAW_CANDIDATE = "RAW_CANDIDATE"
+    EVALUATION_ERROR = "EVALUATION_ERROR"
     FEATURE_UNAVAILABLE = "FEATURE_UNAVAILABLE"
     STRATEGY_TRIGGER_FALSE = "STRATEGY_TRIGGER_FALSE"
     GROSS_EDGE_NON_POSITIVE = "GROSS_EDGE_NON_POSITIVE"
@@ -345,17 +346,33 @@ def collector_from_algorithm_evaluations(
             reason_codes=reasons,
         )
         if not bool(item.get("triggered")):
+            evaluation_error = any(
+                code.startswith(
+                    (
+                        "STRATEGY_ENTRY_EVALUATION_ERROR:",
+                        "PROPOSAL_ENTRY_EVALUATION_ERROR:",
+                        "PROPOSAL_ENTRY_ERROR:",
+                    )
+                )
+                for code in reasons
+            )
             feature_missing = any(
                 marker in code
                 for code in reasons
                 for marker in ("NOT_READY", "MISSING", "UNAVAILABLE", "INSUFFICIENT")
             )
             record.mark(
-                SelectionStage.FEATURE_UNAVAILABLE
+                SelectionStage.EVALUATION_ERROR
+                if evaluation_error
+                else SelectionStage.FEATURE_UNAVAILABLE
                 if feature_missing
                 else SelectionStage.STRATEGY_TRIGGER_FALSE,
                 reason_codes=reasons,
-                detail="recorded algorithm trigger did not fire",
+                detail=(
+                    "strategy evaluation raised an exception"
+                    if evaluation_error
+                    else "recorded algorithm trigger did not fire"
+                ),
             )
             continue
         if edge is None:
@@ -369,6 +386,28 @@ def collector_from_algorithm_evaluations(
                 SelectionStage.GROSS_EDGE_NON_POSITIVE,
                 reason_codes=reasons,
                 detail="recorded expected edge is non-positive",
+            )
+        elif item.get("cost_viable") is False or any(
+            code in {"EDGE_BELOW_COST_FLOOR", "EDGE_BELOW_ALGORITHM_FLOOR"}
+            for code in reasons
+        ):
+            diagnostics = item.get("diagnostics") or {}
+            cost = _finite(diagnostics.get("round_trip_cost_bps"))
+            minimum = _finite(diagnostics.get("minimum_edge_bps"))
+            required_net = _finite(diagnostics.get("min_net_buffer_bps"))
+            record.mark(
+                SelectionStage.COST_FLOOR_REJECTED,
+                reason_codes=reasons,
+                all_in_cost_bps=cost,
+                rule_net_bps=(edge - cost) if cost is not None else None,
+                required_net_bps=(
+                    required_net
+                    if required_net is not None
+                    else (minimum - cost)
+                    if minimum is not None and cost is not None
+                    else None
+                ),
+                detail="mechanical trigger fired but did not clear its entry cost floor",
             )
         elif "EXIT_TARGET_DOES_NOT_CLEAR_COST" in reasons:
             # The algorithm DID fire.  Exit-contract feasibility subsequently

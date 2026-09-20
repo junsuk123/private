@@ -281,19 +281,34 @@ class AccountDashboardService:
             and latest_snapshot.get("source") == "kis_live_account"
         )
         display_snapshot = latest_snapshot if latest_is_live else live_snapshot
-        if latest_is_live:
+        verified_at = display_snapshot.get("updated_at") or display_snapshot.get("created_at")
+        verified_time = _parse_time(verified_at)
+        age_seconds = (datetime.now(timezone.utc) - verified_time).total_seconds() if verified_time else None
+        is_stale = bool(
+            not latest_is_live
+            or display_snapshot.get("is_stale")
+            or age_seconds is None
+            or age_seconds < -5
+            or age_seconds > 120
+        )
+        if latest_is_live and not is_stale:
             status = "live"
             message = "KIS 실계좌 확인값"
         elif display_snapshot:
             status = "last_known"
-            message = "KIS 연결을 확인할 수 없어 마지막 실계좌 확인값을 표시합니다."
+            message = (
+                "실계좌 확인값이 오래되어 마지막 확인값을 표시합니다."
+                if latest_is_live
+                else "KIS 연결을 확인할 수 없어 마지막 실계좌 확인값을 표시합니다."
+            )
         else:
             status = "unavailable"
             message = "확인된 KIS 실계좌 자산 정보가 없습니다."
-        verified_at = display_snapshot.get("updated_at") or display_snapshot.get("created_at")
         return {
             "status": status,
-            "authoritative": latest_is_live,
+            "authoritative": latest_is_live and not is_stale,
+            "is_stale": is_stale,
+            "age_seconds": age_seconds,
             "message": message,
             "current_source": latest_snapshot.get("source") or "unavailable",
             "last_verified_at": verified_at,

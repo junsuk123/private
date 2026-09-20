@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 
@@ -103,6 +103,16 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _candidate_market(candidate: CandidateInput) -> str:
+    from app.data.market_capabilities import normalize_market_group
+
+    group = normalize_market_group(candidate.market_group)
+    if group is not None:
+        return group.value
+    symbol = str(candidate.ticker).strip()
+    return "KR" if symbol.isdigit() and len(symbol) == 6 else "US"
+
+
 @dataclass(frozen=True)
 class RuntimeStatus:
     """What the runtime itself is doing, separate from what it observed."""
@@ -158,7 +168,12 @@ class ContextRuntime:
             state_machine=self._states,
             freshness=self._freshness,
         )
-        self._market_group = str(market_group).upper()
+        from app.data.market_capabilities import normalize_market_group
+
+        normalized_group = normalize_market_group(market_group)
+        self._market_group = normalized_group.value if normalized_group else str(market_group).upper()
+        self._market_pipelines = {self._market_group: self._pipeline}
+        self._latest_by_market: dict[str, CycleResult] = {}
         #: Live strategy-session snapshot, for the authority-path panel. Injected so the
         #: runtime does not reach into the trading engine's globals.
         self._session_snapshot_provider = session_snapshot_provider
@@ -194,6 +209,23 @@ class ContextRuntime:
     def latest(self) -> CycleResult | None:
         with self._lock:
             return self._latest
+
+    def latest_by_market(self) -> dict[str, CycleResult]:
+        with self._lock:
+            return dict(self._latest_by_market)
+
+    def _pipeline_for_market(self, market: str) -> ContextDecisionPipeline:
+        # Regime hysteresis and temporal graph history must never alternate
+        # between a Korean session and a US session in one mutable estimator.
+        if market not in self._market_pipelines:
+            self._market_pipelines[market] = ContextDecisionPipeline(
+                store=self._store, gnn_runtime=self._gnn,
+                snapshot_builder=GraphSnapshotBuilder(
+                    max_nodes=GRAPH_MAX_NODES, time_steps=GRAPH_TIME_STEPS
+                ),
+                state_machine=self._states, freshness=self._freshness,
+            )
+        return self._market_pipelines[market]
 
     def status(self) -> RuntimeStatus:
         with self._lock:
@@ -231,33 +263,58 @@ class ContextRuntime:
         treats ``None`` as "no fresh decision this cycle", which is a state the gate
         already refuses to trade on, rather than as a reason to stop.
         """
+        explicit_moment = now is not None
         moment = now or _utcnow()
+        moment = moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment.astimezone(timezone.utc)
         try:
-            temporal = build_temporal_snapshot(self._market_group, moment)
-            global_context = self.build_global_context(moment)
             resolved_candidates = list(
                 candidates if candidates is not None else self.discover_candidates(moment)
             )
-            domestic_context = self.build_domestic_context(
-                moment, global_context=global_context, candidates=resolved_candidates
-            )
-            sector_contexts = self.build_sector_contexts(
-                moment,
-                candidates=resolved_candidates,
-                global_context=global_context,
-                domestic_context=domestic_context,
-            )
-            result = self._pipeline.run_cycle(
-                captured_at=moment,
-                temporal=temporal,
-                candidates=resolved_candidates,
-                global_context=global_context,
-                domestic_context=domestic_context,
-                sector_contexts=sector_contexts,
-                account=account,
-                websocket_connected=websocket_connected,
-                trading_halted=trading_halted,
-                create_order_intents=create_order_intents,
+            by_market: dict[str, list[CandidateInput]] = {}
+            for candidate in resolved_candidates:
+                market = _candidate_market(candidate)
+                by_market.setdefault(market, []).append(replace(candidate, market_group=market))
+            if not by_market:
+                by_market[self._market_group] = []
+            # Read slow macro data once. Its source and timestamp are retained
+            # independently in each target market's applicability graph.
+            observations = tuple(self._macro_observations(moment))
+            market_contexts = {}
+            for market, members in by_market.items():
+                global_context = self.build_global_context(moment, market=market, observations=observations)
+                domestic_context = self.build_domestic_context(
+                    moment, global_context=global_context, candidates=members, market=market
+                )
+                sectors = self.build_sector_contexts(
+                    moment, candidates=members, global_context=global_context,
+                    domestic_context=domestic_context, market=market,
+                )
+                market_contexts[market] = (global_context, domestic_context, sectors)
+            # Source collection can take longer than the 15-second realtime
+            # freshness threshold on a busy SQLite/WAL.  Evaluating at the
+            # collection *start* made data that arrived during the scan appear
+            # to come from the future and eventually made every earlier row
+            # stale.  Production cycles use the completion clock; replay/tests
+            # that pass ``now`` explicitly retain their deterministic clock.
+            decision_moment = moment if explicit_moment else _utcnow()
+            cycles = {}
+            for market, members in by_market.items():
+                global_context, domestic_context, sectors = market_contexts[market]
+                cycles[market] = self._pipeline_for_market(market).run_cycle(
+                    captured_at=decision_moment,
+                    temporal=build_temporal_snapshot(market, decision_moment), candidates=members,
+                    global_context=global_context, domestic_context=domestic_context,
+                    sector_contexts=sectors, account=account,
+                    websocket_connected=websocket_connected, trading_halted=trading_halted,
+                    create_order_intents=create_order_intents,
+                )
+            primary = cycles.get(self._market_group) or next(iter(cycles.values()))
+            # Legacy APIs retain the primary graph, while each decision and the
+            # explicit markets payload retain their own clock and regime.
+            result = replace(
+                primary,
+                decisions=tuple(decision for cycle in cycles.values() for decision in cycle.decisions),
+                market_cycles={market: cycle.as_dict() for market, cycle in cycles.items()},
             )
         except Exception as exc:  # noqa: BLE001 - recorded and surfaced, never swallowed.
             with self._lock:
@@ -266,32 +323,37 @@ class ContextRuntime:
             return None
         with self._lock:
             self._latest = result
+            self._latest_by_market = cycles
             self._refresh_count += 1
-            self._last_refresh_at = moment
+            self._last_refresh_at = result.captured_at
             self._last_error = None
         return result
 
     # ------------------------------------------------------------------ #
     # source adapters
     # ------------------------------------------------------------------ #
-    def build_global_context(self, moment: datetime) -> GlobalContext:
+    def build_global_context(
+        self, moment: datetime, *, market: str | None = None,
+        observations: Sequence[IndicatorObservation] | None = None,
+    ) -> GlobalContext:
         """Global indicators from whatever the research collectors actually stored.
 
         Every observation is registered with the freshness registry, so a macro series
         that stopped updating shows up as DEGRADED on the data-health endpoint instead of
         quietly continuing to contribute its last value at full weight.
         """
-        observations = list(self._macro_observations(moment))
+        observations = list(observations if observations is not None else self._macro_observations(moment))
         for observation in observations:
+            processed_at = _utcnow()
             self._freshness.record_event(
                 "global_indicator",
                 "index_level",
                 observation.observed_at,
                 scope_key=observation.name,
                 received_time=moment,
-                processed_time=moment,
+                processed_time=processed_at,
             )
-        return self._global_builder.build(observations, captured_at=moment)
+        return self._global_builder.build(observations, captured_at=moment, market=market or self._market_group)
 
     def _macro_observations(self, moment: datetime) -> Iterable[IndicatorObservation]:
         try:
@@ -302,6 +364,9 @@ class ContextRuntime:
             return ()
         by_indicator: dict[str, list[Any]] = {}
         for record in records or ():
+            observed = _parse_datetime(getattr(record, "observed_at", None))
+            if observed is None or observed > moment:
+                continue
             indicator = _MACRO_SERIES_TO_INDICATOR.get(str(getattr(record, "name", "")))
             if indicator is None:
                 continue
@@ -326,7 +391,7 @@ class ContextRuntime:
                 IndicatorObservation(
                     name=indicator,
                     value=value,
-                    observed_at=_parse_datetime(latest.observed_at) or moment,
+                    observed_at=_parse_datetime(latest.observed_at),
                     source=str(getattr(getattr(latest, "source", None), "source_name", "")),
                     change_ratio=change,
                 )
@@ -339,6 +404,7 @@ class ContextRuntime:
         *,
         global_context: GlobalContext | None,
         candidates: Sequence[CandidateInput],
+        market: str | None = None,
     ):
         """Domestic state from the realtime store, the flow store and the candidates.
 
@@ -348,6 +414,8 @@ class ContextRuntime:
         universe's own breadth beside it, and a caller comparing the two can see that the
         first is derived from the second.
         """
+        market = market or self._market_group
+        candidates = tuple(item for item in candidates if _candidate_market(item) == market)
         frame = self._macro_frame(moment, candidates)
         advancing = declining = 0
         for value in (frame.per_symbol_return or {}).values():
@@ -359,8 +427,8 @@ class ContextRuntime:
             elif number < 0:
                 declining += 1
 
-        flows = self._investor_flows(candidates)
-        venues = self._venue_quotes(moment, candidates)
+        flows = self._investor_flows(candidates, moment=moment) if market == "KR" else {}
+        venues = self._venue_quotes(moment, candidates) if market == "KR" else ()
         if frame.timestamp is not None:
             self._freshness.record_event(
                 "internal",
@@ -369,11 +437,11 @@ class ContextRuntime:
                 received_time=moment,
                 processed_time=moment,
             )
-        return self._domestic_builder.build(
+        context = self._domestic_builder.build(
             DomesticContextInputs(
                 kospi_return=_finite(frame.index_trend),
-                advancing_count=advancing or None,
-                declining_count=declining or None,
+                advancing_count=advancing if frame.per_symbol_return else None,
+                declining_count=declining if frame.per_symbol_return else None,
                 breadth_momentum=_finite(frame.breadth_momentum),
                 total_trading_value=_finite(frame.total_trading_value),
                 realized_volatility=_finite(frame.market_volatility),
@@ -389,6 +457,10 @@ class ContextRuntime:
             captured_at=moment,
             global_context=global_context,
         )
+        return replace(context, market=market, reason_codes=tuple(dict.fromkeys((
+            *context.reason_codes, "LOCAL_INDEX_IS_TRACKED_UNIVERSE_PROXY",
+            *(("US_INVESTOR_CLASS_FLOW_UNAVAILABLE",) if market == "US" else ()),
+        ))))
 
     def build_sector_contexts(
         self,
@@ -397,6 +469,7 @@ class ContextRuntime:
         candidates: Sequence[CandidateInput],
         global_context: GlobalContext | None,
         domestic_context,
+        market: str | None = None,
     ) -> tuple[SectorContext, ...]:
         by_sector: dict[str, list[CandidateInput]] = {}
         for candidate in candidates:
@@ -425,6 +498,7 @@ class ContextRuntime:
                         for member in members
                     ],
                     captured_at=moment,
+                    market_group=market or self._market_group,
                     market_return=_finite(market_return),
                     domestic_context=domestic_context,
                     global_context=global_context,
@@ -452,7 +526,15 @@ class ContextRuntime:
             from app.data.realtime_store import RealtimeMarketDataStore
 
             store = RealtimeMarketDataStore()
-            symbols = store.active_symbols(moment - timedelta(minutes=10), limit=40)
+            # Candidate discovery and the critical gate must use the same age
+            # contract.  Keeping ten minutes of rotating symbols here guaranteed
+            # that most displayed candidates were already beyond the realtime
+            # policy's 15-second stale limit before evaluation even began.
+            realtime_policy = self._freshness.policy_for("kis_realtime", "trade")
+            maximum_age = max(1.0, realtime_policy.degraded_max_age_seconds)
+            symbols = store.active_symbols(
+                moment - timedelta(seconds=maximum_age), limit=40
+            )
         except Exception:  # noqa: BLE001 - no feed, no candidates.
             return ()
         candidates: list[CandidateInput] = []
@@ -464,14 +546,17 @@ class ContextRuntime:
                 continue
             if tick is None:
                 continue
-            age = (moment - tick.received_at).total_seconds()
+            observed_now = _utcnow()
+            age = max(0.0, (observed_now - tick.received_at).total_seconds())
+            if age > maximum_age:
+                continue
             self._freshness.record_event(
                 "kis_realtime",
                 "trade",
                 tick.exchange_timestamp,
                 scope_key=symbol,
                 received_time=tick.received_at,
-                processed_time=moment,
+                processed_time=observed_now,
             )
             if book is not None:
                 self._freshness.record_event(
@@ -480,12 +565,12 @@ class ContextRuntime:
                     book.exchange_timestamp,
                     scope_key=symbol,
                     received_time=book.received_at,
-                    processed_time=moment,
+                    processed_time=_utcnow(),
                 )
             candidates.append(
                 CandidateInput(
                     ticker=symbol,
-                    market_group=self._market_group,
+                    market_group="KR" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US",
                     spread_bps=_finite(getattr(book, "spread_bps", None)),
                     orderbook_imbalance=_finite(getattr(book, "imbalance", None)),
                     reference_price=_finite(tick.price),
@@ -541,8 +626,11 @@ class ContextRuntime:
             )
 
     def _investor_flows(
-        self, candidates: Sequence[CandidateInput]
+        self, candidates: Sequence[CandidateInput], *, moment: datetime | None = None
     ) -> dict[str, float | None]:
+        from zoneinfo import ZoneInfo
+
+        moment = moment or _utcnow()
         try:
             from app.data.investor_flow_store import InvestorFlowStore
 
@@ -551,6 +639,7 @@ class ContextRuntime:
             return {}
         foreign = institution = retail = 0.0
         seen = 0
+        timestamps: list[datetime] = []
         for candidate in candidates:
             try:
                 history = store.history(candidate.ticker)
@@ -558,17 +647,37 @@ class ContextRuntime:
                 continue
             if not history:
                 continue
-            latest = history[-1]
+            usable = []
+            for item in history:
+                try:
+                    # Daily totals become evidence only after that day's close.
+                    # Re-reading a historical row is not a new observation.
+                    observed = datetime.strptime(item.business_date, "%Y%m%d").replace(
+                        hour=15, minute=30, tzinfo=ZoneInfo("Asia/Seoul")
+                    ).astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= (moment - observed).total_seconds() <= 4 * 86400:
+                    usable.append((observed, item))
+            if not usable:
+                continue
+            observed, latest = max(usable, key=lambda pair: pair[0])
+            if any(_finite(getattr(latest, name, None)) is None for name in (
+                "foreign_net_buy_value", "institution_net_buy_value", "retail_net_buy_value"
+            )):
+                continue
             foreign += _finite(getattr(latest, "foreign_net_buy_value", None)) or 0.0
             institution += (
                 _finite(getattr(latest, "institution_net_buy_value", None)) or 0.0
             )
             retail += _finite(getattr(latest, "retail_net_buy_value", None)) or 0.0
             seen += 1
+            timestamps.append(observed)
         if seen == 0:
             return {}
         self._freshness.record_event(
-            "investor_flow", "flow_daily", _utcnow(), processed_time=_utcnow()
+            "investor_flow", "flow_daily", min(timestamps),
+            received_time=moment, processed_time=moment,
         )
         return {"foreign": foreign, "institution": institution, "retail": retail}
 
@@ -633,7 +742,11 @@ class ContextRuntime:
             return {"available": False, "reason": "NO_CYCLE_YET"}
         decision = latest.decisions[0] if latest.decisions else None
         payload = dict(decision.global_context) if decision else {}
-        return {"available": bool(payload), "context": payload}
+        markets = {
+            market: dict(cycle.decisions[0].global_context) if cycle.decisions else {}
+            for market, cycle in self.latest_by_market().items()
+        }
+        return {"available": bool(payload), "context": payload, "markets": markets}
 
     def domestic_view(self) -> dict[str, Any]:
         latest = self.latest()
@@ -641,7 +754,11 @@ class ContextRuntime:
             return {"available": False, "reason": "NO_CYCLE_YET"}
         decision = latest.decisions[0] if latest.decisions else None
         payload = dict(decision.domestic_context) if decision else {}
-        return {"available": bool(payload), "context": payload}
+        markets = {
+            market: dict(cycle.decisions[0].domestic_context) if cycle.decisions else {}
+            for market, cycle in self.latest_by_market().items()
+        }
+        return {"available": bool(payload), "context": payload, "markets": markets}
 
     def sector_view(self, sector: str) -> dict[str, Any]:
         latest = self.latest()
@@ -670,7 +787,10 @@ class ContextRuntime:
         latest = self.latest()
         if latest is None:
             return {"available": False, "reason": "NO_CYCLE_YET"}
-        return {"available": True, **latest.regime.as_dict()}
+        return {
+            "available": True, **latest.regime.as_dict(),
+            "markets": {market: cycle.regime.as_dict() for market, cycle in self.latest_by_market().items()},
+        }
 
     def candidates_view(self, *, limit: int = 50) -> dict[str, Any]:
         latest = self.latest()
@@ -693,6 +813,11 @@ class ContextRuntime:
                     "gate_reasons": list(decision.gate_reasons),
                     "position_multiplier": decision.position_multiplier,
                     "decision_id": decision.decision_id,
+                    "candidate_score": decision.candidate_score,
+                    "candidate_rank": decision.candidate_rank,
+                    "candidate_score_components": dict(
+                        decision.candidate_score_components
+                    ),
                 }
             )
         return {
@@ -738,7 +863,13 @@ class ContextRuntime:
 
     def data_health_view(self, *, now: datetime | None = None) -> dict[str, Any]:
         moment = now or _utcnow()
-        report = self._freshness.report(now=moment)
+        latest = self.latest()
+        active_scopes = (
+            tuple(decision.ticker for decision in latest.decisions)
+            if latest is not None else None
+        )
+        report = self._freshness.report(now=moment, scope_keys=active_scopes)
+        report["retained_stream_count"] = len(self._freshness.readings(now=moment))
         report["order_state"] = self._states.summary()
         report["cycle_stale"] = self.is_stale(now=moment)
         return report
@@ -868,7 +999,11 @@ class ContextRuntime:
         us = build_temporal_snapshot("US", moment)
         latest = self.latest()
         model = self._gnn.health(now=moment)
-        data = self._freshness.report(now=moment)
+        active_scopes = (
+            tuple(decision.ticker for decision in latest.decisions)
+            if latest is not None else None
+        )
+        data = self._freshness.report(now=moment, scope_keys=active_scopes)
         blocking = list(data.get("blocking_reasons", []))
         data_state = str(data.get("worst_state") or "UNKNOWN").upper()
         data_stale = data_state == "STALE"

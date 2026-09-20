@@ -193,8 +193,14 @@ class ProfitabilityGateTest(unittest.TestCase):
         self.assertIn("LIQUIDITY_TOO_LOW", decision.rejection_reasons)
 
     def test_required_min_net_return_is_dynamic(self) -> None:
-        # Higher realized volatility raises the required minimum net return.
-        gate = _gate()
+        # Exercise the mechanism explicitly. Deployment policy currently sets the
+        # volatility buffer to zero for one-share live probing.
+        gate = _gate(
+            min_required_net_return={"default": 0.0, "KR": 0.0, "US": 0.0},
+            min_net_profit_buffer_rate=0.0,
+            volatility_buffer_k=0.25,
+            liquidity_buffer_max=0.0,
+        )
         calm = gate.evaluate(
             ProfitabilityInput(symbol="A", market="KR", entry_price=10_000, expected_exit_price=10_200, quantity=1, spread_rate=0.0005, liquidity_score=0.9, realized_volatility=0.0)
         )

@@ -7,6 +7,12 @@
 추측하거나 기억에서 채운 값은 없다. 인용 위치는 각 절의 `출처` 항목에 시트명으로 기록한다.
 
 **검증 일자:** 2026-08-04
+**NXT 연속체결 시각 재검증:** 2026-09-20 (`calendar_version=2026-09-20.1`).
+거래소 [NXT 거래제도](https://nextrade.co.kr/en/transactionSys/content.do)와
+한국투자증권 [최선집행기준](https://file.koreainvestment.com/Storage/customer/guide/regards/nxt01.html)을 대조했다.
+메인마켓은 09:00:30 시작이며, 애프터마켓은 15:30 주문접수 후 15:40 연속체결 시작이다.
+본 시스템은 NXT 애프터 시작 단일가 전략을 구현하지 않으므로 15:30~15:40 신규 연속매매 진입을 허용하지 않는다.
+이번 수정은 거래시간 판정만 변경하며 세션별 `live_order_authorized=false`를 유지한다.
 **verification_source 식별자:** `KIS_OPENAPI_WORKBOOK_20260625`
 **미검증 항목 표기:** `UNVERIFIED` — 데이터 수집만 허용(DATA_ONLY), 신규 주문 fail-closed.
 
@@ -208,8 +214,8 @@ forward label 생성에는 사용하지 않는다.
 | `KRX_AFTER_CLOSE` | KRX | 15:40–16:00 | `H0STOUP0`,`H0STOAA0` | order-cash | `06` | X | O |
 | `KRX_AFTER_SINGLE_PRICE` | KRX | 16:00–18:00 | `H0STOUP0`,`H0STOAA0` | order-cash | `07` | X | O |
 | `NXT_PRE` | NXT | 08:00–08:50 | `H0NXCNT0`,`H0NXASP0` | order-cash `EXCG=NXT` | `00` | X | O |
-| `NXT_REGULAR` | NXT | 09:00–15:20 | `H0NXCNT0`,`H0NXASP0` | order-cash `EXCG=NXT` | `00` | X | O |
-| `NXT_POST` | NXT | 15:30–20:00 | `H0NXCNT0`,`H0NXASP0` | order-cash `EXCG=NXT` | `00` | X | O |
+| `NXT_REGULAR` | NXT | 09:00:30–15:20 | `H0NXCNT0`,`H0NXASP0` | order-cash `EXCG=NXT` | `00` | X | O |
+| `NXT_POST` | NXT | 15:40–20:00 (15:30~15:40 접수단계 제외) | `H0NXCNT0`,`H0NXASP0` | order-cash `EXCG=NXT` | `00` | X | O |
 | (통합 피드) | KRX_NXT_UNIFIED | 08:00–20:00 | `H0UNCNT0`,`H0UNASP0` | **주문 route 없음** | — | X | X |
 | `KR_CLOSED` | — | 그 외 | REST snapshot only | 없음 | — | X | X |
 

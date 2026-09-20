@@ -432,7 +432,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
             client,
             idempotency_store=IdempotencyStore(Path(tmp) / "idempotency.jsonl"),
             journal=LiveOrderJournal(Path(tmp) / "live-orders.jsonl"),
-            execution_config=load_order_execution_config("config/order_execution.json"),
+            execution_config=load_order_execution_config("config/order_execution.example.json"),
         )
         # These tests exercise ROUTING — TR ids, endpoints, order divisions — at arbitrary
         # wall-clock times. The per-order ExecutionGuard would refuse every one of them

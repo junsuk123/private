@@ -151,8 +151,8 @@ def test_corrected_session_and_spread_rules_do_not_inherit_spec_v2_outcomes(
     registry: StrategyRegistry,
 ) -> None:
     assert registry.require("gap_context").algorithm_version == (
-        "gap-context-v3-opening-window"
+        "gap-context-v4-opening-aligned-horizon"
     )
     assert registry.require("liquidity_shock_reversal").algorithm_version == (
-        "liquidity-shock-v3-observed-spread"
+        "liquidity-shock-v4-quarantined-negative-edge"
     )

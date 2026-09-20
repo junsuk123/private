@@ -33,6 +33,12 @@ class FeatureBuilderConfig:
     vol_recent_window: int = 5
     rvgi_period: int = 10
     box_lookback: int = 20
+    ma_short: int = 20
+    ma_medium: int = 50
+    ma_long: int = 200
+    ma_slope_lookback: int = 5
+    momentum_long_window: int = 200
+    momentum_skip_recent: int = 20
 
 
 def _orderbook_field(orderbook: Mapping[str, float] | object, name: str) -> float | None:
@@ -73,6 +79,23 @@ def build_technical_feature_set(
 
     ema_fast = ti.ema(close_vals, cfg.ema_fast)
     ema_slow = ti.ema(close_vals, cfg.ema_slow)
+    ma20 = ti.sma(close_vals, cfg.ma_short)
+    ma50 = ti.sma(close_vals, cfg.ma_medium)
+    ma200 = ti.sma(close_vals, cfg.ma_long)
+    ma50_slope_bps = ti.ma_slope_bps(
+        bars, cfg.ma_medium, cfg.ma_slope_lookback
+    ) if bars else None
+    ma200_slope_bps = ti.ma_slope_bps(
+        bars, cfg.ma_long, cfg.ma_slope_lookback
+    ) if bars else None
+    momentum_long_ex_recent = None
+    long_window = max(2, int(cfg.momentum_long_window))
+    skip_recent = max(1, int(cfg.momentum_skip_recent))
+    if len(close_vals) > long_window and len(close_vals) > skip_recent:
+        anchor = float(close_vals[-long_window - 1])
+        endpoint = float(close_vals[-skip_recent - 1])
+        if anchor > 0.0:
+            momentum_long_ex_recent = endpoint / anchor - 1.0
     macd_res = ti.macd(close_vals)
     boll = ti.bollinger(close_vals, cfg.bb_period)
     rsi_val = ti.rsi(close_vals, cfg.rsi_period)
@@ -173,6 +196,12 @@ def build_technical_feature_set(
         price=last_price,
         ema_fast=ema_fast,
         ema_slow=ema_slow,
+        ma20=ma20,
+        ma50=ma50,
+        ma200=ma200,
+        ma50_slope_bps=ma50_slope_bps,
+        ma200_slope_bps=ma200_slope_bps,
+        momentum_long_ex_recent=momentum_long_ex_recent,
         macd=macd_res.macd if macd_res.ok else None,
         macd_signal=macd_res.signal if macd_res.ok else None,
         macd_histogram=macd_res.histogram if macd_res.ok else None,
@@ -281,6 +310,12 @@ def technical_feature_set_from_live_frame(frame, symbol: str = "") -> TechnicalF
         price=price,
         ema_fast=slow("ema_fast", ema_fast),
         ema_slow=slow("ema_slow", ema_slow),
+        ma20=slow("ma20"),
+        ma50=slow("ma50"),
+        ma200=slow("ma200"),
+        ma50_slope_bps=slow("ma50_slope_bps"),
+        ma200_slope_bps=slow("ma200_slope_bps"),
+        momentum_long_ex_recent=slow("momentum_long_ex_recent"),
         macd=slow("macd"),
         macd_signal=slow("macd_signal"),
         macd_histogram=slow("macd_histogram", g("macd_histogram")),

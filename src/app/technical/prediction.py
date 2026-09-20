@@ -210,8 +210,8 @@ class CostViabilityPolicy:
     downstream code reports as "no edge".
     """
 
-    min_cost_coverage_ratio: float = 1.3
-    minimum_net_buffer_bps: float = 2.0
+    min_cost_coverage_ratio: float = 1.0
+    minimum_net_buffer_bps: float = 0.0
     #: Per-strategy empirical floors, bps. Only measured values belong here.
     empirical_strategy_floor_bps: Mapping[str, float] = field(default_factory=dict)
 

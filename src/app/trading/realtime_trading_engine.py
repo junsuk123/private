@@ -40,8 +40,10 @@ from app.data.realtime_types import KIS_REALTIME_SOURCE
 from app.storage.execution_quality_store import ExecutionQualityStore
 from app.schemas.domain import AccountSnapshot, FinalOrder, Holding, OrderSide, OrderType
 from app.trading.strategy_supervisor import (
+    HaltLevel,
     StrategySupervisor,
     SupervisorObservation,
+    SupervisorVerdict,
 )
 
 
@@ -57,6 +59,70 @@ def _env_int(name: str, default: int) -> int:
         return int(float(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
+
+
+@dataclass(frozen=True)
+class _DailyLossBudget:
+    currency: str
+    realized_pnl: float | None
+    threshold: float | None
+    realized_pnl_krw: float | None
+    threshold_krw: float | None
+    valuation_complete: bool
+    blocked: bool
+    reason: str | None = None
+
+
+def _daily_loss_budget(account: AccountSnapshot) -> _DailyLossBudget:
+    """One measured denomination and the tighter positive cap for both gates."""
+    from app.market_affordability import currency_conversion_rate
+    from app.portfolio import _valuation
+
+    base = str(getattr(account, "base_currency", "KRW") or "KRW").upper()
+    currency = "KRW" if (
+        getattr(account, "total_equity_krw", None) is not None
+        or getattr(account, "cash_equivalent_krw", None) is not None
+    ) else base
+
+    def unknown(reason: str) -> _DailyLossBudget:
+        return _DailyLossBudget(currency, None, None, None, None, False, True, reason)
+
+    try:
+        valuation = _valuation(account)
+        if not valuation.complete or not math.isfinite(valuation.equity):
+            return unknown("ACCOUNT_VALUATION_INCOMPLETE")
+        realized = float(account.realized_pnl_today)
+        rate = currency_conversion_rate(account, base, currency)
+        if not math.isfinite(realized) or (realized != 0.0 and rate is None):
+            return unknown("DAILY_REALIZED_PNL_VALUATION_UNKNOWN")
+        realized *= rate or 1.0
+        absolute_krw = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0)
+        fraction = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0)
+        if not all(math.isfinite(value) and value >= 0 for value in (absolute_krw, fraction)):
+            return unknown("DAILY_LOSS_LIMIT_CONFIG_INVALID")
+        limits = []
+        if absolute_krw > 0:
+            krw_to_common = currency_conversion_rate(account, "KRW", currency)
+            if krw_to_common is None:
+                return unknown("DAILY_LOSS_LIMIT_FX_UNKNOWN")
+            limits.append(absolute_krw * krw_to_common)
+        if fraction > 0:
+            if valuation.equity <= 0:
+                return unknown("ACCOUNT_EQUITY_NOT_POSITIVE")
+            limits.append(valuation.equity * fraction)
+        if not math.isfinite(realized) or any(not math.isfinite(value) for value in limits):
+            return unknown("DAILY_LOSS_VALUATION_NOT_FINITE")
+        threshold = min(limits) if limits else None
+        to_krw = currency_conversion_rate(account, currency, "KRW")
+        realized_krw = realized * to_krw if to_krw is not None else (0.0 if realized == 0 else None)
+        threshold_krw = threshold * to_krw if threshold is not None and to_krw is not None else None
+        if any(value is not None and not math.isfinite(value) for value in (realized_krw, threshold_krw)):
+            return unknown("DAILY_LOSS_VALUATION_NOT_FINITE")
+        blocked = threshold is not None and realized <= -threshold
+        reason = f"DAILY_REALIZED_LOSS_BUY_STOP:{realized:.2f}<={-threshold:.2f}:{currency}" if blocked else None
+        return _DailyLossBudget(currency, realized, threshold, realized_krw, threshold_krw, True, blocked, reason)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return unknown("ACCOUNT_VALUATION_INCOMPLETE")
 
 
 def _freshest_market_data_age_seconds(
@@ -618,6 +684,12 @@ class RealtimeTradingEngine:
             return summary
 
         held_tickers = {h.ticker for h in (account.holdings or ())}
+        # An accepted limit order is not terminal.  The submit-time status probe
+        # often observes OPEN, so keep reconciling tracked broker orders on later
+        # cycles.  Without this, a passive BUY could hold the global duplicate-
+        # order lock forever and a SELL fill could remain invisible to the owned
+        # strategy session until the process restarted.
+        self._reconcile_open_orders_async()
         self._trace_stage(
             "account",
             "계좌 상태 확인",
@@ -658,22 +730,19 @@ class RealtimeTradingEngine:
             # report ``buy_enabled=true`` alongside a stale supervisor halt even
             # though candidate discovery is already running normally.
             self._buy_disabled_reason = None
-        realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
-        account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
-        daily_loss_stop_krw = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0))
-        daily_loss_stop_rate = max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0))
-        daily_loss_threshold = max(daily_loss_stop_krw, account_equity * daily_loss_stop_rate)
-        if buy_enabled and daily_loss_threshold > 0.0 and realized_pnl_today <= -daily_loss_threshold:
+        daily_loss = _daily_loss_budget(account)
+        if buy_enabled and daily_loss.blocked:
             buy_enabled = False
-            self._buy_disabled_reason = (
-                f"DAILY_REALIZED_LOSS_BUY_STOP:{realized_pnl_today:.0f}<={-daily_loss_threshold:.0f}"
-            )
+            self._buy_disabled_reason = daily_loss.reason
         # Display-only telemetry for the account dashboard profitability panel.
         # These are read-model fields; they do not influence any trading decision.
-        summary["realized_pnl_today_krw"] = realized_pnl_today
-        summary["daily_loss_budget_krw"] = daily_loss_threshold if daily_loss_threshold > 0.0 else None
+        summary["realized_pnl_today_krw"] = daily_loss.realized_pnl_krw
+        summary["daily_loss_budget_krw"] = daily_loss.threshold_krw
+        summary["daily_loss_currency"] = daily_loss.currency
+        summary["daily_loss_valuation_complete"] = daily_loss.valuation_complete
         summary["daily_loss_budget_remaining_krw"] = (
-            max(0.0, daily_loss_threshold + realized_pnl_today) if daily_loss_threshold > 0.0 else None
+            max(0.0, daily_loss.threshold_krw + daily_loss.realized_pnl_krw)
+            if daily_loss.threshold_krw is not None and daily_loss.realized_pnl_krw is not None else None
         )
         summary["live_armed"] = buy_enabled
         summary["liquidation_requested"] = liquidation_mode
@@ -757,9 +826,18 @@ class RealtimeTradingEngine:
         # Discovery deliberately supplies a reserve. Apply all symbol-local
         # exclusions first, then cap the usable universe. This is the backfill step
         # that was missing: four cooldowns no longer consume four of eight slots.
-        cycle_buy_candidates = tuple(
-            eligible_candidates[: self.config.max_buy_evaluations_per_cycle]
+        from app.data.multi_market_stream import fair_market_symbols, market_group
+
+        # Alternate the first market across cycles, including a one-slot budget.
+        first_market = getattr(self, "_candidate_first_market", "KR")
+        self._candidate_first_market = "US" if first_market == "KR" else "KR"
+        cycle_buy_candidates = fair_market_symbols(
+            eligible_candidates, self.config.max_buy_evaluations_per_cycle, first=first_market
         )
+        summary["candidate_counts_by_market"] = {
+            group: sum(market_group(s) == group for s in cycle_buy_candidates)
+            for group in ("KR", "US")
+        }
         summary["candidate_pool_count_before_exclusions"] = (
             len(eligible_candidates)
             + len(loss_candidates)
@@ -1833,12 +1911,7 @@ class RealtimeTradingEngine:
 
             ontology_allows = macro_strategy_permitted(strategy_id, allowed, blocked)
 
-        realized_pnl_today = float(getattr(account, "realized_pnl_today", 0.0) or 0.0)
-        account_equity = max(1.0, float(getattr(account, "equity", 0.0) or 0.0))
-        daily_limit = max(
-            max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0)),
-            account_equity * max(0.0, _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0)),
-        )
+        daily_loss = _daily_loss_budget(account)
 
         verdict = self.strategy_supervisor.evaluate(
             SupervisorObservation(
@@ -1865,10 +1938,22 @@ class RealtimeTradingEngine:
                     else None
                 ),
                 realized_volatility=self._symbol_realtime_volatility_safe(symbol, decision_time),
-                daily_realized_loss=realized_pnl_today,
-                daily_loss_limit=daily_limit or None,
+                daily_realized_loss=daily_loss.realized_pnl,
+                daily_loss_limit=daily_loss.threshold,
             )
         )
+        if not daily_loss.valuation_complete:
+            # Unknown FX blocks more exposure, but is not evidence that an
+            # existing position must be liquidated at an unverified price.
+            reason = daily_loss.reason or "ACCOUNT_VALUATION_INCOMPLETE"
+            verdict = SupervisorVerdict(
+                level=verdict.level if verdict.forces_exit else HaltLevel.SOFT,
+                symbol=symbol, as_of=decision_time,
+                reason_codes=tuple(dict.fromkeys((*verdict.reason_codes, reason))),
+                hard_reason_codes=verdict.hard_reason_codes,
+                soft_reason_codes=tuple(dict.fromkeys((*verdict.soft_reason_codes, reason))),
+                diagnostics={**dict(verdict.diagnostics), "daily_loss_valuation_complete": False},
+            )
         if verdict.forces_exit and phase in {"ARMED", "ENTERING", "OWNED"}:
             self.strategy_session_manager.request_halt(
                 symbol, verdict.level.value, verdict.hard_reason_codes
@@ -1960,6 +2045,22 @@ class RealtimeTradingEngine:
     ) -> bool:
         # 제출을 시도한 순간부터 쿨다운 시작(성공/차단/에러 무관) — 매초 재제출 방지.
         self._last_submit_monotonic[order.ticker] = time.monotonic()
+        strategy_id = ""
+        trade_plan_id = ""
+        for reason in tuple(reason_codes or ()):
+            text = str(reason)
+            if "STRATEGY_OWNED:" in text:
+                strategy_id = text.split("STRATEGY_OWNED:", 1)[1].split(";", 1)[0].strip()
+            if text.startswith("TRADE_PLAN:"):
+                trade_plan_id = text.split("TRADE_PLAN:", 1)[1].split(";", 1)[0].strip()
+        if not strategy_id and self.strategy_session_manager is not None:
+            try:
+                session = self.strategy_session_manager.snapshot() or {}
+                if str(session.get("selected_symbol") or "").upper() == str(order.ticker).upper():
+                    strategy_id = str(session.get("selected_strategy") or "").strip()
+                    trade_plan_id = trade_plan_id or str(session.get("trade_plan_id") or "").strip()
+            except Exception:  # noqa: BLE001 - attribution cannot change execution.
+                pass
         event: dict[str, Any] = {
             "at": decision_time.isoformat(),
             "symbol": order.ticker,
@@ -1968,6 +2069,8 @@ class RealtimeTradingEngine:
             "quantity": order.quantity,
             "limit_price": order.limit_price,
             "reason": ";".join(reason_codes or ()),
+            "strategy_id": strategy_id or None,
+            "trade_plan_id": trade_plan_id or None,
         }
         if pricing_diag:
             # Execution diagnostics for GUI/logging: pricing policy, reference vs final
@@ -2038,12 +2141,6 @@ class RealtimeTradingEngine:
             }
         self._record_submitted_order_for_performance(order, side)
         self._record(event)
-        strategy_id = ""
-        for reason in tuple(reason_codes or ()):
-            marker = "STRATEGY_OWNED:"
-            if marker in str(reason):
-                strategy_id = str(reason).split(marker, 1)[1].split(";", 1)[0].strip()
-                break
         journal = getattr(self.coordinator, "journal", None)
         if journal is not None and hasattr(journal, "record"):
             try:
@@ -2057,6 +2154,7 @@ class RealtimeTradingEngine:
                         "quantity": order.quantity,
                         "limit_price": order.limit_price,
                         "strategy_id": strategy_id or None,
+                        "trade_plan_id": trade_plan_id or None,
                         "reason_codes": tuple(reason_codes or ()),
                     },
                 )
@@ -2106,13 +2204,62 @@ class RealtimeTradingEngine:
     def _poll_submitted_order_status_async(
         self, broker_order_id: str, symbol: str, order: FinalOrder | None = None
     ) -> None:
+        now = time.monotonic()
+        poll_interval = max(1.0, _env_float("REALTIME_ORDER_STATUS_POLL_INTERVAL_SEC", 5.0))
+        with self._lock:
+            tracked = self._tracked_order_unlocked(symbol, broker_order_id)
+            if tracked is None:
+                return
+            if bool(tracked.get("status_poll_inflight")):
+                return
+            last_poll = float(tracked.get("last_status_poll_monotonic") or 0.0)
+            if last_poll > 0.0 and now - last_poll < poll_interval:
+                return
+            tracked["status_poll_inflight"] = True
+            tracked["last_status_poll_monotonic"] = now
         thread = threading.Thread(
-            target=self._poll_submitted_order_status,
+            target=self._poll_submitted_order_status_and_release,
             args=(broker_order_id, symbol, order),
             name=f"order-status-{symbol}-{broker_order_id}",
             daemon=True,
         )
         thread.start()
+
+    def _tracked_order_unlocked(
+        self, symbol: str, broker_order_id: str
+    ) -> dict[str, Any] | None:
+        for registry in (self._open_buy_orders, self._open_sell_orders):
+            tracked = registry.get(symbol)
+            if tracked is not None and str(tracked.get("broker_order_id") or "") == broker_order_id:
+                return tracked
+        return None
+
+    def _poll_submitted_order_status_and_release(
+        self, broker_order_id: str, symbol: str, order: FinalOrder | None = None
+    ) -> None:
+        try:
+            self._poll_submitted_order_status(broker_order_id, symbol, order)
+        finally:
+            with self._lock:
+                tracked = self._tracked_order_unlocked(symbol, broker_order_id)
+                if tracked is not None:
+                    tracked["status_poll_inflight"] = False
+
+    def _reconcile_open_orders_async(self) -> None:
+        """Schedule throttled broker reconciliation for every non-terminal order."""
+        with self._lock:
+            tracked_orders = tuple(
+                (
+                    str(item.get("broker_order_id") or ""),
+                    symbol,
+                    item.get("order"),
+                )
+                for registry in (self._open_buy_orders, self._open_sell_orders)
+                for symbol, item in registry.items()
+            )
+        for broker_order_id, symbol, order in tracked_orders:
+            if broker_order_id:
+                self._poll_submitted_order_status_async(broker_order_id, symbol, order)
 
     def _poll_submitted_order_status(
         self, broker_order_id: str, symbol: str, order: FinalOrder | None = None
@@ -2149,10 +2296,31 @@ class RealtimeTradingEngine:
                 marker = getattr(self.strategy_session_manager, "mark_exit_filled", None)
                 if callable(marker):
                     marker(symbol, fill_price, fill_time)
+        if observed_status == "FILLED" and raw_side == "BUY":
+            manager = self.strategy_session_manager
+            if manager is not None:
+                marker = getattr(manager, "note_plan_entry_fill", None)
+                if callable(marker):
+                    filled_quantity = int(
+                        getattr(raw, "quantity", 0)
+                        or getattr(order, "quantity", 0)
+                        or 0
+                    )
+                    resolved_fill_price = float(
+                        fill_price or getattr(order, "limit_price", 0.0) or 0.0
+                    )
+                    if filled_quantity > 0 and resolved_fill_price > 0.0:
+                        marker(symbol, resolved_fill_price, filled_quantity)
         terminal = observed_status in {"FILLED", "CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
         if terminal and raw_side == "BUY":
             with self._lock:
                 self._open_buy_orders.pop(symbol, None)
+            if observed_status != "FILLED" and self.strategy_session_manager is not None:
+                marker = getattr(
+                    self.strategy_session_manager, "mark_entry_terminal", None
+                )
+                if callable(marker):
+                    marker(symbol, observed_status, fill_time)
         if terminal:
             self._open_sell_orders.pop(symbol, None)
             # Broker account snapshots can lag a terminal order status. Keep the

@@ -28,11 +28,6 @@ from app.routing.shadow_intelligence import (
 logger = logging.getLogger(__name__)
 
 
-#: Idle wait between bus polls. Long enough that an empty bus costs nothing,
-#: short enough that ``collector.done()`` is still noticed promptly.
-_BUS_IDLE_WAIT_SECONDS = 0.25
-
-
 #: 해외(미국) 실시간 TR 쌍과 세션 인식 subscription key. 값의 근거는
 #: ``docs/kis_market_session_capability_matrix.md`` §4.
 _OVERSEAS_SUBSCRIPTION_TR_IDS = ("HDFSCNT0", "HDFSASP0")
@@ -75,35 +70,11 @@ async def run_event_driven_kis_websocket_collector(
 ) -> dict[str, Any]:
     """Run KIS ingestion with DB work outside the WebSocket callback."""
     store = collector_kwargs.pop("store", None) or RealtimeMarketDataStore()
-    quant_sink = collector_kwargs.pop("quant_sink", None)
-    quant_activation: dict[str, Any]
-    if quant_sink is None:
-        try:
-            from app.quant.runtime import build_quant_sink
-
-            quant_sink, decision = build_quant_sink(market_store=store)
-            quant_activation = decision.as_dict()
-        except Exception as exc:  # noqa: BLE001 - optional evidence cannot stop KIS ingestion.
-            quant_activation = {
-                "enabled": False,
-                "mode": "auto",
-                "conditions": [],
-                "unavailable_reason": f"{type(exc).__name__}:{exc}",
-            }
-            logger.exception("quant reference layer initialization failed; KIS ingestion continues")
-    else:
-        quant_activation = {
-            "enabled": True,
-            "mode": "injected",
-            "conditions": ["injected_sink"],
-            "unavailable_reason": None,
-        }
     bus = BoundedMarketEventBus(event_bus_capacity)
     runtime = EventDrivenMarketRuntime(
         bus,
         store=store,
         persistence_capacity=persistence_capacity,
-        completed_bar_sink=quant_sink,
     )
     workers = [
         asyncio.create_task(runtime_persistence_worker(runtime))
@@ -118,7 +89,7 @@ async def run_event_driven_kis_websocket_collector(
         if flags.ontology_router or flags.gnn_shadow
         else None
     )
-    slow_queue: "asyncio.Queue[_SlowSnapshotRequest] | None" = (
+    slow_queue: asyncio.Queue[_SlowSnapshotRequest] | None = (
         asyncio.Queue(maxsize=64) if slow_service is not None else None
     )
     slow_worker = (
@@ -150,19 +121,6 @@ async def run_event_driven_kis_websocket_collector(
                     symbol = str(getattr(event, "symbol", "") or "")
                     now_monotonic = time.monotonic()
                     last_enqueued = slow_snapshot_last_enqueued.get(symbol, 0.0)
-                    # Only the cheap in-memory part happens here. Building the
-                    # full snapshot used to run on this event loop, and it issues
-                    # several SQLite queries against an 8GB store
-                    # (``_slow_context_bars`` -> ``recent_minute_bars``). At one
-                    # per second per symbol across six subscribed symbols that
-                    # consumed the loop, so the websocket reader sharing it never
-                    # got to call ``recv()``: the socket stayed ESTABLISHED with
-                    # the kernel receive queue climbing and US market data
-                    # stopped ~70s after every reconnect, with nothing raised.
-                    # Confirmed by a SIGUSR1 thread dump showing this loop parked
-                    # in ``recent_minute_bars``. The store work now happens in the
-                    # slow worker's thread. See
-                    # [[obaits-collector-busywait-starves-websocket]].
                     request = (
                         _slow_snapshot_request(runtime)
                         if symbol
@@ -177,10 +135,7 @@ async def run_event_driven_kis_websocket_collector(
                                 slow_queue.task_done()
                         slow_queue.put_nowait(request)
             else:
-                # Not ``sleep(0)``: that is a bare yield, so this loop spun as
-                # fast as the interpreter could run it and starved the websocket
-                # reader sharing this event loop. Wait for the producer instead.
-                await bus.wait_for_depth(_BUS_IDLE_WAIT_SECONDS)
+                await bus.wait_for_depth(0.25)
         counts = await collector
         await runtime.wait_for_persistence()
         if slow_queue is not None:
@@ -201,11 +156,6 @@ async def run_event_driven_kis_websocket_collector(
         "event_runtime": vars(runtime.stats()),
         "mode": "event_driven",
         "slow_intelligence_enabled": slow_service is not None,
-        "quant_reference": (
-            {**quant_activation, **quant_sink.health()}
-            if quant_sink is not None and callable(getattr(quant_sink, "health", None))
-            else quant_activation
-        ),
     }
 
 
@@ -221,24 +171,16 @@ async def runtime_persistence_worker(runtime: EventDrivenMarketRuntime) -> None:
 
 async def slow_intelligence_worker(
     service: ShadowIntelligenceService,
-    queue: "asyncio.Queue[_SlowSnapshotRequest]",
+    queue: asyncio.Queue[_SlowSnapshotRequest],
     runtime: EventDrivenMarketRuntime,
 ) -> None:
-    """Build and evaluate slow snapshots entirely off the event loop.
-
-    Both halves run in a worker thread: assembling the snapshot queries the store
-    (which is what stalled the websocket reader when it ran on the loop), and the
-    inference is CPU work. ``_build_slow_snapshot`` only reads
-    ``runtime.store``, which opens its own connection per call, so it is safe
-    here — the mutable runtime state was already sampled on the loop.
-    """
     while True:
         request = await queue.get()
         try:
             try:
-                await asyncio.to_thread(
-                    _build_and_evaluate_slow_snapshot, service, runtime, request
-                )
+                snapshot = await asyncio.to_thread(_build_slow_snapshot, runtime, request)
+                if snapshot is not None:
+                    await asyncio.to_thread(service.evaluate, snapshot)
             except Exception:  # noqa: BLE001 - one bad inference must not kill all future samples.
                 logger.exception(
                     "slow intelligence inference failed for %s",
@@ -248,27 +190,8 @@ async def slow_intelligence_worker(
             queue.task_done()
 
 
-def _build_and_evaluate_slow_snapshot(
-    service: ShadowIntelligenceService,
-    runtime: EventDrivenMarketRuntime,
-    request: "_SlowSnapshotRequest",
-) -> None:
-    snapshot = _build_slow_snapshot(runtime, request)
-    if snapshot is None:
-        return
-    service.evaluate(snapshot)
-
-
 @dataclass(frozen=True)
 class _SlowSnapshotRequest:
-    """Everything sampled from mutable runtime state, frozen on the event loop.
-
-    Split out so the loop touches ONLY in-memory state. The store-backed half of
-    the old ``_slow_snapshot`` (``_runtime_strategy_graph_context``) now runs in
-    the slow worker's thread, where a slow SQLite query costs a delayed shadow
-    evaluation instead of a stalled market-data socket.
-    """
-
     symbol: str
     record_id: str
     now: datetime
@@ -278,10 +201,7 @@ class _SlowSnapshotRequest:
     sequence_uncertain: bool
 
 
-def _slow_snapshot_request(
-    runtime: EventDrivenMarketRuntime,
-) -> _SlowSnapshotRequest | None:
-    """Cheap, in-memory sample of the just-processed event. No store access."""
+def _slow_snapshot_request(runtime: EventDrivenMarketRuntime) -> _SlowSnapshotRequest | None:
     event = runtime.last_processed_event
     if event is None:
         return None
@@ -294,24 +214,21 @@ def _slow_snapshot_request(
         return None
     return _SlowSnapshotRequest(
         symbol=event.symbol,
-        record_id=str(event.record_id),
+        record_id=event.record_id,
         now=now,
         as_of=features.as_of,
-        last_price=float(features.last_price),
-        data_fresh=bool(features.fresh),
-        sequence_uncertain=bool(features.sequence_uncertain),
+        last_price=features.last_price,
+        data_fresh=features.fresh,
+        sequence_uncertain=features.sequence_uncertain,
     )
 
 
 def _build_slow_snapshot(
-    runtime: EventDrivenMarketRuntime, request: _SlowSnapshotRequest
+    runtime: EventDrivenMarketRuntime,
+    request: _SlowSnapshotRequest,
 ) -> SlowIntelligenceSnapshot | None:
-    """Store-backed half. Must run off the event loop — it queries SQLite."""
     values = _runtime_strategy_graph_context(
-        runtime,
-        request.symbol,
-        request.now,
-        request.last_price,
+        runtime, request.symbol, request.now, request.last_price
     )
     if values is None:
         return None
@@ -326,8 +243,14 @@ def _build_slow_snapshot(
         tradable=request.data_fresh and not request.sequence_uncertain,
         allowed_strategy_ids=STRATEGY_IDS,
         feature_schema_name=STRATEGY_GRAPH_CONTEXT_SCHEMA,
-        reference_price=max(0.0, request.last_price),
+        reference_price=max(0.0, float(request.last_price)),
     )
+
+
+def _slow_snapshot(runtime: EventDrivenMarketRuntime) -> SlowIntelligenceSnapshot | None:
+    """Synchronous compatibility wrapper used by diagnostics."""
+    request = _slow_snapshot_request(runtime)
+    return _build_slow_snapshot(runtime, request) if request is not None else None
 
 
 def _runtime_strategy_graph_context(

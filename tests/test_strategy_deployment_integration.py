@@ -20,9 +20,12 @@ import pytest
 
 from app.strategy.catalog import STRATEGY_IDS
 from app.technical.strategy_algorithms import (
+    AlgorithmConfig,
     _DEFAULTS,
     _DEPLOYMENT_GATED_STRATEGIES,
+    build_algorithm_registry,
     strategy_live_authorized,
+    strategy_live_probe_authorized,
     strategy_shadow_authorized,
 )
 from app.trading.strategy_session import _session_structure_context
@@ -72,6 +75,36 @@ def test_established_strategies_also_start_evidence_gated() -> None:
 
 def test_unknown_strategy_is_never_live_authorized() -> None:
     assert strategy_live_authorized("no_such_strategy") is False
+
+
+def test_krx_breakout_has_probe_only_and_us_does_not_inherit_it() -> None:
+    kr = build_algorithm_registry(AlgorithmConfig(market="KR"))
+    us = build_algorithm_registry(AlgorithmConfig(market="US"))
+
+    assert strategy_live_probe_authorized("breakout_volume", registry=kr) is True
+    assert strategy_live_authorized("breakout_volume", registry=kr) is False
+    assert strategy_live_probe_authorized("breakout_volume", registry=us) is False
+
+
+def test_forecast_and_exit_horizons_share_one_contract() -> None:
+    from app.strategy.exit_geometry import exit_geometry
+
+    config = AlgorithmConfig()
+    for strategy_id in (
+        "intraday_momentum",
+        "breakout_volume",
+        "vwap_mean_reversion",
+        "event_momentum",
+        "cross_sectional_relative_strength",
+        "gap_context",
+        "rvgi_box_breakout",
+        "residual_relative_strength",
+        "adaptive_anchored_vwap_reversion",
+        "ofi_microprice_exhaustion_reversal",
+    ):
+        assert int(config.get(strategy_id, "horizon_seconds")) == (
+            exit_geometry(strategy_id).max_holding_seconds
+        )
 
 
 # --------------------------------------------------------------------------- #

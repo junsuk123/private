@@ -40,7 +40,12 @@ from uuid import uuid4
 
 from app.context.domestic_context import DomesticContext
 from app.context.global_context import GlobalContext
-from app.context.regime import RegimeEstimate, RegimeEstimator, RegimeEvidence
+from app.context.regime import (
+    RegimeEstimate,
+    RegimeEstimator,
+    RegimeEvidence,
+    RegimeStabilizer,
+)
 from app.context.sector_context import SectorContext
 from app.context.temporal_context import TemporalSnapshot
 from app.data.freshness import DataFreshnessRegistry
@@ -53,6 +58,11 @@ from app.models.graph_snapshot import (
 )
 from app.risk.final_trade_gate import FinalTradeGate, GateDecision, GateInputs
 from app.routing.regime_strategy_selector import RegimeStrategySelector
+from app.routing.candidate_ranker import (
+    CandidateObservation,
+    CandidateRank,
+    rank_candidates,
+)
 from app.storage.trading_state_store import (
     TradingStateStore,
     default_trading_state_store,
@@ -201,6 +211,9 @@ class DecisionTrace:
     data_health: Mapping[str, Any] = field(default_factory=dict)
     gate_id: str | None = None
     strategy_candidates: tuple[Mapping[str, Any], ...] = ()
+    candidate_score: float | None = None
+    candidate_rank: int | None = None
+    candidate_score_components: Mapping[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -234,6 +247,9 @@ class DecisionTrace:
             "data_health": dict(self.data_health),
             "gate_id": self.gate_id,
             "strategy_candidates": [dict(item) for item in self.strategy_candidates],
+            "candidate_score": self.candidate_score,
+            "candidate_rank": self.candidate_rank,
+            "candidate_score_components": dict(self.candidate_score_components),
         }
 
 
@@ -251,6 +267,7 @@ class CycleResult:
     model_health: GnnHealth | None
     data_health: Mapping[str, Any] = field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()
+    market_cycles: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def approved(self) -> tuple[DecisionTrace, ...]:
@@ -259,6 +276,7 @@ class CycleResult:
     def as_dict(self) -> dict[str, Any]:
         return {
             "cycle_id": self.cycle_id,
+            "markets": dict(self.market_cycles),
             "captured_at": iso_column(self.captured_at),
             "temporal": self.temporal.as_dict(),
             "regime": self.regime.as_dict(),
@@ -299,6 +317,7 @@ class ContextDecisionPipeline:
         self._selector = selector or RegimeStrategySelector()
         self._gate = gate or FinalTradeGate()
         self._regimes = regime_estimator or RegimeEstimator()
+        self._regime_stabilizer = RegimeStabilizer()
         self._freshness = freshness
         self._states = state_machine
         self._persist = bool(persist)
@@ -385,6 +404,12 @@ class ContextDecisionPipeline:
             model_probabilities=model_regime,
             model_version=prediction.model_version if prediction else None,
         )
+        regime = self._regime_stabilizer.stabilize(
+            regime, key=temporal.market_group
+        )
+        candidate_ranks = self._rank_candidates(
+            candidates, regime=regime, prediction=prediction
+        )
 
         # -- per-candidate decisions --------------------------------------------- #
         decisions: list[DecisionTrace] = []
@@ -410,6 +435,7 @@ class ContextDecisionPipeline:
                     trading_halted=trading_halted,
                     data_health=data_health,
                     create_order_intent=create_order_intents,
+                    candidate_rank=candidate_ranks.get(candidate.ticker.upper()),
                 )
             )
 
@@ -455,6 +481,7 @@ class ContextDecisionPipeline:
         trading_halted: bool | None,
         data_health: Mapping[str, Any],
         create_order_intent: bool,
+        candidate_rank: CandidateRank | None,
     ) -> DecisionTrace:
         decision_id = f"dec-{uuid4().hex}"
         model_healthy = bool(health and health.allows_model_evidence)
@@ -562,7 +589,59 @@ class ContextDecisionPipeline:
             },
             gate_id=gate.gate_id,
             strategy_candidates=tuple(item.as_dict() for item in selection.ranked),
+            candidate_score=candidate_rank.score if candidate_rank else None,
+            candidate_rank=candidate_rank.rank if candidate_rank else None,
+            candidate_score_components=(
+                dict(candidate_rank.components) if candidate_rank else {}
+            ),
         )
+
+    @staticmethod
+    def _rank_candidates(
+        candidates: Sequence[CandidateInput],
+        *,
+        regime: RegimeEstimate,
+        prediction: GnnPrediction | None,
+    ) -> dict[str, CandidateRank]:
+        """Cross-sectional WHAT ranking; never authorises an entry."""
+        observations: list[CandidateObservation] = []
+        for candidate in candidates:
+            node = prediction.for_ticker(candidate.ticker) if prediction is not None else None
+            suitability = None
+            if node and isinstance(node.get("strategy_suitability"), Mapping):
+                values = [
+                    float(value) for value in node["strategy_suitability"].values()
+                    if value is not None and math.isfinite(float(value))
+                ]
+                suitability = max(values) if values else None
+            trend = candidate.trend_strength
+            long_trend = (
+                max(0.0, min(1.0, 0.5 + 0.5 * float(trend)))
+                if trend is not None else None
+            )
+            regime_fit = (
+                0.10 if regime.routing_regime == "RISK_OFF"
+                else 0.75 if str(regime.routing_regime or "").startswith("TREND")
+                else 0.50
+            )
+            spread = float(candidate.spread_bps or 0.0)
+            observations.append(
+                CandidateObservation(
+                    symbol=candidate.ticker,
+                    momentum_12_1=candidate.momentum,
+                    realized_volatility=candidate.realized_volatility,
+                    relative_strength=candidate.relative_strength,
+                    long_trend_score=long_trend,
+                    liquidity_score=candidate.liquidity_score,
+                    regime_fit=regime_fit,
+                    ontology_fit=0.5,
+                    gnn_suitability=suitability,
+                    penalties={
+                        "wide_spread": min(0.25, max(0.0, spread - 35.0) / 200.0)
+                    },
+                )
+            )
+        return {item.symbol: item for item in rank_candidates(observations)}
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -810,7 +889,10 @@ class ContextDecisionPipeline:
                                 for name, score in global_context.groups.items()
                             }
                         ),
-                        json_column({}),
+                        json_column({
+                            "market": global_context.market,
+                            "indicator_relations": list(global_context.indicator_relations),
+                        }),
                         json_column(list(global_context.reason_codes)),
                     ),
                 )
@@ -837,7 +919,7 @@ class ContextDecisionPipeline:
                         domestic_context.venue_divergence,
                         domestic_context.confidence,
                         json_column(dict(domestic_context.components)),
-                        json_column({}),
+                        json_column({"market": domestic_context.market}),
                         json_column(list(domestic_context.reason_codes)),
                     ),
                 )

@@ -57,22 +57,47 @@ def _single_writer(target: Path):
     again on startup. An advisory ``flock`` is the right guard because the kernel drops it
     when the holder dies — including on SIGKILL, where no cleanup code of ours would run.
     """
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - Windows has no flock; run unguarded.
-        yield True
-        return
     target.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target.parent / f".{target.stem}.train.lock"
-    handle = lock_path.open("w")
+    handle = lock_path.open("a+b")
+    locked = False
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
+        if sys.platform == "win32":
+            import msvcrt
+
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                yield False
+                return
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield False
+                return
+        locked = True
         yield True
     finally:
+        if locked:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
         handle.close()
 
 
@@ -160,14 +185,18 @@ def main() -> int:
     )
     report["training_examples"] = len(examples)
     if len(examples) < max(1, args.minimum_examples):
-        report["checkpoint"] = None
+        incumbent_exists = Path(args.output).exists()
+        report["checkpoint"] = str(args.output) if incumbent_exists else None
         report["refused"] = (
-            f"only {len(examples)} resolved decisions; "
-            f"{args.minimum_examples} required. The runtime stays OFFLINE, which blocks "
-            "new entries and leaves exits working."
+            f"only {len(examples)} resolved decisions; {args.minimum_examples} required. "
+            + (
+                "The existing checkpoint remains active."
+                if incumbent_exists
+                else "The runtime stays OFFLINE, which blocks new entries and leaves exits working."
+            )
         )
         print(json.dumps(report, indent=2, ensure_ascii=False))
-        return 1
+        return 0 if incumbent_exists else 1
 
     # Example count is not supervision. Decisions that never became fills carry no
     # trade_quality or expected_return label, so those heads would come out of a fit

@@ -82,3 +82,12 @@ config/local_llm.env
 
 # Dry-run and replay reports are run artifacts, not source.
 data/reports/
+
+# Local exports and Synology conflict copies are not source.
+*_Conflict*
+data.zip
+debug_ui.html
+handoff_orderable_krw.json
+*.stackdump
+*.sqlite3-wal
+*.sqlite3-shm

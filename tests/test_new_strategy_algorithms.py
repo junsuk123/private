@@ -95,6 +95,36 @@ def test_sparse_tick_signal_uses_completed_minute_volatility_for_edge():
     assert decision.expected_edge_bps > 0.0
 
 
+def test_opening_range_breakout_is_confined_to_its_session_window():
+    algorithm = get_algorithm("opening_range_breakout")
+    features = _features(
+        # 40bps of the opening-range width above the high: a real break, but still
+        # inside the configured 60bps anti-chase ceiling.
+        price=101.008,
+        volume_spike_ratio=2.0,
+        aggressor_imbalance_5s=0.3,
+    )
+    common = dict(
+        opening_range_high=101.0,
+        opening_range_low=99.0,
+        relative_volume=2.0,
+        change_point_probability=0.1,
+    )
+
+    late = algorithm.entry(
+        features,
+        _context("opening_range_breakout", minutes_since_session_open=300.0, **common),
+    )
+    timely = algorithm.entry(
+        features,
+        _context("opening_range_breakout", minutes_since_session_open=60.0, **common),
+    )
+
+    assert late.triggered is False
+    assert "ORB_OUTSIDE_ENTRY_WINDOW" in late.reason_codes
+    assert timely.triggered is True, timely.reason_codes
+
+
 # --------------------------------------------------------------------------- #
 # Catalog / deployment                                                         #
 # --------------------------------------------------------------------------- #
@@ -148,7 +178,7 @@ def test_completed_bar_vwap_recovery_is_registered_and_starts_shadow_authorized(
     assert strategy_id in all_geometries()
 
 
-def test_bar_trend_continuation_is_tick_independent_and_shadow_only():
+def test_bar_trend_pullback_is_tick_independent_and_shadow_only():
     strategy_id = "bar_trend_continuation"
     algorithm = get_algorithm(strategy_id)
     decision = algorithm.entry(
@@ -157,12 +187,15 @@ def test_bar_trend_continuation_is_tick_independent_and_shadow_only():
             second_data_ready=0.0,
             tick_count_5s=0.0,
             price=100.0,
-            ema_fast=99.7,
-            ema_slow=99.4,
+            ma20=100.1,
+            ma50=99.0,
+            ma200=95.0,
+            ma50_slope_bps=8.0,
+            ma200_slope_bps=3.0,
             macd_histogram=0.2,
-            vwap_distance_bps=60.0,
-            momentum_persistence=0.75,
-            relative_volume=2.0,
+            short_return=-0.002,
+            rsi=55.0,
+            relative_volume=0.8,
             atr_pct=0.003,
             liquidity_score=0.85,
             spread_bps=8.0,
@@ -171,8 +204,26 @@ def test_bar_trend_continuation_is_tick_independent_and_shadow_only():
     )
 
     assert decision.triggered is True, decision.reason_codes
+    assert "TREND_PULLBACK_READY" in decision.reason_codes
     assert strategy_shadow_authorized(strategy_id) is True
     assert strategy_live_authorized(strategy_id) is False
+
+
+def test_bar_trend_pullback_rejects_high_volume_chasing():
+    strategy_id = "bar_trend_continuation"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", price=101.0, ma20=100.0, ma50=98.0, ma200=94.0,
+            ma50_slope_bps=8.0, ma200_slope_bps=3.0, macd_histogram=0.2,
+            short_return=0.002, rsi=60.0, relative_volume=2.0, atr_pct=0.01,
+            liquidity_score=0.85, spread_bps=8.0,
+        ),
+        _context(strategy_id, change_point_probability=0.2),
+    )
+    assert decision.triggered is False
+    assert "TREND_PULLBACK_NOT_NEAR_MA20" in decision.reason_codes or (
+        "TREND_PULLBACK_VOLUME_NOT_CONTRACTING" in decision.reason_codes
+    )
 
 
 def test_tradingview_regime_strategies_are_registered_shadow_only():
@@ -208,7 +259,7 @@ def test_keltner_breakout_requires_compression_expansion_and_volume():
     strategy_id = "keltner_volatility_breakout"
     decision = get_algorithm(strategy_id).entry(
         _features(
-            symbol="INTC", price=103.0, keltner_upper=102.0,
+            symbol="INTC", price=102.3, keltner_upper=102.0,
             prior_keltner_squeeze_ratio=0.875,
             volatility_expansion=1.6, adx=28.0, dmi_spread=12.0,
             relative_volume=2.0, vwap_distance_bps=55.0, atr_pct=0.007,
@@ -259,7 +310,7 @@ def test_event_exit_uses_completed_bar_volatility_when_ticks_are_unavailable():
     algorithm = get_algorithm(strategy_id)
     features = _features(
         symbol="AAPL", second_data_ready=0.0, tick_count_5s=0.0,
-        realized_volatility_10s=None, realized_volatility=0.004,
+        realized_volatility_10s=None, realized_volatility=0.008,
         volume_spike_ratio=3.0, macd_histogram=0.2, ema_fast=101.0,
         ema_slow=100.0, short_return=0.001,
     )
@@ -289,6 +340,27 @@ def test_choppiness_reversion_requires_a_nondirectional_oversold_extreme():
     )
     assert decision.triggered is True, decision.reason_codes
     assert "CHOP_RANGE_CONFIRMED" in decision.reason_codes
+
+
+def test_choppiness_regime_rejection_reports_actual_values_and_thresholds():
+    strategy_id = "choppiness_range_reversion"
+    decision = get_algorithm(strategy_id).entry(
+        _features(
+            symbol="INTC", choppiness=48.0, adx=27.0, rsi=28.0,
+            bb_percent_b=0.02, macd_histogram=0.02, atr_pct=0.006,
+            liquidity_score=0.8,
+        ),
+        _context(strategy_id),
+    )
+
+    assert decision.triggered is False
+    assert "CHOP_RANGE_REGIME_NOT_CONFIRMED" in decision.reason_codes
+    assert decision.diagnostics == {
+        "choppiness": 48.0,
+        "min_choppiness": 61.8,
+        "adx": 27.0,
+        "max_adx": 20.0,
+    }
 
 
 def test_every_catalogued_strategy_is_at_least_shadow_authorized():
@@ -354,10 +426,11 @@ def test_completed_bar_vwap_recovery_ignores_cold_tick_window():
     decision = algorithm.entry(
         _features(
             symbol="INTC",
-            price=98.50,
+            price=97.50,
             vwap=100.0,
-            vwap_distance_bps=-150.0,
-            realized_volatility=0.0015,
+            vwap_distance_bps=-250.0,
+            realized_volatility=0.002,
+            realized_volatility_10s=None,
             second_data_ready=0.0,
             tick_count_5s=0.0,
             return_1s=None,
@@ -365,7 +438,7 @@ def test_completed_bar_vwap_recovery_ignores_cold_tick_window():
             return_10s=None,
             aggressor_imbalance_5s=None,
             orderbook_imbalance_change_5s=None,
-            ema_fast=98.40,
+            ema_fast=97.40,
             macd_histogram=0.08,
             rsi=35.0,
             momentum_persistence=0.60,
@@ -377,6 +450,39 @@ def test_completed_bar_vwap_recovery_ignores_cold_tick_window():
     assert decision.triggered, decision.reason_codes
     assert "BAR_CONFIRMED_VWAP_RECOVERY" in decision.reason_codes
     assert "TICK_WINDOW_NOT_READY" not in decision.reason_codes
+
+
+def test_us_completed_bar_vwap_recovery_prices_its_full_vwap_exit_path():
+    algorithm = get_algorithm("bar_confirmed_vwap_recovery")
+    features = _features(
+        symbol="F",
+        price=99.20,
+        vwap=100.0,
+        vwap_distance_bps=-80.0,
+        realized_volatility=0.002,
+        second_data_ready=0.0,
+        tick_count_5s=0.0,
+        return_1s=None,
+        return_5s=None,
+        return_10s=None,
+        aggressor_imbalance_5s=None,
+        orderbook_imbalance_change_5s=None,
+        ema_fast=99.10,
+        macd_histogram=0.08,
+        rsi=35.0,
+        momentum_persistence=0.60,
+        liquidity_score=0.80,
+        spread_bps=10.0,
+    )
+    context = _context("bar_confirmed_vwap_recovery")
+
+    decision = algorithm.entry(features, context)
+    rule = algorithm.exit_rule(float(features.price), features, context)
+
+    assert decision.triggered, decision.reason_codes
+    assert decision.cost_viable is True
+    assert decision.expected_edge_bps == pytest.approx(80.0)
+    assert rule.target_price == pytest.approx(100.0)
 
 
 def test_completed_bar_vwap_recovery_waits_for_fast_ema_reclaim():
@@ -399,6 +505,116 @@ def test_completed_bar_vwap_recovery_waits_for_fast_ema_reclaim():
     )
     assert not decision.triggered
     assert "BAR_VWAP_FAST_EMA_NOT_RECLAIMED" in decision.reason_codes
+
+
+def test_bear_market_bar_recovery_requires_real_liquidity_normalisation():
+    algorithm = get_algorithm("bar_confirmed_vwap_recovery")
+    common = dict(
+        symbol="INTC",
+        price=97.50,
+        vwap=100.0,
+        vwap_distance_bps=-250.0,
+        realized_volatility=0.004,
+        ema_fast=97.40,
+        macd_histogram=0.08,
+        rsi=35.0,
+        momentum_persistence=0.65,
+        liquidity_score=0.85,
+        spread_bps=10.0,
+    )
+    context = _context(
+        "bar_confirmed_vwap_recovery",
+        market_trend="TREND_DOWN",
+        market_breadth=0.30,
+        change_point_probability=0.10,
+    )
+
+    cold = algorithm.entry(
+        _features(
+            **common,
+            second_data_ready=0.0,
+            tick_count_5s=0.0,
+            return_5s=None,
+            aggressor_imbalance_5s=None,
+            orderbook_imbalance_change_5s=None,
+            spread_change_5s=None,
+        ),
+        context,
+    )
+    confirmed = algorithm.entry(
+        _features(
+            **common,
+            return_5s=0.0005,
+            aggressor_imbalance_5s=0.20,
+            orderbook_imbalance_change_5s=0.05,
+            spread_change_5s=-0.05,
+        ),
+        context,
+    )
+
+    assert not cold.triggered
+    assert "BEAR_RELIEF_TICK_CONFIRMATION_MISSING" in cold.reason_codes
+    assert confirmed.triggered, confirmed.reason_codes
+    assert confirmed.cost_viable is True
+    assert confirmed.horizon_seconds >= 7200
+    assert "BEAR_MARKET_RELIEF_REVERSAL" in confirmed.reason_codes
+
+
+def test_cross_sectional_strength_has_a_long_only_bear_defensive_submode():
+    algorithm = get_algorithm("cross_sectional_relative_strength")
+    features = _features(
+        symbol="INTC",
+        price=100.0,
+        vwap=99.0,
+        vwap_distance_bps=101.0,
+        ema_fast=100.0,
+        ema_slow=99.5,
+        short_return=0.004,
+        momentum_persistence=0.70,
+        relative_volume=1.5,
+        realized_volatility=0.003,
+    )
+    context = _context(
+        "cross_sectional_relative_strength",
+        sector_rank=1,
+        sector_candidate_count=10,
+        market_trend="TREND_DOWN",
+        market_breadth=0.30,
+        market_beta=0.50,
+        change_point_probability=0.10,
+    )
+
+    decision = algorithm.entry(features, context)
+    rule = algorithm.exit_rule(100.0, features, context)
+    target_edge = (float(rule.target_price) / 100.0 - 1.0) * 10_000.0
+
+    assert decision.triggered, decision.reason_codes
+    assert decision.cost_viable is True
+    assert decision.horizon_seconds == 10800
+    assert "BEAR_MARKET_CROSS_SECTIONAL_DEFENSIVE_STRENGTH" in decision.reason_codes
+    assert target_edge == pytest.approx(decision.expected_edge_bps)
+
+
+def test_bear_cross_sectional_strength_rejects_high_beta_names():
+    decision = get_algorithm("cross_sectional_relative_strength").entry(
+        _features(
+            symbol="INTC", price=100.0, vwap_distance_bps=50.0,
+            ema_fast=100.0, ema_slow=99.5, short_return=0.004,
+            momentum_persistence=0.70, relative_volume=1.5,
+        ),
+        _context(
+            "cross_sectional_relative_strength",
+            sector_rank=1,
+            sector_candidate_count=10,
+            market_trend="TREND_DOWN",
+            market_breadth=0.30,
+            market_beta=1.20,
+            change_point_probability=0.10,
+        ),
+    )
+
+    assert not decision.triggered
+    assert "BEAR_MARKET_BETA_TOO_HIGH" in decision.reason_codes
 
 
 def test_residual_strength_is_a_relative_strength_family_not_momentum():
@@ -573,6 +789,21 @@ def test_bear_market_long_only_rejects_high_beta_and_missing_breadth():
     assert "BEAR_MARKET_BREADTH_ABSENT" in missing_breadth.reason_codes
 
 
+def test_high_vol_trending_uses_breadth_to_select_the_bear_branch():
+    """The macro enum has no HIGH_VOL_TRENDING_DOWN value in production."""
+    algorithm = get_algorithm("residual_relative_strength")
+    decision = algorithm.entry(
+        _bear_market_long_features(),
+        _bear_market_long_context(
+            market_trend="HIGH_VOL_TRENDING",
+            market_breadth=0.30,
+        ),
+    )
+
+    assert decision.triggered, decision.reason_codes
+    assert "BEAR_MARKET_LONG_ONLY_DEFENSIVE_STRENGTH" in decision.reason_codes
+
+
 # --------------------------------------------------------------------------- #
 # Adaptive anchored VWAP reversion                                             #
 # --------------------------------------------------------------------------- #
@@ -700,13 +931,12 @@ def test_ofi_exhaustion_detects_the_book_turning_not_the_price_falling():
     assert "OFI_EXHAUSTION_CONFIRMED" in decision.reason_codes
     assert "MICROPRICE_ABOVE_MID" in decision.reason_codes
     assert "DEPTH_RECOVERING" in decision.reason_codes
-    # It does NOT fire, and that is the correct outcome at these parameters: a
-    # 35bp shock captured at 35% yields ~21bp, which cannot survive a 34bp KRX
-    # round trip. The trigger used to clear an 8bp constant floor and then die at
-    # the ProfitabilityGate, which is how a structurally negative-expectancy
-    # configuration looked like a working strategy.
-    assert decision.triggered is False
+    # The pattern fires, but it is not economically deployable: a 35bp shock
+    # captured at 35% cannot survive the KRX round trip plus net buffer.
+    assert decision.triggered is True
+    assert decision.cost_viable is False
     assert "EDGE_BELOW_COST_FLOOR" in decision.reason_codes
+    assert "TECHNICAL_EDGE_NON_POSITIVE" not in decision.reason_codes
     assert decision.diagnostics["expected_edge_bps"] < decision.diagnostics["minimum_edge_bps"]
 
 
@@ -721,6 +951,7 @@ def test_ofi_exhaustion_fires_once_the_edge_clears_its_market_cost():
     )
 
     assert decision.triggered is True, decision.reason_codes
+    assert decision.cost_viable is True
     assert decision.expected_edge_bps >= algorithm.entry_floor_bps("005930")[0]
 
 
@@ -793,7 +1024,8 @@ def test_slow_cross_sectional_strategy_does_not_require_tick_window():
         _features(
             symbol="INTC", second_data_ready=0.0, tick_count_5s=0.0,
             aggressor_imbalance_5s=None, short_return=0.004,
-            realized_volatility=0.01,
+            realized_volatility_10s=None,
+            realized_volatility=0.02,
         ),
         _context(
             "cross_sectional_relative_strength",
@@ -811,7 +1043,8 @@ def test_us_residual_strength_does_not_require_krx_investor_flow_or_ticks():
         _features(
             symbol="INTC", second_data_ready=0.0, tick_count_5s=0.0,
             aggressor_imbalance_5s=None, short_return=0.004,
-            realized_volatility=0.01,
+            realized_volatility_10s=None,
+            realized_volatility=0.02,
         ),
         _context(
             "residual_relative_strength",

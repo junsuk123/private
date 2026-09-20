@@ -48,6 +48,17 @@ def train_live_short_horizon_model(
     training_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     registry = registry or ModelArtifactRegistry()
+    if (os.getenv("LIVE_MODEL_FAMILY", "adaptive_relu").strip().lower() == "adaptive_relu"
+            and any(row.get("as_of") for row in rows)):
+        from app.models.adaptive_signal_model import train_adaptive_signal_model
+
+        return train_adaptive_signal_model(
+            rows, registry=registry, minimum_examples=minimum_examples,
+            minimum_positive_labels=minimum_positive_labels,
+            minimum_negative_labels=minimum_negative_labels,
+            force_live_ineligible_reason=force_live_ineligible_reason,
+            warm_start_artifact=warm_start_artifact, training_state=training_state,
+        )
     ok, reasons = validate_training_dataset(
         rows,
         minimum_examples=minimum_examples,
@@ -661,8 +672,10 @@ def _symbol_temporal_holdout(
                 and moment + timedelta(seconds=horizon_seconds + embargo_seconds)
                 <= validation_start
             ]
-            if purged:
-                local_train = purged
+            # An empty purge means there is no independent training interval.
+            # Restoring the original rows here made overlapping labels look like
+            # a valid out-of-time evaluation.
+            local_train = purged
         train_indices.extend(local_train)
         validation_indices.extend(local_validation)
         validation_symbols += 1

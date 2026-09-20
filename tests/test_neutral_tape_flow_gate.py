@@ -106,7 +106,7 @@ def test_no_strategy_still_uses_the_falsy_idiom() -> None:
 
     from app.technical import strategy_algorithms
 
-    source = Path(strategy_algorithms.__file__).read_text()
+    source = Path(strategy_algorithms.__file__).read_text(encoding="utf-8")
     code_only: list[str] = []
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type in (tokenize.STRING, tokenize.COMMENT):

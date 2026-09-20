@@ -244,6 +244,7 @@ class TradePlanBuilder:
         )
         sizing = self.position_sizer.size(
             SizingInputs(
+                market=request.market_snapshot.market,
                 net_expected_return=decision.net_expected_return,
                 target_net_return=decision.required_min_net_return,
                 confidence_score=confidence,
@@ -319,6 +320,20 @@ class TradePlanBuilder:
             )
 
         quantity = int(getattr(risk.final_order, "quantity", 0) or 0)
+        from app.risk.position_sizing import market_position_cap
+        market_cap = market_position_cap(request.market_snapshot.market)
+        # RiskManager can round a small account up to one share. Verify the final
+        # lot against the market ceiling before election, so that rounding cannot
+        # silently concentrate the entire account into one high-priced name.
+        from app.market_affordability import equity_available_for_market
+        market_equity = equity_available_for_market(request.account, request.market_snapshot)
+        if quantity * price > market_equity * market_cap:
+            return TradePlanOutcome(no_trade=NoTradeDecision(
+                symbol=request.symbol, strategy_id=request.strategy_id, decided_at=moment,
+                reason_codes=("MARKET_POSITION_CAP_EXCEEDED",), stage="sizing",
+                cost_snapshot=cost_snapshot, risk_snapshot=risk_snapshot,
+                detail={"market_position_cap": market_cap, "market_equity": market_equity, "quantity": quantity},
+            ))
         if quantity <= 0:
             return TradePlanOutcome(
                 no_trade=NoTradeDecision(

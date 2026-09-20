@@ -186,6 +186,53 @@ class WebLiveFlagsTest(unittest.TestCase):
         self.assertIn("training_rows=0", readiness["failures"]["live_eligible_model"])
         self.assertIn("realtime_store=missing", readiness["failures"]["live_eligible_model"])
 
+    def test_readiness_reports_deterministic_fallback_for_stale_shadow_model(self) -> None:
+        model = {
+            "ok": False,
+            "schema_matches": True,
+            "trust_level": "SHADOW_ONLY",
+        }
+        with (
+            patch("app.web.load_live_trading_safety_config"),
+            patch("app.web.load_order_execution_config"),
+            patch(
+                "app.web.validate_live_secret_file",
+                return_value={
+                    "file_exists": True,
+                    "KIS_APP_KEY": True,
+                    "KIS_APP_SECRET": True,
+                    "KIS_ACCOUNT_NO": True,
+                    "KIS_ACCOUNT_PRODUCT_CODE": True,
+                },
+            ),
+            patch(
+                "app.web.evaluate_live_runtime_gates",
+                return_value=type("Gate", (), {"ok": True, "failures": ()})(),
+            ),
+            patch("app.web.ModelArtifactRegistry") as registry_cls,
+            patch("app.web._active_live_market_groups", return_value=("KRX",)),
+            patch("app.web._latest_model_reliability", return_value=model),
+            patch.dict(
+                os.environ,
+                {
+                    "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION": "true",
+                    "STRATEGY_SESSION_GNN_DIRECT_ELECTION": "false",
+                },
+            ),
+        ):
+            registry_cls.return_value.load_latest_live_eligible.side_effect = RuntimeError(
+                "LATEST_MODEL_STALE:MODEL_AGE_EXCEEDED"
+            )
+
+            readiness = web_module._web_live_readiness_summary()
+
+        self.assertTrue(readiness["ok"])
+        self.assertTrue(readiness["gates"]["live_eligible_model"])
+        self.assertEqual(
+            readiness["degradations"]["live_eligible_model"],
+            "DETERMINISTIC_STRATEGY_FALLBACK",
+        )
+
     def test_homepage_inline_script_is_valid_javascript(self) -> None:
         if shutil.which("node") is None:
             self.skipTest("node is required for JavaScript syntax checking")

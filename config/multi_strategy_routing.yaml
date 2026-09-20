@@ -1,0 +1,27 @@
+schema_version: 1
+
+# Regime changes must persist before the router changes families.  RISK_OFF is
+# allowed to engage immediately for safety, but recovery still needs confirmation.
+regime:
+  volatility_cut: 0.0025
+  minimum_confidence: 0.35
+  hysteresis:
+    minimum_consecutive_observations: 3
+    minimum_hold_seconds: 90
+    switch_margin: 0.08
+    risk_off_immediate_threshold: 0.80
+
+# WHAT to trade.  Entry timing remains wholly inside each strategy algorithm.
+candidate_ranker:
+  momentum_12_1: 0.30
+  risk_adjusted_momentum: 0.20
+  relative_strength: 0.15
+  long_trend_filter: 0.10
+  liquidity: 0.10
+  regime_fit: 0.05
+  ontology_fit: 0.05
+  gnn_suitability: 0.05
+  missing_neutral: 0.50
+  momentum_long_window: 200
+  momentum_skip_recent: 20
+  volatility_window: 60

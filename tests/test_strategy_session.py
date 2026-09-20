@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import threading
+import time
 
 import pytest
 
 from app.schemas.domain import AccountSnapshot, Holding
 from app.trading.directional import PositionDirection
+from app.trading.directional import ExecutionProduct, StrategyDeploymentState
 from app.trading.strategy_session import (
     StrategySessionConfig,
     StrategySessionManager,
@@ -119,6 +122,183 @@ def test_session_uses_the_injected_live_plan_builder(tmp_path):
     )
 
     assert manager._plan_builder is live_builder  # noqa: SLF001
+
+
+def test_session_persistence_retries_synology_sharing_violation(
+    tmp_path, monkeypatch
+):
+    manager = StrategySessionManager(config=_config(tmp_path))
+    import app.trading.strategy_session as module
+
+    actual_replace = module.os.replace
+    attempts = []
+
+    def intermittently_locked(source, destination):
+        attempts.append((source, destination))
+        if len(attempts) < 3:
+            raise PermissionError("file is temporarily locked by sync client")
+        return actual_replace(source, destination)
+
+    monkeypatch.setattr(module.os, "replace", intermittently_locked)
+
+    manager._persist()  # noqa: SLF001
+
+    assert len(attempts) == 3
+    assert (tmp_path / "session.json").exists()
+    assert not list(tmp_path.glob(".session.json.*.tmp"))
+
+
+def test_symbol_strategy_branches_run_in_parallel_and_commit_in_order(
+    tmp_path, monkeypatch
+):
+    manager = StrategySessionManager(
+        config=_config(tmp_path, strategy_evaluation_workers=4)
+    )
+    monkeypatch.setattr(
+        "app.trading.strategy_session.STRATEGY_IDS",
+        ("strategy_a", "strategy_b", "strategy_c", "strategy_d"),
+    )
+    manager._resolve_direction_context = lambda *_args: (  # noqa: SLF001
+        PositionDirection.LONG,
+        ExecutionProduct.CASH,
+        StrategyDeploymentState.LIVE_FULL,
+        None,
+        (),
+    )
+    active = 0
+    maximum_active = 0
+    active_lock = threading.Lock()
+
+    def verdict(**kwargs):
+        nonlocal active, maximum_active
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.03)
+        with active_lock:
+            active -= 1
+        return {
+            "strategy_id": kwargs["strategy_id"],
+            "triggered": False,
+            "score": 0.0,
+            "confidence": 0.0,
+            "expected_edge_bps": 0.0,
+            "reason_codes": ["TEST_HOLD"],
+            "diagnostics": {},
+        }
+
+    manager._mechanical_entry_verdict = verdict  # type: ignore[method-assign]  # noqa: SLF001
+    bundle = SimpleNamespace(micro_results=(), macro_result=None)
+    evidence = {
+        "AAA": {
+            "as_of": NOW.isoformat(),
+            "technical_features": {"symbol": "AAA", "price": 10.0},
+        },
+        "BBB": {
+            "as_of": NOW.isoformat(),
+            "technical_features": {"symbol": "BBB", "price": 20.0},
+        },
+    }
+
+    proposals = manager._registry_algorithm_proposals(  # noqa: SLF001
+        ("AAA", "BBB"), evidence, bundle, NOW
+    )
+    state = manager.snapshot()
+
+    assert proposals == []
+    assert maximum_active > 1
+    assert state["strategy_evaluation_mode"] == "PARALLEL_MAP"
+    assert state["strategy_evaluation_workers"] == 4
+    assert state["strategy_evaluation_branch_count"] == 8
+    assert [row["branch_index"] for row in state["algorithm_evaluations"]] == list(range(8))
+
+
+def test_macro_mismatch_is_evaluated_as_a_bounded_cost_positive_probe(
+    tmp_path, monkeypatch
+):
+    manager = StrategySessionManager(
+        config=_config(
+            tmp_path,
+            macro_mismatch_probe_enabled=True,
+            macro_mismatch_probe_size_fraction=0.10,
+        )
+    )
+    monkeypatch.setattr(
+        "app.trading.strategy_session.STRATEGY_IDS", ("intraday_momentum",)
+    )
+    monkeypatch.setattr(
+        "app.trading.strategy_session._macro_permits", lambda *_args: False
+    )
+    manager._resolve_direction_context = lambda *_args: (  # noqa: SLF001
+        PositionDirection.LONG,
+        ExecutionProduct.CASH,
+        StrategyDeploymentState.LIVE_FULL,
+        None,
+        (),
+    )
+    manager._mechanical_entry_verdict = lambda **_kwargs: {  # type: ignore[method-assign]  # noqa: SLF001
+        "strategy_id": "intraday_momentum",
+        "triggered": True,
+        "score": 0.8,
+        "confidence": 0.7,
+        "expected_edge_bps": 120.0,
+        "horizon_seconds": 3600,
+        "reason_codes": ["MOMENTUM_CONFIRMED"],
+        "diagnostics": {},
+        "cost_viable": True,
+    }
+    evidence = {
+        "AAPL": {
+            "as_of": NOW.isoformat(),
+            "technical_features": {"symbol": "AAPL", "price": 200.0},
+        }
+    }
+
+    proposals = manager._registry_algorithm_proposals(  # noqa: SLF001
+        ("AAPL",), evidence, SimpleNamespace(micro_results=(), macro_result=object()), NOW
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0].risk_tolerance_probe is True
+    assert proposals[0].risk_size_fraction == pytest.approx(0.10)
+    assert proposals[0].source == "MACRO_MISMATCH_ALGORITHM_PROBE"
+    evaluation = manager.snapshot()["algorithm_evaluations"][0]
+    assert evaluation["macro_context_permitted"] is False
+    assert evaluation["risk_tolerance_probe"] is True
+
+    chosen = manager._algorithm_choice(proposals, NOW)  # noqa: SLF001
+    assert chosen is proposals[0]
+    state = manager.snapshot()
+    assert state["bandit_is_exploration"] is True
+    assert state["risk_tolerance_mode"] == "MACRO_MISMATCH_PROBE"
+    assert state["risk_tolerance_size_fraction"] == pytest.approx(0.10)
+
+
+def test_macro_mismatch_probe_can_be_disabled(tmp_path, monkeypatch):
+    manager = StrategySessionManager(
+        config=_config(tmp_path, macro_mismatch_probe_enabled=False)
+    )
+    monkeypatch.setattr(
+        "app.trading.strategy_session.STRATEGY_IDS", ("intraday_momentum",)
+    )
+    monkeypatch.setattr(
+        "app.trading.strategy_session._macro_permits", lambda *_args: False
+    )
+
+    proposals = manager._registry_algorithm_proposals(  # noqa: SLF001
+        ("AAPL",),
+        {
+            "AAPL": {
+                "as_of": NOW.isoformat(),
+                "technical_features": {"symbol": "AAPL", "price": 200.0},
+            }
+        },
+        SimpleNamespace(micro_results=(), macro_result=object()),
+        NOW,
+    )
+
+    assert proposals == []
+    assert manager.snapshot()["strategy_evaluation_branch_count"] == 0
 
 
 def test_plan_cost_contract_matches_algorithm_market_cost_contract():
@@ -481,6 +661,8 @@ def test_algorithm_catalogue_is_evaluated_when_gnn_vector_is_empty(tmp_path, mon
     assert state["selected_strategy"] == "intraday_momentum"
     assert state["selection_source"] == "ONTOLOGY_ALGORITHM_ELECTION"
     assert state["selection_authority"] == "DETERMINISTIC_ALGORITHM"
+    assert state["algorithm_primary_election"] is True
+    assert state["gnn_gate_required_for_selection"] is False
     assert state["bandit_evaluations"] == []
     assert manager.entry_order_size_fraction("005930") > 0.0
     evaluated = {
@@ -539,8 +721,8 @@ def test_untrusted_gnn_duplicate_cannot_replace_deterministic_algorithm_edge() -
     assert selected[0].predicted_net_edge_bps(15.0, 60.0) == 19.44
 
 
-def test_insufficient_cost_coverage_cannot_arm_a_live_session(tmp_path) -> None:
-    """A ranked proposal inside the cost error band must remain non-executable."""
+def test_positive_cost_coverage_can_arm_at_minimum_size(tmp_path) -> None:
+    """Current policy permits a positive but thin edge at minimum size."""
     manager = StrategySessionManager(config=_config(tmp_path))
     proposal = _ElectionProposal(
         symbol="DYN",
@@ -553,7 +735,7 @@ def test_insufficient_cost_coverage_cannot_arm_a_live_session(tmp_path) -> None:
         max_holding_seconds=900,
         score=0.8,
         confidence=0.8,
-        # 13 + 50 = 63 gross bps; 63 / 50 = 1.26, below live 1.3.
+        # 13 + 50 = 63 gross bps; 63 / 50 = 1.26, positive but thin.
         expected_net_return_bps=13.0,
         expected_cost_bps=50.0,
         gnn_actionable=True,
@@ -576,11 +758,10 @@ def test_insufficient_cost_coverage_cannot_arm_a_live_session(tmp_path) -> None:
     armed = manager._arm(proposal, NOW, account=_account())  # noqa: SLF001
 
     state = manager.snapshot()
-    assert armed is False
-    assert state["phase"] == "SCANNING"
-    assert state["selected_symbol"] is None
-    assert state["cost_coverage_band"] == "INSUFFICIENT"
-    assert state["last_reason"].startswith("ENTRY_COST_COVERAGE_REJECTED:INSUFFICIENT")
+    assert armed is True
+    assert state["phase"] == "ARMED"
+    assert state["selected_symbol"] == "DYN"
+    assert state["cost_coverage_band"] == "THIN"
 
 
 def test_cold_algorithm_exploration_is_capped_to_minimum_size(tmp_path):

@@ -132,7 +132,7 @@ def test_informed_flow_excludes_retail() -> None:
     assert day.informed_net_buy_value == pytest.approx(150.0)
 
 
-def test_investor_flow_quantile_never_ranks_against_its_own_future() -> None:
+def test_investor_flow_quantile_uses_only_completed_prior_days() -> None:
     history = {
         "20260727": _day("20260727", 10.0, 0.0),
         "20260728": _day("20260728", 20.0, 0.0),
@@ -141,15 +141,16 @@ def test_investor_flow_quantile_never_ranks_against_its_own_future() -> None:
         # A huge future day must not drag today's rank down.
         "20260731": _day("20260731", 9_999.0, 0.0),
     }
-    # Ranked on 07-30 against 27/28/29 only -> the highest of those.
-    assert _investor_flow_quantile(history, "20260730") == pytest.approx(1.0)
+    # At any point on 07-31, 07-30 is the latest completed day and is ranked
+    # against 27/28/29. The still-changing 07-31 value is never visible.
+    assert _investor_flow_quantile(history, "20260731") == pytest.approx(1.0)
 
 
 def test_investor_flow_requires_a_comparison_set() -> None:
     history = {"20260731": _day("20260731", 10.0, 0.0)}
     assert _investor_flow_quantile(history, "20260731") == 0.0
     assert _investor_flow_quantile(None, "20260731") == 0.0
-    # A date with no row at all cannot be ranked.
+    # Fewer than four completed days cannot provide signal + comparison set.
     assert _investor_flow_quantile(history, "20260730") == 0.0
 
 

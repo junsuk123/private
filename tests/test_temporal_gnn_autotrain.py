@@ -8,6 +8,8 @@ waiting for someone to notice and run a script.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -164,7 +166,8 @@ def test_a_child_report_is_parsed_and_returned(monkeypatch) -> None:
 def test_the_trainer_child_is_capped_and_niced() -> None:
     """The fit saturates every core it is given; the trading loop is latency-sensitive."""
     command = web._temporal_gnn_training_command()
-    assert "nice" in command[0]
+    if os.name != "nt":
+        assert "nice" in command[0]
     assert "--limit" in command and "--epochs" in command
 
 
@@ -180,8 +183,15 @@ def test_shutdown_kills_the_trainer_child() -> None:
     """
     import subprocess
 
+    isolation = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
     child = subprocess.Popen(
-        ["sleep", "120"], start_new_session=True, stdout=subprocess.DEVNULL
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdout=subprocess.DEVNULL,
+        **isolation,
     )
     try:
         web._temporal_gnn_child = child
@@ -223,3 +233,97 @@ def test_a_second_trainer_refuses_to_run_while_one_holds_the_lock(tmp_path) -> N
             assert second is False, "two fits must not publish over each other"
     with trainer._single_writer(target) as third:
         assert third is True, "the lock must be released when the holder exits"
+
+
+def test_a_refusal_that_exits_non_zero_is_not_reported_as_a_healthy_cycle(
+    monkeypatch, tmp_path
+) -> None:
+    """The trainer refuses on thin data and exits 1; the runtime then stays OFFLINE.
+
+    That state blocks every new entry, and the heartbeat used to render it exactly like
+    the healthy "challenger lost to the incumbent" case: ok=True, error=None,
+    promoted=False, checkpoint=None. An operator reading the dashboard could not tell a
+    blocked system from a working one.
+    """
+    monkeypatch.setattr(
+        web,
+        "_run_temporal_gnn_training_once",
+        lambda: (
+            web._temporal_gnn_stop.set(),
+            {
+                "refused": "only 0 resolved decisions; 40 required. The runtime stays OFFLINE",
+                "checkpoint": None,
+                "training_examples": 0,
+                "exit_code": 1,
+            },
+        )[1],
+    )
+    monkeypatch.setattr(web, "DEFAULT_GNN_CHECKPOINT_PATH", tmp_path / "missing.npz")
+    web._temporal_gnn_stop.clear()
+    web._temporal_gnn_training_loop()
+
+    assert web._temporal_gnn_heartbeat["ok"] is False
+    assert web._temporal_gnn_heartbeat["blocks_new_entries"] is True
+    assert "OFFLINE" in web._temporal_gnn_heartbeat["refused"]
+    assert web._temporal_gnn_heartbeat["training_examples"] == 0
+
+
+def test_thin_challenger_does_not_block_when_an_incumbent_exists(
+    monkeypatch, tmp_path
+) -> None:
+    checkpoint = tmp_path / "latest.npz"
+    checkpoint.write_bytes(b"incumbent")
+    monkeypatch.setattr(web, "DEFAULT_GNN_CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr(
+        web,
+        "_run_temporal_gnn_training_once",
+        lambda: (
+            web._temporal_gnn_stop.set(),
+            {"refused": "thin challenger", "exit_code": 1, "training_examples": 120},
+        )[1],
+    )
+
+    web._temporal_gnn_stop.clear()
+    web._temporal_gnn_training_loop()
+
+    assert web._temporal_gnn_heartbeat["ok"] is True
+    assert web._temporal_gnn_heartbeat["blocks_new_entries"] is False
+
+
+def test_a_lock_skip_exits_zero_and_stays_a_healthy_cycle(monkeypatch) -> None:
+    """`refused` also covers a benign skip: another run held the checkpoint lock.
+
+    That one exits 0 and leaves a working incumbent in place, so it must NOT be
+    escalated. The exit code is the only thing telling the two refusals apart.
+    """
+    monkeypatch.setattr(
+        web,
+        "_run_temporal_gnn_training_once",
+        lambda: (
+            web._temporal_gnn_stop.set(),
+            {
+                "refused": "another training run already holds the checkpoint lock",
+                "checkpoint": None,
+                "exit_code": 0,
+            },
+        )[1],
+    )
+    web._temporal_gnn_stop.clear()
+    web._temporal_gnn_training_loop()
+
+    assert web._temporal_gnn_heartbeat["ok"] is True
+    assert web._temporal_gnn_heartbeat["blocks_new_entries"] is False
+
+
+def test_the_child_exit_code_reaches_the_caller(monkeypatch) -> None:
+    """A valid report on a non-zero exit must not lose the exit code."""
+    import subprocess
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *a, **k: _FakeChild(json.dumps({"refused": "thin data"}), "", 1),
+    )
+    report = web._run_temporal_gnn_training_once()
+    assert report["exit_code"] == 1
+    assert report["refused"] == "thin data"

@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass
 
 from app.graph import get_ontology_runtime
+from app.paths import project_path
 from app.realtime.device_plan import (
     CPU,
     Placement,
@@ -50,6 +51,11 @@ class RealtimeAccelerationPolicy:
             self._placements = plan_devices(self._inventory)
         return self._placements
 
+    def inventory(self):
+        """Return the cached cross-runtime device inventory for this process."""
+        self.placements()
+        return self._inventory
+
     def apply_process_hints(self) -> None:
         # Device hints follow the plan instead of a hardcoded "NPU".
         #
@@ -69,7 +75,19 @@ class RealtimeAccelerationPolicy:
         )
         os.environ.setdefault("OPENVINO_HINT_PERFORMANCE_MODE", "LATENCY")
         os.environ.setdefault("OPENVINO_ENABLE_CPU_PINNING", "YES")
-        os.environ.setdefault("OPENVINO_CACHE_DIR", "data/runtime/openvino_cache")
+        os.environ.setdefault("OPENVINO_CACHE_DIR", str(project_path("data/runtime/openvino_cache")))
+        inventory = self.inventory()
+        event_device = by_key.get("event_classification", CPU)
+        event_providers = inventory.providers.get(event_device, ())
+        if "torch-cuda" in event_providers:
+            os.environ.setdefault("LLM_EVENT_INFERENCE_BACKEND", "transformers")
+            os.environ.setdefault("LLM_EVENT_DEVICE", "auto")
+        elif "torch-mps" in event_providers:
+            os.environ.setdefault("LLM_EVENT_INFERENCE_BACKEND", "transformers")
+            os.environ.setdefault("LLM_EVENT_DEVICE", "mps")
+        elif "openvino" in event_providers and event_device in {"NPU", "GPU"}:
+            os.environ.setdefault("LLM_EVENT_INFERENCE_BACKEND", "openvino")
+            os.environ.setdefault("LLM_EVENT_DEVICE", event_device)
         # Event classification is a separate model lifecycle. NPU availability alone
         # must not turn an Ollama model id into a nonexistent embedded model path.
         # Explicit LLM_EVENT_* configuration may still select OpenVINO/NPU.

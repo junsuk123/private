@@ -49,6 +49,7 @@ class LiveExecutionCoordinator:
         plan_provider: Any | None = None,
         orderable_cash_provider: Any | None = None,
         sellable_quantity_provider: Any | None = None,
+        cash_equity_only: bool = False,
     ) -> None:
         self.broker = broker
         self.idempotency_store = idempotency_store or IdempotencyStore()
@@ -72,6 +73,7 @@ class LiveExecutionCoordinator:
         self.plan_provider = plan_provider
         self.orderable_cash_provider = orderable_cash_provider
         self.sellable_quantity_provider = sellable_quantity_provider
+        self.cash_equity_only = cash_equity_only
 
     def submit_final_order(self, order: FinalOrder, *, idempotency_key: str | None = None) -> LiveOrderSubmission:
         self._validate_final_order(order)
@@ -402,6 +404,10 @@ class LiveExecutionCoordinator:
             sellable_quantity=self._sellable_quantity(order),
         )
         self._last_guard_decision = decision
+        if decision.allowed and decision.permitted_quantity < order.quantity:
+            # A technical affordability clip is not permission to send the old,
+            # oversized quantity. A fresh plan must own the reduced order.
+            return ["GUARD_QUANTITY_EXCEEDS_ORDERABLE"]
         if decision.allowed:
             return []
         self.journal.record(
@@ -453,6 +459,9 @@ class LiveExecutionCoordinator:
     def _validate_final_order(self, order: FinalOrder) -> None:
         if not isinstance(order, FinalOrder):
             raise LiveExecutionBlocked(("FINAL_ORDER_REQUIRED",))
+        if self.cash_equity_only and order.resolved_position_effect == "OPEN":
+            if str(order.position_direction).upper() != "LONG" or str(order.execution_product).upper() != "CASH":
+                raise LiveExecutionBlocked(("CASH_LONG_ENTRY_ONLY",))
         if order.order_type != OrderType.LIMIT:
             raise LiveExecutionBlocked(("LIMIT_ORDER_REQUIRED",))
         if order.quantity <= 0:

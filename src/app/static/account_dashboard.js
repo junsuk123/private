@@ -238,6 +238,10 @@ const BLOCKADE_STAGE_LABELS = {
 };
 
 function renderEntryBlockade(payload) {
+  if (typeof window.renderEntryBlockadeGraph === 'function') {
+    window.renderEntryBlockadeGraph(payload);
+    return;
+  }
   const list = document.getElementById('blockade-chain');
   const headline = document.getElementById('blockade-headline');
   const verdict = document.getElementById('blockade-verdict');
@@ -470,10 +474,10 @@ function renderRefactorDashboard(data) {
     intraday_momentum: '장중 모멘텀',
     breakout_volume: '거래량 돌파',
     vwap_mean_reversion: 'VWAP 평균회귀',
-    bar_confirmed_vwap_recovery: '1분봉 확인 VWAP 회복',
+    bar_confirmed_vwap_recovery: 'VWAP 회복 · 하락장 패닉반등',
     liquidity_shock_reversal: '유동성 충격 반전',
     event_momentum: '이벤트 모멘텀',
-    cross_sectional_relative_strength: '횡단면 상대강도',
+    cross_sectional_relative_strength: '상대강도 · 하락장 저베타',
     gap_context: '갭 컨텍스트',
   };
   const metrics = evalData.strategy_metrics || {};

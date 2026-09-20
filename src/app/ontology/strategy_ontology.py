@@ -308,11 +308,11 @@ _SOFT_BY_STRATEGY: dict[str, tuple[SoftRelation, ...]] = {
         *_TREND_UP_EVIDENCE,
         SoftRelation(
             _P, "momentum_persistence", 0.25, low=0.60,
-            rationale="completed-bar continuation requires persistent advances",
+            rationale="the longer completed-bar structure must remain persistent",
         ),
         SoftRelation(
-            _P, "relative_volume", 0.20, low=1.20,
-            rationale="bar trend without participation is not a continuation setup",
+            _P, "relative_volume", 0.20, low=0.20, high=1.10,
+            rationale="a pullback should contract volume rather than chase expansion",
         ),
     ),
     "range_support_reversion": (

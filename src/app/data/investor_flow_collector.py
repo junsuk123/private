@@ -16,14 +16,16 @@ from pathlib import Path
 from typing import Any
 
 from app.data.investor_flow_store import InvestorFlowStore
+from app.paths import realtime_market_database_path
 
-DEFAULT_BAR_DATABASE = "data/store/realtime_market_data.sqlite3"
+DEFAULT_BAR_DATABASE = realtime_market_database_path()
 
 
 @dataclass
 class InvestorFlowRefreshResult:
     symbols_attempted: int = 0
     rows_written: int = 0
+    intraday_snapshots_written: int = 0
     failures: list[str] = field(default_factory=list)
     coverage: dict[str, Any] = field(default_factory=dict)
     skipped_reason: str | None = None
@@ -32,6 +34,7 @@ class InvestorFlowRefreshResult:
         return {
             "symbols_attempted": self.symbols_attempted,
             "rows_written": self.rows_written,
+            "intraday_snapshots_written": self.intraday_snapshots_written,
             "failed_symbols": len(self.failures),
             # Truncated, but the COUNT above is always exact: a partial sweep must
             # never be able to look like a complete one.
@@ -117,9 +120,21 @@ def refresh_investor_flow(
             result.failures.append(f"{symbol}:{type(exc).__name__}")
             continue
         result.rows_written += flow_store.upsert_many(rows)
+        intraday_reader = getattr(
+            client, "get_domestic_intraday_investor_flow_estimate", None
+        )
+        if callable(intraday_reader):
+            try:
+                estimate = intraday_reader(symbol)
+                result.intraday_snapshots_written += int(
+                    flow_store.record_intraday_estimate(symbol, estimate)
+                )
+            except Exception as exc:  # noqa: BLE001 - daily history remains useful.
+                result.failures.append(f"{symbol}:intraday:{type(exc).__name__}")
         # No sleep after the final symbol; it only delays the caller.
         if delay_seconds > 0 and index < len(symbols) - 1:
             time.sleep(delay_seconds)
 
     result.coverage = flow_store.coverage()
+    result.coverage["intraday"] = flow_store.intraday_coverage()
     return result

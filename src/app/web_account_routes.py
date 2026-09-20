@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.account_dashboard import AccountDashboardService
 from app.gnn_visualization import build_strategy_gnn_state, build_strategy_gnn_visualization
+from app.operations_dashboard import OPERATIONS_PAGE, build_operations_overview
 from app.ui_layout_store import TerminalLayoutStore
 
 
@@ -22,6 +23,7 @@ def create_account_router(
     gnn_state_provider: Callable[[], dict[str, Any]] | None = None,
     layout_store: TerminalLayoutStore | None = None,
     service: AccountDashboardService | None = None,
+    operations_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> APIRouter:
     router = APIRouter()
     # A shared service can be injected so a background sampler and the HTTP routes
@@ -31,7 +33,17 @@ def create_account_router(
 
     @router.get("/account", response_class=HTMLResponse)
     def account_dashboard_page() -> HTMLResponse:
+        return HTMLResponse(OPERATIONS_PAGE)
+
+    @router.get("/account/advanced", response_class=HTMLResponse)
+    def account_advanced_page() -> HTMLResponse:
         return HTMLResponse(_STRATEGY_TERMINAL_PAGE)
+
+    @router.get("/api/operations/overview")
+    def operations_overview() -> JSONResponse:
+        # This callback must use cached observations only. Opening the dashboard
+        # is never permission to refresh the broker or start a trading engine.
+        return JSONResponse(operations_provider() if operations_provider else build_operations_overview())
 
     @router.get("/api/account/dashboard")
     def account_dashboard() -> JSONResponse:
@@ -148,6 +160,7 @@ _ACCOUNT_PAGE = """<!doctype html>
   <link rel="icon" type="image/png" href="/static/icon.png" />
   <link rel="apple-touch-icon" href="/static/icon.png" />
   <link rel="stylesheet" href="/static/account_dashboard.css?v=20260727-strategy-owner" />
+  <link rel="stylesheet" href="/static/entry_blockade_graph.css?v=20260903-system-dag-v3" />
 </head>
 <body>
   <main class="account-dashboard" id="account-dashboard">
@@ -194,10 +207,10 @@ _ACCOUNT_PAGE = """<!doctype html>
         <span id="blockade-verdict" class="badge">-</span>
       </div>
       <p class="blockade-headline" id="blockade-headline">불러오는 중…</p>
-      <ol class="blockade-chain" id="blockade-chain"></ol>
+      <div class="blockade-chain" id="blockade-chain"></div>
       <p class="blockade-note">
-        체인은 순서대로 평가되며 <strong>처음 막힌 단계</strong>가 실제 원인입니다.
-        신규 진입만 정규장으로 제한되고, 보유 포지션 청산은 시간외에도 계속 동작합니다.
+        전역 안전 가드는 직렬로 통과하지만 <strong>후보 종목 준비는 병렬</strong>입니다.
+        한 종목만 준비돼도 전략 선출로 진행하며 나머지는 백그라운드에서 계속 준비됩니다.
       </p>
     </section>
 
@@ -396,7 +409,8 @@ _ACCOUNT_PAGE = """<!doctype html>
       <div class="log-panel" id="account-logs"></div>
     </details>
   </main>
-  <script src="/static/account_dashboard.js?v=20260810-macro-context-split-v1"></script>
+  <script src="/static/entry_blockade_graph.js?v=20260903-system-dag-v3"></script>
+  <script src="/static/account_dashboard.js?v=20260831-parallel-flow-v1"></script>
 </body>
 </html>
 """
@@ -409,8 +423,9 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Ontology Strategy Terminal</title>
   <link rel="icon" type="image/png" href="/static/icon.png" />
-  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260824-split-model-metrics-v1" />
-  <link rel="stylesheet" href="/static/operations_overview.css?v=20260731-entry-blockade" />
+  <link rel="stylesheet" href="/static/strategy_terminal.css?v=20260903-cumulative-learning-v4" />
+  <link rel="stylesheet" href="/static/operations_overview.css?v=20260831-gnn-role-v2" />
+  <link rel="stylesheet" href="/static/entry_blockade_graph.css?v=20260903-system-dag-v3" />
   <link rel="stylesheet" href="/static/terminal_layout.css?v=20260802-movable-frames-2" />
 </head>
 <body>
@@ -466,8 +481,8 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           <span class="status-chip waiting" id="blockade-verdict">확인 중</span>
         </div>
         <p class="blockade-headline" id="blockade-headline">진단을 불러오는 중…</p>
-        <ol class="blockade-chain" id="blockade-chain"></ol>
-        <p class="blockade-note">체인은 순서대로 평가되며 <strong>처음 막힌 단계</strong>가 실제 원인입니다. 신규 진입만 정규장으로 제한되며, 보유 포지션 청산은 시간외에도 계속 동작합니다.</p>
+        <div class="blockade-chain" id="blockade-chain"></div>
+        <p class="blockade-note">전역 안전 가드와 주문 커밋만 직렬이며 <strong>후보·컨텍스트·종목×전략 평가는 독립 병렬</strong>입니다. GNN이 보조 모드이면 결정론 전략을 차단하지 않습니다.</p>
       </div>
 
       <div class="ops-gate-grid" id="ops-gate-grid">
@@ -503,7 +518,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
         </article>
 
         <article class="ops-card ops-gnn-card">
-          <div class="ops-card-head"><h3>GNN 실시간 신뢰도</h3><span id="ops-gnn-state">-</span></div>
+          <div class="ops-card-head"><h3>GNN 전방 신뢰도·역할</h3><span id="ops-gnn-state">-</span></div>
           <div class="ops-score-line">
             <strong id="ops-gnn-score">-</strong>
             <div><span id="ops-gnn-samples">표본 -</span><small id="ops-gnn-trusted">신뢰 전략 -</small></div>
@@ -533,7 +548,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <div class="ops-footer">
         <div><span>운영 모드</span><strong id="ops-mode">-</strong></div>
         <div><span>자동 신뢰도</span><strong id="ops-reliability">-</strong></div>
-        <div><span>GNN 실거래 필수</span><strong id="ops-gnn-required">-</strong></div>
+        <div><span>GNN 선택 역할</span><strong id="ops-gnn-required">-</strong></div>
         <div><span>누적 엔진 주기</span><strong id="ops-engine-cycles">-</strong></div>
         <div class="ops-footer-wide"><span>현재 판단 사유</span><strong id="ops-current-reason">-</strong></div>
       </div>
@@ -543,7 +558,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <div class="live-owner-heading">
         <p class="panel-kicker">LIVE STRATEGY EXECUTION</p>
         <h2 id="live-owner-title">실시간 자동 트레이딩</h2>
-        <small>온톨로지·GNN이 채택한 종목과 전략부터 KIS 주문 이행·체결까지 자동 추적합니다.</small>
+        <small>현재 선택 권한(결정론 전략 또는 GNN)과 채택 종목부터 KIS 주문 이행·체결까지 자동 추적합니다.</small>
       </div>
       <div class="live-owner-metrics">
         <article><span>실거래 세션</span><strong id="live-owner-state">확인 중</strong><small id="live-owner-session">-</small></article>
@@ -649,7 +664,7 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
             <small id="training-current-auc">현재 AUC -</small>
           </article>
           <article>
-            <span>학습 데이터 증가</span>
+            <span>학습 데이터 유입</span>
             <strong id="training-row-rate">-</strong>
             <small id="training-new-rows">최근 신규 행 -</small>
           </article>
@@ -669,10 +684,10 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
           </article>
           <article class="training-chart-card">
             <div class="training-chart-title">
-              <b>학습 데이터 누적</b>
-              <span><i class="rows"></i>누적 행 <i class="new-rows"></i>신규 행</span>
+              <b>유효 학습 윈도우</b>
+              <span><i class="rows"></i>유효 행 <i class="new-rows"></i>신규 유입</span>
             </div>
-            <canvas id="training-data-chart" aria-label="학습 데이터 누적 차트"></canvas>
+            <canvas id="training-data-chart" aria-label="유효 학습 윈도우와 신규 유입 차트"></canvas>
           </article>
         </div>
         <div class="training-cycle-list" id="training-cycle-list"></div>
@@ -912,8 +927,9 @@ _STRATEGY_TERMINAL_PAGE = """<!doctype html>
       <a href="/api/refactor/market-view" target="_blank" rel="noreferrer">RAW DATA ↗</a>
     </footer>
   </main>
-  <script src="/static/strategy_terminal.js?v=20260824-split-model-metrics-v1"></script>
-  <script src="/static/operations_overview.js?v=20260824-split-model-metrics-v1"></script>
+  <script src="/static/strategy_terminal.js?v=20260903-cumulative-learning-v4"></script>
+  <script src="/static/entry_blockade_graph.js?v=20260903-system-dag-v3"></script>
+  <script src="/static/operations_overview.js?v=20260831-gnn-role-v2"></script>
   <!-- Loaded last: it re-parents the panels into resizable layers, so every
        other module has already bound its handlers to the elements it moves. -->
   <script src="/static/terminal_layout.js?v=20260821-trade-layers-frame-v1"></script>

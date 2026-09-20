@@ -213,6 +213,7 @@ def test_market_holdouts_are_independent_when_us_tape_is_newer() -> None:
 def test_market_authority_does_not_cross_authorize() -> None:
     passing = {
         "selection_rows": 100,
+        "selection_symbols": 10,
         "selection_auc_ci_low": 0.60,
         "selection_auc_within_symbol_null": 0.52,
         "selection_auc_permutation_p": 0.01,
@@ -233,6 +234,24 @@ def test_market_authority_does_not_cross_authorize() -> None:
     assert markets == ["KRX"]
     assert checks["KRX"]["live_authorized"] is True
     assert checks["US"]["live_authorized"] is False
+
+
+def test_repeated_trades_in_too_few_symbols_cannot_authorize_market() -> None:
+    metrics = {
+        "krx_selection_rows": 100,
+        "krx_selection_symbols": 1,
+        "krx_selection_auc_ci_low": 0.60,
+        "krx_selection_auc_within_symbol_null": 0.52,
+        "krx_selection_auc_permutation_p": 0.01,
+        "krx_selection_top_decile_net_p_nonpositive": 0.01,
+    }
+
+    checks, markets = _market_authorization_verdicts(metrics, base_ready=True)
+
+    assert markets == []
+    assert checks["KRX"]["selection_rows"] == 100
+    assert checks["KRX"]["selection_symbols"] == 1
+    assert checks["KRX"]["live_authorized"] is False
 
 
 def test_untriggered_strategy_is_not_mislabeled_as_a_realized_loss() -> None:
@@ -262,6 +281,29 @@ def test_untriggered_strategy_is_not_mislabeled_as_a_realized_loss() -> None:
 
     assert _target_mask(untriggered)[0] == 0.0
     assert _target_mask(realized_loss)[0] == 1.0
+
+
+def test_censored_future_keeps_graph_node_without_inventing_payoff() -> None:
+    at = datetime(2026, 8, 27, tzinfo=timezone.utc)
+    row = CounterfactualLabel(
+        as_of=at,
+        label_end=at,
+        symbol="AAPL",
+        strategy_id="overnight_gap_carry",
+        triggered=True,
+        filled=False,
+        net_return_bps=0.0,
+        cost_bps=0.0,
+        exit_reason="FUTURE_WINDOW_CENSORED",
+    )
+
+    mask = _target_mask(row)
+
+    assert row.usable_for_training is True
+    assert mask[:5] == (0.0, 0.0, 0.0, 0.0, 0.0)
+    assert mask[5] == 1.0
+    assert mask[6:10] == (0.0, 0.0, 0.0, 0.0)
+    assert mask[10] == 1.0
 
 
 def test_constant_and_weak_context_flags_are_reported() -> None:

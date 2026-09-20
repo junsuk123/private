@@ -270,10 +270,14 @@ class TestCompositeEngine:
 
     def test_owned_strategy_runs_its_own_algorithm(self):
         # KRX symbol on purpose: the entry floor is now the market's round-trip
-        # cost, and this fixture's ~53bp edge clears KRX (~44bp) but not US
-        # (~61bp). The subject here is which algorithm runs, so the market has to
-        # be stated rather than inherited from a placeholder ticker.
-        features = tick_features(symbol="005930", breakout_strength=0.0007)
+        # cost, and the fixture must clear KRX's configured 77.38bp
+        # (52.38bp round trip + 25bp net buffer). The subject here is which
+        # algorithm runs, so economics must not accidentally become the assertion.
+        features = tick_features(
+            symbol="005930",
+            breakout_strength=0.0007,
+            realized_volatility_10s=0.0060,
+        )
         momentum = self.engine.evaluate_owned_strategy(features, "intraday_momentum")
         breakout = self.engine.evaluate_owned_strategy(features, "breakout_volume")
         assert momentum.selected_methodology == "intraday_momentum"
@@ -357,7 +361,13 @@ class TestCompositeEngine:
         assert "VWAP_DISPLACEMENT_STABILISED" in recovered.reason_codes
 
     def test_breakout_requires_positive_five_second_acceptance(self):
-        base = dict(symbol="005930", breakout_strength=0.0007)
+        # Keep cost viability out of this acceptance-window test. The default
+        # volatility produces only ~48bp gross against KRX's 77.38bp floor.
+        base = dict(
+            symbol="005930",
+            breakout_strength=0.0007,
+            realized_volatility_10s=0.0050,
+        )
         missing = self.engine.evaluate_owned_strategy(
             tick_features(**base, return_5s=None), "breakout_volume"
         )
@@ -380,7 +390,7 @@ class TestCompositeEngine:
         # own round trip (see the companion test below).
         shock = tick_features(
             symbol="005930",
-            return_10s=-0.0140,
+            return_10s=-0.0220,
             spread_change_5s=-2.5,
             aggressor_imbalance_5s=-0.20,
             orderbook_imbalance=0.30,
@@ -392,7 +402,7 @@ class TestCompositeEngine:
         widening = self.engine.evaluate_owned_strategy(
             tick_features(
                 symbol="005930",
-                return_10s=-0.0140,
+                return_10s=-0.0220,
                 spread_change_5s=3.0,
                 aggressor_imbalance_5s=-0.20,
                 orderbook_imbalance=0.30,
@@ -518,7 +528,8 @@ class TestCompositeEngine:
         assert horizon == maximum
         assert edge < floor
         decision = algorithm.entry(calm, _election("liquidity_shock_reversal"))
-        assert decision.triggered is False
+        assert decision.triggered is True
+        assert decision.cost_viable is False
         assert "EDGE_BELOW_COST_FLOOR" in decision.reason_codes
 
     def test_us_ask_heavy_absorption_branch_requires_price_recovery(self):

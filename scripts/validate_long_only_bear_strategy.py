@@ -8,12 +8,17 @@ from app.strategy_validation.bear_cash_equity import (
     BearValidationConfig,
     build_bear_cash_equity_report,
 )
+from app.paths import project_path, realtime_market_database_path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate the long-only bear cash-equity submode; no orders.")
-    parser.add_argument("--database", type=Path, default=Path("data/store/realtime_market_data.sqlite3"))
-    parser.add_argument("--output", type=Path, default=Path("data/reports/long_only_bear_validation.json"))
+    parser.add_argument("--database", type=Path, default=realtime_market_database_path())
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=project_path("data/reports/long_only_bear_validation.json"),
+    )
     args = parser.parse_args()
     report = build_bear_cash_equity_report(BearValidationConfig(database=args.database))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -24,4 +29,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

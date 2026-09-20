@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -19,6 +19,7 @@ from app.data.llm_classifier import (
     LocalOpenAICompatibleChatClient,
     build_event_llm_classifier_from_env,
     event_llm_runtime_status,
+    _resolve_local_ollama_model,
 )
 from app.graph import KnowledgeGraph
 from app.graph.event_mapper import add_events_to_graph
@@ -37,6 +38,39 @@ class FakeLLMClient:
 
 
 class LLMEventClassifierTest(unittest.TestCase):
+    def test_qwen3_local_request_disables_reasoning_for_json_budget(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"choices": [{"message": {"content": '{"sentiment":"NEUTRAL"}'}}]}
+        ).encode("utf-8")
+        with (
+            patch.dict("os.environ", {"LLM_EVENT_REASONING_EFFORT": "none"}),
+            patch("app.data.llm_classifier.urllib.request.urlopen", return_value=response) as urlopen,
+        ):
+            LocalOpenAICompatibleChatClient(
+                "qwen3:1.7b", "http://127.0.0.1:11434/v1/chat/completions"
+            ).complete_json("system", "user")
+
+        request = urlopen.call_args.args[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["reasoning_effort"], "none")
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    def test_missing_synced_model_falls_back_to_best_installed_text_model(self) -> None:
+        installed = (
+            {"name": "qwen2.5:1.5b-instruct", "size": 986_000_000},
+            {"name": "qwen2.5:7b-instruct-q4_K_M", "size": 4_700_000_000},
+            {"name": "qwen3-embedding:8b", "size": 4_700_000_000},
+        )
+        with patch("app.data.llm_classifier._ollama_installed_models", return_value=installed):
+            model, fallback, names = _resolve_local_ollama_model(
+                "qwen3:1.7b", "http://127.0.0.1:11434/v1/chat/completions"
+            )
+
+        self.assertEqual(model, "qwen2.5:7b-instruct-q4_K_M")
+        self.assertTrue(fallback)
+        self.assertIn("qwen3-embedding:8b", names)
+
     def test_generic_regulatory_contract_text_is_not_a_supply_contract(self) -> None:
         event = classify_text_event(
             title="Regulator announces enforcement action",
@@ -129,7 +163,7 @@ class LLMEventClassifierTest(unittest.TestCase):
 
         event = classify_text_event(
             title="NVIDIA announces customer update",
-            body="The article uses neutral wording but describes a new customer agreement.",
+            body="The article uses neutral wording but describes a new customer supply agreement.",
             source=source_now("unit", "local://llm", "llm:1"),
             known_tickers={"NVDA": "NVIDIA"},
             llm_classifier=classifier,
@@ -141,6 +175,48 @@ class LLMEventClassifierTest(unittest.TestCase):
         self.assertIn("Contract amount is material", event.key_facts)
         self.assertEqual(event.classification_model, "fake-mini-llm")
         self.assertGreater(event.classification_confidence, 0.9)
+
+    def test_llm_semantic_label_requires_direct_source_evidence(self) -> None:
+        classifier = JsonEventLLMClassifier(
+            FakeLLMClient(
+                {
+                    "sentiment": "POSITIVE",
+                    "summary": "Samsung signed an HBM supply contract.",
+                    "key_facts": ["Multi-year supply agreement"],
+                    "event_labels": ["MajorSupplyContract", "AnalystUpgrade"],
+                    "companies": ["Samsung Electronics"],
+                    "tickers": ["005930"],
+                    "sectors": ["Semiconductors"],
+                    "confidence": 0.8,
+                }
+            )
+        )
+
+        result = classifier.classify(
+            "Samsung wins HBM supply contract",
+            "Samsung Electronics signed a multi-year supply agreement.",
+            {"005930": "Samsung Electronics"},
+        )
+
+        self.assertEqual(result.event_labels, ("MajorSupplyContract",))
+
+    def test_llm_known_ticker_echo_is_normalized_to_the_identifier(self) -> None:
+        result = JsonEventLLMClassifier(
+            FakeLLMClient(
+                {
+                    "sentiment": "NEUTRAL",
+                    "summary": "Example issuer update.",
+                    "key_facts": [],
+                    "event_labels": [],
+                    "companies": ["Example Issuer"],
+                    "tickers": ["DEMO=Example Issuer", "not a ticker value"],
+                    "sectors": [],
+                    "confidence": 0.6,
+                }
+            )
+        ).classify("Example issuer update", "No material change.", {"DEMO": "Example Issuer"})
+
+        self.assertEqual(result.tickers, ("DEMO",))
 
     def test_llm_event_labels_are_mapped_into_graph(self) -> None:
         event = classify_text_event(

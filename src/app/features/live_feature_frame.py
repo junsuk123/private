@@ -838,7 +838,9 @@ def _slow_technical_columns(
         liquidity_score=None,
     )
     names = (
-        "ema_fast", "ema_slow", "macd", "macd_signal", "macd_histogram",
+        "ema_fast", "ema_slow", "ma20", "ma50", "ma200",
+        "ma50_slope_bps", "ma200_slope_bps", "momentum_long_ex_recent",
+        "macd", "macd_signal", "macd_histogram",
         "short_return", "momentum_persistence", "adx", "plus_di", "minus_di",
         "dmi_spread", "supertrend", "supertrend_direction",
         "supertrend_distance_bps", "rsi", "bb_percent_b", "bb_bandwidth",

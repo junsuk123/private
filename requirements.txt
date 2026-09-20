@@ -2,6 +2,7 @@
 # Mirrors [project].dependencies in pyproject.toml.
 # Install with: pip install -r requirements.txt
 fastapi
+exchange-calendars
 httpx
 numpy
 owlrl

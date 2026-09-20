@@ -24,42 +24,82 @@ class DeviceInventory:
     available: tuple[str, ...]
     names: Mapping[str, str]
     probe_error: str | None = None
+    providers: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def has(self, device: str) -> bool:
         return device.upper() in self.available
 
 
 def probe_devices() -> DeviceInventory:
-    """Devices OpenVINO reports, always including CPU.
+    """Probe OpenVINO and PyTorch devices, always including CPU.
 
     A machine with no OpenVINO install, no iGPU or no NPU is the normal case, not
     an error: this returns a CPU-only inventory and records why. Nothing downstream
     is allowed to treat a missing accelerator as a failure.
     """
-    if importlib.util.find_spec("openvino") is None:
-        return DeviceInventory((CPU,), {CPU: "python"}, "openvino not installed")
-    try:
+    found: list[str] = [CPU]
+    names: dict[str, str] = {CPU: "python/numpy"}
+    providers: dict[str, list[str]] = {CPU: ["python"]}
+    notes: list[str] = []
+    if importlib.util.find_spec("openvino") is not None:
         try:
-            from openvino import Core  # type: ignore
-        except Exception:  # noqa: BLE001 - older layout
-            from openvino.runtime import Core  # type: ignore
-        core = Core()
-        found: list[str] = []
-        names: dict[str, str] = {}
-        for raw in core.available_devices:
-            device = str(raw).upper().split(".")[0]
-            if device not in found:
-                found.append(device)
             try:
-                names[device] = str(core.get_property(str(raw), "FULL_DEVICE_NAME"))
-            except Exception:  # noqa: BLE001 - naming is cosmetic
-                names.setdefault(device, str(raw))
-        if CPU not in found:
-            found.append(CPU)
-            names.setdefault(CPU, "cpu")
-        return DeviceInventory(tuple(found), names)
-    except Exception as exc:  # noqa: BLE001 - probing must never break startup
-        return DeviceInventory((CPU,), {CPU: "python"}, f"probe failed: {exc}")
+                from openvino import Core  # type: ignore
+            except Exception:  # noqa: BLE001 - older layout
+                from openvino.runtime import Core  # type: ignore
+            core = Core()
+            for raw in core.available_devices:
+                device = str(raw).upper().split(".")[0]
+                if device not in found:
+                    found.append(device)
+                providers.setdefault(device, []).append("openvino")
+                try:
+                    names[device] = str(core.get_property(str(raw), "FULL_DEVICE_NAME"))
+                except Exception:  # noqa: BLE001 - naming is cosmetic
+                    names.setdefault(device, str(raw))
+        except Exception as exc:  # noqa: BLE001 - probing must never break startup
+            notes.append(f"OpenVINO probe failed: {exc}")
+    else:
+        notes.append("OpenVINO not installed")
+
+    # OpenVINO's GPU plugin targets Intel graphics. CUDA/MPS therefore need a
+    # separate probe so a synced NVIDIA/Apple machine is not mistaken for CPU-only.
+    if importlib.util.find_spec("torch") is not None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                if GPU not in found:
+                    found.append(GPU)
+                providers.setdefault(GPU, []).append("torch-cuda")
+                names[GPU] = str(torch.cuda.get_device_name(0))
+            elif bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available():
+                if GPU not in found:
+                    found.append(GPU)
+                providers.setdefault(GPU, []).append("torch-mps")
+                names.setdefault(GPU, "Apple Metal GPU")
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"PyTorch accelerator probe failed: {exc}")
+
+    return DeviceInventory(
+        tuple(found),
+        names,
+        "; ".join(notes) or None,
+        {key: tuple(dict.fromkeys(value)) for key, value in providers.items()},
+    )
+
+
+def _workload_supports(inventory: DeviceInventory, workload: "Workload", device: str) -> bool:
+    if not inventory.has(device):
+        return False
+    # Provider-less inventories are used by callers/tests that intentionally model
+    # only generic devices; preserve that public contract.
+    if device == CPU or not inventory.providers:
+        return True
+    providers = inventory.providers.get(device, ())
+    if workload.key == "event_classification":
+        return bool(providers)
+    return "openvino" in providers
 
 
 @dataclass(frozen=True)
@@ -211,7 +251,7 @@ def plan_devices(
             )
             continue
         ladder = (requested, *workload.ladder) if override else workload.ladder
-        chosen = next((d for d in ladder if inventory.has(d)), CPU)
+        chosen = next((d for d in ladder if _workload_supports(inventory, workload, d)), CPU)
         reason = None
         if chosen != ladder[0]:
             missing = ladder[0]

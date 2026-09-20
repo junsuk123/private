@@ -870,8 +870,10 @@ def test_shipped_config_disables_every_short_arm(tmp_path) -> None:
     for strategy_id in SHORT_STRATEGY_IDS:
         assert not config.strategy_enabled(strategy_id), strategy_id
         key = DirectionalStrategyKey.for_short(strategy_id, "US")
-        assert controller.authorized_state(key) is not StrategyDeploymentState.LIVE_FULL
-        assert controller.may_submit_orders(key)[0] is False
+        assert controller.authorized_state(key) is StrategyDeploymentState.DISABLED
+        may_submit, reasons = controller.may_submit_orders(key)
+        assert may_submit is False
+        assert ShortReasonCodes.DEPLOYMENT_DISABLED in reasons
 
 
 # --------------------------------------------------------------------------- #

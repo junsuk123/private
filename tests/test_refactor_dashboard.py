@@ -234,7 +234,7 @@ def test_account_page_and_refactor_api_expose_new_console() -> None:
     )
     client = TestClient(app)
 
-    page = client.get("/account")
+    page = client.get("/account/advanced")
     payload = client.get("/api/refactor/dashboard")
 
     assert page.status_code == 200

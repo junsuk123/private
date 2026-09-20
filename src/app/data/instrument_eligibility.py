@@ -55,9 +55,9 @@ CATEGORY_UNKNOWN = "UNKNOWN"
 
 # --- Reason codes ------------------------------------------------------------ #
 INSTRUMENT_LEVERAGED_ETP_NOT_PERMITTED = "INSTRUMENT_LEVERAGED_ETP_NOT_PERMITTED"
+INSTRUMENT_ETF_NOT_PERMITTED = "INSTRUMENT_ETF_NOT_PERMITTED"
 INSTRUMENT_DERIVATIVE_NOT_PERMITTED = "INSTRUMENT_DERIVATIVE_NOT_PERMITTED"
 INSTRUMENT_ETN_NOT_PERMITTED = "INSTRUMENT_ETN_NOT_PERMITTED"
-INSTRUMENT_ETF_NOT_PERMITTED = "INSTRUMENT_ETF_NOT_PERMITTED"
 INSTRUMENT_CODE_SHAPE_UNSUPPORTED = "INSTRUMENT_CODE_SHAPE_UNSUPPORTED"
 INSTRUMENT_NAME_UNRESOLVED = "INSTRUMENT_NAME_UNRESOLVED"
 
@@ -166,29 +166,6 @@ def classify(symbol: str, name: str | None = None, *, market: str | None = None)
     # ticker itself and must survive.
     code = _strip_market_suffix(raw) if resolved_market == "KR" else raw
     normalized = _normalize_name(name)
-
-    # U.S. ticker shape and display name cannot distinguish an ETF from a common
-    # share (e.g. SPY vs SPY Inc.).  Use the locally cached official Nasdaq Trader
-    # ETF flag; this lookup is memory-cached and performs no network IO.
-    if resolved_market == "US":
-        try:
-            from app.data.instrument_catalog import us_instrument
-
-            catalog_record = us_instrument(code)
-        except Exception:  # noqa: BLE001 - unavailable metadata stays explicit below.
-            catalog_record = None
-        if catalog_record is not None and catalog_record.is_etf:
-            return InstrumentVerdict(
-                code,
-                catalog_record.security_name or str(name or ""),
-                resolved_market,
-                CATEGORY_ETF,
-                True,
-                (),
-            )
-        if catalog_record is not None and not normalized:
-            name = catalog_record.security_name
-            normalized = _normalize_name(name)
 
     # --- Code shape, checked first and fail-closed ---------------------------- #
     # This half does not depend on a name being available, and it is about what the
@@ -314,9 +291,9 @@ def filter_tradable(
                     verdict.market,
                     verdict.category,
                     False,
-                    (INSTRUMENT_ETF_NOT_PERMITTED,),
+                    tuple(dict.fromkeys((*verdict.reason_codes, INSTRUMENT_ETF_NOT_PERMITTED))),
                 )
-        if not permitted:
+        elif not permitted:
             if verdict.category == CATEGORY_LEVERAGED_ETP:
                 permitted = bool(leverage_etf_allowed)
             elif verdict.category in {CATEGORY_DERIVATIVE, CATEGORY_ETN}:

@@ -4,10 +4,12 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.paths import runtime_database_path
 
 from app.models.model_staleness import (
     ModelTrustLevel,
@@ -32,6 +34,7 @@ class ModelArtifact:
     live_eligible: bool
     created_at: str = ""
     trust_level: str = ModelTrustLevel.LIVE.value
+    nonlinear: dict[str, Any] = field(default_factory=dict)
 
     @property
     def shadow_only(self) -> bool:
@@ -39,8 +42,10 @@ class ModelArtifact:
 
 
 class ModelArtifactRegistry:
-    def __init__(self, root: str | Path = "data/models/live_short_horizon") -> None:
-        self.root = Path(root)
+    def __init__(self, root: str | Path | None = None) -> None:
+        self.root = Path(root) if root is not None else runtime_database_path(
+            "models/live_short_horizon", env_var="LIVE_MODEL_ARTIFACT_ROOT"
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         # In-memory cache of the parsed latest artifact, keyed by an identity triple
         # for latest.json. The live predictor calls load_latest_live_eligible() once
@@ -529,4 +534,5 @@ def _artifact_from_payload(payload: dict[str, Any], path: Path) -> ModelArtifact
         metrics={str(key): float(value) for key, value in payload["metrics"].items()},
         live_eligible=bool(payload["live_eligible"]),
         created_at=str(payload.get("created_at") or ""),
+        nonlinear=dict(payload.get("nonlinear") or {}),
     )

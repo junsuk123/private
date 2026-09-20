@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.context.regime import RegimeEstimate, RegimeEstimator, RegimeEvidence
+from app.context.regime import (
+    RegimeEstimate,
+    RegimeEstimator,
+    RegimeEvidence,
+    RegimeStabilizer,
+)
 from app.models.temporal_hetero_gnn import REGIME_LABELS, STRATEGY_FAMILIES
 from app.ontology.market_graph import load_market_graph
 from app.routing.regime_strategy_selector import (
@@ -339,3 +344,38 @@ def test_index_breadth_divergence_is_detectable() -> None:
     )
     assert estimate.probability("INDEX_UP_BREADTH_DOWN") > 0.5
     assert estimate.probability("INDEX_DOWN_BREADTH_UP") == 0.0
+
+
+def test_routing_projection_and_hysteresis_are_exposed(tmp_path) -> None:
+    config = tmp_path / "routing.yaml"
+    config.write_text(
+        "regime:\n  hysteresis:\n    minimum_consecutive_observations: 2\n"
+        "    minimum_hold_seconds: 0\n    switch_margin: 0\n"
+        "    risk_off_immediate_threshold: 0.8\n",
+        encoding="utf-8",
+    )
+    estimator = RegimeEstimator()
+    stabilizer = RegimeStabilizer(config)
+    first = stabilizer.stabilize(
+        estimator.estimate(
+            RegimeEvidence(direction=0.7, volatility=0.001, liquidity=0.9),
+            evaluated_at=NOW,
+        ),
+        key="KR",
+    )
+    assert first.routing_regime == "TREND_LOW_VOL"
+    assert first.feature_snapshot["direction"] == 0.7
+    falling = estimator.estimate(
+        RegimeEvidence(direction=0.0, volatility=0.008, liquidity=0.9),
+        evaluated_at=NOW + timedelta(minutes=1),
+    )
+    pending = stabilizer.stabilize(falling, key="KR")
+    switched = stabilizer.stabilize(
+        estimator.estimate(
+            RegimeEvidence(direction=0.0, volatility=0.008, liquidity=0.9),
+            evaluated_at=NOW + timedelta(minutes=2),
+        ),
+        key="KR",
+    )
+    assert pending.routing_regime == "TREND_LOW_VOL"
+    assert switched.routing_regime == "RANGE_HIGH_VOL"

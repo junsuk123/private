@@ -27,9 +27,14 @@ This module labels the state. It never selects a strategy and never authorises a
 from __future__ import annotations
 
 import math
+import threading
+from dataclasses import replace
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
+
+import yaml
 
 from app.context.domestic_context import DomesticContext
 from app.context.global_context import GlobalContext
@@ -42,7 +47,19 @@ __all__ = [
     "RegimeEstimate",
     "RegimeEstimator",
     "RegimeEvidence",
+    "RegimeStabilizer",
 ]
+
+ROUTING_REGIMES = (
+    "TREND_LOW_VOL",
+    "TREND_HIGH_VOL",
+    "RANGE_LOW_VOL",
+    "RANGE_HIGH_VOL",
+    "RISK_OFF",
+)
+DEFAULT_ROUTING_CONFIG = (
+    Path(__file__).resolve().parents[3] / "config" / "multi_strategy_routing.yaml"
+)
 
 #: Weight given to model evidence when the GNN is healthy. Below 0.5 on purpose: the rule
 #: layer is the auditable one, and a model whose evidence outvotes every deterministic
@@ -137,6 +154,12 @@ class RegimeEstimate:
     contributions: Mapping[str, Mapping[str, float | None]] = field(default_factory=dict)
     reasons: tuple[str, ...] = ()
     model_version: str | None = None
+    routing_probabilities: Mapping[str, float] = field(default_factory=dict)
+    raw_routing_regime: str | None = None
+    routing_regime: str | None = None
+    routing_confidence: float = 0.0
+    routing_reasons: tuple[str, ...] = ()
+    feature_snapshot: Mapping[str, Any] = field(default_factory=dict)
 
     #: Reported when no label carries any probability. An estimate with nothing behind it
     #: must not name a regime: ``max()`` over all-zeros returns whichever label happens to
@@ -187,6 +210,14 @@ class RegimeEstimate:
                 label: dict(values) for label, values in self.contributions.items()
             },
             "reasons": list(self.reasons),
+            "routing": {
+                "raw_regime": self.raw_routing_regime,
+                "regime": self.routing_regime,
+                "confidence": self.routing_confidence,
+                "probabilities": dict(self.routing_probabilities),
+                "reasons": list(self.routing_reasons),
+            },
+            "feature_snapshot": dict(self.feature_snapshot),
         }
 
 
@@ -236,6 +267,21 @@ class RegimeEstimator:
         # confident estimate; two is not, regardless of how decisive those two look.
         confidence = round(min(1.0, answered / 9.0), 6)
         source = "rule+model" if model_probabilities else "rule"
+        volatility = evidence.volatility
+        high_vol = (
+            _logistic(volatility, midpoint=VOLATILITY_CUT, steepness=800.0)
+            if volatility is not None else 0.5
+        )
+        trend_mass = max(blended.get("TREND_UP", 0.0), blended.get("TREND_DOWN", 0.0))
+        routing_probabilities = {
+            "TREND_LOW_VOL": round(trend_mass * (1.0 - high_vol), 6),
+            "TREND_HIGH_VOL": round(trend_mass * high_vol, 6),
+            "RANGE_LOW_VOL": round(blended.get("RANGE_LOW_VOL", 0.0), 6),
+            "RANGE_HIGH_VOL": round(blended.get("RANGE_HIGH_VOL", 0.0), 6),
+            "RISK_OFF": round(blended.get("RISK_OFF", 0.0), 6),
+        }
+        raw_routing = max(routing_probabilities, key=routing_probabilities.get)
+        routing_confidence = float(routing_probabilities[raw_routing])
         return RegimeEstimate(
             probabilities=blended,
             confidence=confidence,
@@ -244,7 +290,17 @@ class RegimeEstimator:
             contributions=contributions,
             reasons=tuple(dict.fromkeys(reasons)),
             model_version=model_version,
+            routing_probabilities=routing_probabilities,
+            raw_routing_regime=raw_routing,
+            routing_regime=raw_routing,
+            routing_confidence=round(routing_confidence, 6),
+            routing_reasons=("REGIME_ROUTING_RAW",),
+            feature_snapshot={
+                name: value.value if isinstance(value, SessionPhase) else value
+                for name, value in evidence.__dict__.items()
+            },
         )
+
 
     # ------------------------------------------------------------------ #
     def _rule_scores(
@@ -362,6 +418,71 @@ class RegimeEstimator:
             scores["TRANSITION"] = _clamp(sum(transition_terms) / len(transition_terms))
 
         return {label: round(_clamp(value), 6) for label, value in scores.items()}, reasons
+
+
+class RegimeStabilizer:
+    """Stateful routing-regime hysteresis with immediate strong RISK_OFF."""
+
+    def __init__(self, path: str | Path = DEFAULT_ROUTING_CONFIG) -> None:
+        try:
+            payload = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+            cfg = dict((payload.get("regime") or {}).get("hysteresis") or {})
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        self.minimum_consecutive = max(1, int(cfg.get("minimum_consecutive_observations", 3)))
+        self.minimum_hold_seconds = max(0.0, float(cfg.get("minimum_hold_seconds", 90)))
+        self.switch_margin = max(0.0, float(cfg.get("switch_margin", 0.08)))
+        self.risk_off_immediate_threshold = min(
+            1.0, max(0.0, float(cfg.get("risk_off_immediate_threshold", 0.80)))
+        )
+        self._state: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def stabilize(self, estimate: RegimeEstimate, *, key: str = "GLOBAL") -> RegimeEstimate:
+        scores = dict(estimate.routing_probabilities)
+        if not scores:
+            return estimate
+        raw = estimate.raw_routing_regime or max(scores, key=scores.get)
+        moment = estimate.evaluated_at
+        state_key = str(key or "GLOBAL").upper()
+        reasons: list[str] = []
+        with self._lock:
+            state = self._state.get(state_key)
+            if state is None:
+                state = {"current": raw, "since": moment, "pending": None, "count": 0}
+                self._state[state_key] = state
+                reasons.append("REGIME_HYSTERESIS_INITIALIZED")
+            elif raw == "RISK_OFF" and scores.get("RISK_OFF", 0.0) >= self.risk_off_immediate_threshold:
+                if state["current"] != "RISK_OFF":
+                    state.update(current="RISK_OFF", since=moment, pending=None, count=0)
+                    reasons.append("REGIME_RISK_OFF_IMMEDIATE")
+                else:
+                    reasons.append("REGIME_HYSTERESIS_HELD")
+            elif raw == state["current"]:
+                state.update(pending=None, count=0)
+                reasons.append("REGIME_HYSTERESIS_HELD")
+            else:
+                held = max(0.0, (moment - state["since"]).total_seconds())
+                current_score = float(scores.get(state["current"], 0.0))
+                margin_ok = float(scores.get(raw, 0.0)) >= current_score + self.switch_margin
+                if state.get("pending") == raw:
+                    state["count"] = int(state.get("count", 0)) + 1
+                else:
+                    state.update(pending=raw, count=1)
+                if held >= self.minimum_hold_seconds and margin_ok and int(state["count"]) >= self.minimum_consecutive:
+                    state.update(current=raw, since=moment, pending=None, count=0)
+                    reasons.append("REGIME_HYSTERESIS_SWITCH_CONFIRMED")
+                else:
+                    reasons.append("REGIME_HYSTERESIS_SWITCH_PENDING")
+            stable = str(state["current"])
+            if stable != raw:
+                reasons.append("REGIME_RAW_DIFFERS_FROM_STABLE")
+        return replace(
+            estimate,
+            routing_regime=stable,
+            routing_confidence=round(float(scores.get(stable, 0.0)), 6),
+            routing_reasons=tuple(reasons),
+        )
 
 
 def regime_from_prediction(

@@ -312,7 +312,9 @@ def test_untrusted_vector_can_cold_probe_only_after_owned_algorithm_fires(tmp_pa
                 "tick_count_5s": 9.0,
                 "return_5s": 0.0008,
                 "aggressor_imbalance_5s": 0.35,
-                "realized_volatility_10s": 0.0025,
+                    # The test isolates cold-probe authority; make the owned
+                    # algorithm independently clear KRX's cost-plus-buffer floor.
+                    "realized_volatility_10s": 0.0060,
                 "macd_histogram": 0.4,
                 "ema_fast": 70_010.0,
                 "ema_slow": 70_000.0,
@@ -452,7 +454,11 @@ def test_bar_confirmed_vwap_recovery_is_a_regular_gnn_bandit_arm(tmp_path, monke
         ranked_trade_intents=(), buy_candidates=(), sell_reduce_candidates=(),
         blocked_candidates=(), micro_results=(),
         macro_result=_macro(
-            allowed_micro_strategies=("vwap_reversion", "mean_reversion")
+            allowed_micro_strategies=("vwap_reversion", "mean_reversion"),
+            # Keep this routing test on the regular completed-bar arm.  Weak
+            # breadth intentionally selects the bear-relief submode, whose
+            # contract additionally requires sub-second absorption evidence.
+            diagnostics={"market_breadth": 0.60},
         ),
     )
 

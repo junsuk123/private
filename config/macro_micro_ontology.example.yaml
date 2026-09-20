@@ -27,13 +27,13 @@ micro:
 
 strategy_permissions:
   TREND_UP:
-    allow: [momentum, breakout, vwap_pullback]
+    allow: [momentum, breakout, vwap_pullback, relative_strength, relative_weakness]
     block: [aggressive_countertrend_reversion]
   TREND_DOWN:
-    allow: [sell, reduce_risk, defensive_hold, mean_reversion, vwap_reversion, relative_strength]
+    allow: [sell, reduce_risk, defensive_hold, mean_reversion, vwap_reversion, relative_strength, momentum_short, breakdown, relative_weakness]
     block: [weak_breakout_buy, low_volume_momentum_buy, intraday_momentum, event_momentum, gap_context, breakout_volume, rvgi_box_breakout]
   RANGE_BOUND:
-    allow: [mean_reversion, vwap_reversion]
+    allow: [mean_reversion, vwap_reversion, relative_strength, relative_weakness]
     block: [late_breakout_chasing]
   HIGH_VOLATILITY_RISK:
     allow: [sell, reduce_risk, hold]

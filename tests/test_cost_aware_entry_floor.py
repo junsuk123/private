@@ -60,10 +60,12 @@ def test_floor_is_per_market_not_constant() -> None:
     assert krx_floor > 4 * algorithm.config.shared("min_expected_edge_bps")
 
 
-def test_floor_charges_round_trip_once_without_a_second_net_buffer() -> None:
+def test_floor_charges_the_complete_round_trip_exactly_once() -> None:
     algorithm = IntradayMomentumAlgorithm()
     floor, diagnostics = algorithm.entry_floor_bps("005930")
 
+    # Current policy has no second fixed hurdle: profitability is positive only
+    # above the full configured round trip, and strict comparison rejects equality.
     assert algorithm.config.shared("min_net_buffer_bps") == 0.0
     assert floor == pytest.approx(round_trip_cost_bps("005930"))
     assert diagnostics["effective_cost_floor_multiple"] == 1.0
@@ -95,7 +97,7 @@ def test_realized_edge_calibrator_cannot_veto_a_deterministic_trigger(
     assert decision.triggered is True
 
 
-def test_edge_that_cannot_cover_its_cost_is_rejected_with_a_naming_reason() -> None:
+def test_edge_that_cannot_cover_cost_keeps_trigger_but_is_not_cost_viable() -> None:
     algorithm = IntradayMomentumAlgorithm()
 
     # 12bp used to clear the 8bp floor and then die at the gate.
@@ -107,8 +109,13 @@ def test_edge_that_cannot_cover_its_cost_is_rejected_with_a_naming_reason() -> N
         symbol="005930",
     )
 
-    assert decision.triggered is False
+    # Pattern evidence remains observable; live/proposal selection separately
+    # requires cost_viable and therefore cannot trade this signal.
+    assert decision.triggered is True
+    assert decision.cost_viable is False
+    assert decision.expected_edge_bps == pytest.approx(12.0)
     assert "EDGE_BELOW_COST_FLOOR" in decision.reason_codes
+    assert "TECHNICAL_EDGE_NON_POSITIVE" not in decision.reason_codes
     # The numbers travel with the rejection so an operator can see the shortfall
     # rather than re-deriving it.
     assert decision.diagnostics["round_trip_cost_bps"] > 12.0
@@ -128,6 +135,7 @@ def test_edge_above_the_cost_floor_still_fires() -> None:
     )
 
     assert decision.triggered is True
+    assert decision.cost_viable is True
     assert decision.expected_edge_bps == pytest.approx(floor + 1.0)
 
 

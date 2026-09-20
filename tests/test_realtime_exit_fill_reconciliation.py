@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from app.execution.order_status_tracker import OrderStatusSnapshot
-from app.schemas.domain import FinalOrder, OrderSide, OrderType
+from app.execution.kis_real import KisDevelopersApiClient
+from app.schemas.domain import AccountSnapshot, FinalOrder, OrderSide, OrderType
 from app.trading.realtime_trading_engine import RealtimeTradingEngine
 
 
@@ -110,9 +111,7 @@ def test_any_open_buy_blocks_election_of_additional_entry_risk():
     engine = RealtimeTradingEngine(
         decision_engine=decision_engine,
         coordinator=SimpleNamespace(),
-        account_provider=lambda: SimpleNamespace(
-            holdings=(), equity=100_000.0, realized_pnl_today=0.0
-        ),
+        account_provider=lambda: AccountSnapshot(cash=100_000.0, holdings=()),
         candidate_symbols_provider=lambda: ("SECOND",),
         session_open_provider=lambda: True,
     )
@@ -131,3 +130,82 @@ def test_any_open_buy_blocks_election_of_additional_entry_risk():
     engine.run_once()
 
     assert engine.get_status()["buy_disabled_reason"] is None
+
+
+def test_later_cycles_reconcile_a_submit_time_open_order():
+    order = FinalOrder(
+        ticker="001510",
+        market="KR",
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=1,
+        limit_price=3000.0,
+        manual_approval_required=False,
+    )
+    engine = RealtimeTradingEngine(
+        decision_engine=SimpleNamespace(),
+        coordinator=SimpleNamespace(),
+        account_provider=lambda: None,
+        candidate_symbols_provider=lambda: (),
+        session_open_provider=lambda: True,
+    )
+    engine._open_buy_orders["001510"] = {
+        "broker_order_id": "buy-1",
+        "order": order,
+        "submitted_monotonic": time.monotonic(),
+    }
+    scheduled = Mock()
+    engine._poll_submitted_order_status_async = scheduled
+
+    engine._reconcile_open_orders_async()
+
+    scheduled.assert_called_once_with("buy-1", "001510", order)
+
+
+def test_status_poll_scheduler_throttles_duplicate_threads():
+    engine = RealtimeTradingEngine(
+        decision_engine=SimpleNamespace(),
+        coordinator=SimpleNamespace(),
+        account_provider=lambda: None,
+        candidate_symbols_provider=lambda: (),
+        session_open_provider=lambda: True,
+    )
+    engine._open_buy_orders["001510"] = {
+        "broker_order_id": "buy-1",
+        "order": None,
+        "status_poll_inflight": True,
+    }
+
+    engine._poll_submitted_order_status_async("buy-1", "001510")
+
+    assert engine._open_buy_orders["001510"]["status_poll_inflight"] is True
+
+
+def test_domestic_zero_fill_and_zero_remaining_is_terminal_not_open():
+    order = FinalOrder(
+        ticker="175250",
+        market="KR",
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=1,
+        limit_price=2625.0,
+        manual_approval_required=False,
+    )
+    client = object.__new__(KisDevelopersApiClient)
+
+    execution = client._execution_from_status(
+        "buy-1",
+        {
+            "pdno": "175250",
+            "ord_qty": "1",
+            "tot_ccld_qty": "0",
+            "rmn_qty": "0",
+            "cncl_cfrm_qty": "0",
+            "rjct_qty": "0",
+            "ord_unpr": "2625",
+        },
+        order,
+    )
+
+    assert execution.status == "EXPIRED"
+    assert execution.quantity == 0

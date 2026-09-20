@@ -373,6 +373,7 @@ class OpeningRangeBreakoutExpert(StrategyExpert):
         # same strength as the breakout itself.
         return (
             c.q("opening_range_breakout") >= self.config.entry_quantile
+            and c.q("opening_range_entry_window") >= 1.0
             and c.q("relative_volume") >= self.config.entry_quantile
             and c.q("volume") >= self.config.confirmation_quantile
             and c.q("liquidity") >= self.config.confirmation_quantile
@@ -565,14 +566,14 @@ class RangeSupportReversionExpert(StrategyExpert):
 
 class BarTrendContinuationExpert(StrategyExpert):
     strategy_id = "bar_trend_continuation"
-    thesis = "persistent completed-bar strength above VWAP continues over hours"
+    thesis = "an established completed-bar trend resumes after a quiet pullback"
     default_config = _geometry_config("bar_trend_continuation")
 
     def admissible(self, c: ExpertContext) -> bool:
         return (
-            c.q("return") >= self.config.entry_quantile
-            and c.q("momentum_persistence_long") >= self.config.confirmation_quantile
-            and c.q("volume") >= self.config.confirmation_quantile
+            c.q("momentum_persistence_long") >= self.config.entry_quantile
+            and 0.30 <= c.q("return") <= self.config.entry_quantile
+            and c.q("volume") <= self.config.confirmation_quantile
             and c.q("liquidity") >= self.config.confirmation_quantile
         )
 

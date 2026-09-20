@@ -14,17 +14,11 @@
 #   NO_TRADE_MIN_FEATURE_COMPLETENESS
 
 minimum_edge_bps:
-  # Mirrors strategy_algorithms.yaml `shared.min_net_buffer_bps` (10bps), so the algorithm
-  # layer's entry floor and the selector's NO_TRADE bar agree about what "worth taking"
-  # means. Two layers with different answers is how a strategy fires on an edge the next
-  # layer then rejects.
-  KR: 10.0
-  # Doubled for US. The buffer is the same idea but a 10bps cushion on a 51-70bps round
-  # trip is a much thinner margin of safety than on 28bps.
-  US: 20.0
-  # Applied to a market neither of the above names. Between the two, deliberately: an
-  # unrecognised venue should not be treated as the cheap one.
-  default: 15.0
+  # Cost has already been subtracted from selector utility. Require only a
+  # strictly positive risk-adjusted result, with no additional market buffer.
+  KR: 0.0
+  US: 0.0
+  default: 0.0
 
 # Extra bar charged when the cost estimate was a FALLBACK rather than a measurement. A cost
 # the system guessed and one it computed are different evidence, and the guess should have
@@ -46,4 +40,4 @@ require_positive_lower_bound: true
 # Horizons shorter than this get an extra bar added, because the attainable move over the
 # window is smaller. Set short_horizon_seconds to 0 to disable.
 short_horizon_seconds: 300.0
-short_horizon_extra_bps: 5.0
+short_horizon_extra_bps: 0.0

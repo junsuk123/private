@@ -45,6 +45,7 @@ def _store(tmp_path, **posterior_overrides) -> StrategyPerformanceStore:
         tmp_path / "perf.sqlite3",
         posterior_config=PosteriorConfig(**posterior_overrides),
         cache_ttl_seconds=0.0,
+        clock=lambda: NOW,
     )
 
 

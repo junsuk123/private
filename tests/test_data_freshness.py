@@ -131,6 +131,17 @@ def test_report_summarises_states_and_blocks(registry: DataFreshnessRegistry) ->
     assert report["worst_state"] == "STALE"
 
 
+def test_report_scope_filter_ignores_retained_rotating_symbol(registry: DataFreshnessRegistry) -> None:
+    registry.record_event(
+        "kis_realtime", "trade", NOW - timedelta(hours=1), scope_key="OLD"
+    )
+    registry.record_event("kis_realtime", "trade", NOW, scope_key="ACTIVE")
+    report = registry.report(now=NOW, scope_keys=("ACTIVE",))
+    assert report["worst_state"] == "HEALTHY"
+    assert report["blocking_reasons"] == []
+    assert report["scope_filter"] == ["ACTIVE"]
+
+
 def test_policy_rejects_an_inverted_band() -> None:
     with pytest.raises(ValueError):
         FreshnessPolicy(

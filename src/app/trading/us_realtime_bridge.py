@@ -25,8 +25,9 @@ from app.data.realtime_types import (
 )
 from app.execution.kis_auth import build_kis_client
 from app.execution.kis_real import load_kis_env_file
+from app.paths import realtime_market_database_path
 
-STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
+STORE_PATH = realtime_market_database_path()
 BASE_URL = "https://openapi.koreainvestment.com:9443"
 
 _US_MARKET_NAMES = {"US", "NASDAQ", "NAS", "NYSE", "NYS", "AMEX", "AMS", "ARCA", "BATS", "CBOE", "IEX"}

@@ -61,14 +61,15 @@ class ThresholdMergeSafetyTest(unittest.TestCase):
     """
 
     def test_loose_artifact_cannot_weaken_safety_floor(self) -> None:
-        safety = load_live_trading_safety_config()
+        safety = load_live_trading_safety_config("config/live_trading_safety.example.json")
         # Artifact thresholds strictly looser than the safety config in every direction.
         loose = {
             "minimum_probability_success": safety.minimum_probability_success - 0.2,
             "minimum_expected_net_return_bps": safety.minimum_expected_net_return_bps - 50.0,
             "maximum_uncertainty": 0.99,
         }
-        merged = _prediction_thresholds(loose)
+        with patch("app.models.live_signal_predictor.load_live_trading_safety_config", return_value=safety):
+            merged = _prediction_thresholds(loose)
         self.assertGreaterEqual(
             merged["minimum_probability_success"], safety.minimum_probability_success
         )
@@ -79,13 +80,14 @@ class ThresholdMergeSafetyTest(unittest.TestCase):
         self.assertLessEqual(merged["maximum_uncertainty"], ceiling)
 
     def test_strict_artifact_is_preserved(self) -> None:
-        safety = load_live_trading_safety_config()
+        safety = load_live_trading_safety_config("config/live_trading_safety.example.json")
         strict = {
             "minimum_probability_success": safety.minimum_probability_success + 0.1,
             "minimum_expected_net_return_bps": safety.minimum_expected_net_return_bps + 20.0,
             "maximum_uncertainty": 0.10,
         }
-        merged = _prediction_thresholds(strict)
+        with patch("app.models.live_signal_predictor.load_live_trading_safety_config", return_value=safety):
+            merged = _prediction_thresholds(strict)
         self.assertEqual(
             merged["minimum_probability_success"], safety.minimum_probability_success + 0.1
         )

@@ -5,6 +5,7 @@ import os
 import hashlib
 import sqlite3
 import time
+import warnings
 from contextlib import closing
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,14 @@ from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from app.graph import Triple
+from app.paths import realtime_market_database_path, runtime_store_root
 from app.runtime import DataMode, default_environment
+from app.storage.sqlite_safety import (
+    RECOVERY_LOCK,
+    is_sqlite_corruption,
+    journal_mode_for_path,
+    quarantine_sqlite_files,
+)
 from app.schemas.domain import (
     ClassifiedEvent,
     MacroMetricRecord,
@@ -48,7 +56,7 @@ class LocalResearchStore:
     ) -> None:
         if root is None:
             environment = default_environment()
-            self.root = environment.store_dir
+            self.root = runtime_store_root()
             self.mode = environment.mode
         else:
             self.root = root
@@ -60,6 +68,7 @@ class LocalResearchStore:
             if retention_days is not None
             else max(1, int(os.getenv("RESEARCH_RETENTION_DAYS", "30")))
         )
+        self.recovery_event: dict[str, Any] | None = None
         self._init_db()
 
     def save_research_result(self, result: Any) -> dict[str, int]:
@@ -303,13 +312,13 @@ class LocalResearchStore:
 
     def sync_realtime_ohlcv(
         self,
-        realtime_db_path: str | Path = "data/store/realtime_market_data.sqlite3",
+        realtime_db_path: str | Path | None = None,
         *,
         limit: int = 20_000,
     ) -> int:
         """Idempotently project recent realtime bars into the research typed schema."""
         return self._sync_from_realtime(
-            realtime_db_path,
+            realtime_db_path or realtime_market_database_path(),
             source_table="realtime_minute_bars",
             columns="symbol, minute_start, open, high, low, close, volume",
             insert_sql="""
@@ -322,13 +331,13 @@ class LocalResearchStore:
 
     def sync_realtime_quotes(
         self,
-        realtime_db_path: str | Path = "data/store/realtime_market_data.sqlite3",
+        realtime_db_path: str | Path | None = None,
         *,
         limit: int = 20_000,
     ) -> int:
         """Idempotently project trade ticks into the typed quote schema."""
         return self._sync_from_realtime(
-            realtime_db_path,
+            realtime_db_path or realtime_market_database_path(),
             source_table="realtime_ticks",
             columns="symbol, exchange_timestamp, price, null, null, volume, source",
             insert_sql="""
@@ -631,8 +640,19 @@ class LocalResearchStore:
         return self._write_with_retry(write)
 
     def _init_db(self) -> None:
+        try:
+            self._initialize_schema()
+        except sqlite3.DatabaseError as exc:
+            if not is_sqlite_corruption(exc):
+                raise
+            self._recover_corrupt_database(exc)
+
+    def _initialize_schema(self) -> None:
         with closing(self._connect()) as conn:
-            conn.execute("pragma journal_mode=wal")
+            journal_mode = self._journal_mode()
+            conn.execute(f"pragma journal_mode={journal_mode}")
+            if journal_mode != "wal":
+                conn.execute("pragma synchronous=full")
             conn.execute(
                 """
                 create table if not exists records (
@@ -718,6 +738,39 @@ class LocalResearchStore:
             conn.execute("create index if not exists idx_typed_market_ticker_time on typed_market_snapshots(ticker, observed_at)")
             conn.execute("create index if not exists idx_typed_scores_ticker_time on typed_candidate_scores(ticker, observed_at)")
             conn.commit()
+
+    def _journal_mode(self) -> str:
+        return journal_mode_for_path(
+            self.db_path, override_env="RESEARCH_SQLITE_JOURNAL_MODE"
+        )
+
+    def _recover_corrupt_database(self, cause: sqlite3.DatabaseError) -> None:
+        with RECOVERY_LOCK:
+            # Another thread may have completed recovery while this thread was
+            # waiting. Re-open first so only one quarantine set is created.
+            try:
+                self._initialize_schema()
+                return
+            except sqlite3.DatabaseError as current:
+                if not is_sqlite_corruption(current):
+                    raise
+
+            quarantined = quarantine_sqlite_files(self.db_path)
+
+            self._initialize_schema()
+            self.recovery_event = {
+                "recovered_at": datetime.now(timezone.utc).isoformat(),
+                "database": str(self.db_path),
+                "cause": str(cause),
+                "quarantined": [str(path) for path in quarantined],
+                "journal_mode": self._journal_mode(),
+            }
+            warnings.warn(
+                "Recovered corrupt research SQLite database; quarantined files: "
+                + (", ".join(str(path) for path in quarantined) if quarantined else "none"),
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=60)

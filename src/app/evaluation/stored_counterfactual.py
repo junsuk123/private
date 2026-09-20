@@ -13,7 +13,11 @@ from typing import Any, Mapping, Sequence
 
 from app.backtesting.event_simulator import EventDrivenFillSimulator
 from app.cost.round_trip import all_in_round_trip_bps
-from app.data.investor_flow_store import InvestorFlowStore, business_date_for
+from app.data.investor_flow_store import (
+    InvestorFlowStore,
+    business_date_for,
+    prior_day_informed_flow_percentile,
+)
 from app.evaluation.purged_walk_forward import purged_walk_forward_splits
 from app.strategy.experts import ALL_EXPERT_TYPES, ExpertContext
 from app.strategy.exit_geometry import resolve_exit_geometry
@@ -102,6 +106,11 @@ class CounterfactualLabel:
     cost_floor_dominated: bool = False
 
     @property
+    def outcome_observed(self) -> bool:
+        """Whether the future path was long enough to supervise payoff channels."""
+        return self.exit_reason != "FUTURE_WINDOW_CENSORED"
+
+    @property
     def is_short(self) -> bool:
         return str(self.direction or "LONG").upper() == "SHORT"
 
@@ -114,8 +123,6 @@ class CounterfactualLabel:
         could not have known.
         """
         if not self.short_restriction_passed:
-            return False
-        if self.exit_reason == "FUTURE_WINDOW_CENSORED":
             return False
         if self.borrow_observed_at is not None and self.feature_snapshot_at is not None:
             if self.borrow_observed_at > self.feature_snapshot_at:
@@ -904,26 +911,20 @@ def _investor_flow_quantile(
     history: Mapping[str, Any] | None,
     business_date: str,
 ) -> float:
-    """Informed net buying on this business day, ranked against prior days.
+    """Latest completed day's informed net buying, ranked against earlier days.
 
     Ranked rather than thresholded because net-buy value is denominated in KRW and
     is not comparable across symbols: 3.6bn won into Samsung is routine, the same
     number into a mid-cap is not. A percentile of the symbol's own history is.
 
-    Strictly causal: only business days strictly BEFORE the current one form the
-    comparison set, so a day never ranks against its own future.
+    Strictly causal: the current business day's upserted total is excluded because
+    this store does not retain its intraday revisions. The latest completed day is
+    the signal and only still earlier days form its comparison set.
     """
-    if not history:
-        return 0.0
-    prior = [
-        day.informed_net_buy_value
-        for date_key, day in history.items()
-        if date_key < business_date
-    ]
-    today = history.get(business_date)
-    if today is None or len(prior) < 3:
-        return 0.0
-    return causal_percentile(today.informed_net_buy_value, prior)
+    _available, percentile = prior_day_informed_flow_percentile(
+        history, business_date
+    )
+    return percentile
 
 
 def build_labels(
@@ -1144,6 +1145,9 @@ def build_labels(
                 "gap_entry_window": (
                     1.0 if 5.0 <= minutes_from_open <= 30.0 else 0.0
                 ),
+                "opening_range_entry_window": (
+                    1.0 if 30.0 <= minutes_from_open <= 120.0 else 0.0
+                ),
                 # Relative volume -- the "stocks in play" filter. Not consumed by
                 # the legacy experts, but the opening-range expert requires it and
                 # the model gets it as a feature either way.
@@ -1352,8 +1356,31 @@ def build_labels(
                         ),
                     )
                 if index + strategy_future_bars >= len(bars):
-                    # This strategy's cost-resolved horizon runs past the stored
-                    # series, so its outcome is genuinely unobservable.
+                    # Keep the graph node and its point-in-time reachability label,
+                    # but mark every future-dependent payoff channel unobserved.
+                    # Dropping only this strategy made the entire multi-strategy
+                    # snapshot incomplete, so the graph trainer discarded valid
+                    # short-horizon evidence from every other strategy as well.
+                    labels.append(
+                        CounterfactualLabel(
+                            as_of=as_of,
+                            label_end=as_of,
+                            symbol=symbol,
+                            strategy_id=expert.strategy_id,
+                            triggered=triggered,
+                            filled=False,
+                            net_return_bps=0.0,
+                            cost_bps=0.0,
+                            exit_reason="FUTURE_WINDOW_CENSORED",
+                            features=label_features,
+                            direction=(
+                                plan.position_direction if plan is not None else "LONG"
+                            ),
+                            execution_product=(
+                                plan.execution_product if plan is not None else "CASH"
+                            ),
+                        )
+                    )
                     continue
                 strategy_future = future[:strategy_future_bars]
                 outcome = (
@@ -1374,7 +1401,13 @@ def build_labels(
                 labels.append(
                     CounterfactualLabel(
                         as_of=as_of,
-                        label_end=strategy_future[-1].end_time,
+                        # Purging and overlap accounting use the actual close,
+                        # not the end of the maximum look-ahead window.
+                        label_end=(
+                            outcome.exit_time
+                            if outcome is not None and outcome.exit_time is not None
+                            else strategy_future[-1].end_time
+                        ),
                         symbol=symbol,
                         strategy_id=expert.strategy_id,
                         triggered=triggered,

@@ -1303,6 +1303,15 @@ class ShortStrategyPromotionController:
 
     def authorized_state(self, key: DirectionalStrategyKey) -> StrategyDeploymentState:
         """The committed state, defaulting to SHADOW when unknown."""
+        # Account capability is the outer gate.  Previously a globally disabled
+        # long-only installation still fell through to the state store, whose
+        # cold-start default is SHADOW.  That kept impossible short arms in every
+        # symbol/strategy evaluation and filled the GUI with borrow blockers even
+        # though no short could ever be submitted.  Preserve the research code,
+        # but remove it from the runtime graph until BOTH deployment switches are
+        # deliberately enabled on a short-capable account.
+        if not self.config.enabled or not self.config.strategy_enabled(key.strategy_id):
+            return StrategyDeploymentState.DISABLED
         if self.config.operator_live_full_override and self.config.strategy_enabled(
             key.strategy_id
         ):
@@ -1316,6 +1325,8 @@ class ShortStrategyPromotionController:
         but authoritative in the sense that a False here is final. Both layers must
         agree before an order exists.
         """
+        if not self.config.enabled or not self.config.strategy_enabled(key.strategy_id):
+            return False, (ShortReasonCodes.DEPLOYMENT_DISABLED,)
         if self.config.operator_live_full_override and self.config.strategy_enabled(
             key.strategy_id
         ):

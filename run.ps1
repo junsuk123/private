@@ -724,6 +724,11 @@ Set-RunEnv "STRATEGY_SESSION_GNN_DIRECT_ELECTION" "false"
 # realised posteriors refine its ranking. Cold live probes are capped at 10%.
 Set-RunEnv "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION" "true"
 Set-DefaultEnv "BANDIT_EXPLORATION_SIZE_FRACTION" "0.10"
+# Macro regime is a portfolio-level prior, not a per-symbol veto.  A strategy
+# outside the preferred regime may still act when its own complete setup clears
+# costs, but only as a 10% learning probe; account/risk/session gates stay hard.
+Set-DefaultEnv "STRATEGY_SESSION_MACRO_MISMATCH_PROBE_ENABLED" "true"
+Set-DefaultEnv "STRATEGY_SESSION_MACRO_MISMATCH_PROBE_SIZE_FRACTION" "0.10"
 # --- Event-driven market-data ingestion (2026-08-04) ---------------------------------
 # 국내·미국 실시간 수집을 event bus + 영속화 워커 경로로 돌린다. 켜면:
 #   * 분 bar 를 in-memory 집계기(IncrementalMinuteBarBuilder)로 만든다 — 메시지마다
@@ -742,7 +747,7 @@ Set-DefaultEnv "REFACTOR_WEBSOCKET_MARKET_DATA" "true"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"
-Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "1.25"
+Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "0.15"
 # --- Day-trading (단타) exit discipline (2026-07-07) --------------------------------
 # Research-grounded (Van Tharp expectancy/R-multiple; Odean 1998 & Barber-Lee-Liu-Odean
 # on the disposition effect; StockCharts ATR stops; PwC/EY KR 0.20% sell tax). The prior
@@ -780,8 +785,8 @@ Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
 # Small-account buy tuning synced to the Raspberry Pi node:
 # keep the net-edge floor permissive enough for live fills, widen candidate discovery,
 # and reduce quote delay so the local launcher behaves like the deployed service.
-Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.0005"
-Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_US" "0.0005"
+  Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_KR" "0.0"
+  Set-DefaultEnv "REALTIME_MIN_BUY_NET_RETURN_US" "0.0"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EXTRA_NET" "0.0"
 Set-DefaultEnv "REALTIME_ONE_SHARE_CASH_BUFFER" "1.03"
 Set-DefaultEnv "REALTIME_FALLBACK_EDGE_BPS_PER_SCORE" "220"
@@ -839,7 +844,7 @@ Set-DefaultEnv "STRATEGY_SELECTOR_V2_AUTO_PROMOTE" "true"
 Set-DefaultEnv "STRATEGY_COUNTERFACTUAL_ENABLED" "true"
 Set-DefaultEnv "STRATEGY_NO_TRADE_ENABLED" "true"
 Set-DefaultEnv "STRATEGY_ONTOLOGY_MASK_V2_ENABLED" "true"
-Set-DefaultEnv "STRATEGY_SESSION_MIN_NET_TARGET_BPS" "25"
+  Set-DefaultEnv "STRATEGY_SESSION_MIN_NET_TARGET_BPS" "0"
 Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_BUFFER_RATE" "0.0"
 Set-DefaultEnv "REALTIME_COLLECTOR_MAX_SYMBOLS" "40"
 # 세션 앵커: 로테이션에서 제외하고 장 내내 유지하는 소수 종목.
@@ -907,14 +912,14 @@ Set-DefaultEnv "REALTIME_LATENCY_PROFILE" "low_latency"
 Set-DefaultEnv "OPENVINO_HINT_PERFORMANCE_MODE" "LATENCY"
 Set-DefaultEnv "OPENVINO_ENABLE_CPU_PINNING" "YES"
 Set-DefaultEnv "OPENVINO_CACHE_DIR" (Join-ProjectPath "data" "runtime" "openvino_cache")
-if ($script:OnWindows) {
+if ($false) {
   # The Core Ultra notebook: OpenVINO enumerates NPU (AI Boost) and an Intel iGPU,
   # and the short-horizon path has been running on the NPU since it was written.
   Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
   Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
   Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "openvino"
   Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
-} else {
+} elseif ($false) {
   # The Linux workstation has no NPU. It has an NVIDIA GPU, which OpenVINO cannot
   # target at all — OpenVINO's "GPU" plugin means the Intel iGPU — so the two
   # accelerators are reached by two different runtimes and must be configured
@@ -932,6 +937,9 @@ if ($script:OnWindows) {
   Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "transformers"
   Set-DefaultEnv "LLM_EVENT_DEVICE" "auto"
 }
+# Device selection is not inferred from the operating system. The Python startup
+# probe selects OpenVINO NPU/GPU/CPU and PyTorch CUDA/MPS per workload. Explicit
+# environment variables supplied by the operator still take precedence.
 
 # Shared local-LLM config (config/local_llm.env): the single place to set the
 # news/event sentiment model for both Windows and Raspberry Pi. Applied as
@@ -995,8 +1003,62 @@ Set-DefaultEnv "AUTO_START_LIVE_WORKER" "true"
 Set-DefaultEnv "AUTO_START_REALTIME_TRADING" "true"
 # 데이터 수집은 실시간(KIS 수집기+트레이딩 평가 저널링), 학습은 주기적으로 백그라운드 재학습.
 Set-DefaultEnv "AUTO_START_LIVE_TRAINING" "true"
+Set-DefaultEnv "AUTO_START_TEMPORAL_GNN_TRAINING" "false"
+Set-DefaultEnv "LIVE_MODEL_FAMILY" "adaptive_relu"
 Set-DefaultEnv "LIVE_TRAINING_INTERVAL_SECONDS" "300"
-Set-DefaultEnv "LIVE_TRAINING_STARTUP_DELAY_SECONDS" "90"
+Set-DefaultEnv "LIVE_TRAINING_STARTUP_DELAY_SECONDS" "30"
+# Model economics remain net-of-cost, but a small positive out-of-sample edge is
+# allowed to replace a stale incumbent. This is the bounded-risk setting requested
+# for this account; order-level cost/risk/cash gates still remain mandatory.
+Set-DefaultEnv "LIVE_MODEL_PROMOTION_MIN_TOP_K_NET_BPS" "1.0"
+Set-DefaultEnv "LIVE_MODEL_MAX_AGE_SECONDS" "86400"
+
+# Temporal GNN fitting is a NumPy/CPU evolutionary job; the NPU/GPU accelerate its
+# inference lanes but cannot shorten this fit. Size the background challenger to
+# the machine instead of copying workstation settings onto a 16GB notebook. User
+# supplied environment values always win, and the same synced code scales back up
+# on the larger GPU workstation.
+$detectedMemoryGb = 0.0
+$detectedLogicalProcessors = [Math]::Max(1, [Environment]::ProcessorCount)
+try {
+  if ($script:OnWindows) {
+    $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    $detectedMemoryGb = [double]$computer.TotalPhysicalMemory / 1GB
+  } elseif (Test-Path "/proc/meminfo") {
+    $memoryLine = Get-Content -LiteralPath "/proc/meminfo" |
+      Where-Object { $_ -match '^MemTotal:\s+(\d+)\s+kB' } |
+      Select-Object -First 1
+    if ($memoryLine -and $memoryLine -match '^MemTotal:\s+(\d+)\s+kB') {
+      $detectedMemoryGb = [double]$Matches[1] / 1MB
+    }
+  }
+} catch {
+  $detectedMemoryGb = 0.0
+}
+if ($detectedMemoryGb -gt 0 -and $detectedMemoryGb -le 20) {
+  # The trainer's hard minimum is 150 resolved decisions; stay above it so the
+  # constrained profile still performs a real fit instead of always refusing.
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "200"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "2"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "2"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(2, $detectedLogicalProcessors))
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "1800"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "300"
+} elseif ($detectedMemoryGb -gt 0 -and $detectedMemoryGb -le 40) {
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "240"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "4"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "4"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(4, $detectedLogicalProcessors))
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "3600"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "180"
+} else {
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "400"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "8"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "6"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(6, $detectedLogicalProcessors))
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "7200"
+  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "90"
+}
 # 투자자별 매매동향(개인/외국인/기관 순매수) 일일 갱신. KIS는 이 값을 영업일 단위로만
 # 제공하고, residual_relative_strength는 이 정보를 필수 조건으로 쓴다. 갱신이 멈추면
 # 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
@@ -1140,6 +1202,11 @@ function Start-PublicReadOnlySite {
       which is what makes an ordinary relaunch safe while the site is up.
   #>
   param([int]$Port)
+
+  if ($script:OnWindows) {
+    Write-Host "External read-only site: skipped on Windows (local app is unaffected)." -ForegroundColor DarkGray
+    return $null
+  }
 
   $bind = $null
   try {

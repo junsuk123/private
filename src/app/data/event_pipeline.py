@@ -100,24 +100,20 @@ class BoundedMarketEventBus:
             self._consumed += 1
             return self._items.popleft()
 
-    async def wait_for_depth(self, timeout: float) -> bool:
-        """Sleep until an event is queued, or ``timeout`` elapses.
-
-        Exists so an idle consumer can WAIT instead of polling ``stats().depth``
-        in a ``sleep(0)`` loop. That loop shared its event loop with the KIS
-        websocket reader, and burned a full core spinning while the reader was
-        starved of it — the socket stayed ESTABLISHED, the kernel receive queue
-        grew past 3MB, and US market data stopped arriving with no error anywhere.
-
-        A missed ``notify`` cannot lose data: producers append before notifying
-        and the caller re-checks depth, so the worst case is one extra timeout.
-        """
+    async def wait_for_depth(self, timeout: float | None = None) -> bool:
+        """Block until an item is published; return ``False`` on timeout."""
         async with self._condition:
             if self._items:
                 return True
             try:
-                await asyncio.wait_for(self._condition.wait(), timeout)
-            except (TimeoutError, asyncio.TimeoutError):
+                if timeout is None:
+                    await self._condition.wait_for(lambda: bool(self._items))
+                else:
+                    await asyncio.wait_for(
+                        self._condition.wait_for(lambda: bool(self._items)),
+                        timeout=max(0.0, float(timeout)),
+                    )
+            except asyncio.TimeoutError:
                 return False
             return bool(self._items)
 
@@ -455,7 +451,7 @@ class EventDrivenMarketRuntime:
         self._bars: dict[tuple[str, str], IncrementalMinuteBarBuilder] = {}
         self._pending_books: dict[tuple[str, tuple[object, ...]], RealtimeOrderbookSnapshot] = {}
         self._persistence: asyncio.Queue[
-            tuple[MarketEvent, RealtimeMinuteBar | None, bool]
+            tuple[MarketEvent, RealtimeMinuteBar | None]
         ] = asyncio.Queue(maxsize=persistence_capacity)
         self._fast_path_events = 0
         self._rejected_events = 0
@@ -479,7 +475,6 @@ class EventDrivenMarketRuntime:
             self._rejected_events += 1
             return False
         completed_bar = None
-        bar_is_closed = False
         if isinstance(event, RealtimeTradeTick):
             # builder 는 (symbol, stream) 단위다. 스트림을 섞으면 venue 가 다른 체결이
             # 한 bar 로 합산되고 거래량이 이중 계산된다.
@@ -489,7 +484,6 @@ class EventDrivenMarketRuntime:
                 IncrementalMinuteBarBuilder(event.symbol),
             )
             completed_bar = builder.update(event)
-            bar_is_closed = completed_bar is not None
             pending = self._pending_books.get(
                 (event.symbol, _paired_feed_key(event.meta))
             )
@@ -523,7 +517,7 @@ class EventDrivenMarketRuntime:
                     completed_bar = self._current_bar_if_due(builder_key, builder)
         if self.store is not None:
             try:
-                self._persistence.put_nowait((event, completed_bar, bar_is_closed))
+                self._persistence.put_nowait((event, completed_bar))
                 self._persistence_enqueued += 1
             except asyncio.QueueFull:
                 # Market-state truth remains in memory; persistence loss is
@@ -614,25 +608,27 @@ class EventDrivenMarketRuntime:
 
     def _persist_batch(
         self,
-        batch: list[tuple[MarketEvent, RealtimeMinuteBar | None, bool]],
+        batch: list[tuple[MarketEvent, RealtimeMinuteBar | None]],
     ) -> None:
         ticks = tuple(
-            event for event, _bar, _closed in batch if isinstance(event, RealtimeTradeTick)
+            event for event, _bar in batch if isinstance(event, RealtimeTradeTick)
         )
         books = tuple(
             event
-            for event, _bar, _closed in batch
+            for event, _bar in batch
             if isinstance(event, RealtimeOrderbookSnapshot)
         )
-        bars = tuple(bar for _event, bar, _closed in batch if bar is not None)
+        bars = tuple(bar for _event, bar in batch if bar is not None)
         if ticks:
             self.store.save_ticks(ticks)  # type: ignore[attr-defined]
         if books:
             self.store.save_orderbooks(books)  # type: ignore[attr-defined]
         if bars:
             self.store.save_minute_bars(bars)  # type: ignore[attr-defined]
-        sink = self.completed_bar_sink
-        if sink is not None:
-            for event, bar, closed in batch:
-                if closed and bar is not None:
-                    sink(bar, event)
+        if self.completed_bar_sink is not None:
+            for event, bar in batch:
+                if bar is None or not isinstance(event, RealtimeTradeTick):
+                    continue
+                event_minute = event.exchange_timestamp.replace(second=0, microsecond=0)
+                if event_minute > bar.minute_start:
+                    self.completed_bar_sink(bar, event)

@@ -20,6 +20,10 @@ import tempfile
 
 import pytest
 
+# Synology preserves conflicting historical copies alongside the canonical file.
+# They remain available for manual recovery, but are not a second test suite.
+collect_ignore_glob = ["*_Conflict.py"]
+
 # --------------------------------------------------------------------------- #
 # The operator's journals, redirected before ANY product module is imported.
 # --------------------------------------------------------------------------- #
@@ -41,6 +45,47 @@ import pytest
 os.environ.setdefault(
     "OBAITS_LOG_DIR", tempfile.mkdtemp(prefix="obaits-test-logs-")
 )
+# Resolve mutable defaults before product modules are imported. A synced code
+# checkout relocates these stores outside the repository, so leaving the defaults
+# intact would write synthetic ticks and fitted models into the operator's local
+# production state even though the test logs were isolated.
+_test_runtime_root = tempfile.mkdtemp(prefix="obaits-test-runtime-")
+os.environ.setdefault("REALTIME_STORE_ROOT", _test_runtime_root)
+os.environ.setdefault("LIVE_MODEL_ARTIFACT_ROOT", os.path.join(_test_runtime_root, "models"))
+
+
+@pytest.fixture(autouse=True)
+def prohibit_external_test_connections(monkeypatch):
+    """Unit tests may use local HTTP fixtures, never a funded broker endpoint."""
+    import ipaddress
+    import socket
+
+    original_connect = socket.socket.connect
+    original_connect_ex = socket.socket.connect_ex
+
+    def allowed(address):
+        if not isinstance(address, tuple):  # local Unix sockets
+            return True
+        host = str(address[0])
+        if host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def connect(sock, address):
+        if not allowed(address):
+            raise RuntimeError("External network disabled in unit tests; inject a fake transport")
+        return original_connect(sock, address)
+
+    def connect_ex(sock, address):
+        if not allowed(address):
+            raise RuntimeError("External network disabled in unit tests; inject a fake transport")
+        return original_connect_ex(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
 
 
 @pytest.fixture(scope="session", autouse=True)

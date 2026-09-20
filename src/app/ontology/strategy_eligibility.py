@@ -172,7 +172,7 @@ class StrategyEligibilityEngine:
         config: EligibilityConfig | None = None,
         long_only: bool = True,
     ) -> None:
-        self._registry = registry or default_strategy_registry()
+        self._registry = registry
         self._ontology = ontology or default_strategy_ontology()
         self._config = config or EligibilityConfig()
         # The account cannot trade 대주/공매도 (config/short_strategy_deployment.yaml
@@ -190,10 +190,12 @@ class StrategyEligibilityEngine:
         macro_allowed: Iterable[str] = (),
         macro_blocked: Iterable[str] = (),
     ) -> StrategyEligibilityResult:
+        registry = self._registry or default_strategy_registry(context.market)
+        requested = set(strategy_ids) if strategy_ids is not None else None
         specs = (
-            tuple(spec for spec in self._registry.all_specs() if spec.strategy_id in set(strategy_ids))
+            tuple(spec for spec in registry.all_specs() if spec.strategy_id in requested)
             if strategy_ids is not None
-            else self._registry.all_specs()
+            else registry.all_specs()
         )
         inputs: Mapping[str, Any] = election_inputs or {}
         allowed = tuple(macro_allowed or ())
@@ -367,8 +369,6 @@ class StrategyEligibilityEngine:
         the denominator — an unmatched relation is silence, not a zero vote.
         """
         relations = self._ontology.soft_relations(spec.strategy_id)
-        if not relations:
-            return 0.0, ()
         flat = context.flat()
         numerator = 0.0
         denominator = 0.0
@@ -391,11 +391,21 @@ class StrategyEligibilityEngine:
                 f"{relation.relation}:{relation.field}"
                 f"{'+' if relation.weight > 0 else '-'}"
             )
-        if denominator <= 0.0:
-            return 0.0, ()
-        score = numerator / denominator
+        score = numerator / denominator if denominator > 0.0 else 0.0
         if not math.isfinite(score):
             return 0.0, ()
+        from app.strategy.market_policy import market_profile_strategy_ids
+
+        preferences = market_profile_strategy_ids(context.market, context.macro.market_regime)
+        if preferences:
+            # Small, disclosed prior on family fit. It cannot change a hard
+            # eligibility mask, a mechanical trigger or a net-edge requirement.
+            preferred = spec.strategy_id in preferences
+            score = 0.90 * score + (0.10 if preferred else 0.0)
+            supporting.append(
+                f"prefers:market_profile:{context.market}:{context.macro.market_regime}:"
+                f"{'preferred' if preferred else 'neutral'}"
+            )
         return max(-1.0, min(1.0, score)), tuple(supporting)
 
 

@@ -56,6 +56,16 @@ class TechnicalFeatureSet:
     # Trend
     ema_fast: float | None = None
     ema_slow: float | None = None
+    # Timeframe-normalised trend/pullback structure.  On minute data these are
+    # 20/50/200 completed bars; on daily/weekly replay the same fields retain
+    # their conventional interpretation.  They deliberately stay outside the
+    # seconds-model schema and are consumed by deterministic strategy rules.
+    ma20: float | None = None
+    ma50: float | None = None
+    ma200: float | None = None
+    ma50_slope_bps: float | None = None
+    ma200_slope_bps: float | None = None
+    momentum_long_ex_recent: float | None = None
     macd: float | None = None
     macd_signal: float | None = None
     macd_histogram: float | None = None
@@ -808,7 +818,11 @@ class CompositeTechnicalSignalEngine:
             "regime": regime_diag.as_dict(),
             "reference_methodology_signal": reference.as_dict() if reference else None,
         }
-        if not decision.triggered:
+        # ``triggered`` records the market pattern; a BUY also requires that the
+        # pattern's expected gross edge clears the configured cost floor. Keeping
+        # those facts separate makes the rejected setup observable without ever
+        # turning it into order authority.
+        if not decision.triggered or decision.cost_viable is False:
             return CompositeTechnicalSignal(
                 symbol=features.symbol,
                 direction=SignalDirection.HOLD,

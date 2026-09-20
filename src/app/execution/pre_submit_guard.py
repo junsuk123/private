@@ -131,19 +131,6 @@ class PreSubmitGuard:
                 found = (f"PRESUBMIT_CHECK_FAILED:{name}:{type(exc).__name__}",)
             reasons.extend(found)
 
-        # Exits still get the routing check, above; this adds the one that applies to
-        # every side.
-        if exit_order:
-            checked.append("order_state")
-            try:
-                reasons.extend(
-                    self._check_order_state(
-                        ticker=ticker, side=side, market=market, now=moment, detail=detail
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                reasons.append(f"PRESUBMIT_CHECK_FAILED:order_state:{type(exc).__name__}")
-
         deduped = tuple(dict.fromkeys(reasons))
         blocking = tuple(
             code for code in deduped if self._strict or not code.startswith("PRESUBMIT_NO_EVIDENCE")

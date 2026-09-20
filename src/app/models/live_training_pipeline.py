@@ -7,6 +7,7 @@ import os
 from functools import lru_cache
 import sqlite3
 import threading
+import time
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -19,12 +20,13 @@ from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.features.live_feature_frame import FeatureFrameError, LiveFeatureFrameBuilder
 from app.models.live_model_trainer import train_live_short_horizon_model
 from app.models.model_artifact_registry import ModelArtifactRegistry, _atomic_write_text
+from app.paths import realtime_market_database_path, runtime_database_path
 
 
-DEFAULT_REALTIME_STORE_PATH = Path("data/store/realtime_market_data.sqlite3")
+DEFAULT_REALTIME_STORE_PATH = realtime_market_database_path()
 DEFAULT_FEATURE_JOURNAL_PATH = Path("logs/live-feature-frames.jsonl")
 DEFAULT_ACCOUNT_DASHBOARD_STORE_PATH = Path("data/store/account_dashboard.sqlite3")
-DEFAULT_TRAINING_ROW_STORE_PATH = Path("data/store/live_training_rows.sqlite3")
+DEFAULT_TRAINING_ROW_STORE_PATH = runtime_database_path("live_training_rows.sqlite3", env_var="LIVE_TRAINING_ROW_STORE_PATH")
 DEFAULT_TRADE_PLAN_LABEL_STORE_PATH = Path("data/store/trading_state.sqlite3")
 DEFAULT_NEWS_TRUST_PATH = Path("data/store/news_trust.json")
 DEFAULT_LABEL_MIN_FORWARD_SECONDS = 30.0
@@ -48,10 +50,12 @@ DEFAULT_LABEL_STRATEGY = "intraday_momentum"
 # overlap almost completely and let one bursty symbol dominate the fit.
 DEFAULT_TRAINING_MIN_ROW_SPACING_SECONDS = 15.0
 MIN_TRIPLE_BARRIER_PATH_POINTS = 2
-TRAINING_RECIPE_VERSION = "canonical_observation_thinned_symbol_temporal_holdout_v3"
+TRAINING_RECIPE_VERSION = "adaptive_relu_purged_actual_net_v4"
 INCREMENTAL_TRAINING_STATE_VERSION = 2
 TRAINING_ROW_STORE_SCHEMA_VERSION = "4"
 _LIVE_TRAINING_LOCK = threading.Lock()
+_LINE_COUNT_LOCK = threading.Lock()
+_LINE_COUNT_CACHE: dict[str, tuple[int, int]] = {}
 _FEATURE_FRAME_CACHE_LOCK = threading.Lock()
 _FEATURE_FRAME_CACHE: dict[str, Any] = {
     "path": None,
@@ -531,6 +535,7 @@ def _train_per_market_models(
                 force_live_ineligible_reason=(
                     None if market_rows else "NO_COLLECTED_LIVE_FEATURE_FRAMES"
                 ),
+                warm_start_artifact=previous,
             )
             _annotate_saved_artifact(
                 artifact,
@@ -592,10 +597,11 @@ def _train_live_short_horizon_from_collected_features_unlocked(
         and previous.get("feature_schema_hash") == LIVE_SHORT_HORIZON_SCHEMA.schema_hash
         and tuple(previous.get("feature_names") or ())
         == LIVE_SHORT_HORIZON_SCHEMA.feature_names
-        and (previous.get("classification") or {}).get("family")
-        == "logistic_regression_sgd"
-        and (previous.get("regression") or {}).get("family")
-        == "linear_regression_sgd"
+        and (
+            ((previous.get("classification") or {}).get("family") == "logistic_regression_sgd"
+             and (previous.get("regression") or {}).get("family") == "linear_regression_sgd")
+            or (previous.get("nonlinear") or {}).get("family") == "fixed_relu_two_head_v1"
+        )
     )
     if (
         incremental_compatible
@@ -675,6 +681,7 @@ def _train_live_short_horizon_from_collected_features_unlocked(
             "source_type": "collected_live_feature_frames",
             "row_count": len(rows),
             "materialized_row_count": row_merge["after_rows"],
+            "cumulative_materialized_row_count": row_merge["cumulative_rows"],
             "fresh_row_count": len(fresh_rows),
             "new_materialized_row_count": row_merge["new_rows"],
             "pruned_materialized_row_count": row_merge["pruned_rows"],
@@ -747,6 +754,9 @@ def live_training_status(
     latest_saved = _latest_saved_artifact(registry)
     latest_live_eligible = _live_eligible_artifact(registry)
     training_rows = _materialized_training_row_count(row_store_path)
+    cumulative_training_rows = _cumulative_materialized_training_row_count(
+        row_store_path
+    )
     if training_rows is None:
         metrics = (latest_saved or {}).get("metrics") or {}
         training_rows = int(float(metrics.get("example_count", 0) or 0))
@@ -757,6 +767,7 @@ def live_training_status(
         "feature_journal_path": str(journal_path),
         "feature_frame_lines": _line_count(journal_path),
         "training_rows": training_rows,
+        "cumulative_training_rows": cumulative_training_rows,
         "training_row_store_path": str(row_store_path),
         "training_row_store_exists": row_store_path.exists(),
         "latest_live_eligible_exists": registry.latest_path.exists(),
@@ -881,6 +892,7 @@ def build_live_training_rows_from_feature_journal(
                 "gross_forward_return_bps": gross_forward_return_bps,
                 "label_source": label_source,
                 "label_basis": frame_label_basis,
+                "label_horizon_seconds": float(frame_horizon_seconds),
                 "ticker": symbol,
                 # Market is recorded on every row so the trainer can fit KR and US
                 # separately. Mixing them puts a ~28bps-cost population and a
@@ -1751,6 +1763,7 @@ def _merge_materialized_training_rows(
             for key, _as_of, _market, _ticker, payload, _updated_at in payloads
             if existing_payloads.get(key) != payload
         }
+        new_row_count = sum(1 for key in incoming_keys if key not in before_keys)
         if payloads:
             conn.executemany(
                 """
@@ -1766,6 +1779,24 @@ def _merge_materialized_training_rows(
                 """,
                 payloads,
             )
+        # The table below is deliberately a bounded *active* training pool.  Keep
+        # a separate monotonic counter so retention/pruning cannot make genuine
+        # ingestion look like data loss in diagnostics.  Existing databases are
+        # migrated in-place by seeding the counter from their current row count.
+        cumulative_row = conn.execute(
+            "select value from live_training_store_metadata "
+            "where key='cumulative_materialized_rows'"
+        ).fetchone()
+        try:
+            cumulative_before = int(cumulative_row[0]) if cumulative_row else before_count
+        except (TypeError, ValueError):
+            cumulative_before = before_count
+        cumulative_rows = max(before_count, cumulative_before) + new_row_count
+        conn.execute(
+            "insert into live_training_store_metadata(key, value) values(?, ?) "
+            "on conflict(key) do update set value=excluded.value",
+            ("cumulative_materialized_rows", str(cumulative_rows)),
+        )
         maximum = max(1_000, int(_env_float("LIVE_TRAINING_MAX_MATERIALIZED_ROWS", 100_000)))
         count = int(conn.execute("select count(*) from live_training_rows").fetchone()[0])
         pruned_rows = max(0, count - maximum)
@@ -1778,9 +1809,8 @@ def _merge_materialized_training_rows(
     return _load_materialized_training_rows(path, thin=load_thinned), {
         "before_rows": before_count,
         "after_rows": after_count,
-        "new_rows": sum(
-            1 for key in incoming_keys if key not in before_keys
-        ),
+        "new_rows": new_row_count,
+        "cumulative_rows": cumulative_rows,
         "pruned_rows": pruned_rows,
         "maximum_rows": maximum,
         "duplicate_rows_removed": int(compacted["duplicate_rows_removed"]),
@@ -1800,6 +1830,26 @@ def _materialized_training_row_count(path: Path) -> int | None:
     except sqlite3.Error:
         return None
     return int(row[0]) if row else 0
+
+
+def _cumulative_materialized_training_row_count(path: Path) -> int:
+    """Return lifetime accepted rows while keeping the active pool bounded."""
+    if not path.exists():
+        return 0
+    try:
+        with closing(sqlite3.connect(path, timeout=2.0)) as conn:
+            _ensure_training_row_schema(conn)
+            active = int(
+                conn.execute("select count(*) from live_training_rows").fetchone()[0]
+            )
+            row = conn.execute(
+                "select value from live_training_store_metadata "
+                "where key='cumulative_materialized_rows'"
+            ).fetchone()
+            cumulative = int(row[0]) if row else active
+    except (sqlite3.Error, TypeError, ValueError):
+        return int(_materialized_training_row_count(path) or 0)
+    return max(active, cumulative)
 
 
 def materialized_training_row_count(
@@ -2205,6 +2255,11 @@ def _training_rows_fingerprint(rows: list[dict[str, Any]]) -> str:
             forward_return = 0.0
         digest.update(f"{forward_return:.8f}".encode("ascii"))
         digest.update(b"|")
+        # These affect cash targets and temporal purge even when benchmark alpha
+        # and feature values are unchanged.
+        for name in ("raw_forward_net_return_bps", "label_horizon_seconds", "label_basis"):
+            digest.update(str(row.get(name, "")).encode("utf-8"))
+            digest.update(b"|")
         features = row.get("features") if isinstance(row.get("features"), dict) else {}
         for name in LIVE_SHORT_HORIZON_SCHEMA.feature_names:
             try:
@@ -2224,6 +2279,7 @@ def _incremental_data_format_signature() -> str:
         "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
         "feature_names": LIVE_SHORT_HORIZON_SCHEMA.feature_names,
         "training_recipe_version": TRAINING_RECIPE_VERSION,
+        "configured_model_family": os.getenv("LIVE_MODEL_FAMILY", "adaptive_relu"),
         "minimum_row_spacing_seconds": _training_min_row_spacing_seconds(),
         "classification_family": "logistic_regression_sgd",
         "regression_family": "linear_regression_sgd",
@@ -2324,9 +2380,26 @@ def _line_count(path: Path) -> int:
         # Status endpoints must never scan a multi-GB transient journal. The
         # training loader will rotate it before attempting to parse frames.
         return 0
+    # Dashboard polling used to decode the entire 185MB+ JSONL file on every
+    # request. Count appended bytes incrementally instead; rotation is detected by
+    # a smaller file and resets the counter. Journal records are one non-empty JSON
+    # object plus a newline, so newline count is the exact row count.
+    key = str(path.resolve())
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
+        size = path.stat().st_size
+        with _LINE_COUNT_LOCK:
+            previous_size, previous_count = _LINE_COUNT_CACHE.get(key, (0, 0))
+            if size == previous_size:
+                return previous_count
+            if size < previous_size:
+                previous_size, previous_count = 0, 0
+            count = previous_count
+            with path.open("rb") as handle:
+                handle.seek(previous_size)
+                while chunk := handle.read(1024 * 1024):
+                    count += chunk.count(b"\n")
+            _LINE_COUNT_CACHE[key] = (size, count)
+            return count
     except OSError:
         return 0
 
@@ -2352,23 +2425,25 @@ def _discard_oversized_feature_journal(path: Path) -> None:
     training row store was simply gone, and a re-labelling that needed to rebuild
     from history had at most nine hours to rebuild from.
 
-    Keeping one retired segment costs one journal on disk and makes the loss
-    recoverable instead of final. The active file is still replaced, so the
-    property the original code cared about -- never parsing a giant file in the
-    live server -- is unchanged. ``scripts/prune_logs.py`` expires the segment by
-    the same rules it applies to every other rotated journal.
+    Keeping immutable, uniquely named retired segments makes the loss recoverable
+    instead of replacing ``.1`` (and silently deleting the previous segment) on
+    every rotation. The active file is still replaced, so the property the
+    original code cared about -- never parsing a giant file in the live server --
+    is unchanged. ``scripts/prune_logs.py`` applies the configured count/age/budget
+    retention to these ``.r<ns>-<pid>-<tid>`` segments.
 
     The event is also recorded, because a silent nine-hourly deletion of the
     training input is exactly the kind of thing that should not have to be
     discovered by noticing a model got worse.
     """
-    retired = path.with_suffix(path.suffix + ".1")
+    retired = path.with_name(
+        f"{path.name}.r{time.time_ns()}-{os.getpid()}-{threading.get_ident()}"
+    )
     try:
         size = path.stat().st_size
     except OSError:
         size = -1
     try:
-        retired.unlink(missing_ok=True)
         os.replace(path, retired)
     except OSError:
         # Failing closed here means skipping this cycle, never loading the giant

@@ -23,6 +23,7 @@ from app.models.strategy_utility import (
     StrategyUtilityModelConfig,
 )
 from app.models.strategy_utility.openvino_runtime import OpenVinoStrategyUtilityRuntime
+from app.paths import realtime_market_database_path
 from app.models.strategy_utility.strategy_graph import (
     RELATION_NAMES,
     STRATEGY_NODE_COUNT,
@@ -314,10 +315,7 @@ class ShadowIntelligenceService:
             # must remain isolated from live process state.
             self.trust_evaluator = GnnRealtimeTrustEvaluator(
                 comparison_path=comparison_path,
-                database_path=os.getenv(
-                    "REALTIME_MARKET_DATA_DB",
-                    "data/store/realtime_market_data.sqlite3",
-                ),
+                database_path=realtime_market_database_path(),
                 checkpoint_metadata_path=checkpoint_path.with_suffix(".json"),
                 stale_while_refresh=True,
             )

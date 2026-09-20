@@ -73,9 +73,9 @@ class NoTradePolicyConfig:
     """
 
     base_minimum_edge_bps: Mapping[str, float] = field(
-        default_factory=lambda: {"KR": 10.0, "US": 20.0}
+        default_factory=lambda: {"KR": 0.0, "US": 0.0}
     )
-    default_minimum_edge_bps: float = 15.0
+    default_minimum_edge_bps: float = 0.0
     #: Extra bar charged when the utility estimate is not a measured/trusted one.
     unmeasured_penalty_bps: float = 5.0
     #: Feature completeness below which no trade is admissible at all, regardless of edge.
@@ -86,17 +86,17 @@ class NoTradePolicyConfig:
     #: cannot attain a large move: the measured median absolute US move is 6.7bps over 3
     #: minutes against a 51.2bps round trip. Set to 0 to disable.
     short_horizon_seconds: float = 300.0
-    short_horizon_extra_bps: float = 5.0
+    short_horizon_extra_bps: float = 0.0
 
     @classmethod
     def from_env(cls) -> "NoTradePolicyConfig":
         return cls(
             base_minimum_edge_bps={
-                "KR": max(0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_KR", 10.0)),
-                "US": max(0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_US", 20.0)),
+                "KR": max(0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_KR", 0.0)),
+                "US": max(0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_US", 0.0)),
             },
             default_minimum_edge_bps=max(
-                0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_DEFAULT", 15.0)
+                0.0, _env_float("NO_TRADE_MIN_EDGE_BPS_DEFAULT", 0.0)
             ),
             unmeasured_penalty_bps=max(
                 0.0, _env_float("NO_TRADE_UNMEASURED_PENALTY_BPS", 5.0)

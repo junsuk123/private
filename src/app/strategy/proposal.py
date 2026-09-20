@@ -74,6 +74,9 @@ class StrategyProposal:
     direction: str = "LONG"
     proposed_at: datetime | None = None
     diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    # The mechanical thesis may fire while its gross edge still fails the configured
+    # cost-plus-buffer floor. Keep that evidence, but make it structurally unselectable.
+    cost_viable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "strategy_id", str(self.strategy_id or "").strip().lower())
@@ -111,7 +114,7 @@ class StrategyProposal:
         itself must have fired. Ranking an ``entry_ready=False`` proposal would let the
         selector arm a strategy whose own trigger said no.
         """
-        return bool(self.eligible and self.entry_ready)
+        return bool(self.eligible and self.entry_ready and self.cost_viable)
 
     @property
     def target_move_bps(self) -> float | None:
@@ -147,6 +150,7 @@ class StrategyProposal:
             "direction": self.direction,
             "eligible": self.eligible,
             "entry_ready": self.entry_ready,
+            "cost_viable": self.cost_viable,
             "selectable": self.selectable,
             "raw_signal_strength": round(self.raw_signal_strength, 4),
             "confidence": round(self.confidence, 4),

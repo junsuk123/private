@@ -99,10 +99,9 @@ STRATEGY_IDS: tuple[str, ...] = (
     #     proximity alone measured t=3.01; combining them did not beat the floor
     #     condition on its own.
     "range_support_reversion",
-    # Completed-bar trend continuation for sessions where a causal 1s/5s print
-    # window is unavailable. This is a distinct, multi-hour hypothesis using
-    # minute-bar trend, VWAP location, persistence and relative volume. It ships
-    # SHADOW-only and must earn positive net counterfactual evidence before use.
+    # Completed-bar 20/50/200 trend pullback (legacy id retained for schema
+    # compatibility). It separates long-ex-recent ranking from a quiet MA20
+    # retracement clock and ships SHADOW-only until after-cost promotion.
     "bar_trend_continuation",
     # TradingView-derived multi-indicator regime strategies. All three are
     # appended and ship SHADOW-only: catalogue membership creates observation

@@ -21,17 +21,26 @@ def validate_training_dataset(
 
 
 def auc_like_score(labels: list[int], scores: list[float]) -> float:
-    positives = [(score, label) for score, label in zip(scores, labels, strict=True) if label == 1]
-    negatives = [(score, label) for score, label in zip(scores, labels, strict=True) if label == 0]
+    """Exact tie-aware rank AUC in O(n log n), rather than all positive/negative pairs."""
+    import math
+
+    pairs = sorted(zip(scores, labels, strict=True))
+    if any(not math.isfinite(score) for score, _ in pairs):
+        raise ValueError("AUC scores must be finite")
+    positives = sum(label == 1 for _, label in pairs)
+    negatives = sum(label == 0 for _, label in pairs)
     if not positives or not negatives:
         return 0.5
     wins = 0.0
-    total = 0
-    for pos_score, _ in positives:
-        for neg_score, _ in negatives:
-            total += 1
-            if pos_score > neg_score:
-                wins += 1
-            elif pos_score == neg_score:
-                wins += 0.5
-    return wins / max(1, total)
+    lower_negatives = 0
+    start = 0
+    while start < len(pairs):
+        end = start + 1
+        while end < len(pairs) and pairs[end][0] == pairs[start][0]:
+            end += 1
+        tied_positive = sum(label == 1 for _, label in pairs[start:end])
+        tied_negative = sum(label == 0 for _, label in pairs[start:end])
+        wins += tied_positive * (lower_negatives + 0.5 * tied_negative)
+        lower_negatives += tied_negative
+        start = end
+    return wins / (positives * negatives)

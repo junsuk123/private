@@ -137,6 +137,7 @@ class DomesticContext:
     global_agreement: float | None = None
     components: Mapping[str, float] = field(default_factory=dict)
     reason_codes: tuple[str, ...] = ()
+    market: str = "KR"
 
     # -- global relationship ------------------------------------------------ #
     @property
@@ -178,6 +179,7 @@ class DomesticContext:
     def as_dict(self) -> dict[str, Any]:
         return {
             "context_id": self.context_id,
+            "market": self.market,
             "captured_at": _aware(self.captured_at).isoformat(),
             "global_context_id": self.global_context_id,
             "direction": self.direction,

@@ -15,7 +15,7 @@ from app.data.instrument_eligibility import CATEGORY_ETF as INSTRUMENT_ETF
 from app.data.instrument_eligibility import CATEGORY_LEVERAGED_ETP as INSTRUMENT_LEVERAGED_ETP
 from app.data.instrument_eligibility import classify as classify_instrument
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
-from app.portfolio import build_portfolio_report
+from app.portfolio import build_portfolio_report, valuation_complete
 from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
 from app.schemas.domain import (
     AccountSnapshot,
@@ -80,6 +80,11 @@ class RiskManager:
         checks["volatility_check"] = market.volatility_20d <= self.rules.max_volatility
         checks["duplicate_order_check"] = intent.ticker not in existing_pending_tickers
         checks["data_integrity_check"] = bool(intent.source_data_ids) and market.last_price > 0
+        checks["currency_valuation_complete"] = (
+            intent.action != OrderAction.BUY
+            or intent.resolved_position_effect == "CLOSE"
+            or valuation_complete(account)
+        )
         # --- Product / direction policy ----------------------------------------
         # The old single ``restricted_products_blocked`` check demanded that ALL of
         # margin, short selling, derivatives, leverage ETFs and credit be disallowed,
@@ -236,13 +241,8 @@ class RiskManager:
         if intent.action == OrderAction.BUY and quant_evidence and quant_factor <= 0.0:
             checks["quant_evidence_usable"] = False
         cash_available_for_market = _cash_available_for_market(account, market)
-        if cash_available_for_market <= 0:
-            currency = _market_currency(market)
-            cash_available_for_market = max(
-                cash_available_for_market,
-                float(account.pure_cash or 0.0),
-                float(account.cash_by_currency.get(currency, 0.0) or 0.0),
-            )
+        # A broker-reported zero is authoritative. Base KRW cash is never USD
+        # buying power; fallback here used to resurrect rejected currency funds.
         equity_for_sizing = _equity_for_sizing(account, market, max(report.equity, account.equity))
         metadata["cash_available_for_market"] = cash_available_for_market
         metadata["equity_for_sizing"] = equity_for_sizing
@@ -257,13 +257,19 @@ class RiskManager:
         current_sector_weight = report.sector_weights.get(market.sector, 0.0)
         incremental_weight = max(0.0, (target_value - current_value) / max(1e-9, equity_for_sizing))
         projected_sector_weight = current_sector_weight + incremental_weight
-        checks["max_single_stock_weight"] = adjusted_weight <= self.rules.max_single_stock_weight
+        # A validated close reduces existing exposure. Missing FX conservatively
+        # marks its sector as fully exposed, which must not strand a short cover.
+        # Cash, order contract and borrow-lot quantity checks still apply below.
+        reduces_exposure = effect == "CLOSE" and checks["order_contract_complete"]
+        checks["max_single_stock_weight"] = reduces_exposure or adjusted_weight <= self.rules.max_single_stock_weight
         checks["max_intraday_position_weight"] = (
-            intent.action != OrderAction.BUY
+            reduces_exposure
+            or intent.action != OrderAction.BUY
             or adjusted_weight <= self.rules.max_intraday_position_weight
         )
         checks["max_sector_weight"] = (
-            projected_sector_weight <= self.rules.max_sector_weight
+            reduces_exposure
+            or projected_sector_weight <= self.rules.max_sector_weight
             or (
                 intent.action in {OrderAction.SELL, OrderAction.REDUCE}
                 and projected_sector_weight <= current_sector_weight
@@ -271,6 +277,11 @@ class RiskManager:
         )
 
         buy_amount = max(0.0, target_value - current_value) if intent.action == OrderAction.BUY else 0.0
+        if is_short_exit:
+            # Covers repay the named borrow lot; a target portfolio weight does
+            # not describe their spend and can incorrectly produce zero here.
+            buy_amount = _cover_quantity_hint(intent) * market.last_price
+            metadata["cover_cash_required"] = buy_amount
         if (
             intent.action == OrderAction.BUY
             and buy_amount > 0.0
@@ -281,7 +292,8 @@ class RiskManager:
             buy_amount = float(market.last_price)
         projected_cash = cash_available_for_market - buy_amount
         checks["deposit_limit_check"] = buy_amount <= cash_available_for_market
-        checks["cash_available"] = projected_cash >= equity_for_sizing * self.rules.minimum_cash_reserve
+        required_reserve = 0.0 if reduces_exposure else equity_for_sizing * self.rules.minimum_cash_reserve
+        checks["cash_available"] = projected_cash >= required_reserve
 
         for check, ok in checks.items():
             if not ok:
@@ -377,9 +389,7 @@ class RiskManager:
             # Buy-to-cover. Quantity comes from the borrow lot, and ``loan_date`` is
             # mandatory: without it the execution layer cannot say which lot is being
             # repaid and refuses the order rather than letting the broker pick.
-            cover_quantity = max(
-                0, int(_metadata_value(intent, "cover_quantity") or intent_quantity_hint(intent))
-            )
+            cover_quantity = _cover_quantity_hint(intent)
             loan_date = str(_metadata_value(intent, "loan_date") or "").strip() or None
             if not loan_date:
                 approved = False
@@ -589,6 +599,14 @@ class RiskManager:
             else:
                 sell_value = current_value if intent.action == OrderAction.SELL else max(0.0, current_value - target_value)
                 quantity = floor(sell_value / market.last_price)
+                # Holding prices can lag the exit quote. Value / quote must not
+                # create more sellable shares than the broker snapshot contains.
+                held_quantity = sum(
+                    max(0, min(int(holding.quantity), int(holding.sellable_quantity) if holding.sellable_quantity is not None else int(holding.quantity)))
+                    for holding in account.holdings
+                    if holding.ticker == intent.ticker and not holding.is_short
+                )
+                quantity = min(quantity, held_quantity)
                 final_order = _final_order_or_reject(
                     intent,
                     market,
@@ -971,16 +989,8 @@ def _liquidity_score_from_market(market: MarketSnapshot) -> float:
 
 
 def _equity_for_sizing(account: AccountSnapshot, market: MarketSnapshot, fallback_equity: float) -> float:
-    currency = _market_currency(market)
-    if currency != "KRW":
-        foreign_cash = float(account.cash_by_currency.get(currency, 0.0) or 0.0)
-        foreign_holdings = sum(
-            holding.market_value
-            for holding in account.holdings
-            if _is_overseas_market_name(holding.market, holding.ticker)
-        )
-        return max(0.0, foreign_cash + foreign_holdings)
-    return fallback_equity
+    from app.market_affordability import equity_available_for_market
+    return equity_available_for_market(account, market)
 
 
 def _market_currency(market: MarketSnapshot) -> str:
@@ -1050,8 +1060,19 @@ def intent_quantity_hint(intent: OrderIntent) -> int:
     value = _metadata_value(intent, "quantity")
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _cover_quantity_hint(intent: OrderIntent) -> int:
+    value = _metadata_value(intent, "cover_quantity")
+    if value is None:
+        return intent_quantity_hint(intent)
+    try:
+        quantity = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return int(quantity) if math.isfinite(quantity) and quantity > 0 and quantity.is_integer() else 0
 
 
 def _parse_direction(intent: OrderIntent) -> str:

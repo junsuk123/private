@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -112,7 +113,7 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
 
     response = client.get("/api/account/gnn-graph")
     state = client.get("/api/account/gnn-state")
-    page = client.get("/account")
+    page = client.get("/account/advanced")
 
     assert response.status_code == 200
     assert response.json()["schema"] == "strategy_rgcn_visualization_v1"
@@ -125,12 +126,11 @@ def test_account_route_exposes_dedicated_gnn_graph() -> None:
     assert 'id="gnn-system-health"' in page.text
     assert 'id="gnn-health-physics"' in page.text
     assert 'aria-pressed="false"' in page.text
-    # ONE cache-bust marker for the terminal bundle, bumped alongside the version
-    # in web_account_routes.py. The point is that the page cannot ship a stale
-    # strategy_terminal.js against a changed payload contract. There were two
-    # markers here from successive features; the older one only recorded which
-    # release last touched the file, and every bump broke it.
-    assert "20260824-split-model-metrics-v1" in page.text
+    # The preserved advanced terminal must load matching style/script revisions.
+    css_version = re.search(r"strategy_terminal\.css\?v=([\w.-]+)", page.text)
+    js_version = re.search(r"strategy_terminal\.js\?v=([\w.-]+)", page.text)
+    assert css_version and js_version
+    assert css_version.group(1) == js_version.group(1)
 
 
 def test_gnn_auto_rotation_is_default_on_persistent_and_pauses_for_manual_control() -> None:

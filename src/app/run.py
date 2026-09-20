@@ -31,12 +31,27 @@ from app.web_access_guard import (
 )
 from app.trading_pipeline import load_short_horizon_strategy_config
 from app.config.refactor_profile import load_refactor_profile
+from app.paths import activate_project_root
+from app.realtime import RealtimeAccelerationPolicy
 
 
 def main() -> None:
+    workspace = activate_project_root()
     _configure_stdout()
     _configure_windows_event_loop_policy()
+    # Load operator configuration first. Hardware-derived defaults below use
+    # setdefault, so an explicit provider/device remains authoritative.
     configure_default_event_llm_env()
+    acceleration = RealtimeAccelerationPolicy()
+    acceleration.apply_process_hints()
+    inventory = acceleration.inventory()
+    detected = ", ".join(
+        f"{device} ({inventory.names.get(device, device)})" for device in inventory.available
+    )
+    print(f"Runtime root: {workspace}")
+    print(f"Detected compute: {detected}")
+    if inventory.probe_error:
+        print(f"Compute probe note: {inventory.probe_error}")
     parser = argparse.ArgumentParser(description="Run the complete local investment system")
     parser.add_argument(
         "--host",

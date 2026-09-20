@@ -22,6 +22,7 @@ from app.cost.round_trip import all_in_round_trip_bps
 from app.data.instrument_catalog import us_instrument
 from app.data.instrument_eligibility import CATEGORY_EQUITY, classify
 from app.evaluation.stored_counterfactual import load_minute_bars, load_minute_microstructure
+from app.paths import realtime_market_database_path, runtime_database_path
 from app.technical.signals import TechnicalFeatureSet
 from app.technical.strategy_algorithms import (
     AlgorithmConfig,
@@ -34,8 +35,10 @@ from app.trading.contracts import Bar
 
 @dataclass(frozen=True)
 class BearValidationConfig:
-    database: Path = Path("data/store/realtime_market_data.sqlite3")
-    investor_flow_database: Path = Path("data/store/investor_flow.sqlite3")
+    database: Path = realtime_market_database_path()
+    investor_flow_database: Path = runtime_database_path(
+        "investor_flow.sqlite3", env_var="INVESTOR_FLOW_DB"
+    )
     stride_bars: int = 5
     history_bars: int = 30
     maximum_gap_seconds: float = 120.0
@@ -448,7 +451,7 @@ def build_bear_cash_equity_report(cfg: BearValidationConfig | None = None) -> di
             )
             algorithm = registries[market]["residual_relative_strength"]
             decision = algorithm.entry(features, context)
-            if not decision.triggered:
+            if not decision.triggered or decision.cost_viable is False:
                 for reason in decision.reason_codes:
                     diagnostics[str(reason)] += 1
                 continue
@@ -506,4 +509,3 @@ def build_bear_cash_equity_report(cfg: BearValidationConfig | None = None) -> di
             "Historical sector membership is unavailable, so cross-sectional rank substitutes only for offline screening; live inference retains sector-neutral residuals.",
         ],
     }
-

@@ -18,6 +18,8 @@ from app.data.realtime_types import FeedMetadata, KIS_REALTIME_SOURCE, Orderbook
 from app.features.feature_schema import LIVE_SHORT_HORIZON_SCHEMA
 from app.models import live_training_pipeline as pipeline
 from app.models.live_training_pipeline import (
+    _cumulative_materialized_training_row_count,
+    _line_count,
     _materialized_training_row_count,
     _merge_materialized_training_rows,
     _negative_challenger_recovery_required,
@@ -32,6 +34,17 @@ from app.models.model_artifact_registry import ModelArtifactRegistry
 
 
 class LiveTrainingPipelineTest(unittest.TestCase):
+    def test_feature_journal_line_count_tracks_append_and_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "frames.jsonl"
+            journal.write_bytes(b"{}\n{}\n")
+            self.assertEqual(_line_count(journal), 2)
+            with journal.open("ab") as handle:
+                handle.write(b"{}\n")
+            self.assertEqual(_line_count(journal), 3)
+            journal.write_bytes(b"{}\n")
+            self.assertEqual(_line_count(journal), 1)
+
     def test_negative_challenger_recovery_starts_before_incumbent_stales(self) -> None:
         registry = SimpleNamespace(
             staleness=lambda: SimpleNamespace(
@@ -139,6 +152,7 @@ class LiveTrainingPipelineTest(unittest.TestCase):
             ):
                 _merge_materialized_training_rows(store, initial)
                 rows, stats = _merge_materialized_training_rows(store, newer)
+                cumulative_rows = _cumulative_materialized_training_row_count(store)
 
         self.assertEqual(len(rows), 1_000)
         self.assertEqual(stats["before_rows"], 1_000)
@@ -152,6 +166,8 @@ class LiveTrainingPipelineTest(unittest.TestCase):
         )
         self.assertNotIn("000000", {row["ticker"] for row in rows})
         self.assertNotIn("000001", {row["ticker"] for row in rows})
+        self.assertEqual(stats["cumulative_rows"], 1_002)
+        self.assertEqual(cumulative_rows, 1_002)
 
     def test_materialized_store_pruning_preserves_minority_market_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -603,7 +619,7 @@ def _write_frames(path: Path, *, count: int, flat: bool = False) -> None:
             values["principal_cushion_ratio"] = 1.0
             payload = {
                 "symbol": "005930",
-                "decision_time": f"2026-06-29T09:{index:02d}:00+00:00",
+                "decision_time": (datetime(2026, 6, 29, 9, tzinfo=timezone.utc) + timedelta(minutes=index)).isoformat(),
                 "feature_schema_hash": LIVE_SHORT_HORIZON_SCHEMA.schema_hash,
                 "source_record_ids": [f"tick-{index}"],
                 "values": values,

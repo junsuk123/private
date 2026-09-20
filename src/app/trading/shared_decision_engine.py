@@ -1216,6 +1216,7 @@ class SharedLiveDecisionEngine:
         # RiskManager one-share bump still guarantees a whole share when affordable.
         sizing = self.position_sizer.size(
             SizingInputs(
+                market=market.market,
                 net_expected_return=profitability_decision.net_expected_return,
                 target_net_return=profitability_decision.required_min_net_return,
                 confidence_score=confidence,

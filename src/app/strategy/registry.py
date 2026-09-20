@@ -115,7 +115,10 @@ _REQUIRED_FEATURES: dict[str, tuple[str, ...]] = {
         "aggressor_imbalance_5s", "realized_volatility_10s", "return_10s",
         "volume_spike_ratio",
     ),
-    "cross_sectional_relative_strength": ("aggressor_imbalance_5s", "short_return"),
+    "cross_sectional_relative_strength": (
+        "aggressor_imbalance_5s", "ema_fast", "ema_slow", "momentum_persistence",
+        "relative_volume", "short_return", "vwap_distance_bps",
+    ),
     "gap_context": ("aggressor_imbalance_5s", "volume_spike_ratio"),
     "rvgi_box_breakout": (
         "aggressor_imbalance_5s", "price", "return_1s", "return_5s", "volume_spike_ratio",
@@ -155,9 +158,9 @@ _REQUIRED_FEATURES: dict[str, tuple[str, ...]] = {
         "liquidity_score", "price", "spread_bps",
     ),
     "bar_trend_continuation": (
-        "atr_pct", "ema_fast", "ema_slow", "liquidity_score", "macd_histogram",
-        "momentum_persistence", "price", "relative_volume", "spread_bps",
-        "vwap_distance_bps",
+        "atr_pct", "liquidity_score", "ma20", "ma50", "ma200",
+        "ma50_slope_bps", "ma200_slope_bps", "macd_histogram", "price",
+        "relative_volume", "rsi", "short_return", "spread_bps",
     ),
     "supertrend_dmi_continuation": (
         "adx", "atr_pct", "dmi_spread", "liquidity_score",
@@ -182,7 +185,10 @@ _REQUIRED_FEATURES: dict[str, tuple[str, ...]] = {
 # actually compares against it.
 _REQUIRED_ELECTION_INPUTS: dict[str, tuple[str, ...]] = {
     "event_momentum": ("event_fresh", "event_age_seconds", "event_ttl_seconds"),
-    "cross_sectional_relative_strength": ("sector_rank", "sector_candidate_count"),
+    "cross_sectional_relative_strength": (
+        "sector_rank", "sector_candidate_count", "market_beta", "market_breadth",
+        "change_point_probability",
+    ),
     "gap_context": (
         "gap_rate", "gap_submode", "session_open_price", "previous_close_price",
         "minutes_since_session_open",
@@ -229,6 +235,9 @@ _REQUIRED_ELECTION_INPUTS: dict[str, tuple[str, ...]] = {
         "borrow_available_quantity", "borrow_observed_at", "days_to_cover",
         "short_interest_ratio",
     ),
+    "bar_confirmed_vwap_recovery": (
+        "market_breadth", "change_point_probability",
+    ),
     "overnight_gap_carry": (
         "in_last_continuous_half_hour", "minutes_to_continuous_close",
         "change_point_probability",
@@ -264,7 +273,7 @@ _MINIMUM_HISTORY_BARS: dict[str, int] = {
     "breakout_volume": 20,
     "rvgi_box_breakout": 20,
     "range_support_reversion": 20,
-    "bar_trend_continuation": 30,
+    "bar_trend_continuation": 205,
     "supertrend_dmi_continuation": 30,
     "keltner_volatility_breakout": 30,
     "choppiness_range_reversion": 30,
@@ -341,9 +350,9 @@ LIFECYCLE_RECOMMENDATIONS: dict[str, tuple[StrategyLifecycleState, str]] = {
         "config/strategy_algorithms.yaml now sets live_authorized=false, so the operating "
         "state already satisfies this",
     ),
-    # Measured 2026-08-11 by ``scripts/report_strategy_selection_v2.py`` over the stored
-    # performance data: 739 outcomes, mean net -119.6bps, median -94.7bps, one-sided 95%
-    # lower bound -127.5bps, and not one positive walk-forward window (out-of-sample
+    # Measured again during the 2026-09 strategy audit over the stored performance
+    # data: more than 1,000 outcomes, mean net roughly -111bps, and no positive
+    # walk-forward window (out-of-sample
     # stability 0.00). The gross edge is negative too, so no cost multiple rescues it —
     # this is a strategy problem, not a cost problem. (The count grows as the shadow
     # evaluator keeps scoring; re-run the script for the current figure.)
@@ -354,11 +363,11 @@ LIFECYCLE_RECOMMENDATIONS: dict[str, tuple[StrategyLifecycleState, str]] = {
     # no reason at all to close the file on it — hence SHADOW rather than RETIRED, and hence
     # the audit runner refuses to retire on shadow-only evidence.
     #
-    # Unlike ``range_support_reversion`` this one is NOT yet satisfied by config: the
-    # strategy still resolves to LIVE.
+    # The config now satisfies this recommendation explicitly: it remains enabled
+    # for version-scoped shadow evidence but has no live authority.
     "liquidity_shock_reversal": (
         StrategyLifecycleState.SHADOW,
-        "739 shadow outcomes (US only), mean net -119.6bps, lower bound -127.5bps, "
+        "1,000+ shadow outcomes (US only), mean net about -111bps, "
         "out-of-sample stability 0.00; gross edge also negative",
     ),
 }
@@ -373,15 +382,31 @@ REGISTRY_VERSION = "spec-v2"
 # the older rule merely because the catalogue itself did not change.  Keep this
 # map narrow so unrelated strategies retain their compatible evidence.
 _ALGORITHM_VERSION_OVERRIDES: dict[str, str] = {
+    # v4 unifies the point-in-time forecast horizon with the executor/training
+    # barrier horizon.  The former short clocks (180--420s) made live expected
+    # edge incomparable with the 30--90 minute outcomes used to validate it.
+    "intraday_momentum": "intraday-momentum-v4-aligned-horizon",
+    "breakout_volume": "breakout-volume-v4-aligned-horizon",
+    "vwap_mean_reversion": "vwap-reversion-v4-aligned-horizon",
+    "event_momentum": "event-momentum-v4-aligned-horizon",
+    "cross_sectional_relative_strength": "cross-sectional-v4-aligned-horizon",
+    "rvgi_box_breakout": "rvgi-breakout-v4-aligned-horizon",
+    "residual_relative_strength": "residual-strength-v4-aligned-horizon",
+    "adaptive_anchored_vwap_reversion": "anchored-vwap-v4-aligned-horizon",
+    "ofi_microprice_exhaustion_reversal": "ofi-exhaustion-v4-aligned-horizon",
     # v3 requires an exchange-aware opening clock.  The spec-v2 rule kept the
     # previous-close gap actionable all day (and into after-hours), so its stored
     # outcomes are not compatible evidence for the corrected opening thesis.
-    "gap_context": "gap-context-v3-opening-window",
+    "gap_context": "gap-context-v4-opening-aligned-horizon",
     # v3 requires an actually observed narrowing spread and regular-session
     # collection.  spec-v2 interpreted the sparse-book 0.0 placeholder as
     # contraction and journalled after the continuous market had closed.
-    "liquidity_shock_reversal": "liquidity-shock-v3-observed-spread",
-    "residual_relative_strength": "residual-strength-v3-bear-cash-equity",
+    "liquidity_shock_reversal": "liquidity-shock-v4-quarantined-negative-edge",
+    "bar_confirmed_vwap_recovery": "bar-vwap-v3-bear-relief",
+    # v5 replaces high-volume continuation chasing with a completed-bar
+    # trend-pullback thesis.  Old continuation outcomes are therefore not valid
+    # promotion evidence for this strategy version.
+    "bar_trend_continuation": "bar-trend-pullback-v5",
 }
 
 
@@ -423,6 +448,7 @@ class StrategyRegistry:
         config = algorithm_config or AlgorithmConfig()
         self._resolved = config.as_dict()
         algorithms = build_algorithm_registry(config)
+        self._algorithms = algorithms
 
         for strategy_id in STRATEGY_IDS:
             algorithm = algorithms.get(strategy_id)
@@ -467,8 +493,8 @@ class StrategyRegistry:
             return StrategyLifecycleState.RESEARCH
 
         try:
-            live = strategy_live_authorized(strategy_id)
-            shadow = strategy_shadow_authorized(strategy_id)
+            live = strategy_live_authorized(strategy_id, registry=self._algorithms)
+            shadow = strategy_shadow_authorized(strategy_id, registry=self._algorithms)
         except Exception:  # noqa: BLE001 - an unreadable authorisation fails closed.
             return StrategyLifecycleState.RESEARCH
 
@@ -573,12 +599,22 @@ def _validation_version(strategy_id: str) -> str:
 
 
 _default: StrategyRegistry | None = None
+_market_defaults: dict[str, StrategyRegistry] = {}
 _default_lock = threading.Lock()
 
 
-def default_strategy_registry() -> StrategyRegistry:
+def default_strategy_registry(market: str | None = None) -> StrategyRegistry:
     global _default
+    from app.data.market_capabilities import normalize_market_group
+    from app.technical.strategy_algorithms import AlgorithmConfig
+
+    group = normalize_market_group(str(market or ""))
     with _default_lock:
+        if group is not None:
+            key = group.value
+            if key not in _market_defaults:
+                _market_defaults[key] = StrategyRegistry(algorithm_config=AlgorithmConfig(market=key))
+            return _market_defaults[key]
         if _default is None:
             _default = StrategyRegistry()
         return _default
@@ -589,3 +625,4 @@ def reset_default_strategy_registry() -> None:
     global _default
     with _default_lock:
         _default = None
+        _market_defaults.clear()

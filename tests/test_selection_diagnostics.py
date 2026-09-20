@@ -158,6 +158,50 @@ class TestMerge:
 
 
 class TestCycleSnapshotAdapter:
+    def test_evaluation_exception_is_not_reported_as_a_false_market_trigger(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "INTC",
+                "strategy_id": "cross_sectional_relative_strength",
+                "triggered": False,
+                "expected_edge_bps": 0.0,
+                "reason_codes": ["STRATEGY_ENTRY_EVALUATION_ERROR:NameError"],
+            }],
+            session={},
+        )
+
+        record = collector.records[0]
+        assert record.stage is SelectionStage.EVALUATION_ERROR
+        assert "raised an exception" in record.detail
+
+    def test_positive_mechanical_trigger_reaches_cost_floor_stage(self):
+        collector = collector_from_algorithm_evaluations(
+            [{
+                "symbol": "094480",
+                "strategy_id": "range_support_reversion",
+                "triggered": True,
+                "cost_viable": False,
+                "expected_edge_bps": 19.904,
+                "reason_codes": [
+                    "RANGE_FLOOR_SUPPORT_TOUCH",
+                    "EDGE_BELOW_COST_FLOOR",
+                ],
+                "diagnostics": {
+                    "round_trip_cost_bps": 52.38,
+                    "minimum_edge_bps": 77.38,
+                    "min_net_buffer_bps": 25.0,
+                },
+            }],
+            session={},
+        )
+
+        record = collector.records[0]
+        assert record.stage is SelectionStage.COST_FLOOR_REJECTED
+        assert record.rule_gross_bps == pytest.approx(19.904)
+        assert record.rule_net_bps == pytest.approx(-32.476)
+        assert record.required_net_bps == 25.0
+        assert collector.funnel()["trigger"] == 1
+
     def test_reconstructs_real_feature_and_trigger_failures(self):
         collector = collector_from_algorithm_evaluations(
             [
