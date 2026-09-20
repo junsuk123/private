@@ -147,7 +147,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_live_submission_is_idempotent_when_all_gates_pass(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             env = {
@@ -174,7 +174,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_live_submission_allows_overseas_limit_order(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             env = {
@@ -258,7 +258,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_live_submission_routes_us_daytime_order_to_daytime_api(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             env = {
@@ -286,7 +286,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_domestic_order_can_use_after_hours_order_division(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             env = {
@@ -312,7 +312,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_domestic_sell_revise_uses_rvsecncl_api(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             replacement = FinalOrder(
@@ -348,7 +348,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_overseas_sell_revise_uses_overseas_rvsecncl_api(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             replacement = FinalOrder(
@@ -386,7 +386,7 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
     def test_us_daytime_sell_revise_uses_daytime_rvsecncl_api(self) -> None:
         transport = OrderTransport()
         with tempfile.TemporaryDirectory() as tmp:
-            arming_path = Path("config/secrets/live_trading_armed.json")
+            arming_path = Path(tmp) / "live_trading_armed.json"
             create_arming_file(arming_path, ttl_seconds=60)
             coordinator = self._coordinator(tmp, transport)
             replacement = FinalOrder(
@@ -418,6 +418,10 @@ class LiveExecutionCoordinatorTest(unittest.TestCase):
         self.assertEqual(amended.broker_order_id, "DAY000011")
 
     def _coordinator(self, tmp: str, transport: OrderTransport) -> LiveExecutionCoordinator:
+        # Routing fixtures must never arm the operator workspace.
+        arming = patch("app.trading.live_runtime_guard.ARMING_FILE", Path(tmp) / "live_trading_armed.json")
+        arming.start()
+        self.addCleanup(arming.stop)
         client = KisDevelopersApiClient(
             app_key="app",
             app_secret="secret",

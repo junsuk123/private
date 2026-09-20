@@ -82,3 +82,17 @@ def test_terminal_unfilled_order_cancels_plan_and_releases_session(tmp_path) -> 
     assert saved[-1].status is TradePlanStatus.CANCELLED
     assert manager.snapshot()["phase"] == "SCANNING"
     assert manager.snapshot()["last_reason"] == "ENTRY_ORDER_REJECTED"
+
+
+def test_expired_armed_plan_returns_to_same_election_authority_without_cooldown(tmp_path):
+    from app.schemas.domain import AccountSnapshot
+    manager, saved = _manager(tmp_path)
+    selected = []
+    manager._select = lambda *args, **kwargs: selected.append((args, kwargs))
+    manager.evaluate(AccountSnapshot(cash=100_000., holdings=()), ("005930",), None,
+                     NOW + timedelta(minutes=5))
+    assert manager._trade_plan is None
+    assert manager._state.phase == "SCANNING"
+    assert manager._state.last_reason == "ONTOLOGY_PLAN_EXPIRED_RESELECT"
+    assert len(selected) == 1
+    assert saved[-1].status is TradePlanStatus.CANCELLED

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import math
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
@@ -386,9 +387,13 @@ class SharedLiveDecisionEngine:
         market_refresher: Callable[[str, str, datetime], MarketSnapshot | None] | None = None,
         decision_logger: DecisionLogger | None = None,
         ontology_policy_resolver: Callable[..., OntologyRiskPolicy] | None = None,
+        entry_activity_provider: Callable[[str, datetime], int | None] | None = None,
+        decision_clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
         self.ontology_policy_resolver = ontology_policy_resolver
+        self.entry_activity_provider = entry_activity_provider
+        self.decision_clock = decision_clock
         self._holding_ontology_policies: dict[tuple, OntologyRiskPolicy] = {}
         self._ontology_exit_confirmations: dict[tuple, tuple[str, int, datetime]] = {}
         self._ontology_peak_net: dict[tuple, float] = {}
@@ -457,6 +462,21 @@ class SharedLiveDecisionEngine:
         except Exception as exc:
             return None, f"ONTOLOGY_POLICY_RESOLUTION_FAILED:{type(exc).__name__}"
 
+    def _post_refresh_time(self, original: datetime, started: float) -> datetime:
+        """Use a trusted completion clock, never the incoming quote's clock.
+
+        Live construction injects UTC wall time. Replay callers without that
+        clock retain their supplied timeline and advance by elapsed monotonic
+        time, so a historical decision never jumps to the machine's current day.
+        """
+        elapsed = original + timedelta(seconds=max(0., time.monotonic() - started))
+        if self.decision_clock is None:
+            return elapsed
+        moment = self.decision_clock()
+        if not isinstance(moment, datetime) or moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("decision_clock must return an aware datetime")
+        return max(original, moment)
+
     def _evaluate_ontology_exit(self, *, holding, account, market, price, cost_floor,
                                 ontology_score, ontology_support, decision_time, source_id, quote_age_seconds):
         """Market-derived exits; stale analysis retains barriers but cannot create risk."""
@@ -470,7 +490,7 @@ class SharedLiveDecisionEngine:
             account=account, all_in_cost_rate=cost, requested_horizon_seconds=900,
         )
         previous = self._holding_ontology_policies.get(key)
-        usable = current is not None and current.is_current(decision_time) and current.valid_for_entry
+        usable = current is not None and current.has_current_market_evidence(decision_time)
         if not usable and previous is not None:
             current = previous
         elif current is None:
@@ -705,16 +725,18 @@ class SharedLiveDecisionEngine:
         trade_plan: Any | None = None,
     ) -> SharedDecisionResult:
         decision_time = decision_time or datetime.now(timezone.utc)
+        evaluation_anchor, evaluation_started = decision_time, time.monotonic()
         if self.ontology_policy_resolver is not None:
             self.sync_position_policy_state(account)
         frame = None
         prediction: LiveSignalPrediction | None = None
         prediction_error: Exception | None = None
-        try:
-            frame = self.feature_builder.build(symbol, decision_time=decision_time)
-            prediction = self.predictor.predict(frame)
-        except Exception as exc:  # noqa: BLE001 - model failure can fall back to ontology and rules.
-            prediction_error = exc
+        if trade_plan is None or self.ontology_policy_resolver is None:
+            try:
+                frame = self.feature_builder.build(symbol, decision_time=decision_time)
+                prediction = self.predictor.predict(frame)
+            except Exception as exc:  # noqa: BLE001 - model failure can fall back to ontology and rules.
+                prediction_error = exc
         strategy_locked = bool(str(selected_strategy or "").strip())
         # Realized feedback, scoped to this strategy/market/regime where possible.
         # Both consumers below used to receive literal constants, so the whole
@@ -722,12 +744,12 @@ class SharedLiveDecisionEngine:
         election_regime = (
             str((election_context or {}).get("macro_regime") or "").strip() or None
         )
-        recent_performance = self._recent_performance(
+        recent_performance = 0.0 if trade_plan is not None and self.ontology_policy_resolver is not None else self._recent_performance(
             symbol=symbol,
             strategy_id=selected_strategy,
             regime=election_regime,
         )
-        technical_prediction = (
+        technical_prediction = None if trade_plan is not None and self.ontology_policy_resolver is not None else (
             self._owned_strategy_prediction(
                 frame, symbol, selected_strategy, election_context
             )
@@ -782,6 +804,7 @@ class SharedLiveDecisionEngine:
                     refreshed_market = self.market_refresher(symbol, market_name, decision_time)
                 except Exception:  # noqa: BLE001 - refresh is best-effort.
                     refreshed_market = None
+                decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
                 if refreshed_market is not None and float(getattr(refreshed_market, "last_price", 0.0) or 0.0) > 0:
                     quote_refresh_status = "quote_refresh_ok"
                 else:
@@ -801,7 +824,7 @@ class SharedLiveDecisionEngine:
             "REALTIME_REQUIRE_SECOND_DATA_FOR_BUY",
             "false",
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if require_second_data and not second_data_ready:
+        if require_second_data and not second_data_ready and self.ontology_policy_resolver is None:
             diagnostics = {
                 "second_data_ready": False,
                 "tick_count_1s": float(second_values.get("tick_count_1s", 0.0) or 0.0),
@@ -836,7 +859,8 @@ class SharedLiveDecisionEngine:
         # Cash headroom required to afford one share (covers small tick moves between the
         # decision and the fill). Tunable so a very small account is not locked out by a
         # buffer it cannot spare: REALTIME_ONE_SHARE_CASH_BUFFER (default 1.05 = +5%).
-        one_share_buffer = max(1.0, _env_float("REALTIME_ONE_SHARE_CASH_BUFFER", 1.05))
+        one_share_buffer = (1.0 if self.ontology_policy_resolver is not None
+                            else max(1.0, _env_float("REALTIME_ONE_SHARE_CASH_BUFFER", 1.05)))
         min_cash_for_one_share = price * one_share_buffer
         needs_cash_check_refresh = available_cash < min_cash_for_one_share
         if (
@@ -852,6 +876,7 @@ class SharedLiveDecisionEngine:
                 refreshed_market = self.market_refresher(symbol, market_name, decision_time)
             except Exception:  # noqa: BLE001 - refresh is best-effort.
                 refreshed_market = None
+            decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
             if refreshed_market is not None:
                 quote_refresh_status = "quote_refresh_ok"
                 price = float(getattr(refreshed_market, "last_price", 0.0) or price)
@@ -892,6 +917,21 @@ class SharedLiveDecisionEngine:
                 quality_score=1.0,
             ),
         )
+
+        if self.ontology_policy_resolver is not None:
+            # The feed may append a legitimate quote after this cycle began.
+            # Advance from the trusted live clock after reading the snapshot,
+            # never by adopting the incoming quote's timestamp. Historical
+            # callers without an injected clock keep their explicit as-of.
+            if self.decision_clock is not None:
+                decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
+            return self._ontology_buy(
+                symbol=symbol, account=account, market=market, orderbook=orderbook,
+                decision_time=decision_time, suggested_weight=suggested_weight,
+                selected_strategy=selected_strategy, trade_plan=trade_plan,
+                prediction=prediction, technical_prediction=technical_prediction,
+                quote_refresh_status=quote_refresh_status,
+            )
 
         flow_score = 0.0
         edge_score = 0.0
@@ -1280,30 +1320,7 @@ class SharedLiveDecisionEngine:
         expected_exit_price = price * (1.0 + gross_expected_return)
 
         ontology_policy = None
-        if self.ontology_policy_resolver is not None:
-            current_cost = self.profitability_gate.cost_engine.estimate(
-                symbol=symbol, market=market_name, venue=gate_venue,
-                instrument_type=gate_instrument, entry_price=price,
-                expected_exit_price=price, quantity=max(1, int(getattr(trade_plan, "quantity", 1))),
-                orderbook_snapshot=gate_orderbook,
-                average_daily_trading_value=float(getattr(market, "average_daily_trading_value", 0.0) or 0.0),
-            ).total_cost_rate
-            ontology_policy, policy_error = self._resolve_current_ontology_policy(
-                symbol=symbol, market=market_name, now=decision_time, account=account,
-                all_in_cost_rate=current_cost,
-                forecast_gross_bps=(None if trade_plan is not None else expected_return_bps),
-                requested_horizon_seconds=float(getattr(trade_plan, "max_holding_seconds", policy.time_exit_seconds)),
-            )
-            if ontology_policy is None or not ontology_policy.valid_for_entry or not ontology_policy.is_current(decision_time):
-                diagnostics = {"ontology_risk_policy": ontology_policy.as_dict() if ontology_policy else None,
-                               "ontology_policy_error": policy_error}
-                self._last_diagnostics = diagnostics
-                return SharedDecisionResult(symbol, False, None, prediction,
-                    ("ONTOLOGY_ENTRY_POLICY_UNAVAILABLE", *(ontology_policy.reason_codes if ontology_policy else ())), diagnostics)
-            suggested_weight = min(suggested_weight, ontology_policy.position_cap)
-
-        # A frozen plan owns the strategy thesis and intended size. A current
-        # ontology risk policy still guards execution when market risk has changed.
+        # Only legacy/no-resolver callers reach this compatibility path.
         if trade_plan is not None:
             return self._plan_driven_buy(
                 symbol=symbol,
@@ -1575,6 +1592,79 @@ class SharedLiveDecisionEngine:
             diagnostics=diagnostics,
         )
 
+    def _ontology_buy(self, *, symbol, account, market, orderbook, decision_time,
+                      suggested_weight, selected_strategy, trade_plan, prediction,
+                      technical_prediction, quote_refresh_status):
+        """One ontology decision; legacy economic gates are outside this path."""
+        price = float(market.last_price)
+        if not math.isfinite(price) or price <= 0:
+            return SharedDecisionResult(symbol, False, None, prediction, ("INVALID_PRICE_OR_COST",), {})
+        observed = market.source.observed_at or market.source.retrieved_at
+        received = market.source.retrieved_at
+        if any(not isinstance(t, datetime) or t.tzinfo is None for t in (observed, received)):
+            return SharedDecisionResult(symbol, False, None, prediction, ("QUOTE_TIMESTAMP_INVALID",), {})
+        quote_age = max((decision_time - t).total_seconds() for t in (observed, received))
+        if observed > decision_time or received > decision_time:
+            return SharedDecisionResult(symbol, False, None, prediction, ("QUOTE_FROM_FUTURE",), {})
+        spread_bps = float(getattr(orderbook, "spread_bps", 0.) or 0.)
+        if trade_plan is not None:
+            return self._plan_driven_buy(symbol=symbol, plan=trade_plan, price=price,
+                market_name=market.market, prediction=prediction, technical_prediction=technical_prediction,
+                quote_refresh_status=quote_refresh_status, quote_age_seconds=quote_age,
+                spread_bps=spread_bps, orderbook=orderbook, decision_time=decision_time,
+                account=account, market=market)
+        venue, instrument = _cost_context_for_holding(symbol, market.market, market.company_name, market.sector)
+        book = ({"best_bid": float(orderbook.best_bid), "best_ask": float(orderbook.best_ask)}
+                if orderbook is not None else None)
+        cost = self.profitability_gate.cost_engine.estimate(symbol=symbol, market=market.market,
+            venue=venue, instrument_type=instrument, entry_price=price, expected_exit_price=price,
+            quantity=1, orderbook_snapshot=book,
+            average_daily_trading_value=market.average_daily_trading_value).total_cost_rate
+        gross = None
+        confidence = 0.
+        if technical_prediction is not None and technical_prediction.tradable:
+            gross = float(technical_prediction.expected_gross_return)
+            confidence = float(technical_prediction.confidence)
+        elif prediction is not None and prediction.approved and not selected_strategy:
+            gross = float(prediction.expected_net_return_bps) / 10000. + cost
+            confidence = float(prediction.probability_success)
+        if gross is None or not math.isfinite(gross) or not math.isfinite(confidence):
+            return SharedDecisionResult(symbol, False, None, prediction, ("ONTOLOGY_ENTRY_FORECAST_UNAVAILABLE",), {})
+        current, error = self._resolve_current_ontology_policy(
+            symbol=symbol, market=market.market, now=decision_time, account=account,
+            all_in_cost_rate=cost, requested_horizon_seconds=900,
+        )
+        if current is None:
+            return SharedDecisionResult(symbol, False, None, prediction,
+                (error or "ONTOLOGY_ENTRY_POLICY_UNAVAILABLE",), {})
+        intent = OrderIntent(ticker=symbol, market=market.market, action=OrderAction.BUY,
+            suggested_weight=min(suggested_weight, current.position_cap), confidence=confidence,
+            valid_until=current.expires_at, reasoning_summary=("ontology_entry_decision",),
+            supporting_factors=("ontology_risk_policy",), contradicting_factors=(),
+            source_data_ids=(current.evidence_id, current.policy_id),
+            strategy_family=selected_strategy or "ontology_entry", signal_name="ontology_entry",
+            validation_id=current.policy_id,
+            expected_exit_price=price * (1. + gross), gross_expected_return=gross,
+            expected_holding_minutes=max(1, current.maximum_holding_seconds // 60),
+            target_net_return=current.net_profit_floor_rate,
+            position_direction="LONG", position_effect="OPEN", execution_product="CASH",
+            strategy_metadata={"ontology_risk_policy": current.as_dict(), "orderbook_snapshot": book or {}},
+        )
+        trades_today = 0
+        if self.entry_activity_provider is not None:
+            try:
+                trades_today = self.entry_activity_provider(current.market, decision_time)
+            except Exception:
+                trades_today = None
+        risk = self.risk_manager.validate(intent, account, market, ontology_policy=current,
+                                          now=decision_time, trades_today=trades_today)
+        diagnostics = {"execution_authority": "ONTOLOGY", "ontology_risk_policy": current.as_dict(),
+                       "risk_metadata": risk.metadata, "post_selection_gates": [],
+                       "quote_refresh_status": quote_refresh_status}
+        self._last_diagnostics = diagnostics
+        return SharedDecisionResult(symbol, risk.approved and risk.final_order is not None,
+            risk.final_order, prediction, tuple(risk.rejection_reasons), diagnostics)
+
     def _plan_driven_buy(
         self,
         *,
@@ -1593,11 +1683,7 @@ class SharedLiveDecisionEngine:
         account: AccountSnapshot | None = None,
         market: MarketSnapshot | None = None,
     ) -> SharedDecisionResult:
-        """Convert a plan after execution checks and a current ontology risk check.
-
-        Thesis and quantity are never silently re-elected. A policy rejection
-        returns no order, allowing the owning session to make a new plan.
-        """
+        """Consume the ontology decision without a second economic assessment."""
         executable, why = plan.executable(decision_time)
         if not executable:
             diagnostics = {
@@ -1633,44 +1719,16 @@ class SharedLiveDecisionEngine:
             )
 
         if self.ontology_policy_resolver is not None:
-            if (ontology_policy is None or not ontology_policy.valid_for_entry
-                    or not ontology_policy.is_current(decision_time) or account is None or market is None
-                    or ontology_policy.symbol.upper() != symbol.upper()):
+            from app.ontology.decision_receipt import validate_plan_authority
+            errors = validate_plan_authority(plan, decision_time, symbol=symbol, market=market_name, price=price)
+            if errors:
                 return SharedDecisionResult(symbol, False, None, prediction,
-                                            ("ONTOLOGY_ENTRY_POLICY_UNAVAILABLE",), {})
-            from app.market_affordability import equity_available_for_market
-            equity = equity_available_for_market(account, market)
-            if equity <= 0 or plan.quantity * price > equity * ontology_policy.position_cap + 1e-8:
+                                            errors, {"execution_authority": "ONTOLOGY"})
+            frozen_policy = dict(plan.risk_snapshot.get("ontology_risk_policy") or {})
+            if (not math.isfinite(quote_age_seconds) or quote_age_seconds < 0
+                    or quote_age_seconds > float(frozen_policy.get("max_quote_age_seconds", 0.))):
                 return SharedDecisionResult(symbol, False, None, prediction,
-                                            ("ONTOLOGY_POSITION_CAP_EXCEEDED",),
-                                            {"ontology_risk_policy": ontology_policy.as_dict()})
-            if bool(getattr(plan, "is_short", False)):
-                return SharedDecisionResult(symbol, False, None, prediction, ("CASH_LONG_ENTRY_ONLY",), {})
-            frozen_cost = dict(getattr(plan, "cost_snapshot", {}) or {})
-            planned_gross = float(frozen_cost.get("gross_expected_return",
-                                  float(getattr(plan, "expected_net_edge_bps", 0.0)) / 10000.0
-                                  + float(frozen_cost.get("all_in_cost_rate", 0.0))))
-            projected_exit = float(getattr(plan, "reference_price", price) or price) * (1.0 + planned_gross)
-            intent = OrderIntent(ticker=symbol, market=market_name, action=OrderAction.BUY,
-                suggested_weight=plan.quantity * price / equity, confidence=1.0,
-                valid_until=ontology_policy.expires_at, reasoning_summary=("frozen_plan_current_risk",),
-                supporting_factors=("ontology_risk_policy",), contradicting_factors=(),
-                source_data_ids=tuple(dict.fromkeys((*getattr(plan, "source_ids", ()), ontology_policy.policy_id,
-                                                     ontology_policy.evidence_id))),
-                position_direction="LONG", position_effect="OPEN",
-                gross_expected_return=(projected_exit - price) / price,
-                expected_exit_price=projected_exit,
-                expected_holding_minutes=max(1, ontology_policy.maximum_holding_seconds // 60),
-                strategy_family=str(getattr(plan, "strategy_id", "frozen_plan")),
-                validation_id=str(getattr(plan, "plan_id", ontology_policy.policy_id)),
-                target_net_return=ontology_policy.net_profit_floor_rate,
-                strategy_metadata={"ontology_risk_policy": ontology_policy.as_dict()})
-            risk = self.risk_manager.validate(intent, account, market,
-                                              ontology_policy=ontology_policy, now=decision_time)
-            if not risk.approved or risk.final_order is None or risk.final_order.quantity < plan.quantity:
-                return SharedDecisionResult(symbol, False, None, prediction,
-                                            tuple(risk.rejection_reasons) or ("ONTOLOGY_PLAN_QUANTITY_REJECTED",),
-                                            {"ontology_risk_policy": ontology_policy.as_dict(), "risk_metadata": risk.metadata})
+                                            ("PLAN_QUOTE_NOT_CURRENT",), {})
 
         contract = dict(plan.order_contract or {})
         final_order = FinalOrder(
@@ -1678,7 +1736,7 @@ class SharedLiveDecisionEngine:
             market=market_name,
             order_type=OrderType.LIMIT,
             side=OrderSide.SELL if plan.is_short else OrderSide.BUY,
-            quantity=int(plan.quantity),
+            quantity=int(getattr(plan, "remaining_quantity", plan.quantity)),
             limit_price=float(price),
             manual_approval_required=False,
             position_direction=str(plan.direction),
@@ -1687,7 +1745,7 @@ class SharedLiveDecisionEngine:
         )
         diagnostics = {
             "strategy_locked": True,
-            "execution_authority": "TRADE_PLAN",
+            "execution_authority": "ONTOLOGY" if self.ontology_policy_resolver is not None else "TRADE_PLAN",
             "selected_strategy": plan.strategy_id,
             "trade_plan": plan.as_dict(),
             # Frozen at election. Present so the dashboards and the cost telemetry keep
@@ -1695,8 +1753,8 @@ class SharedLiveDecisionEngine:
             "profitability_decision": dict(plan.cost_snapshot),
             "risk_snapshot": dict(plan.risk_snapshot),
             "weekday_time_context": dict(plan.weekday_time_context),
-            "post_selection_gates": (["current_ontology_risk"] if ontology_policy else []),
-            "ontology_risk_policy": ontology_policy.as_dict() if ontology_policy else None,
+            "post_selection_gates": [],
+            "ontology_risk_policy": dict(plan.risk_snapshot.get("ontology_risk_policy") or {}),
             "quote_refresh_status": quote_refresh_status,
             "quote_age_seconds": round(quote_age_seconds, 3),
             "spread_bps": spread_bps,
@@ -1764,6 +1822,7 @@ class SharedLiveDecisionEngine:
     ) -> SharedDecisionResult:
         symbol = holding.ticker
         decision_time = decision_time or datetime.now(timezone.utc)
+        evaluation_anchor, evaluation_started = decision_time, time.monotonic()
         avg_cost = float(getattr(holding, "average_price", 0.0) or 0.0)
         if not math.isfinite(avg_cost) or avg_cost <= 0:
             result = SharedDecisionResult(symbol, False, None, None, ("INVALID_PRICE_OR_COST",), {"exit_reason": "invalid_price"})
@@ -1774,12 +1833,13 @@ class SharedLiveDecisionEngine:
             self._last_diagnostics = result.diagnostics or {}
             return result
 
-        price, observed_at, received_at, source_id = self._exit_price_source(symbol, holding, decision_time)
+        price, observed_at, received_at, source_id = self._exit_price_source(symbol, holding, decision_time, account)
         if (not math.isfinite(price) or price <= 0) and self.market_refresher is not None:
             try:
                 refreshed = self.market_refresher(symbol, holding.market or "KR", decision_time)
             except Exception:  # noqa: BLE001 - refresh is best-effort.
                 refreshed = None
+            decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
             if refreshed is not None and float(refreshed.last_price or 0.0) > 0:
                 price = float(refreshed.last_price)
                 observed_at = refreshed.source.observed_at or refreshed.source.retrieved_at
@@ -1792,6 +1852,7 @@ class SharedLiveDecisionEngine:
                     refreshed = self.market_refresher(symbol, holding.market or "KR", decision_time)
                 except Exception:  # noqa: BLE001 - refresh is best-effort.
                     refreshed = None
+                decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
                 if refreshed is not None and float(refreshed.last_price or 0.0) > 0:
                     price = float(refreshed.last_price)
                     observed_at = refreshed.source.observed_at or refreshed.source.retrieved_at
@@ -1840,6 +1901,16 @@ class SharedLiveDecisionEngine:
         market = self._exit_market_snapshot(holding, price, observed_at, received_at)
         quote_age_seconds = max(0.0, (decision_time - received_at).total_seconds())
         orderbook = self.store.latest_orderbook(symbol) if hasattr(self.store, "latest_orderbook") else None
+        if self.ontology_policy_resolver is not None:
+            cost_floor = self._exit_cost_floor(holding, price, target_net_return)
+            if self.decision_clock is not None:
+                decision_time = self._post_refresh_time(evaluation_anchor, evaluation_started)
+                quote_age_seconds = max(0.0, (decision_time - received_at).total_seconds())
+            return self._evaluate_ontology_exit(
+                holding=holding, account=account, market=market, price=price, cost_floor=cost_floor,
+                ontology_score=ontology_score, ontology_support=ontology_support,
+                decision_time=decision_time, source_id=source_id, quote_age_seconds=quote_age_seconds,
+            )
         market_state = self.auto_tuner.snapshot_market_state(
             symbol=symbol,
             market=market,
@@ -1865,12 +1936,6 @@ class SharedLiveDecisionEngine:
             decision_time=decision_time,
         )
         cost_floor = self._exit_cost_floor(holding, price, target_net_return)
-        if self.ontology_policy_resolver is not None:
-            return self._evaluate_ontology_exit(
-                holding=holding, account=account, market=market, price=price, cost_floor=cost_floor,
-                ontology_score=ontology_score, ontology_support=ontology_support,
-                decision_time=decision_time, source_id=source_id, quote_age_seconds=quote_age_seconds,
-            )
         required_exit_price = max(cost_floor.required_exit_price, avg_cost * (1.0 + exit_policy.sell_target))
         required_exit_return = (required_exit_price - avg_cost) / avg_cost
         profitable_after_cost = price >= required_exit_price and cost_floor.net_expected_return >= target_net_return
@@ -2372,7 +2437,7 @@ class SharedLiveDecisionEngine:
             return 1.0
 
     def _exit_price_source(
-        self, symbol: str, holding: Holding, decision_time: datetime
+        self, symbol: str, holding: Holding, decision_time: datetime, account: AccountSnapshot | None = None
     ) -> tuple[float, datetime, datetime, str]:
         """Prefer a fresh realtime tick; fall back to the broker balance mark."""
         max_tick_age = float(os.getenv("REALTIME_EXIT_TICK_MAX_AGE_SEC", "30"))
@@ -2392,7 +2457,10 @@ class SharedLiveDecisionEngine:
                     str(getattr(tick, "sequence_key", "") or f"tick:{symbol}"),
                 )
         balance_price = float(getattr(holding, "last_price", 0.0) or 0.0)
-        return balance_price, decision_time, decision_time, f"balance:{symbol}"
+        captured = getattr(account, "captured_at", None)
+        if not isinstance(captured, datetime) or captured.tzinfo is None or captured.utcoffset() is None:
+            return 0.0, decision_time, decision_time, f"balance_timestamp_unavailable:{symbol}"
+        return balance_price, captured, captured, f"balance:{symbol}"
 
     def _exit_risk_manager(self) -> RiskManager:
         """De-risking 매도는 매수용 게이트(현금준비금/실시간 호가 신선도)에 막히면 안 되므로

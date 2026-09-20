@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from dataclasses import replace
 from math import floor
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from app.data.instrument_eligibility import classify as classify_instrument
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report, valuation_complete
 from app.risk.ontology_thresholds import OntologyRiskPolicy
+from app.risk.instrument_contract import is_non_common_equity_ticker as _is_non_common_equity_ticker
 from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
 from app.schemas.domain import (
     AccountSnapshot,
@@ -42,6 +42,11 @@ from app.quant.contracts import QuantEvidence
 
 
 class RiskManager:
+    """Compatibility facade; configured live policies use the ontology authority.
+
+    The legacy implementation remains for explicit no-policy research callers.
+    It never runs after an ontology decision has been produced.
+    """
     def __init__(self, rules: RiskRules | None = None, audit_logger: AuditLogger | None = None, *, ontology_policy_required: bool = False) -> None:
         self.rules = rules or RiskRules()
         self.ontology_policy_required = ontology_policy_required
@@ -58,52 +63,30 @@ class RiskManager:
         intent: OrderIntent,
         account: AccountSnapshot,
         market: MarketSnapshot,
-        trades_today: int = 0,
+        trades_today: int | None = 0,
         existing_pending_tickers: set[str] | None = None,
         quant_evidence: tuple[QuantEvidence, ...] = (),
         *,
         ontology_policy: OntologyRiskPolicy | None = None,
         now: datetime | None = None,
     ) -> RiskManagerResult:
+        if self.ontology_policy_required or ontology_policy is not None:
+            from app.ontology.risk_authority import assess_ontology_risk
+
+            return assess_ontology_risk(
+                intent, account, market, policy=ontology_policy, rules=self.rules,
+                cost_engine=self.cost_engine, now=now, trades_today=trades_today,
+                existing_pending_tickers=existing_pending_tickers,
+            )
         moment = now or datetime.now(timezone.utc)
         moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
         rules = self.rules
-        opening = _parse_effect(intent) == "OPEN"
-        policy_ok = isinstance(ontology_policy, OntologyRiskPolicy)
-        if policy_ok:
-            expected_market = "US" if account_is_overseas_market(market) else "KR"
-            policy_ok = (
-                ontology_policy.market == expected_market
-                and ontology_policy.symbol.upper() == intent.ticker.upper()
-                and ontology_policy.valid_for_entry
-                and ontology_policy.is_current(moment)
-            )
-        if opening and policy_ok:
-            rules = replace(rules, **{
-                "daily_loss_stop": min(rules.daily_loss_stop, ontology_policy.daily_loss_budget_rate),
-                "max_trades_per_day": min(rules.max_trades_per_day, ontology_policy.max_trades_per_day),
-                "max_single_stock_weight": min(rules.max_single_stock_weight, ontology_policy.position_cap),
-                "max_intraday_position_weight": min(rules.max_intraday_position_weight, ontology_policy.position_cap),
-                "max_sector_weight": min(rules.max_sector_weight, ontology_policy.sector_cap),
-                "minimum_cash_reserve": max(rules.minimum_cash_reserve, ontology_policy.minimum_cash_reserve),
-                "max_quote_age_seconds": min(rules.max_quote_age_seconds, ontology_policy.max_quote_age_seconds),
-                "principal_protection": replace(rules.principal_protection,
-                    per_trade_risk_budget_ratio=min(rules.principal_protection.per_trade_risk_budget_ratio, ontology_policy.trade_loss_budget_rate),
-                    daily_risk_budget_ratio=min(rules.principal_protection.daily_risk_budget_ratio, ontology_policy.daily_loss_budget_rate),
-                ),
-            })
         existing_pending_tickers = existing_pending_tickers or set()
         report = build_portfolio_report(account)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
         metadata: dict[str, object] = {}
         rejection_log: list[dict[str, object]] = []
-        if opening and (self.ontology_policy_required or ontology_policy is not None):
-            checks["ontology_policy_current"] = policy_ok
-            if isinstance(ontology_policy, OntologyRiskPolicy):
-                metadata["ontology_risk_policy"] = ontology_policy.as_dict()
-
-
         checks["llm_direct_order_execution_blocked"] = (
             not rules.llm_direct_order_execution_allowed
         )
@@ -599,7 +582,6 @@ class RiskManager:
                         account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
                         target_net_return=intent.target_net_return,
                     ),
-                    **({"ontology_policy": ontology_policy, "now": moment} if policy_ok else {}),
                 )
                 metadata["profitability_decision"] = decision.as_dict()
                 checks["profitability_gate"] = decision.allowed
@@ -671,13 +653,6 @@ class RiskManager:
         elif approved:
             approved = False
             _add_rejection(reasons, rejection_log, "action_requires_no_order", "action_requires_no_order")
-
-        if approved and opening and policy_ok and final_order is not None:
-            # Integer-lot rounding may not enlarge the generated position budget.
-            if final_order.quantity * market.last_price > equity_for_sizing * ontology_policy.position_cap + 1e-8:
-                approved, final_order = False, None
-                checks["ontology_position_budget"] = False
-                _add_rejection(reasons, rejection_log, "ONTOLOGY_POSITION_BUDGET_EXCEEDED", "ontology_position_budget")
 
         for reason in reasons:
             if not any(item.get("reason") == reason for item in rejection_log):
@@ -971,7 +946,7 @@ def _final_order_or_reject(
     manual_approval_required: bool,
     *,
     position_direction: str = "LONG",
-    position_effect: str = "OPEN",
+    position_effect: str | None = None,
     execution_product: str = "CASH",
     credit_type: str | None = None,
     loan_date: str | None = None,
@@ -994,7 +969,7 @@ def _final_order_or_reject(
         limit_price=market.last_price,
         manual_approval_required=manual_approval_required,
         position_direction=position_direction,
-        position_effect=position_effect,
+        position_effect=position_effect or _parse_effect(intent),
         execution_product=execution_product,
         credit_type=credit_type,
         loan_date=loan_date,
@@ -1179,6 +1154,10 @@ def _contract_consistent(
         broker_side,
     )
 
+    if str(getattr(intent, "position_direction", "LONG") or "LONG").upper() not in {"LONG", "SHORT"}:
+        return False
+    if intent.action == OrderAction.REDUCE:
+        return direction == "LONG" and effect == "CLOSE" and product in {"CASH", ""}
     if intent.action not in {OrderAction.BUY, OrderAction.SELL}:
         # HOLD / WATCH / REBALANCE carry no side, so there is nothing to contradict.
         return True
@@ -1222,32 +1201,6 @@ def _reason_for_failed_check(check: str) -> str:
         "overnight_short_check": "OVERNIGHT_SHORT_NOT_PERMITTED",
         "unsupported_products_blocked": "restricted_products_blocked",
     }.get(check, check)
-
-
-def _is_non_common_equity_ticker(ticker: str) -> bool:
-    """Heuristic: does the ticker denote a warrant / unit / right (non-common equity)?
-
-    Targets US/overseas SPAC-style securities that are typically illiquid and hard
-    to exit (e.g. Locafy warrant ``LCFYW``, a unit ``LAFAU``). Uses the NASDAQ
-    5th-letter convention (5 alphabetic chars ending in W=warrant, U=unit, R=right)
-    plus explicit suffix forms (``.WS``, ``-WT``, ``-UN``, ``.RT`` …). Korean numeric
-    codes and ordinary <=4-letter tickers are not affected.
-    """
-    symbol = str(ticker or "").upper().strip()
-    if not symbol:
-        return False
-    suffix_markers = (
-        ".WS", "-WT", ".WT", "/WS", "-WS", "+",       # warrants
-        ".U", "-UN", ".UN", "-U", "/U",               # units
-        ".RT", "-RT", ".RTS", "-RTS", "/R",           # rights
-    )
-    for marker in suffix_markers:
-        if symbol.endswith(marker):
-            return True
-    # NASDAQ 5th-letter suffix convention (only for clean 5-letter alpha symbols).
-    if symbol.isalpha() and len(symbol) == 5 and symbol[-1] in {"W", "U", "R"}:
-        return True
-    return False
 
 
 def _add_rejection(

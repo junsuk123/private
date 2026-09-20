@@ -168,6 +168,18 @@ def test_earliest_required_observation_expiry_bounds_policy_lifetime():
     assert policy.expires_at <= NOW + timedelta(seconds=1)
 
 
+def test_short_lived_risk_evidence_cannot_outlive_its_source():
+    projection = _projection(observation_changes={"model_uncertainty": {"max_age_seconds": 2}})
+    policy = _policy(projection)
+    assert policy.expires_at <= NOW + timedelta(seconds=2)
+
+
+def test_emergency_override_tightens_all_loss_barriers(monkeypatch):
+    monkeypatch.setenv("REALTIME_EMERGENCY_STOP_LOSS", "0.004")
+    policy = _policy()
+    assert policy.soft_stop_rate <= policy.hard_stop_rate <= policy.emergency_stop_rate <= .004
+
+
 def test_legacy_environment_can_tighten_but_never_enlarge_safety_ceilings(monkeypatch):
     monkeypatch.setenv("REALTIME_HARD_STOP_LOSS", "0.90")
     monkeypatch.setenv("REALTIME_EMERGENCY_STOP_LOSS", "0.99")
@@ -196,3 +208,13 @@ def test_unknown_or_halted_market_regime_never_grants_entry():
         policy = _policy(_projection(regime=regime))
         assert policy.valid_for_entry is False
         assert policy.position_cap == 0
+
+
+@pytest.mark.parametrize("reason", ["POLICY_NET_REWARD_INSUFFICIENT", "POLICY_SPREAD_TOO_WIDE",
+                                   "POLICY_NOISE_EXCEEDS_LOSS_BUDGET", "POLICY_REGIME_NO_ENTRY"])
+def test_fresh_adverse_entry_context_remains_usable_for_position_risk(reason):
+    policy = replace(_policy(), valid_for_entry=False, reason_codes=(reason,))
+    assert policy.has_current_market_evidence(NOW)
+    assert not policy.has_current_market_evidence(policy.expires_at + timedelta(seconds=1))
+    assert not replace(policy, reason_codes=(reason, "POLICY_QUOTE_STALE")).has_current_market_evidence(NOW)
+    assert not replace(policy, reason_codes=()).has_current_market_evidence(NOW)

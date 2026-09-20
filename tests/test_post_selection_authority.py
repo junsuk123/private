@@ -161,7 +161,7 @@ def test_the_authority_cap_is_applied_once_at_election() -> None:
 # Nothing re-judges afterwards
 # --------------------------------------------------------------------------- #
 def test_the_plan_driven_buy_path_does_not_reselect_or_resize_the_thesis() -> None:
-    """Current ontology risk may reject execution; thesis selection stays frozen."""
+    """Only the frozen approval contract is read after ontology election."""
     from app.trading.shared_decision_engine import SharedLiveDecisionEngine
 
     source = inspect.getsource(SharedLiveDecisionEngine._plan_driven_buy)
@@ -176,8 +176,9 @@ def test_the_plan_driven_buy_path_does_not_reselect_or_resize_the_thesis() -> No
                   and ast.unparse(node.func) == "self.risk_manager.validate"]
     guarded = [node for node in ast.walk(tree) if isinstance(node, ast.If)
                and ast.unparse(node.test) == "self.ontology_policy_resolver is not None"]
-    assert risk_calls and guarded
-    assert all(any(call in list(ast.walk(branch)) for branch in guarded) for call in risk_calls)
+    assert not risk_calls
+    assert guarded
+    assert "validate_plan_authority" in source
 
 
 def test_the_fast_executor_cannot_reach_a_decision_authority() -> None:

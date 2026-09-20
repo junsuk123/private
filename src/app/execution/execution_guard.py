@@ -13,6 +13,7 @@ the strategy has committed and while the market is moving.
 What it does check is whether the broker can accept the order at all:
 
 * the plan exists, is not expired and is not terminal
+* the final priced order stays within its frozen approval's contract and bounds
 * price > 0 and quantity > 0
 * the symbol / exchange / product is one this account can trade
 * the market is currently orderable
@@ -87,6 +88,7 @@ UNSUPPORTED_INSTRUMENT = "GUARD_UNSUPPORTED_INSTRUMENT"
 INSUFFICIENT_CASH = "GUARD_INSUFFICIENT_CASH"
 CASH_UNKNOWN = "GUARD_ORDERABLE_CASH_UNKNOWN"
 INSUFFICIENT_SELLABLE = "GUARD_INSUFFICIENT_SELLABLE_QUANTITY"
+SELLABLE_UNKNOWN = "GUARD_SELLABLE_QUANTITY_UNKNOWN"
 BORROW_UNAVAILABLE = "GUARD_BORROW_UNAVAILABLE"
 KILL_SWITCH = "GUARD_KILL_SWITCH_ENGAGED"
 BROKER_UNHEALTHY = "GUARD_BROKER_UNHEALTHY"
@@ -154,7 +156,7 @@ def _finite(value: Any) -> float | None:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -192,6 +194,9 @@ class ExecutionGuard:
         orderable_cash: float | None = None,
         sellable_quantity: int | None = None,
         now: datetime | None = None,
+        amending_broker_order_id: str | None = None,
+        amending_order: GuardOrder | None = None,
+        amending_ancestor_order_ids: tuple[str, ...] = (),
     ) -> ExecutionGuardDecision:
         """Verdict for one order. Never raises; an internal error blocks."""
         moment = now or _utcnow()
@@ -202,6 +207,9 @@ class ExecutionGuard:
                 orderable_cash=orderable_cash,
                 sellable_quantity=sellable_quantity,
                 now=moment,
+                amending_broker_order_id=amending_broker_order_id,
+                amending_order=amending_order,
+                amending_ancestor_order_ids=amending_ancestor_order_ids,
             )
         except Exception as exc:  # noqa: BLE001 - a guard that can be crashed past is none.
             return ExecutionGuardDecision(
@@ -219,11 +227,16 @@ class ExecutionGuard:
         orderable_cash: float | None,
         sellable_quantity: int | None,
         now: datetime,
+        amending_broker_order_id: str | None = None,
+        amending_order: GuardOrder | None = None,
+        amending_ancestor_order_ids: tuple[str, ...] = (),
     ) -> ExecutionGuardDecision:
         reasons: list[str] = []
         checked: list[str] = []
         detail: dict[str, Any] = {"is_exit": order.is_exit}
-        permitted = max(0, int(order.quantity))
+        requested = _finite(order.quantity)
+        valid_quantity = requested is not None and requested.is_integer() and requested > 0
+        permitted = int(requested) if valid_quantity else 0
         clipped = False
 
         # -- kill switch, first and unconditional ------------------------- #
@@ -255,20 +268,57 @@ class ExecutionGuard:
         price = _finite(order.limit_price)
         if price is None or price <= 0.0:
             reasons.append(INVALID_PRICE)
-        if int(order.quantity) <= 0:
+        if not valid_quantity:
             reasons.append(INVALID_QUANTITY)
         if not self._instrument_supported(order):
             reasons.append(UNSUPPORTED_INSTRUMENT)
+
+        if amending_broker_order_id is not None:
+            checked.append("amendment_origin")
+            origin = amending_order
+            if origin is None or not str(amending_broker_order_id).strip():
+                reasons.append("GUARD_AMEND_ORIGIN_UNKNOWN")
+            else:
+                def contract(item):
+                    return (
+                        str(item.symbol).upper(), str(item.market).upper(), str(item.side).upper(),
+                        str(item.direction).upper(), "CLOSE" if item.is_exit else "OPEN",
+                        str(item.execution_product).upper(),
+                    )
+                residual = _finite(origin.quantity)
+                origin_price = _finite(origin.limit_price)
+                if contract(order) != contract(origin):
+                    reasons.append("GUARD_AMEND_CONTRACT_MISMATCH")
+                elif not (residual is not None and residual.is_integer() and residual > 0
+                          and origin_price is not None and origin_price > 0
+                          and valid_quantity and requested <= residual):
+                    reasons.append("GUARD_AMEND_QUANTITY_EXCEEDS_REMAINING")
+                else:
+                    # The confirmed unfilled part already reserves these resources.
+                    # No credit is taken for previously filled shares or unknown cash.
+                    detail["amending_broker_order_id"] = str(amending_broker_order_id)
+                    detail["amendment_remaining_quantity"] = int(residual)
+                    if order.is_exit:
+                        sellable_quantity = int(residual)
+                    else:
+                        cash = _finite(orderable_cash)
+                        reserved = residual * origin_price * (1.0 + self._cash_buffer_rate)
+                        if cash is not None and math.isfinite(reserved):
+                            orderable_cash = max(0.0, cash) + reserved
 
         # -- session / order state / freshness / account ---------------------------- #
         guard = self._pre_submit
         if guard is not None:
             checked.append("pre_submit")
+            amendment = ({"amending_broker_order_id": amending_broker_order_id,
+                          "amending_ancestor_order_ids": amending_ancestor_order_ids}
+                         if amending_broker_order_id is not None else {})
             pre = guard.evaluate(
                 ticker=order.symbol,
                 side="SELL" if order.is_exit else "BUY",
                 market=order.market,
                 now=now,
+                **amendment,
             )
             detail["pre_submit"] = pre.as_dict()
             if not pre.allowed:
@@ -298,13 +348,75 @@ class ExecutionGuard:
         else:
             checked.append("sellable")
             if sellable_quantity is not None:
-                sellable = max(0, int(sellable_quantity))
-                detail["sellable_quantity"] = sellable
-                if sellable <= 0:
-                    reasons.append(INSUFFICIENT_SELLABLE)
-                elif sellable < permitted:
-                    permitted = sellable
-                    clipped = True
+                sellable_value = _finite(sellable_quantity)
+                if sellable_value is None or not sellable_value.is_integer():
+                    reasons.append(SELLABLE_UNKNOWN)
+                else:
+                    sellable = max(0, int(sellable_value))
+                    detail["sellable_quantity"] = sellable
+                    if sellable <= 0:
+                        reasons.append(INSUFFICIENT_SELLABLE)
+                    elif sellable < permitted:
+                        permitted = sellable
+                        clipped = True
+
+        # This binds the final broker order to an existing decision. It never
+        # recalculates the decision's economics or asks for new market evidence.
+        snapshot = getattr(plan, "risk_snapshot", None)
+        ontology_plan = isinstance(snapshot, Mapping) and any(
+            key in snapshot for key in ("ontology_authority", "ontology_risk_policy")
+        )
+        if ontology_plan:
+            checked.append("ontology_authority_bounds")
+            side = str(order.side or "").strip().upper()
+            direction = str(order.direction or "").strip().upper()
+            effect = str(order.position_effect or "").strip().upper()
+            product = str(order.execution_product or "").strip().upper()
+            if order.is_exit:
+                # An expired entry grant cannot trap a real position. Conversely,
+                # labelling a BUY as CLOSE cannot bypass the entry's grant.
+                if (side, direction, effect or "CLOSE", product) != ("SELL", "LONG", "CLOSE", "CASH"):
+                    reasons.append("ONTOLOGY_AUTHORITY_CONTRACT_MISMATCH")
+                sellable = _finite(sellable_quantity)
+                if sellable is None or not sellable.is_integer():
+                    reasons.append(SELLABLE_UNKNOWN)
+            else:
+                from app.ontology.decision_receipt import validate_plan_authority
+
+                reasons.extend(validate_plan_authority(
+                    plan, now, symbol=order.symbol, market=order.market, price=order.limit_price,
+                ))
+                receipt = snapshot.get("ontology_authority")
+                receipt = receipt if isinstance(receipt, Mapping) else {}
+                contract = (side, direction, effect or "OPEN", product)
+                approved_contract = tuple(receipt.get(key) for key in (
+                    "side", "position_direction", "position_effect", "execution_product",
+                ))
+                if contract != approved_contract:
+                    reasons.append("ONTOLOGY_AUTHORITY_CONTRACT_MISMATCH")
+                remaining = _finite(getattr(plan, "remaining_quantity", None))
+                approved_quantity = _finite(receipt.get("quantity"))
+                if not (
+                    valid_quantity and remaining is not None and approved_quantity is not None
+                    and 0 < requested <= min(remaining, approved_quantity)
+                    and 0 <= permitted <= requested
+                ):
+                    reasons.append("ONTOLOGY_AUTHORITY_QUANTITY_EXCEEDED")
+                approved_notional = _finite(receipt.get("actual_notional"))
+                plan_notional = _finite(getattr(plan, "max_notional", None))
+                filled = _finite(getattr(plan, "filled_quantity", None))
+                fill_price = _finite(getattr(plan, "entry_fill_price", None))
+                used_notional = filled * fill_price if filled and fill_price is not None else 0.0
+                if not (
+                    valid_quantity and price is not None and price > 0
+                    and approved_notional is not None and plan_notional is not None
+                    and filled is not None and (filled == 0 or (fill_price is not None and fill_price > 0))
+                    and math.isfinite(used_notional)
+                    and used_notional + max(requested, permitted) * price
+                    <= min(approved_notional, plan_notional) + 1e-8
+                ):
+                    reasons.append("ONTOLOGY_AUTHORITY_PRICE_OR_NOTIONAL_EXCEEDED")
+                detail["ontology_evaluation_id"] = receipt.get("evaluation_id")
 
         # -- borrow ----------------------------------------------------------------- #
         if str(order.direction).upper() == "SHORT" and not order.is_exit:

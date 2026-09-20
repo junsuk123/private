@@ -4,7 +4,9 @@
 
 추가 개편: [온톨로지 기반 동적 리스크와 청산](docs/dynamic_ontology_risk.md), [정식 OWL/SHACL 구성](docs/formal_policy_ontology.md), [시간 인식 R-GCN 선택·NPU 실측](docs/temporal_relational_graph_model.md), [시장별 전략 성과 적응](docs/strategy_performance_adaptation.md).
 
-OBAITS는 KIS 실시간 데이터, 온톨로지 기반 근거 추론, live feature frame, 그리고 결정론적 리스크/주문 게이트를 결합한 로컬 자동 투자 운영 시스템입니다. 현재 코드 기준으로는 `run.ps1`과 `run.py`가 표준 런처이며, `src/app` 아래에서 FastAPI UI, 실시간 수집, 전략 선택, risk/gate, 실행 모듈이 함께 동작합니다.
+최신 판단 구조: [온톨로지 위험 판단 통합](docs/ontology_risk_authority.md). 위험·비용·수량을 한 번 결정하고, 승인 이후에는 유효기간·허용 가격·실제 주문 가능 여부만 확인합니다.
+
+OBAITS는 KIS 실시간 데이터, 온톨로지 기반 근거 추론, live feature frame, 동적 위험 판단과 주문 실행 검증을 결합한 로컬 자동 투자 운영 시스템입니다. 현재 코드 기준으로는 `run.ps1`과 `run.py`가 표준 런처이며, `src/app` 아래에서 FastAPI UI, 실시간 수집, 전략 선택, 위험 판단, 실행 모듈이 함께 동작합니다.
 
 > 핵심 원칙: 실시간 판단은 `selection`과 `execution`을 구분해 다룹니다. LLM이나 가속기 결과는 주문 권한이 아니며, 실제 주문은 `FinalOrder`를 통과한 경우만 `LiveExecutionCoordinator`를 통해 제출됩니다. 전략 선택 V2는 SHADOW에서 시작하고 증거가 누적되면 자동 승격/강등이 일어납니다.
 
@@ -76,16 +78,16 @@ python scripts/live_readiness_check.py --dry-run
 - `run.py`의 기본값은 `8000`이지만, 런처가 `APP_PORT`를 `8010`로 설정하고 충돌 시 다른 포트로 이동할 수 있습니다.
 - 외부 바인드가 필요한 경우 `APP_ACCESS_TOKEN`이나 `-External` 정책을 통해 접근 제어가 요구됩니다.
 - `run.py`는 startup checks를 백그라운드로 수행하여 `ResearchService`, demo pipeline, 그래프 저장/검증 등을 바로 실행합니다.
-- 실시간 엔진은 `MarketContext`, `StrategySelectorV2`, 비용·리스크 게이트, `FinalTradeGate`, `LiveExecutionCoordinator`를 순서대로 통과해야만 실제 주문을 만들 수 있습니다.
-- 숏 전략은 기본적으로 `SHADOW` 상태이며, 실제 실주문 권한은 별도 자동 승격 조건을 충족해야 생깁니다.
+- 운영 온톨로지 경로는 시장 근거와 전략 예측을 `ontology.risk_authority`에서 비용·위험·수량으로 통합하고, 승인 기록이 있는 `TradePlan`을 `LiveExecutionCoordinator`에 전달합니다. 이후 별도의 시장 위험·수익성 심사를 반복하지 않습니다.
+- 현재 운영 경로의 신규 진입은 현금 롱 주문만 허용합니다. 숏·대주 모듈은 연구와 기존 상태 처리용으로 남겨 두었습니다.
 - LLM 또는 NPU 결과는 의사결정 보조 입력일 뿐이고, 주문 승인 권한은 없습니다.
 
 ## 안전 모델과 운영 포지처
 
 - `run.ps1` 기본 실행은 platform-agnostic live-capable 상태를 전제로 합니다.
-- 안전성은 "플래그를 낮게 끄는 것"이 아니라, 계좌 신뢰도, 시장 신선도, 비용·리스크 게이트, 주문 상태와 final approval를 모두 통과해야 하도록 구현되어 있습니다.
+- 실행 계층은 계좌 상태, 시세 유효성, 중복 주문, 실제 주문 가능 현금·수량과 사용자 중지 설정을 확인합니다. 기존 리스크 API의 정책 미주입 경로는 과거 재현과 호환을 위해 유지합니다.
 - `StrategySelectorV2`는 SHADOW → LIVE_PROBE → LIVE로 자동 전환할 수 있지만, 이를 위해 필요한 증거와 통계 게이트는 설정 파일과 promotion controller가 담당합니다.
-- 숏/대주 관련 로직은 fail-closed 규칙이 적용되며, 계좌 정책 허용과 arm 배포 상태가 둘 다 충족되어야 실제 주문이 생성됩니다.
+- 전략의 승격 상태와 별개로 운영 계좌의 현금 롱 주문 계약을 지켜야 합니다.
 - `run.py`는 시작 전에 `require_token_for_external_bind`를 수행하여, 외부 접근이 필요한 경우 안전하게 거절하거나 토큰을 요구합니다.
 
 ## 주요 디렉터리

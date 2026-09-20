@@ -348,9 +348,20 @@ class ProfitabilityGate:
             )
             local.policy_version = policy.policy_id
             observed = {item["metric"]: item["value"] for item in policy.evidence}
-            request = replace(request, target_net_return=required,
-                spread_rate=observed.get("spread_rate", request.spread_rate),
-                liquidity_score=observed.get("liquidity_score", request.liquidity_score))
+            # A still-current policy cannot erase a worse executable observation
+            # supplied with this order (the policy may predate the latest quote).
+            try:
+                spread = request.spread_rate
+                if observed.get("spread_rate") is not None:
+                    spread = observed["spread_rate"] if spread is None else max(float(spread), float(observed["spread_rate"]))
+                liquidity = request.liquidity_score
+                if observed.get("liquidity_score") is not None:
+                    liquidity = min(float(liquidity), float(observed["liquidity_score"]))
+                target = required if request.target_net_return is None else max(float(request.target_net_return), required)
+            except (TypeError, ValueError, OverflowError):
+                return self._reject(request, request.entry_price, float(request.expected_exit_price or 0.), [REASON_INVALID])
+            request = replace(request, target_net_return=target,
+                spread_rate=spread, liquidity_score=liquidity)
             return local.evaluate(request)
         decision = self._evaluate(request)
         if self.policy_version and not decision.policy_version:
@@ -388,6 +399,17 @@ class ProfitabilityGate:
         flags: list[str] = []
 
         # --- Basic validity ----------------------------------------------------
+        supplied = (request.liquidity_score, request.realized_volatility,
+                    request.spread_rate, request.target_net_return,
+                    request.average_daily_trading_value, request.account_equity_krw)
+        try:
+            valid_measurements = all(value is None or (not isinstance(value, bool) and math.isfinite(float(value)) and float(value) >= 0)
+                                     for value in supplied)
+            valid_measurements = valid_measurements and float(request.liquidity_score) <= 1
+        except (TypeError, ValueError, OverflowError):
+            valid_measurements = False
+        if not valid_measurements:
+            return self._reject(request, entry_price, 0.0, [REASON_INVALID])
         if not math.isfinite(entry_price) or entry_price <= 0 or quantity <= 0:
             return self._reject(request, entry_price, 0.0, [REASON_INVALID])
         if expected_exit_price is None or not math.isfinite(float(expected_exit_price)) or float(expected_exit_price) <= 0:
@@ -644,21 +666,28 @@ class ProfitabilityGate:
         expected_exit_price: float,
         reasons: list[str],
     ) -> ProfitabilityDecision:
+        def diagnostic_number(value: object) -> float:
+            try:
+                result = float(value)
+                return result if math.isfinite(result) and result >= 0 else 0.0
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+
         return ProfitabilityDecision(
             allowed=False,
             action=(request.action or "BUY").upper(),
             symbol=request.symbol,
-            entry_price=entry_price,
-            expected_exit_price=expected_exit_price,
+            entry_price=diagnostic_number(entry_price),
+            expected_exit_price=diagnostic_number(expected_exit_price),
             break_even_exit_price=0.0,
             gross_expected_return=0.0,
             all_in_cost_rate=0.0,
             net_expected_return=0.0,
             required_min_net_return=self.policy.min_net_for_market(request.market),
-            spread_rate=request.spread_rate or 0.0,
+            spread_rate=diagnostic_number(request.spread_rate),
             expected_slippage_rate=0.0,
             market_impact_rate=0.0,
-            liquidity_score=max(0.0, min(1.0, float(request.liquidity_score))),
+            liquidity_score=min(1.0, diagnostic_number(request.liquidity_score)),
             cost_to_alpha_ratio=0.0,
             rejection_reasons=tuple(reasons),
         )

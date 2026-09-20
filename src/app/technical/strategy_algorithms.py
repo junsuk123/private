@@ -289,6 +289,8 @@ class ExitRule:
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    if not math.isfinite(value):
+        return low
     return max(low, min(high, value))
 
 
@@ -305,7 +307,9 @@ def tick_expected_move_bps(
     10-second realised volatility by sqrt(time) and keep a capture fraction
     below 1. Returns 0.0 when the proxy is missing — no fabricated floor.
     """
-    if not realized_volatility_10s or realized_volatility_10s <= 0 or horizon_seconds <= 0:
+    if (not _present(realized_volatility_10s, horizon_seconds, window_seconds, capture_fraction)
+            or realized_volatility_10s <= 0 or horizon_seconds <= 0
+            or window_seconds <= 0 or capture_fraction <= 0):
         return 0.0
     scaled = realized_volatility_10s * math.sqrt(horizon_seconds / max(1, window_seconds))
     return max(0.0, capture_fraction * scaled * 10_000.0)
@@ -343,7 +347,10 @@ def _market_scale_bps(f: "TechnicalFeatureSet") -> float | None:
 
 
 def _present(*values: float | None) -> bool:
-    return all(value is not None for value in values)
+    try:
+        return all(value is not None and math.isfinite(value) for value in values)
+    except (TypeError, ValueError):
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1186,14 +1193,16 @@ class TradingAlgorithm:
         The strategies whose thresholds are <= 0 are precisely the ones meant to fire on a
         neutral tape, so the idiom disabled exactly the arms it most needed to admit.
         """
-        if value is None:
+        if not _present(value, threshold):
             return True
         return value <= threshold if inclusive else value < threshold
 
     def _tick_ready(self, f: TechnicalFeatureSet) -> tuple[bool, tuple[str, ...]]:
         if not f.tick_data_ready:
             return False, ("TICK_WINDOW_NOT_READY",)
-        if (f.tick_count_5s or 0.0) < self.config.shared("min_tick_count_5s"):
+        if not _present(f.tick_count_5s):
+            return False, ("TICK_COUNT_UNAVAILABLE",)
+        if f.tick_count_5s < self.config.shared("min_tick_count_5s"):
             return False, ("TICK_COUNT_TOO_LOW",)
         return True, ()
 
@@ -1310,7 +1319,13 @@ class TradingAlgorithm:
         symbol: str = "",
         **diagnostics: Any,
     ) -> AlgorithmDecision:
+        if not _present(edge_bps, score, confidence):
+            return self._reject(("ALGORITHM_NONFINITE_FORECAST",))
+        if horizon_seconds is not None and (not _present(horizon_seconds) or horizon_seconds <= 0):
+            return self._reject(("ALGORITHM_INVALID_FORECAST_HORIZON",))
         minimum, floor_diagnostics = self.entry_floor_bps(symbol)
+        if not _present(minimum):
+            return self._reject(("ALGORITHM_COST_FLOOR_UNAVAILABLE",))
         # Historical edge calibration remains recorded for analysis, but does
         # not rewrite a deterministic strategy's point-in-time edge or veto its
         # trigger. Learned estimates are auxiliary throughout the live path.

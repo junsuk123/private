@@ -437,6 +437,19 @@ def test_throttled_bundle_is_counted_only_once_for_invalidation(tmp_path):
     assert repeated["invalidation_cycles"] == 1
 
 
+@pytest.mark.parametrize("offset", [-200, -1, 20])
+def test_stale_out_of_order_or_future_exit_analysis_cannot_confirm_deterioration(tmp_path, offset):
+    manager = StrategySessionManager(config=_config(tmp_path, invalidation_confirm_cycles=2))
+    holding = Holding("005930", "KR", "Samsung", "Technology", 1, 70_000., 69_900., opened_at=NOW)
+    manager.evaluate(_account(holding), (), _bundle(), NOW)
+    manager.evaluate(_account(holding), (), _continuation_bundle(NOW + timedelta(seconds=5)),
+                     NOW + timedelta(seconds=5))
+    repeated = manager.evaluate(_account(holding), (),
+        _continuation_bundle(NOW + timedelta(seconds=offset)), NOW + timedelta(seconds=6))
+    assert repeated["phase"] == "OWNED"
+    assert repeated["invalidation_cycles"] == 1
+
+
 def test_cost_blind_time_exit_gets_one_bounded_extension_when_thesis_is_intact(
     tmp_path,
 ):

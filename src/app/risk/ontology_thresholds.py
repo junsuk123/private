@@ -120,6 +120,22 @@ class OntologyRiskPolicy:
         now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
         return self.as_of <= now <= self.expires_at
 
+    def has_current_market_evidence(self, now: datetime) -> bool:
+        """Entry unattractiveness is still actionable evidence for owned risk.
+
+        A wide spread, adverse reward/risk or a no-entry regime must not make
+        the exit controller ignore a newly observed deterioration. Missing,
+        stale or invalid evidence remains unusable for discretionary changes.
+        """
+        entry_only = {
+            "POLICY_NET_REWARD_INSUFFICIENT", "POLICY_NOISE_EXCEEDS_LOSS_BUDGET",
+            "POLICY_SPREAD_TOO_WIDE", "POLICY_REGIME_NO_ENTRY",
+        }
+        return self.is_current(now) and (
+            self.valid_for_entry or bool(self.reason_codes)
+            and not (set(self.reason_codes) - entry_only)
+        )
+
     def tighten_for_position(self, previous: "OntologyRiskPolicy | None") -> "OntologyRiskPolicy":
         """Once risk is owned, new volatility cannot move the loss barrier away."""
         if previous is None or previous.symbol != self.symbol or previous.market != self.market:
@@ -209,8 +225,8 @@ def resolve_ontology_policy(
     sigma_horizon = sigma * math.sqrt(effective_horizon / max(1., float(measured_horizon or effective_horizon)))
     sigma_horizon = min(.10, sigma_horizon)
     noise = max(spread * (1 + .5 * (1 - liquidity)), sigma_horizon * (.30 + .25 * uncertainty), cost * .15)
-    hard_ceiling = _ceiling("REALTIME_HARD_STOP_LOSS", limits.maximum_hard_stop_rate)
-    emergency_ceiling = max(hard_ceiling, _ceiling("REALTIME_EMERGENCY_STOP_LOSS", limits.maximum_emergency_stop_rate))
+    emergency_ceiling = _ceiling("REALTIME_EMERGENCY_STOP_LOSS", limits.maximum_emergency_stop_rate)
+    hard_ceiling = min(emergency_ceiling, _ceiling("REALTIME_HARD_STOP_LOSS", limits.maximum_hard_stop_rate))
     soft = min(hard_ceiling * .8, max(noise * 1.5, sigma_horizon * (1.8 - .8 * stress), cost * .4, 1e-5))
     hard = min(hard_ceiling, max(soft, soft * (1.35 - .20 * stress)))
     emergency = min(emergency_ceiling, max(hard, hard * (1.3 - .15 * stress)))
@@ -251,7 +267,11 @@ def resolve_ontology_policy(
         policy_id=f"orp-{fingerprint}", evidence_id=str(projection.context_id), market=market, symbol=symbol,
         as_of=now, expires_at=min(
             [now + timedelta(seconds=max(0., min(quote_age - _number(values, "quote_age_seconds", quote_age), limits.maximum_policy_age_seconds)))]
-            + [item.observed_at + timedelta(seconds=item.max_age_seconds) for item in observations if item.metric in (*required, "regime_confidence")]
+            + [item.observed_at + timedelta(seconds=item.max_age_seconds) for item in observations if item.metric in (
+                *required, "regime_confidence", "data_quality_score", "model_uncertainty",
+                "market_breadth", "trend_strength", "drawdown_rate", "change_point_probability",
+                "global_risk_sentiment", "global_direction", "expected_downside_net_bps",
+            )]
         ),
         regime=regime, valid_for_entry=valid, reason_codes=tuple(dict.fromkeys(reasons)), stress=stress, confidence=confidence,
         all_in_cost_rate=cost, noise_band_rate=noise, net_profit_floor_rate=net_floor, target_return_rate=target,

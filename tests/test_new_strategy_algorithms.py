@@ -58,6 +58,25 @@ def _context(strategy_id, **overrides) -> ElectionContext:
 # --------------------------------------------------------------------------- #
 # Derived microstructure                                                       #
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("field", ["return_5s", "aggressor_imbalance_5s", "tick_count_5s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_momentum_requires_finite_observed_tick_inputs(field, value):
+    decision = get_algorithm("intraday_momentum").entry(
+        _features(**{field: value}), _context("intraday_momentum"),
+    )
+    assert not decision.triggered
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_forecast_cannot_become_cost_viable(value):
+    algorithm = get_algorithm("intraday_momentum")
+    result = algorithm._fire(score=.8, confidence=.8, edge_bps=value, reasons=("TEST",), symbol="005930")
+    assert not result.triggered
+    assert not result.cost_viable
+    assert "ALGORITHM_NONFINITE_FORECAST" in result.reason_codes
+    assert algorithm._below_minimum(value, 0.0)
+
+
 def test_microprice_edge_follows_the_book_tilt():
     # microprice - mid == (spread / 2) * depth imbalance
     assert _features(spread_bps=10.0, orderbook_imbalance=0.5).microprice_edge_bps == 2.5

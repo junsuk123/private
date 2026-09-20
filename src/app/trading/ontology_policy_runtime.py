@@ -189,7 +189,7 @@ class OntologyPolicyRuntime:
                 continue
             if _get(bar, "symbol") != symbol or _meta_identity(bar)[0] != market:
                 continue
-            if start in candidates and (float(_get(bar, "close", 0)), _meta_identity(bar)) != (float(_get(candidates[start], "close", 0)), _meta_identity(candidates[start])):
+            if start in candidates and (float(_get(bar, "close", 0)), _number(_get(bar, "volume")), _meta_identity(bar)) != (float(_get(candidates[start], "close", 0)), _number(_get(candidates[start], "volume")), _meta_identity(candidates[start])):
                 conflicts.add(start)
             candidates[start] = bar
         ordered = sorted(candidates.items())
@@ -284,12 +284,12 @@ class OntologyPolicyRuntime:
             advisory = advisory.as_dict()
         if not isinstance(advisory, Mapping) or _group(advisory.get("market")) != market:
             return []
-        if advisory.get("symbol", symbol) != symbol or advisory.get("source") != "validated_temporal_rgcn":
+        if advisory.get("symbol") != symbol or advisory.get("source") != "validated_temporal_rgcn":
             return []
         if (advisory.get("label_execution_policy") != "ontology-risk-v1-entry-frozen-shadow"
                 or advisory.get("authority") != "bounded_risk_advisory_only"):
             return []
-        if advisory.get("available") is False or advisory.get("validated") is False:
+        if advisory.get("available") is not True or advisory.get("validated") is not True:
             return []
         checkpoint, snapshot = str(advisory.get("checkpoint_hash") or ""), str(advisory.get("ontology_snapshot_id") or "")
         observed = _time(advisory.get("observed_at") or advisory.get("as_of"))
@@ -335,6 +335,7 @@ class OntologyPolicyRuntime:
                       if isinstance(value, (float, int)) and not isinstance(value, bool)}
         from app.models.strategy_utility.strategy_graph import materialize_strategy_graph
 
-        graph = materialize_evidence_graph(projection, threshold_values=thresholds, instrument_symbol=policy.symbol)
+        graph = materialize_evidence_graph(projection, threshold_values=thresholds,
+                                           instrument_symbol=policy.symbol, policy_id=policy.policy_id)
         graph += materialize_strategy_graph(policy.market)
         return graph

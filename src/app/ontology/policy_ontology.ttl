@@ -6,9 +6,9 @@
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
 <https://obaits.local/ontology/policy> a owl:Ontology ;
-    owl:versionInfo "2026-09-20.1" ;
+    owl:versionInfo "2026-09-21.2" ;
     rdfs:label "Market evidence and dynamic policy ontology" ;
-    rdfs:comment "Class / Instance / Object Property / Data Property / Axiom. OWL expresses meaning; SHACL checks completeness; Python derives numerical thresholds; existing execution controls retain authority." .
+    rdfs:comment "Class / Instance / Object Property / Data Property / Axiom. OWL expresses meaning; SHACL checks completeness; the ontology numeric authority resolves risk once; execution checks only the approved contract and broker resources." .
 
 # Class ----------------------------------------------------------------------
 pol:Entity a owl:Class ; rdfs:subClassOf tr:TradingEntity .
@@ -24,6 +24,10 @@ pol:LongCashStrategy a owl:Class ; rdfs:subClassOf pol:Strategy .
 pol:ShortStrategy a owl:Class ; rdfs:subClassOf pol:Strategy .
 pol:Position a owl:Class ; rdfs:subClassOf pol:Entity, tr:PortfolioPosition .
 pol:RiskAssessment a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:RiskAuthority a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:RiskDecision a owl:Class ; rdfs:subClassOf pol:RiskAssessment .
+pol:ApprovedRiskDecision a owl:Class ; rdfs:subClassOf pol:RiskDecision .
+pol:RejectedRiskDecision a owl:Class ; rdfs:subClassOf pol:RiskDecision .
 pol:ThresholdPolicy a owl:Class ; rdfs:subClassOf pol:Entity .
 pol:Threshold a owl:Class ; rdfs:subClassOf pol:Entity .
 pol:DataSource a owl:Class ; rdfs:subClassOf pol:Entity .
@@ -34,6 +38,8 @@ pol:StrategyPerformanceObservation a owl:Class ; rdfs:subClassOf pol:Observation
 # Instance -------------------------------------------------------------------
 # Static individuals identify markets and session kinds. Availability, holidays,
 # actual session times and observations are runtime facts, not invented here.
+pol:OntologyRiskAuthority a owl:NamedIndividual, pol:RiskAuthority ;
+    rdfs:label "ontology-risk-authority-v1" .
 pol:KR a owl:NamedIndividual, pol:Market ; pol:marketCode "KR" ; pol:currency "KRW" .
 pol:US a owl:NamedIndividual, pol:Market ; pol:marketCode "US" ; pol:currency "USD" .
 pol:GLOBAL a owl:NamedIndividual, pol:Market ; pol:marketCode "GLOBAL" .
@@ -59,6 +65,9 @@ pol:observedInstrument a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs
 pol:projectionForInstrument a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:Instrument .
 pol:policyForInstrument a owl:ObjectProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range pol:Instrument .
 pol:assessesInstrument a owl:ObjectProperty ; rdfs:domain pol:RiskAssessment ; rdfs:range pol:Instrument .
+pol:decisionForInstrument a owl:ObjectProperty ; rdfs:subPropertyOf pol:assessesInstrument ; rdfs:domain pol:RiskDecision ; rdfs:range pol:Instrument .
+pol:decidedBy a owl:ObjectProperty ; rdfs:domain pol:RiskDecision ; rdfs:range pol:RiskAuthority .
+pol:usesThresholdPolicy a owl:ObjectProperty ; rdfs:domain pol:RiskDecision ; rdfs:range pol:ThresholdPolicy .
 pol:observedMetric a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:Metric .
 pol:providedBy a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:DataSource .
 pol:usesEvidence a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:AcceptedObservation .
@@ -80,6 +89,12 @@ pol:influencesMarket a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:r
 pol:confirmsMarket a owl:ObjectProperty ; rdfs:subPropertyOf pol:influencesMarket ; rdfs:domain pol:Observation ; rdfs:range pol:Market .
 
 # Data Property --------------------------------------------------------------
+pol:approved a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:boolean .
+pol:evaluatedAt a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:dateTime .
+pol:validUntil a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:dateTime .
+pol:approvedQuantity a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:integer .
+pol:authorizedPrice a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:double .
+pol:decisionPhase a owl:DatatypeProperty ; rdfs:domain pol:RiskDecision ; rdfs:range xsd:string .
 pol:marketCode a owl:DatatypeProperty ; rdfs:domain pol:Market ; rdfs:range xsd:string .
 pol:currency a owl:DatatypeProperty ; rdfs:domain pol:Market ; rdfs:range xsd:string .
 pol:sessionName a owl:DatatypeProperty ; rdfs:domain pol:Session ; rdfs:range xsd:string .
@@ -99,6 +114,7 @@ pol:evidenceReference a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdf
 pol:reasonCode a owl:DatatypeProperty ; rdfs:domain pol:Entity ; rdfs:range xsd:string .
 pol:regimeLabel a owl:DatatypeProperty ; rdfs:domain pol:Regime ; rdfs:range xsd:string .
 pol:policyMode a owl:DatatypeProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range xsd:string .
+pol:policyId a owl:DatatypeProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range xsd:string .
 pol:strategyId a owl:DatatypeProperty ; rdfs:domain pol:Strategy ; rdfs:range xsd:string .
 pol:realizedNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
 pol:expectedNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
@@ -114,6 +130,7 @@ pol:evidenceSource a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceO
 # these types cannot co-apply; absence still remains unknown (OWL open world).
 pol:KR owl:differentFrom pol:US .
 pol:AcceptedObservation owl:disjointWith pol:RejectedObservation .
+pol:ApprovedRiskDecision owl:disjointWith pol:RejectedRiskDecision .
 pol:LongCashStrategy owl:disjointWith pol:ShortStrategy .
 pol:Market owl:disjointWith pol:Observation, pol:ThresholdPolicy .
 pol:hasPerformance owl:inverseOf pol:observedStrategy .

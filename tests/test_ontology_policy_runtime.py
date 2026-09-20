@@ -205,8 +205,17 @@ def test_cached_future_bars_are_not_reused_for_an_earlier_decision():
     assert "realized_volatility" not in {item["metric"] for item in earlier.evidence}
 
 
+def test_conflicting_duplicate_bar_volume_cannot_change_executable_liquidity():
+    store = Store()
+    store.bars = (*store.bars, replace(store.bars[-1], volume=1))
+    policy = resolve(OntologyPolicyRuntime(store, context_provider=context))
+    assert not policy.valid_for_entry
+    assert "liquidity_score" not in {item["metric"] for item in policy.evidence}
+
+
 def test_graph_advisory_exact_validity_and_checkpoint_provenance_are_preserved():
     advisory = {"symbol": "005930", "market": "KR", "as_of": NOW, "valid_until": NOW+timedelta(seconds=5),
+                "available": True, "validated": True,
                 "source": "validated_temporal_rgcn", "checkpoint_hash": "checkpoint", "ontology_snapshot_id": "graph1",
                 "label_execution_policy": "ontology-risk-v1-entry-frozen-shadow", "authority": "bounded_risk_advisory_only",
                 "model_uncertainty": .25, "expected_net_return_bps": -10, "expected_downside_net_bps": 25,
@@ -221,7 +230,7 @@ def test_graph_advisory_exact_validity_and_checkpoint_provenance_are_preserved()
     assert policy.expires_at <= NOW+timedelta(seconds=5)
     later = resolve(runtime, now=NOW+timedelta(seconds=6))
     assert "model_uncertainty" not in {item["metric"] for item in later.evidence}
-    for key in ("checkpoint_hash", "ontology_snapshot_id", "valid_until", "label_execution_policy", "authority"):
+    for key in ("symbol", "available", "validated", "checkpoint_hash", "ontology_snapshot_id", "valid_until", "label_execution_policy", "authority"):
         incomplete = {name: value for name, value in advisory.items() if name != key}
         assert not runtime._graph_observations("005930", "KR", NOW, incomplete)
 

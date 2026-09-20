@@ -33,12 +33,14 @@ def test_actual_web_factory_requires_one_shared_policy_without_starting_broker(m
     assert engine.decision_engine.risk_manager.ontology_policy_required
     assert session.plan_builder.risk_manager.ontology_policy_required
     assert session.graph_training_context_provider.__self__ is web._graph_policy_contexts
+    assert session.entry_activity_provider is engine.decision_engine.entry_activity_provider
+    assert session.entry_activity_provider.scope == "bot_confirmed_entries"
     assert engine.coordinator.cash_equity_only
     # An otherwise affordable profitable request must still fail when this
     # actual factory's store/context cannot substantiate the operating policy.
     result = session.plan_builder.build(_request(), now=NOW)
     assert result.plan is None
-    assert result.no_trade.stage == "ontology_policy"
+    assert result.no_trade.stage == "ontology_authority"
 
 
 def test_live_forward_training_inputs_are_captured_without_authorized_or_enabled_gnn(monkeypatch):

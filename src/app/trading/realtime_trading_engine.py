@@ -73,7 +73,9 @@ class _DailyLossBudget:
     reason: str | None = None
 
 
-def _daily_loss_budget(account: AccountSnapshot, *, policy_rate: float | None = None) -> _DailyLossBudget:
+def _daily_loss_budget(
+    account: AccountSnapshot, *, policy_rate: float | None = None, legacy_limits: bool = True,
+) -> _DailyLossBudget:
     """One measured denomination and the tighter positive cap for both gates."""
     from app.market_affordability import currency_conversion_rate
     from app.portfolio import _valuation
@@ -96,8 +98,8 @@ def _daily_loss_budget(account: AccountSnapshot, *, policy_rate: float | None = 
         if not math.isfinite(realized) or (realized != 0.0 and rate is None):
             return unknown("DAILY_REALIZED_PNL_VALUATION_UNKNOWN")
         realized *= rate or 1.0
-        absolute_krw = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0)
-        fraction = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0)
+        absolute_krw = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW", 0.0) if legacy_limits else 0.0
+        fraction = _env_float("REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE", 0.0) if legacy_limits else 0.0
         if not all(math.isfinite(value) and value >= 0 for value in (absolute_krw, fraction)):
             return unknown("DAILY_LOSS_LIMIT_CONFIG_INVALID")
         limits = []
@@ -744,7 +746,9 @@ class RealtimeTradingEngine:
         if callable(sync_policy_state):
             sync_policy_state(account)
         daily_loss = self._account_loss_budget(account, decision_time)
-        if buy_enabled and daily_loss.blocked:
+        if buy_enabled and daily_loss.blocked and (
+            not self._ontology_owns_entry() or not daily_loss.valuation_complete
+        ):
             buy_enabled = False
             self._buy_disabled_reason = daily_loss.reason
         # Display-only telemetry for the account dashboard profitability panel.
@@ -803,12 +807,13 @@ class RealtimeTradingEngine:
         backoff_candidates: list[str] = []
         eligible_candidates: list[str] = []
         for symbol in cycle_buy_candidates:
-            if symbol in active_loss_cooldowns:
+            if not self._ontology_owns_entry() and symbol in active_loss_cooldowns:
                 loss_candidates.append(symbol)
             elif symbol in ignored_symbols:
                 ignored_candidates.append(symbol)
             elif (
-                self._reentry_cooldown_seconds(symbol) > 0
+                not self._ontology_owns_entry()
+                and self._reentry_cooldown_seconds(symbol) > 0
                 and (last_sell := self._recent_sell_monotonic.get(symbol)) is not None
                 and now_monotonic - last_sell < self._reentry_cooldown_seconds(symbol)
             ):
@@ -895,7 +900,7 @@ class RealtimeTradingEngine:
                 nodes=("MacroMarket", "OntologyFilter2:EntryDecision"),
                 links=({"source": "MacroMarket", "target": "OntologyFilter2:EntryDecision", "predicate": "feedsDecision"},),
             )
-        if buy_enabled and _macro_micro_blocks_buy(macro_micro_bundle):
+        if buy_enabled and not self._ontology_owns_entry() and _macro_micro_blocks_buy(macro_micro_bundle):
             buy_enabled = False
             self._buy_disabled_reason = "MACRO_MICRO_BLOCK_BUY"
 
@@ -1139,11 +1144,11 @@ class RealtimeTradingEngine:
             if symbol in held_tickers:
                 continue  # 보유 종목은 매도 감시 대상이므로 신규 매수에서 제외.
             loss_until = self._loss_cooldown_until.get(symbol)
-            if loss_until is not None and time.monotonic() < loss_until:
+            if not self._ontology_owns_entry() and loss_until is not None and time.monotonic() < loss_until:
                 summary["skipped_cooldown"] += 1
                 self._append_rejection(summary, symbol, "BUY", ("RECENT_LOSS_SYMBOL_COOLDOWN",))
                 continue
-            if self._reentry_cooldown_seconds(symbol) > 0:
+            if not self._ontology_owns_entry() and self._reentry_cooldown_seconds(symbol) > 0:
                 last_sell = self._recent_sell_monotonic.get(symbol)
                 if last_sell is not None and (time.monotonic() - last_sell) < self._reentry_cooldown_seconds(symbol):
                     summary["skipped_cooldown"] += 1
@@ -1910,6 +1915,13 @@ class RealtimeTradingEngine:
             except Exception:  # noqa: BLE001 - treat an unusable provider as unknown.
                 session_tradable = None
 
+        if self._ontology_owns_entry():
+            return self._supervise_ontology_execution(
+                session=session, symbol=symbol, phase=phase, account=account,
+                position_open=position_open, data_age=data_age,
+                session_tradable=session_tradable, now=decision_time,
+            )
+
         macro = getattr(macro_micro_bundle, "macro_result", None)
         macro_risk = getattr(getattr(macro, "risk_level", None), "value", None)
         allowed = tuple(getattr(macro, "allowed_micro_strategies", ()) or ())
@@ -1999,9 +2011,67 @@ class RealtimeTradingEngine:
             )
         return verdict
 
+    def _ontology_owns_entry(self) -> bool:
+        """Production's mandatory policy path, not a flag carried by a candidate."""
+        return callable(getattr(self, "ontology_policy_resolver", None)) and callable(
+            getattr(getattr(self, "strategy_session_manager", None), "ontology_policy_resolver", None)
+        )
+
+    def _supervise_ontology_execution(
+        self, *, session: dict[str, Any], symbol: str, phase: str,
+        account: AccountSnapshot, position_open: bool, data_age: float | None,
+        session_tradable: bool | None, now: datetime,
+    ) -> SupervisorVerdict:
+        """Check the frozen receipt and operational health, without a new risk vote.
+
+        Entry economics were approved once for this symbol by the ontology. An
+        unrelated market's daily budget or global macro label cannot veto it here.
+        After commitment, the owning session updates exit policy; expiration of
+        the historical entry receipt is not a reason to liquidate that position.
+        """
+        issues: tuple[str, ...] = ()
+        if phase == "ARMED":
+            from app.ontology.decision_receipt import validate_plan_authority
+
+            try:
+                plan = self.strategy_session_manager.trade_plan_for(symbol)
+                issues = validate_plan_authority(plan, now, symbol=symbol)
+            except Exception:
+                issues = ("ONTOLOGY_AUTHORITY_RECEIPT_UNAVAILABLE",)
+        verdict = self.strategy_supervisor.evaluate(SupervisorObservation(
+            symbol=symbol, as_of=now,
+            strategy_id=str(session.get("selected_strategy") or "") or None,
+            position_open=position_open or phase in {"ENTERING", "OWNED", "EXITING"},
+            data_age_seconds=data_age, session_tradable=session_tradable,
+        ))
+        # Account denomination/cash availability is an execution resource fact.
+        # The dashboard budget remains telemetry; its cross-market minimum is
+        # never another economic assessment of this already approved entry.
+        budget = self._account_loss_budget(account, now)
+        if not budget.valuation_complete:
+            issues = (*issues, budget.reason or "ACCOUNT_VALUATION_INCOMPLETE")
+        if issues:
+            verdict = replace(
+                verdict, level=verdict.level if verdict.forces_exit else HaltLevel.SOFT,
+                reason_codes=tuple(dict.fromkeys((*verdict.reason_codes, *issues))),
+                soft_reason_codes=tuple(dict.fromkeys((*verdict.soft_reason_codes, *issues))),
+            )
+        verdict = replace(verdict, diagnostics={
+            **dict(verdict.diagnostics), "supervision_scope": "execution_integrity",
+            "daily_loss_valuation_complete": budget.valuation_complete,
+        })
+        if verdict.forces_exit and phase in {"ARMED", "ENTERING", "OWNED"}:
+            self.strategy_session_manager.request_halt(symbol, verdict.level.value, verdict.hard_reason_codes)
+            self._record({"at": now.isoformat(), "symbol": symbol, "kind": "SUPERVISOR",
+                          "outcome": "hard_halt", "detail": ",".join(verdict.hard_reason_codes) or "UNSPECIFIED"})
+        elif verdict.blocks_new_entries and phase == "ARMED":
+            self.strategy_session_manager.request_halt(symbol, verdict.level.value, verdict.soft_reason_codes)
+        return verdict
+
     def _account_loss_budget(self, account: AccountSnapshot, now: datetime) -> _DailyLossBudget:
+        legacy_limits = not self._ontology_owns_entry()
         if self.ontology_policy_snapshot_provider is None:
-            return _daily_loss_budget(account)
+            return _daily_loss_budget(account, legacy_limits=legacy_limits)
         from app.risk.ontology_thresholds import policy_limits
         rates = [policy_limits().maximum_daily_loss_rate]
         try:
@@ -2016,7 +2086,7 @@ class RealtimeTradingEngine:
                         rates.append(rate)
         except (AttributeError, TypeError, ValueError, KeyError):
             pass
-        return _daily_loss_budget(account, policy_rate=min(rates))
+        return _daily_loss_budget(account, policy_rate=min(rates), legacy_limits=legacy_limits)
 
     def _symbol_realtime_volatility_safe(self, symbol: str, decision_time: datetime) -> float | None:
         getter = getattr(self.decision_engine, "_symbol_realtime_volatility", None)

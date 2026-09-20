@@ -101,6 +101,8 @@ class PreSubmitGuard:
         side: Any,
         market: str,
         now: datetime | None = None,
+        amending_broker_order_id: str | None = None,
+        amending_ancestor_order_ids: tuple[str, ...] = (),
     ) -> PreSubmitDecision:
         """Verdict for one order about to be submitted.
 
@@ -126,7 +128,9 @@ class PreSubmitGuard:
                 continue
             checked.append(name)
             try:
-                found = check(ticker=ticker, side=side, market=market, now=moment, detail=detail)
+                found = check(ticker=ticker, side=side, market=market, now=moment, detail=detail,
+                              amending_broker_order_id=amending_broker_order_id,
+                              amending_ancestor_order_ids=amending_ancestor_order_ids)
             except Exception as exc:  # noqa: BLE001 - a failing check blocks under strict.
                 found = (f"PRESUBMIT_CHECK_FAILED:{name}:{type(exc).__name__}",)
             reasons.extend(found)
@@ -144,7 +148,9 @@ class PreSubmitGuard:
 
     # ------------------------------------------------------------------ #
     def _check_order_state(
-        self, *, ticker: str, side: Any, now: datetime, detail: dict[str, Any], **_: Any
+        self, *, ticker: str, side: Any, now: datetime, detail: dict[str, Any],
+        amending_broker_order_id: str | None = None,
+        amending_ancestor_order_ids: tuple[str, ...] = (), **_: Any
     ) -> tuple[str, ...]:
         machine = self._state_machine
         if machine is None:
@@ -159,7 +165,27 @@ class PreSubmitGuard:
             detail["unknown_intent_ids"] = unknown
             reasons.append("UNKNOWN_ORDER_STATE")
         resolved_side = str(getattr(side, "value", side) or "").strip().upper()
-        if machine.has_duplicate_risk(ticker, resolved_side):
+        if amending_broker_order_id is not None:
+            # The coordinator separately proves this ID's accepted-order origin.
+            # Exempt just that known working order, never another/unknown intent.
+            pending = machine.open_intents(ticker=str(ticker).strip().upper())
+            original_ids = {str(amending_broker_order_id), *amending_ancestor_order_ids}
+            blockers = []
+            for record in pending:
+                if record.side != resolved_side:
+                    continue
+                state = str(getattr(record.state, "value", record.state)).upper()
+                if state == "CREATED":
+                    continue
+                same = str(record.broker_order_id or "") in original_ids
+                if same and state in {"SUBMITTED", "PARTIALLY_FILLED"}:
+                    detail["amended_intent_id"] = record.intent_id
+                    continue
+                blockers.append(record.intent_id)
+            if blockers:
+                detail["conflicting_intent_ids"] = blockers
+                reasons.append("DUPLICATE_ORDER_RISK")
+        elif machine.has_duplicate_risk(ticker, resolved_side):
             reasons.append("DUPLICATE_ORDER_RISK")
         return tuple(reasons)
 

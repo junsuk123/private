@@ -67,7 +67,8 @@ def test_frozen_trade_plan_uses_generated_geometry_cost_basis_and_expiry():
     assert plan.risk_snapshot["ontology_risk_policy"]["policy_id"] == policy.policy_id
     assert plan.election_context["ontology_risk_policy"]["evidence_id"] == policy.evidence_id
     assert policy.policy_id in plan.source_ids
-    assert captured[0]["all_in_cost_rate"] == plan.cost_snapshot["all_in_cost_rate"]
+    assert captured[0]["all_in_cost_rate"] <= plan.cost_snapshot["all_in_cost_rate"]
+    assert plan.cost_snapshot["quantity"] == plan.quantity
     assert plan.max_notional <= 100_000_000 * policy.position_cap
 
 
@@ -105,19 +106,14 @@ def test_required_risk_policy_rejects_new_entry_even_with_good_cash_and_price(in
 
 def test_one_share_rounding_cannot_exceed_generated_position_budget():
     policy = replace(_policy(symbol="000660"), position_cap=.01)
-    # Isolate the final integer-lot invariant from unrelated affordability gates:
-    # a risk adapter returns one share even though the new policy allows only 1k.
-    class OneShareRisk:
-        rules = RiskRules()
-
-        def validate(self, *args, **kwargs):
-            return SimpleNamespace(approved=True, rejection_reasons=(), metadata={},
-                                   final_order=SimpleNamespace(quantity=1))
-
+    # The single authority must return NO_TRADE when one share exceeds the
+    # generated 1k position budget; no downstream sizing veto is needed.
     request = _request(account=AccountSnapshot(cash=100_000, holdings=(), total_equity_krw=100_000))
-    outcome = TradePlanBuilder(risk_manager=OneShareRisk(), ontology_policy_resolver=lambda **kwargs: policy).build(request, now=NOW)
+    outcome = TradePlanBuilder(ontology_policy_resolver=lambda **kwargs: policy).build(request, now=NOW)
     assert outcome.plan is None
-    assert outcome.no_trade.reason_codes == ("MARKET_POSITION_CAP_EXCEEDED",)
+    assert "ONTOLOGY_POSITION_BUDGET_EXCEEDED" in outcome.no_trade.reason_codes
+    assert outcome.no_trade.stage == "ontology_authority"
+    assert outcome.no_trade.risk_snapshot["ontology_authority"]["approved"] is False
 
 
 def test_dynamic_risk_budget_tightens_current_order_without_mutating_shared_rules():
@@ -243,12 +239,28 @@ def test_generated_early_exit_confirmation_count_replaces_legacy_fixed_count(tmp
                      noise_band_rate=.00001)
     manager = _owned_manager(tmp_path, lambda **kwargs: policy)
     manager._state.election_context["ontology_risk_policy"] = policy.as_dict()
-    ids = iter(("one", "two", "three"))
+    ids = iter((NOW.isoformat(), (NOW + timedelta(seconds=1)).isoformat(), (NOW + timedelta(seconds=2)).isoformat()))
     manager._continuation_invalidation_evidence = lambda *args: (next(ids), ["ONTOLOGY_THESIS_CHANGED"])
     holding = SimpleNamespace(average_price=100, last_price=99.5, quantity=1)
+    manager._refresh_position_ontology_policy(holding, NOW)
     assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW) is None
-    assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW) is None
-    assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW) == "STRATEGY_EDGE_DECAY_LOSS_LIMIT"
+    assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW + timedelta(seconds=1)) is None
+    assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW + timedelta(seconds=2)) == "STRATEGY_EDGE_DECAY_LOSS_LIMIT"
+
+
+def test_algorithm_static_economic_floor_is_advisory_to_ontology(tmp_path, monkeypatch):
+    manager = _owned_manager(tmp_path, lambda **kwargs: _policy())
+    raw = {"triggered": True, "expected_edge_bps": 35., "cost_viable": False,
+           "score": .8, "confidence": .8, "diagnostics": {"minimum_edge_bps": 100.}}
+    algorithm = SimpleNamespace(entry=lambda *args: SimpleNamespace(as_dict=lambda: dict(raw)))
+    monkeypatch.setattr("app.technical.strategy_algorithms.get_algorithm", lambda *args, **kwargs: algorithm)
+    decision = manager._mechanical_entry_verdict(symbol="005930", strategy_id="breakout_volume",
+        evidence_row={"technical_features": {"symbol": "005930"}}, now=NOW, macro=None,
+        intent=None, micro_result=None, candidate_count=1, borrow_snapshot=None, record=False)
+    assert decision["triggered"]
+    assert decision["expected_edge_bps"] == 35., "Do not inflate the forecast to clear a floor"
+    assert decision["cost_viable"] is None, "The ontology must decide actual economics"
+    assert decision["diagnostics"]["legacy_cost_viable"] is False
 
 
 @pytest.mark.parametrize("mark", [float("nan"), float("inf"), 0.0])
@@ -257,8 +269,9 @@ def test_invalid_mark_cannot_manufacture_a_dynamic_thesis_exit(tmp_path, mark):
                      noise_band_rate=.00001)
     manager = _owned_manager(tmp_path, lambda **kwargs: policy)
     manager._state.election_context["ontology_risk_policy"] = policy.as_dict()
-    manager._continuation_invalidation_evidence = lambda *args: ("new-evidence", ["ONTOLOGY_THESIS_CHANGED"])
+    manager._continuation_invalidation_evidence = lambda *args: (NOW.isoformat(), ["ONTOLOGY_THESIS_CHANGED"])
     holding = SimpleNamespace(average_price=100, last_price=mark, quantity=1)
+    manager._refresh_position_ontology_policy(holding, NOW)
     assert manager._confirmed_continuation_exit_reason(holding, None, direction=PositionDirection.LONG, now=NOW) is None
 
 

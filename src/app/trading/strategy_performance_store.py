@@ -601,11 +601,21 @@ class StrategyPerformanceStore:
             clauses.append("evaluation_version = ?")
             params.append(str(resolved_evaluation_version))
         if cutoff is not None:
+            # Keep the existing strategy/market/regime/time index usable. Every
+            # legal datetime offset is below 24h, so a coarse local-date range
+            # safely narrows old history before the exact UTC predicate runs.
             clauses.append("recorded_at >= ?")
-            params.append(cutoff)
+            params.append((_parse_iso(cutoff) - timedelta(days=1)).date().isoformat())
+            clauses.append("evidence_utc(recorded_at) >= ?")
+            params.append(_evidence_utc(cutoff))
+        # Historical rows can carry KST/ET offsets. Lexical ISO ordering is only
+        # chronological after UTC normalization, including before the LIMIT.
+        clauses.append("evidence_utc(recorded_at) is not null")
         if as_of is not None:
-            clauses.append("recorded_at <= ?")
-            params.append(observation_time.isoformat())
+            clauses.append("recorded_at < ?")
+            params.append((observation_time + timedelta(days=2)).date().isoformat())
+            clauses.append("evidence_utc(recorded_at) <= ?")
+            params.append(_evidence_utc(observation_time.isoformat()))
         params.append(window)
         sql = (
             "select recorded_at, strategy_id, market, regime, symbol, realized_net_bps, "
@@ -614,11 +624,15 @@ class StrategyPerformanceStore:
             "deployment_state, evaluation_source, borrow_available, borrow_fee_bps, "
             "borrow_quantity, signal_executable, algorithm_version, evaluation_version, risk_policy_family "
             "from strategy_outcomes "
-            f"where {' and '.join(clauses)} order by recorded_at desc, rowid desc limit ?"
+            f"where {' and '.join(clauses)} order by evidence_utc(recorded_at) desc, rowid desc limit ?"
         )
         rows: Sequence[Any] = ()
         try:
             with self._lock, closing(self._connect()) as conn:
+                conn.create_function("evidence_utc", 1, _evidence_utc, deterministic=True)
+                if as_of is not None:
+                    deadline = time.monotonic() + .100
+                    conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
                 rows = conn.execute(sql, params).fetchall()
         except sqlite3.Error:
             if as_of is not None:
@@ -1316,7 +1330,12 @@ def _finite(value: Any) -> float | None:
 
 
 def _aware(moment: datetime) -> datetime:
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc) if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def _evidence_utc(value: Any) -> str | None:
+    parsed = _parse_iso(value)
+    return parsed.isoformat(timespec="microseconds") if parsed is not None else None
 
 
 def _median(values: Sequence[float]) -> float:

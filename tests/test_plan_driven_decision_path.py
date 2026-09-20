@@ -232,56 +232,60 @@ def _execute_current_policy_plan(engine, account, policy, plan=None):
     )
 
 
-def test_fresh_dynamic_policy_cannot_increase_the_frozen_quantity(engine, account):
-    from types import SimpleNamespace
-    calls = []
+def _approved_ontology_plan(account):
+    from app.schemas.domain import MarketSnapshot, SourceMetadata
+    from app.trading.trade_plan_builder import PlanRequest, TradePlanBuilder
+    market = MarketSnapshot(SYMBOL, "KR", "Example", "semiconductor", 70_360., 5e11, .02,
+        SourceMetadata("KIS realtime WebSocket", NOW, observed_at=NOW,
+                       source_type="broker_api", trust_level=5, quality_score=1., is_realtime=True))
+    outcome = TradePlanBuilder(ontology_policy_resolver=lambda **_: _current_policy_for_plan()).build(
+        PlanRequest(symbol=SYMBOL, market="KR", strategy_id="intraday_momentum", account=account,
+                    market_snapshot=market, reference_price=70_360., take_profit_rate=.06,
+                    stop_loss_rate=.01, trailing_rate=.005, max_holding_seconds=900,
+                    gross_edge_bps=600., source_ids=("live-quote",)), now=NOW)
+    assert outcome.plan is not None, outcome.no_trade
+    return outcome.plan
 
-    def allow_more(*args, **kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(approved=True, final_order=SimpleNamespace(quantity=100),
-                               rejection_reasons=(), metadata={})
 
-    engine.risk_manager.validate = allow_more
-    result = _execute_current_policy_plan(engine, account, _current_policy_for_plan())
+def test_fresh_dynamic_policy_cannot_resize_the_frozen_quantity(engine, account):
+    plan = _approved_ontology_plan(account)
+    spies = _disarm(engine)
+    result = _execute_current_policy_plan(engine, account, _current_policy_for_plan(), plan)
     assert result.approved, result.reason_codes
-    assert calls
-    assert result.final_order.quantity == 7
-    assert result.diagnostics["post_selection_gates"] == ["current_ontology_risk"]
+    assert result.final_order.quantity == plan.quantity
+    assert all(spy.calls == 0 for spy in spies.values())
+    assert result.diagnostics["post_selection_gates"] == []
 
 
-def test_current_policy_quantity_reduction_cannot_submit_old_larger_plan(engine, account):
-    from types import SimpleNamespace
-    engine.risk_manager.validate = lambda *args, **kwargs: SimpleNamespace(
-        approved=True, final_order=SimpleNamespace(quantity=3), rejection_reasons=(), metadata={})
+def test_missing_approval_cannot_be_recreated_by_risk_revalidation(engine, account):
+    spies = _disarm(engine)
     result = _execute_current_policy_plan(engine, account, _current_policy_for_plan())
-    assert result.approved is False
-    assert result.final_order is None
-    assert "ONTOLOGY_PLAN_QUANTITY_REJECTED" in result.reason_codes
+    assert not result.approved and result.final_order is None
+    assert "ONTOLOGY_AUTHORITY_RECEIPT_MISSING" in result.reason_codes
+    assert all(spy.calls == 0 for spy in spies.values())
 
 
-def test_expired_or_deteriorated_policy_vetoes_the_frozen_entry(engine, account):
+def test_later_policy_does_not_cast_a_second_vote_on_current_approval(engine, account):
     from dataclasses import replace
+    plan = _approved_ontology_plan(account)
+    spies = _disarm(engine)
     policy = _current_policy_for_plan()
     for current in (replace(policy, expires_at=NOW - timedelta(seconds=1)), replace(policy, position_cap=.001)):
-        result = _execute_current_policy_plan(engine, account, current)
-        assert result.approved is False
-        assert result.final_order is None
+        result = _execute_current_policy_plan(engine, account, current, plan)
+        assert result.approved, result.reason_codes
+        assert result.final_order.quantity == plan.quantity
+    assert all(spy.calls == 0 for spy in spies.values())
 
 
-def test_frozen_plan_with_current_policy_can_pass_real_risk_revalidation(engine, account):
-    plan = _plan(quantity=3, expected_net_edge_bps=600, cost_snapshot={"all_in_cost_rate": .003, "net_expected_return": .06})
-    captured = []
-    original = engine.risk_manager.validate
-
-    def record_risk(*args, **kwargs):
-        verdict = original(*args, **kwargs)
-        captured.append(verdict)
-        return verdict
-
-    engine.risk_manager.validate = record_risk
+def test_quantity_outside_receipt_is_rejected_without_risk_revalidation(engine, account):
+    from dataclasses import replace
+    plan = _approved_ontology_plan(account)
+    plan = replace(plan, quantity=plan.quantity + 1)
+    spies = _disarm(engine)
     result = _execute_current_policy_plan(engine, account, _current_policy_for_plan(), plan)
-    assert result.approved, (result.reason_codes, captured[0].adjusted_weight, getattr(captured[0].final_order, "quantity", None))
-    assert result.final_order.quantity == 3
+    assert not result.approved and result.final_order is None
+    assert "ONTOLOGY_AUTHORITY_QUANTITY_EXCEEDED" in result.reason_codes
+    assert all(spy.calls == 0 for spy in spies.values())
 
 
 def test_the_diagnostics_name_the_plan_as_the_authority(engine, account) -> None:

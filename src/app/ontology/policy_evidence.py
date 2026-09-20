@@ -351,6 +351,7 @@ def materialize_evidence_graph(
     projection: EvidenceProjection, *, threshold_values: Mapping[str, float] | None = None,
     performance_assessments: Iterable[Mapping[str, Any]] = (),
     instrument_symbol: str | None = None,
+    policy_id: str | None = None,
 ) -> Any:
     """Create an RDF audit graph explicitly outside the realtime receive path.
 
@@ -431,7 +432,9 @@ def materialize_evidence_graph(
             graph.add((node, pol.reasonCode, Literal(reason)))
     if threshold_values is not None:
         threshold_digest = hashlib.sha256((digest + json.dumps(dict(threshold_values), sort_keys=True, default=str)).encode()).hexdigest()[:24]
-        policy = pol["policy_" + threshold_digest]
+        policy = pol["policy_" + (quote(policy_id, safe="_") if policy_id else threshold_digest)]
+        if policy_id:
+            graph.add((policy, pol.policyId, Literal(policy_id)))
         assessment = pol["risk_" + digest]
         graph.add((policy, RDF.type, pol.ThresholdPolicy))
         graph.add((policy, pol.appliesToMarket, pol[projection.market]))

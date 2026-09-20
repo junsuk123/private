@@ -73,7 +73,7 @@ __all__ = [
 
 #: Stamped onto every result. Bump when the formula or the term set changes, so a stored
 #: selection can be matched to the arithmetic that produced it.
-SELECTION_VERSION = "selector-v2.1.0"
+SELECTION_VERSION = "selector-v2.2.0"
 
 SELECTION_REASON_ENTRY_NOT_READY = "CANDIDATE_ENTRY_NOT_READY"
 SELECTION_REASON_COST_FLOOR_REJECTED = "CANDIDATE_COST_FLOOR_REJECTED"
@@ -174,6 +174,12 @@ class RankedStrategyCandidate:
             self.eligible
             and self.entry_ready
             and self.cost_viable
+            and SELECTION_REASON_NO_PREDICTION not in self.reason_codes
+            and all(math.isfinite(value) for value in (
+                self.expected_gross_return_bps, self.expected_cost_bps,
+                self.final_utility_bps, self.downside_penalty_bps,
+                self.uncertainty_penalty_bps, self.expected_holding_seconds,
+            ))
             and SELECTION_REASON_LIFECYCLE_NOT_LIVE not in self.reason_codes
             and PERFORMANCE_SHADOW_ONLY not in self.reason_codes
         )
@@ -468,7 +474,32 @@ class StrategySelectorV2:
             # A predictor that does not accept GNN rows (the heuristic, or an injected
             # test double) still satisfies the protocol.
             predicted = self._utility.predict(context, proposals, costs)
-        return {item.strategy_id: item for item in predicted}
+        # A model output describes one symbol at one captured context. Reusing a
+        # cached row for a new context must not import a previous market state.
+        requested = {proposal.strategy_id for proposal in proposals}
+        accepted: dict[str, StrategyUtilityPrediction] = {}
+        duplicates: set[str] = set()
+        seen: set[str] = set()
+        for item in predicted:
+            if item.strategy_id in seen:
+                duplicates.add(item.strategy_id)
+            seen.add(item.strategy_id)
+            if (item.strategy_id not in requested or item.context_id != context.context_id
+                    or item.symbol != context.symbol_id):
+                continue
+            numbers = (
+                item.expected_gross_return_bps, item.expected_cost_bps,
+                item.expected_downside_bps, item.expected_holding_seconds,
+                item.uncertainty_bps, item.probability_profit,
+            )
+            if (not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) for value in numbers)
+                    or item.expected_cost_bps < 0 or item.expected_downside_bps < 0
+                    or item.uncertainty_bps < 0 or item.expected_holding_seconds <= 0
+                    or not 0 <= item.probability_profit <= 1):
+                continue
+            accepted[item.strategy_id] = item
+        return {key: item for key, item in accepted.items() if key not in duplicates}
 
     def _corrections(
         self,

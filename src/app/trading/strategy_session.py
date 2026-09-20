@@ -1101,9 +1101,11 @@ class StrategySessionManager:
         selector_v2_runner: Any | None = None,
         plan_builder: Any | None = None,
         ontology_policy_resolver: Callable[..., Any] | None = None,
+        entry_activity_provider: Callable[[str, datetime], int | None] | None = None,
         graph_training_context_provider: Callable[..., Mapping[str, Any] | None] | None = None,
     ) -> None:
         self.ontology_policy_resolver = ontology_policy_resolver
+        self.entry_activity_provider = entry_activity_provider
         self.graph_training_context_provider = graph_training_context_provider
         self._position_ontology_policy = None
         self._position_ontology_session = None
@@ -1181,6 +1183,10 @@ class StrategySessionManager:
                     self._reset_to_scanning("ENTRY_NOT_FILLED_TIMEOUT")
 
             if self._state.phase == "ARMED" and not holdings:
+                if self._trade_plan is not None and self._trade_plan.is_expired(now):
+                    # A short-lived ontology decision is renewed by the same
+                    # election authority, never by downstream risk reapproval.
+                    self._reset_to_scanning("ONTOLOGY_PLAN_EXPIRED_RESELECT")
                 selected_at = _parse_time(self._state.selected_at)
                 if (
                     selected_at is not None
@@ -1431,6 +1437,12 @@ class StrategySessionManager:
                 builder = TradePlanBuilder(ontology_policy_resolver=self.ontology_policy_resolver)
                 self._plan_builder = builder
             venue, instrument_type = _cost_market_contract(proposal.symbol)
+            trades_today = 0
+            if self.entry_activity_provider is not None:
+                try:
+                    trades_today = self.entry_activity_provider(market, now)
+                except Exception:
+                    trades_today = None
             outcome = builder.build(
                 PlanRequest(
                     symbol=proposal.symbol,
@@ -1476,6 +1488,7 @@ class StrategySessionManager:
                     source_ids=self._plan_source_ids(proposal, now),
                     session_id=self._state.session_id,
                     plan_ttl_seconds=self._plan_ttl_seconds(),
+                    trades_today=trades_today,
                 ),
                 now=now,
             )
@@ -2264,8 +2277,20 @@ class StrategySessionManager:
         # Fail closed for an automated early exit rather than counting loop ticks.
         if evidence_id is None:
             return None
-        if evidence_id == state.last_invalidation_evidence_at:
+        observed_at = _parse_time(evidence_id)
+        previous_at = _parse_time(state.last_invalidation_evidence_at)
+        if observed_at is None or (previous_at is not None and observed_at <= previous_at):
             return None
+        if now is not None:
+            now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+            age = (now - observed_at).total_seconds()
+            if age < 0 or age > self.config.selection_evidence_max_age_seconds:
+                return None
+        if self.ontology_policy_resolver is not None:
+            current = self._position_ontology_policy
+            if (now is None or current is None or not current.has_current_market_evidence(now)
+                    or not state.election_context.get("ontology_policy_current_evidence", False)):
+                return None
         state.last_invalidation_evidence_at = evidence_id
         if reasons:
             state.invalidation_cycles += 1
@@ -2334,8 +2359,9 @@ class StrategySessionManager:
                 raise ValueError("ONTOLOGY_POLICY_TIME_INVALID")
             prior = self._position_ontology_policy
             # An outage cannot manufacture a new noise estimate or widen owned risk.
-            missing = any("MISSING" in reason or "UNKNOWN" in reason or "STALE" in reason for reason in policy.reason_codes)
-            if missing and prior is not None and prior.symbol == symbol:
+            usable = policy.has_current_market_evidence(now)
+            state.election_context["ontology_policy_current_evidence"] = usable
+            if not usable and prior is not None and prior.symbol == symbol:
                 policy = prior
             else:
                 policy = policy.tighten_for_position(prior)
@@ -2360,6 +2386,7 @@ class StrategySessionManager:
                 state.target_return_rate = data["target_return_rate"]
                 state.target_price = _directional_target_price(entry, state.target_return_rate, direction)
         except Exception as exc:
+            state.election_context["ontology_policy_current_evidence"] = False
             state.election_context["ontology_policy_error"] = type(exc).__name__
             # Last validated position barriers remain in force. Restored legacy
             # positions still cannot exceed the declared engineering loss ceiling.
@@ -3732,6 +3759,16 @@ class StrategySessionManager:
                 "reason_codes": [f"STRATEGY_ENTRY_EVALUATION_ERROR:{type(exc).__name__}"],
                 "diagnostics": {},
             }
+        if self.ontology_policy_resolver is not None and decision.get("triggered"):
+            # A pattern proposes its measured forecast. The ontology authority
+            # applies current costs and reward/risk; an old YAML economic floor
+            # cannot discard the proposal before that single assessment.
+            edge = _optional_float(decision.get("expected_edge_bps"))
+            if edge is not None and math.isfinite(edge):
+                decision["diagnostics"] = {**dict(decision.get("diagnostics") or {}),
+                    "legacy_cost_viable": decision.get("cost_viable"),
+                    "economic_authority": "ONTOLOGY"}
+                decision["cost_viable"] = None
         if record:
             self._record_algorithm_evaluation(symbol, decision)
         return decision
@@ -4739,7 +4776,7 @@ class StrategySessionManager:
         # economics required to survive round-trip costs.  Previously this
         # assessment was written to the UI and then ignored, which allowed an
         # INSUFFICIENT 1.269x DYN proposal to reach the live order path.
-        if (
+        if self.ontology_policy_resolver is None and (
             not coverage.live_eligible
             or coverage.ratio is None
             or coverage.ratio <= 1.0

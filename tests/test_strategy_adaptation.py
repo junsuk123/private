@@ -101,6 +101,90 @@ def test_change_point_increases_uncertainty_without_inventing_positive_history(t
     assert changed.shadow.effective_sample_count == 0
     assert changed.shadow.posterior_net_bps == 0
     assert changed.shadow.lower_net_bps < 0 < changed.shadow.upper_net_bps
+    assert not changed.live_entry_allowed, "A loss of confidence is not recovery evidence"
+    assert changed.performance_state == "SHADOW_ONLY"
+    assert "PERFORMANCE_LOSS_RETAINED_ACROSS_CHANGE_POINT" in changed.reason_codes
+
+
+@pytest.mark.parametrize("source", ["live", "live_probe", "shadow"])
+@pytest.mark.parametrize("probability", [1.0, float("nan"), float("inf")])
+def test_change_point_cannot_reauthorize_a_losing_arm(tmp_path, source, probability):
+    store = _store(tmp_path)
+    _record(store, source=source)
+    result = _assess(store, change_point_probability=probability)
+    assert not result.live_entry_allowed
+    assert result.performance_state == "SHADOW_ONLY"
+
+
+def test_mature_local_timezone_evidence_is_visible_at_same_utc_instant(tmp_path):
+    store = _store(tmp_path)
+    local = timezone(timedelta(hours=9))
+    _record(store, end=NOW.astimezone(local))
+    result = _assess(store)
+    assert result.shadow.sample_count == 16
+    assert not result.live_entry_allowed
+
+
+def test_legacy_mixed_offset_timestamps_order_before_query_limit(tmp_path):
+    import sqlite3
+
+    store = _store(tmp_path)
+    for symbol, net, moment in (
+        ("005930", -100, NOW - timedelta(minutes=1)),
+        ("000660", 100, NOW - timedelta(minutes=2)),
+        ("035420", 999, NOW + timedelta(minutes=1)),
+    ):
+        store.record(strategy_id="intraday_momentum", symbol=symbol, market="KR",
+                     regime="TREND_UP", realized_net_bps=net, recorded_at=moment)
+    # Existing imported rows can predate UTC-normalized writes. A KST older win
+    # sorts after a UTC newer loss lexically; an ET future row sorts before both.
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE strategy_outcomes SET recorded_at=? WHERE symbol='000660'",
+                     ((NOW - timedelta(minutes=2)).astimezone(timezone(timedelta(hours=9))).isoformat(),))
+        conn.execute("UPDATE strategy_outcomes SET recorded_at=? WHERE symbol='035420'",
+                     ((NOW + timedelta(minutes=1)).astimezone(timezone(timedelta(hours=-4))).isoformat(),))
+    rows = store.recent_outcomes("intraday_momentum", as_of=NOW, limit=1)
+    assert len(rows) == 1 and rows[0].symbol == "005930"
+    assert rows[0].realized_net_bps == -100
+
+
+def test_invalid_recorded_time_is_not_replaced_with_current_time(tmp_path):
+    import sqlite3
+
+    store = _store(tmp_path)
+    _record(store, count=1)
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE strategy_outcomes SET recorded_at='not-a-time'")
+    assert store.recent_outcomes("intraday_momentum", as_of=NOW) == ()
+
+
+def test_point_in_time_query_does_not_normalize_entire_old_history(tmp_path, monkeypatch):
+    import sqlite3
+    from app.trading import strategy_performance_store as module
+
+    store = _store(tmp_path)
+    _record(store, count=1)
+    with sqlite3.connect(store.path) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(strategy_outcomes)")]
+        template = list(conn.execute("SELECT * FROM strategy_outcomes LIMIT 1").fetchone())
+        old_rows = []
+        for index in range(5000):
+            row = list(template)
+            row[columns.index("outcome_id")] = f"historical-{index}"
+            row[columns.index("recorded_at")] = (NOW - timedelta(days=200, seconds=index)).isoformat()
+            old_rows.append(row)
+        conn.executemany("INSERT INTO strategy_outcomes VALUES (" + ",".join("?" for _ in columns) + ")", old_rows)
+    original = module._evidence_utc
+    converted = []
+
+    def observed(value):
+        converted.append(value)
+        return original(value)
+
+    monkeypatch.setattr(module, "_evidence_utc", observed)
+    rows = store.recent_outcomes("intraday_momentum", market="KR", regime="TREND_UP", as_of=NOW)
+    assert len(rows) == 1
+    assert len(converted) < 20, "The indexed coarse date range must precede Python UTC normalization"
 
 
 def test_shadow_recovery_requires_fresh_evidence_and_existing_probe_authority(tmp_path):

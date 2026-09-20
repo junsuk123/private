@@ -11068,6 +11068,8 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   from app.trading.strategy_session import StrategySessionManager
   from app.trading.trade_plan_builder import TradePlanBuilder
   from app.trading.ontology_policy_runtime import OntologyPolicyRuntime
+  from app.execution.entry_activity import BotConfirmedEntryActivity
+  from app.audit import log_path
 
   global _ontology_policy_runtime
   store = RealtimeMarketDataStore()
@@ -11087,6 +11089,7 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   account = _live_account_snapshot_for_analysis()
   rules = _live_risk_rules_for_account(account)
   broker_client = KisDevelopersApiClient(paper=False, enabled=True)
+  entry_activity = BotConfirmedEntryActivity(log_path("live-orders.jsonl"))
 
   def _refresh_market_snapshot(symbol: str, market: str, decision_time: datetime) -> MarketSnapshot | None:
     try:
@@ -11098,11 +11101,14 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       store,
       risk_manager=RiskManager(rules, ontology_policy_required=True),
       market_refresher=_refresh_market_snapshot,
+      decision_clock=lambda: datetime.now(timezone.utc),
       ontology_policy_resolver=policy_runtime.resolve,
+      entry_activity_provider=entry_activity,
   )
   _ensure_us_fast_poll_started()
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   strategy_session_manager = StrategySessionManager(
+      entry_activity_provider=entry_activity,
       selection_evidence_provider=_strategy_session_selection_evidence,
       graph_training_context_provider=_graph_policy_contexts.latest,
       plan_builder=TradePlanBuilder(

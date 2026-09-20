@@ -129,6 +129,23 @@ def test_repeated_quote_does_not_count_as_multiple_early_exit_confirmations():
     assert third.diagnostics["exit_reason"] == "ontology_soft_stop"
 
 
+def test_fresh_entry_rejection_still_tightens_owned_position():
+    calm = policy(hard_stop_rate=.02, emergency_stop_rate=.03, maximum_holding_seconds=900)
+    holder = [calm]
+    e = engine(100_000, lambda **_: holder[0])
+    h = position()
+    account = AccountSnapshot(cash=0, holdings=(h,))
+    e.evaluate_exit_for_holding(h, account, decision_time=NOW)
+    holder[0] = replace(calm, policy_id="adverse-market", valid_for_entry=False,
+                        reason_codes=("POLICY_SPREAD_TOO_WIDE",), hard_stop_rate=.005)
+    e.store.tick.price = 99_000
+    result = e.evaluate_exit_for_holding(h, account, decision_time=NOW + timedelta(seconds=1))
+    assert result.approved, result.reason_codes
+    assert result.diagnostics["ontology_policy_current_evidence"]
+    assert result.diagnostics["ontology_risk_policy"]["policy_id"] == "adverse-market"
+    assert result.diagnostics["exit_reason"] == "ontology_hard_stop"
+
+
 def test_frozen_plan_cannot_bypass_missing_current_policy():
     e = engine(100_000, lambda **_: None)
     plan = SimpleNamespace(executable=lambda _: (True, None),
@@ -136,10 +153,10 @@ def test_frozen_plan_cannot_bypass_missing_current_policy():
     result = e._plan_driven_buy(symbol="005930", plan=plan, price=100_000, market_name="KR",
         prediction=None, technical_prediction=None, quote_refresh_status="ok", quote_age_seconds=0,
         spread_bps=1, orderbook=None, decision_time=NOW)
-    assert not result.approved and result.reason_codes == ("ONTOLOGY_ENTRY_POLICY_UNAVAILABLE",)
+    assert not result.approved and result.reason_codes == ("ONTOLOGY_AUTHORITY_RECEIPT_MISSING",)
 
 
-def test_frozen_plan_runs_current_risk_and_cannot_resurrect_rejected_order():
+def test_frozen_plan_cannot_recreate_approval_by_running_risk_again():
     p = policy(position_cap=.15)
     e = engine(10_000, lambda **_: p)
     seen = []
@@ -155,5 +172,80 @@ def test_frozen_plan_runs_current_risk_and_cannot_resurrect_rejected_order():
         prediction=None, technical_prediction=None, quote_refresh_status="ok", quote_age_seconds=0,
         spread_bps=1, orderbook=None, decision_time=NOW, ontology_policy=p,
         account=AccountSnapshot(cash=1_000_000, holdings=()), market=market)
-    assert not result.approved and result.reason_codes == ("current_risk_rejected",)
-    assert seen == [{"ontology_policy": p, "now": NOW}]
+    assert not result.approved and result.reason_codes == ("ONTOLOGY_AUTHORITY_RECEIPT_MISSING",)
+    assert seen == []
+
+
+def _approved_plan():
+    from app.trading.trade_plan_builder import PlanRequest, TradePlanBuilder
+    from app.schemas.domain import MarketSnapshot, SourceMetadata
+    p = policy()
+    market = MarketSnapshot("005930", "KR", "Samsung", "Tech", 10_000., 1e10, .02,
+        SourceMetadata("KIS realtime WebSocket", NOW, observed_at=NOW, source_type="broker_api",
+                       trust_level=5, is_realtime=True, quality_score=1.))
+    account = AccountSnapshot(cash=10_000_000., holdings=())
+    builder = TradePlanBuilder(ontology_policy_resolver=lambda **_: p)
+    outcome = builder.build(PlanRequest(symbol="005930", strategy_id="breakout_volume", market="KR",
+        account=account, market_snapshot=market, reference_price=10_000., take_profit_rate=.04,
+        stop_loss_rate=.01, trailing_rate=.005, max_holding_seconds=900, gross_edge_bps=400,
+        confidence=.9, source_ids=("live-quote",)), now=NOW)
+    assert outcome.plan is not None, outcome.no_trade
+    return outcome.plan, account
+
+
+def test_approved_plan_is_consumed_without_resolver_profitability_sizing_or_risk_recheck(monkeypatch):
+    plan, account = _approved_plan()
+    def forbidden(*_, **__):
+        pytest.fail("A frozen ontology decision must not be economically assessed again")
+    e = engine(10_000, forbidden)
+    e.risk_manager.validate = forbidden
+    e.profitability_gate.evaluate = forbidden
+    e.position_sizer.size = forbidden
+    e.auto_tuner.build_buy_policy = forbidden
+    e.feature_builder.build = forbidden
+    e.predictor.predict = forbidden
+    result = e.evaluate_buy("005930", account, selected_strategy="breakout_volume",
+                            trade_plan=plan, decision_time=NOW)
+    assert result.approved, result.reason_codes
+    assert result.final_order.quantity == plan.quantity
+    assert result.diagnostics["execution_authority"] == "ONTOLOGY"
+    assert result.diagnostics["post_selection_gates"] == []
+    # A partial fill consumes only the unfilled part of the same approval.
+    partial = replace(plan, filled_quantity=1)
+    result = e.evaluate_buy("005930", account, selected_strategy="breakout_volume",
+                            trade_plan=partial, decision_time=NOW)
+    assert result.approved and result.final_order.quantity == plan.quantity - 1
+
+
+def test_expired_ontology_plan_cannot_reach_execution():
+    plan, account = _approved_plan()
+    e = engine(10_000, lambda **_: pytest.fail("Expired plan must return to election"))
+    result = e.evaluate_buy("005930", account, trade_plan=plan,
+                            decision_time=plan.expires_at + timedelta(microseconds=1))
+    assert not result.approved and "PLAN_EXPIRED" in result.reason_codes
+
+
+@pytest.mark.parametrize("trade_count,approved", [(0, True), (100, False), (None, False)])
+def test_unplanned_entry_uses_one_ontology_assessment_with_real_activity(trade_count, approved):
+    p = policy()
+    e = engine(10_000, lambda **_: p)
+    e.entry_activity_provider = lambda market, now: trade_count
+    e.feature_builder.build = lambda *args, **kwargs: None
+    e.predictor.predict = lambda frame: SimpleNamespace(approved=True, expected_net_return_bps=500.,
+                                                        probability_success=.9)
+    e._technical_prediction = lambda *args, **kwargs: None
+    def forbidden(*args, **kwargs):
+        pytest.fail("Ontology entry must not invoke a legacy economic gate")
+    e.profitability_gate.evaluate = forbidden
+    e.position_sizer.size = forbidden
+    e.auto_tuner.build_buy_policy = forbidden
+    original = e.risk_manager.validate
+    calls = []
+    def assess(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+    e.risk_manager.validate = assess
+    result = e.evaluate_buy("005930", AccountSnapshot(cash=1_000_000., holdings=()), decision_time=NOW)
+    assert result.approved is approved, result.reason_codes
+    assert len(calls) == 1 and calls[0]["trades_today"] == trade_count
+    assert result.diagnostics["risk_metadata"]["ontology_risk_authority"]["approved"] is approved

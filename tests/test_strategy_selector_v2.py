@@ -195,6 +195,41 @@ def test_strong_edge_produces_a_selection() -> None:
     assert result.selection_version == SELECTION_VERSION
 
 
+@pytest.mark.parametrize("changes", [
+    {"context_id": "previous-cycle"}, {"symbol": "AAPL"},
+    {"expected_gross_return_bps": float("nan")},
+    {"expected_gross_return_bps": float("inf")},
+    {"expected_cost_bps": -1.0}, {"expected_downside_bps": -1000.0},
+    {"uncertainty_bps": -1000.0}, {"expected_holding_seconds": 0.0},
+    {"probability_profit": 1.5},
+])
+def test_stale_foreign_or_invalid_prediction_cannot_be_selected(changes):
+    class InvalidPredictor(_StubPredictor):
+        def predict(self, *args, **kwargs):
+            return tuple(replace(row, **changes) for row in super().predict(*args, **kwargs))
+
+    result = _selector(utility_predictor=InvalidPredictor(gross_bps=1000)).select(
+        _context(), election_inputs=ELECTION_INPUTS,
+    )
+    assert result.decision == "NO_TRADE"
+    assert result.selected_strategy is None
+    assert result.ranked_candidates
+    assert all(not row.selectable for row in result.ranked_candidates)
+
+
+def test_duplicate_predictions_are_ambiguous_not_last_writer_wins():
+    class DuplicatePredictor(_StubPredictor):
+        def predict(self, *args, **kwargs):
+            rows = super().predict(*args, **kwargs)
+            return rows + tuple(replace(row, expected_gross_return_bps=10000) for row in rows)
+
+    result = _selector(utility_predictor=DuplicatePredictor(gross_bps=1000)).select(
+        _context(), election_inputs=ELECTION_INPUTS,
+    )
+    assert result.decision == "NO_TRADE"
+    assert all(not row.selectable for row in result.ranked_candidates)
+
+
 def test_optimistic_utility_cannot_reinstate_a_demonstrated_losing_strategy(tmp_path) -> None:
     from datetime import timedelta
     from app.trading.strategy_adaptation import StrategyAdaptation

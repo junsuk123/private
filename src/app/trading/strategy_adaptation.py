@@ -154,22 +154,31 @@ class StrategyAdaptation:
         common = dict(now=moment, cfg=cfg, change_point_probability=change_point_probability)
         live = _estimate(live_rows, source="LIVE", **common)
         shadow = _estimate(shadow_rows, source="SHADOW", **common)
+        # A structural-break discount expresses reduced predictive relevance; it
+        # is not evidence that an already demonstrated losing arm recovered.
+        # Preserve that quarantine until fresh matching shadow recovery exists.
+        undiscounted = dict(common, change_point_probability=0.0)
+        live_loss = live.demonstrated_loss or _estimate(live_rows, source="LIVE", **undiscounted).demonstrated_loss
+        shadow_loss = shadow.demonstrated_loss or _estimate(shadow_rows, source="SHADOW", **undiscounted).demonstrated_loss
+        if ((live_loss and not live.demonstrated_loss)
+                or (shadow_loss and not shadow.demonstrated_loss)):
+            reasons.append("PERFORMANCE_LOSS_RETAINED_ACROSS_CHANGE_POINT")
         state, allowed = "ACTIVE" if rows else "COLD", True
         if "STRATEGY_PERFORMANCE_UNAVAILABLE" in reasons:
             state, allowed = "UNAVAILABLE", False
             reasons.append(PERFORMANCE_SHADOW_ONLY)
         if not rows:
             reasons.append("STRATEGY_PERFORMANCE_NO_MATCHING_MATURE_EVIDENCE")
-        if live.demonstrated_loss or shadow.demonstrated_loss:
+        if live_loss or shadow_loss:
             state, allowed = "SHADOW_ONLY", False
             reasons.append(PERFORMANCE_SHADOW_ONLY)
             reasons.extend(
                 code for condition, code in (
-                    (live.demonstrated_loss, "LIVE_NET_EVIDENCE_NEGATIVE"),
-                    (shadow.demonstrated_loss, "SHADOW_NET_EVIDENCE_NEGATIVE"),
+                    (live_loss, "LIVE_NET_EVIDENCE_NEGATIVE"),
+                    (shadow_loss, "SHADOW_NET_EVIDENCE_NEGATIVE"),
                 ) if condition
             )
-        if live.demonstrated_loss and live_rows:
+        if live_loss and live_rows:
             last_live = max(_utc(row.recorded_at) for row in live_rows)
             recovery = _estimate(
                 tuple(row for row in shadow_rows if _utc(row.recorded_at) > last_live

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-from dataclasses import asdict
+import threading
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -32,6 +35,17 @@ from app.trading.contracts import (
     RiskVerdictAction,
 )
 from app.trading.live_runtime_guard import evaluate_live_runtime_gates
+
+
+@dataclass(frozen=True)
+class _AcceptedOrder:
+    order: FinalOrder
+    # None after durable replay: the original ack alone cannot establish what
+    # remains after a restart. A subsequent broker status can resolve it.
+    remaining_quantity: int | None
+    ancestor_order_ids: tuple[str, ...] = ()
+    filled_baseline: int = 0
+    last_filled_quantity: int = 0
 
 
 class LiveExecutionCoordinator:
@@ -74,6 +88,8 @@ class LiveExecutionCoordinator:
         self.orderable_cash_provider = orderable_cash_provider
         self.sellable_quantity_provider = sellable_quantity_provider
         self.cash_equity_only = cash_equity_only
+        self._accepted_orders: OrderedDict[str, _AcceptedOrder] = OrderedDict()
+        self._accepted_orders_lock = threading.RLock()
 
     def submit_final_order(self, order: FinalOrder, *, idempotency_key: str | None = None) -> LiveOrderSubmission:
         self._validate_final_order(order)
@@ -84,6 +100,8 @@ class LiveExecutionCoordinator:
             if existing.payload_hash != payload_hash:
                 raise LiveExecutionBlocked(("IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",))
             result = existing.result
+            self._remember_accepted_order(str(result.get("broker_order_id") or ""), order,
+                                          str(result.get("status") or existing.status), replay=True)
             return LiveOrderSubmission(
                 execution_id=str(result.get("execution_id") or key),
                 idempotency_key=key,
@@ -116,6 +134,8 @@ class LiveExecutionCoordinator:
             if reservation.payload_hash != payload_hash:
                 raise LiveExecutionBlocked(("IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",))
             result = reservation.result
+            self._remember_accepted_order(str(result.get("broker_order_id") or ""), order,
+                                          str(result.get("status") or reservation.status), replay=True)
             return LiveOrderSubmission(
                 execution_id=str(result.get("execution_id") or key),
                 idempotency_key=key,
@@ -164,6 +184,7 @@ class LiveExecutionCoordinator:
 
         broker_order_id = str(getattr(receipt, "order_id", ""))
         status = str(getattr(receipt, "status", "UNKNOWN"))
+        self._remember_accepted_order(broker_order_id, order, status)
         result = {
             "execution_id": execution_id,
             "broker_order_id": broker_order_id,
@@ -263,11 +284,14 @@ class LiveExecutionCoordinator:
             timeout_seconds=self.execution_config.max_order_status_poll_seconds,
         )
         self.journal.record("live_order_status", snapshot)
+        self._record_accepted_order_status(broker_order_id, snapshot)
         return snapshot
 
     def amend_final_order(self, broker_order_id: str, replacement: FinalOrder) -> LiveOrderSubmission:
         self._validate_final_order(replacement)
-        failures = self._preflight_failures()
+        failures = self._preflight_failures() + self._pre_submit_failures(
+            replacement, amending_broker_order_id=str(broker_order_id),
+        )
         if failures:
             self.journal.record(
                 "live_order_amend_blocked",
@@ -282,6 +306,12 @@ class LiveExecutionCoordinator:
         try:
             receipt = self.broker.amend_limit_order(broker_order_id, replacement)
         except Exception as exc:
+            # A timeout may have amended the order at the broker. Its prior
+            # residual is no longer safe to reuse until status reconciliation.
+            with self._accepted_orders_lock:
+                previous = self._accepted_orders.get(str(broker_order_id))
+                if previous is not None:
+                    self._accepted_orders[str(broker_order_id)] = replace(previous, remaining_quantity=None)
             self.journal.record(
                 "live_order_amend_error",
                 {
@@ -293,6 +323,17 @@ class LiveExecutionCoordinator:
             )
             raise
         amended_order_id = str(getattr(receipt, "order_id", "") or broker_order_id)
+        with self._accepted_orders_lock:
+            previous = self._accepted_orders.pop(str(broker_order_id), None)
+        ancestors = tuple(dict.fromkeys((*(previous.ancestor_order_ids if previous else ()), str(broker_order_id))))[-16:]
+        # Some venues retain the original ID and its cumulative fill counter.
+        # In that case only fills after this acknowledgement reduce the revised
+        # residual. A new ID starts its own fill counter.
+        baseline = (previous.last_filled_quantity
+                    if previous is not None and amended_order_id == str(broker_order_id) else 0)
+        self._remember_accepted_order(amended_order_id, replacement,
+                                      str(getattr(receipt, "status", "UNKNOWN")),
+                                      ancestors=ancestors, filled_baseline=baseline)
         self.journal.record(
             "live_order_amended",
             {
@@ -346,6 +387,9 @@ class LiveExecutionCoordinator:
             )
             raise
         canceled_order_id = str(getattr(receipt, "order_id", "") or broker_order_id)
+        with self._accepted_orders_lock:
+            self._accepted_orders.pop(str(broker_order_id), None)
+            self._accepted_orders.pop(canceled_order_id, None)
         self.journal.record(
             "live_order_canceled",
             {
@@ -383,7 +427,9 @@ class LiveExecutionCoordinator:
             failures.extend(f"KIS_HEALTH_{name.upper()}_FAILED" for name in health.failures)
         return failures
 
-    def _pre_submit_failures(self, order: FinalOrder) -> list[str]:
+    def _pre_submit_failures(
+        self, order: FinalOrder, *, amending_broker_order_id: str | None = None,
+    ) -> list[str]:
         """Order-specific re-verification, one step before the broker call.
 
         Separate from :meth:`_preflight_failures` because the two answer different
@@ -397,11 +443,21 @@ class LiveExecutionCoordinator:
         guard = self.execution_guard
         if guard is None:
             return []
+        amendment = {}
+        if amending_broker_order_id is not None:
+            with self._accepted_orders_lock:
+                origin = self._accepted_orders.get(amending_broker_order_id)
+            original_order = (replace(origin.order, quantity=origin.remaining_quantity)
+                              if origin is not None and origin.remaining_quantity is not None else None)
+            amendment = {"amending_broker_order_id": amending_broker_order_id,
+                         "amending_order": self._guard_order(original_order) if original_order else None,
+                         "amending_ancestor_order_ids": origin.ancestor_order_ids if origin else ()}
         decision = guard.evaluate(
             self._guard_order(order),
             plan=self._plan_for(order),
             orderable_cash=self._orderable_cash(order),
             sellable_quantity=self._sellable_quantity(order),
+            **amendment,
         )
         self._last_guard_decision = decision
         if decision.allowed and decision.permitted_quantity < order.quantity:
@@ -415,6 +471,58 @@ class LiveExecutionCoordinator:
             {"order": order, "guard": decision.as_dict()},
         )
         return list(decision.reason_codes)
+
+    def _remember_accepted_order(
+        self, broker_order_id: str, order: FinalOrder, status: str, *, replay: bool = False,
+        ancestors: tuple[str, ...] = (), filled_baseline: int = 0,
+    ) -> None:
+        if not broker_order_id or str(status).upper() not in {"ACCEPTED", "OPEN", "SUBMITTED", "PENDING"}:
+            return
+        with self._accepted_orders_lock:
+            if replay and broker_order_id in self._accepted_orders:
+                return
+            self._accepted_orders[broker_order_id] = _AcceptedOrder(
+                order, None if replay else order.quantity, ancestors, filled_baseline, filled_baseline,
+            )
+            self._accepted_orders.move_to_end(broker_order_id)
+            while len(self._accepted_orders) > 256:
+                self._accepted_orders.popitem(last=False)
+
+    def _record_accepted_order_status(self, broker_order_id: str, snapshot: Any) -> None:
+        with self._accepted_orders_lock:
+            previous = self._accepted_orders.get(str(broker_order_id))
+            if previous is None:
+                return
+            status = str(getattr(snapshot, "status", "UNKNOWN")).upper()
+            raw = getattr(snapshot, "raw", None)
+            matched = (
+                str(getattr(raw, "order_id", "")) == str(broker_order_id)
+                and str(getattr(raw, "ticker", "")).upper() == previous.order.ticker.upper()
+                and str(getattr(getattr(raw, "side", None), "value", getattr(raw, "side", ""))).upper()
+                == str(getattr(previous.order.side, "value", previous.order.side)).upper()
+            )
+            if matched and status in {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                self._accepted_orders.pop(str(broker_order_id), None)
+                return
+            try:
+                filled = float(getattr(raw, "quantity", None))
+                valid = (not isinstance(getattr(raw, "quantity", None), bool)
+                         and math.isfinite(filled) and filled.is_integer()
+                         and filled >= previous.last_filled_quantity
+                         and 0 <= filled - previous.filled_baseline < previous.order.quantity
+                         and (status == "PARTIALLY_FILLED") == (filled > 0)
+                         and matched)
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if status not in {"ACCEPTED", "OPEN", "SUBMITTED", "PENDING", "PARTIALLY_FILLED"} or not valid:
+                self._accepted_orders[str(broker_order_id)] = replace(previous, remaining_quantity=None)
+                return
+            residual = previous.order.quantity - (int(filled) - previous.filled_baseline)
+            if previous.remaining_quantity is not None and residual > previous.remaining_quantity:
+                self._accepted_orders[str(broker_order_id)] = replace(previous, remaining_quantity=None)
+                return
+            self._accepted_orders[str(broker_order_id)] = _AcceptedOrder(previous.order, residual,
+                previous.ancestor_order_ids, previous.filled_baseline, int(filled))
 
     @staticmethod
     def _guard_order(order: FinalOrder) -> GuardOrder:

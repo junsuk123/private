@@ -1,5 +1,10 @@
 """Where cost, size and risk are decided — before the strategy is elected.
 
+With an ontology resolver, one ontology authority assessment binds the current
+policy to the account, integer quantity and final cost at the worst allowed entry
+price. Its receipt is frozen for downstream execution. Independent profitability
+and position-sizing gates below are retained only for legacy callers.
+
 The move this module performs
 -----------------------------
 ``ProfitabilityGate``, ``PositionSizer`` and ``RiskManager`` used to run *after* a strategy
@@ -36,7 +41,7 @@ Exactly one of:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Callable
 
@@ -119,6 +124,9 @@ class PlanRequest:
     instrument_type: str = "EQUITY"
     #: Weight ceiling from the caller's policy, before edge-aware sizing narrows it.
     max_position_weight: float = 0.05
+    #: Confirmed managed entries in this market's local day. None means the
+    #: durable ledger could not establish a count, never an implicit zero.
+    trades_today: int | None = 0
 
 
 @dataclass(frozen=True)
@@ -185,7 +193,7 @@ def _finite(value: Any, default: float = 0.0) -> float:
 
 
 class TradePlanBuilder:
-    """Runs cost, sizing and risk once, before election, and emits a plan or NO_TRADE."""
+    """Freeze one ontology decision, or use the legacy pipeline without a resolver."""
 
     def __init__(
         self,
@@ -220,6 +228,8 @@ class TradePlanBuilder:
                     stage="input",
                 )
             )
+        if self.ontology_policy_resolver is not None:
+            return self._build_ontology_plan(request, moment, price)
 
         # -- 1. cost and net edge ------------------------------------------ #
         decision = self._profitability(request, price)
@@ -449,6 +459,157 @@ class TradePlanBuilder:
         return TradePlanOutcome(plan=plan)
 
     # ------------------------------------------------------------------ #
+    def _build_ontology_plan(self, request: PlanRequest, moment: datetime, price: float) -> TradePlanOutcome:
+        """Generate one policy and consume one ontology authority assessment.
+
+        The approved order is priced at the most expensive allowed LONG entry.
+        A later fill inside the band therefore needs execution checks only.
+        The independent legacy profitability/sizing pipeline is not consulted.
+        """
+        from app.data.market_capabilities import normalize_market_group
+        from app.risk.ontology_thresholds import OntologyRiskPolicy
+
+        def rejected(reason: str, *, stage="ontology_policy", cost=None, risk=None):
+            return TradePlanOutcome(no_trade=NoTradeDecision(
+                request.symbol, request.strategy_id, moment, (reason,), stage,
+                cost_snapshot=cost or {}, risk_snapshot=risk or {},
+            ))
+
+        group = normalize_market_group(request.market)
+        snapshot_group = normalize_market_group(request.market_snapshot.market)
+        if (group is None or group != snapshot_group
+                or request.symbol.upper() != request.market_snapshot.ticker.upper()):
+            return rejected("PLAN_MARKET_SNAPSHOT_SCOPE_MISMATCH", stage="input")
+        if (isinstance(request.trades_today, bool) or not isinstance(request.trades_today, int)
+                or request.trades_today < 0):
+            return rejected("ONTOLOGY_TRADE_COUNT_UNAVAILABLE", stage="ontology_authority")
+        contract = dict(request.order_contract)
+        contract.setdefault("direction", "LONG")
+        contract.setdefault("position_direction", "LONG")
+        contract.setdefault("position_effect", "OPEN")
+        contract.setdefault("execution_product", "CASH")
+        if (str(request.direction).upper() != "LONG"
+                or any(str(contract[key]).upper() != value for key, value in
+                       (("direction", "LONG"), ("position_direction", "LONG"), ("position_effect", "OPEN"), ("execution_product", "CASH")))):
+            return rejected("ONTOLOGY_PLAN_REQUIRES_CASH_LONG", stage="input")
+        contract.update(direction="LONG", position_direction="LONG", position_effect="OPEN", execution_product="CASH")
+        authority_fraction = _finite(request.authority_size_fraction)
+        requested_weight = _finite(request.max_position_weight)
+        gross = _finite(request.gross_edge_bps) / 10000.
+        if authority_fraction <= 0 or requested_weight <= 0:
+            return rejected("AUTHORITY_NOT_ORDERABLE", stage="sizing")
+        expected_exit = price * (1. + gross)
+        preliminary = self.cost_engine.estimate(
+            symbol=request.symbol, market=request.market, venue=request.venue or request.market,
+            instrument_type=request.instrument_type, entry_price=price,
+            expected_exit_price=expected_exit, quantity=1,
+            orderbook_snapshot=request.orderbook_snapshot,
+            average_daily_trading_value=request.market_snapshot.average_daily_trading_value,
+        )
+        try:
+            policy = self.ontology_policy_resolver(
+                symbol=request.symbol, market=request.market, now=moment,
+                all_in_cost_rate=preliminary.total_cost_rate, forecast_gross_bps=request.gross_edge_bps,
+                requested_horizon_seconds=request.max_holding_seconds, account=request.account,
+            )
+            if not (isinstance(policy, OntologyRiskPolicy) and policy.is_current(moment)
+                    and policy.symbol.upper() == request.symbol.upper() and policy.market == group.value):
+                return rejected("ONTOLOGY_POLICY_UNAVAILABLE")
+        except Exception:
+            return rejected("ONTOLOGY_POLICY_UNAVAILABLE")
+        expires = min(moment + timedelta(seconds=max(1., _finite(request.plan_ttl_seconds, 1.))), policy.expires_at)
+        worst_entry = price * (1. + policy.entry_band_rate)
+        plan_id = new_plan_id(request.symbol, moment)
+        snapshot = replace(request.market_snapshot, last_price=worst_entry)
+        source_ids = tuple(dict.fromkeys((*request.source_ids, policy.policy_id, policy.evidence_id)))
+        book = request.orderbook_snapshot
+        if hasattr(book, "as_dict"):
+            book = book.as_dict()
+        intent = OrderIntent(
+            ticker=request.symbol.upper(), market=request.market, action=OrderAction.BUY,
+            suggested_weight=min(1., requested_weight) * min(1., authority_fraction),
+            confidence=max(0., min(1., _finite(request.confidence, DEFAULT_CONFIDENCE))),
+            valid_until=expires, reasoning_summary=(f"ontology_plan:{request.strategy_id}",),
+            supporting_factors=(f"strategy:{request.strategy_id}",), contradicting_factors=(),
+            source_data_ids=source_ids, strategy_family=request.strategy_id,
+            signal_name=f"elected:{request.strategy_id}", expected_exit_price=expected_exit,
+            expected_holding_minutes=max(1, math.ceil(policy.maximum_holding_seconds / 60)),
+            gross_expected_return=(expected_exit / worst_entry - 1.),
+            target_net_return=policy.net_profit_floor_rate, validation_id=plan_id,
+            position_direction="LONG", position_effect="OPEN", execution_product="CASH",
+            strategy_metadata={"elected": True, "strategy_id": request.strategy_id,
+                "orderbook_snapshot": book if isinstance(book, dict) else None,
+                "stop_loss_rate": policy.hard_stop_rate, "ontology_risk_policy": policy.as_dict(),
+                "approval_price_basis": "worst_allowed_entry", "signal_reference_price": price},
+        )
+        risk = self.risk_manager.validate(intent, request.account, snapshot,
+            trades_today=request.trades_today, ontology_policy=policy, now=moment)
+        metadata = dict(risk.metadata or {})
+        receipt = metadata.get("ontology_risk_authority")
+        risk_snapshot = {"approved": bool(risk.approved), "rejection_reasons": list(risk.rejection_reasons),
+                         "ontology_risk_policy": policy.as_dict(), "metadata": metadata,
+                         "entry_activity_scope": "bot_confirmed_entries", "trades_today": request.trades_today,
+                         "authority_size_fraction": authority_fraction,
+                         "sizing_methodology": "ontology_risk_authority"}
+        if isinstance(receipt, Mapping):
+            risk_snapshot["ontology_authority"] = dict(receipt)
+        cost = dict(metadata.get("cost_breakdown") or {})
+        if not risk.approved or risk.final_order is None:
+            return TradePlanOutcome(no_trade=NoTradeDecision(
+                request.symbol, request.strategy_id, moment,
+                tuple(risk.rejection_reasons) or ("ONTOLOGY_AUTHORITY_REJECTED",),
+                "ontology_authority", cost_snapshot=cost, risk_snapshot=risk_snapshot))
+        if not isinstance(receipt, Mapping) or receipt.get("authority_id") != "ontology-risk-authority-v1":
+            return rejected("ONTOLOGY_AUTHORITY_RECEIPT_MISSING", stage="ontology_authority", cost=cost, risk=risk_snapshot)
+        quantity = int(risk.final_order.quantity)
+        all_in = _finite(receipt.get("all_in_cost_rate"), -1.)
+        assessed_price = _finite(cost.get("entry_price"), -1.)
+        try:
+            receipt_expiry = datetime.fromisoformat(str(receipt.get("expires_at")))
+            receipt_valid = (receipt.get("approved") is True
+                and receipt.get("phase") == "entry_assessment"
+                and receipt.get("policy_id") == policy.policy_id
+                and receipt.get("symbol") == request.symbol.upper()
+                and receipt.get("market") == group.value
+                and receipt.get("side") == "BUY"
+                and receipt.get("position_direction") == "LONG"
+                and receipt.get("position_effect") == "OPEN"
+                and receipt.get("execution_product") == "CASH"
+                and _finite(receipt.get("actual_quantity"), -1.) == quantity
+                and assessed_price == _finite(receipt.get("authorized_price"), -1.)
+                and assessed_price <= worst_entry
+                and quantity * assessed_price <= _finite(receipt.get("actual_notional"), -1.)
+                and receipt_expiry.tzinfo is not None and receipt_expiry > moment)
+        except (TypeError, ValueError, OverflowError):
+            receipt_valid = False
+        if quantity <= 0 or all_in < 0 or assessed_price <= 0 or not receipt_valid:
+            return rejected("ONTOLOGY_AUTHORITY_RECEIPT_INVALID", stage="ontology_authority", cost=cost, risk=risk_snapshot)
+        expires = min(expires, receipt_expiry)
+        # These are the authority's final-quantity economics, not a one-share quote.
+        cost.update(all_in_cost_rate=all_in, gross_expected_return=expected_exit / assessed_price - 1.,
+                    net_expected_return=expected_exit / assessed_price - 1. - all_in,
+                    expected_exit_price=expected_exit, quantity=quantity,
+                    policy_version=policy.policy_id, approval_price_basis="worst_allowed_entry",
+                    signal_reference_price=price)
+        try:
+            return TradePlanOutcome(plan=TradePlan(
+                plan_id=plan_id, created_at=moment, expires_at=expires,
+                symbol=request.symbol.upper(), market=request.market, direction="LONG",
+                strategy_id=request.strategy_id, quantity=quantity, max_notional=quantity * assessed_price,
+                entry_rule=EntryRule(request.entry_trigger, min_price=price * (1. - policy.entry_band_rate),
+                    max_price=assessed_price, max_wait_seconds=(expires - moment).total_seconds()),
+                exit_rules=ExitRules(policy.target_return_rate, policy.soft_stop_rate, policy.trailing_stop_rate,
+                    policy.maximum_holding_seconds, request.strategy_exit_trigger),
+                cancel_rule=request.cancel_rule, expected_net_edge_bps=cost["net_expected_return"] * 10000.,
+                cost_snapshot=cost, risk_snapshot=risk_snapshot, source_ids=source_ids,
+                weekday_time_context=dict(request.weekday_time_context), status=TradePlanStatus.ARMED,
+                reference_price=assessed_price, election_context={**dict(request.election_context),
+                    "ontology_risk_policy": policy.as_dict()}, decision_id=request.decision_id,
+                session_id=request.session_id, order_contract=contract,
+            ))
+        except TradePlanError as exc:
+            return rejected(f"PLAN_CONSTRUCTION_FAILED:{exc}", stage="plan", cost=cost, risk=risk_snapshot)
+
     def _profitability(self, request: PlanRequest, price: float, *, ontology_policy: Any = None, now: datetime | None = None):
         gross = max(0.0, _finite(request.gross_edge_bps)) / 10_000.0
         sign = -1.0 if str(request.direction).upper() == "SHORT" else 1.0
