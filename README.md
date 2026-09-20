@@ -25,16 +25,26 @@ OBAITS는 KIS 실시간 데이터, 온톨로지 기반 근거 추론, live featu
 ## 빠른 시작
 
 ```powershell
-# Windows
-.\setup.ps1 -All
-.\run.ps1
+# Windows: run.bat 더블클릭 또는 아래 명령
+.\run.bat
+
+# 설치·서버 시작·주문 없이 실행 환경만 확인
+.\run.bat -CheckOnly
 ```
 
 ```bash
 # Linux + PowerShell 7
-./setup.ps1 -All -CudaWheels cu128
 ./run.ps1
+./run.ps1 -CheckOnly
 ```
+
+일반 실행은 해당 OS의 가상환경과 필수 의존성을 먼저 검사하고, 누락 시 `setup.ps1`을 실행한 뒤 다시 검사합니다. 최초 준비에는 Python 3.11 이상 또는 `uv`, 패키지 다운로드 연결이 필요합니다. 이미 준비된 환경에서는 설치를 반복하지 않습니다. 자동 설치를 생략하려면 `-SkipSetup`, 브라우저 없이 실행하려면 `-Headless`를 사용합니다. 별도 구성은 `setup.ps1`의 옵션으로 지정할 수 있습니다.
+
+다른 PC에서 동기화된 가상환경의 Python 실행 경로가 깨진 경우에는 해당 PC에서 `setup.ps1 -Recreate`로 가상환경을 다시 만든 뒤 실행합니다.
+
+`run.bat`은 PowerShell 7을 우선 사용하고 없으면 Windows PowerShell 5.1로 실행합니다. 실행 위치와 무관하게 프로젝트를 찾으며 한글·공백 경로와 인자를 보존합니다. 시작 시 Python 버전, 실제 감지 장치, 기기별 DB·모델 경로를 표시합니다. Synology 폴더에서 실행할 때 모델, OpenVINO 캐시, 브라우저 프로필과 새 런처 로그는 기기별 로컬 경로를 사용하며, 명시적인 경로 설정은 유지합니다.
+
+일반 실행은 기존 실계좌 운영 설정을 사용합니다. 명시적으로 지정한 `LIVE_ORDER_SUBMIT_ENABLED=false` 또는 `REQUIRE_MANUAL_ARMING=true`를 덮어쓰지 않습니다. 기존 서버의 종료 안전성을 확인할 수 없거나 관리 중인 포지션이 있으면 재시작을 중단합니다. 브라우저를 닫아도 안전한 종료가 거절되면 서버를 유지하고 주소를 표시합니다. 의도적인 강제 복구에만 `-ForceRestart` 또는 `-HardKill`을 사용합니다.
 
 수동 실행:
 

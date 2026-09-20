@@ -4,6 +4,10 @@
 # param().
 param(
   [switch]$Headless,
+  # Offline diagnostics only: no install, server, browser or process shutdown.
+  [switch]$CheckOnly,
+  # Normal launches provision missing base dependencies unless this is supplied.
+  [switch]$SkipSetup,
   # Stop a running server even when it is holding a position. A restart discards
   # the in-memory stop/target/trailing state for an open trade, so this is opt-in.
   [switch]$ForceRestart,
@@ -39,6 +43,13 @@ $ErrorActionPreference = "Stop"
 # three. An undefined variable therefore means 5.1, which only ever runs on
 # Windows.
 $script:OnWindows = if ($null -eq $IsWindows) { $true } else { [bool]$IsWindows }
+Set-Location -LiteralPath $PSScriptRoot
+# PowerShell 5.1 otherwise decodes Python's UTF-8 paths with the console OEM
+# code page. Keep Hangul/space-containing workspace and local-store paths intact.
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 function Get-ProcessTable {
   <#
@@ -184,14 +195,103 @@ function Set-RunEnv($Name, $Value) {
   [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
 }
 
+function Test-WorkspaceCommand {
+  param([string]$Command, [string]$EntryPoint = "run.py")
+  if (-not $Command) { return $false }
+  $tokens = @([regex]::Matches($Command, '"([^"]*)"|''([^'']*)''|(\S+)') | ForEach-Object {
+    $_.Value.Trim('"').Trim("'").Replace('\', '/')
+  })
+  if ($tokens.Count -lt 2) { return $false }
+  $root = ([System.IO.Path]::GetFullPath($PSScriptRoot)).Replace('\', '/').TrimEnd('/')
+  if ($script:OnWindows) {
+    $root = $root.ToLowerInvariant()
+    $tokens = @($tokens | ForEach-Object { $_.ToLowerInvariant() })
+    $EntryPoint = $EntryPoint.ToLowerInvariant()
+  }
+  $entry = "$root/$EntryPoint"
+  $executable = ($tokens[0] -split '/')[-1]
+  if ($EntryPoint -eq "run.ps1") {
+    if ($executable -notmatch '^(powershell|pwsh)(\.exe)?$') { return $false }
+    if ($tokens[1] -eq $entry) { return $true }
+    for ($i = 1; $i -lt $tokens.Count - 1; $i++) {
+      if ($tokens[$i] -ieq '-File') { return $tokens[$i + 1] -eq $entry }
+    }
+    return $false
+  }
+  if ($executable -notmatch '^python([0-9.]+)?(\.exe)?$') { return $false }
+  $argument = 1
+  while ($argument -lt $tokens.Count -and $tokens[$argument] -match '^-(B|u|I|E|s|S|b|bb)$') { $argument++ }
+  if ($argument -ge $tokens.Count) { return $false }
+  if ($tokens[$argument] -eq $entry) { return $true }
+  $ownedPython = $tokens[0].StartsWith("$root/.venv/") -or $tokens[0].StartsWith("$root/.venv-linux/")
+  if ($ownedPython -and $tokens[$argument] -in @($EntryPoint, "./$EntryPoint")) { return $true }
+  if ($tokens[$argument] -eq '-m' -and $argument + 2 -lt $tokens.Count -and
+      $tokens[$argument + 1] -eq 'uvicorn' -and $tokens[$argument + 2] -eq 'app.web:app') {
+    for ($i = $argument + 3; $i -lt $tokens.Count - 1; $i++) {
+      if ($tokens[$i] -eq '--app-dir') { return $tokens[$i + 1].TrimEnd('/') -eq "$root/src" }
+    }
+  }
+  return $false
+}
+
+function Invoke-LauncherPreflight {
+  if (-not (Test-Path -LiteralPath $script:VenvPython -PathType Leaf)) {
+    return [pscustomobject]@{ ok = $false; errors = @("Python environment is missing: $script:VenvPython"); dependency_errors = @("venv"); warnings = @() }
+  }
+  try {
+    $raw = & $script:VenvPython -B (Join-ProjectPath "scripts" "launcher_preflight.py")
+    $code = $LASTEXITCODE
+    $report = ($raw -join "`n") | ConvertFrom-Json
+    if ($code -ne 0 -and $report.ok) { throw "Preflight process failed ($code)." }
+    return $report
+  } catch {
+    return [pscustomobject]@{ ok = $false; errors = @("Cannot run this Python environment. If it was copied from another machine, run setup.ps1 -Recreate to rebuild it."); dependency_errors = @(); warnings = @() }
+  }
+}
+
+function Initialize-Launcher {
+  $report = Invoke-LauncherPreflight
+  if ($CheckOnly) {
+    $report | ConvertTo-Json -Depth 12
+    if ($report.ok) { exit 0 } else { exit 1 }
+  }
+  if (-not $report.ok -and @($report.dependency_errors).Count -gt 0 -and -not $SkipSetup) {
+    Write-Host "Preparing the Python environment and required packages..." -ForegroundColor Cyan
+    $hostExecutable = (Get-Process -Id $PID).Path
+    $setupArguments = @("-NoProfile")
+    if ($script:OnWindows) { $setupArguments += @("-ExecutionPolicy", "Bypass") }
+    $setupArguments += @("-File", (Join-ProjectPath "setup.ps1"))
+    & $hostExecutable @setupArguments
+    if ($LASTEXITCODE -ne 0) { throw "Setup failed. The running application was left untouched." }
+    $report = Invoke-LauncherPreflight
+  }
+  if (-not $report.ok) {
+    foreach ($problem in $report.errors) { Write-Host "  $problem" -ForegroundColor Red }
+    throw "Startup checks failed. Run setup.ps1, then run.ps1 -CheckOnly."
+  }
+  foreach ($item in $report.environment_defaults.PSObject.Properties) {
+    # The Python helper already preserves explicit settings and normalizes their
+    # paths. Do this before any module can bind a mutable default store.
+    Set-RunEnv $item.Name ([string]$item.Value)
+  }
+  Write-Host "Python: $($report.python.version) ($($report.python.executable))"
+  Write-Host "OpenVINO devices: $($report.devices.openvino.available_devices -join ', '); CUDA: $($report.devices.torch.cuda_available)"
+  Write-Host "Runtime store: $env:REALTIME_STORE_ROOT"
+  Write-Host "Graph checkpoint: $env:REFACTOR_GNN_CHECKPOINT"
+  Write-Host "Risk: ontology-risk-v1; strategy: cash long; graph: bounded advisory"
+  foreach ($warning in $report.warnings) { Write-Host "  $warning" -ForegroundColor DarkYellow }
+}
+
 function Get-LocalAppServerListeners {
   $processes = @{}
   foreach ($row in Get-ProcessTable) { $processes[$row.ProcessId] = $row }
+  $configuredPort = [Environment]::GetEnvironmentVariable("APP_PORT", "Process")
+  if (-not $configuredPort) { $configuredPort = "8010" }
 
   $listeners = @()
   $seen = New-Object 'System.Collections.Generic.HashSet[string]'
   foreach ($entry in Get-ListeningEntries) {
-    if ($entry.Port -lt 8000 -or $entry.Port -gt 8050) { continue }
+    if (($entry.Port -lt 8000 -or $entry.Port -gt 8050) -and $entry.Port -ne [int]$configuredPort) { continue }
     if (-not $entry.ProcessId) { continue }
     $process = $processes[$entry.ProcessId]
     if (-not $process -or -not $process.Command) { continue }
@@ -199,8 +299,8 @@ function Get-LocalAppServerListeners {
     # "python " also matches a POSIX "/…/bin/python ./run.py"; "python.exe" is the
     # Windows form. Both interpreters are named in the command line, never inferred.
     $isPython = $command.Contains("python.exe") -or $command.Contains("python ")
-    $isLocalApp = $command.Contains("run.py")
-    if ($isPython -and $isLocalApp) {
+    $isLocalApp = Test-WorkspaceCommand -Command $process.Command -EntryPoint "run.py"
+    if ($isLocalApp) {
       # A dual-stack server answers on both a v4 and a v6 LISTEN row; without this
       # the same pid would be stopped twice and the second attempt would look like
       # a failure.
@@ -218,8 +318,10 @@ function Get-LocalAppServerListeners {
 }
 
 function Test-PortRangeFree {
+  $targetPort = [Environment]::GetEnvironmentVariable("APP_PORT", "Process")
+  if (-not $targetPort) { $targetPort = "8010" }
   $stillListening = Get-ListeningEntries |
-    Where-Object { $_.Port -ge 8000 -and $_.Port -le 8050 }
+    Where-Object { $_.Port -eq [int]$targetPort }
   return (-not $stillListening)
 }
 
@@ -235,7 +337,7 @@ function Stop-LocalAppServerProcessTree {
     if ($parent -and $parent.Command) {
       $parentCommand = $parent.Command.ToLowerInvariant()
       $parentIsPython = $parentCommand.Contains("python.exe") -or $parentCommand.Contains("python ")
-      if ($parentIsPython -and $parentCommand.Contains("run.py")) {
+      if ($parentIsPython -and (Test-WorkspaceCommand -Command $parent.Command -EntryPoint "run.py")) {
         [void]$processIdsToStop.Add([int]$parent.ProcessId)
       }
     }
@@ -280,9 +382,22 @@ function Stop-OrphanedSupervisors {
     -not $ancestors.Contains([int]$_.ProcessId) -and
     $_.Command -and
     ($_.Name -in @("powershell.exe", "pwsh.exe", "powershell", "pwsh")) -and
-    $_.Command -like '*run.ps1*'
+    (Test-WorkspaceCommand -Command $_.Command -EntryPoint "run.ps1")
   }
   foreach ($orphan in $orphans) {
+    # A supervisor for a different, still-running instance is not an orphan.
+    $hasServer = $false
+    foreach ($process in $table) {
+      if (-not (Test-WorkspaceCommand -Command $process.Command -EntryPoint "run.py")) { continue }
+      $parentId = $process.ParentId
+      $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+      while ($parentId -and $visited.Add([int]$parentId)) {
+        if ($parentId -eq $orphan.ProcessId) { $hasServer = $true; break }
+        $parentId = $parentById[$parentId]
+      }
+      if ($hasServer) { break }
+    }
+    if ($hasServer) { continue }
     Write-Host "  Stopping orphaned launcher (PID $($orphan.ProcessId))."
     Stop-Process -Id $orphan.ProcessId -Force -ErrorAction SilentlyContinue
   }
@@ -302,9 +417,15 @@ function Stop-ExistingLocalAppServers {
     only force-kill if it will not go. Force-kill remains available because a hung
     server that cannot answer HTTP must still be replaceable.
   #>
-  Stop-OrphanedSupervisors
   $listeners = Get-LocalAppServerListeners
-  if (-not $listeners) { return $true }
+  if (-not $listeners) {
+    if (-not (Test-PortRangeFree)) {
+      Write-Host "The requested port belongs to another process; no server was stopped or started." -ForegroundColor Yellow
+      return $false
+    }
+    Stop-OrphanedSupervisors
+    return $true
+  }
 
   foreach ($listener in $listeners) {
     # The address it is actually bound to, not an assumed loopback: a previous
@@ -337,9 +458,9 @@ function Stop-ExistingLocalAppServers {
       Write-Host "  Could not read restart safety ($($_.Exception.Message))."
     }
 
-    if ($safetyKnown -and -not $safe -and -not $ForceRestart) {
+    if (-not $safe -and -not $ForceRestart) {
       Write-Host ""
-      Write-Host "ABORTING: the running server is holding managed state." -ForegroundColor Yellow
+      Write-Host "ABORTING: restart safety is negative or could not be verified." -ForegroundColor Yellow
       Write-Host "Restarting now would leave an open position with no stop, target or" -ForegroundColor Yellow
       Write-Host "trailing logic watching it. Choose one:" -ForegroundColor Yellow
       Write-Host "  * flatten first, then rerun .\run.ps1" -ForegroundColor Yellow
@@ -373,20 +494,28 @@ function Stop-ExistingLocalAppServers {
 
     # 3. Force-kill only what refused to leave.
     if (Get-Process -Id $listener.ProcessId -ErrorAction SilentlyContinue) {
-      Write-Host "  Process did not exit in time; terminating it."
+      if (-not $ForceRestart) {
+        Write-Host "  Server did not exit. It was left running; use -ForceRestart only for an intentional forced restart." -ForegroundColor Yellow
+        return $false
+      }
+      Write-Host "  Forced restart requested; terminating the previous server."
       Stop-LocalAppServerProcessTree -Listener $listener
     } else {
       Write-Host "  Previous server stopped cleanly."
     }
   }
 
+  # Only retire old supervisors after their servers have safely stopped. Their
+  # old finally blocks must not run against the replacement server's port.
+  Stop-OrphanedSupervisors
+
   # 4. The port must actually be released before the new server tries to bind.
   for ($attempt = 0; $attempt -lt 40; $attempt++) {
     if (Test-PortRangeFree) { return $true }
     Start-Sleep -Milliseconds 250
   }
-  Write-Host "WARNING: a listener is still bound in 8000-8050 after waiting." -ForegroundColor Yellow
-  return $true
+  Write-Host "The requested port is still occupied; no replacement server was started." -ForegroundColor Yellow
+  return $false
 }
 
 function Stop-ProcessTree {
@@ -411,6 +540,8 @@ function Stop-WorkspaceRunPyProcesses {
   $workspacePath = (Resolve-Path -LiteralPath $PSScriptRoot).Path.ToLowerInvariant()
   $currentProcessId = $PID
   $table = Get-ProcessTable
+  $configuredPort = [Environment]::GetEnvironmentVariable("APP_PORT", "Process")
+  if (-not $configuredPort) { $configuredPort = "8010" }
   foreach ($process in $table) {
     if (-not $process.Command) { continue }
     if ([int]$process.ProcessId -eq [int]$currentProcessId) { continue }
@@ -420,16 +551,21 @@ function Stop-WorkspaceRunPyProcesses {
     # workspace check below is what actually narrows this to our own server.
     if (-not $name.StartsWith("python")) { continue }
     $command = $process.Command.ToLowerInvariant()
-    $isWorkspaceRunPy = $command.Contains("run.py") -and (
-      $command.Contains($workspacePath) -or
-      $command.Contains(".\run.py") -or
-      $command.Contains("./run.py")
-    )
+    $isWorkspaceRunPy = Test-WorkspaceCommand -Command $process.Command -EntryPoint "run.py"
     if ($isWorkspaceRunPy) {
+      if ($command -match '--port[ =]+["'']?(\d+)') {
+        $processPort = [int]$Matches[1]
+        if (($processPort -lt 8000 -or $processPort -gt 8050) -and $processPort -ne [int]$configuredPort) { continue }
+      }
+      if (-not $HardKill) {
+        Write-Host "A workspace server is still starting or unresponsive (PID $($process.ProcessId)); left running. Use -HardKill for deliberate recovery." -ForegroundColor Yellow
+        return $false
+      }
       Write-Host "Stopping existing workspace run.py process (PID $($process.ProcessId))"
       Stop-ProcessTree -RootProcessId ([int]$process.ProcessId) -ProcessTable $table
     }
   }
+  return $true
 }
 
 function Find-BrowserExecutable {
@@ -577,7 +713,7 @@ function Wait-LocalAppReady {
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     if ($ServerProcess.HasExited) {
-      throw "Local app server exited before it became ready. Check logs\run-server.err.log."
+      throw "Local app server exited before it became ready. Check $env:OBAITS_LOG_DIR/run-server.err.log."
     }
     try {
       $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 -Headers (Get-ControlHeaders)
@@ -613,14 +749,7 @@ function Test-ManagedBrowserProfileRunning {
   return [bool]$browserProcesses
 }
 
-if (-not (Stop-ExistingLocalAppServers)) {
-  # The running server is holding managed state and -ForceRestart was not given.
-  # Leaving it alone is the safe outcome, so exit without starting a second one.
-  exit 2
-}
-# Safety net for a run.py that is not (yet) listening — mid-boot or hung — and so
-# was invisible to the graceful path above.
-Stop-WorkspaceRunPyProcesses
+Initialize-Launcher
 
 # PYTHONPATH must CONTAIN src, which is not the same as being unset.
 #
@@ -632,7 +761,7 @@ Stop-WorkspaceRunPyProcesses
 # configured PYTHONPATH working while guaranteeing our own source wins.
 $existingPythonPath = [Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
 $pathSeparator = [System.IO.Path]::PathSeparator
-$pythonPathParts = @("src")
+$pythonPathParts = @((Join-ProjectPath "src"))
 if ($existingPythonPath) {
   foreach ($part in $existingPythonPath.Split($pathSeparator)) {
     if ($part -and $part -ne "src" -and ($pythonPathParts -notcontains $part)) {
@@ -690,39 +819,20 @@ if ($External) {
   Write-Host ""
 }
 Set-DefaultEnv "DATA_ENV" "realtime"
-Set-RunEnv "TRADING_MODE" "live_trading"
-Set-RunEnv "LIVE_TRADING_ENABLED" "true"
-Set-RunEnv "KIS_LIVE_ENABLED" "true"
-Set-RunEnv "KIS_PAPER_TRADING" "false"
-Set-RunEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
+Set-DefaultEnv "TRADING_MODE" "live_trading"
+Set-DefaultEnv "LIVE_TRADING_ENABLED" "true"
+Set-DefaultEnv "KIS_LIVE_ENABLED" "true"
+Set-DefaultEnv "KIS_PAPER_TRADING" "false"
+Set-DefaultEnv "LIVE_ORDER_SUBMIT_ENABLED" "true"
 # Real orders auto-submit with NO manual arming file (operator's explicit choice).
 # To run WITHOUT placing real orders, set this to "true" (then arm via
 # scripts/arm_live_trading.py) or set LIVE_ORDER_SUBMIT_ENABLED "false".
-Set-RunEnv "REQUIRE_MANUAL_ARMING" "false"
-# --- GNN-direct election (operator posture, 2026-08-08) ------------------------------
-# 운영자 결정: GNN 이 고른 전략이 그대로 채택되고 곧바로 실거래로 간다.
-# 이 한 변수가 두 곳을 동시에 바꾼다(플래그 두 개가 어긋나는 상태를 만들지 않으려고
-# 일부러 같은 이름을 쓴다):
-#   * StrategySessionManager — 밴딧의 비관적 하한과 NO_TRADE 선택지를 건너뛰고
-#     GNN 예측 net edge 1등을 그대로 ARM 한다.
-#   * SharedDecisionEngine  — 채택된 전략(strategy_locked)에 한해 ProfitabilityGate 의
-#     거부권을 자문으로 강등한다. 게이트는 계속 돌고 판정도 기록되지만 막지 않는다.
-#     (진단 필드: profitability_gate_bypassed / _overruled_reasons)
-#
-# 켜기 전 실측을 남겨 둔다. 이 posture 가 받아들이는 숫자다:
-#   * GNN 선택의 라이브 전방검증 107건 — positive_net_rate 0.0, 평균 실현 net -62.08bps
-#   * success 헤드 체결 408셀 정확도 61.8% vs 상수 예측기 기준선 84.6%
-#   * counterfactual 16전략 중 14개 net 음수 (KRX intraday_momentum +9.8,
-#     cross_sectional_relative_strength +8.5 만 양수. US 는 전 전략 -33~-66)
-#
-# 그대로 두는 것: RiskManager(주문 자체를 만드는 주체라 우회 대상이 아니다),
-# 숏 SHADOW 사다리, 세션/유동성 판정.
-# 전역 (종목, 전략, 방향) 공동 순위와 NO_TRADE를 사용한다. 종목별 GNN
-# 1등을 먼저 확정하면 최종 밴딧과 다른 목적함수로 전역 우승 조합을 버릴 수 있다.
-Set-RunEnv "STRATEGY_SESSION_GNN_DIRECT_ELECTION" "false"
+Set-DefaultEnv "REQUIRE_MANUAL_ARMING" "false"
+# Strategy proposals own entry selection; learned graph outputs are bounded risk advice.
+Set-DefaultEnv "STRATEGY_SESSION_GNN_DIRECT_ELECTION" "false"
 # Deterministic ontology/strategy policy is the baseline; learned estimates and
 # realised posteriors refine its ranking. Cold live probes are capped at 10%.
-Set-RunEnv "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION" "true"
+Set-DefaultEnv "STRATEGY_SESSION_ALGORITHM_PRIMARY_ELECTION" "true"
 Set-DefaultEnv "BANDIT_EXPLORATION_SIZE_FRACTION" "0.10"
 # Macro regime is a portfolio-level prior, not a per-symbol veto.  A strategy
 # outside the preferred regime may still act when its own complete setup clears
@@ -744,44 +854,18 @@ Set-DefaultEnv "STRATEGY_SESSION_MACRO_MISMATCH_PROBE_SIZE_FRACTION" "0.10"
 # config/refactor_profile.json 의 flags 는 진단·비교 화면의 posture 선언이고, 실제 코드
 # 경로를 여는 것은 이 환경변수다. 둘이 어긋나 있으면 JSON 이 아니라 이 값이 이긴다.
 Set-DefaultEnv "REFACTOR_WEBSOCKET_MARKET_DATA" "true"
+Set-DefaultEnv "REFACTOR_ONTOLOGY_ROUTER" "true"
+Set-DefaultEnv "REFACTOR_GNN_SHADOW" "true"
+Set-DefaultEnv "STRATEGY_SESSION_REQUIRE_LIVE_GNN" "false"
 Set-DefaultEnv "KIS_ACCOUNT_CACHE_SECONDS" "3"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MODE" "true"
 Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EQUITY_KRW" "300000"
-Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_MAX_POSITION_WEIGHT" "0.15"
-# --- Day-trading (단타) exit discipline (2026-07-07) --------------------------------
-# Research-grounded (Van Tharp expectancy/R-multiple; Odean 1998 & Barber-Lee-Liu-Odean
-# on the disposition effect; StockCharts ATR stops; PwC/EY KR 0.20% sell tax). The prior
-# "investment mode" HELD losers (BLOCK_ONE_SHARE_LOSS_REDUCE + no loss exit) until the
-# 3% hard stop — the classic 물림 that let small losses ride to -3%. Day trading requires
-# cutting losses fast and realizing meaningful profits, so:
-#  - allow loss exit + never block a 1-share stop or a below-breakeven stop
-#  - tight net stop ~0.8% (≈0.5% gross) so each loss stays small
-#  - take-profit net 1.4% (quick) / 0.8% (routine); NO tiny won-amount take-profit
-#  - hard stop 2% capital backstop; emergency 5%
-# 2026-07-13: the values below were previously wired the OPPOSITE of this comment
-# (ALLOW_LOSS_EXIT=false, STOP_LOSS_NET=0.0, HARD_STOP=0.03) which disabled every
-# routine stop and let losers ride to the 3% hard stop — the 물림 this block set out
-# to fix. Corrected to match the documented discipline. Ordering: net 0.8% < hard 2%
-# < emergency 5%. Validated by TradingPolicySnapshot.conflicts() (no STOP_LOSS_DISABLED).
-# NOTE: research's top caveat — small-account day trading is structurally negative-
-# expectancy (round-trip cost amplifies losses); this discipline MINIMIZES losses, it
-# does not guarantee profit. Tune from realized PnL.
+# Operating thresholds come from ontology-risk-v1. Engineering ceilings live in
+# config/ontology_risk_policy.yaml; explicit operator overrides can tighten them.
 Set-DefaultEnv "REALTIME_ALLOW_LOSS_EXIT" "true"
-Set-DefaultEnv "REALTIME_HARD_STOP_LOSS" "0.02"
 Set-DefaultEnv "REALTIME_BLOCK_SELL_BELOW_BREAKEVEN" "false"
 Set-DefaultEnv "REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE" "false"
-Set-DefaultEnv "REALTIME_LOSS_EXIT_REDUCE_FRACTION" "0.5"
-Set-DefaultEnv "REALTIME_EMERGENCY_STOP_LOSS" "0.05"
-Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_LIMIT_KRW" "1500"
-Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_KRW" "1000"
-Set-DefaultEnv "REALTIME_DAILY_REALIZED_LOSS_BUY_STOP_RATE" "0.004"
-Set-DefaultEnv "REALTIME_QUICK_TAKE_PROFIT_NET" "0.014"
-Set-DefaultEnv "REALTIME_MIN_NET_PROFIT_EXIT" "0.008"
-Set-DefaultEnv "REALTIME_STOP_LOSS_NET" "0.008"
 Set-DefaultEnv "REALTIME_ENABLE_ROUTINE_LOSS_SELL" "true"
-Set-DefaultEnv "REALTIME_TAKE_PROFIT_AMOUNT_KRW" "0"
-Set-DefaultEnv "REALTIME_PROFIT_LOCK_ARM_NET" "0.012"
-Set-DefaultEnv "REALTIME_PROFIT_LOCK_GIVEBACK" "0.30"
 # Small-account buy tuning synced to the Raspberry Pi node:
 # keep the net-edge floor permissive enough for live fills, widen candidate discovery,
 # and reduce quote delay so the local launcher behaves like the deployed service.
@@ -791,12 +875,7 @@ Set-DefaultEnv "REALTIME_SMALL_ACCOUNT_EXTRA_NET" "0.0"
 Set-DefaultEnv "REALTIME_ONE_SHARE_CASH_BUFFER" "1.03"
 Set-DefaultEnv "REALTIME_FALLBACK_EDGE_BPS_PER_SCORE" "220"
 Set-DefaultEnv "REALTIME_US_EXCLUDE_SYMBOL_SUFFIXES" "U,WS,WT,W,R,P"
-Set-DefaultEnv "REALTIME_LOSS_REENTRY_COOLDOWN_SEC" "7200"
-Set-DefaultEnv "REALTIME_LOSS_REBUY_COOLDOWN_SEC" "86400"
-Set-DefaultEnv "REALTIME_LOSS_REBUY_RETURN_THRESHOLD" "-0.004"
 Set-DefaultEnv "REALTIME_MAX_BUY_ORDERS_PER_CYCLE" "2"
-Set-DefaultEnv "REALTIME_BUY_WEIGHT" "0.4"
-Set-DefaultEnv "REALTIME_TAKE_PROFIT" "0.008"
 # US realtime breadth. Six was leaving most of the account's KIS realtime budget
 # unused and starving the election: measured 2026-08-21, KRX streamed 171 distinct
 # symbols in 24h while the US side saw six, and the candidate filter's 10s/2-tick
@@ -876,24 +955,14 @@ Set-DefaultEnv "REALTIME_VOLUME_SURGE_LIMIT" "16"
 Set-DefaultEnv "REALTIME_US_FEATURE_WARM_LIMIT" "10"
 Set-DefaultEnv "REALTIME_SYMBOL_VOLATILITY_WINDOW_SEC" "300"
 Set-DefaultEnv "REALTIME_MARKET_VOLATILITY_WINDOW_SEC" "300"
-Set-DefaultEnv "REALTIME_MAX_SYMBOL_VOLATILITY_BUY" "0.015"
-Set-DefaultEnv "REALTIME_MAX_MARKET_VOLATILITY_BUY" "0.008"
-Set-DefaultEnv "REALTIME_SYMBOL_VOLATILITY_REFERENCE" "0.006"
-Set-DefaultEnv "REALTIME_MARKET_VOLATILITY_REFERENCE" "0.004"
-Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_TIGHTEN_TRIGGER" "0.005"
-Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_BONUS_MULTIPLIER" "6.0"
-Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_BUY_MAX_BONUS" "0.18"
-Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_ENABLED" "true"
+Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_ENABLED" "false"
 Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_MARGIN" "0.18"
 Set-DefaultEnv "REALTIME_RUNTIME_PROBE_BUY_WEIGHT" "0.003"
-Set-RunEnv "REALTIME_BUY_ENABLED" "true"
-Set-RunEnv "LIVE_TERMINATION_SELL_ONLY_ON_START" "false"
+Set-DefaultEnv "REALTIME_BUY_ENABLED" "true"
+Set-DefaultEnv "LIVE_TERMINATION_SELL_ONLY_ON_START" "false"
 Set-DefaultEnv "REALTIME_IGNORE_SYMBOLS" "LCFYW"
 Set-DefaultEnv "REALTIME_MODEL_AUXILIARY_ONLY" "true"
 Set-DefaultEnv "REALTIME_DOMESTIC_BUY_CORE_SESSION_ONLY" "false"
-Set-DefaultEnv "REALTIME_DOMESTIC_DRAWDOWN_REDUCE_TRIGGER" "0.015"
-Set-DefaultEnv "REALTIME_DOMESTIC_EMERGENCY_EXIT_TRIGGER" "0.03"
-Set-DefaultEnv "REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT" "0.60"
 # --- Compute placement --------------------------------------------------------
 # This block used to pin ONTOLOGY_ACCELERATOR / OPENVINO_DEVICE / LLM_EVENT_DEVICE
 # to "NPU" unconditionally, which was right for exactly one machine: the Intel
@@ -911,32 +980,6 @@ Set-DefaultEnv "REALTIME_DOMESTIC_CONCENTRATION_REDUCE_WEIGHT" "0.60"
 Set-DefaultEnv "REALTIME_LATENCY_PROFILE" "low_latency"
 Set-DefaultEnv "OPENVINO_HINT_PERFORMANCE_MODE" "LATENCY"
 Set-DefaultEnv "OPENVINO_ENABLE_CPU_PINNING" "YES"
-Set-DefaultEnv "OPENVINO_CACHE_DIR" (Join-ProjectPath "data" "runtime" "openvino_cache")
-if ($false) {
-  # The Core Ultra notebook: OpenVINO enumerates NPU (AI Boost) and an Intel iGPU,
-  # and the short-horizon path has been running on the NPU since it was written.
-  Set-DefaultEnv "ONTOLOGY_ACCELERATOR" "NPU"
-  Set-DefaultEnv "OPENVINO_DEVICE" "NPU"
-  Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "openvino"
-  Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
-} elseif ($false) {
-  # The Linux workstation has no NPU. It has an NVIDIA GPU, which OpenVINO cannot
-  # target at all — OpenVINO's "GPU" plugin means the Intel iGPU — so the two
-  # accelerators are reached by two different runtimes and must be configured
-  # separately rather than through one "device" string:
-  #
-  #   * ONTOLOGY_ACCELERATOR / OPENVINO_DEVICE stay UNSET so device_plan places
-  #     each workload on whatever OpenVINO reports here (Intel iGPU if the driver
-  #     is loaded, otherwise CPU). Note that the decision-carrying workloads are
-  #     pinned to CPU in device_plan.py regardless, and that is not relaxed here.
-  #   * LLM_EVENT_* goes to the transformers backend with device "auto", which is
-  #     the path that reaches CUDA: llm_classifier passes device_map="auto" to
-  #     transformers, which places the model on the NVIDIA GPU when torch sees it
-  #     and on CPU when it does not. Asking for "openvino"/"NPU" here would instead
-  #     select a runtime that cannot use this machine's only real accelerator.
-  Set-DefaultEnv "LLM_EVENT_INFERENCE_BACKEND" "transformers"
-  Set-DefaultEnv "LLM_EVENT_DEVICE" "auto"
-}
 # Device selection is not inferred from the operating system. The Python startup
 # probe selects OpenVINO NPU/GPU/CPU and PyTorch CUDA/MPS per workload. Explicit
 # environment variables supplied by the operator still take precedence.
@@ -962,9 +1005,9 @@ if (-not [Environment]::GetEnvironmentVariable("LLM_EVENT_PROVIDER", "Process"))
   if (Test-Path $embeddedModelPath) {
     [Environment]::SetEnvironmentVariable("LLM_EVENT_PROVIDER", "embedded", "Process")
     [Environment]::SetEnvironmentVariable("LLM_EVENT_MODEL", $embeddedModelPath, "Process")
-    Set-DefaultEnv "LLM_EVENT_MODEL_CACHE_DIR" (Join-ProjectPath "models" "local-llm" "cache")
+    Set-DefaultEnv "LLM_EVENT_MODEL_CACHE_DIR" (Join-Path $env:OBAITS_LAUNCHER_RUNTIME_DIR "local-llm-cache")
     Set-DefaultEnv "LLM_EVENT_LOCAL_FILES_ONLY" "true"
-    Set-DefaultEnv "LLM_EVENT_DEVICE" "NPU"
+    Set-DefaultEnv "LLM_EVENT_DEVICE" "auto"
   } else {
     [Environment]::SetEnvironmentVariable("LLM_EVENT_PROVIDER", "local", "Process")
     Set-DefaultEnv "LLM_EVENT_MODEL" "qwen2.5:1.5b-instruct"
@@ -1013,61 +1056,15 @@ Set-DefaultEnv "LIVE_TRAINING_STARTUP_DELAY_SECONDS" "30"
 Set-DefaultEnv "LIVE_MODEL_PROMOTION_MIN_TOP_K_NET_BPS" "1.0"
 Set-DefaultEnv "LIVE_MODEL_MAX_AGE_SECONDS" "86400"
 
-# Temporal GNN fitting is a NumPy/CPU evolutionary job; the NPU/GPU accelerate its
-# inference lanes but cannot shorten this fit. Size the background challenger to
-# the machine instead of copying workstation settings onto a 16GB notebook. User
-# supplied environment values always win, and the same synced code scales back up
-# on the larger GPU workstation.
-$detectedMemoryGb = 0.0
-$detectedLogicalProcessors = [Math]::Max(1, [Environment]::ProcessorCount)
-try {
-  if ($script:OnWindows) {
-    $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-    $detectedMemoryGb = [double]$computer.TotalPhysicalMemory / 1GB
-  } elseif (Test-Path "/proc/meminfo") {
-    $memoryLine = Get-Content -LiteralPath "/proc/meminfo" |
-      Where-Object { $_ -match '^MemTotal:\s+(\d+)\s+kB' } |
-      Select-Object -First 1
-    if ($memoryLine -and $memoryLine -match '^MemTotal:\s+(\d+)\s+kB') {
-      $detectedMemoryGb = [double]$Matches[1] / 1MB
-    }
-  }
-} catch {
-  $detectedMemoryGb = 0.0
-}
-if ($detectedMemoryGb -gt 0 -and $detectedMemoryGb -le 20) {
-  # The trainer's hard minimum is 150 resolved decisions; stay above it so the
-  # constrained profile still performs a real fit instead of always refusing.
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "200"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "2"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "2"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(2, $detectedLogicalProcessors))
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "1800"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "300"
-} elseif ($detectedMemoryGb -gt 0 -and $detectedMemoryGb -le 40) {
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "240"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "4"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "4"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(4, $detectedLogicalProcessors))
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "3600"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "180"
-} else {
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_LIMIT" "400"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_EPOCHS" "8"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_POPULATION" "6"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_THREADS" ([string][Math]::Min(6, $detectedLogicalProcessors))
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_TIMEOUT_SECONDS" "7200"
-  Set-DefaultEnv "TEMPORAL_GNN_TRAINING_STARTUP_DELAY_SECONDS" "90"
-}
-# 투자자별 매매동향(개인/외국인/기관 순매수) 일일 갱신. KIS는 이 값을 영업일 단위로만
-# 제공하고, residual_relative_strength는 이 정보를 필수 조건으로 쓴다. 갱신이 멈추면
-# 저장된 30영업일 창이 밀려나면서 해당 전략이 조용히 평가 불가 상태로 돌아간다.
-# 6시간 주기인 이유: 당일 수치는 장중 계속 변하므로 24시간 주기면 정작 필요한
-# 당일 데이터가 하루 대부분 낡은 상태로 남는다. 읽기 전용 조회만 사용한다.
-# 주말 리서치: KRX 금요일 마감 ~ 월요일 개장 사이에는 양 시장 모두 정지하므로
-# 연산 여유가 있고 방해할 거래도 없다. 이 구간에 거시·이벤트를 집계해 월요일 개장
-# 갭에 대한 "검증 가능한 사전 예측"을 남기고, 개장 후 실제 갭과 대조해 채점한다.
-# 채점하지 않는 주말 분석은 틀린 분석과 구별되지 않는다.
+# The current time-aware R-GCN has bounded replay, epochs and updates.
+# Heavy legacy evolutionary training remains opt-in.
+Set-DefaultEnv "AUTO_TRAIN_TEMPORAL_RGCN" "true"
+Set-DefaultEnv "GNN_TRAIN_INTERVAL_SECONDS" "900"
+Set-DefaultEnv "GNN_MIN_NEW_LABELLED_SNAPSHOTS" "64"
+Set-DefaultEnv "GNN_REPLAY_MAX_SNAPSHOTS_PER_MARKET" "2048"
+Set-DefaultEnv "GNN_TRAINING_EPOCHS" "12"
+Set-DefaultEnv "GNN_TRAINING_MAX_STEPS" "128"
+
 Set-DefaultEnv "AUTO_START_WEEKEND_BRIEF" "true"
 Set-DefaultEnv "WEEKEND_BRIEF_INTERVAL_SECONDS" "3600"
 Set-DefaultEnv "AUTO_START_INVESTOR_FLOW_REFRESH" "true"
@@ -1131,17 +1128,15 @@ Set-DefaultEnv "KIS_US_EXCHANGE_STRICT" "true"
 Set-DefaultEnv "KIS_ALLOW_DEFAULT_US_EXCHANGE_IN_LIVE" "false"
 
 $python = $script:VenvPython
-if (-not (Test-Path $python)) {
-  # No venv for THIS OS. Falling back to a bare interpreter is deliberate — the
-  # project imports fine from any 3.11+ environment — but say which one is missing,
-  # because "python" resolving to a 3.10 system interpreter is the failure this
-  # message exists to shorten (app.schemas.domain uses enum.StrEnum, 3.11+).
-  Write-Host "No virtual environment at $python; falling back to the interpreter on PATH." -ForegroundColor Yellow
-  Write-Host "  Create one with:  ./setup.ps1" -ForegroundColor DarkGray
-  $python = if ($script:OnWindows) { "python" } else { "python3" }
-}
+# Dependency and ontology validation finished before any previous server is touched.
+if (-not (Stop-ExistingLocalAppServers)) { exit 2 }
+if (-not (Stop-WorkspaceRunPyProcesses)) { exit 2 }
 
-$logsDir = Join-ProjectPath "logs"
+$runtimeDir = [Environment]::GetEnvironmentVariable("OBAITS_LAUNCHER_RUNTIME_DIR", "Process")
+Set-DefaultEnv "OBAITS_LOG_DIR" (Join-Path $runtimeDir "logs")
+$logsDir = [Environment]::GetEnvironmentVariable("OBAITS_LOG_DIR", "Process")
+if (-not [System.IO.Path]::IsPathRooted($logsDir)) { $logsDir = Join-Path $PSScriptRoot $logsDir }
+Set-RunEnv "OBAITS_LOG_DIR" $logsDir
 New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
 $serverOutLog = Join-Path $logsDir "run-server.out.log"
 $serverErrLog = Join-Path $logsDir "run-server.err.log"
@@ -1230,8 +1225,8 @@ function Start-PublicReadOnlySite {
     return $null
   }
 
-  $outLog = Join-ProjectPath "logs" "public-proxy.out.log"
-  $errLog = Join-ProjectPath "logs" "public-proxy.err.log"
+  $outLog = Join-Path $logsDir "public-proxy.out.log"
+  $errLog = Join-Path $logsDir "public-proxy.err.log"
   $arguments = @{
     FilePath               = "/usr/bin/env"
     ArgumentList           = @("bash", $script, "--port", "$Port")
@@ -1302,14 +1297,15 @@ function Start-PublicReadOnlySite {
 $browserProfile = $null
 $browserStartedAt = $null
 $publicSite = $null
+$serverLeftRunning = $false
+$launcherExitCode = 0
 
 try {
   $serverArguments = @{
     FilePath               = $python
-    # "run.py" without a leading .\ or ./ : -WorkingDirectory already puts the
-    # process in the project root, and the two prefixes are not interchangeable
-    # across the two shells.
-    ArgumentList           = @("run.py", "--skip-startup-checks", "--port", "$port", "--strict-port")
+    # Absolute, quoted script path identifies this workspace on restart. Python
+    # must not repeat an unconditional process sweep after the checks above.
+    ArgumentList           = @("`"$(Join-ProjectPath "run.py")`"", "--skip-startup-checks", "--keep-existing-servers", "--port", "$port", "--strict-port")
     WorkingDirectory       = $PSScriptRoot
     RedirectStandardOutput = $serverOutLog
     RedirectStandardError  = $serverErrLog
@@ -1378,7 +1374,7 @@ try {
   if ($Headless) {
     Write-Host "Headless mode: server will keep running without a managed browser."
   } elseif ($browserExe) {
-    $browserProfile = Join-ProjectPath "data" "runtime" "managed-browser-profile"
+    $browserProfile = Join-Path $runtimeDir "managed-browser-profile"
     New-Item -ItemType Directory -Force -Path $browserProfile | Out-Null
     $browserStartedAt = Get-Date
     # Chrome writes its own diagnostics to stderr -- a snap GLIBCXX mismatch in
@@ -1386,12 +1382,12 @@ try {
     # quota -- none of which say anything about this application. Inherited, they
     # bury the two lines that matter (the URL and the token) in noise that reads
     # like a failed start. Sent to a log they stay available and stop lying.
-    $browserLog = Join-ProjectPath "logs" "managed-browser.err.log"
+    $browserLog = Join-Path $logsDir "managed-browser.err.log"
     $browser = Start-Process `
       -FilePath $browserExe `
       -ArgumentList @(
         "--app=$launchUrl",
-        "--user-data-dir=$browserProfile",
+        "--user-data-dir=`"$browserProfile`"",
         "--no-first-run",
         "--disable-extensions",
         # Silences the GCM registration attempt (and its QUOTA_EXCEEDED error);
@@ -1412,7 +1408,8 @@ try {
 
   while ($true) {
     if ($server.HasExited) {
-      Write-Host "Server process exited."
+      $launcherExitCode = $server.ExitCode
+      Write-Host "Server process exited (code $launcherExitCode)."
       break
     }
     if ($browserProfile) {
@@ -1432,39 +1429,38 @@ try {
     Stop-ProcessTree -RootProcessId ([int]$browser.Id)
   }
   if ($server -and -not $server.HasExited) {
-    # Our own server gets the same courtesy as one we are replacing: ask it to
-    # unwind its trading engine and feeds before the process dies. This path runs
-    # when the managed browser closes or on Ctrl+C, which is the ordinary way this
-    # server is stopped -- so it must not be the one path that kills it hard.
-    #
-    # force=true here on purpose: the operator has already decided to stop, and a
-    # refusal at this point would leave the process running after "Local app
-    # stopped." was printed, which is worse than an acknowledged unsafe stop.
+    # Closing a dashboard must not abandon a managed position. Request an
+    # ordinary shutdown; explicit force flags remain available for recovery.
+    $forceStop = $ForceRestart -or $HardKill
     try {
-      Invoke-RestMethod -Method Post -Uri "$url/api/system/graceful-shutdown?force=true" -TimeoutSec 20 -Headers (Get-ControlHeaders) | Out-Null
-      $deadline = (Get-Date).AddSeconds(25)
-      while ((Get-Date) -lt $deadline -and -not $server.HasExited) {
-        Start-Sleep -Milliseconds 400
+      $query = if ($forceStop) { "?force=true" } else { "" }
+      $shutdown = Invoke-RestMethod -Method Post -Uri "$url/api/system/graceful-shutdown$query" -TimeoutSec 20 -Headers (Get-ControlHeaders)
+      if ($shutdown.ok) {
+        $deadline = (Get-Date).AddSeconds(25)
+        while ((Get-Date) -lt $deadline -and -not $server.HasExited) {
+          Start-Sleep -Milliseconds 400
+        }
       }
     } catch {
-      Write-Host "Graceful stop request failed ($($_.Exception.Message)); terminating."
+      Write-Host "Graceful stop could not be confirmed."
     }
     if (-not $server.HasExited) {
-      Stop-ProcessTree -RootProcessId ([int]$server.Id)
+      if ($forceStop) {
+        Stop-ProcessTree -RootProcessId ([int]$server.Id)
+      } else {
+        $serverLeftRunning = $true
+        $launcherExitCode = 2
+        Write-Host "Server kept running to preserve managed positions or unverified state: $launchUrl" -ForegroundColor Yellow
+      }
     }
   }
-  if ($publicSite -and -not $publicSite.HasExited) {
+  if (-not $serverLeftRunning -and $publicSite -and -not $publicSite.HasExited) {
     # Stopped with the rest: leaving it up would keep a real portfolio published
     # after "Local app stopped." was printed. Funnel itself stays configured --
     # it is a tailscaled setting, not ours -- so the URL serves 502 until the
     # next launch brings the site back.
     Stop-ProcessTree -RootProcessId ([int]$publicSite.Id)
   }
-  # Whatever is still bound after that is not ours to negotiate with.
-  if (-not (Test-PortRangeFree)) {
-    foreach ($listener in Get-LocalAppServerListeners) {
-      Stop-LocalAppServerProcessTree -Listener $listener
-    }
-  }
-  Write-Host "Local app stopped."
+  if (-not $serverLeftRunning) { Write-Host "Local app stopped." }
 }
+exit $launcherExitCode
