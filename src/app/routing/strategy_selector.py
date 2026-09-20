@@ -61,6 +61,7 @@ from app.strategy.proposal import StrategyProposal
 from app.strategy.proposal_engine import StrategyProposalEngine
 from app.strategy.registry import StrategyRegistry, default_strategy_registry
 from app.strategy.spec import StrategyLifecycleState
+from app.trading.strategy_adaptation import PERFORMANCE_SHADOW_ONLY, StrategyAdaptation
 
 __all__ = [
     "SELECTION_VERSION",
@@ -72,7 +73,7 @@ __all__ = [
 
 #: Stamped onto every result. Bump when the formula or the term set changes, so a stored
 #: selection can be matched to the arithmetic that produced it.
-SELECTION_VERSION = "selector-v2.0.0"
+SELECTION_VERSION = "selector-v2.1.0"
 
 SELECTION_REASON_ENTRY_NOT_READY = "CANDIDATE_ENTRY_NOT_READY"
 SELECTION_REASON_COST_FLOOR_REJECTED = "CANDIDATE_COST_FLOOR_REJECTED"
@@ -151,6 +152,7 @@ class RankedStrategyCandidate:
     reason_codes: tuple[str, ...] = ()
     proposal_id: str = ""
     lifecycle_state: str = ""
+    performance_assessment: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def expected_net_return_bps(self) -> float:
@@ -173,6 +175,7 @@ class RankedStrategyCandidate:
             and self.entry_ready
             and self.cost_viable
             and SELECTION_REASON_LIFECYCLE_NOT_LIVE not in self.reason_codes
+            and PERFORMANCE_SHADOW_ONLY not in self.reason_codes
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -200,6 +203,7 @@ class RankedStrategyCandidate:
             "lifecycle_state": self.lifecycle_state,
             "proposal_id": self.proposal_id,
             "reason_codes": list(self.reason_codes),
+            "performance_assessment": dict(self.performance_assessment),
         }
 
 
@@ -282,6 +286,7 @@ class StrategySelectorV2:
         no_trade_policy: NoTradePolicy | None = None,
         weights: UtilityWeights | None = None,
         bandit_enabled: bool = True,
+        performance_adapter: StrategyAdaptation | None = None,
     ) -> None:
         self._registry = registry or default_strategy_registry()
         self._mask = mask or OntologyStrategyMask(
@@ -294,6 +299,9 @@ class StrategySelectorV2:
         self._no_trade = no_trade_policy or NoTradePolicy()
         self._weights = weights or UtilityWeights()
         self._bandit_enabled = bool(bandit_enabled)
+        self._performance = performance_adapter or StrategyAdaptation(
+            store=getattr(self._bandit, "_store", None)
+        )
 
     # -- public API --------------------------------------------------------- #
     def select(
@@ -367,6 +375,16 @@ class StrategySelectorV2:
         costs = self._costs_for(context, proposals)
         predictions = self._predict(context, proposals, costs, gnn_rows)
         corrections = self._corrections(context, predictions, proposals, evaluated_at)
+        performance = {
+            proposal.strategy_id: self._performance.assess(
+                proposal.strategy_id, market=context.market,
+                regime=context.macro.market_regime, now=evaluated_at,
+                direction=str(proposal.direction),
+                execution_product="CREDIT_BORROW" if proposal.is_short else "CASH",
+                change_point_probability=context.macro.change_point_probability or 0.0,
+            )
+            for proposal in proposals
+        }
 
         candidates = self._rank(
             context=context,
@@ -375,6 +393,7 @@ class StrategySelectorV2:
             costs=costs,
             corrections=corrections,
             eligibility=by_id,
+            performance=performance,
         )
         entry_ready_count = sum(1 for item in candidates if item.entry_ready)
         selectable = tuple(item for item in candidates if item.selectable)
@@ -484,6 +503,7 @@ class StrategySelectorV2:
         costs: Mapping[str, CostEstimate],
         corrections: Mapping[str, BanditCorrection],
         eligibility: Mapping[str, StrategyEligibility],
+        performance: Mapping[str, Any] | None = None,
     ) -> tuple[RankedStrategyCandidate, ...]:
         weights = self._weights
         ranked: list[RankedStrategyCandidate] = []
@@ -493,6 +513,10 @@ class StrategySelectorV2:
             eligible = eligibility.get(strategy_id)
             spec = self._registry.get(strategy_id)
             reasons: list[str] = list(proposal.strategy_reason_codes[:6])
+            assessment = (performance or {}).get(strategy_id)
+            if assessment is not None and not assessment.live_entry_allowed:
+                reasons.append(PERFORMANCE_SHADOW_ONLY)
+                reasons.extend(assessment.reason_codes)
 
             if prediction is None:
                 reasons.append(SELECTION_REASON_NO_PREDICTION)
@@ -570,6 +594,7 @@ class StrategySelectorV2:
                     reason_codes=tuple(dict.fromkeys(reasons)),
                     proposal_id=proposal.proposal_id,
                     lifecycle_state=str(lifecycle),
+                    performance_assessment=assessment.as_dict() if assessment is not None else {},
                 )
             )
         # Highest utility first, then strategy id so the order is stable across cycles

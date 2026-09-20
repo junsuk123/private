@@ -34,6 +34,9 @@ Configuration precedence (highest wins), all resolved values logged once:
 from __future__ import annotations
 
 import logging
+import math
+import copy
+from datetime import datetime, timezone
 import os
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -313,7 +316,42 @@ class ProfitabilityGate:
         except Exception:  # noqa: BLE001 - versioning must never block a decision
             self.policy_version = ""
 
-    def evaluate(self, request: ProfitabilityInput) -> ProfitabilityDecision:
+    def evaluate(self, request: ProfitabilityInput, *, ontology_policy: Any = None, now: datetime | None = None) -> ProfitabilityDecision:
+        if ontology_policy is not None and request.resolved_position_effect == "CLOSE":
+            return self.evaluate(request)  # Exit economics never require entry permission.
+        if ontology_policy is not None:
+            from app.risk.ontology_thresholds import OntologyRiskPolicy
+            from app.data.market_capabilities import normalize_market_group
+            policy = ontology_policy
+            market = normalize_market_group(request.market)
+            moment = now or datetime.now(timezone.utc)
+            if not (
+                isinstance(policy, OntologyRiskPolicy) and policy.valid_for_entry
+                and policy.is_current(moment) and policy.symbol.upper() == request.symbol.upper()
+                and market is not None and market.value == policy.market
+            ):
+                return self._reject(request, request.entry_price, float(request.expected_exit_price or 0.), ["ONTOLOGY_PROFITABILITY_POLICY_INVALID"])
+            required = max(policy.net_profit_floor_rate, policy.soft_stop_rate * policy.minimum_reward_risk)
+            coverage = 1. + required / max(policy.all_in_cost_rate, _EPSILON)
+            local = copy.copy(self)
+            local.policy = replace(self.policy,
+                min_required_net_return={"default": required, "KR": required, "US": required},
+                min_net_profit_buffer_rate=required,
+                max_spread_rate=policy.max_spread_rate,
+                max_slippage_rate=min(self.policy.max_slippage_rate, max(policy.noise_band_rate, policy.all_in_cost_rate * .5)),
+                max_spread_alpha_ratio=min(.5, policy.max_spread_rate / max(policy.all_in_cost_rate + required, _EPSILON)),
+                max_cost_to_alpha_ratio=1. / coverage,
+                min_liquidity_score=.05 + .15 * policy.stress,
+                volatility_buffer_k=0., liquidity_buffer_max=0., small_account_extra_net=0.,
+                min_cost_coverage_ratio=coverage,
+                cost_coverage_thresholds=CostCoverageThresholds(covered=1., live=coverage, comfortable=coverage * (1. + .25 * policy.confidence)),
+            )
+            local.policy_version = policy.policy_id
+            observed = {item["metric"]: item["value"] for item in policy.evidence}
+            request = replace(request, target_net_return=required,
+                spread_rate=observed.get("spread_rate", request.spread_rate),
+                liquidity_score=observed.get("liquidity_score", request.liquidity_score))
+            return local.evaluate(request)
         decision = self._evaluate(request)
         if self.policy_version and not decision.policy_version:
             return replace(decision, policy_version=self.policy_version)
@@ -350,9 +388,9 @@ class ProfitabilityGate:
         flags: list[str] = []
 
         # --- Basic validity ----------------------------------------------------
-        if entry_price <= 0 or quantity <= 0:
+        if not math.isfinite(entry_price) or entry_price <= 0 or quantity <= 0:
             return self._reject(request, entry_price, 0.0, [REASON_INVALID])
-        if expected_exit_price is None or float(expected_exit_price) <= 0:
+        if expected_exit_price is None or not math.isfinite(float(expected_exit_price)) or float(expected_exit_price) <= 0:
             return self._reject(request, entry_price, float(expected_exit_price or 0.0), [REASON_MISSING_EXIT])
         expected_exit_price = float(expected_exit_price)
 

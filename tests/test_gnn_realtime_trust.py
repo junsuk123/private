@@ -55,7 +55,7 @@ def test_tail_reader_continues_across_rotated_journals(tmp_path) -> None:
     assert has_earlier_rows is True
 
 
-def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
+def test_legacy_geometry_tick_calibration_cannot_authorize_dynamic_live_execution(tmp_path) -> None:
     log_path = tmp_path / "shadow.jsonl"
     database = tmp_path / "realtime.sqlite3"
     metadata_path = tmp_path / "model.json"
@@ -133,11 +133,15 @@ def test_forward_live_outcomes_can_authorize_gnn_execution(tmp_path) -> None:
     assert result.mean_realized_net_bps is not None
     assert result.mean_realized_net_bps > 0
     assert result.strategy_sample_counts == {"intraday_momentum": 10}
-    assert result.trusted_strategy_ids == ("intraday_momentum",)
-    assert result.trusted_strategy_markets == {"intraday_momentum": ("KRX",)}
+    assert result.trusted_strategy_ids == ()
+    assert result.trusted_strategy_markets == {}
     assert result.strategy_market_metrics["intraday_momentum"]["KRX"][
         "entry_authorized"
-    ] is True
+    ] is False
+    assert result.strategy_market_metrics["intraday_momentum"]["KRX"]["legacy_geometry_positive_edge_passed"] is True
+    assert "GNN_TRUST_EXECUTION_POLICY_UNVALIDATED" in result.reason_codes
+    assert result.outcome_validation_uses_live_algorithm is False
+    assert result.authority_scope == "legacy_geometry_research_calibration_only"
     assert result.strategy_metrics["intraday_momentum"]["passed"] is True
 
 

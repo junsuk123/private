@@ -30,6 +30,7 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from app.risk.ontology_thresholds import OntologyRiskPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,29 @@ class DynamicExitPolicy:
         liquidity_score: float = 1.0,
         predicted_downside_risk: float = 0.0,
         account_drawdown_rate: float = 0.0,
+        ontology_policy: OntologyRiskPolicy | None = None,
     ) -> ResolvedExitLevels:
+        if ontology_policy is not None:
+            if not isinstance(ontology_policy, OntologyRiskPolicy):
+                raise TypeError("ontology_policy must be OntologyRiskPolicy")
+            p = ontology_policy
+            return ResolvedExitLevels(
+                take_profit_rate=p.target_return_rate,
+                quick_take_profit_net=max(p.net_profit_floor_rate, p.target_return_rate - p.all_in_cost_rate),
+                min_net_profit_exit=p.net_profit_floor_rate,
+                profit_lock_arm_net=p.profit_lock_arm_net,
+                trailing_giveback_rate=p.trailing_giveback,
+                profit_time_exit_sec=p.maximum_holding_seconds,
+                stop_loss_net=p.soft_stop_rate,
+                soft_stop_rate=p.soft_stop_rate,
+                hard_stop_rate=p.hard_stop_rate,
+                emergency_stop_rate=p.emergency_stop_rate,
+                allow_loss_exit=True,
+                block_sell_below_breakeven=False,
+                ontology_sell_dominance=p.ontology_sell_threshold,
+                strong_negative_forecast_bps=p.negative_forecast_bps,
+                noise_band_loss_rate=p.noise_band_rate,
+            )
         cfg = self.config
         vol = max(0.0, float(realized_volatility))
         spread = max(0.0, float(spread_rate))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,12 +26,19 @@ from app.models.strategy_utility.strategy_graph import (
     strategy_relation_adjacency,
     strategy_ids_for_market,
     strategy_market_mask,
+    relation_object_properties,
 )
 from app.routing.shadow_intelligence import (
     COMPATIBILITY_UNAVAILABLE_REASONS,
     STRATEGY_IDS,
 )
 from app.strategy.catalog import is_short_strategy
+from app.models.strategy_utility.temporal_graph import (
+    ARCHITECTURE, TIME_STEPS, CausalGraphHistory, GraphObservation,
+)
+from app.models.strategy_utility.label_contract import (
+    LEGACY_BAR_POLICY, ENTRY_FROZEN_SHADOW_POLICY, BOUNDED_ADVISORY_SCOPE, bounded_advisory_markets,
+)
 
 
 def train_counterfactual_checkpoint(
@@ -40,10 +49,10 @@ def train_counterfactual_checkpoint(
     input_feature_schema: str = "counterfactual_quantiles_v2_session_structure",
     authorize_live_shadow: bool = False,
 ) -> dict[str, object]:
-    """Calibrate strategy heads on causal stored counterfactual labels.
+    """Fit the complete compact temporal R-GCN on causal, bounded replay.
 
-    The graph encoder remains deterministic; strategy and no-trade heads are
-    ridge-fitted. This is a shadow checkpoint, never an authorization to trade.
+    Relation transforms, self transform and all supervised heads are fitted;
+    chronological holdouts are never refitted into the saved checkpoint.
     """
     graph_schema = input_feature_schema in {
         "realtime_strategy_graph_v3",
@@ -76,9 +85,19 @@ def train_counterfactual_checkpoint(
         raise ValueError(
             f"no counterfactual rows with {context_feature_dim} causal features"
         )
+    label_policies = {getattr(row, "label_execution_policy", LEGACY_BAR_POLICY) for row in rows}
+    if len(label_policies) != 1:
+        raise ValueError("mixed execution-policy label contracts cannot train one payoff model")
+    label_policy = next(iter(label_policies))
+    policy_matched = bool(label_policy == ENTRY_FROZEN_SHADOW_POLICY and any(row.outcome_observed for row in rows) and all(
+        (getattr(row, "policy_id", "") and getattr(row, "feature_snapshot_id", ""))
+        for row in rows if row.outcome_observed
+    ))
+    if label_policy == ENTRY_FROZEN_SHADOW_POLICY and not policy_matched:
+        raise ValueError("policy shadow labels require frozen policy and feature provenance")
     config = StrategyUtilityModelConfig(
         batch_size=1,
-        time_steps=1,
+        time_steps=TIME_STEPS if input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA else 1,
         max_nodes=STRATEGY_NODE_COUNT if graph_schema else 1,
         feature_dim=(
             context_feature_dim + STRATEGY_NODE_COUNT
@@ -89,6 +108,7 @@ def train_counterfactual_checkpoint(
         strategy_count=len(STRATEGY_IDS),
         hidden_dim=16,
         seed=17,
+        temporal_mode=1 if input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA else 0,
     )
     strategy_index = {name: index for index, name in enumerate(STRATEGY_IDS)}
     grouped: dict[tuple[str, object], list[int]] = defaultdict(list)
@@ -134,6 +154,7 @@ def train_counterfactual_checkpoint(
             fitted[strategy_id] = len(selected)
         group_positions = [positions[0] for positions in grouped.values()]
         no_trade_targets = []
+        no_trade_masks = []
         for positions in grouped.values():
             attractive = any(
                 rows[position].triggered
@@ -142,15 +163,24 @@ def train_counterfactual_checkpoint(
                 for position in positions
             )
             no_trade_targets.append(-2.0 if attractive else 2.0)
-        model.no_trade_head = _ridge_fit(
+            applicable = set(strategy_ids_for_market(rows[positions[0]].symbol))
+            observed = {rows[position].strategy_id for position in positions if rows[position].outcome_observed}
+            no_trade_masks.append(float(attractive or applicable <= observed))
+        model.no_trade_head = _masked_ridge_fit(
             hidden[group_positions],
             np.asarray(no_trade_targets, dtype=np.float32)[:, None],
+            np.asarray(no_trade_masks, dtype=np.float32)[:, None],
             ridge,
         )[:, 0]
         validation_metrics = {}
         method = "causal_feature_encoder_plus_ridge_calibrated_heads"
-    checkpoint = model.save_checkpoint(output)
-    minimum_rows = 10_000
+    checkpoint = Path(output)
+    trained_keys = set(validation_metrics.pop("_trained_snapshot_keys", ()))
+    supervision_rows = tuple(row for row in rows if row.outcome_observed and (row.symbol, row.as_of) in trained_keys) if graph_schema else tuple(row for row in rows if row.outcome_observed)
+    # Missing alternatives are no longer counted as observed training rows.
+    # The bounded advisory source still needs 1000 separate training snapshots,
+    # each with at least one actual completed walk, plus held-out market gates.
+    minimum_rows = 1_000 if policy_matched else 10_000
     minimum_snapshots = 1_000
     # ``fitted`` counts SNAPSHOTS the strategy appeared in, which for the graph
     # path is every snapshot — 1,615 for all 16 ids, including the 6 whose
@@ -159,7 +189,7 @@ def train_counterfactual_checkpoint(
     # Coverage has to be measured on realized outcomes, and specifically on the
     # UPSIDE ones, because those are the only rows that teach the model what a
     # profitable setup looks like (see ``_strategy_supervision``).
-    supervision = _strategy_supervision(rows)
+    supervision = _strategy_supervision(supervision_rows)
     supervised_strategy_ids = tuple(
         strategy_id
         for strategy_id in STRATEGY_IDS
@@ -173,38 +203,64 @@ def train_counterfactual_checkpoint(
     skill_verdict = _skill_verdict(validation_metrics)
     base_authorization_ready = bool(
         authorize_live_shadow
+        and policy_matched
         and input_feature_schema == STRATEGY_GRAPH_CONTEXT_SCHEMA
-        and len(rows) >= minimum_rows
-        and len(grouped) >= minimum_snapshots
+        and len(supervision_rows) >= minimum_rows
+        and len({(row.symbol, row.as_of) for row in supervision_rows}) >= minimum_snapshots
         and strategy_coverage
     )
-    market_authorization_checks, live_authorized_markets = (
+    market_authorization_checks, advisory_authorized_markets = (
         _market_authorization_verdicts(
             validation_metrics,
             base_ready=base_authorization_ready,
         )
     )
-    # Backward-compatible aggregate for older consumers. Current order routing
-    # reads ``live_authorized_markets`` and cannot cross-authorize KR and US.
-    live_shadow_authorized = bool(live_authorized_markets)
+    market_authorization_checks = {market: {
+        **checks, "bounded_advisory_authorized": checks["live_authorized"], "live_authorized": False,
+    } for market, checks in market_authorization_checks.items()}
+    # Frozen-entry shadow walks do not validate dynamic live exits. Their
+    # independently validated downside/uncertainty may only tighten risk.
+    live_authorized_markets = []
+    live_shadow_authorized = False
+    # Never replace a validated incumbent with a failing candidate or remove a
+    # market authorization while adding the other market. Candidate artifacts
+    # remain reviewable and can gather separate shadow evidence.
+    incumbent_markets = set()
+    incumbent_policy_matched = False
+    if checkpoint.exists():
+        try:
+            old_report = json.loads(checkpoint.with_suffix(".json").read_text(encoding="utf-8"))
+            if old_report.get("checkpoint_hash") == _checkpoint_hash(checkpoint):
+                incumbent_markets = set(bounded_advisory_markets(old_report))
+                incumbent_policy_matched = (old_report.get("label_execution_policy") == ENTRY_FROZEN_SHADOW_POLICY
+                                           and old_report.get("label_policy_provenance_matched") is True)
+        except (OSError, ValueError, TypeError):
+            pass
+    retained_incumbent = bool(incumbent_markets - set(advisory_authorized_markets)
+                             or (incumbent_policy_matched and not policy_matched))
+    if retained_incumbent:
+        checkpoint = checkpoint.with_name(checkpoint.stem + ".candidate.npz")
+    checkpoint = model.save_checkpoint(checkpoint)
     report = {
         "checkpoint": str(checkpoint),
+        "retained_incumbent": retained_incumbent,
+        "training_supervision_rows": len(supervision_rows),
         "rows": len(rows),
         "snapshots": len(grouped),
         "strategies": fitted,
-        "label_outcomes": _label_outcome_summary(rows),
+        "label_outcomes": _label_outcome_summary(supervision_rows),
         "label_outcomes_by_market": {
             "KRX": _label_outcome_summary(
                 tuple(
                     row
-                    for row in rows
+                    for row in supervision_rows
                     if row.symbol.isdigit() and len(row.symbol) == 6
                 )
             ),
             "US": _label_outcome_summary(
                 tuple(
                     row
-                    for row in rows
+                    for row in supervision_rows
                     if not (row.symbol.isdigit() and len(row.symbol) == 6)
                 )
             ),
@@ -235,11 +291,18 @@ def train_counterfactual_checkpoint(
             ),
         ],
         "relation_names": list(RELATION_NAMES) if graph_schema else ["context"],
+        "relation_object_properties": list(relation_object_properties()) if graph_schema else [],
         "training_data_range": {
             "start": min((row.as_of.isoformat() for row in rows), default=None),
             "end": max((row.label_end.isoformat() for row in rows), default=None),
         },
         "training_method": method,
+        "label_execution_policy": label_policy,
+        "label_policy_provenance_matched": policy_matched,
+        "payoff_semantics": "entry_frozen_shadow_net_after_cost" if policy_matched else "historical_strategy_geometry_counterfactual_net_after_cost",
+        "dynamic_live_payoff_validated": False,
+        "architecture": ARCHITECTURE if config.temporal_mode else "rgcn_v1",
+        "temporal_contract": "three_causal_minute_observations_elapsed_time_decay" if config.temporal_mode else "legacy_single_snapshot",
         "validation_metrics": validation_metrics,
         "checkpoint_hash": _checkpoint_hash(checkpoint),
         "input_feature_schema": input_feature_schema,
@@ -257,14 +320,17 @@ def train_counterfactual_checkpoint(
         ),
         "live_authorized": live_shadow_authorized,
         "live_authorized_markets": live_authorized_markets,
-        "authorization_scope": "ontology_gnn_realtime_trust_gated_execution",
+        "bounded_advisory_authorized_markets": advisory_authorized_markets,
+        "authorization_scope": BOUNDED_ADVISORY_SCOPE if policy_matched else "research_shadow_only",
         "authorization_checks": {
             "requested": bool(authorize_live_shadow),
+            "label_policy_provenance_matched": policy_matched,
+            "dynamic_live_execution_authority": False,
             "minimum_rows": minimum_rows,
             "minimum_snapshots": minimum_snapshots,
             "strategy_minimum_upside_rows": _MINIMUM_UPSIDE_SUPERVISION_ROWS,
-            "row_count_ok": len(rows) >= minimum_rows,
-            "snapshot_count_ok": len(grouped) >= minimum_snapshots,
+            "row_count_ok": len(supervision_rows) >= minimum_rows,
+            "snapshot_count_ok": len({(row.symbol, row.as_of) for row in supervision_rows}) >= minimum_snapshots,
             "strategy_coverage_ok": strategy_coverage,
             "strategy_coverage_basis": "upside_supervision_rows_per_strategy",
             # The runtime schema is whatever the contract module currently
@@ -403,6 +469,7 @@ def _label_outcome_summary(
             "simulated_filled": len(simulated_filled),
             "filled": len(filled),
             "positive_net": len(positive),
+            "negative_net": len(negative),
             "positive_net_rate_when_filled": (
                 len(positive) / len(filled) if filled else None
             ),
@@ -589,6 +656,7 @@ class _Snapshot:
     attractive: bool
     nets: np.ndarray
     filled: np.ndarray
+    no_trade_observed: bool = True
 
 
 def _market_purged_split(
@@ -623,16 +691,20 @@ def _market_purged_split(
         market_validation = market_rows[split:]
         boundary = market_validation[0].as_of
         market_train = [
-            item for item in market_rows[:split] if item.label_end <= boundary
+            item for item in market_rows[:split] if item.label_end + timedelta(seconds=60) < boundary
         ]
         purged += split - len(market_train)
-        if not market_train:
-            market_train = market_rows[:split]
-            purged -= split
         train.extend(market_train)
         validation.extend(market_validation)
     train.sort(key=lambda item: item.as_of)
     validation.sort(key=lambda item: item.as_of)
+    if validation:
+        # All markets share learned parameters. A later US training label must
+        # not teach the encoder while an earlier KR window is called holdout.
+        boundary = validation[0].as_of
+        shared_causal_train = [item for item in train if item.label_end + timedelta(seconds=60) < boundary]
+        purged += len(train) - len(shared_causal_train)
+        train = shared_causal_train
     return train, validation, max(0, purged)
 
 
@@ -782,16 +854,23 @@ def _fit_strategy_relation_graph(
     dict[str, float | int],
 ]:
     strategy_index = {name: index for index, name in enumerate(STRATEGY_IDS)}
-    snapshots: list[
-        tuple[object, np.ndarray, np.ndarray, np.ndarray, bool]
-    ] = []
+    snapshots: list[_Snapshot] = []
     fitted = {strategy_id: 0 for strategy_id in STRATEGY_IDS}
     for (symbol, _key_as_of), positions in grouped.items():
         by_strategy = {rows[position].strategy_id: rows[position] for position in positions}
         if any(strategy_id not in by_strategy for strategy_id in STRATEGY_IDS):
             continue
         ordered = [by_strategy[strategy_id] for strategy_id in STRATEGY_IDS]
+        now = datetime.now(timezone.utc)
+        if any(row.as_of.tzinfo is None or row.label_end.tzinfo is None
+               or row.label_end < row.as_of or row.label_end > now
+               or not np.isfinite(row.features).all()
+               or not np.isfinite([row.net_return_bps, row.cost_bps, row.mae_bps, row.mfe_bps, row.holding_seconds]).all()
+               or row.cost_bps < 0 for row in ordered):
+            continue
         context = np.asarray(ordered[0].features, dtype=np.float32)
+        if any(not np.array_equal(np.asarray(row.features, dtype=np.float32), context) for row in ordered):
+            continue
         targets = np.asarray([_raw_target(row) for row in ordered], dtype=np.float32)
         target_masks = np.asarray(
             [_target_mask(row) for row in ordered],
@@ -815,6 +894,8 @@ def _fit_strategy_relation_graph(
                 targets=targets,
                 target_masks=target_masks,
                 attractive=attractive,
+                no_trade_observed=attractive or all(row.outcome_observed for row in ordered
+                                                   if row.strategy_id in market_strategy_ids),
                 # Carried so validation can measure SELECTION quality, which
                 # needs the realised P&L and the symbol each row came from.
                 nets=np.asarray(
@@ -833,9 +914,21 @@ def _fit_strategy_relation_graph(
             fitted[strategy_id] += 1
     if len(snapshots) < 2:
         raise ValueError("strategy relation graph requires complete multi-strategy snapshots")
+    # Bound training independently per market; a newer US tape cannot evict KR.
+    replay_limit = _bounded_env_int("GNN_REPLAY_MAX_SNAPSHOTS_PER_MARKET", 2048, 64, 4096)
+    snapshots = sorted(snapshots, key=lambda item: item.as_of)
+    kr = [item for item in snapshots if item.symbol.isdigit() and len(item.symbol) == 6][-replay_limit:]
+    us = [item for item in snapshots if not (item.symbol.isdigit() and len(item.symbol) == 6)][-replay_limit:]
+    snapshots = sorted((*kr, *us), key=lambda item: item.as_of)
+    temporal_inputs = {}
+    if config.temporal_mode:
+        history = CausalGraphHistory(max_symbols=max(1, len({item.symbol for item in snapshots})))
+        for item in snapshots:
+            temporal_inputs[(item.symbol, item.as_of)] = history.inputs(
+                GraphObservation(item.symbol, item.as_of, tuple(item.context)))
     train, validation, purged_rows = _market_purged_split(snapshots)
-    if not validation:
-        raise ValueError("strategy relation graph requires a validation market")
+    if not validation or not train:
+        raise ValueError("strategy relation graph requires non-overlapping purged train and validation")
     train_context = np.asarray([item.context for item in train], dtype=np.float32)
     train_x = np.concatenate(
         (
@@ -860,26 +953,8 @@ def _fit_strategy_relation_graph(
     train_x *= train_market_mask[:, :, None]
     train_target_mask *= train_market_mask[:, :, None]
     train_loss_weight = np.ones_like(train_y, dtype=np.float32)
-    # Profitable post-cost outcomes are intentionally rare.  Without
-    # class-balanced weighting the success head minimizes loss by predicting
-    # NO_TRADE for every snapshot, which looks accurate but cannot rank the
-    # rare usable edges.  Balance only the success classification head; P&L
-    # regression remains trained on realized fills through target_mask.
-    for strategy_position in range(STRATEGY_NODE_COUNT):
-        observed = train_target_mask[:, strategy_position, 0] > 0.0
-        positive = observed & (train_y[:, strategy_position, 0] > 0.0)
-        negative = observed & ~positive
-        positive_count = int(positive.sum())
-        negative_count = int(negative.sum())
-        if positive_count and negative_count:
-            total = positive_count + negative_count
-            train_loss_weight[positive, strategy_position, 0] = min(
-                20.0,
-                total / (2.0 * positive_count),
-            )
-            train_loss_weight[negative, strategy_position, 0] = (
-                total / (2.0 * negative_count)
-            )
+    # Unweighted Bernoulli loss keeps success probabilities on the observed
+    # class prior. Class balancing improved ranking while overstating cash edge.
     krx_flag = _krx_flag_index(train_context.shape[1])
     train_is_krx = train_context[:, krx_flag] >= 0.5
     krx_count = int(train_is_krx.sum())
@@ -896,11 +971,20 @@ def _fit_strategy_relation_graph(
         [strategy_relation_adjacency(market=item.symbol) for item in train],
         dtype=np.float32,
     )
+    if config.temporal_mode:
+        train_x = np.asarray([temporal_inputs[(item.symbol, item.as_of)][0] for item in train])
+        train_adjacency = np.asarray([temporal_inputs[(item.symbol, item.as_of)][1] for item in train])
+        train_temporal_mask = np.asarray([temporal_inputs[(item.symbol, item.as_of)][2] for item in train])
+    else:
+        train_x = train_x[:, None]
+        train_adjacency = train_adjacency[:, None]
+        train_temporal_mask = train_market_mask[:, None]
     model = FixedShapeStrategyUtilityModel(config)
     initial_relations = model.relation_weights.copy()
     learning_rate = 0.003
-    epochs = 40
-    batch_size = 256
+    epochs = _bounded_env_int("GNN_TRAINING_EPOCHS", 12, 1, 40)
+    maximum_steps = _bounded_env_int("GNN_TRAINING_MAX_STEPS", 128, 1, 256)
+    batch_size = 128
     parameters = {
         "relation_weights": model.relation_weights,
         "self_weight": model.self_weight,
@@ -913,27 +997,21 @@ def _fit_strategy_relation_graph(
     for _ in range(epochs):
         order = rng.permutation(len(train_x))
         for start in range(0, len(order), batch_size):
+            if step >= maximum_steps:
+                break
             indexes = order[start : start + batch_size]
             x = train_x[indexes]
             target = train_y[indexes]
             target_mask = train_target_mask[indexes]
             loss_weight = train_loss_weight[indexes]
             adjacency = train_adjacency[indexes]
-            messages = np.einsum("brij,bjf->brif", adjacency, x, optimize=True)
-            relational = np.einsum(
-                "brnf,rfh->bnh",
-                messages,
-                model.relation_weights,
-                optimize=True,
-            )
-            self_part = np.einsum(
-                "bnf,fh->bnh",
-                x,
-                model.self_weight,
-                optimize=True,
-            )
+            time_mask = train_temporal_mask[indexes]
+            messages = np.einsum("btrij,btjf->btrif", adjacency, x, optimize=True)
+            relational = np.einsum("btrnf,rfh->btnh", messages, model.relation_weights, optimize=True)
+            self_part = np.einsum("btnf,fh->btnh", x, model.self_weight, optimize=True)
             pre_activation = relational + self_part
-            hidden = np.maximum(pre_activation, 0.0)
+            hidden_by_time = np.maximum(pre_activation, 0.0)
+            hidden = np.einsum("t,btn,btnh->bnh", model.temporal_weights, time_mask, hidden_by_time, optimize=True)
             prediction = np.einsum(
                 "bnh,nhk->bnk",
                 hidden,
@@ -947,6 +1025,9 @@ def _fit_strategy_relation_graph(
                 * loss_weight
                 / max(1.0, float(target_mask.sum()))
             )
+            probability = 1.0 / (1.0 + np.exp(-np.clip(prediction[..., 0], -30, 30)))
+            gradient_prediction[..., 0] = ((probability - (target[..., 0] > 0))
+                                          * target_mask[..., 0] / max(1.0, float(target_mask[..., 0].sum())))
             gradient_prediction *= sample_weights[indexes, None, None]
             gradients = {
                 "strategy_heads": np.einsum(
@@ -962,19 +1043,10 @@ def _fit_strategy_relation_graph(
                 model.strategy_heads,
                 optimize=True,
             )
-            gradient_pre = gradient_hidden * (pre_activation > 0)
-            gradients["self_weight"] = np.einsum(
-                "bnf,bnh->fh",
-                x,
-                gradient_pre,
-                optimize=True,
-            )
-            gradients["relation_weights"] = np.einsum(
-                "brnf,bnh->rfh",
-                messages,
-                gradient_pre,
-                optimize=True,
-            )
+            gradient_pre = (gradient_hidden[:, None] * time_mask[..., None]
+                            * model.temporal_weights[None, :, None, None] * (pre_activation > 0))
+            gradients["self_weight"] = np.einsum("btnf,btnh->fh", x, gradient_pre, optimize=True)
+            gradients["relation_weights"] = np.einsum("btrnf,btnh->rfh", messages, gradient_pre, optimize=True)
             step += 1
             for name, parameter in parameters.items():
                 gradient = gradients[name] + float(ridge) * 1e-5 * parameter
@@ -993,7 +1065,7 @@ def _fit_strategy_relation_graph(
                     / (np.sqrt(corrected_second) + 1e-8)
                 )
 
-    full_hidden = _graph_hidden(model, train_x, train_adjacency)
+    full_hidden = _temporal_graph_hidden(model, train_x, train_adjacency, train_temporal_mask)
     no_trade_targets = np.repeat(
         np.asarray(
             [-2.0 if item.attractive else 2.0 for item in train],
@@ -1001,9 +1073,11 @@ def _fit_strategy_relation_graph(
         ),
         STRATEGY_NODE_COUNT,
     )
-    model.no_trade_head = _ridge_fit(
+    no_trade_mask = np.repeat(np.asarray([item.no_trade_observed for item in train], dtype=np.float32), STRATEGY_NODE_COUNT)
+    model.no_trade_head = _masked_ridge_fit(
         full_hidden.reshape(-1, config.hidden_dim),
         no_trade_targets[:, None],
+        no_trade_mask[:, None],
         ridge,
     )[:, 0]
 
@@ -1038,7 +1112,15 @@ def _fit_strategy_relation_graph(
         [strategy_relation_adjacency(market=item.symbol) for item in validation],
         dtype=np.float32,
     )
-    validation_hidden = _graph_hidden(model, validation_x, validation_adjacency)
+    if config.temporal_mode:
+        validation_x = np.asarray([temporal_inputs[(item.symbol, item.as_of)][0] for item in validation])
+        validation_adjacency = np.asarray([temporal_inputs[(item.symbol, item.as_of)][1] for item in validation])
+        validation_temporal_mask = np.asarray([temporal_inputs[(item.symbol, item.as_of)][2] for item in validation])
+    else:
+        validation_x = validation_x[:, None]
+        validation_adjacency = validation_adjacency[:, None]
+        validation_temporal_mask = validation_market_mask[:, None]
+    validation_hidden = _temporal_graph_hidden(model, validation_x, validation_adjacency, validation_temporal_mask)
     validation_prediction = np.einsum(
         "bnh,nhk->bnk",
         validation_hidden,
@@ -1131,6 +1213,7 @@ def _fit_strategy_relation_graph(
         return {f"{prefix}_{key}": value for key, value in values.items()}
 
     return model, fitted, {
+        "_trained_snapshot_keys": [(item.symbol, item.as_of) for item in train],
         "train_snapshots": len(train),
         "validation_snapshots": len(validation),
         "krx_train_snapshots": sum(
@@ -1172,7 +1255,25 @@ def _fit_strategy_relation_graph(
             np.linalg.norm(model.relation_weights - initial_relations)
         ),
         "epochs": epochs,
+        "gradient_steps": step,
+        "maximum_gradient_steps": maximum_steps,
+        "replay_snapshots": len(snapshots),
+        "time_steps": config.time_steps,
     }
+
+
+def _bounded_env_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        return min(high, max(low, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _temporal_graph_hidden(model, x, adjacency, masks):
+    messages = np.einsum("btrij,btjf->btrif", adjacency, x, optimize=True)
+    pre = (np.einsum("btrnf,rfh->btnh", messages, model.relation_weights, optimize=True)
+           + np.einsum("btnf,fh->btnh", x, model.self_weight, optimize=True))
+    return np.einsum("t,btn,btnh->bnh", model.temporal_weights, masks, np.maximum(pre, 0.0), optimize=True)
 
 
 def _graph_hidden(
@@ -1284,10 +1385,9 @@ def _raw_target(row: CounterfactualLabel) -> tuple[float, ...]:
 
 def _target_mask(row: CounterfactualLabel) -> tuple[float, ...]:
     if not row.outcome_observed:
-        # Trigger reachability and epistemic uncertainty are known at decision
-        # time. Payoff, fill, cost and borrow outcomes are not, so they must not
-        # receive a gradient from a censored future window.
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        # A missing arm or unfinished walk is neither a failed fill nor evidence
+        # of uncertainty. Keep the graph node, but supervise no output channel.
+        return (0.0,) * 11
     realized = 1.0 if row.triggered and row.filled else 0.0
     positive = 1.0 if realized and row.net_return_bps > 0.0 else 0.0
     negative = 1.0 if realized and row.net_return_bps <= 0.0 else 0.0

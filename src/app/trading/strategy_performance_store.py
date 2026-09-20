@@ -55,7 +55,7 @@ NO_TRADE_ARM = "no_trade"
 
 # v2 added directional columns. v3 versions the algorithm and payoff evaluator so
 # corrected geometry cannot be promoted on outcomes produced by older semantics.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 LEGACY_EVIDENCE_VERSION = "legacy"
 CURRENT_EVALUATION_VERSION = "net-payoff-v2"
 
@@ -90,7 +90,7 @@ def _env_int(name: str, default: int) -> int:
 
 def normalize_market(market: str | None) -> str:
     name = str(market or "").strip().upper()
-    if name in {"KR", "KRX", "KOSPI", "KOSDAQ", "KONEX"}:
+    if name in {"KR", "KRX", "NXT", "KOSPI", "KOSDAQ", "KONEX"}:
         return "KR"
     if name in {"US", "USA", "NASD", "NASDAQ", "NYSE", "AMEX"}:
         return "US"
@@ -167,6 +167,7 @@ class StrategyOutcome:
     signal_executable: bool = True
     algorithm_version: str = LEGACY_EVIDENCE_VERSION
     evaluation_version: str = LEGACY_EVIDENCE_VERSION
+    risk_policy_family: str = LEGACY_EVIDENCE_VERSION
 
     @property
     def is_loss(self) -> bool:
@@ -387,6 +388,7 @@ class StrategyPerformanceStore:
         signal_executable: bool = True,
         algorithm_version: str | None = None,
         evaluation_version: str | None = None,
+        risk_policy_family: str | None = None,
     ) -> bool:
         """Persist one closed outcome. Returns False when the store is unusable.
 
@@ -447,6 +449,7 @@ class StrategyPerformanceStore:
             int(bool(signal_executable)),
             resolved_algorithm_version,
             resolved_evaluation_version,
+            str(risk_policy_family or LEGACY_EVIDENCE_VERSION),
         )
         try:
             with self._lock, closing(self._connect()) as conn:
@@ -459,8 +462,8 @@ class StrategyPerformanceStore:
                         exit_reason, source,
                         direction, execution_product, deployment_state, evaluation_source,
                         borrow_available, borrow_fee_bps, borrow_quantity, signal_executable,
-                        algorithm_version, evaluation_version
-                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        algorithm_version, evaluation_version, risk_policy_family
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     row,
                 )
@@ -510,8 +513,13 @@ class StrategyPerformanceStore:
         algorithm_version: str | None = None,
         evaluation_version: str | None = None,
         compatible_only: bool = True,
+        as_of: datetime | None = None,
     ) -> tuple[StrategyOutcome, ...]:
         """Most recent closed outcomes for one arm.
+
+        ``as_of`` restricts both the upper observation time and the age window
+        for point-in-time decisions. New entry adaptation always supplies it;
+        query failure then raises instead of pretending no outcomes exist.
 
         ``direction`` is a genuine filter, not a convenience. Omitting it pools LONG
         and SHORT history into one series, and a strategy pair that makes 60bps long
@@ -542,8 +550,9 @@ class StrategyPerformanceStore:
         # cycle instead of missing on every microsecond.
         max_age_days = max(0.0, float(self.posterior_config.max_age_days))
         cutoff: str | None = None
+        observation_time = _aware(as_of) if as_of is not None else self._now()
         if max_age_days > 0.0:
-            moment = self._now() - timedelta(days=max_age_days)
+            moment = observation_time - timedelta(days=max_age_days)
             cutoff = moment.replace(minute=0, second=0, microsecond=0).isoformat()
         key = (
             "outcomes",
@@ -558,6 +567,7 @@ class StrategyPerformanceStore:
             resolved_algorithm_version,
             resolved_evaluation_version,
             cutoff,
+            observation_time.isoformat() if as_of is not None else None,
         )
         cached = self._cached(key)
         if cached is not None:
@@ -593,13 +603,16 @@ class StrategyPerformanceStore:
         if cutoff is not None:
             clauses.append("recorded_at >= ?")
             params.append(cutoff)
+        if as_of is not None:
+            clauses.append("recorded_at <= ?")
+            params.append(observation_time.isoformat())
         params.append(window)
         sql = (
             "select recorded_at, strategy_id, market, regime, symbol, realized_net_bps, "
             "realized_gross_bps, expected_net_bps, holding_seconds, slippage_error_bps, "
             "max_adverse_excursion_bps, exit_reason, source, direction, execution_product, "
             "deployment_state, evaluation_source, borrow_available, borrow_fee_bps, "
-            "borrow_quantity, signal_executable, algorithm_version, evaluation_version "
+            "borrow_quantity, signal_executable, algorithm_version, evaluation_version, risk_policy_family "
             "from strategy_outcomes "
             f"where {' and '.join(clauses)} order by recorded_at desc, rowid desc limit ?"
         )
@@ -608,6 +621,10 @@ class StrategyPerformanceStore:
             with self._lock, closing(self._connect()) as conn:
                 rows = conn.execute(sql, params).fetchall()
         except sqlite3.Error:
+            if as_of is not None:
+                # Point-in-time entry evidence must distinguish unavailable from
+                # genuinely unseen. Callers can then fail closed for new entries.
+                raise
             rows = ()
         outcomes = tuple(
             StrategyOutcome(
@@ -634,6 +651,7 @@ class StrategyPerformanceStore:
                 signal_executable=True if row[20] is None else bool(row[20]),
                 algorithm_version=str(row[21] or LEGACY_EVIDENCE_VERSION),
                 evaluation_version=str(row[22] or LEGACY_EVIDENCE_VERSION),
+                risk_policy_family=str(row[23] or LEGACY_EVIDENCE_VERSION),
             )
             for row in rows
         )
@@ -1199,6 +1217,8 @@ class StrategyPerformanceStore:
                 )
                 self._migrate_directional_columns(conn)
                 self._migrate_evidence_version_columns(conn)
+                if "risk_policy_family" not in {str(row[1]) for row in conn.execute("pragma table_info(strategy_outcomes)")}:
+                    conn.execute("alter table strategy_outcomes add column risk_policy_family text not null default 'legacy'")
                 conn.execute(
                     "insert or ignore into schema_version(version) values (?)", (_SCHEMA_VERSION,)
                 )

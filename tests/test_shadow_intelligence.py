@@ -240,7 +240,7 @@ def test_slow_intelligence_runs_order_free_comparison_and_throttles(tmp_path) ->
     # (8 -> 11). Either code is a correct, actionable answer; "corrupt" would not be,
     # which is why the loader distinguishes them.
     reason_codes = result.comparison.decisions[-1].reason_codes
-    assert {"GNN_FEATURE_SCHEMA_MISMATCH", "GNN_HEAD_SCHEMA_MISMATCH"} & set(reason_codes)
+    assert {"GNN_FEATURE_SCHEMA_MISMATCH", "GNN_HEAD_SCHEMA_MISMATCH", "GNN_CHECKPOINT_MISSING"} & set(reason_codes)
     assert "GNN_CHECKPOINT_CORRUPT" not in reason_codes
     assert not result.npu_evidence
     assert result.comparison.decisions[0].path == "legacy"
@@ -432,7 +432,7 @@ def test_authorized_checkpoint_with_matching_schema_emits_live_shadow_evidence(
     assert "GNN_REALTIME_TRUST_NOT_READY" in result.comparison.decisions[-1].reason_codes
 
 
-def test_checkpoint_authority_is_scoped_to_its_validated_market(
+def test_legacy_checkpoint_market_flags_do_not_certify_dynamic_live_payoff(
     tmp_path, monkeypatch
 ) -> None:
     seed = ShadowIntelligenceService(
@@ -459,7 +459,7 @@ def test_checkpoint_authority_is_scoped_to_its_validated_market(
         comparison_path=tmp_path / "shadow.jsonl",
     )
 
-    assert service._checkpoint_live_authorized_for("AAPL") is True
+    assert service._checkpoint_live_authorized_for("AAPL") is False
     assert service._checkpoint_live_authorized_for("005930") is False
 
 

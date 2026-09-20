@@ -4,3 +4,4 @@
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 
 .market-heading .badge{max-width:65%;white-space:normal;text-align:center}
+.policy-card{min-width:0;border:1px solid var(--line);border-radius:9px;padding:16px}.policy-card .market-heading h3{font-size:15px}.policy-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin:15px 0}.policy-metrics dt{font-size:11px;color:var(--muted)}.policy-metrics dd{font-size:14px;font-variant-numeric:tabular-nums;margin:3px 0;overflow-wrap:anywhere}.policy-card details{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-size:11px;overflow-wrap:anywhere}.policy-card summary{cursor:pointer;color:var(--muted)}.policy-card details a{display:inline-block;margin-top:10px;color:var(--accent)}#policy-title+a{font-size:11px;color:var(--muted);white-space:nowrap}

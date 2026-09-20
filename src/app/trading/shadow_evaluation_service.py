@@ -344,6 +344,7 @@ class ShadowEvaluationService:
                 exit_reason=outcome.outcome,
                 recorded_at=outcome.resolved_at,
                 evaluation_source=EVALUATION_SOURCE_SHADOW,
+                risk_policy_family=outcome.risk_policy_family,
                 deployment_state="SHADOW",
                 borrow_available=(
                     outcome.executable

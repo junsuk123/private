@@ -196,18 +196,23 @@ def test_verdict_is_false_when_metrics_are_absent() -> None:
     assert verdict["selection_net_edge_established"] is False
 
 
-def test_market_holdouts_are_independent_when_us_tape_is_newer() -> None:
+def test_market_holdouts_are_preserved_without_shared_encoder_future_leakage() -> None:
     snapshots = [
         *[_snapshot("005930", day) for day in range(10)],
         *[_snapshot("AAPL", 30 + day) for day in range(10)],
     ]
 
-    train, validation, _purged = _market_purged_split(snapshots)
+    train, validation, purged = _market_purged_split(snapshots)
 
     assert {item.symbol for item in validation} == {"005930", "AAPL"}
     assert sum(item.symbol == "005930" for item in validation) == 2
     assert sum(item.symbol == "AAPL" for item in validation) == 2
-    assert {item.symbol for item in train} == {"005930", "AAPL"}
+    # Both markets retain validation, but a single shared encoder cannot learn
+    # September US labels while August KR is presented as unseen holdout.
+    assert {item.symbol for item in train} == {"005930"}
+    boundary = min(item.as_of for item in validation)
+    assert all(item.label_end + timedelta(seconds=60) < boundary for item in train)
+    assert purged == 8
 
 
 def test_market_authority_does_not_cross_authorize() -> None:
@@ -300,10 +305,8 @@ def test_censored_future_keeps_graph_node_without_inventing_payoff() -> None:
     mask = _target_mask(row)
 
     assert row.usable_for_training is True
-    assert mask[:5] == (0.0, 0.0, 0.0, 0.0, 0.0)
-    assert mask[5] == 1.0
-    assert mask[6:10] == (0.0, 0.0, 0.0, 0.0)
-    assert mask[10] == 1.0
+    # No realized fill or uncertainty outcome exists for a censored arm.
+    assert mask == (0.0,) * 11
 
 
 def test_constant_and_weak_context_flags_are_reported() -> None:

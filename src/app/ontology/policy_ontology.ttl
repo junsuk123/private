@@ -1,0 +1,123 @@
+@prefix pol: <https://obaits.local/ontology/policy#> .
+@prefix tr: <https://example.com/ontology/trading#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://obaits.local/ontology/policy> a owl:Ontology ;
+    owl:versionInfo "2026-09-20.1" ;
+    rdfs:label "Market evidence and dynamic policy ontology" ;
+    rdfs:comment "Class / Instance / Object Property / Data Property / Axiom. OWL expresses meaning; SHACL checks completeness; Python derives numerical thresholds; existing execution controls retain authority." .
+
+# Class ----------------------------------------------------------------------
+pol:Entity a owl:Class ; rdfs:subClassOf tr:TradingEntity .
+pol:Market a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:Session a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:Instrument a owl:Class ; rdfs:subClassOf pol:Entity, tr:Stock .
+pol:Observation a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:AcceptedObservation a owl:Class ; rdfs:subClassOf pol:Observation .
+pol:RejectedObservation a owl:Class ; rdfs:subClassOf pol:Observation .
+pol:Regime a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:Strategy a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:LongCashStrategy a owl:Class ; rdfs:subClassOf pol:Strategy .
+pol:ShortStrategy a owl:Class ; rdfs:subClassOf pol:Strategy .
+pol:Position a owl:Class ; rdfs:subClassOf pol:Entity, tr:PortfolioPosition .
+pol:RiskAssessment a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:ThresholdPolicy a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:Threshold a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:DataSource a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:Metric a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:EvidenceProjection a owl:Class ; rdfs:subClassOf pol:Entity .
+pol:StrategyPerformanceObservation a owl:Class ; rdfs:subClassOf pol:Observation .
+
+# Instance -------------------------------------------------------------------
+# Static individuals identify markets and session kinds. Availability, holidays,
+# actual session times and observations are runtime facts, not invented here.
+pol:KR a owl:NamedIndividual, pol:Market ; pol:marketCode "KR" ; pol:currency "KRW" .
+pol:US a owl:NamedIndividual, pol:Market ; pol:marketCode "US" ; pol:currency "USD" .
+pol:GLOBAL a owl:NamedIndividual, pol:Market ; pol:marketCode "GLOBAL" .
+pol:JP a owl:NamedIndividual, pol:Market ; pol:marketCode "JP" ; pol:currency "JPY" .
+pol:HK a owl:NamedIndividual, pol:Market ; pol:marketCode "HK" ; pol:currency "HKD" .
+pol:CN a owl:NamedIndividual, pol:Market ; pol:marketCode "CN" ; pol:currency "CNY" .
+pol:KRXRegular a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:KR ; pol:sessionName "KRX_REGULAR" .
+pol:NXTPre a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:KR ; pol:sessionName "NXT_PRE" .
+pol:NXTRegular a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:KR ; pol:sessionName "NXT_REGULAR" .
+pol:NXTPost a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:KR ; pol:sessionName "NXT_POST" .
+pol:USPre a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:US ; pol:sessionName "US_PRE" .
+pol:USRegular a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:US ; pol:sessionName "US_REGULAR" .
+pol:USAfter a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:US ; pol:sessionName "US_AFTER" .
+pol:USDaytime a owl:NamedIndividual, pol:Session ; pol:sessionOfMarket pol:US ; pol:sessionName "US_DAYTIME" .
+
+# Object Property ------------------------------------------------------------
+pol:appliesToMarket a owl:ObjectProperty ; rdfs:domain pol:Entity ; rdfs:range pol:Market .
+pol:originMarket a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:Market .
+pol:sessionOfMarket a owl:ObjectProperty ; rdfs:domain pol:Session ; rdfs:range pol:Market .
+pol:tradedInMarket a owl:ObjectProperty ; rdfs:domain pol:Instrument ; rdfs:range pol:Market .
+pol:duringSession a owl:ObjectProperty ; rdfs:domain pol:Entity ; rdfs:range pol:Session .
+pol:observedInstrument a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:Instrument .
+pol:projectionForInstrument a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:Instrument .
+pol:policyForInstrument a owl:ObjectProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range pol:Instrument .
+pol:assessesInstrument a owl:ObjectProperty ; rdfs:domain pol:RiskAssessment ; rdfs:range pol:Instrument .
+pol:observedMetric a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:Metric .
+pol:providedBy a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:DataSource .
+pol:usesEvidence a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:AcceptedObservation .
+pol:rejectedEvidence a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:RejectedObservation .
+pol:derivedFromProjection a owl:ObjectProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range pol:EvidenceProjection .
+pol:assessedFrom a owl:ObjectProperty ; rdfs:domain pol:RiskAssessment ; rdfs:range pol:EvidenceProjection .
+pol:generatesPolicy a owl:ObjectProperty ; rdfs:domain pol:RiskAssessment ; rdfs:range pol:ThresholdPolicy .
+pol:hasThreshold a owl:ObjectProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range pol:Threshold .
+pol:observedRegime a owl:ObjectProperty ; rdfs:domain pol:Entity ; rdfs:range pol:Regime .
+pol:positionInInstrument a owl:ObjectProperty ; rdfs:domain pol:Position ; rdfs:range pol:Instrument .
+pol:positionUsesStrategy a owl:ObjectProperty ; rdfs:domain pol:Position ; rdfs:range pol:Strategy .
+pol:observedStrategy a owl:ObjectProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range pol:Strategy .
+pol:hasPerformance a owl:ObjectProperty ; rdfs:domain pol:Strategy ; rdfs:range pol:StrategyPerformanceObservation .
+pol:considersPerformance a owl:ObjectProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range pol:StrategyPerformanceObservation .
+pol:sameMethodologyFamily a owl:ObjectProperty, owl:SymmetricProperty ; rdfs:domain pol:Strategy ; rdfs:range pol:Strategy .
+pol:confirmsStrategy a owl:ObjectProperty ; rdfs:domain pol:Strategy ; rdfs:range pol:Strategy .
+pol:contrastsStrategy a owl:ObjectProperty, owl:SymmetricProperty ; rdfs:domain pol:Strategy ; rdfs:range pol:Strategy .
+pol:influencesMarket a owl:ObjectProperty ; rdfs:domain pol:Observation ; rdfs:range pol:Market .
+pol:confirmsMarket a owl:ObjectProperty ; rdfs:subPropertyOf pol:influencesMarket ; rdfs:domain pol:Observation ; rdfs:range pol:Market .
+
+# Data Property --------------------------------------------------------------
+pol:marketCode a owl:DatatypeProperty ; rdfs:domain pol:Market ; rdfs:range xsd:string .
+pol:currency a owl:DatatypeProperty ; rdfs:domain pol:Market ; rdfs:range xsd:string .
+pol:sessionName a owl:DatatypeProperty ; rdfs:domain pol:Session ; rdfs:range xsd:string .
+pol:symbol a owl:DatatypeProperty ; rdfs:domain pol:Instrument ; rdfs:range xsd:string .
+pol:observedAt a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:dateTime .
+pol:asOf a owl:DatatypeProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range xsd:dateTime .
+pol:usable a owl:DatatypeProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range xsd:boolean .
+pol:contextId a owl:DatatypeProperty ; rdfs:domain pol:EvidenceProjection ; rdfs:range xsd:string .
+pol:numericValue a owl:DatatypeProperty ; rdfs:domain pol:Entity ; rdfs:range xsd:double .
+pol:unit a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:string .
+pol:maximumAgeSeconds a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:double .
+pol:ageSeconds a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:double .
+pol:horizonSeconds a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:double .
+pol:metricName a owl:DatatypeProperty ; rdfs:domain pol:Entity ; rdfs:range xsd:string .
+pol:sourceName a owl:DatatypeProperty ; rdfs:domain pol:DataSource ; rdfs:range xsd:string .
+pol:evidenceReference a owl:DatatypeProperty ; rdfs:domain pol:Observation ; rdfs:range xsd:string .
+pol:reasonCode a owl:DatatypeProperty ; rdfs:domain pol:Entity ; rdfs:range xsd:string .
+pol:regimeLabel a owl:DatatypeProperty ; rdfs:domain pol:Regime ; rdfs:range xsd:string .
+pol:policyMode a owl:DatatypeProperty ; rdfs:domain pol:ThresholdPolicy ; rdfs:range xsd:string .
+pol:strategyId a owl:DatatypeProperty ; rdfs:domain pol:Strategy ; rdfs:range xsd:string .
+pol:realizedNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:expectedNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:sampleCount a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:effectiveSampleCount a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:lowerNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:upperNetBps a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:double .
+pol:performanceState a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:string .
+pol:evidenceSource a owl:DatatypeProperty ; rdfs:domain pol:StrategyPerformanceObservation ; rdfs:range xsd:string .
+
+# Axiom ----------------------------------------------------------------------
+# Distinct market identities prevent a semantic KR/US merge. Disjointness says
+# these types cannot co-apply; absence still remains unknown (OWL open world).
+pol:KR owl:differentFrom pol:US .
+pol:AcceptedObservation owl:disjointWith pol:RejectedObservation .
+pol:LongCashStrategy owl:disjointWith pol:ShortStrategy .
+pol:Market owl:disjointWith pol:Observation, pol:ThresholdPolicy .
+pol:hasPerformance owl:inverseOf pol:observedStrategy .
+pol:sessionOfMarket rdfs:subPropertyOf pol:appliesToMarket .
+pol:tradedInMarket rdfs:subPropertyOf pol:appliesToMarket .
+# No property chain links foreign volatility to a local instrument's volatility.
+# No class, inverse edge, learned weight or missing fact grants order permission.

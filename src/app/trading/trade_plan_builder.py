@@ -38,7 +38,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Callable
 
 from app.cost import ProfitabilityGate, ProfitabilityInput, TradingCostEngine
 from app.risk.manager import RiskManager
@@ -195,7 +195,9 @@ class TradePlanBuilder:
         position_sizer: PositionSizer | None = None,
         risk_manager: RiskManager | None = None,
         risk_rules: RiskRules | None = None,
+        ontology_policy_resolver: Callable[..., Any] | None = None,
     ) -> None:
+        self.ontology_policy_resolver = ontology_policy_resolver
         self.cost_engine = cost_engine or TradingCostEngine()
         self.profitability_gate = profitability_gate or ProfitabilityGate(
             cost_engine=self.cost_engine
@@ -222,7 +224,7 @@ class TradePlanBuilder:
         # -- 1. cost and net edge ------------------------------------------ #
         decision = self._profitability(request, price)
         cost_snapshot = decision.as_dict()
-        if not decision.allowed:
+        if not decision.allowed and self.ontology_policy_resolver is None:
             return TradePlanOutcome(
                 no_trade=NoTradeDecision(
                     symbol=request.symbol,
@@ -235,6 +237,44 @@ class TradePlanBuilder:
                     cost_snapshot=cost_snapshot,
                 )
             )
+
+        policy = None
+        if self.ontology_policy_resolver is not None:
+            from app.risk.ontology_thresholds import OntologyRiskPolicy
+            from app.data.market_capabilities import normalize_market_group
+            expected_policy_market = normalize_market_group(request.market)
+            try:
+                policy = self.ontology_policy_resolver(
+                    symbol=request.symbol, market=request.market, now=moment,
+                    all_in_cost_rate=decision.all_in_cost_rate,
+                    forecast_gross_bps=request.gross_edge_bps,
+                    requested_horizon_seconds=request.max_holding_seconds,
+                    account=request.account,
+                )
+                valid_policy = (
+                    isinstance(policy, OntologyRiskPolicy) and policy.valid_for_entry
+                    and policy.is_current(moment) and policy.symbol.upper() == request.symbol.upper()
+                    and expected_policy_market is not None and policy.market == expected_policy_market.value
+                )
+            except Exception:
+                valid_policy = False
+            if not valid_policy:
+                return TradePlanOutcome(no_trade=NoTradeDecision(
+                    symbol=request.symbol, strategy_id=request.strategy_id, decided_at=moment,
+                    reason_codes=tuple(getattr(policy, "reason_codes", ())) or ("ONTOLOGY_POLICY_UNAVAILABLE",),
+                    stage="ontology_policy", cost_snapshot=cost_snapshot,
+                    risk_snapshot={"ontology_risk_policy": policy.as_dict() if isinstance(policy, OntologyRiskPolicy) else None},
+                ))
+
+        if policy is not None:
+            decision = self._profitability(request, price, ontology_policy=policy, now=moment)
+            cost_snapshot = decision.as_dict()
+            if not decision.allowed:
+                return TradePlanOutcome(no_trade=NoTradeDecision(
+                    symbol=request.symbol, strategy_id=request.strategy_id, decided_at=moment,
+                    reason_codes=tuple(decision.rejection_reasons), stage="ontology_profitability",
+                    cost_snapshot=cost_snapshot, risk_snapshot={"ontology_risk_policy": policy.as_dict()},
+                ))
 
         # -- 2. size ---------------------------------------------------------- #
         confidence = (
@@ -273,6 +313,8 @@ class TradePlanBuilder:
             max(0.0, _finite(request.max_position_weight, 0.05)),
             max(0.0, sizing.position_weight),
         ) * authority
+        if policy is not None:
+            weight = min(weight, policy.position_cap)
         if weight <= 0.0:
             return TradePlanOutcome(
                 no_trade=NoTradeDecision(
@@ -289,7 +331,8 @@ class TradePlanBuilder:
         # -- 3. risk ---------------------------------------------------------- #
         intent = self._intent(request, decision, weight, confidence, moment)
         risk = self.risk_manager.validate(
-            intent, request.account, request.market_snapshot
+            intent, request.account, request.market_snapshot,
+            **({"ontology_policy": policy, "now": moment} if policy is not None else {}),
         )
         risk_snapshot = {
             "approved": bool(risk.approved),
@@ -304,6 +347,8 @@ class TradePlanBuilder:
             "sizing_methodology": "fractional_kelly_edge_liquidity_drawdown",
             "risk_rules_version": getattr(self.risk_manager.rules, "version", "default"),
         }
+        if policy is not None:
+            risk_snapshot["ontology_risk_policy"] = policy.as_dict()
         if not risk.approved or risk.final_order is None:
             return TradePlanOutcome(
                 no_trade=NoTradeDecision(
@@ -322,6 +367,8 @@ class TradePlanBuilder:
         quantity = int(getattr(risk.final_order, "quantity", 0) or 0)
         from app.risk.position_sizing import market_position_cap
         market_cap = market_position_cap(request.market_snapshot.market)
+        if policy is not None:
+            market_cap = min(market_cap, policy.position_cap)
         # RiskManager can round a small account up to one share. Verify the final
         # lot against the market ceiling before election, so that rounding cannot
         # silently concentrate the entire account into one high-priced name.
@@ -352,8 +399,7 @@ class TradePlanBuilder:
             plan = TradePlan(
                 plan_id=new_plan_id(request.symbol, moment),
                 created_at=moment,
-                expires_at=moment
-                + timedelta(seconds=max(30.0, float(request.plan_ttl_seconds))),
+                expires_at=min(moment + timedelta(seconds=max(1., float(request.plan_ttl_seconds))), policy.expires_at) if policy is not None else moment + timedelta(seconds=max(30., float(request.plan_ttl_seconds))),
                 symbol=str(request.symbol).upper(),
                 market=str(request.market),
                 direction=str(request.direction).upper(),
@@ -362,15 +408,15 @@ class TradePlanBuilder:
                 max_notional=quantity * price,
                 entry_rule=EntryRule(
                     trigger=request.entry_trigger,
-                    min_price=price * (1.0 - ENTRY_BAND_RATE),
-                    max_price=price * (1.0 + ENTRY_BAND_RATE),
-                    max_wait_seconds=float(request.plan_ttl_seconds),
+                    min_price=price * (1.0 - (policy.entry_band_rate if policy is not None else ENTRY_BAND_RATE)),
+                    max_price=price * (1.0 + (policy.entry_band_rate if policy is not None else ENTRY_BAND_RATE)),
+                    max_wait_seconds=min(float(request.plan_ttl_seconds), (policy.expires_at - moment).total_seconds()) if policy is not None else float(request.plan_ttl_seconds),
                 ),
                 exit_rules=ExitRules(
-                    take_profit_rate=request.take_profit_rate,
-                    stop_loss_rate=request.stop_loss_rate,
-                    trailing_rate=request.trailing_rate,
-                    max_holding_seconds=int(request.max_holding_seconds),
+                    take_profit_rate=policy.target_return_rate if policy is not None else request.take_profit_rate,
+                    stop_loss_rate=policy.soft_stop_rate if policy is not None else request.stop_loss_rate,
+                    trailing_rate=policy.trailing_stop_rate if policy is not None else request.trailing_rate,
+                    max_holding_seconds=policy.maximum_holding_seconds if policy is not None else int(request.max_holding_seconds),
                     strategy_exit_trigger=request.strategy_exit_trigger,
                 ),
                 cancel_rule=request.cancel_rule,
@@ -380,10 +426,10 @@ class TradePlanBuilder:
                 cost_snapshot=cost_snapshot,
                 risk_snapshot=risk_snapshot,
                 weekday_time_context=dict(request.weekday_time_context),
-                source_ids=tuple(request.source_ids),
+                source_ids=tuple(dict.fromkeys((*request.source_ids, *((policy.policy_id, policy.evidence_id) if policy is not None else ())))),
                 status=TradePlanStatus.ARMED,
                 reference_price=price,
-                election_context=dict(request.election_context),
+                election_context={**dict(request.election_context), **({"ontology_risk_policy": policy.as_dict()} if policy is not None else {})},
                 decision_id=request.decision_id,
                 session_id=request.session_id,
                 order_contract=dict(request.order_contract),
@@ -403,7 +449,7 @@ class TradePlanBuilder:
         return TradePlanOutcome(plan=plan)
 
     # ------------------------------------------------------------------ #
-    def _profitability(self, request: PlanRequest, price: float):
+    def _profitability(self, request: PlanRequest, price: float, *, ontology_policy: Any = None, now: datetime | None = None):
         gross = max(0.0, _finite(request.gross_edge_bps)) / 10_000.0
         sign = -1.0 if str(request.direction).upper() == "SHORT" else 1.0
         expected_exit = price * (1.0 + sign * gross)
@@ -430,7 +476,8 @@ class TradePlanBuilder:
                     getattr(request.market_snapshot, "average_daily_trading_value", 0.0)
                 ),
                 account_equity_krw=_finite(getattr(request.account, "equity", 0.0)),
-            )
+            ),
+            **({"ontology_policy": ontology_policy, "now": now} if ontology_policy is not None else {}),
         )
 
     def _intent(

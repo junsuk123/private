@@ -8,6 +8,8 @@ either runs before election or does not run at all.
 from __future__ import annotations
 
 import inspect
+import ast
+import textwrap
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -158,19 +160,24 @@ def test_the_authority_cap_is_applied_once_at_election() -> None:
 # --------------------------------------------------------------------------- #
 # Nothing re-judges afterwards
 # --------------------------------------------------------------------------- #
-def test_the_plan_driven_buy_path_calls_no_post_selection_authority() -> None:
-    """``_plan_driven_buy`` is the whole post-election decision path. It must not
-    reference the three authorities the refactor moved upstream."""
+def test_the_plan_driven_buy_path_does_not_reselect_or_resize_the_thesis() -> None:
+    """Current ontology risk may reject execution; thesis selection stays frozen."""
     from app.trading.shared_decision_engine import SharedLiveDecisionEngine
 
     source = inspect.getsource(SharedLiveDecisionEngine._plan_driven_buy)
     for forbidden in (
         "profitability_gate.evaluate",
         "position_sizer.size",
-        "risk_manager.validate",
         "RiskManager(",
     ):
         assert forbidden not in source, forbidden
+    tree = ast.parse(textwrap.dedent(source))
+    risk_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and ast.unparse(node.func) == "self.risk_manager.validate"]
+    guarded = [node for node in ast.walk(tree) if isinstance(node, ast.If)
+               and ast.unparse(node.test) == "self.ontology_policy_resolver is not None"]
+    assert risk_calls and guarded
+    assert all(any(call in list(ast.walk(branch)) for branch in guarded) for call in risk_calls)
 
 
 def test_the_fast_executor_cannot_reach_a_decision_authority() -> None:

@@ -104,6 +104,11 @@ class CounterfactualLabel:
     mfe_bps: float = 0.0
     holding_seconds: float = 0.0
     cost_floor_dominated: bool = False
+    # Execution behavior actually measured by this label, independent of model
+    # architecture. Frozen shadow exits cannot authorize dynamic live behavior.
+    label_execution_policy: str = "legacy_strategy_geometry_v1"
+    policy_id: str = ""
+    feature_snapshot_id: str = ""
 
     @property
     def outcome_observed(self) -> bool:

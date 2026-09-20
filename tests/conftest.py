@@ -52,6 +52,17 @@ os.environ.setdefault(
 _test_runtime_root = tempfile.mkdtemp(prefix="obaits-test-runtime-")
 os.environ.setdefault("REALTIME_STORE_ROOT", _test_runtime_root)
 os.environ.setdefault("LIVE_MODEL_ARTIFACT_ROOT", os.path.join(_test_runtime_root, "models"))
+# Collection imports can instantiate a singleton before session fixtures run.
+# Redirect every mutable default at import time as well as resetting the stores
+# below, so schema migrations and caches cannot touch the operator's databases.
+for _name, _file in {
+    "STRATEGY_PERFORMANCE_STORE_PATH": "strategy-performance.sqlite3",
+    "CHANGE_POINT_STATE_PATH": "change-point-state.json",
+    "TRADING_STATE_DB_PATH": "trading-state.sqlite3",
+    "ADAPTIVE_THRESHOLDS_STORE_PATH": "adaptive-thresholds.sqlite3",
+    "DIRECTIONAL_SHADOW_STORE_PATH": "directional-shadow.sqlite3",
+}.items():
+    os.environ.setdefault(_name, os.path.join(_test_runtime_root, _file))
 
 
 @pytest.fixture(autouse=True)

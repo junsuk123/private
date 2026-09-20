@@ -9,6 +9,7 @@ one-second trading loop from hopping between unrelated candidates.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -69,6 +70,7 @@ from app.trading.strategy_performance_store import (
     default_store as _default_performance_store,
     market_for_symbol,
 )
+from app.trading.strategy_adaptation import StrategyAdaptation
 
 
 def _fallback_exit_geometry():
@@ -598,6 +600,7 @@ class _ElectionProposal:
     # longer deletes the branch before its own algorithm gets to speak.
     risk_tolerance_probe: bool = False
     risk_size_fraction: float = 1.0
+    ontology_entry_permitted: bool = True
 
     @property
     def is_short(self) -> bool:
@@ -610,7 +613,7 @@ class _ElectionProposal:
         # intentional: SHADOW must record the unexecutable signal so borrow health
         # and signal quality can accumulate.  Only the broker-facing capability is
         # removed here.
-        return self.deployment_state.submits_orders and (
+        return self.ontology_entry_permitted and self.deployment_state.submits_orders and (
             not self.is_short or self.borrow_snapshot is not None
         )
 
@@ -872,23 +875,9 @@ class StrategySessionConfig:
             0.0, _env_float("STRATEGY_SESSION_FALLBACK_COST_BPS", 28.0)
         )
     )
-    # --- GNN-direct election (operator posture, 2026-08-08) ------------------ #
-    # The GNN's own ranking becomes the selection, full stop: highest predicted
-    # net edge is armed, with no pessimistic re-scoring and no NO_TRADE arm. Set
-    # by an operator who holds that a model trained to pick the best strategy
-    # should not then have its pick second-guessed by the layers below it.
-    #
-    # This overrides ``bandit_enabled``. What it gives up, stated plainly because
-    # the flag cannot state it at runtime:
-    #   * the pessimistic lower bound -- a cold arm is armed on its own optimism;
-    #   * NO_TRADE as a selectable outcome -- if any proposal exists, one is armed;
-    #   * the realized-history posterior and the BOCPD regime discount.
-    #
-    # Measured before this was switched on (2026-08-08, forward validation of GNN
-    # elections on live ticks): 107 samples, positive_net_rate 0.0, mean realized
-    # net -62.08bps, and the success head scored 61.8% on realized cells against
-    # an 84.6% constant-predictor baseline. Those are the numbers this posture
-    # accepts. Revert by unsetting the variable; no code path is deleted.
+    # --- GNN-direct ranking ------------------------------------------------- #
+    # Chooses among available positive model estimates. All election postures
+    # share market/regime performance admissibility and can now choose NO_TRADE.
     gnn_direct_election: bool = field(
         default_factory=lambda: os.getenv(
             "STRATEGY_SESSION_GNN_DIRECT_ELECTION", "false"
@@ -996,6 +985,7 @@ class StrategySessionState:
     gnn_reason_codes: list[str] = field(default_factory=list)
     explanation_paths: list[dict[str, Any]] = field(default_factory=list)
     candidate_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    performance_assessments: list[dict[str, Any]] = field(default_factory=list)
     # Every actual strategy trigger checked this cycle, including rejected ones.
     # This is distinct from bandit_evaluations: the latter contains only pairs
     # that first passed their strategy's own mechanical entry algorithm.
@@ -1110,13 +1100,20 @@ class StrategySessionManager:
         bandit: ConservativeStrategyBandit | None = None,
         selector_v2_runner: Any | None = None,
         plan_builder: Any | None = None,
+        ontology_policy_resolver: Callable[..., Any] | None = None,
+        graph_training_context_provider: Callable[..., Mapping[str, Any] | None] | None = None,
     ) -> None:
+        self.ontology_policy_resolver = ontology_policy_resolver
+        self.graph_training_context_provider = graph_training_context_provider
+        self._position_ontology_policy = None
+        self._position_ontology_session = None
         self.config = config or StrategySessionConfig()
         self.selection_evidence_provider = selection_evidence_provider
         self.performance_store = (
             performance_store if performance_store is not None else _default_performance_store()
         )
         self.bandit = bandit or ConservativeStrategyBandit(store=self.performance_store)
+        self._strategy_adaptation = StrategyAdaptation(store=self.performance_store)
         # Algorithms are immutable policy objects for the lifetime of a live
         # session. Building the registry per proposal reread and reparsed YAML
         # hundreds of times in one election cycle, delaying the first cycle by
@@ -1431,7 +1428,7 @@ class StrategySessionManager:
                 context["exit_contract"] = dict(proposal.exit_contract)
             builder = getattr(self, "_plan_builder", None)
             if builder is None:
-                builder = TradePlanBuilder()
+                builder = TradePlanBuilder(ontology_policy_resolver=self.ontology_policy_resolver)
                 self._plan_builder = builder
             venue, instrument_type = _cost_market_contract(proposal.symbol)
             outcome = builder.build(
@@ -1445,11 +1442,9 @@ class StrategySessionManager:
                     take_profit_rate=float(proposal.target_return_rate),
                     stop_loss_rate=float(proposal.stop_loss_rate),
                     trailing_rate=float(proposal.trailing_stop_rate) or None,
-                    max_holding_seconds=int(proposal.max_holding_seconds),
+                    max_holding_seconds=int((proposal.exit_contract or {}).get("policy_requested_horizon_seconds", proposal.max_holding_seconds)),
                     gross_edge_bps=float(
-                        proposal.predicted_gross_edge_bps(
-                            self.config.fallback_round_trip_cost_bps
-                        )
+                        (proposal.exit_contract or {}).get("forecast_gross_bps", proposal.predicted_gross_edge_bps(self.config.fallback_round_trip_cost_bps))
                         or 0.0
                     ),
                     direction=str(getattr(proposal.direction, "value", proposal.direction)),
@@ -1484,7 +1479,8 @@ class StrategySessionManager:
                 ),
                 now=now,
             )
-        except Exception:  # noqa: BLE001 - a plan-build failure falls back, never crashes.
+        except Exception as exc:  # A mandatory live policy failure cannot grant entry.
+            self._state.last_reason = f"PLAN_BUILD_UNAVAILABLE:{type(exc).__name__}"
             return None
         if outcome.plan is None:
             self._state.last_reason = (
@@ -1492,6 +1488,17 @@ class StrategySessionManager:
             )
             return None
         self._save_trade_plan(outcome.plan)
+        policy_data = dict(outcome.plan.risk_snapshot).get("ontology_risk_policy")
+        if isinstance(policy_data, Mapping):
+            self._state.election_context["ontology_risk_policy"] = dict(policy_data)
+            self._state.election_context["policy_requested_horizon_seconds"] = int((proposal.exit_contract or {}).get("policy_requested_horizon_seconds", proposal.max_holding_seconds))
+            self._state.target_return_rate = outcome.plan.exit_rules.take_profit_rate
+            self._state.stop_loss_rate = outcome.plan.exit_rules.stop_loss_rate
+            self._state.trailing_stop_rate = outcome.plan.exit_rules.trailing_rate or 0.0
+            self._state.max_holding_seconds = outcome.plan.exit_rules.max_holding_seconds
+            self._state.target_price = _directional_target_price(
+                float(proposal.entry_price), self._state.target_return_rate, proposal.direction
+            )
         return outcome.plan
 
     def _plan_ttl_seconds(self) -> float:
@@ -2145,6 +2152,7 @@ class StrategySessionManager:
             ),
             borrow_fee_bps=state.borrow_fee_bps_annualised,
             signal_executable=True,
+            risk_policy_family=str((state.election_context.get("exit_contract") or {}).get("risk_policy_family") or "legacy"),
         )
         state.outcome_recorded = bool(recorded)
         if recorded and state.selector_v2_context_id and self._selector_v2 is not None:
@@ -2221,7 +2229,7 @@ class StrategySessionManager:
             and _macro_permits(bundle, strategy_id) is False
             and change_probability is not None
             and change_probability
-            >= self.config.invalidation_change_point_probability
+            >= float(self._exit_policy_values().get("change_point_exit_probability", self.config.invalidation_change_point_probability))
         ):
             # When no micro exit exists, identify the observation by the macro
             # timestamp. A cached structural-break verdict must not be counted as
@@ -2245,6 +2253,7 @@ class StrategySessionManager:
         bundle: Any,
         *,
         direction: PositionDirection,
+        now: datetime | None = None,
     ) -> str | None:
         """Confirm thesis decay and classify the exit as profit protection/loss limit."""
         state = self._state
@@ -2267,12 +2276,18 @@ class StrategySessionManager:
             state.invalidation_cycles = 0
             state.invalidation_reason_codes = []
             return None
-        if state.invalidation_cycles < self.config.invalidation_confirm_cycles:
+        policy = self._exit_policy_values()
+        if state.invalidation_cycles < int(policy.get("early_exit_confirmations", self.config.invalidation_confirm_cycles)):
             return None
+        opened = _parse_time(state.position_opened_at) or getattr(holding, "opened_at", None)
+        if policy and now is not None and isinstance(opened, datetime):
+            opened = opened if opened.tzinfo else opened.replace(tzinfo=timezone.utc)
+            if (now - opened).total_seconds() < float(policy["minimum_holding_seconds"]):
+                return None
 
         entry = float(getattr(holding, "average_price", 0.0) or 0.0)
         mark = float(getattr(holding, "last_price", 0.0) or 0.0)
-        if entry <= 0.0 or mark <= 0.0:
+        if not math.isfinite(entry) or not math.isfinite(mark) or entry <= 0.0 or mark <= 0.0:
             return None
         gross_bps = _directional_gross_bps(entry, mark, direction)
         cost_bps = max(
@@ -2283,11 +2298,77 @@ class StrategySessionManager:
                 else self.config.fallback_round_trip_cost_bps
             ),
         )
+        if policy and abs(gross_bps - cost_bps) < float(policy["noise_band_rate"]) * 10000.:
+            return None
         return (
             "STRATEGY_EDGE_DECAY_PROFIT_PROTECT"
             if gross_bps > cost_bps
             else "STRATEGY_EDGE_DECAY_LOSS_LIMIT"
         )
+
+    def _exit_policy_values(self) -> Mapping[str, Any]:
+        values = self._state.election_context.get("ontology_risk_policy", {})
+        if not isinstance(values, Mapping) or values.get("symbol") != self._state.selected_symbol:
+            return {}
+        return values
+
+    def _refresh_position_ontology_policy(self, holding: Any, now: datetime) -> None:
+        if self.ontology_policy_resolver is None:
+            return
+        state = self._state
+        symbol = state.selected_symbol or ""
+        from app.risk.ontology_thresholds import OntologyRiskPolicy, policy_limits
+        if self._position_ontology_session != state.session_id:
+            self._position_ontology_policy = None
+            self._position_ontology_session = state.session_id
+        requested_horizon = state.election_context.setdefault("policy_requested_horizon_seconds", max(60, state.max_holding_seconds))
+        try:
+            policy = self.ontology_policy_resolver(
+                symbol=symbol, market=_market_group_for(symbol), now=now,
+                all_in_cost_rate=max(0., float(state.expected_cost_bps or self.config.fallback_round_trip_cost_bps)) / 10000.,
+                requested_horizon_seconds=requested_horizon,
+            )
+            if not isinstance(policy, OntologyRiskPolicy) or policy.symbol != symbol or policy.market != ("KR" if _market_group_for(symbol) in {"KR", "KRX", "NXT"} else "US"):
+                raise ValueError("ONTOLOGY_POLICY_IDENTITY_INVALID")
+            if not policy.is_current(now):
+                raise ValueError("ONTOLOGY_POLICY_TIME_INVALID")
+            prior = self._position_ontology_policy
+            # An outage cannot manufacture a new noise estimate or widen owned risk.
+            missing = any("MISSING" in reason or "UNKNOWN" in reason or "STALE" in reason for reason in policy.reason_codes)
+            if missing and prior is not None and prior.symbol == symbol:
+                policy = prior
+            else:
+                policy = policy.tighten_for_position(prior)
+            self._position_ontology_policy = policy
+            previous = self._exit_policy_values()
+            data = policy.as_dict()
+            if previous:
+                for name in ("soft_stop_rate", "hard_stop_rate", "emergency_stop_rate", "trailing_stop_rate", "maximum_holding_seconds"):
+                    data[name] = min(data[name], float(previous.get(name, data[name])))
+            state.election_context["ontology_risk_policy"] = data
+            state.stop_loss_rate = min(state.stop_loss_rate, data["soft_stop_rate"]) if state.stop_loss_rate > 0 else data["soft_stop_rate"]
+            state.trailing_stop_rate = min(state.trailing_stop_rate, data["trailing_stop_rate"]) if state.trailing_stop_rate > 0 else data["trailing_stop_rate"]
+            state.max_holding_seconds = min(state.max_holding_seconds, int(data["maximum_holding_seconds"]))
+            entry = float(getattr(holding, "average_price", 0.0) or state.entry_price or 0.)
+            if entry > 0:
+                direction = parse_direction(state.selected_direction)
+                generated_stop = _directional_stop_price(entry, state.stop_loss_rate, direction)
+                if state.stop_price:
+                    state.stop_price = max(state.stop_price, generated_stop) if direction is PositionDirection.LONG else min(state.stop_price, generated_stop)
+                else:
+                    state.stop_price = generated_stop
+                state.target_return_rate = data["target_return_rate"]
+                state.target_price = _directional_target_price(entry, state.target_return_rate, direction)
+        except Exception as exc:
+            state.election_context["ontology_policy_error"] = type(exc).__name__
+            # Last validated position barriers remain in force. Restored legacy
+            # positions still cannot exceed the declared engineering loss ceiling.
+            state.stop_loss_rate = min(state.stop_loss_rate, policy_limits().maximum_hard_stop_rate) if state.stop_loss_rate > 0 else policy_limits().maximum_hard_stop_rate
+            entry = float(getattr(holding, "average_price", 0.0) or state.entry_price or 0.)
+            if entry > 0:
+                direction = parse_direction(state.selected_direction)
+                barrier = _directional_stop_price(entry, state.stop_loss_rate, direction)
+                state.stop_price = (max(float(state.stop_price or 0.), barrier) if direction is PositionDirection.LONG else min(float(state.stop_price or barrier), barrier))
 
     def _evaluate_exit(self, holding: Any, bundle: Any, now: datetime) -> None:
         state = self._state
@@ -2298,6 +2379,10 @@ class StrategySessionManager:
         last_price = float(getattr(holding, "last_price", 0.0) or 0.0)
         average_price = float(getattr(holding, "average_price", 0.0) or 0.0)
         quantity = max(0, int(getattr(holding, "quantity", 0) or 0))
+        if not math.isfinite(last_price) or not math.isfinite(average_price) or last_price <= 0 or average_price <= 0:
+            state.last_reason = "POSITION_QUOTE_INVALID"
+            return
+        self._refresh_position_ontology_policy(holding, now)
         # Direction-signed: a short's PnL is positive when the price has FALLEN below
         # the entry, so the unsigned (last - average) would report every winning short
         # as a loss and drive the wrong exit decisions downstream.
@@ -2366,6 +2451,9 @@ class StrategySessionManager:
             ),
         )
 
+        policy = self._exit_policy_values()
+        if policy:
+            trailing_required_gross_bps = expected_cost_bps + float(policy["net_profit_floor_rate"]) * 10000.
         reason: str | None = None
         if target_reached(last_price, state.target_price, direction):
             reason = "STRATEGY_PROFIT_TARGET"
@@ -2389,6 +2477,7 @@ class StrategySessionManager:
                 holding,
                 bundle,
                 direction=direction,
+                now=now,
             )
 
         opened = _parse_time(state.position_opened_at) or getattr(holding, "opened_at", None)
@@ -2419,7 +2508,8 @@ class StrategySessionManager:
                 and not state.invalidation_reason_codes
             )
             if (
-                not time_boxed
+                not policy
+                and not time_boxed
                 and not state.holding_extension_used
                 and thesis_intact
                 and gross_bps < cost_bps
@@ -2483,6 +2573,8 @@ class StrategySessionManager:
         # 실제로 그것 때문에 "미국 정규장에 마감된 국내 종목 arm 을 평가한다"는 오진이
         # 나왔다. 진단값은 계산된 사이클 안에서만 유효해야 한다.
         self._reset_bandit_diagnostics()
+
+        self._state.performance_assessments = []
 
         if bundle is None:
             self._state.macro_permitted_strategy_ids = []
@@ -2600,9 +2692,15 @@ class StrategySessionManager:
         # inside the bandit keeps SHADOW arms visible in the evaluation list (so the
         # dashboard can show what they WOULD have done) while making them structurally
         # unable to win.
-        executable = [proposal for proposal in proposals if proposal.submits_orders]
+        order_authorized = [proposal for proposal in proposals if proposal.submits_orders]
+        executable = self._performance_admissible(order_authorized, now)
+        allowed_ids = {id(proposal) for proposal in executable}
+        admissible_proposals = [
+            proposal for proposal in proposals
+            if not proposal.submits_orders or id(proposal) in allowed_ids
+        ]
         selected: "_ElectionProposal | None" = None
-        decided = False
+        decided = bool(order_authorized and not executable)
         if executable and self.config.gnn_direct_election:
             gnn_selected = self._gnn_direct_choice(executable)
             selected = gnn_selected
@@ -2611,13 +2709,14 @@ class StrategySessionManager:
             self.config.algorithm_primary_election
             and self._state.algorithm_evaluations
         ):
-            # One authority only: a deterministic strategy must have fired, and
-            # candidates are ranked on that same algorithm's forward net edge.
-            # Historical bandit evidence and model availability cannot veto it.
+            # A deterministic strategy must have fired. Among candidates that
+            # passed performance admissibility, use that algorithm's net edge;
+            # missing model availability does not invent an extra veto.
             selected = self._algorithm_choice(executable, now)
             decided = True
         elif proposals and self.config.bandit_enabled:
-            selected = self._bandit_choice(proposals, macro, now)
+            bandit_selected = self._bandit_choice(proposals, macro, now)
+            selected = bandit_selected if id(bandit_selected) in allowed_ids else None
             decided = True
         elif executable:
             selected = self._forward_edge_choice(executable, now)
@@ -2636,7 +2735,7 @@ class StrategySessionManager:
         # ``evaluation_source=shadow``, so promotion still weights them below a real
         # fill and cannot mistake a simulation for execution.
         self._journal_shadow_proposals(
-            executable, now, counterfactual=True, exclude=selected
+            order_authorized, now, counterfactual=True, exclude=selected
         )
 
         legacy_selected = selected
@@ -2648,7 +2747,7 @@ class StrategySessionManager:
         v2_context_id: str | None = None
         if v2_had_authority:
             v2_selected, v2_context_id = self._selector_v2_live_choice(
-                v2_authorized_results, proposals
+                v2_authorized_results, admissible_proposals
             )
             selected = v2_selected
             if selected is None:
@@ -2685,6 +2784,8 @@ class StrategySessionManager:
             # A selector ran and chose nothing; it owns the reason string.
             if v2_had_authority:
                 self._state.last_reason = "SELECTOR_V2_NO_TRADE"
+            if order_authorized and not executable:
+                self._state.last_reason = "STRATEGY_PERFORMANCE_SHADOW_ONLY"
             return
         if proposals:
             self._state.last_reason = (
@@ -3691,6 +3792,65 @@ class StrategySessionManager:
             return False
 
         entry = _optional_float(proposal.entry_price)
+        if self.ontology_policy_resolver is not None:
+            from app.risk.ontology_thresholds import OntologyRiskPolicy, POLICY_FAMILY_VERSION
+
+            if entry is None or not math.isfinite(entry) or entry <= 0:
+                return reject("EXIT_CONTRACT_ENTRY_PRICE_MISSING")
+            original = dict(proposal.exit_contract)
+            horizon = original.get("policy_requested_horizon_seconds", proposal.max_holding_seconds)
+            forecast = original.get("forecast_gross_bps", proposal.predicted_gross_edge_bps(
+                self.config.fallback_round_trip_cost_bps
+            ))
+            cost = proposal.resolved_cost_bps(self.config.fallback_round_trip_cost_bps)
+            try:
+                policy = self.ontology_policy_resolver(
+                    symbol=proposal.symbol, market=market_for_symbol(proposal.symbol), now=now,
+                    all_in_cost_rate=float(cost) / 10000., forecast_gross_bps=forecast,
+                    requested_horizon_seconds=horizon,
+                )
+                if not isinstance(policy, OntologyRiskPolicy) or not policy.is_current(now):
+                    return reject("SHADOW_POLICY_UNAVAILABLE_OR_STALE")
+                if policy.symbol.upper() != proposal.symbol.upper() or policy.market != market_for_symbol(proposal.symbol):
+                    return reject("SHADOW_POLICY_SCOPE_MISMATCH")
+                # An uneconomic forecast may still be studied with defined barriers.
+                # Missing/stale market evidence cannot create promotable geometry.
+                if set(policy.reason_codes) - {"POLICY_NET_REWARD_INSUFFICIENT"}:
+                    return reject("SHADOW_POLICY_EVIDENCE_INVALID", reasons=list(policy.reason_codes))
+                if not all(math.isfinite(float(value)) and float(value) > 0 for value in (
+                    policy.target_return_rate, policy.soft_stop_rate,
+                    policy.trailing_stop_rate, policy.maximum_holding_seconds,
+                )):
+                    return reject("SHADOW_POLICY_GEOMETRY_INVALID")
+            except Exception as exc:
+                return reject(f"SHADOW_POLICY_RESOLUTION_FAILED:{type(exc).__name__}")
+            proposal.ontology_entry_permitted = bool(
+                policy.valid_for_entry and forecast is not None
+                and math.isfinite(float(forecast)) and float(forecast) > 0
+            )
+            if not proposal.ontology_entry_permitted:
+                proposal.ontology_reason_codes = list(dict.fromkeys(
+                    (*proposal.ontology_reason_codes, "ONTOLOGY_RESEARCH_ONLY")
+                ))
+            proposal.target_return_rate = policy.target_return_rate
+            proposal.stop_loss_rate = policy.soft_stop_rate
+            proposal.trailing_stop_rate = policy.trailing_stop_rate
+            proposal.max_holding_seconds = policy.maximum_holding_seconds
+            proposal.exit_contract = {
+                "resolved_at": _iso(now), "policy_id": policy.policy_id,
+                "risk_policy_family": POLICY_FAMILY_VERSION,
+                "policy_requested_horizon_seconds": horizon,
+                "forecast_gross_bps": forecast, "forecast_basis": "original_strategy_forecast",
+                "target_basis": "ontology_market_policy", "stop_basis": "ontology_market_policy",
+                "target_bps": policy.target_return_rate * 10000.,
+                "stop_bps": policy.soft_stop_rate * 10000.,
+                "trailing_bps": policy.trailing_stop_rate * 10000.,
+                "max_holding_seconds": policy.maximum_holding_seconds,
+                "expected_cost_bps": cost,
+                "ontology_entry_permitted": proposal.ontology_entry_permitted,
+                "ontology_risk_policy": policy.as_dict(),
+            }
+            return True
         row = proposal.evidence_row
         raw = row.get("technical_features") if isinstance(row, Mapping) else None
         if not isinstance(raw, Mapping):
@@ -4122,6 +4282,12 @@ class StrategySessionManager:
             return
         recorded: list[str] = []
         pending: list[Any] = []
+        graph_contexts: dict[str, Any] = {}
+        if callable(self.graph_training_context_provider):
+            # Feature capture occurs during the cycle, after its starting `now`.
+            # Journal and look up at one actual decision timestamp so a later
+            # capture can never be backdated into a historical training label.
+            now = max(now, datetime.now(timezone.utc))
         for proposal in proposals:
             if counterfactual:
                 # The winner's outcome comes from its real fill; journaling it here
@@ -4138,6 +4304,12 @@ class StrategySessionManager:
                 continue
             try:
                 key = proposal.directional_key(market_for_symbol(proposal.symbol))
+                if callable(self.graph_training_context_provider) and self.ontology_policy_resolver is not None:
+                    frozen_policy = proposal.exit_contract.get("ontology_risk_policy") or {}
+                    policy_at = _parse_time(frozen_policy.get("as_of"))
+                    policy_until = _parse_time(frozen_policy.get("expires_at"))
+                    if policy_at is None or policy_until is None or not policy_at <= now <= policy_until:
+                        continue
                 spacing_seconds = max(
                     self.config.shadow_signal_cooldown_seconds,
                     min(int(proposal.max_holding_seconds), 900),
@@ -4148,6 +4320,24 @@ class StrategySessionManager:
                     since=now - timedelta(seconds=spacing_seconds),
                 ):
                     continue
+                # Capture only the graph context available at this decision. A
+                # missing context leaves an auditable shadow plan but no training
+                # label; it must never be reconstructed from later market data.
+                graph_context = None
+                if callable(self.graph_training_context_provider):
+                    if proposal.symbol not in graph_contexts:
+                        try:
+                            supplied = self.graph_training_context_provider(proposal.symbol, as_of=now)
+                            graph_contexts[proposal.symbol] = (
+                                json.loads(json.dumps(dict(supplied), allow_nan=False))
+                                if isinstance(supplied, Mapping) else None
+                            )
+                        except Exception:  # A missing context cannot disrupt election.
+                            graph_contexts[proposal.symbol] = None
+                    graph_context = graph_contexts[proposal.symbol]
+                diagnostics = {"exit_contract": dict(proposal.exit_contract)}
+                if graph_context is not None:
+                    diagnostics["graph_training_context"] = graph_context
                 plan = ShadowTradePlan(
                     plan_id="",
                     key=key,
@@ -4168,7 +4358,7 @@ class StrategySessionManager:
                         self.config.fallback_round_trip_cost_bps,
                     ),
                     predicted_success_probability=proposal.confidence or None,
-                    regime=self._state.macro_regime or "UNKNOWN",
+                    regime=proposal.macro_regime or self._state.macro_regime or "UNKNOWN",
                     signal_reason_codes=(
                         (*proposal.ontology_reason_codes, _COUNTERFACTUAL_REASON_CODE)
                         if counterfactual
@@ -4177,6 +4367,8 @@ class StrategySessionManager:
                     borrow_snapshot=proposal.borrow_snapshot,
                     borrow_reason_codes=proposal.borrow_reason_codes,
                     deployment_state=str(proposal.deployment_state),
+                    feature_snapshot_id=str((graph_context or {}).get("feature_snapshot_id") or ""),
+                    diagnostics=diagnostics,
                 )
             except Exception:  # noqa: BLE001
                 continue
@@ -4305,22 +4497,63 @@ class StrategySessionManager:
         self._state.strategy_evaluation_branch_count = 0
         self._state.strategy_evaluation_duration_ms = None
 
+    def _performance_admissible(
+        self, proposals: list["_ElectionProposal"], now: datetime,
+    ) -> list["_ElectionProposal"]:
+        """Performance evidence precedes all ranking postures, including GNN-direct.
+
+        Rejected arms remain counterfactual shadow candidates so fresh evidence
+        can demonstrate recovery without spending cash on known losing setups.
+        """
+        admitted: list[_ElectionProposal] = []
+        reports: list[dict[str, Any]] = []
+        for proposal in proposals:
+            report = self._strategy_adaptation.assess(
+                proposal.strategy_id, market=market_for_symbol(proposal.symbol),
+                regime=proposal.macro_regime or self._state.macro_regime,
+                now=now, direction=str(proposal.direction),
+                execution_product=str(proposal.execution_product),
+                deployment_state=str(proposal.deployment_state),
+                change_point_probability=self._state.change_point_probability or 0.0,
+                required_policy_family=(
+                    str(proposal.exit_contract.get("risk_policy_family") or "ontology-risk-v1")
+                    if self.ontology_policy_resolver is not None else None
+                ),
+            )
+            reports.append({"symbol": proposal.symbol, **report.as_dict()})
+            if report.live_entry_allowed:
+                admitted.append(proposal)
+        self._state.performance_assessments = reports
+        return admitted
+
     def _gnn_direct_choice(
         self,
         executable: list["_ElectionProposal"],
         _now: datetime | None = None,
-    ) -> "_ElectionProposal":
-        """Arm the GNN's own top pick. Always returns a proposal -- never NO_TRADE.
+    ) -> "_ElectionProposal | None":
+        """Rank usable positive model estimates after performance admissibility.
 
         Ranking mirrors ``StrategyRouter``: highest forward net edge first, then
         the model's score and confidence, then the id so the choice is stable
-        across cycles. ``gnn_actionable`` proposals outrank ones the model could
-        not speak to at all -- honouring the model's pick presupposes it made one.
+        across cycles. An unavailable estimate cannot win by default.
 
-        No pessimistic bound, no realized-history posterior, no regime discount:
-        the edge is taken at face value, which is the whole point of the posture.
+        Missing or non-positive estimates select cash. Historical performance
+        admissibility is shared with every election path before this method.
         """
         self._reset_bandit_diagnostics()
+        executable = [
+            proposal for proposal in executable
+            if proposal.gnn_actionable
+            and (edge := proposal.predicted_net_edge_bps(
+                0.0, self.config.fallback_round_trip_cost_bps
+            )) is not None
+            and math.isfinite(float(edge)) and float(edge) > 0.0
+        ]
+        if not executable:
+            self._state.last_reason = "GNN_DIRECT_NO_POSITIVE_ESTIMATE"
+            self._state.bandit_selected_arm = "no_trade"
+            self._state.bandit_reason_codes = ["GNN_DIRECT_NO_POSITIVE_ESTIMATE"]
+            return None
 
         def key(proposal: "_ElectionProposal") -> tuple[int, float, float, float, str]:
             edge = proposal.predicted_net_edge_bps(
@@ -4573,6 +4806,7 @@ class StrategySessionManager:
             gnn_reason_codes=list(proposal.gnn_reason_codes),
             explanation_paths=list(proposal.explanation_paths),
             candidate_diagnostics=list(self._state.candidate_diagnostics),
+            performance_assessments=list(self._state.performance_assessments),
             algorithm_evaluations=list(self._state.algorithm_evaluations),
             bandit_selected_arm=self._state.bandit_selected_arm,
             bandit_conservative_edge_bps=proposal.conservative_edge_bps,
@@ -4617,6 +4851,11 @@ class StrategySessionManager:
         # fatal to the election: the session still owns the symbol, and the legacy
         # evaluate_buy path (which still runs its own gates) handles it.
         self._trade_plan = self._build_trade_plan(proposal, now, account=account)
+        if self.ontology_policy_resolver is not None and self._trade_plan is None:
+            self._state.phase = "SCANNING"
+            self._state.selected_symbol = None
+            self._state.selected_strategy = None
+            return False
         if self._trade_plan is not None:
             self._state.trade_plan_id = self._trade_plan.plan_id
             self._state.trade_plan_quantity = self._trade_plan.quantity

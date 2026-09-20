@@ -45,6 +45,8 @@ class StrategyUtilityModelConfig:
     strategy_count: int
     hidden_dim: int = 16
     seed: int = 7
+    # 1: node_mask carries causal elapsed-time weights, already normalised.
+    temporal_mode: int = 0
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,8 @@ class FixedShapeStrategyUtilityModel:
             0, 1 / max(1, config.hidden_dim) ** 0.5, (config.hidden_dim,)
         ).astype(np.float32)
         temporal = np.arange(1, config.time_steps + 1, dtype=np.float32)
-        self.temporal_weights = temporal / temporal.sum()
+        self.temporal_weights = (np.ones(config.time_steps, dtype=np.float32)
+                                 if config.temporal_mode == 1 else temporal / temporal.sum())
 
     def save_checkpoint(self, path: str | Path) -> Path:
         target = Path(path)
@@ -109,6 +112,7 @@ class FixedShapeStrategyUtilityModel:
                     self.config.strategy_count,
                     self.config.hidden_dim,
                     self.config.seed,
+                    self.config.temporal_mode,
                 ],
                 dtype=np.int64,
             ),
@@ -126,10 +130,10 @@ class FixedShapeStrategyUtilityModel:
 
     @classmethod
     def load_checkpoint(cls, path: str | Path) -> FixedShapeStrategyUtilityModel:
-        source = Path(path)
+        source = path if hasattr(path, "read") else Path(path)
         with np.load(source, allow_pickle=False) as data:
             values = tuple(int(value) for value in data["config"].tolist())
-            if len(values) != 8:
+            if len(values) not in (8, 9):
                 raise ValueError("invalid strategy utility checkpoint config")
             model = cls(StrategyUtilityModelConfig(*values))
             for name in (
@@ -218,6 +222,8 @@ class FixedShapeStrategyUtilityModel:
             for value in (x, adjacency, node_mask, strategy_mask)
         ):
             raise ValueError("model inputs must be finite")
+        if np.any(node_mask < 0) or np.any(node_mask > 1):
+            raise ValueError("node masks must lie in [0, 1]")
 
 
 def output_from_raw(

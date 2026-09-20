@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from dataclasses import replace
 from math import floor
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from app.data.instrument_eligibility import CATEGORY_LEVERAGED_ETP as INSTRUMENT
 from app.data.instrument_eligibility import classify as classify_instrument
 from app.data.source_policy import compute_quality_score, default_trust_level, infer_source_type
 from app.portfolio import build_portfolio_report, valuation_complete
+from app.risk.ontology_thresholds import OntologyRiskPolicy
 from app.risk.principal_protection import PrincipalProtectionEngine, to_jsonable
 from app.schemas.domain import (
     AccountSnapshot,
@@ -40,8 +42,9 @@ from app.quant.contracts import QuantEvidence
 
 
 class RiskManager:
-    def __init__(self, rules: RiskRules | None = None, audit_logger: AuditLogger | None = None) -> None:
+    def __init__(self, rules: RiskRules | None = None, audit_logger: AuditLogger | None = None, *, ontology_policy_required: bool = False) -> None:
         self.rules = rules or RiskRules()
+        self.ontology_policy_required = ontology_policy_required
         self.cost_engine = TradingCostEngine()
         self._profitability_gate = ProfitabilityGate(cost_engine=self.cost_engine)
         self.principal_protection = PrincipalProtectionEngine()
@@ -58,26 +61,61 @@ class RiskManager:
         trades_today: int = 0,
         existing_pending_tickers: set[str] | None = None,
         quant_evidence: tuple[QuantEvidence, ...] = (),
+        *,
+        ontology_policy: OntologyRiskPolicy | None = None,
+        now: datetime | None = None,
     ) -> RiskManagerResult:
+        moment = now or datetime.now(timezone.utc)
+        moment = moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+        rules = self.rules
+        opening = _parse_effect(intent) == "OPEN"
+        policy_ok = isinstance(ontology_policy, OntologyRiskPolicy)
+        if policy_ok:
+            expected_market = "US" if account_is_overseas_market(market) else "KR"
+            policy_ok = (
+                ontology_policy.market == expected_market
+                and ontology_policy.symbol.upper() == intent.ticker.upper()
+                and ontology_policy.valid_for_entry
+                and ontology_policy.is_current(moment)
+            )
+        if opening and policy_ok:
+            rules = replace(rules, **{
+                "daily_loss_stop": min(rules.daily_loss_stop, ontology_policy.daily_loss_budget_rate),
+                "max_trades_per_day": min(rules.max_trades_per_day, ontology_policy.max_trades_per_day),
+                "max_single_stock_weight": min(rules.max_single_stock_weight, ontology_policy.position_cap),
+                "max_intraday_position_weight": min(rules.max_intraday_position_weight, ontology_policy.position_cap),
+                "max_sector_weight": min(rules.max_sector_weight, ontology_policy.sector_cap),
+                "minimum_cash_reserve": max(rules.minimum_cash_reserve, ontology_policy.minimum_cash_reserve),
+                "max_quote_age_seconds": min(rules.max_quote_age_seconds, ontology_policy.max_quote_age_seconds),
+                "principal_protection": replace(rules.principal_protection,
+                    per_trade_risk_budget_ratio=min(rules.principal_protection.per_trade_risk_budget_ratio, ontology_policy.trade_loss_budget_rate),
+                    daily_risk_budget_ratio=min(rules.principal_protection.daily_risk_budget_ratio, ontology_policy.daily_loss_budget_rate),
+                ),
+            })
         existing_pending_tickers = existing_pending_tickers or set()
         report = build_portfolio_report(account)
         checks: dict[str, bool] = {}
         reasons: list[str] = []
         metadata: dict[str, object] = {}
         rejection_log: list[dict[str, object]] = []
+        if opening and (self.ontology_policy_required or ontology_policy is not None):
+            checks["ontology_policy_current"] = policy_ok
+            if isinstance(ontology_policy, OntologyRiskPolicy):
+                metadata["ontology_risk_policy"] = ontology_policy.as_dict()
+
 
         checks["llm_direct_order_execution_blocked"] = (
-            not self.rules.llm_direct_order_execution_allowed
+            not rules.llm_direct_order_execution_allowed
         )
         checks["live_trading_mode_allowed"] = True
         checks["allowed_action"] = intent.action in {OrderAction.BUY, OrderAction.SELL, OrderAction.REDUCE}
-        checks["valid_limit_order_mode"] = self.rules.order_type == OrderType.LIMIT
-        checks["daily_loss_limit"] = report.daily_pnl_ratio > -self.rules.daily_loss_stop
-        checks["trade_count_limit"] = trades_today < self.rules.max_trades_per_day
+        checks["valid_limit_order_mode"] = rules.order_type == OrderType.LIMIT
+        checks["daily_loss_limit"] = report.daily_pnl_ratio > -rules.daily_loss_stop
+        checks["trade_count_limit"] = trades_today < rules.max_trades_per_day
         checks["liquidity_check"] = (
-            market.average_daily_trading_value >= self.rules.min_average_daily_trading_value
+            market.average_daily_trading_value >= rules.min_average_daily_trading_value
         )
-        checks["volatility_check"] = market.volatility_20d <= self.rules.max_volatility
+        checks["volatility_check"] = market.volatility_20d <= rules.max_volatility
         checks["duplicate_order_check"] = intent.ticker not in existing_pending_tickers
         checks["data_integrity_check"] = bool(intent.source_data_ids) and market.last_price > 0
         checks["currency_valuation_complete"] = (
@@ -107,9 +145,9 @@ class RiskManager:
         # Short selling and credit borrow are removed from this set precisely because
         # they now DO have an execution path and their own per-order gates below.
         checks["unsupported_products_blocked"] = (
-            not self.rules.margin_trading_allowed
-            and not self.rules.derivatives_allowed
-            and not self.rules.leverage_etf_allowed
+            not rules.margin_trading_allowed
+            and not rules.derivatives_allowed
+            and not rules.leverage_etf_allowed
         )
         # The per-order half the comment above used to say was impossible. It is now
         # possible because ``app.data.instrument_eligibility`` can classify a listing
@@ -132,13 +170,13 @@ class RiskManager:
         )
         metadata["instrument_category"] = instrument.category
         if instrument.category == INSTRUMENT_ETF:
-            checks["instrument_permitted"] = bool(self.rules.etf_trading_allowed)
+            checks["instrument_permitted"] = bool(rules.etf_trading_allowed)
         elif instrument.tradable:
             checks["instrument_permitted"] = True
         elif instrument.category == INSTRUMENT_LEVERAGED_ETP:
-            checks["instrument_permitted"] = bool(self.rules.leverage_etf_allowed)
+            checks["instrument_permitted"] = bool(rules.leverage_etf_allowed)
         elif instrument.category in {INSTRUMENT_DERIVATIVE, INSTRUMENT_ETN}:
-            checks["instrument_permitted"] = bool(self.rules.derivatives_allowed)
+            checks["instrument_permitted"] = bool(rules.derivatives_allowed)
         else:
             # An unsupported code shape is not a permission question: the execution
             # layer cannot construct the order whatever the account may hold.
@@ -155,10 +193,10 @@ class RiskManager:
         # position. De-risking is never blocked here, exactly as SELL/REDUCE of a long
         # never was.
         checks["short_selling_policy_check"] = (
-            not is_short_entry or self.rules.short_selling_allowed
+            not is_short_entry or rules.short_selling_allowed
         )
         checks["credit_borrow_policy_check"] = (
-            product != "CREDIT_BORROW" or not is_short_entry or self.rules.credit_loan_allowed
+            product != "CREDIT_BORROW" or not is_short_entry or rules.credit_loan_allowed
         )
         # Every field of the order contract must be present and mutually consistent.
         # An order that cannot say what it is must not be sent.
@@ -175,7 +213,7 @@ class RiskManager:
         )
         checks["strategy_family_present"] = intent.action != OrderAction.BUY or bool(intent.strategy_family)
         checks["live_validation_id_present"] = (
-            not self.rules.live_trading_enabled
+            not rules.live_trading_enabled
             or intent.action != OrderAction.BUY
             or bool(intent.validation_id)
         )
@@ -185,7 +223,7 @@ class RiskManager:
         # (e.g. a warrant whose order book is empty), so buying them traps capital.
         # SELL/REDUCE of an already-held position is never blocked here.
         checks["tradable_instrument_type"] = (
-            self.rules.warrant_unit_buys_allowed
+            rules.warrant_unit_buys_allowed
             or intent.action != OrderAction.BUY
             or not _is_non_common_equity_ticker(intent.ticker)
         )
@@ -196,33 +234,33 @@ class RiskManager:
         source_trust = source.trust_level if source.trust_level > 0 else default_trust_level(source_type)
         quality_score = source.quality_score if source.quality_score > 0 else compute_quality_score(source)
         observed_at = source.observed_at or source.retrieved_at
-        quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - observed_at).total_seconds())
-        live_mode = self.rules.live_trading_enabled
-        checks["source_trust_check"] = (not live_mode) or source_trust >= self.rules.min_source_trust_level
-        checks["data_quality_check"] = (not live_mode) or quality_score >= self.rules.min_data_quality_score
+        quote_age_seconds = max(0.0, (moment - observed_at).total_seconds())
+        live_mode = rules.live_trading_enabled
+        checks["source_trust_check"] = (not live_mode) or source_trust >= rules.min_source_trust_level
+        checks["data_quality_check"] = (not live_mode) or quality_score >= rules.min_data_quality_score
         checks["synthetic_data_blocked"] = (
             not live_mode
-            or self.rules.synthetic_live_data_allowed
+            or rules.synthetic_live_data_allowed
             or (not source.is_synthetic and source_type not in {"synthetic", "sample"})
         )
         checks["quote_freshness_check"] = (
             not live_mode
-            or quote_age_seconds <= self.rules.max_quote_age_seconds
+            or quote_age_seconds <= rules.max_quote_age_seconds
         )
         checks["model_uncertainty_check"] = (
             intent.model_uncertainty is None
-            or intent.model_uncertainty <= self.rules.max_model_uncertainty
+            or intent.model_uncertainty <= rules.max_model_uncertainty
         )
         checks["unknown_source_check"] = (
             not live_mode
-            or self.rules.unknown_source_live_allowed
+            or rules.unknown_source_live_allowed
             or source_type != "unknown"
         )
 
         adjusted_weight = min(
             intent.suggested_weight,
-            self.rules.max_single_stock_weight,
-            self.rules.max_intraday_position_weight if intent.action == OrderAction.BUY else self.rules.max_single_stock_weight,
+            rules.max_single_stock_weight,
+            rules.max_intraday_position_weight if intent.action == OrderAction.BUY else rules.max_single_stock_weight,
         )
         quant_factor, quant_reasons = quant_risk_factor(
             quant_evidence,
@@ -261,15 +299,15 @@ class RiskManager:
         # marks its sector as fully exposed, which must not strand a short cover.
         # Cash, order contract and borrow-lot quantity checks still apply below.
         reduces_exposure = effect == "CLOSE" and checks["order_contract_complete"]
-        checks["max_single_stock_weight"] = reduces_exposure or adjusted_weight <= self.rules.max_single_stock_weight
+        checks["max_single_stock_weight"] = reduces_exposure or adjusted_weight <= rules.max_single_stock_weight
         checks["max_intraday_position_weight"] = (
             reduces_exposure
             or intent.action != OrderAction.BUY
-            or adjusted_weight <= self.rules.max_intraday_position_weight
+            or adjusted_weight <= rules.max_intraday_position_weight
         )
         checks["max_sector_weight"] = (
             reduces_exposure
-            or projected_sector_weight <= self.rules.max_sector_weight
+            or projected_sector_weight <= rules.max_sector_weight
             or (
                 intent.action in {OrderAction.SELL, OrderAction.REDUCE}
                 and projected_sector_weight <= current_sector_weight
@@ -292,8 +330,19 @@ class RiskManager:
             buy_amount = float(market.last_price)
         projected_cash = cash_available_for_market - buy_amount
         checks["deposit_limit_check"] = buy_amount <= cash_available_for_market
-        required_reserve = 0.0 if reduces_exposure else equity_for_sizing * self.rules.minimum_cash_reserve
+        required_reserve = 0.0 if reduces_exposure else equity_for_sizing * rules.minimum_cash_reserve
         checks["cash_available"] = projected_cash >= required_reserve
+
+        if reduces_exposure:
+            # Entry opportunity gates must never strand an existing cash holding
+            # or a verified borrow-lot cover. Executable price, quantity, cash for
+            # covers, source integrity and account contract checks still apply.
+            for entry_check in (
+                "daily_loss_limit", "trade_count_limit", "liquidity_check", "volatility_check",
+                "model_uncertainty_check", "ontology_trade_not_forbidden",
+                "expected_exit_price_present", "strategy_family_present", "live_validation_id_present",
+            ):
+                checks[entry_check] = True
 
         for check, ok in checks.items():
             if not ok:
@@ -378,7 +427,7 @@ class RiskManager:
                     OrderSide.SELL,
                     short_quantity,
                     reasons,
-                    self.rules.manual_approval_required,
+                    rules.manual_approval_required,
                     position_direction="SHORT",
                     position_effect="OPEN",
                     execution_product="CREDIT_BORROW",
@@ -408,7 +457,7 @@ class RiskManager:
                     OrderSide.BUY,
                     cover_quantity,
                     reasons,
-                    self.rules.manual_approval_required,
+                    rules.manual_approval_required,
                     position_direction="SHORT",
                     position_effect="CLOSE",
                     execution_product="CREDIT_BORROW",
@@ -418,7 +467,9 @@ class RiskManager:
                 approved = final_order is not None
         elif approved and intent.action == OrderAction.BUY:
             spend = buy_amount
-            quantity = floor(spend / market.last_price)
+            # Undo at most one representational ULP lost by equity*weight;
+            # actual cash, cost and generated notional ceilings are checked below.
+            quantity = floor(math.nextafter(spend / market.last_price, math.inf))
             metadata["estimated_order_quantity"] = quantity
             metadata["minimum_one_share_cash_required"] = float(market.last_price)
             small_account_enabled = _env_bool("REALTIME_SMALL_ACCOUNT_MODE", False)
@@ -465,7 +516,7 @@ class RiskManager:
                     account.holdings,
                     market,
                     cost,
-                    self.rules.principal_protection,
+                    rules.principal_protection,
                     proposed_quantity=quantity,
                 )
                 metadata["principal_protection"] = to_jsonable(protection)
@@ -547,7 +598,8 @@ class RiskManager:
                         average_daily_trading_value=market.average_daily_trading_value,
                         account_equity_krw=float(getattr(account, "equity", 0.0) or 0.0),
                         target_net_return=intent.target_net_return,
-                    )
+                    ),
+                    **({"ontology_policy": ontology_policy, "now": moment} if policy_ok else {}),
                 )
                 metadata["profitability_decision"] = decision.as_dict()
                 checks["profitability_gate"] = decision.allowed
@@ -589,7 +641,7 @@ class RiskManager:
                     OrderSide.BUY,
                     quantity,
                     reasons,
-                    self.rules.manual_approval_required,
+                    rules.manual_approval_required,
                 )
                 approved = final_order is not None
         elif approved and intent.action in {OrderAction.SELL, OrderAction.REDUCE}:
@@ -606,19 +658,26 @@ class RiskManager:
                     for holding in account.holdings
                     if holding.ticker == intent.ticker and not holding.is_short
                 )
-                quantity = min(quantity, held_quantity)
+                quantity = held_quantity if intent.action == OrderAction.SELL else min(quantity, held_quantity)
                 final_order = _final_order_or_reject(
                     intent,
                     market,
                     OrderSide.SELL,
                     quantity,
                     reasons,
-                    self.rules.manual_approval_required,
+                    rules.manual_approval_required,
                 )
                 approved = final_order is not None
         elif approved:
             approved = False
             _add_rejection(reasons, rejection_log, "action_requires_no_order", "action_requires_no_order")
+
+        if approved and opening and policy_ok and final_order is not None:
+            # Integer-lot rounding may not enlarge the generated position budget.
+            if final_order.quantity * market.last_price > equity_for_sizing * ontology_policy.position_cap + 1e-8:
+                approved, final_order = False, None
+                checks["ontology_position_budget"] = False
+                _add_rejection(reasons, rejection_log, "ONTOLOGY_POSITION_BUDGET_EXCEEDED", "ontology_position_budget")
 
         for reason in reasons:
             if not any(item.get("reason") == reason for item in rejection_log):

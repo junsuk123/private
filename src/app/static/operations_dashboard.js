@@ -84,6 +84,39 @@
     text('runtime-note', row.fallback_reason || model.reason || '관측된 실행 장치 기준입니다. 새 모델은 검증 결과에 따라 반영됩니다.');
   }
 
+  function renderPolicies(trading, connected = true) {
+    const target = $('ontology-policies');
+    if (!target) return;
+    const snapshot = trading?.ontology_policy || {};
+    const records = Object.values(snapshot.policies || {}).filter((item) => item && typeof item.policy === 'object');
+    const selected = trading?.selected_symbol;
+    const selectedRows = ['KR', 'US'].map((market) => {
+      const matches = records.filter((item) => item.policy.market === market);
+      return matches.find((item) => item.policy.symbol === selected) || matches.sort((a, b) => String(b.policy.as_of || '').localeCompare(String(a.policy.as_of || '')))[0];
+    }).filter(Boolean);
+    if (!selectedRows.length) {
+      target.innerHTML = '<p class="empty">분석된 정책이 아직 없습니다. 새 관측이 쌓이면 종목별 기준을 표시합니다.</p>';
+      return;
+    }
+    const percent = (value) => numeric(value) === null ? '확인 대기' : `${number(Number(value) * 100, 3)}%`;
+    const policyReasons = { POLICY_MARKET_CONTEXT_UNKNOWN: '시장 분석 부족', POLICY_QUOTE_STALE: '시세 만료', POLICY_SPREAD_TOO_WIDE: '호가 간격 과다', POLICY_NET_REWARD_INSUFFICIENT: '비용 차감 후 기대수익 부족', POLICY_VOLATILITY_HORIZON_UNKNOWN: '변동성 측정 구간 미확인', ONTO_POLICY_CONTEXT_UNAVAILABLE: '시장 분석 대기', ONTO_POLICY_BAR_READ_FAILED: '분봉 관측 대기', ONTO_POLICY_BOOK_READ_FAILED: '호가 관측 대기' };
+    target.innerHTML = selectedRows.map(({ policy, projection }) => {
+      const at = Date.parse(policy.as_of || '');
+      const until = Date.parse(policy.expires_at || '');
+      const fresh = connected && Number.isFinite(at) && Number.isFinite(until) && at <= Date.now() && Date.now() <= until;
+      const ready = fresh && policy.valid_for_entry === true;
+      const evidence = Array.isArray(policy.evidence) ? policy.evidence : [];
+      const sources = [...new Set(evidence.map((item) => item.source).filter(Boolean))];
+      const references = [...new Set(evidence.flatMap((item) => Array.isArray(item.derived_from) ? item.derived_from : []))];
+      const targetNet = numeric(policy.target_return_rate) !== null && numeric(policy.all_in_cost_rate) !== null ? Number(policy.target_return_rate) - Number(policy.all_in_cost_rate) : null;
+      const metrics = [['목표 순수익률', percent(targetNet)], ['강제 손절 기준', percent(policy.hard_stop_rate)], ['추적 손절 폭', percent(policy.trailing_stop_rate)], ['최대 보유 시간', numeric(policy.maximum_holding_seconds) === null ? '확인 대기' : `${number(policy.maximum_holding_seconds / 60, 1)}분`], ['종목 비중 한도', percent(policy.position_cap)], ['하루 손실 예산', percent(policy.daily_loss_budget_rate)], ['분석 신뢰도', percent(policy.confidence)], ['조기 탈출 확인', numeric(policy.early_exit_confirmations) === null ? '확인 대기' : `${number(policy.early_exit_confirmations)}회`]];
+      const reasonsList = Array.isArray(policy.reason_codes) ? policy.reason_codes : [];
+      const explanations = reasonsList.slice(0, 4).map((reason) => policyReasons[reason] || (String(reason).includes('MISSING:') ? `관측 부족: ${String(reason).split(':').pop()}` : reason));
+      const link = `/api/ontology/policy/${encodeURIComponent(policy.market)}/${encodeURIComponent(policy.symbol)}`;
+      return `<article class="policy-card"><div class="market-heading"><h3>${escape(policy.market)} · ${escape(policy.symbol)}</h3><span class="badge ${ready ? 'good' : 'warn'}">${!connected ? '연결 지연 · 재확인 필요' : !fresh ? '만료 · 재분석 필요' : ready ? '정책 조건 충족' : '신규 진입 대기'}</span></div><p class="market-source">${escape(policy.regime || '시장 국면 미확인')} · ${escape(clock(policy.as_of))} 생성<br>${escape(clock(policy.expires_at))}까지 유효</p><dl class="policy-metrics">${metrics.map(([label, value]) => `<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl><p class="source-note">${escape(explanations.join(' · ') || '비용·유동성·변동성에 따라 다음 분석에서 갱신됩니다.')}</p><details><summary>관측 근거 ${evidence.length}개 · ${escape(policy.policy_id || '정책 ID 대기')}</summary><p class="source-note">${escape(sources.join(' · '))}</p><p class="source-note">분석 ID: ${escape(policy.evidence_id || projection?.context_id || '확인 대기')}<br>${references.slice(0, 4).map(escape).join('<br>')}${references.length > 4 ? `<br>외 ${references.length - 4}개 근거` : ''}</p><a href="${link}" download>종목별 온톨로지 근거 ↓</a></details></article>`;
+    }).join('');
+  }
+
   async function fetchJson(url) {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 8000);
@@ -107,7 +140,7 @@
         else state.failures.push(index === 0 ? '운영 상태' : '계좌');
       });
       if (results[0].status === 'fulfilled') {
-        renderMarkets(state.operations.markets); renderTrading(state.operations.trading); renderRuntime(state.operations.runtime);
+        renderMarkets(state.operations.markets); renderTrading(state.operations.trading); renderRuntime(state.operations.runtime); renderPolicies(state.operations.trading);
         state.lastSuccess = state.operations.generated_at || new Date().toISOString();
       }
       renderAccount(state.failures.includes('계좌') && state.account ? { ...state.account, authoritative: false, is_stale: true } : state.account);
@@ -115,6 +148,7 @@
       text('connection', state.failures.length ? `${state.failures.join(' · ')} 연결 지연 · 마지막 확인값 표시` : '연결됨 · 5초 간격 확인');
       $('connection').className = state.failures.length ? 'stale' : '';
       if (state.failures.includes('운영 상태')) {
+        renderPolicies(state.operations?.trading, false);
         $('verdict').className = 'verdict';
         text('blocker-title', '운영 상태 연결 지연');
         text('blocker-detail', '마지막 진단을 표시하고 있습니다. 현재 주문 권한과 시장 상태는 확인할 수 없습니다.');
@@ -124,7 +158,7 @@
   }
   function schedule() { window.clearTimeout(state.timer); state.timer = window.setTimeout(async () => { await refresh(); schedule(); }, 5000); }
   // Small pure formatting hooks support offline contract tests without a server.
-  if (typeof module !== 'undefined' && module.exports) module.exports = { numeric, number, money, escape, renderAccount, renderMarkets, renderTrading, renderRuntime, refresh, state };
+  if (typeof module !== 'undefined' && module.exports) module.exports = { numeric, number, money, escape, renderAccount, renderMarkets, renderTrading, renderRuntime, renderPolicies, refresh, state };
   if (typeof document !== 'undefined' && $('refresh')) {
     $('refresh').addEventListener('click', refresh);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });

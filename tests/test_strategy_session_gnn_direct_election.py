@@ -1,10 +1,4 @@
-"""GNN-direct election: the model's pick is armed without a second opinion.
-
-The posture exists because an operator holds that a model trained to select the
-best strategy should not then be re-judged by the layers below it. These tests
-pin what that actually changes, including the part that is a loss of protection
--- a posture whose downside is untested is a posture nobody can evaluate later.
-"""
+"""GNN-direct ranking respects realized losses and requires a model estimate."""
 
 from __future__ import annotations
 
@@ -138,14 +132,8 @@ def _losing_store(tmp_path) -> StrategyPerformanceStore:
     return store
 
 
-def test_direct_election_arms_what_the_bandit_would_have_refused(tmp_path):
-    """The defining difference, stated as a loss of protection.
-
-    Same losing history that produces NO_TRADE under the bandit. Under this
-    posture it arms instead. If this test ever passes for the wrong reason --
-    say the history stopped being negative -- the sibling test below fails too,
-    so the pair cannot both drift into vacuous agreement.
-    """
+def test_direct_election_cannot_override_demonstrated_cash_losses(tmp_path):
+    """The model-ranking posture no longer bypasses realized net evidence."""
     manager = _manager(
         tmp_path,
         store=_losing_store(tmp_path),
@@ -153,12 +141,13 @@ def test_direct_election_arms_what_the_bandit_would_have_refused(tmp_path):
     )
     state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
 
-    assert state["phase"] == "ARMED"
-    assert state["selected_strategy"] == "intraday_momentum"
-    assert "GNN_DIRECT_ELECTION" in state["bandit_reason_codes"]
-    # Never labelled exploration: this is a conviction pick, and calling it a
-    # probe would let a loss read as a deliberate minimum-size experiment.
-    assert state["bandit_is_exploration"] is False
+    assert state["phase"] == "SCANNING"
+    assert state["selected_strategy"] is None
+    assert state["last_reason"] == "STRATEGY_PERFORMANCE_SHADOW_ONLY"
+    assessment = state["performance_assessments"][0]
+    assert assessment["live"]["upper_net_bps"] < 0.0
+    assert assessment["live_entry_allowed"] is False
+    assert manager.drain_shadow_plans(), "Rejected live arm must retain a recovery evidence path"
 
 
 def test_the_same_history_refuses_to_trade_under_the_bandit(tmp_path):
@@ -176,26 +165,18 @@ def test_posture_is_off_unless_explicitly_configured(tmp_path):
     assert StrategySessionConfig(state_path=str(tmp_path / "s.json")).gnn_direct_election is False
 
 
-def test_arming_without_any_model_estimate_says_so(tmp_path):
-    """The sharpest edge of this posture, pinned rather than discovered later.
-
-    "Honour the model's pick" presupposes the model made one. With no evidence
-    row there is no forward edge to honour, yet a lone proposal still wins by
-    default -- the posture has no NO_TRADE to fall back to. That is arming a
-    candidate the model never spoke to, so the reason codes must say exactly
-    that; otherwise the session state is indistinguishable from a conviction
-    pick backed by a real estimate.
-    """
+def test_direct_election_without_any_model_estimate_selects_cash(tmp_path):
+    """A lone proposal without a model estimate no longer wins by default."""
     manager = _manager(
         tmp_path,
-        store=_losing_store(tmp_path),
+        store=_store(tmp_path),
         gnn_direct_election=True,
     )
     state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
 
-    assert state["phase"] == "ARMED"
-    assert "GNN_DIRECT_ELECTION" in state["bandit_reason_codes"]
-    assert "GNN_ESTIMATE_UNAVAILABLE_RANKED_LAST" in state["bandit_reason_codes"]
+    assert state["phase"] == "SCANNING"
+    assert state["selected_strategy"] is None
+    assert state["last_reason"] == "GNN_DIRECT_NO_POSITIVE_ESTIMATE"
     # No fabricated zero: an absent edge stays absent rather than being recorded
     # as a measured 0.0bps, which would read as "flat" instead of "unknown".
     assert state["bandit_conservative_edge_bps"] is None

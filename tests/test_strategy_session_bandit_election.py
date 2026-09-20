@@ -141,7 +141,7 @@ def test_measured_negative_expectancy_produces_no_trade(tmp_path):
     state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
     assert state["phase"] == "SCANNING"
     assert state["selected_strategy"] is None
-    assert state["last_reason"].startswith("BANDIT_NO_TRADE")
+    assert state["last_reason"] == "STRATEGY_PERFORMANCE_SHADOW_ONLY"
     assert state["bandit_selected_arm"] == "no_trade"
     # The refusal is auditable, not a silent nothing-happened.
     assert state["bandit_evaluations"]
@@ -622,7 +622,7 @@ def test_outcome_is_recorded_once_only(tmp_path):
     assert len(store.recent_outcomes("intraday_momentum", market="KR")) == 1
 
 
-def test_bandit_can_be_disabled_to_restore_first_admissible_election(tmp_path):
+def test_disabling_bandit_cannot_bypass_negative_cash_performance(tmp_path):
     # 15 samples, not 25: past LongPromotionConfig.minimum_shadow_samples (20) a
     # non-positive conservative edge demotes the arm out of live authority, and this
     # test would then be measuring the deployment ladder rather than the election
@@ -640,7 +640,8 @@ def test_bandit_can_be_disabled_to_restore_first_admissible_election(tmp_path):
         )
     manager = _manager(tmp_path, store=store, bandit_enabled=False)
     state = manager.evaluate(_account(), ("005930",), _bundle(), NOW)
-    assert state["phase"] == "ARMED"
+    assert state["phase"] == "SCANNING"
+    assert state["last_reason"] == "STRATEGY_PERFORMANCE_SHADOW_ONLY"
     assert state["bandit_selected_arm"] is None
 
 

@@ -15,7 +15,7 @@ from typing import Any
 
 from app.config.refactor_profile import load_refactor_profile
 from app.features import session_structure
-from app.paths import PROJECT_ROOT, realtime_market_database_path
+from app.paths import PROJECT_ROOT, realtime_market_database_path, runtime_database_path
 from app.strategy.experts import ALL_EXPERT_TYPES
 
 
@@ -42,7 +42,10 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
     profile, profile_error = _profile(base)
     counterfactual = _json(base / "data/reports/refactor_counterfactual_evaluation.json")
     benchmark = _json(base / "data/reports/strategy_utility_openvino.json")
-    gnn_training = _json(base / "data/models/strategy_utility/rgcn_shadow.json")
+    gnn_checkpoint = (runtime_database_path("models/strategy_utility/temporal_rgcn.npz", env_var="REFACTOR_GNN_CHECKPOINT")
+                      if base.resolve() == PROJECT_ROOT.resolve()
+                      else base / "data/models/strategy_utility/rgcn_shadow.npz")
+    gnn_training = _json(gnn_checkpoint.with_suffix(".json"))
     readiness, readiness_meta = _latest_json_with_freshness(
         base / "data/reports",
         "live_readiness_*.json",
@@ -59,7 +62,7 @@ def build_refactor_dashboard(root: str | Path = ".") -> dict[str, Any]:
     mode = str((profile or {}).get("mode") or "invalid")
     broker_submission = bool((profile or {}).get("broker_submission_enabled"))
     model_trained = (
-        (base / "data/models/strategy_utility/rgcn_shadow.npz").exists()
+        gnn_checkpoint.exists()
         and int(gnn_training.get("rows") or 0) > 0
     )
     data_promoted = bool(counterfactual.get("promotion_eligible"))

@@ -27,7 +27,7 @@ an order. It only reports a verdict; the caller applies it.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
@@ -120,6 +120,8 @@ class SupervisorObservation:
     # Account risk
     daily_realized_loss: float | None = None
     daily_loss_limit: float | None = None
+    ontology_policy: Any = None
+    ontology_policy_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -165,8 +167,21 @@ class StrategySupervisor:
         config = self.config
         hard: list[str] = []
         soft: list[str] = []
+        from app.risk.ontology_thresholds import OntologyRiskPolicy
+        policy = observation.ontology_policy
+        if isinstance(policy, OntologyRiskPolicy) and policy.symbol == observation.symbol and policy.is_current(observation.as_of):
+            config = replace(config,
+                max_data_age_seconds=min(config.max_data_age_seconds, policy.max_quote_age_seconds),
+                max_spread_bps=policy.max_spread_rate * 10000.,
+                min_liquidity_score=.10 + .30 * policy.stress,
+                daily_loss_soft_fraction=.60 + .25 * (1. - policy.stress),
+            )
+            if not policy.valid_for_entry:
+                soft.extend(policy.reason_codes or ("ONTOLOGY_POLICY_NO_ENTRY",))
+        elif observation.ontology_policy_required:
+            soft.append("ONTOLOGY_POLICY_UNAVAILABLE")
 
-        if not config.enabled:
+        if not config.enabled and not observation.ontology_policy_required:
             verdict = SupervisorVerdict(
                 level=HaltLevel.NONE,
                 symbol=observation.symbol,
@@ -228,7 +243,7 @@ class StrategySupervisor:
         if spread is not None and spread > config.max_spread_bps:
             soft.append(f"SPREAD_WIDENED:{spread:.1f}bps")
         volatility = observation.realized_volatility
-        if volatility is not None and volatility > config.max_realized_volatility:
+        if not observation.ontology_policy_required and volatility is not None and volatility > config.max_realized_volatility:
             soft.append(f"VOLATILITY_ELEVATED:{volatility:.4f}")
 
         if hard:
@@ -246,6 +261,8 @@ class StrategySupervisor:
             hard_reason_codes=tuple(dict.fromkeys(hard)),
             soft_reason_codes=tuple(dict.fromkeys(soft)),
             diagnostics={
+                "ontology_policy_id": policy.policy_id if isinstance(policy, OntologyRiskPolicy) else None,
+                "operating_thresholds": config.as_dict(),
                 "position_open": observation.position_open,
                 "strategy_id": observation.strategy_id,
                 "data_age_seconds": age,

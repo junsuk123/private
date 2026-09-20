@@ -10,6 +10,44 @@ RELATION_NAMES = (
     "confirming_methodology",
     "contrasting_methodology",
 )
+
+
+def relation_object_properties() -> tuple[str, ...]:
+    """Ordered OWL object-property identities for the R-GCN relation axis."""
+    from app.ontology.policy_evidence import STRATEGY_RELATION_IRIS
+
+    return tuple(STRATEGY_RELATION_IRIS[name] for name in RELATION_NAMES)
+
+
+def materialize_strategy_graph(market: str):
+    """Export the exact active tensor topology as OWL instance assertions.
+
+    RDF is deliberately optional on the inference path; this function is for
+    audit/export only and shares the policy evidence graph's strategy IRIs.
+    """
+    from urllib.parse import quote
+    from rdflib import Graph, Namespace, URIRef
+    from rdflib.namespace import RDF
+    from app.ontology.policy_evidence import POLICY_NAMESPACE
+    from app.data.market_capabilities import normalize_market_group
+
+    group = normalize_market_group(market)
+    if group not in {"KR", "US"}:
+        raise ValueError("strategy graph export requires KR or US")
+    group = group.value if hasattr(group, "value") else str(group)
+    graph, pol = Graph(), Namespace(POLICY_NAMESPACE)
+    graph.bind("pol", pol)
+    allowed = set(strategy_ids_for_market(group))
+    nodes = {name: pol["strategy_" + quote(group + "_" + name, safe="_")] for name in allowed}
+    for node in nodes.values():
+        graph.add((node, RDF.type, pol.Strategy))
+        graph.add((node, pol.appliesToMarket, pol[group]))
+    adjacency = strategy_relation_adjacency(market=group)
+    for relation, iri in enumerate(relation_object_properties()):
+        for target, source in np.argwhere(adjacency[relation] > 0):
+            # Tensor convention is adjacency[relation,target,source].
+            graph.add((nodes[STRATEGY_IDS[source]], URIRef(iri), nodes[STRATEGY_IDS[target]]))
+    return graph
 STRATEGY_NODE_COUNT = len(STRATEGY_IDS)
 
 _MOMENTUM = {

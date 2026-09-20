@@ -195,6 +195,32 @@ def test_strong_edge_produces_a_selection() -> None:
     assert result.selection_version == SELECTION_VERSION
 
 
+def test_optimistic_utility_cannot_reinstate_a_demonstrated_losing_strategy(tmp_path) -> None:
+    from datetime import timedelta
+    from app.trading.strategy_adaptation import StrategyAdaptation
+    from app.trading.strategy_performance_store import StrategyPerformanceStore
+
+    context = _context()
+    baseline = _selector().select(context, election_inputs=ELECTION_INPUTS)
+    winner = baseline.selected_strategy
+    assert winner is not None
+    store = StrategyPerformanceStore(tmp_path / "perf.sqlite3", clock=lambda: AT)
+    for index in range(20):
+        store.record(
+            strategy_id=winner, symbol=context.symbol_id, market=context.market,
+            regime=context.macro.market_regime, realized_net_bps=-150,
+            recorded_at=AT - timedelta(minutes=10 * index), holding_seconds=60,
+            evaluation_source="live",
+        )
+    selector = _selector(performance_adapter=StrategyAdaptation(store=store))
+    result = selector.select(context, election_inputs=ELECTION_INPUTS)
+    candidate = next(item for item in result.ranked_candidates if item.strategy_id == winner)
+    assert candidate.final_utility_bps > 0, "Fixture preserves the overly optimistic forecast"
+    assert candidate.selectable is False
+    assert result.selected_strategy != winner
+    assert candidate.performance_assessment["live"]["upper_net_bps"] < 0
+
+
 def test_weak_edge_produces_no_trade_and_that_is_normal() -> None:
     result = _selector(utility_predictor=_StubPredictor(gross_bps=10.0)).select(
         _context(), election_inputs=ELECTION_INPUTS

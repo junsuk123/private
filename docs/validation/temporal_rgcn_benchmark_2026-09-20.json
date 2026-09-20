@@ -1,0 +1,55 @@
+{
+  "architecture": "time_aware_rgcn_v1",
+  "data": "synthetic; no market performance or trading latency claim",
+  "live_authorized": false,
+  "openvino_version": "2026.3.1-22476-759c5a6ab8c-releases/2026/3",
+  "device_names": {
+    "CPU": "Intel(R) Core(TM) Ultra 7 155H",
+    "GPU": "Intel(R) Arc(TM) Graphics (iGPU)",
+    "NPU": "Intel(R) AI Boost"
+  },
+  "trained_parameters": 8672,
+  "shapes": {
+    "features": [
+      1,
+      3,
+      23,
+      72
+    ],
+    "adjacency": [
+      1,
+      3,
+      3,
+      23,
+      23
+    ],
+    "time_masks": [
+      1,
+      3,
+      23
+    ],
+    "strategy_masks": [
+      1,
+      23,
+      23
+    ]
+  },
+  "training_ms": 2712.262,
+  "training_steps": 12,
+  "relation_weight_update_l2": 1.752289891242981,
+  "raw_max_abs_error": 0.0019795894622802734,
+  "eligible_expected_net_bps_max_abs_error": 0.003493785858154297,
+  "requested_device": "NPU",
+  "compiled_devices": [
+    "NPU"
+  ],
+  "fallback_reason": null,
+  "compile_ms": 1768.5470999995232,
+  "model_hash": "16bcb846ae04bd5a2fb5147b013d399e15c84b8ce24049fee436436c451568ef",
+  "precision": "FP32",
+  "iterations": 100,
+  "p50_ms": 1.2525499996627332,
+  "p95_ms": 1.6531999999642721,
+  "p99_ms": 2.0036999994772486,
+  "throughput_per_second": 783.4596009375047
+}

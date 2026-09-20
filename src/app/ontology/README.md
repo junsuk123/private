@@ -9,6 +9,8 @@ existing trading pipeline. It does **not** replace numerical scoring or trading 
 
 | File | Role |
 |---|---|
+| `policy_ontology.ttl`, `policy_shapes.ttl` | Explicit Class / Instance / Object Property / Data Property / Axiom vocabulary and closed-world evidence constraints for dynamic thresholds; market, time, source and unit identity remain separate. |
+| `policy_evidence.py`, `policy_routes.py` | Lightweight validated policy evidence projection; lazy off-tick RDF/SHACL audit and read-only cached diagnostics. See [formal policy ontology](../../../docs/formal_policy_ontology.md). |
 | `trading_core.ttl` | Core RDFS/OWL vocabulary: classes, class hierarchy, object/data properties, `rdfs:domain`/`rdfs:range`, property hierarchy (`rdfs:subPropertyOf`), and disjointness axioms. |
 | `trading_rules.ttl` | OWL 2 RL classification axioms (`owl:hasValue` restriction classes) that let the reasoner infer semantic class memberships from asserted facts. Imports `trading_core.ttl`. |
 | `trading_shapes.ttl` | SHACL shapes for closed-world operational validation (required fields, positive prices, stale/synthetic blocking, account/order structure, approved-vs-rejected conflict, final-order preconditions). |

@@ -1,0 +1,67 @@
+@prefix pol: <https://obaits.local/ontology/policy#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# Closed-world Axiom constraints, separate from OWL's open-world meaning.
+pol:ProjectionShape a sh:NodeShape ; sh:targetClass pol:EvidenceProjection ;
+    sh:property [ sh:path pol:appliesToMarket ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (pol:KR pol:US) ] ;
+    sh:property [ sh:path pol:asOf ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ;
+    sh:property [ sh:path pol:usable ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:boolean ] ;
+    sh:sparql [ sh:message "Accepted observation target market must match the projection." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:appliesToMarket ?market ; pol:usesEvidence ?e .
+            ?e pol:appliesToMarket ?other . FILTER (?market != ?other) }""" ] ;
+    sh:sparql [ sh:message "Accepted evidence must be observed at or before the decision time." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:asOf ?asOf ; pol:usesEvidence ?e .
+            ?e pol:observedAt ?observedAt . FILTER (?observedAt > ?asOf) }""" ] ;
+    sh:sparql [ sh:message "A usable projection requires at least one accepted observation." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:usable true . FILTER NOT EXISTS { $this pol:usesEvidence ?e } }""" ] .
+
+pol:AcceptedObservationShape a sh:NodeShape ; sh:targetClass pol:AcceptedObservation ;
+    sh:not [ sh:class pol:RejectedObservation ] ;
+    sh:property [ sh:path pol:appliesToMarket ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (pol:KR pol:US) ] ;
+    sh:property [ sh:path pol:originMarket ; sh:minCount 1 ; sh:maxCount 1 ; sh:class pol:Market ] ;
+    sh:property [ sh:path pol:observedMetric ; sh:minCount 1 ; sh:maxCount 1 ; sh:class pol:Metric ] ;
+    sh:property [ sh:path pol:providedBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:class pol:DataSource ] ;
+    sh:property [ sh:path pol:observedAt ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:dateTime ] ;
+    sh:property [ sh:path pol:numericValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:double ] ;
+    sh:property [ sh:path pol:unit ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ] ;
+    sh:property [ sh:path pol:maximumAgeSeconds ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:double ; sh:minExclusive 0 ] ;
+    sh:property [ sh:path pol:ageSeconds ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:double ; sh:minInclusive 0 ] ;
+    sh:property [ sh:path pol:horizonSeconds ; sh:maxCount 1 ; sh:datatype xsd:double ; sh:minExclusive 0 ] ;
+    sh:sparql [ sh:message "Accepted observation age must not exceed its source freshness allowance." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:ageSeconds ?age ; pol:maximumAgeSeconds ?maximum .
+            FILTER (?age > ?maximum) }""" ] ;
+    sh:sparql [ sh:message "Foreign evidence can support global factors only, never substitute for local metrics." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:appliesToMarket ?market ; pol:originMarket ?origin ; pol:observedMetric ?metric .
+            ?metric pol:metricName ?name . FILTER (?market != ?origin && !STRSTARTS(?name, "global_")) }""" ] ;
+    sh:sparql [ sh:message "Volatility requires an explicit measurement horizon." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:observedMetric ?metric . ?metric pol:metricName ?name .
+            FILTER (?name IN ("realized_volatility", "downside_volatility"))
+            FILTER NOT EXISTS { $this pol:horizonSeconds ?horizon } }""" ] .
+
+pol:PolicyShape a sh:NodeShape ; sh:targetClass pol:ThresholdPolicy ;
+    sh:property [ sh:path pol:appliesToMarket ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (pol:KR pol:US) ] ;
+    sh:property [ sh:path pol:derivedFromProjection ; sh:minCount 1 ; sh:maxCount 1 ; sh:class pol:EvidenceProjection ] ;
+    sh:property [ sh:path pol:policyMode ; sh:minCount 1 ; sh:maxCount 1 ; sh:in ("ADAPTIVE" "PROTECTIVE_FALLBACK") ] ;
+    sh:sparql [ sh:message "An adaptive threshold policy requires a usable evidence projection in the same market." ;
+        sh:select """PREFIX pol: <https://obaits.local/ontology/policy#>
+          SELECT $this WHERE { $this pol:policyMode "ADAPTIVE" ; pol:appliesToMarket ?market ; pol:derivedFromProjection ?projection .
+            FILTER NOT EXISTS { ?projection pol:usable true ; pol:appliesToMarket ?market } }""" ] .
+
+pol:ThresholdShape a sh:NodeShape ; sh:targetClass pol:Threshold ;
+    sh:property [ sh:path pol:metricName ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:string ; sh:minLength 1 ] ;
+    sh:property [ sh:path pol:numericValue ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:double ] .
+
+pol:StrategyShape a sh:NodeShape ; sh:targetClass pol:LongCashStrategy ;
+    sh:not [ sh:class pol:ShortStrategy ] .
+pol:StrategyPerformanceShape a sh:NodeShape ; sh:targetClass pol:StrategyPerformanceObservation ;
+    sh:property [ sh:path pol:appliesToMarket ; sh:minCount 1 ; sh:maxCount 1 ; sh:in (pol:KR pol:US) ] ;
+    sh:property [ sh:path pol:observedStrategy ; sh:minCount 1 ; sh:maxCount 1 ; sh:class pol:Strategy ] ;
+    sh:property [ sh:path pol:sampleCount ; sh:maxCount 1 ; sh:minInclusive 0 ] ;
+    sh:property [ sh:path pol:effectiveSampleCount ; sh:maxCount 1 ; sh:minInclusive 0 ] .

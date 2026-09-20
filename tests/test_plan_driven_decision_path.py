@@ -210,6 +210,80 @@ def test_the_submitted_quantity_is_the_elected_quantity(engine, account) -> None
     assert result.final_order.manual_approval_required is False
 
 
+def _current_policy_for_plan():
+    from dataclasses import replace
+    from test_ontology_thresholds import _policy
+    return replace(_policy(symbol=SYMBOL), as_of=NOW, expires_at=NOW + timedelta(seconds=15),
+                   position_cap=.15)
+
+
+def _execute_current_policy_plan(engine, account, policy, plan=None):
+    from app.schemas.domain import MarketSnapshot, SourceMetadata
+    market = MarketSnapshot(ticker=SYMBOL, market="KR", company_name="Example", sector="semiconductor",
+                            last_price=70_360, average_daily_trading_value=5e11, volatility_20d=.02,
+                            source=SourceMetadata(source_name="kis_realtime", retrieved_at=NOW,
+                                                  observed_at=NOW, is_realtime=True))
+    engine.ontology_policy_resolver = lambda **kwargs: policy
+    return engine._plan_driven_buy(
+        symbol=SYMBOL, plan=plan or _plan(), price=70_360, market_name="KR", prediction=None,
+        technical_prediction=None, quote_refresh_status="quote_refresh_ok", quote_age_seconds=0,
+        spread_bps=3, orderbook=None, decision_time=NOW, ontology_policy=policy,
+        account=account, market=market,
+    )
+
+
+def test_fresh_dynamic_policy_cannot_increase_the_frozen_quantity(engine, account):
+    from types import SimpleNamespace
+    calls = []
+
+    def allow_more(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(approved=True, final_order=SimpleNamespace(quantity=100),
+                               rejection_reasons=(), metadata={})
+
+    engine.risk_manager.validate = allow_more
+    result = _execute_current_policy_plan(engine, account, _current_policy_for_plan())
+    assert result.approved, result.reason_codes
+    assert calls
+    assert result.final_order.quantity == 7
+    assert result.diagnostics["post_selection_gates"] == ["current_ontology_risk"]
+
+
+def test_current_policy_quantity_reduction_cannot_submit_old_larger_plan(engine, account):
+    from types import SimpleNamespace
+    engine.risk_manager.validate = lambda *args, **kwargs: SimpleNamespace(
+        approved=True, final_order=SimpleNamespace(quantity=3), rejection_reasons=(), metadata={})
+    result = _execute_current_policy_plan(engine, account, _current_policy_for_plan())
+    assert result.approved is False
+    assert result.final_order is None
+    assert "ONTOLOGY_PLAN_QUANTITY_REJECTED" in result.reason_codes
+
+
+def test_expired_or_deteriorated_policy_vetoes_the_frozen_entry(engine, account):
+    from dataclasses import replace
+    policy = _current_policy_for_plan()
+    for current in (replace(policy, expires_at=NOW - timedelta(seconds=1)), replace(policy, position_cap=.001)):
+        result = _execute_current_policy_plan(engine, account, current)
+        assert result.approved is False
+        assert result.final_order is None
+
+
+def test_frozen_plan_with_current_policy_can_pass_real_risk_revalidation(engine, account):
+    plan = _plan(quantity=3, expected_net_edge_bps=600, cost_snapshot={"all_in_cost_rate": .003, "net_expected_return": .06})
+    captured = []
+    original = engine.risk_manager.validate
+
+    def record_risk(*args, **kwargs):
+        verdict = original(*args, **kwargs)
+        captured.append(verdict)
+        return verdict
+
+    engine.risk_manager.validate = record_risk
+    result = _execute_current_policy_plan(engine, account, _current_policy_for_plan(), plan)
+    assert result.approved, (result.reason_codes, captured[0].adjusted_weight, getattr(captured[0].final_order, "quantity", None))
+    assert result.final_order.quantity == 3
+
+
 def test_the_diagnostics_name_the_plan_as_the_authority(engine, account) -> None:
     _disarm(engine)
     plan = _plan()

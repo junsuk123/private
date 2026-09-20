@@ -14,7 +14,8 @@ import time
 from typing import Any, Iterable, Iterator
 
 from app.cost import TradingCostEngine
-from app.paths import realtime_market_database_path
+from app.paths import realtime_market_database_path, runtime_database_path
+from app.models.strategy_utility.label_contract import LEGACY_BAR_POLICY
 from app.routing.actions import is_actionable_strategy_route
 from app.strategy.catalog import is_short_strategy
 from app.strategy.exit_geometry import (
@@ -56,6 +57,8 @@ class GnnRealtimeTrust:
     outcome_validation_method: str
     outcome_validation_uses_live_algorithm: bool
     outcome_validation_caveat: str
+    authority_scope: str = "legacy_geometry_research_calibration_only"
+    label_execution_policy: str = LEGACY_BAR_POLICY
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,9 +78,7 @@ class GnnRealtimeTrustEvaluator:
         *,
         comparison_path: str | Path = "logs/refactor-shadow-comparison.jsonl",
         database_path: str | Path | None = None,
-        checkpoint_metadata_path: str | Path = (
-            "data/models/strategy_utility/rgcn_shadow.json"
-        ),
+        checkpoint_metadata_path: str | Path | None = None,
         horizon_seconds: int | None = None,
         minimum_samples: int | None = None,
         window_samples: int | None = None,
@@ -88,7 +89,8 @@ class GnnRealtimeTrustEvaluator:
     ) -> None:
         self.comparison_path = Path(comparison_path)
         self.database_path = Path(database_path or realtime_market_database_path())
-        self.checkpoint_metadata_path = Path(checkpoint_metadata_path)
+        self.checkpoint_metadata_path = Path(checkpoint_metadata_path) if checkpoint_metadata_path is not None else runtime_database_path(
+            "models/strategy_utility/temporal_rgcn.npz", env_var="REFACTOR_GNN_CHECKPOINT").with_suffix(".json")
         self.use_strategy_horizons = horizon_seconds is None
         self.horizon_seconds = max(
             30,
@@ -402,6 +404,18 @@ class GnnRealtimeTrustEvaluator:
             for strategy_id, metrics in strategy_metrics.items()
             if metrics["calibration_passed"] is True
         )
+        # Tick replay below uses the legacy entry geometry, not the observed
+        # ontology policy and its dynamic updates. Preserve calibration and the
+        # research score, but never reinterpret it as current execution proof.
+        for metrics in (*strategy_metrics.values(),
+                        *(row for markets in strategy_market_metrics.values() for row in markets.values())):
+            metrics["legacy_geometry_positive_edge_passed"] = metrics["entry_authorized"]
+            metrics["legacy_geometry_validation_stage"] = metrics["execution_validation_stage"]
+            if metrics["entry_authorized"]:
+                metrics["execution_validation_stage"] = "LEGACY_GEOMETRY_RESEARCH_ONLY"
+            metrics["entry_authorized"] = False
+            metrics["authority_scope"] = "legacy_geometry_research_calibration_only"
+        reasons.append("GNN_TRUST_EXECUTION_POLICY_UNVALIDATED")
         trusted_strategy_markets = {
             strategy_id: tuple(
                 market
@@ -446,13 +460,13 @@ class GnnRealtimeTrustEvaluator:
             calibrated_strategy_ids=calibrated_strategy_ids,
             trusted_strategy_ids=trusted_strategy_ids,
             trusted_strategy_markets=trusted_strategy_markets,
-            outcome_validation_method="directional_strategy_policy_replay_v2",
-            outcome_validation_uses_live_algorithm=True,
+            outcome_validation_method="legacy_directional_geometry_tick_replay",
+            outcome_validation_uses_live_algorithm=False,
             outcome_validation_caveat=(
                 "entry=first tick after an admissible forecast; "
-                "exit=direction-aware target/stop/trailing/max-holding policy; "
-                "contextual supervisor halts are not reconstructed from "
-                "price-only history"
+                "exit=legacy direction-aware target/stop/trailing/max-holding; "
+                "ontology entry policy and dynamic updates are not reconstructed; "
+                "research calibration only, no live entry permission"
             ),
         )
     def _query_outcomes(
@@ -862,13 +876,13 @@ class GnnRealtimeTrustEvaluator:
             calibrated_strategy_ids=(),
             trusted_strategy_ids=(),
             trusted_strategy_markets={},
-            outcome_validation_method="directional_strategy_policy_replay_v2",
-            outcome_validation_uses_live_algorithm=True,
+            outcome_validation_method="legacy_directional_geometry_tick_replay",
+            outcome_validation_uses_live_algorithm=False,
             outcome_validation_caveat=(
                 "entry=first tick after an admissible forecast; "
-                "exit=direction-aware target/stop/trailing/max-holding policy; "
-                "contextual supervisor halts are not reconstructed from "
-                "price-only history"
+                "exit=legacy direction-aware target/stop/trailing/max-holding; "
+                "ontology entry policy and dynamic updates are not reconstructed; "
+                "research calibration only, no live entry permission"
             ),
         )
 

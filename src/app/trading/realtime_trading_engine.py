@@ -73,7 +73,7 @@ class _DailyLossBudget:
     reason: str | None = None
 
 
-def _daily_loss_budget(account: AccountSnapshot) -> _DailyLossBudget:
+def _daily_loss_budget(account: AccountSnapshot, *, policy_rate: float | None = None) -> _DailyLossBudget:
     """One measured denomination and the tighter positive cap for both gates."""
     from app.market_affordability import currency_conversion_rate
     from app.portfolio import _valuation
@@ -101,6 +101,10 @@ def _daily_loss_budget(account: AccountSnapshot) -> _DailyLossBudget:
         if not all(math.isfinite(value) and value >= 0 for value in (absolute_krw, fraction)):
             return unknown("DAILY_LOSS_LIMIT_CONFIG_INVALID")
         limits = []
+        if policy_rate is not None:
+            if not math.isfinite(policy_rate) or policy_rate <= 0 or valuation.equity <= 0:
+                return unknown("ONTOLOGY_DAILY_LOSS_POLICY_INVALID")
+            limits.append(valuation.equity * policy_rate)
         if absolute_krw > 0:
             krw_to_common = currency_conversion_rate(account, "KRW", currency)
             if krw_to_common is None:
@@ -391,7 +395,11 @@ class RealtimeTradingEngine:
         strategy_supervisor: Any | None = None,
         config: RealtimeTradingConfig | None = None,
         recent_events_max: int = 50,
+        ontology_policy_resolver: Callable[..., Any] | None = None,
+        ontology_policy_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
+        self.ontology_policy_resolver = ontology_policy_resolver
+        self.ontology_policy_snapshot_provider = ontology_policy_snapshot_provider
         self.decision_engine = decision_engine
         self.coordinator = coordinator
         self.account_provider = account_provider
@@ -578,6 +586,8 @@ class RealtimeTradingEngine:
             status["loss_cooldown_symbols"] = sorted(
                 symbol for symbol, until in self._loss_cooldown_until.items() if until > time.monotonic()
             )
+            if self.ontology_policy_snapshot_provider is not None:
+                status["ontology_policy"] = self.ontology_policy_snapshot_provider()
             if self.strategy_session_manager is not None:
                 status["strategy_session"] = self.strategy_session_manager.snapshot()
             if self.strategy_supervisor is not None:
@@ -730,7 +740,10 @@ class RealtimeTradingEngine:
             # report ``buy_enabled=true`` alongside a stale supervisor halt even
             # though candidate discovery is already running normally.
             self._buy_disabled_reason = None
-        daily_loss = _daily_loss_budget(account)
+        sync_policy_state = getattr(self.decision_engine, "sync_position_policy_state", None)
+        if callable(sync_policy_state):
+            sync_policy_state(account)
+        daily_loss = self._account_loss_budget(account, decision_time)
         if buy_enabled and daily_loss.blocked:
             buy_enabled = False
             self._buy_disabled_reason = daily_loss.reason
@@ -795,9 +808,9 @@ class RealtimeTradingEngine:
             elif symbol in ignored_symbols:
                 ignored_candidates.append(symbol)
             elif (
-                self.config.rebuy_cooldown_sec > 0
+                self._reentry_cooldown_seconds(symbol) > 0
                 and (last_sell := self._recent_sell_monotonic.get(symbol)) is not None
-                and now_monotonic - last_sell < self.config.rebuy_cooldown_sec
+                and now_monotonic - last_sell < self._reentry_cooldown_seconds(symbol)
             ):
                 rebuy_candidates.append(symbol)
             elif self._in_cooldown(symbol):
@@ -1130,9 +1143,9 @@ class RealtimeTradingEngine:
                 summary["skipped_cooldown"] += 1
                 self._append_rejection(summary, symbol, "BUY", ("RECENT_LOSS_SYMBOL_COOLDOWN",))
                 continue
-            if self.config.rebuy_cooldown_sec > 0:
+            if self._reentry_cooldown_seconds(symbol) > 0:
                 last_sell = self._recent_sell_monotonic.get(symbol)
-                if last_sell is not None and (time.monotonic() - last_sell) < self.config.rebuy_cooldown_sec:
+                if last_sell is not None and (time.monotonic() - last_sell) < self._reentry_cooldown_seconds(symbol):
                     summary["skipped_cooldown"] += 1
                     continue  # 방금 판 종목 재매수 보류(churn 억제).
             if (
@@ -1911,7 +1924,18 @@ class RealtimeTradingEngine:
 
             ontology_allows = macro_strategy_permitted(strategy_id, allowed, blocked)
 
-        daily_loss = _daily_loss_budget(account)
+        policy = None
+        if self.ontology_policy_resolver is not None:
+            try:
+                policy = self.ontology_policy_resolver(
+                    symbol=symbol, market="KR" if symbol.isdigit() else "US", now=decision_time,
+                    all_in_cost_rate=float(session.get("expected_cost_bps") or 0.) / 10000.,
+                    requested_horizon_seconds=float(dict(session.get("election_context") or {}).get("policy_requested_horizon_seconds") or session.get("max_holding_seconds") or 900),
+                    account=account,
+                )
+            except Exception:
+                policy = None
+        daily_loss = self._account_loss_budget(account, decision_time)
 
         verdict = self.strategy_supervisor.evaluate(
             SupervisorObservation(
@@ -1940,6 +1964,8 @@ class RealtimeTradingEngine:
                 realized_volatility=self._symbol_realtime_volatility_safe(symbol, decision_time),
                 daily_realized_loss=daily_loss.realized_pnl,
                 daily_loss_limit=daily_loss.threshold,
+                ontology_policy=policy,
+                ontology_policy_required=self.ontology_policy_resolver is not None,
             )
         )
         if not daily_loss.valuation_complete:
@@ -1973,6 +1999,25 @@ class RealtimeTradingEngine:
             )
         return verdict
 
+    def _account_loss_budget(self, account: AccountSnapshot, now: datetime) -> _DailyLossBudget:
+        if self.ontology_policy_snapshot_provider is None:
+            return _daily_loss_budget(account)
+        from app.risk.ontology_thresholds import policy_limits
+        rates = [policy_limits().maximum_daily_loss_rate]
+        try:
+            rows = self.ontology_policy_snapshot_provider().get("policies", {})
+            for row in rows.values():
+                policy = row.get("policy", {})
+                start = datetime.fromisoformat(str(policy.get("as_of", "")))
+                end = datetime.fromisoformat(str(policy.get("expires_at", "")))
+                if policy.get("valid_for_entry") and start <= now <= end:
+                    rate = float(policy["daily_loss_budget_rate"])
+                    if math.isfinite(rate) and rate > 0:
+                        rates.append(rate)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            pass
+        return _daily_loss_budget(account, policy_rate=min(rates))
+
     def _symbol_realtime_volatility_safe(self, symbol: str, decision_time: datetime) -> float | None:
         getter = getattr(self.decision_engine, "_symbol_realtime_volatility", None)
         if getter is None:
@@ -1999,11 +2044,8 @@ class RealtimeTradingEngine:
             or getattr(holding, "average_price", 0.0)
             or 0.0
         )
-        quantity = int(
-            getattr(holding, "sellable_quantity", None)
-            or getattr(holding, "quantity", 0)
-            or 0
-        )
+        sellable = getattr(holding, "sellable_quantity", None)
+        quantity = max(0, min(int(getattr(holding, "quantity", 0) or 0), int(sellable) if sellable is not None else int(getattr(holding, "quantity", 0) or 0)))
         order = FinalOrder(
             ticker=str(getattr(holding, "ticker", "") or ""),
             market=str(getattr(holding, "market", "") or "KR"),
@@ -2380,7 +2422,25 @@ class RealtimeTradingEngine:
             }
         )
 
+    def _reentry_cooldown_seconds(self, symbol: str) -> float:
+        if self.ontology_policy_snapshot_provider is None:
+            return self.config.rebuy_cooldown_sec
+        try:
+            key = ("KR:" if symbol.isdigit() else "US:") + symbol
+            data = self.ontology_policy_snapshot_provider().get("policies", {}).get(key, {}).get("policy", {})
+            if data:
+                return min(float(data["maximum_holding_seconds"]),
+                    float(data["minimum_holding_seconds"]) * (1. + 3. * float(data["stress"]))
+                    + 60. * float(data["all_in_cost_rate"]) / max(float(data["noise_band_rate"]), 1e-6))
+        except (TypeError, ValueError, KeyError):
+            pass
+        # Missing evidence already blocks entries; this is a conservative pause,
+        # never inferred strategy performance from a submitted limit price.
+        return self.config.rebuy_cooldown_sec
+
     def _record_submitted_order_for_performance(self, order: FinalOrder, side: str) -> None:
+        if self.ontology_policy_resolver is not None:
+            return  # Submission is not a fill or a realized strategy outcome.
         price = float(getattr(order, "limit_price", 0.0) or 0.0)
         quantity = float(getattr(order, "quantity", 0.0) or 0.0)
         if price <= 0.0 or quantity <= 0.0:
@@ -2412,6 +2472,8 @@ class RealtimeTradingEngine:
             )
 
     def _seed_loss_cooldowns_from_order_log(self) -> None:
+        if self.ontology_policy_resolver is not None:
+            return  # Legacy submission journals cannot prove realized losses.
         if self.config.loss_rebuy_cooldown_sec <= 0.0:
             return
         path = Path(self.config.order_log_path)

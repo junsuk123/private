@@ -1,0 +1,159 @@
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from app.ontology.policy_evidence import PolicyObservation, project_market_evidence
+from app.risk.ontology_thresholds import resolve_ontology_policy
+from app.schemas.domain import AccountSnapshot, Holding, OrderSide
+from app.trading.dynamic_exit_policy import DynamicExitPolicy
+from app.trading.shared_decision_engine import SharedLiveDecisionEngine
+
+NOW = datetime(2026, 9, 20, 1, tzinfo=timezone.utc)
+
+
+def policy(now=NOW, **overrides):
+    values = dict(realized_volatility=.003, spread_rate=.0001, liquidity_score=.9,
+                  quote_age_seconds=.1, regime_confidence=.9, data_quality_score=.9,
+                  market_breadth=.4, trend_strength=.5)
+    obs = tuple(PolicyObservation(metric=k, value=v, market="KR", observed_at=now,
+                source="kis_realtime", max_age_seconds=30, unit="seconds" if k == "quote_age_seconds" else "ratio",
+                horizon_seconds=60 if k == "realized_volatility" else None) for k, v in values.items())
+    projection = project_market_evidence("KR", as_of=now, observations=obs, regime="TREND_UP", context_id="typed-market")
+    p = resolve_ontology_policy(projection, symbol="005930", all_in_cost_rate=.001)
+    assert p.valid_for_entry, p.reason_codes
+    return replace(p, **overrides)
+
+
+class Store:
+    def __init__(self, price):
+        self.tick = SimpleNamespace(price=price, received_at=NOW, exchange_timestamp=NOW, sequence_key="tick-1")
+
+    def latest_tick(self, symbol):
+        return self.tick
+
+
+def engine(price, resolver):
+    result = SharedLiveDecisionEngine(Store(price), ontology_policy_resolver=resolver)
+    result._technical_exit_deterioration = lambda *_: ((), 0.0)
+    return result
+
+
+def position(price=100_000.0, opened_at=NOW - timedelta(seconds=60)):
+    return Holding(ticker="005930", market="KR", company_name="Samsung", sector="Tech", quantity=1,
+                   average_price=100_000.0, last_price=price, opened_at=opened_at)
+
+
+def test_policy_levels_override_legacy_loss_disable_and_absolute_profit_settings(monkeypatch):
+    monkeypatch.setenv("REALTIME_HARD_STOP_LOSS", "0.9")
+    monkeypatch.setenv("REALTIME_ALLOW_LOSS_EXIT", "false")
+    monkeypatch.setenv("REALTIME_BLOCK_SELL_BELOW_BREAKEVEN", "true")
+    p = policy(hard_stop_rate=.012, soft_stop_rate=.008, emergency_stop_rate=.02)
+    resolved = DynamicExitPolicy().resolve(all_in_cost_rate=.001, ontology_policy=p)
+    assert resolved.hard_stop_rate == .012
+    assert resolved.allow_loss_exit and not resolved.block_sell_below_breakeven
+
+
+def test_dynamic_hard_stop_closes_one_share_even_with_legacy_loss_blocks(monkeypatch):
+    monkeypatch.setenv("REALTIME_ALLOW_LOSS_EXIT", "false")
+    monkeypatch.setenv("REALTIME_BLOCK_SELL_BELOW_BREAKEVEN", "true")
+    monkeypatch.setenv("REALTIME_SMALL_ACCOUNT_MODE", "true")
+    monkeypatch.setenv("REALTIME_BLOCK_ONE_SHARE_LOSS_REDUCE", "true")
+    p = policy(hard_stop_rate=.012, emergency_stop_rate=.025)
+    e = engine(98_500, lambda **_: p)
+    h = position(98_500)
+    result = e.evaluate_exit_for_holding(h, AccountSnapshot(cash=0, holdings=(h,)), decision_time=NOW)
+    assert result.approved, result.reason_codes
+    assert result.final_order.side is OrderSide.SELL and result.final_order.quantity == 1
+    assert result.diagnostics["exit_reason"] == "ontology_hard_stop"
+
+
+def test_tiny_currency_profit_does_not_override_market_generated_target(monkeypatch):
+    monkeypatch.setenv("REALTIME_TAKE_PROFIT_AMOUNT_KRW", "1")
+    p = policy(target_return_rate=.03, net_profit_floor_rate=.01, maximum_holding_seconds=900)
+    e = engine(100_700, lambda **_: p)
+    h = position(100_700)
+    result = e.evaluate_exit_for_holding(h, AccountSnapshot(cash=0, holdings=(h,)), decision_time=NOW)
+    assert not result.approved and result.reason_codes == ("HOLD_ONTOLOGY_POLICY",)
+
+
+def test_policy_staleness_retains_tighter_barrier_and_flat_cycle_resets_it():
+    p = policy(hard_stop_rate=.01, emergency_stop_rate=.015, maximum_holding_seconds=900)
+    holder = [p]
+    e = engine(100_000, lambda **_: holder[0])
+    h = position()
+    account = AccountSnapshot(cash=0, holdings=(h,))
+    e.evaluate_exit_for_holding(h, account, decision_time=NOW)
+    holder[0] = replace(p, valid_for_entry=False, hard_stop_rate=.08, emergency_stop_rate=.10)
+    e.store.tick.price = 98_800
+    result = e.evaluate_exit_for_holding(h, account, decision_time=NOW + timedelta(seconds=1))
+    assert result.approved, result.reason_codes
+    assert result.diagnostics["ontology_risk_policy"]["hard_stop_rate"] == .01
+    assert not result.diagnostics["ontology_policy_current_evidence"]
+    e.sync_position_policy_state(AccountSnapshot(cash=0, holdings=()))
+    assert not e._holding_ontology_policies and not e._ontology_peak_net
+
+
+def test_resolver_failure_keeps_exit_only_safety_ceiling():
+    def broken(**_):
+        raise RuntimeError("unavailable")
+    e = engine(96_000, broken)
+    h = position(96_000)
+    result = e.evaluate_exit_for_holding(h, AccountSnapshot(cash=0, holdings=(h,)), decision_time=NOW)
+    assert result.approved, result.reason_codes
+    assert result.diagnostics["ontology_risk_policy"]["valid_for_entry"] is False
+
+
+@pytest.mark.parametrize("bad_price", [float("nan"), float("inf"), -1.0])
+def test_exit_rejects_nonfinite_or_nonpositive_quote_before_cost_calculation(bad_price):
+    e = engine(bad_price, lambda **_: policy())
+    e._exit_price_source = lambda *_: (bad_price, NOW, NOW, "invalid")
+    h = position()
+    result = e.evaluate_exit_for_holding(h, AccountSnapshot(cash=0, holdings=(h,)), decision_time=NOW)
+    assert not result.approved and result.reason_codes == ("MISSING_MARKET_DATA",)
+
+
+def test_repeated_quote_does_not_count_as_multiple_early_exit_confirmations():
+    p = policy(soft_stop_rate=.005, hard_stop_rate=.03, emergency_stop_rate=.04,
+               early_exit_confirmations=2, minimum_holding_seconds=0, maximum_holding_seconds=900)
+    e = engine(99_000, lambda **_: p)
+    h = position(99_000)
+    account = AccountSnapshot(cash=0, holdings=(h,))
+    first = e.evaluate_exit_for_holding(h, account, decision_time=NOW)
+    second = e.evaluate_exit_for_holding(h, account, decision_time=NOW + timedelta(seconds=1))
+    assert not first.approved and not second.approved
+    e.store.tick.received_at = e.store.tick.exchange_timestamp = NOW + timedelta(seconds=2)
+    third = e.evaluate_exit_for_holding(h, account, decision_time=NOW + timedelta(seconds=2))
+    assert third.approved, third.reason_codes
+    assert third.diagnostics["exit_reason"] == "ontology_soft_stop"
+
+
+def test_frozen_plan_cannot_bypass_missing_current_policy():
+    e = engine(100_000, lambda **_: None)
+    plan = SimpleNamespace(executable=lambda _: (True, None),
+                           entry_rule=SimpleNamespace(price_permitted=lambda _: True))
+    result = e._plan_driven_buy(symbol="005930", plan=plan, price=100_000, market_name="KR",
+        prediction=None, technical_prediction=None, quote_refresh_status="ok", quote_age_seconds=0,
+        spread_bps=1, orderbook=None, decision_time=NOW)
+    assert not result.approved and result.reason_codes == ("ONTOLOGY_ENTRY_POLICY_UNAVAILABLE",)
+
+
+def test_frozen_plan_runs_current_risk_and_cannot_resurrect_rejected_order():
+    p = policy(position_cap=.15)
+    e = engine(10_000, lambda **_: p)
+    seen = []
+    def reject(*args, **kwargs):
+        seen.append(kwargs)
+        return SimpleNamespace(approved=False, final_order=None, rejection_reasons=("current_risk_rejected",), metadata={})
+    e.risk_manager.validate = reject
+    plan = SimpleNamespace(executable=lambda _: (True, None), quantity=1,
+                           entry_rule=SimpleNamespace(price_permitted=lambda _: True))
+    h = position(10_000)
+    market = e._exit_market_snapshot(h, 10_000, NOW, NOW)
+    result = e._plan_driven_buy(symbol="005930", plan=plan, price=10_000, market_name="KR",
+        prediction=None, technical_prediction=None, quote_refresh_status="ok", quote_age_seconds=0,
+        spread_bps=1, orderbook=None, decision_time=NOW, ontology_policy=p,
+        account=AccountSnapshot(cash=1_000_000, holdings=()), market=market)
+    assert not result.approved and result.reason_codes == ("current_risk_rejected",)
+    assert seen == [{"ontology_policy": p, "now": NOW}]

@@ -2,6 +2,8 @@
 
 2026-09-20 변경: [다중시장·경량 추론 리팩터링과 검증](docs/refactor_2026_09_20.md). 기본 화면은 `/account`, 기존 상세 화면은 `/account/advanced`입니다.
 
+추가 개편: [온톨로지 기반 동적 리스크와 청산](docs/dynamic_ontology_risk.md), [정식 OWL/SHACL 구성](docs/formal_policy_ontology.md), [시간 인식 R-GCN 선택·NPU 실측](docs/temporal_relational_graph_model.md), [시장별 전략 성과 적응](docs/strategy_performance_adaptation.md).
+
 OBAITS는 KIS 실시간 데이터, 온톨로지 기반 근거 추론, live feature frame, 그리고 결정론적 리스크/주문 게이트를 결합한 로컬 자동 투자 운영 시스템입니다. 현재 코드 기준으로는 `run.ps1`과 `run.py`가 표준 런처이며, `src/app` 아래에서 FastAPI UI, 실시간 수집, 전략 선택, risk/gate, 실행 모듈이 함께 동작합니다.
 
 > 핵심 원칙: 실시간 판단은 `selection`과 `execution`을 구분해 다룹니다. LLM이나 가속기 결과는 주문 권한이 아니며, 실제 주문은 `FinalOrder`를 통과한 경우만 `LiveExecutionCoordinator`를 통해 제출됩니다. 전략 선택 V2는 SHADOW에서 시작하고 증거가 누적되면 자동 승격/강등이 일어납니다.

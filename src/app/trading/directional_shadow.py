@@ -50,6 +50,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
+from app.paths import runtime_database_path
+
 from app.trading.borrow import (
     DEFAULT_MAX_BORROW_FEE_BPS_ANNUALISED,
     BorrowSnapshot,
@@ -67,7 +69,10 @@ from app.trading.directional import (
     target_reached,
 )
 
-DEFAULT_SHADOW_STORE_PATH = "data/store/directional-shadow.sqlite3"
+# Each machine owns its SQLite writer; Synology distributes source, not an
+# active shared WAL. Old project journals remain untouched and can be selected
+# explicitly with DIRECTIONAL_SHADOW_STORE_PATH.
+DEFAULT_SHADOW_STORE_PATH = str(runtime_database_path("directional-shadow.sqlite3"))
 
 # Terminal states of a shadow plan.
 OUTCOME_TARGET = "TARGET"
@@ -315,6 +320,8 @@ class ShadowOutcome:
     #: is NOT evidence about trades the executor would place, and the bandit
     #: posterior must not read it as such.
     signal_admissible: bool = True
+    risk_policy_family: str = "legacy"
+    risk_policy_id: str = ""
 
     @property
     def scored(self) -> bool:
@@ -352,6 +359,10 @@ class ShadowOutcome:
             "max_favorable_excursion_bps": self.max_favorable_excursion_bps,
             "fill_ratio": self.fill_ratio,
             "reason_codes": list(self.reason_codes),
+            "risk_policy_family": self.risk_policy_family,
+            "risk_policy_id": self.risk_policy_id,
+            "signal_admissible": self.signal_admissible,
+            "predicted_gross_edge_bps": self.predicted_gross_edge_bps,
         }
 
 
@@ -669,6 +680,8 @@ class ShadowFillSimulator:
         )
         return ShadowOutcome(
             signal_admissible=plan_signal_admissible(plan),
+            risk_policy_family=str((plan.diagnostics.get("exit_contract") or {}).get("risk_policy_family") or "legacy"),
+            risk_policy_id=str((plan.diagnostics.get("exit_contract") or {}).get("policy_id") or ""),
             predicted_gross_edge_bps=plan.predicted_gross_edge_bps,
             plan_id=plan.plan_id,
             key=plan.key,
@@ -717,6 +730,7 @@ SIGNAL_REJECTION_CODES: frozenset[str] = frozenset(
         "EDGE_BELOW_COST_FLOOR",
         "EDGE_BELOW_ALGORITHM_FLOOR",
         "TECHNICAL_EDGE_NON_POSITIVE",
+        "ONTOLOGY_RESEARCH_ONLY",
     }
 )
 

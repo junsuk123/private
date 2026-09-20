@@ -14,15 +14,16 @@ from app.evaluation.stored_counterfactual import (
     load_news_sentiment,
 )
 from app.models.strategy_utility.training import train_counterfactual_checkpoint
+from app.paths import realtime_market_database_path, runtime_database_path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--database", type=Path, default=Path("data/store/realtime_market_data.sqlite3"))
+    parser.add_argument("--database", type=Path, default=realtime_market_database_path())
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/models/strategy_utility/rgcn_shadow.npz"),
+        default=runtime_database_path("models/strategy_utility/temporal_rgcn.npz", env_var="REFACTOR_GNN_CHECKPOINT"),
     )
     args = parser.parse_args()
     labels = build_labels(

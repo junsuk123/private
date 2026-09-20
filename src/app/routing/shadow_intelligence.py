@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import hashlib
+import io
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +27,12 @@ from app.models.strategy_utility import (
     FixedShapeStrategyUtilityModel,
     StrategyUtilityModelConfig,
 )
-from app.models.strategy_utility.openvino_runtime import OpenVinoStrategyUtilityRuntime
-from app.paths import realtime_market_database_path
+from app.models.strategy_utility.openvino_runtime import OpenVinoStrategyUtilityRuntime, AdaptiveStrategyUtilityRuntime
+from app.models.strategy_utility.temporal_graph import ARCHITECTURE, TIME_STEPS, CausalGraphHistory, GraphObservation
+from app.models.strategy_utility.label_contract import (
+    LEGACY_BAR_POLICY, ENTRY_FROZEN_SHADOW_POLICY, bounded_advisory_markets, risk_advisory_strategy_markets,
+)
+from app.paths import realtime_market_database_path, runtime_database_path
 from app.models.strategy_utility.strategy_graph import (
     RELATION_NAMES,
     STRATEGY_NODE_COUNT,
@@ -52,6 +61,33 @@ from app.routing.strategy_router import StrategyRouter
 from app.strategy.catalog import is_short_strategy
 from app.strategy.catalog import STRATEGY_IDS
 from app.trading.contracts import StrategyUtilityEvidence
+
+_GRAPH_RELOADER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="obaits-graph-reload")
+
+
+def _load_graph_replacement(path, expected_config, previous_hash, authorized_markets, previous_label_policy=None):
+    metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+    blob = path.read_bytes()
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest != metadata.get("checkpoint_hash"):
+        raise ValueError("graph checkpoint/manifest hash mismatch")
+    if digest == previous_hash:
+        return None
+    if (metadata.get("architecture") != ARCHITECTURE
+            or metadata.get("input_feature_schema") != STRATEGY_GRAPH_CONTEXT_SCHEMA
+            or tuple(metadata.get("strategy_ids", ())) != STRATEGY_IDS):
+        raise ValueError("graph replacement schema mismatch")
+    candidate_markets = set(bounded_advisory_markets(metadata))
+    if set(authorized_markets) - candidate_markets:
+        raise ValueError("graph replacement loses validated market authority")
+    if (previous_label_policy == ENTRY_FROZEN_SHADOW_POLICY
+            and (metadata.get("label_execution_policy") != ENTRY_FROZEN_SHADOW_POLICY
+                 or metadata.get("label_policy_provenance_matched") is not True)):
+        raise ValueError("research checkpoint cannot replace policy-matched incumbent")
+    model = FixedShapeStrategyUtilityModel.load_checkpoint(io.BytesIO(blob))
+    if model.config != expected_config:
+        raise ValueError("graph replacement tensor contract mismatch")
+    return model, metadata
 
 
 @dataclass(frozen=True)
@@ -173,7 +209,7 @@ class ShadowIntelligenceService:
         self.graph_mode = feature_dim in {27, 28, STRATEGY_GRAPH_CONTEXT_DIM}
         config = StrategyUtilityModelConfig(
             batch_size=1,
-            time_steps=1,
+            time_steps=TIME_STEPS if feature_dim == STRATEGY_GRAPH_CONTEXT_DIM else 1,
             max_nodes=STRATEGY_NODE_COUNT if self.graph_mode else 1,
             feature_dim=(
                 feature_dim + STRATEGY_NODE_COUNT
@@ -184,11 +220,12 @@ class ShadowIntelligenceService:
             strategy_count=len(STRATEGY_IDS),
             hidden_dim=16,
             seed=17,
+            temporal_mode=1 if feature_dim == STRATEGY_GRAPH_CONTEXT_DIM else 0,
         )
         checkpoint_path = Path(
             os.getenv(
                 "REFACTOR_GNN_CHECKPOINT",
-                "data/models/strategy_utility/rgcn_shadow.npz",
+                str(runtime_database_path("models/strategy_utility/temporal_rgcn.npz")),
             )
         )
         self.checkpoint_path = checkpoint_path
@@ -196,7 +233,8 @@ class ShadowIntelligenceService:
         self.checkpoint_error: str | None = None
         if checkpoint_path.exists():
             try:
-                checkpoint_model = FixedShapeStrategyUtilityModel.load_checkpoint(checkpoint_path)
+                checkpoint_blob = checkpoint_path.read_bytes()
+                checkpoint_model = FixedShapeStrategyUtilityModel.load_checkpoint(io.BytesIO(checkpoint_blob))
             except Exception as exc:  # noqa: BLE001 - an unloadable model fails closed.
                 # A HEAD-SHAPE mismatch is a schema change, not corruption, and the two
                 # send an operator in different directions: "corrupt" means look for a
@@ -210,6 +248,13 @@ class ShadowIntelligenceService:
                     if "strategy_heads" in message or "no_trade_head" in message
                     else "GNN_CHECKPOINT_CORRUPT"
                 )
+        # Legacy one-snapshot artifacts retain their original serving contract;
+        # newly trained current-schema artifacts always use elapsed-time pooling.
+        if checkpoint_model is not None and checkpoint_model.config.temporal_mode == 0:
+            legacy = checkpoint_model.config
+            from dataclasses import replace
+            if replace(legacy, time_steps=config.time_steps, temporal_mode=config.temporal_mode) == config:
+                config = legacy
         self.checkpoint_loaded = (
             checkpoint_model is not None and checkpoint_model.config == config
         )
@@ -239,6 +284,9 @@ class ShadowIntelligenceService:
         self.live_authorized = False
         self.live_authorized_markets: tuple[str, ...] = ()
         self.authorization_scope = "none"
+        self.label_execution_policy = LEGACY_BAR_POLICY
+        self.bounded_advisory_authorized_markets = ()
+        self.risk_advisory_strategy_markets = {}
         self.checkpoint_hash: str | None = None
         if self.checkpoint_loaded:
             try:
@@ -257,19 +305,11 @@ class ShadowIntelligenceService:
                 self.model_strategy_ids = tuple(
                     str(item) for item in metadata.get("strategy_ids", ())
                 )
-                self.live_authorized = bool(metadata.get("live_authorized"))
-                declared_markets = metadata.get("live_authorized_markets")
-                if isinstance(declared_markets, (list, tuple)):
-                    self.live_authorized_markets = tuple(
-                        market
-                        for market in (str(item).upper() for item in declared_markets)
-                        if market in {"KRX", "US"}
-                    )
-                    self.live_authorized = bool(self.live_authorized_markets)
-                elif self.live_authorized:
-                    # Legacy cards carried only the aggregate flag. Newly trained
-                    # cards always carry explicit market authority.
-                    self.live_authorized_markets = ("KRX", "US")
+                # No available label source verifies the complete dynamic-live
+                # execution policy. Old flags cannot create that authority.
+                self.live_authorized = False
+                self.live_authorized_markets = ()
+                self.label_execution_policy = str(metadata.get("label_execution_policy") or LEGACY_BAR_POLICY)
                 self.authorization_scope = str(
                     metadata.get("authorization_scope") or "none"
                 )
@@ -278,13 +318,24 @@ class ShadowIntelligenceService:
                     if metadata.get("checkpoint_hash")
                     else None
                 )
+                if checkpoint_model.config.temporal_mode == 1:
+                    import hashlib
+                    if (metadata.get("architecture") != ARCHITECTURE or not self.checkpoint_hash
+                            or hashlib.sha256(checkpoint_blob).hexdigest() != self.checkpoint_hash):
+                        raise ValueError("temporal R-GCN checkpoint metadata/hash mismatch")
+                    self.bounded_advisory_authorized_markets = bounded_advisory_markets(metadata)
+                    self.risk_advisory_strategy_markets = risk_advisory_strategy_markets(metadata)
                 self.upside_supervised_strategy_ids = (
                     _upside_supervised_strategy_ids(metadata)
                 )
                 self.upside_authorized_strategy_markets = (
                     _upside_authorized_strategy_markets(metadata)
                 )
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, ValueError, TypeError, OverflowError):
+                self.live_authorized = False
+                self.live_authorized_markets = ()
+                self.bounded_advisory_authorized_markets = ()
+                self.risk_advisory_strategy_markets = {}
                 self.model_input_schema = "unknown"
                 self.checkpoint_error = "GNN_CHECKPOINT_METADATA_INVALID"
         self.model = (
@@ -292,7 +343,15 @@ class ShadowIntelligenceService:
             if self.checkpoint_loaded
             else FixedShapeStrategyUtilityModel(config)
         )
-        self.cpu = OpenVinoStrategyUtilityRuntime(self.model, requested_device="CPU")
+        self.cpu = (AdaptiveStrategyUtilityRuntime(self.model)
+                    if self.checkpoint_loaded and self.model.config.temporal_mode == 1
+                    else OpenVinoStrategyUtilityRuntime(self.model, requested_device="CPU"))
+        self._graph_history = CausalGraphHistory()
+        self._latest_advisories: dict[str, dict[str, Any]] = {}
+        self._model_lock = threading.RLock()
+        self._reload_future = None
+        self._reload_last_check = float("-inf")
+        self.reload_error: str | None = None
         self.npu = (
             OpenVinoStrategyUtilityRuntime(self.model, requested_device="NPU")
             if enable_npu_comparison
@@ -341,11 +400,114 @@ class ShadowIntelligenceService:
             )
         )
 
+    def latest_graph_advisory(self, symbol: str, as_of: datetime) -> dict[str, Any] | None:
+        """Fresh, market-validated graph evidence; never an order permission."""
+        value = self._latest_advisories.get(symbol)
+        if value is None or as_of.tzinfo is None or not self._checkpoint_advisory_authorized_for(symbol):
+            return None
+        age = (as_of - value["as_of"]).total_seconds()
+        if age < 0 or as_of > value["valid_until"]:
+            return None
+        return dict(value)
+
+    def _record_graph_advisory(self, snapshot, evidence, devices):
+        from math import isfinite
+        # A schema-compatible but unpromoted model may gather shadow evidence,
+        # but cannot influence thresholds on a real position.
+        if not self._checkpoint_advisory_authorized_for(snapshot.symbol) or self.model.config.temporal_mode != 1:
+            self._latest_advisories.pop(snapshot.symbol, None)
+            return
+        market_key = "KRX" if snapshot.symbol.isdigit() and len(snapshot.symbol) == 6 else "US"
+        supported = getattr(self, "risk_advisory_strategy_markets", {})
+        eligible = [item for item in evidence if item.ontology_allowed and not is_short_strategy(item.strategy_id)
+                    and market_key in supported.get(item.strategy_id, ())
+                    and not item.hard_block_reasons and isfinite(item.expected_net_return_bps)
+                    and isfinite(item.expected_adverse_excursion_bps) and item.expected_adverse_excursion_bps >= 0]
+        if not eligible:
+            self._latest_advisories.pop(snapshot.symbol, None)
+            return
+        best = max(eligible, key=lambda item: item.expected_net_return_bps)
+        uncertainty = max(best.aleatoric_uncertainty, best.epistemic_uncertainty_or_proxy)
+        if not isfinite(uncertainty):
+            return
+        self._latest_advisories[snapshot.symbol] = {
+            "symbol": snapshot.symbol, "market": "KR" if snapshot.symbol.isdigit() else "US",
+            "as_of": snapshot.as_of, "valid_until": snapshot.valid_until,
+            "architecture": ARCHITECTURE, "checkpoint_hash": self.checkpoint_hash,
+            "source": "validated_temporal_rgcn", "backend": "+".join(devices),
+            "model_uncertainty": min(1.0, max(0.0, uncertainty)),
+            "research_expected_entry_frozen_shadow_net_bps": best.expected_net_return_bps,
+            "expected_downside_net_bps": best.expected_adverse_excursion_bps,
+            "label_execution_policy": self.label_execution_policy,
+            "payoff_semantics": "entry_frozen_shadow_net_after_cost",
+            "strategy_id": best.strategy_id, "ontology_snapshot_id": best.ontology_snapshot_id,
+            "explanation_paths": best.explanation_paths, "authority": "bounded_risk_advisory_only",
+        }
+        if len(self._latest_advisories) > 256:
+            oldest = min(self._latest_advisories, key=lambda key: self._latest_advisories[key]["as_of"])
+            self._latest_advisories.pop(oldest, None)
+
     def _checkpoint_live_authorized_for(self, symbol: str) -> bool:
+        # Entry-frozen shadow and historical bars are not dynamic-live labels.
+        return False
+
+    def _checkpoint_advisory_authorized_for(self, symbol: str) -> bool:
         market = "KRX" if str(symbol).isdigit() and len(str(symbol)) == 6 else "US"
-        return market in self.live_authorized_markets
+        return (getattr(self, "label_execution_policy", None) == ENTRY_FROZEN_SHADOW_POLICY
+                and market in getattr(self, "bounded_advisory_authorized_markets", ()))
+
+    def _maybe_reload_graph(self):
+        if self._reload_future is not None and self._reload_future.done():
+            try:
+                candidate = self._reload_future.result()
+                if candidate is not None:
+                    model, metadata = candidate
+                    # Prepare every fallible operation before changing active state.
+                    supervised = _upside_supervised_strategy_ids(metadata)
+                    authorized = _upside_authorized_strategy_markets(metadata)
+                    advisory_markets = bounded_advisory_markets(metadata)
+                    risk_heads = risk_advisory_strategy_markets(metadata)
+                    cpu = AdaptiveStrategyUtilityRuntime(model)
+                    npu = (AdaptiveStrategyUtilityRuntime(model, requested_device="NPU")
+                           if self.npu is not None else None)
+                    self.model = model
+                    self.cpu = cpu
+                    self.npu = npu
+                    self.checkpoint_loaded = True
+                    self.checkpoint_error = None
+                    self.checkpoint_contract_reasons = ()
+                    self.model_input_schema = metadata["input_feature_schema"]
+                    self.model_strategy_ids = tuple(metadata["strategy_ids"])
+                    self.live_authorized_markets = ()
+                    self.live_authorized = False
+                    self.label_execution_policy = str(metadata.get("label_execution_policy") or LEGACY_BAR_POLICY)
+                    self.bounded_advisory_authorized_markets = advisory_markets
+                    self.risk_advisory_strategy_markets = risk_heads
+                    self.authorization_scope = str(metadata.get("authorization_scope", "none"))
+                    self.checkpoint_hash = metadata["checkpoint_hash"]
+                    self.upside_supervised_strategy_ids = supervised
+                    self.upside_authorized_strategy_markets = authorized
+                    self._latest_advisories.clear()
+                self.reload_error = None
+            except Exception as exc:
+                # A partially updated/corrupt candidate cannot displace an incumbent.
+                self.reload_error = f"{type(exc).__name__}: {exc}"
+            self._reload_future = None
+        if self._reload_future is None and time.monotonic() - self._reload_last_check >= 15:
+            from dataclasses import replace
+            self._reload_last_check = time.monotonic()
+            expected = replace(self.model.config, time_steps=TIME_STEPS, temporal_mode=1)
+            self._reload_future = _GRAPH_RELOADER.submit(_load_graph_replacement, self.checkpoint_path,
+                expected, self.checkpoint_hash, self.bounded_advisory_authorized_markets, self.label_execution_policy)
 
     def evaluate(
+        self, snapshot: SlowIntelligenceSnapshot, *, legacy_action: str = "NO_TRADE",
+    ) -> ShadowIntelligenceResult | None:
+        with self._model_lock:
+            self._maybe_reload_graph()
+            return self._evaluate(snapshot, legacy_action=legacy_action)
+
+    def _evaluate(
         self,
         snapshot: SlowIntelligenceSnapshot,
         *,
@@ -389,7 +551,11 @@ class ShadowIntelligenceService:
             )
         inputs = self._inputs(snapshot, ontology.allowed_strategy_ids)
         cpu_output = self.cpu.infer(*inputs)
-        cpu_evidence = self._evidence(snapshot, ontology, cpu_output, "openvino-cpu")
+        serving_devices = tuple(self.cpu.status.compiled_devices)
+        serving_version = (ARCHITECTURE + ":" + "+".join(serving_devices)
+                           if self.model.config.temporal_mode else "openvino-cpu")
+        cpu_evidence = self._evidence(snapshot, ontology, cpu_output, serving_version)
+        self._record_graph_advisory(snapshot, cpu_evidence, serving_devices)
         cpu_route = self.router.route(
             as_of=snapshot.as_of,
             symbol=snapshot.symbol,
@@ -539,6 +705,13 @@ class ShadowIntelligenceService:
         return self.gate.evaluate(operational, rules)
 
     def _inputs(self, snapshot: SlowIntelligenceSnapshot, allowed: tuple[str, ...]):
+        if self.graph_mode and self.model.config.temporal_mode == 1:
+            x, adjacency, weights = self._graph_history.inputs(
+                GraphObservation(snapshot.symbol, snapshot.as_of, snapshot.features))
+            # Eligibility gates outputs; it never alters the trained graph topology.
+            mask = diagonal_strategy_mask(tuple(value for value in allowed
+                                                 if value in strategy_ids_for_market(snapshot.symbol)))
+            return x[None], adjacency[None], weights[None], mask[None]
         if self.graph_mode:
             allowed = tuple(
                 strategy_id

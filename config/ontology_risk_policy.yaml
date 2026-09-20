@@ -1,0 +1,14 @@
+# Engineering safety ceilings, not fixed trade triggers. Every operating level is
+# generated from typed, timestamped ontology evidence beneath these ceilings.
+schema_version: 1
+maximum_daily_loss_rate: 0.01
+maximum_trade_loss_rate: 0.002
+maximum_position_weight_kr: 0.15
+maximum_position_weight_us: 0.12
+maximum_sector_weight: 0.30
+maximum_hard_stop_rate: 0.02
+maximum_emergency_stop_rate: 0.035
+maximum_holding_seconds: 7200
+maximum_quote_age_seconds: 20
+maximum_policy_age_seconds: 15
+maximum_trades_per_day: 24

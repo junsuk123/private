@@ -207,6 +207,8 @@ app.add_middleware(AccessGuardMiddleware)
 _gnn_realtime_trust_evaluator = default_gnn_realtime_trust_evaluator()
 _live_shadow_lock = threading.RLock()
 _live_shadow_service: Any | None = None
+from app.models.strategy_utility.policy_context import GraphPolicyContextCache
+_graph_policy_contexts = GraphPolicyContextCache()
 _live_shadow_state: dict[str, Any] = {
     "enabled": False,
     "last_attempt_at": None,
@@ -4078,6 +4080,9 @@ def _with_upside_supervision(payload: dict) -> dict:
       _upside_authorized_strategy_markets,
       _upside_supervised_strategy_ids,
   )
+  from app.models.strategy_utility.label_contract import (
+      checkpoint_live_execution_authorized, checkpoint_bounded_advisory_markets,
+  )
 
   try:
     metadata = json.loads(
@@ -4088,16 +4093,20 @@ def _with_upside_supervision(payload: dict) -> dict:
   except (OSError, ValueError, json.JSONDecodeError):
     return payload
   supervised = set(_upside_supervised_strategy_ids(metadata))
-  checkpoint_live_authorized = bool(metadata.get("live_authorized"))
+  checkpoint_live_authorized = checkpoint_live_execution_authorized(metadata)
+  bounded_markets = checkpoint_bounded_advisory_markets(metadata)
   payload["checkpoint_live_authorized"] = checkpoint_live_authorized
-  payload["checkpoint_live_authorized_markets"] = list(
-      metadata.get("live_authorized_markets") or ()
-  )
+  payload["checkpoint_live_authorized_markets"] = list(metadata.get("live_authorized_markets") or ()) if checkpoint_live_authorized else []
+  payload["checkpoint_bounded_advisory_markets"] = list(bounded_markets)
+  payload["checkpoint_label_execution_policy"] = metadata.get("label_execution_policy", "unspecified")
   payload["checkpoint_authorization_checks"] = dict(
       metadata.get("authorization_checks") or {}
   )
   payload["score_available"] = int(payload.get("sample_count") or 0) > 0
   payload["trust_state"] = (
+      "BOUNDED_RISK_ADVISORY"
+      if bounded_markets and not checkpoint_live_authorized
+      else
       "CHECKPOINT_NOT_PROMOTED"
       if not checkpoint_live_authorized
       else (
@@ -10650,6 +10659,10 @@ def _live_training_loop() -> None:
       else:
         backfill = backfill_live_feature_frames_from_realtime_store()
       collection = collect_live_feature_frames_from_realtime_store()
+      from app.models.strategy_utility.online_training import maybe_schedule_graph_training
+      graph_training = maybe_schedule_graph_training()
+      with _live_lock:
+        _live_training_heartbeat["temporal_rgcn"] = graph_training
       artifact = train_live_short_horizon_from_collected_features()
       metrics = artifact.get("metrics") or {}
       deployment = artifact.get("deployment") or {}
@@ -11045,11 +11058,32 @@ def _stop_live_training_worker() -> None:
     worker.join(timeout=2.0)
 
 
+_ontology_policy_runtime: Any | None = None
+
+from app.ontology.policy_routes import create_policy_router
+app.include_router(create_policy_router(lambda: _ontology_policy_runtime))
+
+
 def _build_realtime_trading_engine() -> RealtimeTradingEngine:
   from app.trading.strategy_session import StrategySessionManager
   from app.trading.trade_plan_builder import TradePlanBuilder
+  from app.trading.ontology_policy_runtime import OntologyPolicyRuntime
 
+  global _ontology_policy_runtime
   store = RealtimeMarketDataStore()
+
+  def _policy_contexts() -> dict[str, Any]:
+    runtime = get_context_runtime()
+    return runtime.latest_by_market() if runtime is not None else {}
+
+  def _policy_graph_advisory(symbol: str, as_of: datetime) -> Any:
+    service = _live_shadow_service
+    return service.latest_graph_advisory(symbol, as_of) if service is not None else None
+
+  policy_runtime = OntologyPolicyRuntime(
+      store, context_provider=_policy_contexts, graph_advisory_provider=_policy_graph_advisory,
+  )
+  _ontology_policy_runtime = policy_runtime
   account = _live_account_snapshot_for_analysis()
   rules = _live_risk_rules_for_account(account)
   broker_client = KisDevelopersApiClient(paper=False, enabled=True)
@@ -11062,14 +11096,20 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
 
   decision_engine = SharedLiveDecisionEngine(
       store,
-      risk_manager=RiskManager(rules),
+      risk_manager=RiskManager(rules, ontology_policy_required=True),
       market_refresher=_refresh_market_snapshot,
+      ontology_policy_resolver=policy_runtime.resolve,
   )
   _ensure_us_fast_poll_started()
   macro_micro_observer = _build_macro_micro_observer(decision_engine)
   strategy_session_manager = StrategySessionManager(
       selection_evidence_provider=_strategy_session_selection_evidence,
-      plan_builder=TradePlanBuilder(risk_manager=RiskManager(rules)),
+      graph_training_context_provider=_graph_policy_contexts.latest,
+      plan_builder=TradePlanBuilder(
+          risk_manager=RiskManager(rules, ontology_policy_required=True),
+          ontology_policy_resolver=policy_runtime.resolve,
+      ),
+      ontology_policy_resolver=policy_runtime.resolve,
   )
   # The ExecutionGuard needs the plan that owns the order and the broker's own view of
   # cash and sellable quantity. Wired here rather than looked up inside the guard so the
@@ -11094,6 +11134,8 @@ def _build_realtime_trading_engine() -> RealtimeTradingEngine:
       cycle_observer=_record_realtime_trading_cycle,
       macro_micro_observer=macro_micro_observer,
       strategy_session_manager=strategy_session_manager,
+      ontology_policy_resolver=policy_runtime.resolve,
+      ontology_policy_snapshot_provider=policy_runtime.snapshot,
   )
 
 
@@ -11364,6 +11406,19 @@ def _refresh_live_candidate_shadow(
   global _live_shadow_service
   if not frames:
     return
+  # Capture actual causal inputs even while a model is absent or inference is
+  # disabled. Forward outcomes can then teach a candidate without reconstructing
+  # historical ontology states or requiring an already-authorized model.
+  from app.routing.shadow_intelligence import slow_snapshot_from_live_feature_frame
+
+  snapshots = {}
+  for symbol, frame in sorted(frames.items()):
+    try:
+      snapshot = slow_snapshot_from_live_feature_frame(frame)
+      if _graph_policy_contexts.record(snapshot):
+        snapshots[symbol] = snapshot
+    except Exception as exc:
+      _record_live_shadow_error(symbol, exc, observed_at)
   flags = RefactorFeatureFlags.from_env()
   require_live_gnn = os.getenv(
       "STRATEGY_SESSION_REQUIRE_LIVE_GNN",
@@ -11392,11 +11447,8 @@ def _refresh_live_candidate_shadow(
           trust_evaluator=_gnn_realtime_trust_evaluator,
       )
 
-    from app.routing.shadow_intelligence import slow_snapshot_from_live_feature_frame
-
-    for symbol, frame in sorted(frames.items()):
+    for symbol, snapshot in snapshots.items():
       try:
-        snapshot = slow_snapshot_from_live_feature_frame(frame)
         result = _live_shadow_service.evaluate(snapshot)
       except Exception as exc:  # one symbol must never kill the trading cycle.
         _record_live_shadow_error(symbol, exc, observed_at, lock_held=True)

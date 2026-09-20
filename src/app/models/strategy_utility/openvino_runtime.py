@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from statistics import median
 from typing import Any
@@ -103,7 +105,69 @@ class OpenVinoStrategyUtilityRuntime:
         )
         raw = np.asarray(result[self.compiled.output(0)])
         no_trade_raw = np.asarray(result[self.compiled.output(1)])
+        if not np.isfinite(raw).all() or not np.isfinite(no_trade_raw).all():
+            raise FloatingPointError("non-finite graph accelerator output")
         return output_from_raw(raw, no_trade_raw, node_mask, strategy_mask)
+
+
+_COMPILER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="obaits-temporal-rgcn")
+
+
+class AdaptiveStrategyUtilityRuntime:
+    """Serve exact fitted NumPy weights while NPU compilation runs off the tick path."""
+
+    def __init__(self, reference: FixedShapeStrategyUtilityModel, *, requested_device: str | None = None) -> None:
+        self.reference = reference
+        self.requested_device = (requested_device or os.getenv("NPU_DEVICE_PREFERENCE", "AUTO")).upper()
+        self._runtime = None
+        self._error = "Accelerator warming up; using fitted NumPy R-GCN"
+        self._pending = (_COMPILER.submit(self._compile) if self.requested_device != "CPU_NUMPY" else None)
+
+    @property
+    def status(self) -> OpenVinoUtilityStatus:
+        if self._runtime is not None:
+            return self._runtime.status
+        return OpenVinoUtilityStatus(self.requested_device, ("CPU_NUMPY",), self._error, 0.0,
+                                     _model_hash(self.reference), "FP32")
+
+    def _compile(self):
+        import openvino as ov
+
+        devices = {str(value).split(".")[0] for value in ov.Core().available_devices}
+        requested = self.requested_device
+        if requested == "AUTO":
+            requested = next((value for value in ("NPU", "GPU", "CPU") if value in devices), "CPU")
+        runtime = OpenVinoStrategyUtilityRuntime(self.reference, requested_device=requested)
+        # Compare ALL raw channels, not only a postprocessed utility score.
+        c = self.reference.config
+        rng = np.random.default_rng(223)
+        x = rng.normal(0, 0.15, (c.batch_size, c.time_steps, c.max_nodes, c.feature_dim)).astype(np.float32)
+        adjacency = np.full((c.batch_size, c.time_steps, c.relation_count, c.max_nodes, c.max_nodes),
+                            1.0 / max(1, c.max_nodes), dtype=np.float32)
+        masks = np.ones((c.batch_size, c.time_steps, c.max_nodes), dtype=np.float32) / c.time_steps
+        strategy_mask = np.ones((c.batch_size, c.max_nodes, c.strategy_count), dtype=np.float32)
+        expected = self.reference.infer_raw(x, adjacency, masks, strategy_mask)
+        if runtime.compiled is not None:
+            result = runtime.compiled({"features": x, "adjacency": adjacency, "node_mask": masks})
+            for index in (0, 1):
+                if not np.allclose(np.asarray(result[runtime.compiled.output(index)]), expected[index], rtol=.01, atol=.03):
+                    raise ValueError("temporal R-GCN accelerator raw-output parity failed")
+        return runtime
+
+    def infer(self, x, adjacency, node_mask, strategy_mask):
+        if self._pending is not None and self._pending.done():
+            try:
+                self._runtime = self._pending.result()
+            except Exception as exc:
+                self._error = f"R-GCN accelerator unavailable: {type(exc).__name__}: {exc}"
+            self._pending = None
+        if self._runtime is not None:
+            try:
+                return self._runtime.infer(x, adjacency, node_mask, strategy_mask)
+            except Exception as exc:
+                self._error = f"R-GCN inference failed: {type(exc).__name__}: {exc}"
+                self._runtime = None
+        return self.reference.infer(x, adjacency, node_mask, strategy_mask)
 
 
 def benchmark_runtime(
@@ -219,6 +283,7 @@ def _model_hash(reference: FixedShapeStrategyUtilityModel) -> str:
         reference.self_weight,
         reference.strategy_heads,
         reference.no_trade_head,
+        reference.temporal_weights,
     ):
         digest.update(value.tobytes())
     return digest.hexdigest()

@@ -21,6 +21,8 @@ def _supervise(account):
         snapshot=lambda: {"selected_symbol": "AAPL", "phase": "ARMED"}, request_halt=Mock())
     engine.strategy_supervisor = StrategySupervisor()
     engine.decision_engine = SimpleNamespace(store=None)
+    engine.ontology_policy_resolver = None
+    engine.ontology_policy_snapshot_provider = None
     engine.market_open_provider = lambda *_: True
     engine._record = Mock()
     return engine._supervise_session(account, None, datetime.now(timezone.utc))

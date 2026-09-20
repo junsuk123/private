@@ -127,6 +127,7 @@ def build_operations_overview(
             "blocker": blocker,
             "pipeline": pipeline,
             "orders": _order_rows(orders or []),
+            "ontology_policy": _mapping(status.get("ontology_policy")),
         },
         "runtime": {key: runtime.get(key) for key in (
             "backend", "requested_backend", "device", "latency_ms", "model",
@@ -143,8 +144,8 @@ OPERATIONS_PAGE = """<!doctype html>
   <meta name="color-scheme" content="dark">
   <title>OBAITS · 트레이딩 현황</title>
   <link rel="icon" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/operations_dashboard.css?v=20260920">
-  <script defer src="/static/operations_dashboard.js?v=20260920"></script>
+  <link rel="stylesheet" href="/static/operations_dashboard.css?v=20260920-policy">
+  <script defer src="/static/operations_dashboard.js?v=20260920-policy"></script>
 </head>
 <body>
   <a class="skip-link" href="#profit">손익으로 이동</a>
@@ -176,6 +177,12 @@ OPERATIONS_PAGE = """<!doctype html>
       <div class="verdict" id="verdict" role="status"><span class="verdict-indicator" aria-hidden="true"></span><div><h3 id="blocker-title">주문 경로 확인 중</h3><p id="blocker-detail">엔진 상태와 진입 조건을 확인합니다.</p></div></div>
       <ol class="pipeline" id="pipeline"></ol>
       <div class="execution-footer"><span id="execution-owner">선택된 전략 확인 대기</span><span>시장별 관측 · 계좌당 한 실행 주체</span></div>
+    </section>
+
+    <section class="card" aria-labelledby="policy-title">
+      <div class="section-heading"><h2 id="policy-title">시장 분석으로 정한 리스크 기준</h2><a href="/api/ontology/policy/schema" download>온톨로지 정의 ↓</a></div>
+      <div class="markets" id="ontology-policies"><p class="empty">분석된 정책이 아직 없습니다.</p></div>
+      <p class="source-note">종목별 관측 시점의 기준입니다. 만료되면 새 분석이 필요하며, 손절 기준이 실제 체결가를 보장하지는 않습니다.</p>
     </section>
 
     <div class="lower-grid">
